@@ -135,7 +135,10 @@ fi
 PRODUCT_REF=""
 PRODUCT_REF_SHORT="unknown"
 PRODUCT_DIRTY="unknown"
-if git -C "$REPO" rev-parse HEAD >/dev/null 2>&1; then
+# A source archive may sit inside another repository. Only this exact tree's
+# own checkout can supply product identity; never inherit a containing repo.
+PRODUCT_GIT_ROOT="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || true)"
+if [ "$PRODUCT_GIT_ROOT" = "$REPO" ] && git -C "$REPO" rev-parse HEAD >/dev/null 2>&1; then
     PRODUCT_REF="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
     PRODUCT_REF_SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     PRODUCT_DIRTY="false"
