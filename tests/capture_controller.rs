@@ -6390,50 +6390,62 @@ fn live_prestop_cancel_reaps_real_child() {
 }
 
 #[test]
-fn live_short_children_are_detected() {
-    // Back-to-back short-lived grandchildren: polling is
-    // best-effort (the fallback stays explicitly PARTIAL either
-    // way), but sustained children must surface at least one Fork.
-    // Round 2, residual S (flake-hardening): adaptive within a
-    // bounded budget — poll until first detection or 50 rounds
-    // (early exit keeps healthy runs fast; the ~6s children span
-    // outlasts the ~5s budget even when parallel-suite load
-    // stretches sleeps). The detection assertion stays: a
-    // detection-dropping mutant exhausts the budget and fails
-    // (mutant-proven — see the fix-wave report).
+fn live_polling_detects_child_present_during_scan() {
+    // Polling can miss a child that exits before its scan. Hold one known
+    // child through the actual scan, then let it exit promptly. Readiness
+    // comes from the workload; the 15s failsafe also bounds an orphan if the
+    // test process dies. No fixed scheduling interval guarantees detection.
+    let stage = Stage::fresh("polling-child");
+    let ready = stage.dir.join("ready");
+    let release = stage.dir.join("release");
     let argv = vec![
-        "/bin/sh".to_string(),
+        "/bin/bash".to_string(),
         "-c".to_string(),
-        "i=0; while [ $i -lt 120 ]; do sleep 0.05; i=$((i+1)); done".to_string(),
+        "deadline=$((SECONDS+15)); printf ready > \"$1\"; while [ ! -e \"$2\" ] && [ \"$SECONDS\" -lt \"$deadline\" ]; do :; done; test -e \"$2\"".to_string(),
+        "polling-child".to_string(),
+        ready.to_str().unwrap().to_string(),
+        release.to_str().unwrap().to_string(),
     ];
     let mut owned = OwnedTarget::spawn_stopped(&argv, WorkloadDest::Null).unwrap();
     let pid = owned.pid();
+    let mut cleanup = R06PidGuard::arm(pid);
     owned.release().unwrap();
-    let mut lc = PollingLifecycle::new(pid);
+    let ready_end = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(owned.peek_exit().unwrap().is_none(), "fixture exited early");
+        assert!(Instant::now() < ready_end, "fixture never became ready");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut lc = PollingLifecycle::new(std::process::id());
     assert!(lc.fallback_partial());
-    let mut forks = 0u64;
-    for _ in 0..50 {
-        let delta = lc.poll();
-        forks += delta
+    let first = lc.poll();
+    assert_eq!(
+        first
             .events
             .iter()
-            .filter(|e| e.kind == LifecycleKind::Fork)
-            .count() as u64;
-        if forks >= 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(
-        forks >= 1,
-        "fifty scans across ~6s of 50ms children saw nothing"
+            .filter(|e| e.kind == LifecycleKind::Fork && e.pid == pid)
+            .count(),
+        1,
+        "the known live child must be detected: {first:?}"
     );
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    assert!(
+        lc.poll()
+            .events
+            .iter()
+            .all(|e| e.kind != LifecycleKind::Fork || e.pid != pid),
+        "the same child must not be counted again"
+    );
+    std::fs::write(&release, b"done").unwrap();
+    let exit_end = Instant::now() + Duration::from_secs(5);
+    while owned.peek_exit().unwrap().is_none() {
+        assert!(Instant::now() < exit_end, "fixture never exited");
+        std::thread::sleep(Duration::from_millis(1));
     }
-    let mut status = 0;
-    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
-    assert!(r > 0);
+    let exit = owned.poll_exit();
+    if matches!(exit, Ok(Some(_))) {
+        cleanup.disarm();
+    }
+    assert_eq!(exit.unwrap(), Some(0));
     assert_reaped(pid);
 }
 
