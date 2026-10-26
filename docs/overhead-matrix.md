@@ -13,20 +13,25 @@ Five alternating baseline/observed pairs per family on the development
 candidate used the [finite workload](../tests/runtime/README.md), N100000,
 default debug host and release BPF, root privileges for both legs, no concurrent
 builds/tests and no CPU pinning. Each observed SHA run counted100000 context
-entries; each AES run counted100000 context entries and100000 shared updates.
-All workloads exited0 and reports remained PARTIAL3.
+entries; each AES run counted 100000 context entries and 100000 shared updates.
+All workloads exited 0 and reports remained PARTIAL/exit 3.
 
 | Workload | Baseline median | Observed median | Median paired wall ratio |
 | --- | ---: | ---: | ---: |
-| SHA-256 | 0.015865s | 0.364560s | 22.98x |
-| AES-256-GCM | 0.064000s | 0.715125s | 11.18x |
+| SHA-256 | about 0.016s | about 0.36s | about 23x |
+| AES-256-GCM | about 0.064s | about 0.72s | about 11x |
 
 These whole-command times include startup, library hashing, load/attach,
-drain/rendering and polling. Tiny messages and fresh contexts make this a
+drain/rendering and controller polling (up to 50ms per timed wait). The rounded
+numbers and ratios reflect this measurement limit. Tiny messages and fresh contexts make this a
 stress case, not a paced production workload. The wall difference is not an
 isolated probe or callback latency. Bounded inventory runs complete in under a
 second here, but tight loops pay material overhead. There is no production
-low-overhead, 100k/s, 4us or2x guarantee.
+low-overhead, 100k/s, 4us or 2x guarantee.
+
+The installed 0.2.0 candidate repeated one pair per family with the same Count
+bytes and exact expected totals: SHA about 0.016/0.36s and AES about 0.064/0.77s
+baseline/observed. This is a version-check repeat, not a new five-pair median.
 
 Observed count delta was zero in these finite controls, with no map insertion,
 attach, drain-shortfall or unattributed-count loss. The strict receipt still

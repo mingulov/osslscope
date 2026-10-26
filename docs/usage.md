@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Foreground preview usage
 
-The v0.2.0 development route supports one exact enrolled x86-64 library/kernel
-profile, one owned foreground process and its threads. Runtime qualification is
-still open. Start with [build](build.md), [install](install.md) and the
+The v0.2.0 foreground preview supports one exact enrolled x86-64 library/kernel
+profile, one owned foreground process and its threads. Native qualification is
+described in the [release notes](release-v0.2.0.md). Start with [build](build.md), [install](install.md) and the
 [catalogue](../profiles/README.md). Broader modes in older developer references
 are deferred; their flags are rejected by the current CLI.
 

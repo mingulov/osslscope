@@ -1,8 +1,8 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Install the source-built foreground preview
 
-This unreleased milestone targets a source build and local-prefix installation.
-Its actual installed/runtime qualification remains open. Initial enrollment is
+The v0.2.0 source preview uses a source build and local-prefix installation.
+Native installed checks cover the [advertised profile](release-v0.2.0.md):
 Ubuntu OpenSSL `3.5.5-1ubuntu3.7` amd64 and one exact `7.0.0-38-generic` kernel
 build, with protected file backing and the initial PID namespace. See the
 [catalogue](../profiles/README.md). A general kernel/OpenSSL version match is
@@ -69,7 +69,8 @@ Use the [README example](../README.md#build-and-try-the-development-route) or
 [usage](usage.md). A normal partial report exits 3; a positive require can also
 exit 3. A known unobserved algorithm is inconclusive (11), not an absence pass.
 The report, JSON and CBOM retain the same profile gap and Count fingerprint.
-Actual count/confinement/cleanup and overhead results remain release gates.
+Read the [measured limits](overhead-matrix.md) before using tight loops or
+applying broader performance expectations.
 
 ## Deferred distribution
 
