@@ -21,6 +21,7 @@ pub mod doctor;
 // T01 (coordinator review): conserved evidence model + pure policy primitives.
 pub mod evidence;
 pub mod inspect;
+pub mod inventory;
 pub mod kinds;
 pub mod lifecycle_producer;
 pub mod loader;
