@@ -489,3 +489,111 @@ fn exact_public_api_spellings_are_exhaustive() {
         Some("OSSL_PROVIDER_unquery_operation")
     );
 }
+
+#[test]
+fn retained_parser_state_is_admitted_before_elf_reads() {
+    let fixture = Fixture::new();
+    for available in [0, 4096] {
+        let mut budget = ObservationBudget::new(ObservationLimits {
+            max_state_bytes: available,
+            ..Default::default()
+        });
+        assert_eq!(
+            observation::inspect_exports(&mut fixture.file(), &mut budget),
+            Err(ObservationGap::StateLimit)
+        );
+        assert_eq!(
+            budget.elf_read_bytes(),
+            0,
+            "retained parser admission followed ELF work"
+        );
+    }
+}
+
+#[test]
+fn sectionless_shared_long_unknown_names_remain_valid() {
+    // One literal ELF fixture: 129 FUNC definitions share one 64 KiB name.
+    // The private reader-count test independently bounds comparison work.
+    const BASE: u64 = 0x400000;
+    const COUNT: usize = 130;
+    const STRINGS: usize = 0x2000;
+    let mut names = b"\0OSSL_PROVIDER_unquery_operation".to_vec();
+    names.resize(65536, b'x');
+    names.push(0);
+    let mut image = vec![0; STRINGS + names.len()];
+    image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    let put = |image: &mut [u8], at: usize, value: u64, size: usize| {
+        image[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
+    };
+    put(&mut image, 16, 3, 2);
+    put(
+        &mut image,
+        18,
+        if cfg!(target_arch = "aarch64") {
+            183
+        } else {
+            62
+        },
+        2,
+    );
+    put(&mut image, 20, 1, 4);
+    put(&mut image, 32, 64, 8);
+    put(&mut image, 52, 64, 2);
+    put(&mut image, 54, 56, 2);
+    put(&mut image, 56, 2, 2);
+    // RX PT_LOAD for every file byte; PT_DYNAMIC has six entries plus NULL.
+    let len = image.len() as u64;
+    for (at, value, size) in [
+        (64, 1, 4),
+        (68, 5, 4),
+        (80, BASE, 8),
+        (96, len, 8),
+        (104, len, 8),
+        (112, 4096, 8),
+        (120, 2, 4),
+        (128, 0x100, 8),
+        (136, BASE + 0x100, 8),
+        (152, 112, 8),
+        (160, 112, 8),
+    ] {
+        put(&mut image, at, value, size);
+    }
+    let dynamic = [
+        (4, BASE + 0x200),
+        (5, BASE + STRINGS as u64),
+        (6, BASE + 0x600),
+        (10, names.len() as u64),
+        (11, 24),
+        (0, 0),
+    ];
+    for (index, (tag, value)) in dynamic.into_iter().enumerate() {
+        put(&mut image, 0x100 + index * 16, tag, 8);
+        put(&mut image, 0x108 + index * 16, value, 8);
+    }
+    put(&mut image, 0x200, 1, 4);
+    put(&mut image, 0x204, COUNT as u64, 4);
+    put(&mut image, 0x208, 1, 4);
+    for index in 1..COUNT {
+        let at = 0x600 + index * 24;
+        put(&mut image, at, 1, 4);
+        image[at + 4] = 0x12;
+        put(&mut image, at + 6, 1, 2);
+        put(&mut image, at + 8, BASE + 0x80, 8);
+        put(&mut image, at + 16, 1, 8);
+    }
+    image[STRINGS..].copy_from_slice(&names);
+    let fixture = Fixture::new();
+    fs::write(fixture.0.join("renamed.so"), &image).unwrap();
+    assert!(inventory::elf::inspect_file(&mut fixture.file(), u64::MAX).is_ok());
+    assert_eq!(
+        observation::inspect_exports(&mut fixture.file(), &mut ObservationBudget::default()),
+        Ok(vec![])
+    );
+    // A malformed table ending cannot become an exact known-name match.
+    *image.last_mut().unwrap() = b'x';
+    fs::write(fixture.0.join("renamed.so"), image).unwrap();
+    assert!(
+        observation::inspect_exports(&mut fixture.file(), &mut ObservationBudget::default())
+            .is_err()
+    );
+}

@@ -19,6 +19,14 @@ const MAX_OBJECT: u64 = 134_217_728;
 const MAX_HEADERS: usize = 4096;
 const MAX_SYMBOLS: u64 = 262_144;
 const MAX_STRINGS: u64 = 16 * 1024 * 1024;
+// A parser can retain at most one executable range per program header and
+// one offset per finite API. Reserve this conservative upper bound before
+// hashing, reads, or construction, including source-only inspection.
+const PARSER_STATE_BYTES: usize = MAX_HEADERS * std::mem::size_of::<Segment>()
+    + APIS.len() * std::mem::size_of::<(ObservationApi, u64)>()
+    + std::mem::size_of::<ElfObject>()
+    + 64;
+
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -645,6 +653,7 @@ fn parse_object(
     expected: Option<&ModuleInfo>,
     budget: &ObservationBudget,
 ) -> Result<ElfObject, ObservationGap> {
+    budget.state(PARSER_STATE_BYTES)?;
     let before = file
         .metadata()
         .map_err(|_| ObservationGap::BackingUnavailable)?;
@@ -739,7 +748,7 @@ fn parse_exports(
         return Err(ObservationGap::MalformedElf);
     }
     let programs = bytes(file, phoff, phnum * 56, len, budget)?;
-    let mut segments = Vec::new();
+    let mut segments = Vec::with_capacity(phnum);
     for p in programs.chunks_exact(56) {
         if word(p, 0, 4)? != 1 {
             continue;
@@ -781,7 +790,7 @@ fn parse_exports(
         }
         bytes(file, shoff, count as usize * 64, len, budget)?
     };
-    let mut exports = std::collections::BTreeMap::new();
+    let mut exports: Vec<(ObservationApi, u64)> = Vec::with_capacity(APIS.len());
     if let Some(DynamicSymbols { symbols, names }) = dynamic_symbols(file, &programs, len, budget)?
     {
         for symbol in symbols.chunks_exact(24) {
@@ -805,16 +814,10 @@ fn parse_exports(
                 }
             }
             let name = word(symbol, 0, 4)? as usize;
-            let Some(tail) = names.get(name..) else {
+            let Some(tail) = names.get(name..).filter(|tail| !tail.is_empty()) else {
                 return Err(ObservationGap::MalformedElf);
             };
-            let Some(end) = tail.iter().position(|b| *b == 0) else {
-                return Err(ObservationGap::MalformedElf);
-            };
-            let Some(api) = APIS.iter().copied().find(|api| {
-                api.export_name()
-                    .is_some_and(|name| name.as_bytes() == &tail[..end])
-            }) else {
+            let Some(api) = export_api_at(|index| tail.get(index).copied()) else {
                 continue;
             };
             let address = word(symbol, 8, 8)?;
@@ -837,18 +840,20 @@ fn parse_exports(
                 .offset
                 .checked_add(address - segment.address)
                 .ok_or(ObservationGap::MalformedElf)?;
-            if let Some(previous) = exports.insert(api, offset) {
-                if previous != offset {
+            if let Some((_, previous)) = exports.iter().find(|(found, _)| *found == api) {
+                if *previous != offset {
                     return Err(ObservationGap::AmbiguousSite);
                 }
+            } else {
+                exports.push((api, offset));
             }
         }
     }
-    budget.state(segments.len() * std::mem::size_of::<Segment>() + exports.len() * 32 + 128)?;
+    exports.sort_unstable_by_key(|(api, _)| *api);
     Ok(ElfObject {
         hash,
         segments,
-        exports: exports.into_iter().collect(),
+        exports,
     })
 }
 
@@ -1006,5 +1011,64 @@ fn dynamic_symbols(
         len,
         budget,
     )?;
+    if names.first() != Some(&0) || names.last() != Some(&0) {
+        return Err(ObservationGap::MalformedElf);
+    }
     Ok(Some(DynamicSymbols { symbols, names }))
+}
+
+fn export_api_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<ObservationApi> {
+    // A caller-supplied name may be arbitrarily long or share its index with
+    // every symbol. Inspect only finite public spellings plus the exact NUL.
+    APIS.iter().copied().find(|api| {
+        api.export_name().is_some_and(|name| {
+            name.bytes()
+                .chain(std::iter::once(0))
+                .enumerate()
+                .all(|(index, want)| byte_at(index) == Some(want))
+        })
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_long_unknown_names_have_constant_finite_comparison_work() {
+        // The same valid long unknown name is referenced repeatedly. Count
+        // actual reader accesses, independently of any host timing threshold.
+        let mut names = b"\0OSSL_PROVIDER_unquery_operation".to_vec();
+        names.resize(65536, b'x');
+        names.push(0);
+        let longest = APIS
+            .iter()
+            .filter_map(|api| api.export_name())
+            .map(str::len)
+            .max()
+            .unwrap();
+        let mut accesses = 0;
+        for _ in 0..129 {
+            assert_eq!(
+                export_api_at(|index| {
+                    accesses += 1;
+                    names.get(index + 1).copied()
+                }),
+                None
+            );
+        }
+        assert!(
+            accesses <= 129 * APIS.len() * (longest + 1),
+            "name access work exceeded the finite spelling bound: {accesses}"
+        );
+        for api in APIS {
+            let mut exact = api.export_name().unwrap().as_bytes().to_vec();
+            exact.push(0);
+            assert_eq!(export_api_at(|index| exact.get(index).copied()), Some(api));
+            exact.pop();
+            assert_eq!(export_api_at(|index| exact.get(index).copied()), None);
+            exact.extend_from_slice(b"x\0");
+            assert_eq!(export_api_at(|index| exact.get(index).copied()), None);
+        }
+    }
 }
