@@ -1,150 +1,81 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope
 
-Discover OpenSSL-compatible libraries, provider modules and consumers from
-ELF interfaces and running-process mappings. Discovery needs no enrolled
-library profile, manual offsets or BPF. A separate foreground diagnostic can
-observe entries into a small catalogue of OpenSSL callbacks.
+Discover OpenSSL-compatible libraries, provider modules and consumers, then
+observe public provider interfaces and count entries at learned callback sites
+for one selected process. Normal workflows need no enrolled library profile,
+manual offsets or application changes.
 
-**Status: discovery development toward v0.3.0; v0.3.0 is not released.**
-Passive snapshots, sampled watch, PID/cgroup scopes and supplied-file matching
-are implemented and checked, including scope exclusion and churn. Provider
-activation and advertised runtime interfaces remain unknown; execution is
-`not_observed`. ELF exports and mappings do not prove activation or execution.
-The discovery result is metadata inventory, without an executed CBOM or policy
-verdict. Remaining delivery stages are listed in the [roadmap](ROADMAP.md).
+**Status: v0.3.0 source candidate; not released.** Source implementation and
+fixture checks do not establish installed runtime or platform qualification.
+See [release scope and pending gates](docs/release-v0.3.0.md).
 
-## Discover processes and files
+## Discover, select, observe
 
-Build the host CLI using the pinned Rust toolchain:
-
-```sh
-cargo build --locked --bin osslscope
-./target/debug/osslscope scan --json
-./target/debug/osslscope scan --watch --interval 1 --duration 30 --json
-./target/debug/osslscope scan --watch --pid 1234 --json
-./target/debug/osslscope scan --cgroup /sys/fs/cgroup/example.service --json
-./target/debug/osslscope scan --pid 1234 --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
-./target/debug/osslscope inspect --pid 1234 --json
-./target/debug/osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
-```
-
-Start with a snapshot, then watch the visible population or narrow it to a PID,
-a cgroup subtree or supplied module hashes. Selector families intersect; an empty
-or unavailable selection never expands to all processes. Watch reports sampled
-changes, not a lossless event history. Ctrl-C stops the observer and returns 3;
-the independently running targets keep running.
-
-Use actual visible PIDs and file paths on your host. Ordinary filesystem/procfs
-permissions apply. No privilege elevation or BPF setup is needed for discovery;
-unreadable or unverifiable backing produces explicit partial/unavailable
-results. System scan means the processes visible in the observer's procfs view.
-Output contains finite interface labels and numeric identities/hashes, without
-raw paths, process names, mapping addresses, environment or command lines.
-Only verified mapped backing has `identity_status: verified`; a
-`locator_candidate` is useful file metadata with an unverified mapping association.
-It is never an execution site. Snapshots are bounded and detect some churn;
-they are not atomic. See [usage](docs/usage.md) for bounds, exit codes and
-[host-side Docker/kind scope selection](docs/usage.md#host-side-container-workflows).
-Docker and Kubernetes tools are optional operator utilities; osslscope has no
-runtime-socket or Kubernetes-client dependency.
-
-## Legacy foreground diagnostic (v0.2.0)
-
-The initial enrollment is one exact Ubuntu OpenSSL `3.5.5-1ubuntu3.7` amd64
-library and kernel `7.0.0-38-generic` build. Admission checks the actual library
-SHA-256/build ID, protected file backing, kernel build ID and initial PID
-namespace. The [catalogue](profiles/README.md) documents the three callback
-sites: definite SHA-256 and AES-256-GCM context creation entries, plus a shared
-GCM update with seven possible algorithm meanings. Qualification covers this
-exact profile; additional OpenSSL and Linux builds need separate enrollment.
-
-The legacy diagnostic commands are `doctor`, `report`, `check` and offline
-`alias-audit`. They retain the v0.2.0 fixed-profile behavior.
-`report` and `check` launch one owned foreground process and observe its threads.
-They require `--libcrypto PATH` and load only the Count object. There are no
-target-memory discovery readers in this route.
-
-Captures remain **PARTIAL** because the small catalogue has an unknown global
-denominator. Positive definite entries are useful; absence is inconclusive.
-Callback entry does not establish message processing, crypto success, key size,
-runtime provider activation or FIPS state. Shared counts are not duplicated
-across candidate algorithms. CBOM exports contain definite assets only.
-
-Foreign execution attach, dynamic provider activation/interface observation,
-reader-object selection, provider/ENGINE policy rules, services and process
-following remain deferred. Passive `scan`/`inspect` do not change the legacy
-`report`/`check` restrictions.
-
-## Build and try the development route
-
-Use the pinned Rust/BPF tools and [build recipe](docs/build.md). The existing
-build/install tools still prepare three development objects; the preview loads
-only `osslscope-count`.
+Build the host CLI with `cargo build --locked --bin osslscope` for passive
+inventory. Tracing additionally needs the source-built BPF companions and
+BPF/perf privileges; follow [build](docs/build.md) and [install](docs/install.md).
+Use actual host-visible PIDs and file paths:
 
 ```sh
-./scripts/build-dev.sh
-./scripts/install-dev.sh --prefix "$HOME/.local"
+osslscope scan --json
+osslscope scan --watch --interval 1 --duration 30 --json
+osslscope scan --cgroup /sys/fs/cgroup/example.service --json
+osslscope inspect --pid 1234 --json
+osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
+osslscope doctor --format json
+osslscope report --pid 1234 --duration 30 --format json --out report.json --cbom bom.json
+osslscope check --pid 1234 --duration 30 --require-executed SHA256
+osslscope report --duration 5 --format json run -- openssl dgst -sha256 /dev/null
 ```
 
-Grant BPF/perf rights using the [installation instructions](docs/install.md).
-The app does not change privileges or host settings itself. Then select the
-enrolled library and the actual locally built Count object:
+Scan/watch narrows PID, cgroup and supplied-module selectors by intersection.
+For [Docker/kind](docs/usage.md#host-side-container-workflows), independently
+resolve the workload in host PID/cgroup coordinates, inventory it, then pass
+one selected PID to report/check. Execution documents cover one process
+incarnation and its threads; they do not follow children or cgroup membership.
 
-```sh
-OSSL_PREVIEW_LIBCRYPTO=/usr/lib/x86_64-linux-gnu/libcrypto.so.3
-OSSL_PREVIEW_PREFIX="$HOME/.local"
+Passive discovery uses ordinary procfs/filesystem access and loads no supplied
+module. Add `--observe-providers` to a PID scan/watch or PID inspection for
+bounded public lifecycle/query observation. Report/check automatically use the
+installed `osslscope-provider-observation` and `osslscope-focused-count` pair.
+Doctor checks inventory, namespace and companion integrity and performs
+scanner-owned functional BPF load/self-attachment controls. Target attachment
+and access remain scope dependent.
 
-"$OSSL_PREVIEW_PREFIX/bin/osslscope" doctor \
-  --libcrypto "$OSSL_PREVIEW_LIBCRYPTO" \
-  --count-object "$OSSL_PREVIEW_PREFIX/lib/osslscope/osslscope-count"
+## Interpret the evidence
 
-"$OSSL_PREVIEW_PREFIX/bin/osslscope" report \
-  --libcrypto "$OSSL_PREVIEW_LIBCRYPTO" \
-  --count-object "$OSSL_PREVIEW_PREFIX/lib/osslscope/osslscope-count" \
-  --duration 5 --format json --out report.json --cbom bom.json \
-  run -- openssl dgst -sha256 /dev/null
+ELF interfaces and mappings establish metadata inventory, not activation or
+execution. Public queries advertise callbacks; advertisement is not execution.
+A physical callback entry establishes neither cryptographic nor application
+success. A shared implementation contributes its physical count once.
+Candidates and their coverage remain **Unknown**; learned advertisements do
+not establish a definite algorithm/provider count or definite CBOM asset.
+Normal reports remain **PARTIAL** and algorithm checks remain inconclusive.
 
-"$OSSL_PREVIEW_PREFIX/bin/osslscope" check \
-  --libcrypto "$OSSL_PREVIEW_LIBCRYPTO" \
-  --count-object "$OSSL_PREVIEW_PREFIX/lib/osslscope/osslscope-count" \
-  --require-executed SHA256 --duration 5 \
-  run -- openssl dgst -sha256 /dev/null
-```
+There is no universal first-call guarantee. Warm/built-in activation can remain
+unknown; startup, polling, invalidation and final drain leave explicit gaps.
+Calls before attachment or after retirement are uncovered. Unavailable backing,
+permissions, namespace mismatch and resource caps retain partial/unavailable
+semantics. Linux x86-64/OpenSSL 3 is the initial scope; kernel admission is
+feature based. ARM64, pre-3.0/OpenSSL 4, RHEL/Secure Boot and broader platform
+qualification remain deferred. See [usage](docs/usage.md) for bounds, privacy,
+exit codes and cancellation.
 
-A normal report, or a satisfied positive rule with partial coverage, exits **3**.
-A definite deny violation exits **10**; an unobserved known algorithm is
-inconclusive (**11**). Usage errors exit **2**, setup/environment refusals **4**.
-See [usage](docs/usage.md) for failure precedence, policy files and output sinks.
-Doctor checks metadata, namespaces, Count compatibility and capability bits;
-it explicitly labels runtime permission/attachment as unprobed. Report/check
-validate load and attachment before releasing the workload.
+## Historical diagnostics and documentation
 
-Explicit `--count-object` is operator-trusted code. Compatibility checks and a
-hash do not authenticate arbitrary BPF or establish its privacy. No-reader and
-release claims apply to the exact source-built object actually qualified.
-Implicit selection is limited to trusted installed Count locations and retains
-the existing install-receipt checks.
+Explicit `--libcrypto PATH` selects the v0.2 fixed-profile foreground diagnostic.
+Its exact enrolled-library/kernel and Count-only restrictions still apply.
+Historical results in the [v0.2 release notes](docs/release-v0.2.0.md),
+[catalogue](profiles/README.md) and [overhead matrix](docs/overhead-matrix.md)
+do not qualify the v0.3 candidate or establish v0.3 scan/watch overhead.
 
-A released live workload is left running at observation end. Normal setup and
-signal cleanup handle owned resources. A crash/SIGKILL while the child is held
-stopped before exec can strand it; this preview does not provide crash-safe
-startup custody.
-
-## Documentation
-
-- [Build](docs/build.md) and [install](docs/install.md)
-- [CLI and policy files](docs/usage.md)
-- [Observation meaning and limits](docs/what-it-proves.md)
-- [Catalogue provenance](profiles/README.md)
-- [Output contract](docs/observed-crypto-v2.md)
-- [Roadmap](ROADMAP.md), [documentation index](docs/README.md)
-- [Component licensing](docs/licensing.md)
-- [v0.2.0 source release notes](docs/release-v0.2.0.md)
+- [CLI and policy files](docs/usage.md), [build](docs/build.md), [install](docs/install.md)
+- [v0.3 candidate notes](docs/release-v0.3.0.md), [roadmap](ROADMAP.md), [documentation index](docs/README.md)
+- [Output contract](docs/observed-crypto-v2.md), [observation meaning](docs/what-it-proves.md)
 
 Permanent boundaries: no keys, passwords, plaintext or application payload
-capture; no TLS interception or interposition. Broader discovery, execution and
-package qualification remain in development.
+capture; no TLS interception, interposition or target environment/argv readers.
 
 ## License
 

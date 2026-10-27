@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Roadmap
 
-osslscope is in development toward v0.3.0. It is not released. Discovery is
+osslscope is in development toward v0.3.0. It is not released. Discovery and focused execution are implemented in source. Discovery is
 the normal starting point; the v0.2.0 fixed-profile foreground route remains a
 legacy diagnostic with its original qualification boundary.
 
@@ -21,16 +21,21 @@ legacy diagnostic with its original qualification boundary.
   candidate backing; it does not establish process exit, provider unload or
   lossless following. Native scope exclusion, churn, container and integration
   checks cover these workflows within their stated observation limits.
-- **D3 — remaining:** observe public provider lifecycle events and external
-  provider initialization/query interfaces; retain warm-process, built-in and
-  attachment limitations.
-- **D4 — remaining:** count execution at learned callback sites, integrate
-  report/check, and qualify installed workflows, ambiguity, conservation,
-  privacy, failures, resources, overhead and kernel compatibility.
+- **D3 — source implemented:** public provider lifecycle/init/query observation,
+  verified backing custody and candidate retirement. Warm/built-in activation,
+  query races and unknown advertisements remain explicit limits.
+- **D4 — source implemented; final qualification pending:** learned physical
+  callback counting, ordinary PID/run report/check, functional doctor and fixed
+  installed companions. Candidate attribution stays Unknown, reports PARTIAL,
+  and algorithm policy inconclusive. The independent callback fixture is a
+  stimulus oracle, not installed observation acceptance.
 
 All stages are required for v0.3.0. Source implementation and local fixtures
-do not establish platform/provider or release qualification. Discovery metadata
-alone produces neither an executed CBOM nor a policy verdict.
+do not establish platform/provider or release qualification. Discovery metadata alone produces neither an executed CBOM nor a policy verdict.
+The final unchanged installed CLI/companion pair still needs the finite
+fixture/stock-build, lifecycle, namespace, resource, privacy, overhead and
+two-kernel checks described in [candidate notes](docs/release-v0.3.0.md).
+No release is authorized by source completion alone.
 
 ## v0.2.0: a usable foreground preview
 
@@ -73,7 +78,7 @@ incrementally. Additional capabilities remain later work:
 - Stronger completeness/first-call guarantees and broader performance,
   platform/provider and consumer qualification.
 
-These later tracks do not replace the remaining D3–D4 delivery gates.
+These later tracks do not replace the remaining installed/runtime delivery gates.
 ARM64 and OpenSSL before 3.0 remain later evaluation. Platform and performance
 claims will follow actual results, with their limits documented.
 

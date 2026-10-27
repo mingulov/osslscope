@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Usage
 
-Discovery is the starting point for the v0.3.0 development tree. v0.3.0 is not
-released. Watch/scopes/namespaces are implemented and checked as D2 workflows.
-Provider events/interfaces (D3) and learned-site execution plus
-installed qualification (D4) remain mandatory delivery stages.
+The v0.3.0 source candidate starts with passive discovery, optionally observes
+public provider interfaces, and counts learned physical callback entries for
+one selected process. It is not released; installed/platform qualification
+remains required. See [candidate notes](release-v0.3.0.md).
 
 ## Passive discovery
 
@@ -296,126 +296,157 @@ workloads keep running. The library `watch::run` uses a caller-supplied
 and stops acquisition. An output end record is attempted once, but a failed
 sink may prevent delivery, including delivery of the end record itself.
 
-## Legacy foreground diagnostic
-
-The v0.2.0 foreground route supports one exact enrolled x86-64 library/kernel
-profile, one owned foreground process and its threads. Native qualification is
-described in the [release notes](release-v0.2.0.md). Start with [build](build.md),
-[install](install.md) and the [catalogue](../profiles/README.md).
-
-## Commands
+## Provider observation
 
 ```sh
-osslscope doctor --libcrypto LIB [--count-object COUNT] [--format human|json]
-osslscope report --libcrypto LIB [capture/output options] run -- COMMAND
-osslscope check --libcrypto LIB [capture/output options] [rules] run -- COMMAND
+osslscope scan --pid 1234 --observe-providers --json
+osslscope scan --pid 1234 --observe-providers --watch --duration 30 --json
+osslscope inspect --pid 1234 --observe-providers --json
 ```
 
-`--libcrypto` selects the actual root-owned, protected library file. Its bytes,
-GNU build identity and executable callback offsets must match the built-in
-catalogue. The exact kernel build and initial PID namespace must also match.
-No caller catalogue, guessed offset or unsupported-profile fallback is accepted.
+This opt-in observes public provider lifecycle/query interfaces using the fixed
+observation companion. It does not count callback execution. Public interfaces
+are incomplete advertisements; warm and built-in activation may stay unknown.
+Unsupported observations retain passive inventory and explicit gaps. Supplied
+module inspection remains passive and rejects provider observation.
 
-`--count-object` selects operator-trusted locally built BPF bytes. A user-owned
-prefix requires this explicit path. Omission searches trusted system Count
-locations and applies the existing install-receipt checks. Only Count is
-resolved/loaded: harvest, members and identity bundles are not part of this route.
-Role/ABI/hash checks establish compatibility and identity, not authentication
-or a reader-free guarantee for an arbitrary supplied object.
+## Execution report and check
 
-Doctor opens no live target and loads no BPF. It checks the exact profile,
-namespaces, Count compatibility and effective capability bits, and labels
-runtime permissions as unprobed. Report/check perform actual load and attach
-checks while their owned child is still stopped.
+```sh
+osslscope doctor --format json
+osslscope report --pid 1234 --duration 30 --format json --out report.json --cbom bom.json
+osslscope check --pid 1234 --duration 30 --require-executed SHA256
+osslscope report --duration 5 --format json run -- openssl dgst -sha256 /dev/null
+osslscope check --duration 5 --require-executed SHA256 run -- openssl dgst -sha256 /dev/null
+```
 
-## Capture and output options
+Report/check require exactly one positive host-visible `--pid` or `run -- COMMAND`.
+They select the fixed installed observation/focused-count companions automatically;
+no `--libcrypto`, profile or manual callback offsets are required. There is no
+hidden fallback to historical diagnostics. See [install](install.md) for trust
+requirements. Explicit `--observation-object` and `--count-object` overrides are
+operator-trusted BPF code, subject to object/privilege checks; compatibility and
+hashes do not authenticate arbitrary BPF or establish its privacy.
+
+A document covers one process incarnation and its threads. Cgroup/container
+inventory chooses a PID, not an implicit tracing group. Forks, children, process
+replacement and later numeric PID reuse do not acquire execution coverage.
+The observer requires matching PID namespace coordinates and refuses mismatch
+or unavailable namespace identity. It does not enter target namespaces.
+
+Doctor checks scanner-owned inventory, namespace and companion integrity,
+functional program/map loading and self-attachment. Its JSON distinguishes
+available, denied, unavailable and not-checked capabilities; an available
+self-control does not establish target-specific access or observation success.
+`doctor --discovery --json` retains the discovery-only capability route.
 
 | Option | Meaning |
 | --- | --- |
-| `--duration S` | Requested observation duration: `(0,3600]` seconds, default 30. |
-| `--timeout S` | Stopped-target/count setup budget: `[0,120]` seconds, default 60. Zero expires before acquisition. |
-| `--grace S` | Count close/read budget: `[0,30]` seconds, default 5. Incomplete cleanup remains explicit. |
-| `--format human\|json` | Primary output, default human. |
-| `--out FILE` | Write the primary artifact to a file; default stdout. |
-| `--cbom FILE` | Also write a definite-only CycloneDX crypto-BOM from the same document. |
-| `--workload-out FILE` | Redirect the workload's stdout/stderr to a fresh file. |
-| `--workload-out-fd N` | Redirect workload output to a caller-owned open fd; mutually exclusive with the file option. |
+| `--duration S` | Observation window `(0,3600]` seconds, default 30. |
+| `--timeout S` | Setup budget `(0,120]` seconds, default 60. |
+| `--grace S` | Cleanup budget `(0,30]` seconds, default 5. |
+| `--format human\|json` | Primary output, default human. Report/check use `--format`, not `--json`. |
+| `--out FILE` | Primary artifact; default stdout. |
+| `--cbom FILE` | Definite-only CycloneDX export from the same document. |
+| `--workload-out FILE` | Owned-run stdout/stderr to a fresh file. |
+| `--workload-out-fd N` | Owned-run output to a caller-owned fd; excludes `--workload-out`. |
 
-Nonfinite, negative, out-of-range and positive-rounded-to-zero durations are
-usage errors before acquisition. Workload stdout/stderr go to `/dev/null` by
-default; observer stdout is an artifact channel. Prefer an independent fd for
-workload output. Selecting fd 1 or 2 intentionally shares an observer channel
-and can mix workload bytes with JSON or diagnostics. A nonzero workload exit
-prints a rerun hint rather than workload bytes.
+Nonfinite, nonpositive, out-of-range and positive-rounded-to-zero timing values
+are refused before acquisition. Workload redirection requires `run --`; its
+default is `/dev/null`. Fd 1 or 2 intentionally shares an observer channel and
+can mix workload bytes with artifacts/diagnostics. The observer does not include
+argv, target environment, raw provider/algorithm spellings, paths, addresses,
+keys or application payload in its output. Workload output is separately
+operator-selected data. Choose distinct primary/CBOM destinations; aliasing
+refuses CBOM delivery and preserves the primary artifact.
 
-The observer uses a safe `owned-process` label, not argv or comm. Reports retain
-exact object fingerprints, callback candidates, conserved entry counts, window
-bounds and typed gaps. `count_object` records the selected Count digest/length
-and trust selection. Provider labels describe compiled candidates, not runtime
-provider activation. All formats carry the profile's unknown-denominator gap.
+### Physical counts, policy and limits
 
-Choose distinct primary and CBOM destinations. If both resolve to the same
-file or stdout, CBOM delivery fails and the primary artifact is preserved.
-This includes relative/absolute path aliases, hard links and symlinks.
+Advertisement alone produces no callback count. Learned sites require verified
+mapped backing, current incarnation/namespace and candidate revalidation.
+Repeated advertisements share a physical attachment. Unquery, volatile query,
+module/process change or invalidated custody retires old sites; calls before
+later reattachment remain uncovered. The stderr readiness line proves verified
+attachment at that point, not semantic attribution or complete coverage.
 
-## Algorithm rules and policy files
+Physical counts are conserved across current/fenced rows; a shared implementation
+contributes N entries once rather than N per candidate. Candidate coverage and
+expected scope remain Unknown. Even a recognized advertised SHA256 spelling
+does not establish a definite SHA256/provider count. Callback entry does not
+prove crypto success, FIPS state, key size, message processing or application
+success. Unknown candidates create no definite CBOM asset, and absence never
+proves non-use. Production first-call and final-tail coverage remain unknown.
 
-At least one active rule is required by `check`:
+<a id="reusable-policy-files"></a>
 
-```sh
-osslscope check --libcrypto LIB --count-object COUNT \
-  --require-executed SHA256 run -- COMMAND
-osslscope check --libcrypto LIB --count-object COUNT \
-  --deny-algorithm AES-256-GCM run -- COMMAND
-```
-
-Names must exist in the frozen registry. Known but unobserved algorithms remain
-inconclusive; a typo is a usage error. The same rules may come from a bounded
-version-1 TOML file:
+`check` requires an algorithm rule such as `--require-executed SHA256` or
+`--deny-algorithm AES-256-GCM`, or a bounded policy file:
 
 ```toml
 version = 1
 require-executed = ["SHA256"]
 ```
 
-Pass it with `--policy FILE`. Command-line rules are additive. Contradictory
-requirements/denials refuse; provider, ENGINE and weak predicates in either
-source refuse rather than being silently dropped.
+Use `--policy FILE`; CLI constraints are additive. Names must exist in the
+frozen registry. Contradictions and provider/ENGINE/weak predicates refuse.
+Unknown-only normal evidence leaves algorithm rules inconclusive, including
+when the physical fixture count is positive.
 
-## Coverage and custody
+Execution observation admits one process, 256 objects, 512 observer links,
+4096 pending calls, depth 8, 4096 learned candidates and 16384 facts, with a
+1 MiB ring, 64 MiB cumulative host-state charges and 256 MiB cumulative ELF
+read work. Counting adds at most 512 active links, 4096 lifetime cookies,
+8192 map keys, 256 possible CPUs and 32 MiB host-state charges; the combined
+link bound is 1024. Charges precede allocation/attachment; cookie meanings are
+never recycled. Fixed maps bound kernel storage separately; host-state charges
+are not a total kernel memory claim. Resource/deadline failures remain gaps.
 
-Normal results are **PARTIAL**, including a successful positive requirement.
-The catalogue has no known global denominator. A shared site contributes N
-calls once; it cannot establish N calls for every possible algorithm. NEWCTX
-entries describe context creation attempts. GCM UPDATE can include AAD, empty
-input or failure. Counts establish neither message processing nor crypto success.
+The controller polls/drains every 100 ms and rescans every second, with a
+25 ms finite observation-drain deadline per iteration. These are cooperative
+budgets, not guarantees against a stalled syscall or delayed work. Startup,
+warm/built-in activation, query races, sampling and cleanup gaps are explicit.
+There is no universal first-call or terminal-count guarantee. Normal capture
+is PARTIAL. No v0.3 scan/watch overhead measurement is claimed yet; the
+[historical matrix](overhead-matrix.md) measures an earlier route only.
 
-Probes are installed before child release using the original nonzero group
-identity. No numeric reattachment or per-image following occurs. Exit is
-observed without reaping, then the count terminal is selected before final
-reap/detach. Pending cleanup and unknown writer tails remain visible. Coverage
-can be lost at leader retirement/nonleader exec; aggregate identity does not
-promise seamless exec coverage.
+Timeout/cancellation closes observer resources. An independently running target
+and a released owned workload are left running when observation ends; signal
+the observer PID rather than a process group containing the workload. Setup
+failure resolves stopped owned children. Observer crash/SIGKILL before child
+release can strand a stopped child and requires external cleanup.
 
-A released live child is left running when observation ends. Normal setup
-failure/SIGINT/SIGTERM resolves stopped children and count resources. A crash or
-SIGKILL in the stopped pre-exec interval can strand the child; external cleanup
-is then required. There is no crash-safe startup custodian in this preview.
-
-## Legacy foreground exit codes
+### Execution exit codes
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Help/offline success or doctor preflight without a hard failure; ordinary preview captures remain partial. |
-| 1 | Failed child, failed artifact delivery or a usable post-observation runtime failure. |
-| 2 | Invalid or deferred CLI/policy input, before acquisition. |
-| 3 | PARTIAL observation, including satisfied positive rules. |
-| 4 | Profile, namespace, Count ABI or setup/environment refusal without usable observation. |
-| 10 | A definite policy violation; dominates child, artifact and usable runtime failure. |
-| 11 | Policy inconclusive, including known algorithms unobserved under incomplete coverage. |
+| 0 | Help or successful doctor controls; no complete execution claim. |
+| 1 | Child failure, artifact delivery failure or usable runtime failure. |
+| 2 | Invalid arguments/policy or invalid explicit companion. |
+| 3 | PARTIAL report. |
+| 4 | Setup/environment refusal without usable observation; doctor unavailable/denied capability. |
+| 10 | Definite policy violation, taking precedence over other usable-result failures. |
+| 11 | Policy inconclusive; normal Unknown-only candidate evidence cannot satisfy definite algorithm rules. |
 
-For `report`/`check`, foreign `--pid`, `--provider`, `--builtin`, `--object`,
-`--members-object`, `--dev-bundle`, table/offset overrides, `--settle`,
-`--image-digest`, provider/ENGINE/weak rules, services and following are deferred.
-Offline `alias-audit` remains available for an existing harvest document; it
-performs no live acquisition. Its input does not become new runtime evidence.
+Artifact/runtime/child failure takes precedence over partial or inconclusive
+status, while a definite violation retains exit 10. Retain artifacts and gaps
+when interpreting failure; successful stimulus alone proves no observation.
+
+## Legacy foreground diagnostic
+
+Explicit `--libcrypto PATH` selects the v0.2 fixed-profile route:
+
+```sh
+osslscope doctor --libcrypto LIB --count-object COUNT --format json
+osslscope report --libcrypto LIB --count-object COUNT --duration 5 run -- COMMAND
+osslscope check --libcrypto LIB --count-object COUNT --require-executed SHA256 run -- COMMAND
+```
+
+It requires the exact enrolled x86-64 library/kernel identity and protected
+backing, accepts only one owned run and loads legacy Count alone. `--libcrypto`
+conflicts with `--pid` and `--observation-object`. It is not an automatic
+fallback. Legacy timeout/grace permit zero for immediate expiry. Its definite
+catalogue entries, partial positive-policy behavior and qualification are
+historical; see [v0.2 notes](release-v0.2.0.md), [catalogue](../profiles/README.md)
+and [historical overhead](overhead-matrix.md). Offline `alias-audit` remains
+available; its input does not become new runtime evidence. Manual offsets,
+reader/member objects, services and following are outside the normal workflow.

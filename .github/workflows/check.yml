@@ -54,8 +54,8 @@ jobs:
           toolchain: nightly-2026-05-20
           components: rust-src
       - run: cargo install bpf-linker --locked --version 0.10.4
-      - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members
-      - run: file crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count crates/ebpf/target/bpfel-unknown-none/release/osslscope-members
+      - run: cd crates/ebpf && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-provider-observation --bin osslscope-focused-count
+      - run: file crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest crates/ebpf/target/bpfel-unknown-none/release/osslscope-count crates/ebpf/target/bpfel-unknown-none/release/osslscope-members crates/ebpf/target/bpfel-unknown-none/release/osslscope-provider-observation crates/ebpf/target/bpfel-unknown-none/release/osslscope-focused-count
       - run: ./scripts/tests/test-ebpf-build-warnings.sh
       # Members-shape gate (G04): the pure shape suite runs in required
       # mode against this job's freshly built members object — a missing
@@ -63,6 +63,9 @@ jobs:
       # still not verifier or live qualification.
       - uses: dtolnay/rust-toolchain@1.88.0
       - run: OSSL_MEMBERS_REQUIRED=1 OSSL_MEMBERS_OBJECT=crates/ebpf/target/bpfel-unknown-none/release/osslscope-members cargo +1.88.0 test --locked --test members_shape -- --nocapture
+      # Required fresh-object preparation only; no BPF loading or live verdict.
+      - run: OSSL_PROVIDER_OBSERVATION_TEST_BPF=crates/ebpf/target/bpfel-unknown-none/release/osslscope-provider-observation cargo +1.88.0 test --locked --lib provider_observation::session::tests::real_bpf_object_prepares_when_built -- --ignored --exact --nocapture
+      - run: OSSLSCOPE_FOCUSED_COUNT_OBJECT=crates/ebpf/target/bpfel-unknown-none/release/osslscope-focused-count cargo +1.88.0 test --locked --test focused_count actual_ -- --ignored --nocapture
   packaging:
     # Host-runnable lifecycle/install simulation: deb/rpm scriptlet argument
     # matrix (stub setcap, no root) + local-prefix install layout and

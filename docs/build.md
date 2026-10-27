@@ -1,24 +1,22 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
-The current target is the source-built v0.2.0 foreground preview. Native
-qualification covers the [exact enrolled profile](release-v0.2.0.md); compile
-success alone grants no support for other profiles. The existing recipe still
-builds three development BPF objects; supported
-commands resolve/load only Count. No hermetic builder, v2 bundle, DEB/RPM or
-broader matrix is required for this milestone. See [usage](usage.md) and the
-[exact catalogue](../profiles/README.md).
+Build the v0.3.0 source candidate for Linux x86-64 using pinned host/BPF
+toolchains and locked dependencies. It is not released. Compilation and pure
+object preparation are separate from installed verifier/runtime qualification;
+see [candidate gates](release-v0.3.0.md). The historical exact-profile diagnostic
+is selected only with `--libcrypto`.
 
-The host/common, BPF programs, and independent BPF contract have distinct
-terms and dependencies; see [component licensing](licensing.md).
+The host/common, BPF programs and independent BPF contract have distinct terms
+and dependencies; see [component licensing](licensing.md).
 
-One reproducible entrypoint builds the host binary and three BPF
-objects (harvest, count, members) with pinned toolchains and locked
-dependencies:
+The existing entrypoint builds the host CLI plus five BPF objects: harvest,
+legacy count, members, provider-observation and focused-count. Normal tracing
+uses the last two automatically; passive scan/inspect needs only the host CLI.
 
 ```sh
-./scripts/build-dev.sh --check-only   # prerequisites only; exit 0 here means ready
-./scripts/build-dev.sh                # host + BPF; writes target/dev-build-manifest.json
+./scripts/build-dev.sh --check-only
+./scripts/build-dev.sh
 ```
 
 The script never installs packages or moves toolchains. A missing
@@ -49,7 +47,7 @@ target directories, and the job/network/mode selection.
 
 ```sh
 ./scripts/build-dev.sh --host-only    # host workspace only
-./scripts/build-dev.sh --bpf-only     # harvest/count/members BPF objects only
+./scripts/build-dev.sh --bpf-only     # all five BPF objects only
 ./scripts/build-dev.sh --release      # host in release mode (BPF is always release)
 ./scripts/build-dev.sh --offline      # refuse any network; fail if the cache is incomplete
 ```
@@ -64,10 +62,12 @@ A source archive plus the prerequisites above must build without git
 (the manifest then records a null product revision):
 
 ```sh
-git archive HEAD -o osslscope-src.tar
-rm -rf /tmp/ossl-build && mkdir /tmp/ossl-build
-tar -x -f osslscope-src.tar -C /tmp/ossl-build
-cd /tmp/ossl-build && ./scripts/build-dev.sh
+ossl_archive_dir=$(mktemp -d)
+git archive HEAD -o "$ossl_archive_dir/osslscope-src.tar"
+mkdir "$ossl_archive_dir/source"
+tar -x -f "$ossl_archive_dir/osslscope-src.tar" -C "$ossl_archive_dir/source"
+cd "$ossl_archive_dir/source"
+./scripts/build-dev.sh
 ```
 
 ## Lockfiles
@@ -91,6 +91,8 @@ the cargo log path, and the `install_layout` mapping that
 - `osslscope-harvest` → `lib/osslscope/osslscope-harvest`
 - `osslscope-count` → `lib/osslscope/osslscope-count`
 - `osslscope-members` → `lib/osslscope/osslscope-members`
+- `osslscope-provider-observation` → `lib/osslscope/osslscope-provider-observation`
+- `osslscope-focused-count` → `lib/osslscope/osslscope-focused-count`
 
 The objects land at:
 
@@ -99,6 +101,8 @@ The objects land at:
 - `crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest`
 - `crates/ebpf/target/bpfel-unknown-none/release/osslscope-count`
 - `crates/ebpf/target/bpfel-unknown-none/release/osslscope-members`
+- `crates/ebpf/target/bpfel-unknown-none/release/osslscope-provider-observation`
+- `crates/ebpf/target/bpfel-unknown-none/release/osslscope-focused-count`
 
 Confirm their identity with:
 
@@ -106,14 +110,16 @@ Confirm their identity with:
 file target/debug/osslscope \
   crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest \
   crates/ebpf/target/bpfel-unknown-none/release/osslscope-count \
-  crates/ebpf/target/bpfel-unknown-none/release/osslscope-members
+  crates/ebpf/target/bpfel-unknown-none/release/osslscope-members \
+  crates/ebpf/target/bpfel-unknown-none/release/osslscope-provider-observation \
+  crates/ebpf/target/bpfel-unknown-none/release/osslscope-focused-count
 ```
 
-expecting an x86-64 ELF executable plus three eBPF relocatables.
-The installer consumes all three roles from a normal manifest.
-For a user prefix, pass its Count file explicitly along with `--libcrypto`.
-The preview needs no harvest/members runtime selection; explicit role overrides
-are operator-trusted code, not matched-package or reader-free qualification.
+Expect an x86-64 ELF executable and five eBPF relocatables. The installer
+consumes all five roles from a normal manifest. Normal report/check resolves the
+observation/focused-count pair from the installed executable layout; privileged
+invocation requires root-owned protected files and ancestors. See [install](install.md).
+Legacy harvest/count/members do not replace the normal companion pair.
 
 ## Known linker warning
 
@@ -132,7 +138,7 @@ Install the built tree into a local prefix with
 
 The retained host suites use owned temporary directories, serial tests and the
 actual Cargo-built lifecycle host driver. These are existing test inputs, not
-runtime dependencies of the count-only app. The three deferred embedded-host
+runtime dependencies of the CLI. The three deferred embedded-host
 recompilation fixtures are opt-in:
 
 ```sh
@@ -159,5 +165,7 @@ cargo +1.88.0 clippy --workspace --locked -- -D warnings
 Rebuild the driver after source changes. The enrolled-host metadata admission
 control is separately opt-in; it reads metadata/namespaces and loads no BPF:
 `cargo +1.88.0 test --locked --lib profile::tests::enrolled_host_metadata_admission -- --ignored`.
-Live capture checks require an authorized matching host. Hosted CI on other
-kernels does not establish the preview's runtime qualification.
+Live capture checks require an authorized supported host. CI builds all five
+objects and explicitly selects the pure fresh-object preparation controls for
+provider-observation and focused-count; those controls never load BPF. Neither
+host tests nor object-shape success establish runtime/platform qualification.

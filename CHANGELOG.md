@@ -1,6 +1,26 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## 0.3.0 source candidate (unreleased)
+
+- Automatic ELF/process discovery, sampled watch and intersecting PID/cgroup/
+  supplied-module inventory scopes without enrolled profiles or manual offsets.
+- Public provider lifecycle/query observation and bounded physical callback
+  counting for one selected process incarnation or owned run. Retained fixed
+  observation/focused-count companions install and resolve automatically.
+- Ordinary report/check use learned candidates with Unknown coverage, PARTIAL
+  reports, inconclusive algorithm policy and no definite assets from Unknown
+  attribution. Shared-site counts remain conserved; first-call/final-tail,
+  warm/built-in and invalidation gaps stay explicit.
+- Functional scanner-owned doctor controls, namespace refusal, independent
+  callback-counter fixture and CI compilation/fresh-object preparation coverage.
+  Fixture/host/object checks do not establish installed runtime qualification.
+- Root package version 0.3.0; helper-crate versions unchanged. Explicit
+  `--libcrypto` retains historical fixed-profile diagnostics. Final installed,
+  stock-build, two-kernel, privacy/resource and overhead qualification remains
+  pending; no unrun platform or performance claim. See
+  [candidate notes](docs/release-v0.3.0.md).
+
 ## 0.2.0 source preview
 
 - Count-only foreground `doctor` / `report` / `check` workflow for one owned

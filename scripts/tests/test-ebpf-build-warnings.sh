@@ -9,7 +9,7 @@ set -eu
 REPO=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
 LOG=$(mktemp)
 trap 'rm -f "$LOG"' EXIT INT TERM
-if ! (cd "$REPO/crates/ebpf" && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members >"$LOG" 2>&1); then
+if ! (cd "$REPO/crates/ebpf" && cargo +nightly-2026-05-20 build --locked -Z build-std=core --target bpfel-unknown-none --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-provider-observation --bin osslscope-focused-count >"$LOG" 2>&1); then
     echo "ebpf build failed:"; cat "$LOG"; exit 1
 fi
 if grep -E '^warning: (comparison is useless|unused)' "$LOG"; then
