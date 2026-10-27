@@ -45,6 +45,7 @@ pub struct VerifiedSiteCandidate {
     advertisers: Vec<ObjectHash>,
     operation: Operation,
     algorithm: AlgorithmId,
+    alias_quality: AliasQuality,
     function: FunctionIdentity,
 }
 impl VerifiedSiteCandidate {
@@ -68,6 +69,9 @@ impl VerifiedSiteCandidate {
     }
     pub fn algorithm(&self) -> AlgorithmId {
         self.algorithm
+    }
+    pub fn alias_quality(&self) -> AliasQuality {
+        self.alias_quality
     }
     pub fn function(&self) -> FunctionIdentity {
         self.function
@@ -405,10 +409,6 @@ impl ProviderSession {
             if self.targets.contains_key(&record.pid) {
                 continue;
             }
-            if self.targets.len() >= self.budget.limits.max_processes {
-                b.gap(ObservationGap::ProcessLimit);
-                break;
-            }
             match self.add_target(record, &mut b) {
                 Ok(()) => {}
                 Err(g) => b.gap(g),
@@ -422,7 +422,9 @@ impl ProviderSession {
         record: &inventory::ProcessRecord,
         b: &mut ObservationBatch,
     ) -> Result<(), ObservationGap> {
-        let process = acquire(record, &mut self.budget)?;
+        let Some(process) = acquire_observable(record, &mut self.budget)? else {
+            return Ok(());
+        };
         let ranges = order_ranges(process.executable_ranges()?)?;
         let generation = self.next_generation;
         self.next_generation = self
@@ -612,49 +614,8 @@ impl ProviderSession {
         let hash = attachment.site.object_hash().clone();
         let advertisers = attachment.advertisers.clone();
         let starttime = target.starttime;
-        let mut payload = match event {
-            wire::Transport::Alias(r) => {
-                if let Err(g) = self.aliases.alias(&r) {
-                    invalidate_algorithms(b);
-                    b.gap(g);
-                }
-                return;
-            }
-            wire::Transport::End(r) => {
-                let algorithm = match self.aliases.end(&r) {
-                    Ok((algorithm, status, _weak)) => {
-                        match status {
-                            2 | 3 => b.gap(ObservationGap::DispatchPartial),
-                            4 => b.gap(ObservationGap::TargetReadFailed),
-                            _ => (),
-                        }
-                        algorithm
-                    }
-                    Err(g) => {
-                        invalidate_algorithms(b);
-                        b.gap(g);
-                        super::assembly::other()
-                    }
-                };
-                wire::algorithm_event(r, algorithm).into_payload()
-            }
-            wire::Transport::Event(event) => {
-                if r.kind == c::QUERY {
-                    if let Err(g) = self.aliases.begin(&r, &self.budget) {
-                        b.gap(g);
-                    }
-                } else if r.kind == c::INVALIDATION {
-                    self.aliases.retire(r.pid);
-                }
-                let mut payload = event.into_payload();
-                if let ObservationPayload::Implementation { algorithm, .. } = &mut payload {
-                    *algorithm = self.aliases.implementation(&r).unwrap_or_else(|g| {
-                        b.gap(g);
-                        super::assembly::other()
-                    });
-                }
-                payload
-            }
+        let Some(mut payload) = assemble_payload(event, &mut self.aliases, &self.budget, b) else {
+            return;
         };
         if r.code != 0 {
             let site = match target
@@ -693,6 +654,7 @@ impl ProviderSession {
             }
             if let ObservationPayload::Implementation {
                 algorithm,
+                alias_quality,
                 function,
                 advertiser_candidates,
                 backing_sha256,
@@ -720,6 +682,7 @@ impl ProviderSession {
                             advertisers,
                             operation: Operation::from_id(r.operation).unwrap_or(Operation::Other),
                             algorithm: *algorithm,
+                            alias_quality: *alias_quality,
                             function: *function,
                         });
                         self.learned.insert(physical);
@@ -888,18 +851,105 @@ impl Drop for ProviderSession {
         }
     }
 }
+fn acquire_observable(
+    record: &inventory::ProcessRecord,
+    budget: &mut ObservationBudget,
+) -> Result<Option<VerifiedProcess>, ObservationGap> {
+    // Inventory has already classified dynamic code exports. Names, build IDs,
+    // dependencies and non-observable exports cannot authorize acquisition.
+    // A later snapshot is evaluated afresh, so late module arrival can retry.
+    if !record.modules.iter().any(|module| {
+        module
+            .info
+            .exports
+            .iter()
+            .any(|api| ObservationApi::Inventoried(*api).export_name().is_some())
+    }) {
+        return Ok(None);
+    }
+    acquire(record, budget).map(Some)
+}
+
+pub(crate) fn assemble_payload(
+    event: wire::Transport,
+    aliases: &mut super::assembly::Sequences,
+    budget: &ObservationBudget,
+    b: &mut ObservationBatch,
+) -> Option<ObservationPayload> {
+    let r = event.record();
+    Some(match event {
+        wire::Transport::Alias(r) => {
+            if let Err(g) = aliases.alias(&r) {
+                invalidate_algorithms(b);
+                b.gap(g);
+            }
+            return None;
+        }
+        wire::Transport::End(r) => {
+            let (algorithm, alias_quality) = match aliases.end(&r) {
+                Ok((algorithm, status, weak)) => {
+                    match status {
+                        2 | 3 => b.gap(ObservationGap::DispatchPartial),
+                        4 => b.gap(ObservationGap::TargetReadFailed),
+                        _ => (),
+                    }
+                    (algorithm, AliasQuality::from_fold(status, weak))
+                }
+                Err(g) => {
+                    invalidate_algorithms(b);
+                    b.gap(g);
+                    (super::assembly::other(), AliasQuality::default())
+                }
+            };
+            wire::algorithm_event(r, algorithm, alias_quality).into_payload()
+        }
+        wire::Transport::Event(event) => {
+            if r.kind == c::QUERY {
+                if let Err(g) = aliases.begin(&r, budget) {
+                    b.gap(g);
+                }
+            } else if r.kind == c::INVALIDATION {
+                aliases.retire(r.pid);
+            }
+            let mut payload = event.into_payload();
+            if let ObservationPayload::Implementation {
+                algorithm,
+                alias_quality,
+                ..
+            } = &mut payload
+            {
+                (*algorithm, *alias_quality) = aliases.implementation(&r).unwrap_or_else(|g| {
+                    b.gap(g);
+                    (super::assembly::other(), AliasQuality::default())
+                });
+            }
+            payload
+        }
+    })
+}
+
 fn invalidate_algorithms(batch: &mut ObservationBatch) {
     for fact in &mut batch.facts {
         match &mut fact.payload {
-            ObservationPayload::Algorithm { algorithm, .. }
-            | ObservationPayload::Implementation { algorithm, .. } => {
-                *algorithm = super::assembly::other()
+            ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            }
+            | ObservationPayload::Implementation {
+                algorithm,
+                alias_quality,
+                ..
+            } => {
+                *algorithm = super::assembly::other();
+                alias_quality.status = AliasStatus::Unavailable
             }
             _ => (),
         }
     }
     for site in &mut batch.learned_sites {
         site.algorithm = super::assembly::other();
+        site.alias_quality.status = AliasStatus::Unavailable;
     }
 }
 fn order_ranges(mut ranges: Vec<(u64, u64)>) -> Result<Vec<(u64, u64)>, ObservationGap> {
@@ -1040,16 +1090,79 @@ fn object_id(site: &VerifiedSite) -> u64 {
 mod tests {
     use super::*;
     #[test]
+    fn no_source_snapshots_preserve_admission_for_late_source() {
+        let mut record: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 1},
+            "namespaces": {"pid": null, "mount": null}, "pid": 0, "starttime": 0,
+            "modules": [], "provider_activation": "unknown", "provider_interfaces": "unknown",
+            "execution": "not_observed"
+        }))
+        .unwrap();
+        let mut budget = ObservationBudget::new(ObservationLimits {
+            max_processes: 1,
+            ..Default::default()
+        });
+        for pid in 0..80 {
+            record.pid = pid;
+            for _ in 0..30 {
+                assert!(matches!(acquire_observable(&record, &mut budget), Ok(None)));
+            }
+        }
+        record.pid = 0; // Observable exports now authorize exactly one attempted acquisition.
+        record.modules = vec![inventory::ModuleRecord {
+            info: inventory::ModuleInfo {
+                sha256: "a".repeat(64),
+                device: 0,
+                inode: 0,
+                size_bytes: 0,
+                architecture: inventory::Architecture::X86_64,
+                kind: inventory::ObjectKind::Other,
+                exports: vec![
+                    inventory::Api::OpenSslInitCrypto,
+                    inventory::Api::OpenSslVersionMajor,
+                ],
+                depends_on_libcrypto: true,
+                depends_on_libssl: false,
+            },
+            identity_status: inventory::IdentityStatus::Verified,
+        }];
+        assert!(matches!(acquire_observable(&record, &mut budget), Ok(None)));
+        assert_eq!(budget.elf_read_bytes(), 0);
+        budget.state(budget.limits.max_state_bytes).unwrap();
+        // None of the no-source snapshots consumed state or process admission.
+        record.modules[0]
+            .info
+            .exports
+            .push(inventory::Api::OsslProviderLoad);
+        assert!(matches!(
+            acquire_observable(&record, &mut budget),
+            Err(ObservationGap::ProcessUnavailable)
+        ));
+        assert!(matches!(
+            acquire_observable(&record, &mut budget),
+            Err(ObservationGap::ProcessLimit)
+        ));
+    }
+
+    #[test]
     fn queue_loss_downgrades_already_drained_algorithm_facts() {
         let known = AlgorithmId::try_from(0).unwrap();
         let mut batch = ObservationBatch::default();
         for payload in [
             ObservationPayload::Algorithm {
                 algorithm: known,
+                alias_quality: AliasQuality {
+                    status: AliasStatus::Mixed,
+                    weak: true,
+                },
                 cacheability: Cacheability::Cacheable,
             },
             ObservationPayload::Implementation {
                 algorithm: known,
+                alias_quality: AliasQuality {
+                    status: AliasStatus::Mixed,
+                    weak: true,
+                },
                 function: FunctionIdentity::new(Operation::Other, 0).unwrap(),
                 cacheability: Cacheability::Cacheable,
                 advertiser_candidates: Vec::new(),
@@ -1073,12 +1186,22 @@ mod tests {
         }
         invalidate_algorithms(&mut batch);
         for fact in batch.facts {
-            let algorithm = match fact.payload {
-                ObservationPayload::Algorithm { algorithm, .. }
-                | ObservationPayload::Implementation { algorithm, .. } => algorithm,
+            let (algorithm, quality) = match fact.payload {
+                ObservationPayload::Algorithm {
+                    algorithm,
+                    alias_quality,
+                    ..
+                }
+                | ObservationPayload::Implementation {
+                    algorithm,
+                    alias_quality,
+                    ..
+                } => (algorithm, alias_quality),
                 _ => unreachable!(),
             };
             assert_eq!(algorithm, super::super::assembly::other());
+            assert_eq!(quality.status, AliasStatus::Unavailable);
+            assert!(quality.weak);
         }
     }
 
@@ -1361,12 +1484,11 @@ mod tests {
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
     #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF pointing to a rebuilt object; preparation only"]
     fn real_bpf_object_prepares_when_built() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("crates/ebpf/target/bpfel-unknown-none/release/osslscope-provider-observation");
-        let Ok(object) = std::fs::read(path) else {
-            return;
-        };
+        let path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")
+            .expect("required test-only object path OSSL_PROVIDER_OBSERVATION_TEST_BPF");
+        let object = std::fs::read(path).expect("required test-only object must be readable");
         let result = loader::prepare(
             &object,
             &specs(),

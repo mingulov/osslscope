@@ -265,10 +265,24 @@ impl Render for Record<'_> {
                 finite(&fact.context)?,
                 finite(&fact.confidence)?
             )?;
-            if let super::ObservationPayload::Algorithm { algorithm, .. }
-            | super::ObservationPayload::Implementation { algorithm, .. } = &fact.payload
+            if let super::ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            }
+            | super::ObservationPayload::Implementation {
+                algorithm,
+                alias_quality,
+                ..
+            } = &fact.payload
             {
-                write!(writer, " algorithm={}", algorithm.label())?;
+                write!(
+                    writer,
+                    " algorithm={} alias_status={} weak={}",
+                    algorithm.label(),
+                    finite(&alias_quality.status)?,
+                    alias_quality.weak
+                )?;
             }
             writeln!(writer, " payload={}", finite(&fact.payload)?)?;
         }
@@ -676,6 +690,135 @@ mod tests {
         assert_eq!(json["facts"][1]["class"], "cipher");
         assert_eq!(json["facts"][1]["monotonic_ns"], 10);
     }
+    #[test]
+    fn assembled_mixed_and_weak_aliases_reach_public_json_and_human() {
+        use super::super::{
+            assembly::Sequences,
+            session::{ObservationBatch, assemble_payload},
+            wire::{self, contract as c},
+            *,
+        };
+        for (labels, expected_status, expected_weak) in [
+            (vec!["AES-256-GCM", "MD5"], "mixed", true),
+            (vec!["MD5"], "complete", true),
+            (vec!["AES-256-GCM"], "complete", false),
+        ] {
+            let mut sequences = Sequences::default();
+            let budget = ObservationBudget::default();
+            let mut batch = ObservationBatch::default();
+            let q = c::Record {
+                version: c::VERSION,
+                size: 96,
+                kind: c::QUERY,
+                api: c::QUERY_CALLBACK,
+                pid: 1,
+                tid: 2,
+                cookie: 3,
+                generation: 4,
+                invocation: 5,
+                outcome: 1,
+                operation: 1,
+                cacheability: 1,
+                ..Default::default()
+            };
+            let mut assemble = |r: c::Record| {
+                let bytes =
+                    unsafe { std::slice::from_raw_parts((&r as *const c::Record).cast(), 96) };
+                assemble_payload(
+                    wire::decode_transport(bytes).unwrap(),
+                    &mut sequences,
+                    &budget,
+                    &mut batch,
+                )
+            };
+            assemble(q).unwrap();
+            for (index, label) in labels.iter().enumerate() {
+                let id = crate::kinds::ALG_NAMES
+                    .iter()
+                    .position(|entry| entry.name == *label)
+                    .unwrap();
+                assemble(c::Record {
+                    kind: c::ALIAS,
+                    algorithm: id as u32,
+                    function: crate::kinds::algorithm_semantic_id(label).unwrap() as u32,
+                    outcome: u32::from(crate::kinds::is_weak_alg(label)),
+                    status: index as u32,
+                    ..q
+                });
+            }
+            let algorithm = assemble(c::Record {
+                kind: c::ALIAS_END,
+                algorithm: c::OTHER,
+                outcome: 0,
+                function: labels.len() as u32,
+                ..q
+            })
+            .unwrap();
+            let implementation = assemble(c::Record {
+                kind: c::IMPLEMENTATION,
+                algorithm: c::OTHER,
+                outcome: 0,
+                function: 0,
+                ..q
+            })
+            .unwrap();
+            let facts: Vec<_> = [algorithm, implementation]
+                .into_iter()
+                .map(|payload| ObservationFact {
+                    pid: 1,
+                    starttime: 2,
+                    object_sha256: "a".repeat(64).try_into().unwrap(),
+                    generation: 4,
+                    context: ContextIdentity::Unknown {},
+                    source: ObservationSource::ProviderQuery,
+                    api: ObservationApi::ProviderQueryCallback,
+                    operation: Operation::Digest,
+                    class: AlgorithmClass::Digest,
+                    monotonic_ns: 0,
+                    confidence: ScopeConfidence::Observed,
+                    payload,
+                })
+                .collect();
+            let capabilities = Capabilities::new(true);
+            let record = Record {
+                schema_version: SCHEMA,
+                mode: "watch",
+                record: "observation",
+                sequence: 1,
+                interval: Interval {
+                    started_elapsed_ns: 0,
+                    finished_elapsed_ns: 1,
+                    drain_lag_ns: 0,
+                },
+                poll_interval: Duration::from_secs(1),
+                snapshot: None,
+                facts: &facts,
+                gaps: &[],
+                capabilities: &capabilities,
+                sampled_history: "incomplete",
+            };
+            let mut json = Vec::new();
+            emit(&record, &mut json, false).unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+            for fact in value["facts"].as_array().unwrap() {
+                assert_eq!(fact["payload"]["alias_quality"]["status"], expected_status);
+                assert_eq!(fact["payload"]["alias_quality"]["weak"], expected_weak);
+            }
+            let mut human = Vec::new();
+            emit(&record, &mut human, true).unwrap();
+            let human = String::from_utf8(human).unwrap();
+            assert_eq!(
+                human
+                    .matches(&format!(
+                        "alias_status=\"{expected_status}\" weak={expected_weak}"
+                    ))
+                    .count(),
+                2,
+                "{human}"
+            );
+        }
+    }
+
     #[test]
     fn human_facts_render_finite_algorithm_labels_and_safe_identity() {
         let fact: super::super::ObservationFact = serde_json::from_value(serde_json::json!({

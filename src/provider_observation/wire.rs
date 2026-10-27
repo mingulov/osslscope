@@ -173,6 +173,7 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
             let function = FunctionIdentity::new(op, r.function).map_err(|_| bad)?;
             ObservationPayload::Implementation {
                 algorithm: AlgorithmId::try_from(u16::MAX).unwrap(),
+                alias_quality: AliasQuality::default(),
                 function,
                 cacheability: cache(r.cacheability)?,
                 advertiser_candidates: Vec::new(),
@@ -257,12 +258,17 @@ pub(crate) fn decode_transport(bytes: &[u8]) -> Result<Transport, ObservationGap
         Ok(Transport::End(r))
     }
 }
-pub(crate) fn algorithm_event(mut record: c::Record, algorithm: AlgorithmId) -> ProviderEvent {
+pub(crate) fn algorithm_event(
+    mut record: c::Record,
+    algorithm: AlgorithmId,
+    alias_quality: AliasQuality,
+) -> ProviderEvent {
     record.kind = c::ALGORITHM;
     ProviderEvent {
         record,
         payload: ObservationPayload::Algorithm {
             algorithm,
+            alias_quality,
             cacheability: cache(record.cacheability).unwrap_or(Cacheability::Unknown),
         },
     }

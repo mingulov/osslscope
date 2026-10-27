@@ -357,6 +357,43 @@ impl AlgorithmId {
         crate::kinds::alg_class_label(self.0).unwrap_or("other")
     }
 }
+/// Quality of the finite alias fold. The algorithm is the minimum registered
+/// ID, not a unique semantic identity when status is mixed or incomplete.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AliasStatus {
+    Complete,
+    Unknown,
+    Truncated,
+    AliasLimit,
+    ReadFailed,
+    Mixed,
+    #[default]
+    Unavailable,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AliasQuality {
+    pub status: AliasStatus,
+    /// A weak alias (or conservative truncated-alias signal) was observed.
+    pub weak: bool,
+}
+impl AliasQuality {
+    pub(crate) fn from_fold(status: u8, weak: bool) -> Self {
+        Self {
+            status: match status {
+                0 => AliasStatus::Complete,
+                1 => AliasStatus::Unknown,
+                2 => AliasStatus::Truncated,
+                3 => AliasStatus::AliasLimit,
+                4 => AliasStatus::ReadFailed,
+                5 => AliasStatus::Mixed,
+                _ => AliasStatus::Unavailable,
+            },
+            weak,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "(Operation, u32)", into = "(Operation, u32)")]
 pub struct FunctionIdentity {
@@ -451,10 +488,14 @@ pub enum ObservationPayload {
     },
     Algorithm {
         algorithm: AlgorithmId,
+        #[serde(default)]
+        alias_quality: AliasQuality,
         cacheability: Cacheability,
     },
     Implementation {
         algorithm: AlgorithmId,
+        #[serde(default)]
+        alias_quality: AliasQuality,
         function: FunctionIdentity,
         cacheability: Cacheability,
         advertiser_candidates: Vec<ObjectHash>,

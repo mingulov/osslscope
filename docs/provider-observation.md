@@ -42,6 +42,21 @@ The end record includes elapsed time, status and duration/interruption reason.
 No CBOM assets or policy verdicts are produced. Human output carries safe
 identities, finite facts, capabilities and gaps in readable lines.
 
+Algorithm and implementation facts include `alias_quality.status` and
+`alias_quality.weak`. The algorithm ID is the minimum registered alias ID;
+`mixed` means the observed aliases span different semantic families, so that ID
+must not be read as a unique algorithm identity. `complete` means the finite
+alias fold completed, not that enumeration is complete. Other statuses are
+`unknown`, `truncated`, `alias_limit`, `read_failed` and `unavailable`. The weak
+flag preserves a recognized weak alias or the classifier's conservative signal
+when its alias limit is reached. It is not a policy verdict. Human output shows
+the same status and weak flag; raw target alias text is never output.
+
+Processes without an inventoried export that this producer can observe retain
+passive inventory without spending trace admission or acquisition budget. Each
+snapshot checks the current exports again, allowing a later module load to
+become eligible within the same observation window.
+
 The event loop drains cooperatively at a 100 ms cadence while it has control.
 Bounded synchronous snapshots and ELF reads can delay draining. Queue loss,
 overrun, lag, first-query uncertainty and unobserved intervals remain explicit;

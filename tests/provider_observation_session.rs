@@ -132,8 +132,8 @@ fn query_phase_complete(
         f.api == po::ObservationApi::ProviderQueryCallback && f.operation == po::Operation::Digest
     };
     if !batch.facts.iter().any(|f|callback(f) && matches!(f.payload,po::ObservationPayload::QueryResult{outcome:po::ApiOutcome::Success,cacheability} if cacheability==cache)){return Err("callback_query_missing")}
-    if !batch.facts.iter().any(|f|callback(f) && matches!(f.payload,po::ObservationPayload::Algorithm{algorithm,cacheability} if cacheability==cache && (algorithm.label()=="other")==other)){return Err("callback_algorithm_missing")}
-    let implementation=batch.facts.iter().find(|f|callback(f) && matches!(&f.payload,po::ObservationPayload::Implementation{algorithm,function,cacheability,advertiser_candidates,backing_sha256} if *cacheability==cache && (algorithm.label()=="other")==other && function.id()!=0 && !advertiser_candidates.is_empty() && backing_sha256.is_some()!=volatile));
+    if !batch.facts.iter().any(|f|callback(f) && matches!(f.payload,po::ObservationPayload::Algorithm{algorithm,cacheability,..} if cacheability==cache && (algorithm.label()=="other")==other)){return Err("callback_algorithm_missing")}
+    let implementation=batch.facts.iter().find(|f|callback(f) && matches!(&f.payload,po::ObservationPayload::Implementation{algorithm,function,cacheability,advertiser_candidates,backing_sha256,..} if *cacheability==cache && (algorithm.label()=="other")==other && function.id()!=0 && !advertiser_candidates.is_empty() && backing_sha256.is_some()!=volatile));
     let Some(fact) = implementation else {
         return Err("callback_implementation_missing");
     };
@@ -154,6 +154,7 @@ fn query_phase_complete(
         }
     } else if let po::ObservationPayload::Implementation {
         algorithm,
+        alias_quality,
         function,
         backing_sha256: Some(backing),
         advertiser_candidates,
@@ -164,6 +165,7 @@ fn query_phase_complete(
             site.pid() == fact.pid
                 && site.generation() == fact.generation
                 && site.algorithm() == *algorithm
+                && site.alias_quality() == *alias_quality
                 && site.function() == *function
                 && site.site().object_hash() == backing
                 && !site.advertiser_candidates().is_empty()
@@ -218,6 +220,7 @@ fn native_query_oracle_refuses_public_only_evidence() {
             }),
             fact(po::ObservationPayload::Algorithm {
                 algorithm: po::AlgorithmId::try_from(u16::MAX).unwrap(),
+                alias_quality: po::AliasQuality::default(),
                 cacheability: po::Cacheability::Cacheable,
             }),
         ],

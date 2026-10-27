@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded joins of finite alias metadata. No target address or opaque handle.
-use super::{AlgorithmId, ObservationBudget, ObservationGap, wire::contract as c};
+use super::{AlgorithmId, AliasQuality, ObservationBudget, ObservationGap, wire::contract as c};
 use std::collections::BTreeMap;
 
 type Thread = (u32, u32, u64);
@@ -10,7 +10,7 @@ struct Sequence {
     next: u32,
     valid: bool,
     ended: bool,
-    algorithm: Option<AlgorithmId>,
+    algorithm: Option<(AlgorithmId, AliasQuality)>,
 }
 #[derive(Default)]
 pub(crate) struct Sequences(BTreeMap<Thread, Sequence>);
@@ -108,10 +108,13 @@ impl Sequences {
         };
         let algorithm = AlgorithmId::try_from(class).map_err(|_| ObservationGap::InvalidWire)?;
         s.ended = true;
-        s.algorithm = Some(algorithm);
+        s.algorithm = Some((algorithm, AliasQuality::from_fold(status, weak)));
         Ok((algorithm, status, weak))
     }
-    pub(crate) fn implementation(&mut self, r: &c::Record) -> Result<AlgorithmId, ObservationGap> {
+    pub(crate) fn implementation(
+        &mut self,
+        r: &c::Record,
+    ) -> Result<(AlgorithmId, AliasQuality), ObservationGap> {
         let s = self.get(r)?;
         if !s.ended {
             s.valid = false;
@@ -182,7 +185,7 @@ mod tests {
             u16::from(s.end(&decode(end(q, 1, 0)).unwrap().record()).unwrap().0),
             0
         );
-        assert_eq!(u16::from(s.implementation(&q).unwrap()), 0);
+        assert_eq!(u16::from(s.implementation(&q).unwrap().0), 0);
         let mut stale = q;
         stale.invocation += 1;
         assert!(s.implementation(&stale).is_err());

@@ -67,9 +67,12 @@ fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
         },
     ))
 }
-#[inline(always)]
-fn base(p: &Pending, t: &ThreadKey, kind: u32) -> Record {
-    Record {
+// Explicit output avoids aggregate-return ABI and keeps construction spills
+// out of the query frame on kernels with a combined 512-byte stack limit.
+#[inline(never)]
+#[no_mangle]
+pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record) {
+    *out = Record {
         version: VERSION,
         kind,
         size: EVENT_SIZE as u32,
@@ -81,7 +84,7 @@ fn base(p: &Pending, t: &ThreadKey, kind: u32) -> Record {
         monotonic_ns: unsafe { helpers::bpf_ktime_get_ns() },
         invocation: p.invocation,
         ..Record::default()
-    }
+    };
 }
 #[inline(never)]
 #[no_mangle]
@@ -189,7 +192,8 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
                 | UNQUERY_CALLBACK
         )
     {
-        let mut r = base(&p, &key, ATTEMPT);
+        let mut r = Record::default();
+        base(&p, &key, ATTEMPT, &mut r);
         r.status = p.name;
         emit(&r)
     }
@@ -205,14 +209,16 @@ pub fn invalidate(p: &Pending, key: &ThreadKey, status: u32) {
     if let Some(member) = MEMBERS.get_ptr_mut(&key.pid) {
         unsafe { (*member).epoch = 0 }
     }
-    let mut r = base(p, key, INVALIDATION);
+    let mut r = Record::default();
+    base(p, key, INVALIDATION, &mut r);
     r.status = status;
     emit(&r);
 }
 #[inline(never)]
 #[no_mangle]
 pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64) {
-    let mut r = base(p, key, INIT);
+    let mut r = Record::default();
+    base(p, key, INIT, &mut r);
     r.outcome = int_outcome(rv);
     emit(&r);
     if r.outcome != 1 {
@@ -292,7 +298,8 @@ pub fn alias(hash: u64, len: u64, index: u32, r: &mut Record) {
 }
 #[repr(C)]
 struct AliasScan {
-    record: Record,
+    // Synchronous own-stack borrow; no target address or transport field.
+    record: *mut Record,
     input: [u8; 128],
     len: usize,
     hash: u64,
@@ -300,7 +307,7 @@ struct AliasScan {
     completed: u32,
     reserved: u32,
 }
-const _: () = assert!(core::mem::size_of::<AliasScan>() == 256);
+const _: () = assert!(core::mem::size_of::<AliasScan>() == 168);
 #[inline(never)]
 #[no_mangle]
 pub extern "C" fn alias_byte(index: u64, context: u64) -> u64 {
@@ -309,12 +316,10 @@ pub extern "C" fn alias_byte(index: u64, context: u64) -> u64 {
     if index < 128 && index < scan.len as u64 && scan.completed < 8 {
         let octet = scan.input[index as usize];
         if octet == b':' {
-            alias(
-                scan.hash,
-                scan.segment_len,
-                scan.completed,
-                &mut scan.record,
-            );
+            // SAFETY: classify keeps this caller-owned Record alive for bpf_loop.
+            alias(scan.hash, scan.segment_len, scan.completed, unsafe {
+                &mut *scan.record
+            });
             scan.completed += 1;
             scan.hash = 14_695_981_039_346_656_037;
             scan.segment_len = 0;
@@ -325,15 +330,14 @@ pub extern "C" fn alias_byte(index: u64, context: u64) -> u64 {
     }
     0
 }
-#[inline(never)]
-#[no_mangle]
-pub fn classify(pointer: u64, r: &mut Record) {
+#[inline(always)]
+fn classify(pointer: u64, r: &mut Record) {
     r.algorithm = OTHER;
     r.function = 0;
     r.outcome = 0;
     r.status = 0;
     let mut scan = AliasScan {
-        record: *r,
+        record: r,
         input: [0; 128],
         len: 0,
         hash: 14_695_981_039_346_656_037,
@@ -439,7 +443,8 @@ pub fn walk_dispatch(imp: u64, r: &mut Record) {
 #[inline(never)]
 #[no_mangle]
 pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
-    let mut r = base(p, key, QUERY);
+    let mut r = Record::default();
+    base(p, key, QUERY, &mut r);
     r.operation = p.operation;
     r.outcome = if table == 0 { 2 } else { 1 };
     r.cacheability = match unsafe { helpers::bpf_probe_read_user(p.arg2 as *const u32) } {
@@ -520,25 +525,26 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
         }
     }
 }
-#[uretprobe]
-pub fn observation_return(ctx: RetProbeContext) -> u32 {
-    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+// Keep pairing temporaries out of the frame that classifies a query return.
+#[inline(never)]
+#[no_mangle]
+pub fn pop_return(cookie: u64, out_key: &mut ThreadKey, out_pending: &mut Pending) -> bool {
     let Some((_, key)) = identity(cookie) else {
-        return 0;
+        return false;
     };
     let Some(mut thread) = (unsafe { THREADS.get(&key).copied() }) else {
         loss(LOSS_PAIR);
-        return 0;
+        return false;
     };
     if thread.skip_return() {
         if THREADS.insert(key, thread, 0).is_err() {
             loss(LOSS_MAP)
         }
-        return 0;
+        return false;
     }
     if thread.depth == 0 {
         loss(LOSS_PAIR);
-        return 0;
+        return false;
     }
     let pk = PendingKey {
         thread: key,
@@ -547,22 +553,31 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
     };
     let Some(p) = (unsafe { PENDING.get(&pk).copied() }) else {
         loss(LOSS_PAIR);
-        return 0;
+        return false;
     };
     if p.cookie != cookie {
         loss(LOSS_PAIR);
-        return 0;
+        return false;
     }
     if PENDING.remove(&pk).is_err() {
         loss(LOSS_MAP);
-        return 0;
+        return false;
     }
     thread.depth -= 1;
     if THREADS.insert(key, thread, 0).is_err() {
         loss(LOSS_MAP);
-        return 0;
+        return false;
     }
-    if p.suppressed != 0 {
+    *out_key = key;
+    *out_pending = p;
+    p.suppressed == 0
+}
+#[uretprobe]
+pub fn observation_return(ctx: RetProbeContext) -> u32 {
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let mut key = ThreadKey::default();
+    let mut p = Pending::default();
+    if !pop_return(cookie, &mut key, &mut p) {
         return 0;
     }
     let rv: u64 = ctx.ret();
@@ -571,32 +586,38 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
     } else if query_api(p.api) {
         query_return(&p, &key, rv)
     } else if !matches!(p.api, PUBLIC_UNQUERY | TEARDOWN | UNQUERY_CALLBACK) {
-        let mut r = base(&p, &key, RESULT);
-        r.status = p.name;
-        r.outcome = if matches!(p.api, UNLOAD | ADD_BUILTIN) {
-            int_outcome(rv)
-        } else if rv != 0 {
-            1
-        } else {
-            2
-        };
-        emit(&r);
-        if p.api == UNLOAD && r.outcome == 1 {
-            invalidate(&p, &key, 1)
-        }
-        if p.api == ADD_BUILTIN && r.outcome == 1 {
-            if code_ok(key.pid, p.arg2) {
-                r.kind = INIT;
-                r.status = 0;
-                r.function = 1;
-                r.code = p.arg2;
-                emit(&r)
-            } else {
-                loss(LOSS_RANGE)
-            }
-        }
+        api_return(&p, &key, rv);
     }
     0
+}
+#[inline(never)]
+#[no_mangle]
+pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64) {
+    let mut r = Record::default();
+    base(p, key, RESULT, &mut r);
+    r.status = p.name;
+    r.outcome = if matches!(p.api, UNLOAD | ADD_BUILTIN) {
+        int_outcome(rv)
+    } else if rv != 0 {
+        1
+    } else {
+        2
+    };
+    emit(&r);
+    if p.api == UNLOAD && r.outcome == 1 {
+        invalidate(p, key, 1)
+    }
+    if p.api == ADD_BUILTIN && r.outcome == 1 {
+        if code_ok(key.pid, p.arg2) {
+            r.kind = INIT;
+            r.status = 0;
+            r.function = 1;
+            r.code = p.arg2;
+            emit(&r)
+        } else {
+            loss(LOSS_RANGE)
+        }
+    }
 }
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
