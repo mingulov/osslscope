@@ -2,8 +2,8 @@
 # Usage
 
 Discovery is the starting point for the v0.3.0 development tree. v0.3.0 is not
-released. Watch/scopes/namespaces are implemented with D2 acceptance still in
-progress. Provider events/interfaces (D3) and learned-site execution plus
+released. Watch/scopes/namespaces are implemented and checked as D2 workflows.
+Provider events/interfaces (D3) and learned-site execution plus
 installed qualification (D4) remain mandatory delivery stages.
 
 ## Passive discovery

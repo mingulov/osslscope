@@ -8,7 +8,7 @@ observe entries into a small catalogue of OpenSSL callbacks.
 
 **Status: discovery development toward v0.3.0; v0.3.0 is not released.**
 Passive snapshots, sampled watch, PID/cgroup scopes and supplied-file matching
-are implemented; scope/churn qualification remains part of D2. Provider
+are implemented and checked, including scope exclusion and churn. Provider
 activation and advertised runtime interfaces remain unknown; execution is
 `not_observed`. ELF exports and mappings do not prove activation or execution.
 The discovery result is metadata inventory, without an executed CBOM or policy

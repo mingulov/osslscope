@@ -14,13 +14,13 @@ legacy diagnostic with its original qualification boundary.
   identity and resource gaps remain visible. Mapping candidates are distinct
   from verified backing. Activation/interfaces are unknown and execution is
   not observed.
-- **D2 — implementation available; acceptance in progress:** sampled watch,
+- **D2 — workflows implemented and checked:** sampled watch,
   intersecting PID/cgroup/module selectors, namespace provenance and bounded
   metadata reuse. Host-side container workflows use independently resolved
   PIDs/cgroups. Watch is sampled inventory, with explicit visibility loss and
   candidate backing; it does not establish process exit, provider unload or
   lossless following. Native scope exclusion, churn, container and integration
-  acceptance remain required before closing D2.
+  checks cover these workflows within their stated observation limits.
 - **D3 — remaining:** observe public provider lifecycle events and external
   provider initialization/query interfaces; retain warm-process, built-in and
   attachment limitations.
@@ -73,7 +73,7 @@ incrementally. Additional capabilities remain later work:
 - Stronger completeness/first-call guarantees and broader performance,
   platform/provider and consumer qualification.
 
-These later tracks do not replace the remaining D2–D4 delivery gates.
+These later tracks do not replace the remaining D3–D4 delivery gates.
 ARM64 and OpenSSL before 3.0 remain later evaluation. Platform and performance
 claims will follow actual results, with their limits documented.
 
