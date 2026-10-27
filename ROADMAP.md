@@ -7,7 +7,7 @@ legacy diagnostic with its original qualification boundary.
 
 ## v0.3.0: discover first, then observe
 
-- **D1 — implemented snapshot surface, acceptance in progress.** `scan` inventories
+- **D1 — snapshot and passive-file workflows implemented and checked.** `scan` inventories
   visible processes or selected PIDs; `inspect` inventories one PID or supplied
   ELF files. The same bounded parser recognizes finite OpenSSL interfaces from
   file bytes without profiles, manual offsets, code loading or BPF. Access,
