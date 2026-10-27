@@ -362,9 +362,12 @@ fn backing(
     process: &Process,
     mapping: &Mapping<'_>,
 ) -> Result<(File, Metadata, IdentityStatus), GapReason> {
+    // Acquisition failures must remain distinct from a successfully acquired
+    // LocatorCandidate: failure leaves mapping visibility unresolved and can
+    // never support a sampled absence claim in watch.
     let name = format!("map_files/{}", mapping.map_name());
     if let Ok(file) = open_at(&process.directory, name.as_bytes()) {
-        let metadata = file.metadata().map_err(|_| GapReason::Unavailable)?;
+        let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
         // A mapping-bound descriptor on a nonstackable filesystem is the
         // association proof, including Btrfs' distinct anonymous st_dev.
         if direct_filesystem(&file)
@@ -378,21 +381,21 @@ fn backing(
         if metadata.ino() == mapping.inode {
             return Ok((file, metadata, IdentityStatus::LocatorCandidate));
         }
-        return Err(GapReason::IdentityUnverified);
+        return Err(GapReason::BackingUnavailable);
     }
     // Namespace-relative locator fallback never establishes mapping identity.
     // Do not strip the kernel's deleted suffix into a replacement pathname.
     if !mapping.path.starts_with(b"/") || mapping.path.ends_with(b" (deleted)") {
-        return Err(GapReason::IdentityUnverified);
+        return Err(GapReason::BackingUnavailable);
     }
     let mut name = b"root".to_vec();
     name.extend_from_slice(mapping.path);
-    let file = open_at(&process.directory, &name).map_err(|_| GapReason::IdentityUnverified)?;
-    let metadata = file.metadata().map_err(|_| GapReason::IdentityUnverified)?;
+    let file = open_at(&process.directory, &name).map_err(|_| GapReason::BackingUnavailable)?;
+    let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
     if metadata.ino() != mapping.inode
         || (metadata.dev() != mapping.device && filesystem(&file) != Some(0x9123683e))
     {
-        return Err(GapReason::IdentityUnverified);
+        return Err(GapReason::BackingUnavailable);
     }
     Ok((file, metadata, IdentityStatus::LocatorCandidate))
 }

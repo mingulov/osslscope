@@ -225,7 +225,7 @@ fn replacement_deleted_and_foreign_backing_are_not_silently_rebound() {
             process.modules.iter().any(|m| m.info.sha256 == hash)
                 || result.gaps.iter().any(|gap| gap.pid == Some(child.pid())
                     && gap.inode == Some(inode)
-                    && gap.reason == GapReason::IdentityUnverified)
+                    && gap.reason == GapReason::BackingUnavailable)
         );
     }
     assert!(

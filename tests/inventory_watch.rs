@@ -548,3 +548,88 @@ fn failed_scope_drops_sample_cache_but_keeps_pinned_selector() {
     assert!(failed.processes.is_empty());
     assert_eq!(descriptors(), 1);
 }
+
+// Independent procfs oracle for the test-owned mapping; no target bytes are read.
+fn assert_executable_mapping(pid: u32, inode: u64) {
+    let maps = fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+    assert!(
+        maps.lines().any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields
+                .get(1)
+                .is_some_and(|p| p.as_bytes().get(2) == Some(&b'x'))
+                && fields.get(4).and_then(|s| s.parse::<u64>().ok()) == Some(inode)
+        }),
+        "owned executable mmap must remain present"
+    );
+}
+fn unresolved_backing_watch(module_scope: bool) {
+    let f = Fixture::new();
+    let module = f.module();
+    // A separate native inode with identical content pins the selector. Its
+    // fingerprint cannot be invalidated by unlinking the actual mapped file.
+    let selector = f.0.join("PRIVATE_CANARY_selector_copy");
+    fs::copy(&module, &selector).unwrap();
+    let inode = fs::metadata(&module).unwrap().ino();
+    let mut child = f.child(&module);
+    child.command(b'm');
+    let pid = child.pid();
+    assert_executable_mapping(pid, inode);
+    let mut options = options(pid);
+    if module_scope {
+        options.selection.modules.push(selector);
+    }
+    let cancel = AtomicBool::new(false);
+    let mut count = 0;
+    let mut writer = Records {
+        pending: vec![],
+        values: vec![],
+        after: |record: &Value| {
+            if record["record"] != "snapshot" {
+                return;
+            }
+            count += 1;
+            if count == 1 {
+                fs::remove_file(&module).unwrap();
+            } else {
+                assert_eq!(count, 2);
+                cancel.store(true, Ordering::Relaxed);
+            }
+            assert_executable_mapping(pid, inode);
+            assert!(child.child.try_wait().unwrap().is_none());
+        },
+    };
+    watch::run(&options, &mut writer, &cancel).unwrap();
+    assert!(changes(&writer.values[0], "module_seen"));
+    let second = &writer.values[1];
+    assert!(
+        changes(second, "visibility_lost"),
+        "expected visibility_lost; changes={}",
+        second["changes"]
+    );
+    assert!(!changes(second, "module_not_seen"));
+    assert!(!changes(second, "process_not_seen"));
+    assert!(
+        second["snapshot"]["gaps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["reason"] == "backing_unavailable")
+    );
+    assert_eq!(
+        second["snapshot"]["scope_record"],
+        writer.values[0]["snapshot"]["scope_record"]
+    );
+    assert_executable_mapping(pid, inode);
+    assert!(child.child.try_wait().unwrap().is_none());
+}
+// Catches conflating a deleted/unresolvable executable backing with real unmapping.
+#[test]
+fn unresolved_backing_loses_visibility_without_asserting_module_absence() {
+    unresolved_backing_watch(false);
+}
+// Catches selector filtering promoting that same backing failure to process absence.
+#[test]
+fn unresolved_backing_with_independent_selector_cannot_assert_process_absence() {
+    unresolved_backing_watch(true);
+}

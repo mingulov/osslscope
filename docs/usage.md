@@ -147,9 +147,11 @@ process just started or a provider just loaded. `process_not_seen` and
 absent from the sampled selection, never process exit or provider unload.
 Read, backing, membership, namespace, identity-change and resource failures
 produce `visibility_lost` instead of absence claims. Successfully enumerated
-locator candidates keep their candidate status; this association gap alone
-does not hide a mapping-list observation. A newly visible incarnation or
-namespace is a fresh observation. Human output shows the same finite changes.
+locator candidates keep their candidate status; their `identity_unverified`
+association gap alone does not hide a mapping-list observation. Unresolved,
+deleted or mismatched executable backing instead has `backing_unavailable`,
+which forbids absence claims even when module selection filters out a process.
+A newly visible incarnation or namespace is a fresh observation. Human output shows the same finite changes.
 
 All watch records state `sampled_history: "incomplete"`, independently of the
 snapshot's inventory completeness. Polling can miss activity entirely between

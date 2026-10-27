@@ -106,6 +106,8 @@ fn visible(snapshot: &Snapshot, pid: u32) -> bool {
         // mapping enumeration is usable for sampled absence. Ordinary ELF
         // candidates may be filtered from the public module list. Every
         // backing/read/churn/selection failure still forbids absence claims.
+        // IdentityUnverified is emitted only after successful candidate
+        // acquisition; unresolved/mismatched backing is BackingUnavailable.
         gap.reason == GapReason::IdentityUnverified
     })
 }

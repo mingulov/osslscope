@@ -67,7 +67,10 @@ pub enum GapReason {
     Changed,
     UnsupportedArchitecture,
     ProcessUnavailable,
+    /// Metadata was acquired, but its mapping association is a locator candidate.
     IdentityUnverified,
+    /// Executable backing could not be acquired or its native identity mismatched.
+    BackingUnavailable,
     ReadLimit,
     ProcessLimit,
     ObjectLimit,
