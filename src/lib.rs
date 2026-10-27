@@ -32,6 +32,7 @@ pub mod plan;
 pub mod policy;
 pub(crate) mod policy_config;
 pub(crate) mod profile;
+pub mod provider_observation;
 pub mod report;
 // R19 (P7 item 3): scan-plane birth registry, join oracle, governor
 // and production backend (see scan's module documentation).

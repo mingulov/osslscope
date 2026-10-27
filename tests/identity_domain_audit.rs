@@ -114,6 +114,40 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Provider observations retain native fstat identities throughout.
+        // The map_files association uses makedev-decoded maps dev_t and the
+        // same reviewed Btrfs exception as inventory; only the retained FD's
+        // native device/inode is used for deduplication and expected hashes.
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            "native: m.dev(),",
+            1,
+        ),
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            "device: m.dev(),",
+            1,
+        ),
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            "&& m.info.device == stamp.native",
+            2,
+        ),
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            "&& (metadata.dev() == map.native || filesystem == 0x9123683e)",
+            1,
+        ),
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            "e.device != before.dev() || e.inode != before.ino() || e.size_bytes != before.len()",
+            1,
+        ),
         // Discovery cache, verified-record dedup and ELF identity use native
         // fstat dev_t, never
         // encoded callback/stat words. Cache keys and stability checks compare
