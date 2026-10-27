@@ -3638,3 +3638,178 @@ fn spawn_coverage_note() -> Check {
                     "run -- requests observation from exec; effective callback attachment follows discovery (fast or short-lived workloads may stay PARTIAL); a wrong libcrypto prediction degrades to zero-rows PARTIAL, never wrong attribution".into(),
                 )
 }
+
+/// Independent discovery capability checks: no target profile or catalogue.
+/// Kernel/verifier diagnostics are reduced to finite states before rendering.
+pub(crate) fn discovery(args: &[String]) -> ExitCode {
+    use serde::Serialize;
+    use std::io::{self, Write as _};
+    #[derive(Clone, Copy, Serialize)]
+    #[serde(rename_all = "snake_case")]
+    enum Capability {
+        Available,
+        Denied,
+        Unavailable,
+        NotChecked,
+    }
+    fn state(probe: ProbeOut) -> Capability {
+        if probe.ok {
+            Capability::Available
+        } else if is_perm_errno(probe.errno) {
+            Capability::Denied
+        } else {
+            Capability::Unavailable
+        }
+    }
+    #[derive(Serialize)]
+    struct Capabilities {
+        inventory: Capability,
+        companion: Capability,
+        producer: Capability,
+        bpf: Capability,
+        user_read: Capability,
+        ring_buffer: Capability,
+        uprobe_multi: Capability,
+        historical_activation: &'static str,
+        execution: &'static str,
+    }
+    #[derive(Serialize)]
+    struct Discovery {
+        schema_version: &'static str,
+        record: &'static str,
+        capabilities: Capabilities,
+    }
+    let mut json = false;
+    let mut discovery = false;
+    let mut format = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--discovery" if !discovery => discovery = true,
+            "--json" if !format => {
+                json = true;
+                format = true;
+            }
+            "--format" if !format => {
+                match args.next().map(String::as_str) {
+                    Some("json") => json = true,
+                    Some("human") => (),
+                    _ => {
+                        crate::report::err_line("osslscope doctor discovery: invalid arguments");
+                        return ExitCode::from(2);
+                    }
+                }
+                format = true;
+            }
+            "--help" | "-h" if !format && discovery && args.len() == 0 => {
+                let result = io::stdout().lock().write_all(b"usage: osslscope doctor --discovery [--json | --format human|json]\nFinite discovery capability checks; no build catalogue.\n");
+                return ExitCode::from(if result.is_ok() { 0 } else { 1 });
+            }
+            _ => {
+                crate::report::err_line("osslscope doctor discovery: invalid arguments");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    if !discovery {
+        return ExitCode::from(2);
+    }
+    let (companion, producer) = match crate::provider_observation::artifact::load() {
+        Ok(bytes) => match crate::provider_observation::ProviderSession::open(
+            crate::provider_observation::ObservationLimits::default(),
+            &bytes,
+        ) {
+            Ok(session) => {
+                drop(session);
+                (Capability::Available, Capability::Available)
+            }
+            Err(crate::provider_observation::ObservationGap::InvalidObject) => {
+                (Capability::Unavailable, Capability::Unavailable)
+            }
+            Err(_) => (Capability::Available, Capability::Unavailable),
+        },
+        Err(_) => (Capability::Unavailable, Capability::NotChecked),
+    };
+    let inventory = if std::fs::File::open("/proc/self/stat").is_ok() {
+        Capability::Available
+    } else {
+        Capability::Unavailable
+    };
+    let bpf = state(run_prog_load(&insns_noop()));
+    let (user_read, ring_buffer, uprobe_multi) = if matches!(bpf, Capability::Available) {
+        (
+            state(run_prog_load(&insns_probe_read_user())),
+            state(run_map_create(27, 0, 0, 1 << 20)),
+            state(run_multi_self()),
+        )
+    } else {
+        (
+            Capability::NotChecked,
+            Capability::NotChecked,
+            Capability::NotChecked,
+        )
+    };
+    let available = [
+        inventory,
+        companion,
+        producer,
+        bpf,
+        user_read,
+        ring_buffer,
+        uprobe_multi,
+    ]
+    .iter()
+    .all(|c| matches!(c, Capability::Available));
+    let result = Discovery {
+        schema_version: "osslscope.discovery.provider.v1",
+        record: "doctor",
+        capabilities: Capabilities {
+            inventory,
+            companion,
+            producer,
+            bpf,
+            user_read,
+            ring_buffer,
+            uprobe_multi,
+            historical_activation: "unknown",
+            execution: "not_observed",
+        },
+    };
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    let rendered = (|| -> io::Result<()> {
+        if !json {
+            out.write_all(
+                b"Discovery capability checks; target access/attachment remains scope dependent.\n",
+            )?;
+        }
+        if json {
+            serde_json::to_writer(&mut out, &result).map_err(io::Error::other)?;
+            out.write_all(b"\n")?;
+        } else {
+            let caps = &result.capabilities;
+            for (name, state) in [
+                ("inventory", caps.inventory),
+                ("companion", caps.companion),
+                ("producer", caps.producer),
+                ("bpf", caps.bpf),
+                ("user_read", caps.user_read),
+                ("ring_buffer", caps.ring_buffer),
+                ("uprobe_multi", caps.uprobe_multi),
+            ] {
+                write!(out, "  {name}=")?;
+                serde_json::to_writer(&mut out, &state).map_err(io::Error::other)?;
+                out.write_all(b"\n")?;
+            }
+            out.write_all(b"  historical_activation=unknown execution=not_observed\n")?;
+        }
+        out.flush()
+    })();
+    ExitCode::from(if rendered.is_err() {
+        1
+    } else if available {
+        0
+    } else {
+        3
+    })
+}

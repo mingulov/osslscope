@@ -7,7 +7,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let argv: Vec<String> = args.collect();
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
     match cmd {
+        "doctor" if argv[1..].iter().any(|arg| arg == "--discovery") => {
+            crate::doctor::discovery(&argv[1..])
+        }
         "doctor" => crate::doctor::profiled::run(&argv[1..]),
+        "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-providers") => {
+            crate::provider_observation::cli::run(&argv)
+        }
         "scan" | "inspect" => crate::inventory::cli::run(cmd, &argv[1..]),
         "alias-audit" => crate::aliases::run(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
@@ -27,6 +33,8 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             println!(
                 "  scan/inspect  passive process/module discovery; no profile or BPF required"
             );
+            println!("  --observe-providers  public provider API observation (default 30 seconds)");
+            println!("  doctor --discovery  capability checks without a build catalogue");
             println!("  discovery does not prove provider activation or execution");
             ExitCode::SUCCESS
         }
