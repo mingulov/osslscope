@@ -36,62 +36,26 @@ pub enum TripTaxonomy {
     Load,
 }
 
-struct AlgEvidence {
-    minimum: u16,
-    weak: bool,
-    canon: Option<u16>,
-    mixed: bool,
-}
-
+struct AlgEvidence(crate::provider_observation::FiniteEvidence);
 impl AlgEvidence {
     fn new() -> Self {
-        Self {
-            minimum: u16::MAX,
-            weak: false,
-            canon: None,
-            mixed: false,
-        }
+        Self(crate::provider_observation::FiniteEvidence::new())
     }
-
     fn include<F: Fn(u64) -> Option<AlgClassValue>>(&mut self, hash: u64, len: usize, lookup: &F) {
         if len > 36 {
             return;
         }
         let Some(entry) = lookup(hash) else { return };
-        if usize::from(entry.len) != len || entry.weak > 1 {
-            return;
-        }
-        if entry.class == u16::MAX {
-            if entry.canon == u16::MAX && entry.weak == 1 {
-                self.weak = true;
-            }
-            return;
-        }
-        if entry.canon == u16::MAX {
-            return;
-        }
-        self.minimum = self.minimum.min(entry.class);
-        self.weak |= entry.weak == 1;
-        if let Some(previous) = self.canon {
-            self.mixed |= previous != entry.canon;
-        } else {
-            self.canon = Some(entry.canon);
+        if usize::from(entry.len) == len {
+            self.0.include(entry.class, entry.weak, entry.canon);
         }
     }
-
     fn verdict(self, truncated: bool) -> AlgVerdict {
+        let (class, weak, status) = self.0.finish(truncated);
         AlgVerdict {
-            class: self.minimum,
-            weak: self.weak || truncated,
-            status: if truncated {
-                3
-            } else if self.canon.is_none() {
-                1
-            } else if self.mixed {
-                5
-            } else {
-                0
-            },
+            class,
+            weak,
+            status,
         }
     }
 }

@@ -68,12 +68,18 @@ fn name(v: u32) -> Result<ProviderNameClass, ObservationGap> {
         _ => return Err(ObservationGap::InvalidWire),
     })
 }
-pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
+fn read_record(bytes: &[u8]) -> Result<c::Record, ObservationGap> {
     if bytes.len() != c::EVENT_SIZE {
         return Err(ObservationGap::InvalidWire);
     }
     // All fields are plain integers; exact-size checked, no enum/padding dereference.
     let r = unsafe { bytes.as_ptr().cast::<c::Record>().read_unaligned() };
+    Ok(r)
+}
+pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
+    decode_record(read_record(bytes)?)
+}
+fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
     let bad = ObservationGap::InvalidWire;
     if r.version != c::VERSION
         || r.size != c::EVENT_SIZE as u32
@@ -105,7 +111,7 @@ pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
             r.api == c::PROVIDER_INIT && r.function != 1
                 || r.api == c::ADD_BUILTIN && r.function == 1
         }
-        c::QUERY | c::ALGORITHM | c::IMPLEMENTATION => c::query_api(r.api),
+        c::QUERY | c::IMPLEMENTATION => c::query_api(r.api),
         c::INVALIDATION => matches!(
             r.api,
             c::UNLOAD | c::PUBLIC_UNQUERY | c::TEARDOWN | c::UNQUERY_CALLBACK
@@ -160,28 +166,17 @@ pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
                 cacheability: cache(r.cacheability)?,
             }
         }
-        c::ALGORITHM | c::IMPLEMENTATION => {
-            if r.outcome != 0 || r.status > 5 || r.algorithm > u16::MAX as u32 {
+        c::IMPLEMENTATION => {
+            if r.outcome != 0 || r.status != 0 || r.algorithm != c::OTHER {
                 return Err(bad);
             }
-            let algorithm = AlgorithmId::try_from(r.algorithm as u16).map_err(|_| bad)?;
-            if r.kind == c::ALGORITHM {
-                if r.function != 0 {
-                    return Err(bad);
-                }
-                ObservationPayload::Algorithm {
-                    algorithm,
-                    cacheability: cache(r.cacheability)?,
-                }
-            } else {
-                let function = FunctionIdentity::new(op, r.function).map_err(|_| bad)?;
-                ObservationPayload::Implementation {
-                    algorithm,
-                    function,
-                    cacheability: cache(r.cacheability)?,
-                    advertiser_candidates: Vec::new(),
-                    backing_sha256: None,
-                }
+            let function = FunctionIdentity::new(op, r.function).map_err(|_| bad)?;
+            ObservationPayload::Implementation {
+                algorithm: AlgorithmId::try_from(u16::MAX).unwrap(),
+                function,
+                cacheability: cache(r.cacheability)?,
+                advertiser_candidates: Vec::new(),
+                backing_sha256: None,
             }
         }
         c::INVALIDATION => {
@@ -205,4 +200,70 @@ pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
         _ => return Err(bad),
     };
     Ok(ProviderEvent { record: r, payload })
+}
+
+pub(crate) enum Transport {
+    Event(ProviderEvent),
+    Alias(c::Record),
+    End(c::Record),
+}
+impl Transport {
+    pub(crate) fn record(&self) -> c::Record {
+        match self {
+            Self::Event(e) => e.record,
+            Self::Alias(r) | Self::End(r) => *r,
+        }
+    }
+}
+pub(crate) fn decode_transport(bytes: &[u8]) -> Result<Transport, ObservationGap> {
+    let r = read_record(bytes)?;
+    if !matches!(r.kind, c::ALIAS | c::ALIAS_END) {
+        return decode_record(r).map(Transport::Event);
+    }
+    // Reuse the complete envelope/query validation, retaining code and reserved
+    // slots so internal records cannot smuggle relocation operands or extensions.
+    let mut envelope = r;
+    envelope.kind = c::QUERY;
+    envelope.algorithm = 0;
+    envelope.function = 0;
+    envelope.outcome = 0;
+    envelope.status = 0;
+    decode_record(envelope)?;
+    let bad = ObservationGap::InvalidWire;
+    if r.kind == c::ALIAS {
+        if r.status >= 8 || r.outcome > 1 || r.algorithm > c::OTHER || r.function > c::OTHER {
+            return Err(bad);
+        }
+        if r.algorithm == c::OTHER {
+            if r.function != c::OTHER {
+                return Err(bad);
+            }
+        } else {
+            let label = crate::kinds::alg_class_label(r.algorithm as u16).ok_or(bad)?;
+            if crate::kinds::algorithm_semantic_id(label) != Some(r.function as u16)
+                || u32::from(crate::kinds::is_weak_alg(label)) != r.outcome
+            {
+                return Err(bad);
+            }
+        }
+        Ok(Transport::Alias(r))
+    } else {
+        if r.algorithm != c::OTHER
+            || r.outcome != 0
+            || !matches!((r.status, r.function), (0, 1..=8) | (3, 8) | (2 | 4, 0))
+        {
+            return Err(bad);
+        }
+        Ok(Transport::End(r))
+    }
+}
+pub(crate) fn algorithm_event(mut record: c::Record, algorithm: AlgorithmId) -> ProviderEvent {
+    record.kind = c::ALGORITHM;
+    ProviderEvent {
+        record,
+        payload: ObservationPayload::Algorithm {
+            algorithm,
+            cacheability: cache(record.cacheability).unwrap_or(Cacheability::Unknown),
+        },
+    }
 }

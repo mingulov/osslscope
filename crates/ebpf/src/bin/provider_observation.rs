@@ -10,9 +10,7 @@ use aya_ebpf::{
     programs::{ProbeContext, RetProbeContext},
     EbpfContext,
 };
-use osslscope_bpf_contract::{
-    classify_alg_with, provider_observation::*, AlgClassValue, TripClassValue,
-};
+use osslscope_bpf_contract::{provider_observation::*, AlgClassValue, TripClassValue};
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 #[map]
@@ -98,17 +96,12 @@ pub fn emit(r: &Record) {
 #[inline(never)]
 #[no_mangle]
 pub fn code_ok(pid: u32, address: u64) -> bool {
-    if !(4096..=0x0000_ffff_ffff_ffff).contains(&address) {
+    let Some(member) = (unsafe { MEMBERS.get(&pid) }) else {
         return false;
-    }
-    for index in 0..MAX_RANGES {
-        if let Some(r) = unsafe { RANGES.get(&RangeKey { pid, index }) } {
-            if address >= r.start && address < r.end {
-                return true;
-            }
-        }
-    }
-    false
+    };
+    code_in_ranges(address, member.range_count, |index| unsafe {
+        RANGES.get(&RangeKey { pid, index }).copied()
+    })
 }
 #[inline(never)]
 #[no_mangle]
@@ -275,20 +268,127 @@ pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64) {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn classify(pointer: u64) -> u64 {
-    let mut buf = [0u8; 128];
-    let len =
-        match unsafe { helpers::bpf_probe_read_user_str_bytes(pointer as *const u8, &mut buf) } {
-            Ok(v) => v.len(),
-            Err(_) => {
-                loss(LOSS_READ);
-                return (OTHER as u64) | (4u64 << 32);
+pub fn alias(hash: u64, len: u64, index: u32, r: &mut Record) {
+    r.kind = ALIAS;
+    r.algorithm = OTHER;
+    r.function = OTHER;
+    r.outcome = 0;
+    r.status = index;
+    if len <= 36 {
+        if let Some(entry) = unsafe { ALG_CLASS.get(&hash) } {
+            if entry.len as u64 == len {
+                r.algorithm = entry.class as u32;
+                r.function = entry.canon as u32;
+                r.outcome = entry.weak as u32;
             }
-        };
-    let v = classify_alg_with(&buf, len, len == 127, |h| unsafe {
-        ALG_CLASS.get(&h).copied()
-    });
-    (v.class as u64) | ((v.status as u64) << 32)
+        }
+    }
+    emit(r);
+    // Do not carry map-derived alias identities into the next byte or dispatch.
+    r.algorithm = OTHER;
+    r.function = 0;
+    r.outcome = 0;
+    r.status = 0;
+}
+#[repr(C)]
+struct AliasScan {
+    record: Record,
+    input: [u8; 128],
+    len: usize,
+    hash: u64,
+    segment_len: u64,
+    completed: u32,
+    reserved: u32,
+}
+const _: () = assert!(core::mem::size_of::<AliasScan>() == 256);
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn alias_byte(index: u64, context: u64) -> u64 {
+    // SAFETY: synchronous bpf_loop receives this initialized own-stack context.
+    let scan = unsafe { &mut *(context as *mut AliasScan) };
+    if index < 128 && index < scan.len as u64 && scan.completed < 8 {
+        let octet = scan.input[index as usize];
+        if octet == b':' {
+            alias(
+                scan.hash,
+                scan.segment_len,
+                scan.completed,
+                &mut scan.record,
+            );
+            scan.completed += 1;
+            scan.hash = 14_695_981_039_346_656_037;
+            scan.segment_len = 0;
+        } else {
+            scan.hash = (scan.hash ^ octet as u64).wrapping_mul(1_099_511_628_211);
+            scan.segment_len += 1;
+        }
+    }
+    0
+}
+#[inline(never)]
+#[no_mangle]
+pub fn classify(pointer: u64, r: &mut Record) {
+    r.algorithm = OTHER;
+    r.function = 0;
+    r.outcome = 0;
+    r.status = 0;
+    let mut scan = AliasScan {
+        record: *r,
+        input: [0; 128],
+        len: 0,
+        hash: 14_695_981_039_346_656_037,
+        segment_len: 0,
+        completed: 0,
+        reserved: 0,
+    };
+    scan.len = match unsafe {
+        helpers::bpf_probe_read_user_str_bytes(pointer as *const u8, &mut scan.input)
+    } {
+        Ok(v) => v.len(),
+        Err(_) => {
+            loss(LOSS_READ);
+            r.kind = ALIAS_END;
+            r.status = 4;
+            emit(r);
+            r.status = 0;
+            return;
+        }
+    };
+    if scan.len >= 127 {
+        r.kind = ALIAS_END;
+        r.status = 2;
+        emit(r);
+        r.status = 0;
+        return;
+    }
+    // Callback only reads captured scratch and the frozen classifier LUT.
+    let result = unsafe {
+        helpers::bpf_loop(
+            128,
+            alias_byte as *mut core::ffi::c_void,
+            (&mut scan as *mut AliasScan).cast(),
+            0,
+        )
+    };
+    if result != 128 {
+        loss(LOSS_READ);
+        r.kind = ALIAS_END;
+        r.status = 4;
+        emit(r);
+        r.status = 0;
+        return;
+    }
+    if scan.completed == 8 {
+        r.status = 3;
+    } else {
+        alias(scan.hash, scan.segment_len, scan.completed, r);
+        scan.completed += 1;
+    }
+    r.kind = ALIAS_END;
+    r.function = scan.completed;
+    emit(r);
+    r.function = 0;
+    r.status = 0;
 }
 #[inline(never)]
 #[no_mangle]
@@ -408,14 +508,7 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
             return;
         }
     };
-    let classified = classify(names);
-    let algorithm = classified as u32;
-    let status = (classified >> 32) as u32;
-    r.kind = ALGORITHM;
-    r.algorithm = algorithm;
-    r.status = status;
-    r.outcome = 0;
-    emit(&r);
+    classify(names, &mut r);
     if imp != 0 {
         walk_dispatch(imp, &mut r)
     } else {

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Finite observation ABI. No opaque target handle is a transport field.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 pub const EVENT_SIZE: usize = 96;
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_PENDING: u32 = 4096;
@@ -14,6 +14,10 @@ pub const ALGORITHM: u32 = 5;
 pub const IMPLEMENTATION: u32 = 6;
 pub const INVALIDATION: u32 = 7;
 pub const GAP: u32 = 8;
+/// Internal finite alias: algorithm=class, function=canon, outcome=weak, status=index.
+pub const ALIAS: u32 = 9;
+/// Internal terminator: function=segment count, status=0/2/3/4, algorithm=OTHER.
+pub const ALIAS_END: u32 = 10;
 pub const LOAD: u32 = 1;
 pub const TRY_LOAD: u32 = 2;
 pub const LOAD_EX: u32 = 3;
@@ -71,6 +75,8 @@ pub struct Config {
 pub struct Member {
     pub generation: u64,
     pub epoch: u64,
+    pub range_count: u32,
+    pub reserved: u32,
 }
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -237,5 +243,98 @@ pub const fn int_outcome(rv: u64) -> u32 {
         1 => 1,
         0 => 2,
         _ => 0,
+    }
+}
+
+/// Executable-range membership, with no target-memory reads.
+#[inline(always)]
+pub fn code_in_ranges(
+    address: u64,
+    count: u32,
+    mut lookup: impl FnMut(u32) -> Option<Range>,
+) -> bool {
+    if !(4096..=0x0000_ffff_ffff_ffff).contains(&address) || count == 0 || count > MAX_RANGES {
+        return false;
+    }
+    // Upper-bound search for the last start <= address. Host admission proves
+    // sorted, nonempty, disjoint intervals. Eight steps cover all 128 slots.
+    let mut low = 0u32;
+    let mut high = count;
+    let mut end = 0u64;
+    for _ in 0..8 {
+        if low >= high {
+            break;
+        }
+        let mid = (low + high) / 2;
+        let Some(range) = lookup(mid) else {
+            return false;
+        };
+        if address < range.start {
+            high = mid
+        } else {
+            low = mid + 1;
+            end = range.end
+        }
+    }
+    address < end
+}
+
+/// Aggregate already classified finite alias identities; never raw target bytes.
+#[derive(Clone, Copy)]
+pub struct FiniteEvidence {
+    minimum: u16,
+    weak: bool,
+    canon: Option<u16>,
+    mixed: bool,
+}
+impl Default for FiniteEvidence {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+impl FiniteEvidence {
+    pub const fn new() -> Self {
+        Self {
+            minimum: u16::MAX,
+            weak: false,
+            canon: None,
+            mixed: false,
+        }
+    }
+    pub fn include(&mut self, class: u16, weak: u8, canon: u16) {
+        if weak > 1 {
+            return;
+        }
+        if class == u16::MAX {
+            if canon == u16::MAX && weak == 1 {
+                self.weak = true;
+            }
+            return;
+        }
+        if canon == u16::MAX {
+            return;
+        }
+        self.minimum = self.minimum.min(class);
+        self.weak |= weak == 1;
+        if let Some(previous) = self.canon {
+            self.mixed |= previous != canon;
+        } else {
+            self.canon = Some(canon);
+        }
+    }
+    pub fn finish(self, truncated: bool) -> (u16, bool, u8) {
+        (
+            self.minimum,
+            self.weak || truncated,
+            if truncated {
+                3
+            } else if self.canon.is_none() {
+                1
+            } else if self.mixed {
+                5
+            } else {
+                0
+            },
+        )
     }
 }

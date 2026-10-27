@@ -3,7 +3,14 @@ use osslscope::provider_observation::{self as po, wire};
 
 fn record(kind: u32) -> Vec<u8> {
     let mut b = vec![0; 96];
-    for (at, v) in [(0, 1u32), (4, kind), (8, 96), (12, 1), (16, 42), (20, 43)] {
+    for (at, v) in [
+        (0, wire::contract::VERSION),
+        (4, kind),
+        (8, 96),
+        (12, 1),
+        (16, 42),
+        (20, 43),
+    ] {
         b[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
     for at in [24, 32, 40, 48] {
@@ -586,7 +593,7 @@ fn unknown_and_alias_bytes_discarded() {
     bytes[..unknown.len()].copy_from_slice(unknown);
     let v = classify_alg_with(&bytes, unknown.len(), false, |_| None);
     assert_eq!(v.class, OTHER_CLASS);
-    let mut r = record(5);
+    let mut r = record(6);
     r[12..16].copy_from_slice(&17u32.to_le_bytes());
     r[64..68].copy_from_slice(&(OTHER_CLASS as u32).to_le_bytes());
     let json = serde_json::to_string(wire::decode(&r).unwrap().payload()).unwrap();

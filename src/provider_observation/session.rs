@@ -141,6 +141,7 @@ pub struct ProviderSession {
     loss: PerCpuArray<MapData, u64>,
     targets: BTreeMap<u32, Target>,
     roles: Roles,
+    aliases: super::assembly::Sequences,
     budget: ObservationBudget,
     next_cookie: u64,
     next_generation: u64,
@@ -168,7 +169,7 @@ fn specs() -> Vec<loader::MapSpec> {
     let shapes = [
         ("EVENTS", 27, 0, 0, 1 << 20),
         ("CONFIG", 1, 8, 24, 1024),
-        ("MEMBERS", 1, 4, 16, 64),
+        ("MEMBERS", 1, 4, 24, 64),
         ("NAMESPACE", 2, 4, 16, 1),
         ("RANGES", 1, 8, 16, 8192),
         ("THREADS", 1, 16, 16, 4096),
@@ -282,6 +283,7 @@ impl ProviderSession {
             loaded,
             targets: BTreeMap::new(),
             roles: Roles::default(),
+            aliases: super::assembly::Sequences::default(),
             budget,
             next_cookie: 1,
             next_generation: 1,
@@ -355,6 +357,7 @@ impl ProviderSession {
         })()
     }
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) {
+        self.aliases.retire(pid);
         b.learned_sites.retain(|site| site.pid != pid);
         // Disarm before dropping links. Never walk kernel-private opaque joins.
         if self.members.remove(&pid).is_err() {
@@ -420,7 +423,7 @@ impl ProviderSession {
         b: &mut ObservationBatch,
     ) -> Result<(), ObservationGap> {
         let process = acquire(record, &mut self.budget)?;
-        let ranges = process.executable_ranges()?;
+        let ranges = order_ranges(process.executable_ranges()?)?;
         let generation = self.next_generation;
         self.next_generation = self
             .next_generation
@@ -495,6 +498,8 @@ impl ProviderSession {
                     c::Member {
                         generation,
                         epoch: 1,
+                        range_count: target.ranges as u32,
+                        reserved: 0,
                     },
                     0,
                 )
@@ -533,12 +538,16 @@ impl ProviderSession {
                 break;
             }
             let event = match self.events.next() {
-                Some(bytes) => wire::decode(&bytes),
+                Some(bytes) => wire::decode_transport(&bytes),
                 None => break,
             };
             match event {
                 Ok(e) => self.consume(e, &mut b),
-                Err(g) => b.gap(g),
+                Err(g) => {
+                    self.aliases.clear();
+                    invalidate_algorithms(&mut b);
+                    b.gap(g);
+                }
             }
             if self.emitted >= self.budget.limits.max_facts {
                 b.gap(ObservationGap::FactLimit);
@@ -550,6 +559,8 @@ impl ProviderSession {
                 Ok(values) => {
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
+                        self.aliases.clear();
+                        invalidate_algorithms(&mut b);
                         b.gap(match index {
                             0 => ObservationGap::QueueLoss,
                             1 => ObservationGap::PendingLimit,
@@ -563,13 +574,20 @@ impl ProviderSession {
                         self.last_loss[index] = total;
                     }
                 }
-                Err(_) => b.gap(ObservationGap::BpfUnavailable),
+                Err(_) => {
+                    self.aliases.clear();
+                    invalidate_algorithms(&mut b);
+                    b.gap(ObservationGap::BpfUnavailable);
+                }
             }
+        }
+        if self.aliases.incomplete() {
+            b.gap(ObservationGap::IntervalUnknown);
         }
         b
     }
-    fn consume(&mut self, event: wire::ProviderEvent, b: &mut ObservationBatch) {
-        let r = event.record;
+    fn consume(&mut self, event: wire::Transport, b: &mut ObservationBatch) {
+        let r = event.record();
         let Some(target) = self.targets.get(&r.pid) else {
             return;
         };
@@ -594,7 +612,50 @@ impl ProviderSession {
         let hash = attachment.site.object_hash().clone();
         let advertisers = attachment.advertisers.clone();
         let starttime = target.starttime;
-        let mut payload = event.into_payload();
+        let mut payload = match event {
+            wire::Transport::Alias(r) => {
+                if let Err(g) = self.aliases.alias(&r) {
+                    invalidate_algorithms(b);
+                    b.gap(g);
+                }
+                return;
+            }
+            wire::Transport::End(r) => {
+                let algorithm = match self.aliases.end(&r) {
+                    Ok((algorithm, status, _weak)) => {
+                        match status {
+                            2 | 3 => b.gap(ObservationGap::DispatchPartial),
+                            4 => b.gap(ObservationGap::TargetReadFailed),
+                            _ => (),
+                        }
+                        algorithm
+                    }
+                    Err(g) => {
+                        invalidate_algorithms(b);
+                        b.gap(g);
+                        super::assembly::other()
+                    }
+                };
+                wire::algorithm_event(r, algorithm).into_payload()
+            }
+            wire::Transport::Event(event) => {
+                if r.kind == c::QUERY {
+                    if let Err(g) = self.aliases.begin(&r, &self.budget) {
+                        b.gap(g);
+                    }
+                } else if r.kind == c::INVALIDATION {
+                    self.aliases.retire(r.pid);
+                }
+                let mut payload = event.into_payload();
+                if let ObservationPayload::Implementation { algorithm, .. } = &mut payload {
+                    *algorithm = self.aliases.implementation(&r).unwrap_or_else(|g| {
+                        b.gap(g);
+                        super::assembly::other()
+                    });
+                }
+                payload
+            }
+        };
         if r.code != 0 {
             let site = match target
                 .process
@@ -717,7 +778,7 @@ impl ProviderSession {
             context: ContextIdentity::Unknown {},
             source: match r.kind {
                 c::INIT => ObservationSource::ProviderInit,
-                c::QUERY | c::ALGORITHM => ObservationSource::ProviderQuery,
+                c::QUERY | c::ALGORITHM | c::ALIAS_END => ObservationSource::ProviderQuery,
                 c::IMPLEMENTATION => ObservationSource::ProviderDispatch,
                 _ => ObservationSource::PublicApi,
             },
@@ -751,6 +812,7 @@ impl ProviderSession {
                 // batch. Do not return those facts/candidates as usable evidence.
                 b.facts.retain(|fact| fact.pid != pid);
                 b.learned_sites.retain(|candidate| candidate.pid != pid);
+                self.aliases.retire(pid);
                 b.gap(ObservationGap::AmbiguousSite);
                 b.gap(ObservationGap::Invalidated);
                 if let Err(g) = result {
@@ -825,6 +887,33 @@ impl Drop for ProviderSession {
             self.retire(pid, &mut b)
         }
     }
+}
+fn invalidate_algorithms(batch: &mut ObservationBatch) {
+    for fact in &mut batch.facts {
+        match &mut fact.payload {
+            ObservationPayload::Algorithm { algorithm, .. }
+            | ObservationPayload::Implementation { algorithm, .. } => {
+                *algorithm = super::assembly::other()
+            }
+            _ => (),
+        }
+    }
+    for site in &mut batch.learned_sites {
+        site.algorithm = super::assembly::other();
+    }
+}
+fn order_ranges(mut ranges: Vec<(u64, u64)>) -> Result<Vec<(u64, u64)>, ObservationGap> {
+    if ranges.len() > c::MAX_RANGES as usize {
+        return Err(ObservationGap::SiteLimit);
+    }
+    if ranges.iter().any(|&(start, end)| start >= end) {
+        return Err(ObservationGap::MalformedMaps);
+    }
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(ObservationGap::AmbiguousSite);
+    }
+    Ok(ranges)
 }
 fn identity_failure(gap: ObservationGap) -> bool {
     matches!(
@@ -951,6 +1040,49 @@ fn object_id(site: &VerifiedSite) -> u64 {
 mod tests {
     use super::*;
     #[test]
+    fn queue_loss_downgrades_already_drained_algorithm_facts() {
+        let known = AlgorithmId::try_from(0).unwrap();
+        let mut batch = ObservationBatch::default();
+        for payload in [
+            ObservationPayload::Algorithm {
+                algorithm: known,
+                cacheability: Cacheability::Cacheable,
+            },
+            ObservationPayload::Implementation {
+                algorithm: known,
+                function: FunctionIdentity::new(Operation::Other, 0).unwrap(),
+                cacheability: Cacheability::Cacheable,
+                advertiser_candidates: Vec::new(),
+                backing_sha256: None,
+            },
+        ] {
+            batch.facts.push(ObservationFact {
+                pid: 1,
+                starttime: 2,
+                object_sha256: "a".repeat(64).try_into().unwrap(),
+                generation: 3,
+                context: ContextIdentity::Unknown {},
+                source: ObservationSource::ProviderQuery,
+                api: ObservationApi::ProviderQueryCallback,
+                operation: Operation::Other,
+                class: AlgorithmClass::Other,
+                monotonic_ns: 4,
+                confidence: ScopeConfidence::Observed,
+                payload,
+            });
+        }
+        invalidate_algorithms(&mut batch);
+        for fact in batch.facts {
+            let algorithm = match fact.payload {
+                ObservationPayload::Algorithm { algorithm, .. }
+                | ObservationPayload::Implementation { algorithm, .. } => algorithm,
+                _ => unreachable!(),
+            };
+            assert_eq!(algorithm, super::super::assembly::other());
+        }
+    }
+
+    #[test]
     fn role_conflicts_retire_both_discovery_orders_and_cannot_rearm() {
         for (first, second) in [
             (c::QUERY_CALLBACK, c::UNQUERY_CALLBACK),
@@ -976,19 +1108,20 @@ mod tests {
     }
     #[test]
     fn conflict_disarm_closes_both_links_even_on_map_failure() {
-        use std::os::fd::FromRawFd;
+        use std::{io::Read, os::unix::net::UnixStream};
         for fail in [false, true] {
-            let raw = [unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) }, unsafe {
-                libc::eventfd(0, libc::EFD_CLOEXEC)
-            }];
-            assert!(raw.iter().all(|fd| *fd >= 0));
-            let links = raw
-                .into_iter()
-                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
-                .collect();
+            let mut peers = Vec::new();
+            let mut links = Vec::new();
+            for _ in 0..2 {
+                let (link, peer) = UnixStream::pair().unwrap();
+                peer.set_nonblocking(true).unwrap();
+                peers.push(peer);
+                links.push(OwnedFd::from(link));
+            }
+            let raw: Vec<_> = links.iter().map(AsRawFd::as_raw_fd).collect();
             let result = disarm_links(links, || {
-                for fd in raw {
-                    assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+                for &fd in &raw {
+                    assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
                 }
                 if fail {
                     Err(ObservationGap::AttachFailed)
@@ -997,8 +1130,10 @@ mod tests {
                 }
             });
             assert_eq!(result.is_err(), fail);
-            for fd in raw {
-                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1)
+            // EOF proves these exact owned endpoints closed, even if another
+            // parallel test has already reused their descriptor numbers.
+            for mut peer in peers {
+                assert_eq!(peer.read(&mut [0]).unwrap(), 0);
             }
         }
     }
@@ -1076,6 +1211,123 @@ mod tests {
         assert_eq!(*calls.borrow(), vec!["validate", "arm", "validate"]);
     }
     #[test]
+    fn range_search_matches_actual_executable_maps_and_eight_lookup_bound() {
+        let text = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let mut ranges = Vec::new();
+        for line in text.lines() {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            if fields[1].as_bytes()[2] != b'x' || fields[4] == "0" {
+                continue;
+            }
+            let (start, end) = fields[0].split_once('-').unwrap();
+            ranges.push((
+                u64::from_str_radix(start, 16).unwrap(),
+                u64::from_str_radix(end, 16).unwrap(),
+            ));
+        }
+        assert!(!ranges.is_empty());
+        assert!(ranges.len() <= 128);
+        let oracle = ranges.clone();
+        ranges.reverse(); // Task1's priority passes need not preserve address order.
+        let sorted = order_ranges(ranges).unwrap();
+        assert!(
+            sorted.windows(2).all(|pair| pair[0].1 <= pair[1].0),
+            "admitted ranges must be sorted and disjoint"
+        );
+        let mut points = vec![
+            0,
+            4095,
+            4096,
+            0xffff_ffff_ffff,
+            0x1_0000_0000_0000,
+            u64::MAX,
+        ];
+        for &(start, end) in &oracle {
+            points.extend([start - 1, start, start + (end - start) / 2, end - 1, end]);
+        }
+        for address in points {
+            let expected = (4096..=0xffff_ffff_ffff).contains(&address)
+                && oracle
+                    .iter()
+                    .any(|&(start, end)| start <= address && address < end);
+            let mut lookups = 0;
+            let found = c::code_in_ranges(address, sorted.len() as u32, |index| {
+                lookups += 1;
+                sorted
+                    .get(index as usize)
+                    .map(|&(start, end)| c::Range { start, end })
+            });
+            assert_eq!(
+                found, expected,
+                "range membership differs from independent linear oracle"
+            );
+            assert!(
+                lookups <= 8,
+                "range search exceeded eight lookups: {lookups}"
+            );
+        }
+    }
+    #[test]
+    fn range_search_all_128_slots_and_boundaries() {
+        let ranges: Vec<_> = (0..128u64)
+            .map(|index| (4096 + index * 32, 4112 + index * 32))
+            .collect();
+        for address in 4095..=8192 {
+            let expected = ranges
+                .iter()
+                .any(|&(start, end)| start <= address && address < end);
+            let mut calls = 0;
+            let found = c::code_in_ranges(address, 128, |index| {
+                calls += 1;
+                ranges
+                    .get(index as usize)
+                    .map(|&(start, end)| c::Range { start, end })
+            });
+            assert_eq!(found, expected);
+            assert!(calls <= 8, "range search exceeded eight lookups: {calls}");
+        }
+    }
+    #[test]
+    fn range_metadata_count_and_missing_slots_fail_closed() {
+        assert_eq!(std::mem::size_of::<c::Member>(), 24);
+        for count in [0, 129, u32::MAX] {
+            assert!(!c::code_in_ranges(4096, count, |_| panic!(
+                "invalid count must not access RANGES"
+            )));
+        }
+        for address in [0, 4095, 0x1_0000_0000_0000, u64::MAX] {
+            assert!(!c::code_in_ranges(address, 128, |_| panic!(
+                "noncanonical code must not access RANGES"
+            )));
+        }
+        assert!(!c::code_in_ranges(4096, 128, |_| None));
+        assert!(c::code_in_ranges(8192, 2, |index| Some(if index == 0 {
+            c::Range {
+                start: 4096,
+                end: 8192,
+            }
+        } else {
+            c::Range {
+                start: 8192,
+                end: 12288,
+            }
+        })));
+    }
+    #[test]
+    fn range_admission_refuses_overlaps_and_malformed_intervals() {
+        assert!(matches!(
+            order_ranges(vec![(4096, 8192), (5000, 6000)]),
+            Err(ObservationGap::AmbiguousSite)
+        ));
+        assert!(order_ranges(vec![(4096, 4096)]).is_err());
+        assert!(order_ranges(vec![(8192, 4096)]).is_err());
+        assert!(order_ranges(vec![(4096, 8192); 129]).is_err());
+        assert_eq!(
+            order_ranges(vec![(8192, 12288), (4096, 8192)]).unwrap(),
+            vec![(4096, 8192), (8192, 12288)]
+        );
+    }
+    #[test]
     fn same_site_multiple_candidates() {
         let a: ObjectHash = "a".repeat(64).try_into().unwrap();
         let b: ObjectHash = "b".repeat(64).try_into().unwrap();
@@ -1101,12 +1353,12 @@ mod tests {
     }
     #[test]
     fn return_link_failure_rolls_back() {
-        use std::os::fd::FromRawFd;
-        let raw = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) };
-        assert!(raw >= 0);
-        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        use std::{io::Read, os::unix::net::UnixStream};
+        let (link, mut peer) = UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let owned = OwnedFd::from(link);
         assert!(paired_links(|| Ok(owned), || Err(ObservationGap::AttachFailed)).is_err());
-        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
     #[test]
     fn real_bpf_object_prepares_when_built() {
