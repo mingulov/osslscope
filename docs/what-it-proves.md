@@ -49,6 +49,8 @@ scope. Leader retirement/nonleader exec can lose coverage, so there is no
 seamless-follow or per-image guarantee. The library/catalogue and native kernel
 behavior require the actual installed qualification controls.
 
+<a id="terminal-count-proof-in-development"></a>
+
 ## Closure, custody and privacy
 
 Child exit is observed without consuming its wait status. The existing count

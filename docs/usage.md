@@ -383,25 +383,37 @@ proves non-use. Production first-call and final-tail coverage remain unknown.
 
 <a id="reusable-policy-files"></a>
 
-`check` requires an algorithm rule such as `--require-executed SHA256` or
-`--deny-algorithm AES-256-GCM`, or a bounded policy file:
+`check` accepts algorithm rules (`--require-executed`, `--deny-algorithm`),
+provider rules (`--require-provider`, `--deny-provider`), `--deny-engine` and
+`--deny-weak`. At least one rule is required, supplied on the CLI or in a
+bounded policy file:
 
 ```toml
 version = 1
 require-executed = ["SHA256"]
 ```
 
-Use `--policy FILE`; CLI constraints are additive. Names must exist in the
-frozen registry. Contradictions and provider/ENGINE/weak predicates refuse.
-Unknown-only normal evidence leaves algorithm rules inconclusive, including
-when the physical fixture count is positive.
+Use `--policy FILE`; CLI constraints are additive. Algorithm names must exist
+in the frozen registry; provider identities can include opaque third-party
+classes. With `--policy`, required providers denied by provider/ENGINE rules
+and required algorithms denied directly or by `--deny-weak` are rejected.
+CLI-only rules do not receive this contradiction check. Unknown-only normal
+evidence leaves algorithm rules inconclusive, including when the physical
+fixture count is positive. Accepting provider/ENGINE/weak rules does not turn
+Unknown attribution into definite policy evidence.
 
-Execution observation admits one process, 256 objects, 512 observer links,
-4096 pending calls, depth 8, 4096 learned candidates and 16384 facts, with a
-1 MiB ring, 64 MiB cumulative host-state charges and 256 MiB cumulative ELF
-read work. Counting adds at most 512 active links, 4096 lifetime cookies,
-8192 map keys, 256 possible CPUs and 32 MiB host-state charges; the combined
-link bound is 1024. Charges precede allocation/attachment; cookie meanings are
+Explicit legacy diagnostics (`--libcrypto`) accept only `--require-executed`
+and `--deny-algorithm`; provider, ENGINE and weak predicates are refused.
+
+The provider observation session admits one process, 256 objects, 512 observer
+links, 4096 pending calls, depth 8, 4096 learned candidates and 16384 facts,
+with a 1 MiB ring, 64 MiB cumulative host-state charges and its own 256 MiB
+cumulative ELF-read budget. The separate passive inventory scanner receives
+a per-snapshot read allowance of 256 MiB minus the initial inventory read
+charges. That allowance renews for each snapshot; repeated snapshots can
+exceed 256 MiB of total read work across the command. Counting adds at most
+512 active links, 4096 lifetime cookies, 8192 map keys, 256 possible CPUs and
+32 MiB host-state charges; the combined link bound is 1024. Charges precede allocation/attachment; cookie meanings are
 never recycled. Fixed maps bound kernel storage separately; host-state charges
 are not a total kernel memory claim. Resource/deadline failures remain gaps.
 
