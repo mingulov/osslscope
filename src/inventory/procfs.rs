@@ -656,36 +656,7 @@ pub(super) fn snapshot_reused(
         .collect();
     let mut selected_pids = order.clone();
     selected_pids.sort_unstable();
-    let mut processes = Vec::new();
-    for &pid in &order {
-        if let Err(reason) = work.deadline() {
-            work.gap(Some(pid), None, reason);
-            break;
-        }
-        state.cursor = Some(pid);
-        work.totals.processes_attempted += 1;
-        match process(pid, &mut work) {
-            Ok(process) => processes.push(process),
-            Err(reason) => work.gap(Some(pid), None, reason),
-        }
-        if work.totals.objects_attempted >= options.limits.max_objects || work.remaining() == 0 {
-            // The next poll resumes at a different process, even when this
-            // process consumed the entire snapshot allowance.
-            if order.last() != Some(&pid) {
-                work.gap(
-                    None,
-                    None,
-                    if work.remaining() == 0 {
-                        GapReason::ReadLimit
-                    } else {
-                        GapReason::ObjectLimit
-                    },
-                );
-            }
-            break;
-        }
-    }
-    processes.sort_by_key(|p| p.pid);
+    let processes = sample_order(&order, &mut work, state);
     work.cache.retain(|key, value| {
         value.seen
             && value
@@ -721,9 +692,79 @@ pub(super) fn snapshot_reused(
     }
 }
 
+fn sample_order(order: &[u32], work: &mut Work<'_>, state: &mut ScanState) -> Vec<ProcessRecord> {
+    let mut processes = Vec::new();
+    for &pid in order {
+        if let Err(reason) = work.deadline() {
+            // Every remaining admitted PID is unsampled. A PID-specific gap
+            // would let watch mistake the others for successful absences.
+            work.gap(None, None, reason);
+            break;
+        }
+        state.cursor = Some(pid);
+        work.totals.processes_attempted += 1;
+        match process(pid, work) {
+            Ok(process) => processes.push(process),
+            Err(reason) => work.gap(Some(pid), None, reason),
+        }
+        if work.totals.objects_attempted >= work.options.limits.max_objects || work.remaining() == 0
+        {
+            // The next poll resumes at a different process, even when this
+            // process consumed the entire snapshot allowance.
+            if order.last() != Some(&pid) {
+                work.gap(
+                    None,
+                    None,
+                    if work.remaining() == 0 {
+                        GapReason::ReadLimit
+                    } else {
+                        GapReason::ObjectLimit
+                    },
+                );
+            }
+            break;
+        }
+    }
+    processes.sort_by_key(|p| p.pid);
+    processes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Catches deadline uncertainty applying only to the first skipped PID.
+    #[test]
+    fn expired_admitted_population_has_uncertainty_for_every_skipped_pid() {
+        let options = SnapshotOptions {
+            pids: vec![7, 11, 13],
+            limits: super::super::Limits {
+                timeout: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+        };
+        let mut work = Work {
+            options: &options,
+            include_other: false,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+        };
+        let mut state = ScanState::default();
+        assert!(sample_order(&options.pids, &mut work, &mut state).is_empty());
+        assert_eq!(work.totals.processes_attempted, 0);
+        assert_eq!(state.cursor, None);
+        for &pid in &options.pids {
+            assert!(
+                work.gaps.iter().any(|gap| {
+                    gap.reason == GapReason::Deadline && (gap.pid.is_none() || gap.pid == Some(pid))
+                }),
+                "skipped PID {pid} has no applicable deadline uncertainty: {:?}",
+                work.gaps
+            );
+        }
+    }
 
     // Catches accepting truncated/overflowing/non-file mappings as identities.
     #[test]

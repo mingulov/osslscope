@@ -349,3 +349,89 @@ pub(super) fn run_formatted(
     emit(&end, writer, human)?;
     Ok(end)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Child, Command, Stdio};
+
+    struct Owned(Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            assert!(self.0.wait().unwrap().success());
+        }
+    }
+
+    // Catches treating duration-skipped live PIDs as absent, while preserving
+    // successful sampled scope departure as process_not_seen.
+    #[test]
+    fn duration_capped_snapshot_loses_visibility_for_all_live_pids() {
+        let mut children: Vec<_> = (0..3)
+            .map(|_| {
+                Owned(
+                    Command::new("/bin/cat")
+                        .stdin(Stdio::piped())
+                        .stdout(Stdio::null())
+                        .spawn()
+                        .unwrap(),
+                )
+            })
+            .collect();
+        let pids: Vec<_> = children.iter().map(|child| child.0.id()).collect();
+        let mut scanner = ScopedScanner::new(
+            Selection {
+                pids: pids.clone(),
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        let previous = scanner.snapshot();
+        assert_eq!(previous.processes.len(), pids.len());
+
+        // This is the production final-duration snapshot route, with no
+        // remaining acquisition budget rather than a host-specific deadline.
+        let current = scanner.snapshot_for(Duration::ZERO);
+        assert!(current.processes.is_empty());
+        let observed = serde_json::to_value(changes(Some(&previous), &current)).unwrap();
+        let observed = observed.as_array().unwrap();
+        assert_eq!(observed.len(), pids.len());
+        for &pid in &pids {
+            assert!(
+                observed
+                    .iter()
+                    .any(|change| { change["pid"] == pid && change["kind"] == "visibility_lost" })
+            );
+        }
+
+        // A successful scan of a smaller selection can still report a sampled
+        // departure for the omitted live processes.
+        let mut remaining = ScopedScanner::new(
+            Selection {
+                pids: vec![pids[0]],
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        let current = remaining.snapshot();
+        assert_eq!(current.processes.len(), 1);
+        assert!(visible(&current, pids[1]));
+        assert!(visible(&current, pids[2]));
+        let observed = serde_json::to_value(changes(Some(&previous), &current)).unwrap();
+        for &pid in &pids[1..] {
+            let matching: Vec<_> = observed
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|change| change["pid"] == pid)
+                .collect();
+            assert_eq!(matching.len(), 1);
+            assert_eq!(matching[0]["kind"], "process_not_seen");
+        }
+        for child in &mut children {
+            assert!(child.0.try_wait().unwrap().is_none());
+        }
+    }
+}
