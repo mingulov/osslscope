@@ -264,7 +264,7 @@ fn invalid_selectors_fail_before_io() {
             "1",
         ],
         vec!["inspect", "--module", "/PRIVATE_CANARY_missing", "--watch"],
-        vec!["scan", "--cgroup", "PRIVATE_CANARY_value"],
+        vec!["scan", "--cgroup"],
         vec!["scan", "--pid"],
     ] {
         let output = cli(&args);

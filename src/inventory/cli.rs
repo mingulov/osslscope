@@ -13,12 +13,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
 
-const HELP: &str = "usage: osslscope scan [--pid PID ...] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
+const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
 
 struct Options {
     pids: Vec<u32>,
     modules: Vec<PathBuf>,
+    cgroup: Option<PathBuf>,
     json: bool,
 }
 fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
@@ -26,6 +27,7 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
         pids: Vec::new(),
         modules: Vec::new(),
         json: false,
+        cgroup: None,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
@@ -42,12 +44,19 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
                 }
                 options.pids.push(pid);
             }
-            "--module" if command == "inspect" => {
+            "--module" => {
                 let path = args.next().ok_or(())?;
                 if path.is_empty() || path.starts_with("--") {
                     return Err(());
                 }
                 options.modules.push(PathBuf::from(path));
+            }
+            "--cgroup" if command == "scan" && options.cgroup.is_none() => {
+                let path = args.next().ok_or(())?;
+                if path.is_empty() || path.starts_with("--") {
+                    return Err(());
+                }
+                options.cgroup = Some(PathBuf::from(path));
             }
             _ => return Err(()),
         }
@@ -222,7 +231,24 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        if options.modules.is_empty() {
+        if command == "scan" {
+            let mut scanner = match super::scope::ScopedScanner::new(
+                super::scope::Selection {
+                    pids: options.pids,
+                    cgroup: options.cgroup,
+                    modules: options.modules,
+                },
+                Limits::default(),
+            ) {
+                Ok(scanner) => scanner,
+                Err(_) => {
+                    crate::report::err_line("osslscope discovery: requested scope unavailable");
+                    return ExitCode::from(4);
+                }
+            };
+            let result = scanner.snapshot();
+            render(&result, options.json, &mut output).map(|()| result.exit_code())
+        } else if options.modules.is_empty() {
             let result = snapshot(&SnapshotOptions {
                 pids: options.pids,
                 limits: Limits::default(),

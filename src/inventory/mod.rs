@@ -4,6 +4,7 @@
 
 pub mod cli;
 pub mod elf;
+pub mod scope;
 
 use serde::{Deserialize, Serialize};
 
@@ -71,6 +72,11 @@ pub enum GapReason {
     ObjectLimit,
     MalformedMaps,
     Deadline,
+    UnsupportedCgroup,
+    CgroupUnavailable,
+    CgroupLimit,
+    MembershipUnknown,
+    NamespaceUnavailable,
 }
 
 /// File identity plus finite interface evidence; never paths or raw symbols.
@@ -151,6 +157,8 @@ pub enum ObservationState {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessRecord {
+    pub interval: CaptureInterval,
+    pub namespaces: NamespaceIds,
     pub pid: u32,
     pub starttime: u64,
     pub modules: Vec<ModuleRecord>,
@@ -169,6 +177,9 @@ pub enum SnapshotMode {
 pub enum Scope {
     System,
     Pids,
+    Cgroup,
+    Modules,
+    Intersection,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +221,8 @@ pub struct WorkTotals {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
+    pub interval: CaptureInterval,
+    pub scope_record: ScopeRecord,
     pub schema_version: String,
     pub mode: SnapshotMode,
     pub scope: Scope,
@@ -234,4 +247,58 @@ impl Snapshot {
 /// Read-only, file-backed discovery; no target memory, code, signals or BPF.
 pub fn snapshot(options: &SnapshotOptions) -> Snapshot {
     procfs::snapshot(options)
+}
+
+/// Observer clocks describe capture only; wall time may move independently.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureInterval {
+    pub started_unix_ms: Option<u64>,
+    pub finished_unix_ms: Option<u64>,
+    pub elapsed_ns: u64,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceId {
+    pub device: u64,
+    pub inode: u64,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceIds {
+    pub pid: Option<NamespaceId>,
+    pub mount: Option<NamespaceId>,
+}
+/// Native cgroup identity and supplied content hashes, without locators.
+/// Membership is sampled in the observer's visible PID/cgroup namespaces.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScopeRecord {
+    pub cgroup: Option<NamespaceId>,
+    pub modules: Vec<String>,
+}
+pub(super) struct CaptureClock {
+    started: std::time::Instant,
+    wall: Option<u64>,
+}
+impl CaptureClock {
+    pub(super) fn start() -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            wall: wall_ms(),
+        }
+    }
+    pub(super) fn finish(&self) -> CaptureInterval {
+        CaptureInterval {
+            started_unix_ms: self.wall,
+            finished_unix_ms: wall_ms(),
+            elapsed_ns: u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+}
+fn wall_ms() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| u64::try_from(d.as_millis()).ok())
 }

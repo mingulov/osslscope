@@ -3,9 +3,9 @@
 //! as execution evidence. No producer bootstrap or target-memory dependency.
 
 use super::{
-    Capabilities, Gap, GapReason, IdentityStatus, InventoryState, ModuleInfo, ModuleRecord,
-    ObjectKind, ObservationState, ProcessRecord, Scope, Snapshot, SnapshotMode, SnapshotOptions,
-    WorkTotals, elf,
+    Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, ModuleInfo,
+    ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, ProcessRecord, Scope,
+    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, elf,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
@@ -144,7 +144,7 @@ impl Process {
         Ok(())
     }
 }
-fn open_at(directory: &File, name: &[u8]) -> io::Result<File> {
+pub(super) fn open_at(directory: &File, name: &[u8]) -> io::Result<File> {
     let name = CString::new(name).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: directory/name remain live; the returned FD is owned exactly
     // once. Nonblocking prevents FIFO open from waiting for a writer.
@@ -212,6 +212,7 @@ struct Cached {
 }
 struct Work<'a> {
     options: &'a SnapshotOptions,
+    include_other: bool,
     started: Instant,
     totals: WorkTotals,
     gaps: BTreeSet<Gap>,
@@ -306,7 +307,7 @@ impl Work<'_> {
     }
 }
 
-fn filesystem(file: &File) -> Option<libc::c_long> {
+pub(super) fn filesystem(file: &File) -> Option<libc::c_long> {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: fstatfs initializes stat on success and borrows an open FD.
     if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } == 0 {
@@ -375,7 +376,26 @@ fn backing(
 }
 
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
+    let clock = CaptureClock::start();
     let process = Process::open(pid, work)?;
+    let namespace = |name: &[u8]| {
+        open_at(&process.directory, name).ok().and_then(|f| {
+            f.metadata().ok().map(|m| {
+                (
+                    f,
+                    NamespaceId {
+                        device: m.dev(),
+                        inode: m.ino(),
+                    },
+                )
+            })
+        })
+    };
+    let pid_ns = namespace(b"ns/pid");
+    let mount_ns = namespace(b"ns/mnt");
+    if pid_ns.is_none() || mount_ns.is_none() {
+        work.gap(Some(pid), None, GapReason::NamespaceUnavailable);
+    }
     let maps_file =
         open_at(&process.directory, b"maps").map_err(|_| GapReason::ProcessUnavailable)?;
     let maps = work.read(maps_file, work.options.limits.max_maps_bytes)?;
@@ -424,7 +444,7 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
             continue;
         }
         match work.inspect(file, &metadata) {
-            Ok(info) if info.kind != ObjectKind::Other => modules.push((
+            Ok(info) if work.include_other || info.kind != ObjectKind::Other => modules.push((
                 ModuleRecord {
                     info,
                     identity_status,
@@ -479,7 +499,22 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     process.validate(work)?;
     modules
         .sort_by(|a, b| (a.0.info.device, a.0.info.inode).cmp(&(b.0.info.device, b.0.info.inode)));
+    let mut namespaces = NamespaceIds {
+        pid: pid_ns.as_ref().map(|(_, id)| *id),
+        mount: mount_ns.as_ref().map(|(_, id)| *id),
+    };
+    for (name, identity) in [
+        (b"ns/pid".as_slice(), &mut namespaces.pid),
+        (b"ns/mnt".as_slice(), &mut namespaces.mount),
+    ] {
+        if namespace(name).map(|(_, id)| id) != *identity {
+            *identity = None;
+            work.gap(Some(pid), None, GapReason::NamespaceUnavailable);
+        }
+    }
     Ok(ProcessRecord {
+        interval: clock.finish(),
+        namespaces,
         pid,
         starttime: process.starttime,
         modules: modules.into_iter().map(|(module, _)| module).collect(),
@@ -490,14 +525,26 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
 }
 
 pub(super) fn snapshot(options: &SnapshotOptions) -> Snapshot {
+    snapshot_selected(options, options.pids.is_empty())
+}
+/// The explicit mode preserves an empty resolved selection as empty.
+pub(super) fn snapshot_selected(options: &SnapshotOptions, system: bool) -> Snapshot {
+    snapshot_scoped(options, system, false)
+}
+pub(super) fn snapshot_scoped(
+    options: &SnapshotOptions,
+    system: bool,
+    include_other: bool,
+) -> Snapshot {
+    let clock = CaptureClock::start();
     let mut work = Work {
+        include_other,
         options,
         started: Instant::now(),
         totals: WorkTotals::default(),
         gaps: BTreeSet::new(),
         cache: BTreeMap::new(),
     };
-    let system = options.pids.is_empty();
     let mut pids = BTreeSet::new();
     let mut admit = |pid, work: &mut Work<'_>| {
         if let Err(reason) = work.deadline() {
@@ -566,6 +613,8 @@ pub(super) fn snapshot(options: &SnapshotOptions) -> Snapshot {
         InventoryState::Partial
     };
     Snapshot {
+        interval: clock.finish(),
+        scope_record: ScopeRecord::default(),
         schema_version: "osslscope.discovery.v1".to_owned(),
         mode: SnapshotMode::Snapshot,
         scope: if system { Scope::System } else { Scope::Pids },
@@ -616,6 +665,7 @@ mod tests {
         let options = SnapshotOptions::default();
         let mut work = Work {
             options: &options,
+            include_other: false,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
@@ -632,6 +682,7 @@ mod tests {
         );
         let mut fresh = Work {
             options: &options,
+            include_other: false,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),

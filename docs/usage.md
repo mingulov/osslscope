@@ -8,17 +8,22 @@ learned-site execution plus installed qualification (D4) remain required.
 ## Passive discovery
 
 ```sh
-osslscope scan [--pid PID ...] [--json]
+osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--json]
 osslscope inspect --pid PID [--json]
 osslscope inspect --module PATH [--module PATH ...] [--json]
 ```
 
-With no PID, `scan` inventories visible numeric entries in the observer's
-procfs view. Repeated PIDs are deduplicated. `inspect` requires exactly one
-positive PID or one or more module paths; selector families cannot be mixed.
-Unknown, missing or conflicting arguments fail with exit 2 before discovery IO.
-`scan --help` and `inspect --help` exit 0. Watch and cgroup flags are not yet
-supported. PID namespaces and mount namespaces are not exhaustively resolved.
+With no selectors, `scan` inventories visible numeric entries in the observer's
+procfs view. Repeated PIDs are deduplicated. `--cgroup` selects a cgroup-v2
+directory and its inclusive subtree. `--module` selects mapped ELF content by
+SHA-256; repeat it to accept any supplied hash. PID, cgroup and module selector
+families intersect. A resolved empty intersection stays empty. Unavailable,
+invalid or changed selectors never widen the request to the system population.
+Physical copies with the same hash retain their distinct native file identities.
+`inspect` requires exactly one positive PID or one or more module paths;
+its selector families cannot be mixed. Unknown, missing or conflicting arguments
+fail with exit 2 before discovery IO. `scan --help` and `inspect --help` exit 0.
+Watch flags are not yet supported.
 
 No `--libcrypto`, enrolled profile, manual offset, BPF object, or privilege
 setup is required. Normal procfs and filesystem permissions apply. No supplied
@@ -32,6 +37,9 @@ For example, substitute a visible PID and actual file paths:
 
 ```sh
 osslscope scan --pid 1234 --pid 5678 --json
+osslscope scan --cgroup /sys/fs/cgroup/example.service --json
+osslscope scan --pid 1234 --cgroup /sys/fs/cgroup/example.service \
+  --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
 osslscope inspect --pid 1234
 osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
 osslscope inspect --module /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so --json
@@ -40,6 +48,12 @@ osslscope inspect --module /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so --js
 Both JSON modes use `schema_version: "osslscope.discovery.v1"`. Process output
 has `mode: "snapshot"`, selected PIDs, process/starttime identities, relevant
 module metadata, finite gaps, work totals, limits and capability status.
+Snapshot and process `interval` fields contain optional observer Unix-millisecond
+start/finish clocks and monotonic `elapsed_ns`. Wall clocks may move independently.
+Process `namespaces` contain optional native device/inode identities for the PID
+and mount namespaces. Unreadable or changing namespace metadata stays unknown
+with a gap. `scope_record` contains only the selected cgroup's native device/inode
+identity and computed supplied-module SHA-256 IDs.
 Module output has `mode: "module"`, deduplicated `modules`, finite `errors`
 with zero-based `input_index`, work totals, limits and capability status. No
 raw target paths, names, symbol strings or mapping addresses enter either
@@ -71,6 +85,29 @@ or an admitted bounded parse. A budget failure preserves earlier independent
 results and reports a finite gap/error. Discovery snapshots are not atomic;
 detectable mapping/file/process churn is reported, and later changes or
 undetectable mutate-and-restore races are not ruled out.
+
+Cgroup selection pins the actual cgroup2 directory and samples numeric membership
+before and after inventory. Both passes together admit at most 4096 directory
+visits and 4 MiB of numeric membership bytes; their reads also consume the shared
+read/deadline budget. Only domain cgroups are supported: threaded, inaccessible,
+malformed or invisible membership produces a finite refusal/gap. The real
+hierarchy root has an implicit domain type. Membership changes produce a gap;
+retained process records must be in the same single native cgroup at both sample
+boundaries. Nested mount crossings or unavailable mount identities omit the
+uncertain subtree and add a gap, preserving independently validated members.
+`statx` mount identity support is required for cgroup subtree traversal.
+Procfs and cgroup PID coordinates must agree. Visibility remains the
+observer's namespace/permission view, with no claim about inaccessible host or
+cluster populations. A cgroup pathname supplied inside a container must be
+visible to the observer in its mount namespace.
+
+Module selectors are opened, bounded and hashed once during scanner construction,
+with unchanged descriptor metadata checked at each snapshot boundary. This setup
+has its own shared read/object/deadline limits; snapshot work totals describe
+sampling after setup. Replaced paths do not retarget the pinned selection.
+Changed selector descriptors make the scope unavailable. Supplied hashes can
+select ELF files classified as `other`; automatic unfiltered discovery still
+reports only relevant OpenSSL interfaces/dependencies.
 
 Discovery exits: **0** requested inventory completed without access/resource
 failure; **3** useful partial inventory; **4** wholly unavailable observation;

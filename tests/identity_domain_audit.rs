@@ -127,6 +127,11 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/inventory/procfs.rs", "raw", "dev: m.dev(),", 1),
+        // Namespace and cgroup descriptor IDs retain native dev_t; selector
+        // fingerprints compare fstat metadata only, never encoded map IDs.
+        ("src/inventory/procfs.rs", "raw", "device: m.dev(),", 1),
+        ("src/inventory/scope.rs", "raw", "device: m.dev(),", 1),
+        ("src/inventory/scope.rs", "raw", "m.dev(),", 1),
         // Mapping text major/minor is converted with libc::makedev before
         // all joins. The explicit Btrfs branch permits its known distinct
         // subvolume st_dev; it does not convert device domains or establish
