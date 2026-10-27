@@ -114,6 +114,17 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Native retained observer namespace st_dev is used solely by the
+        // public namespace helper, never joined to maps text device values.
+        ("src/focused_count.rs", "raw", "device: meta.dev(),", 1),
+        // Explicit one-way conversion from native fstat dev_t to evidence's
+        // major/minor encoding. The roundtrip is covered by focused_count.
+        (
+            "src/focused_count.rs",
+            "stat",
+            "crate::plan::encode_device(libc::major(native), libc::minor(native))",
+            1,
+        ),
         // Companion snapshots and executable reopen checks compare native
         // fstat identities only; no maps or encoded device-domain join.
         ("src/provider_observation/artifact.rs", "raw", "m.dev(),", 1),

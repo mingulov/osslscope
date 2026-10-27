@@ -6240,3 +6240,71 @@ mod fix1_event_tests {
         assert!(ring.next().is_none());
     }
 }
+
+/// Focused Count adds only the public observer PID-namespace helper contract.
+/// The legacy seven-map Count owner/validators remain independent.
+pub const FOCUSED_COUNT_MAPS: [MapSpec; 9] = [
+    COUNT_MAPS[0],
+    COUNT_MAPS[1],
+    COUNT_MAPS[2],
+    COUNT_MAPS[3],
+    COUNT_MAPS[4],
+    COUNT_MAPS[5],
+    COUNT_MAPS[6],
+    MapSpec {
+        name: "NS_CONFIG",
+        map_type: 2,
+        key_size: 4,
+        value_size: 16,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "NSFAIL",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
+];
+/// Pure, fail-closed shape/privacy admission for the learned-site counter.
+pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
+    validate_count_object(object)?;
+    let prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
+    anyhow::ensure!(
+        prepared.maps.len() == 9 && prepared.progs.len() == 1,
+        "focused shape"
+    );
+    let root = &prepared.progs[0];
+    anyhow::ensure!(
+        root.name == "count_entry"
+            && !root.is_return
+            && !root.insns.is_empty()
+            && root.insns.len() % 8 == 0
+            && root
+                .subprogs
+                .first()
+                .is_some_and(|s| s.name == "count_entry" && s.insn_off == 0)
+            && root.subprogs.iter().all(|s| !s.is_callback),
+        "focused root"
+    );
+    let mut namespace_helper = false;
+    for i in root.insns.chunks_exact(8) {
+        anyhow::ensure!(!(i[0] == 0x18 && i[1] >> 4 == 4), "focused callback");
+        if i[0] == 0x85 && i[1] >> 4 == 0 {
+            let helper = u32le(&i[4..8]);
+            anyhow::ensure!([1, 2, 5, 120, 174].contains(&helper), "focused helper");
+            namespace_helper |= helper == 120;
+        }
+    }
+    anyhow::ensure!(namespace_helper, "focused namespace helper absent");
+    for fixup in &root.map_fixups {
+        check_ld_imm64_site(&root.insns, fixup.insn_off, &root.name)?;
+        anyhow::ensure!(
+            FOCUSED_COUNT_MAPS.iter().any(|m| m.name == fixup.map),
+            "focused map fixup"
+        );
+    }
+    Ok(prepared)
+}

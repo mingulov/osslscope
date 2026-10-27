@@ -863,7 +863,7 @@ fn acquire_observable(
             .info
             .exports
             .iter()
-            .any(|api| ObservationApi::Inventoried(*api).export_name().is_some())
+            .any(|api| (1..=15).any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api))))
     }) {
         return Ok(None);
     }
@@ -1120,6 +1120,7 @@ mod tests {
                 exports: vec![
                     inventory::Api::OpenSslInitCrypto,
                     inventory::Api::OpenSslVersionMajor,
+                    inventory::Api::OsslProviderGet0Dispatch,
                 ],
                 depends_on_libcrypto: true,
                 depends_on_libssl: false,

@@ -1961,3 +1961,16 @@ mod tests {
         }
     }
 }
+
+/// Native observer PID namespace identity for the focused counter helper.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CountNamespace {
+    pub device: u64,
+    pub inode: u64,
+}
+/// Namespace-helper failure and a closed target never authorize a count.
+#[inline(always)]
+pub const fn focused_namespace_admits(result: i64, tgid: u32, target: u64) -> bool {
+    result == 0 && target != 0 && tgid as u64 == target
+}
