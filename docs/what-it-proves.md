@@ -1,6 +1,41 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Observation meaning and limits
 
+## Current v0.3 discovery and observation
+
+Normal `scan`/`inspect` discover mapped OpenSSL-compatible objects and provider
+interfaces without an enrolled build or supplied offset. Watch samples changes;
+PID/cgroup/module selectors narrow inventory. A mapping is presence evidence,
+not provider activation or crypto execution.
+
+Public provider API/init/query observation can learn advertised callbacks.
+Normal `report`/`check` count physical entries at verified learned sites in one
+selected process and its threads. An entry contributes once even if several
+algorithms/providers share the address. Candidate coverage stays Unknown:
+normal reports are PARTIAL, algorithm policies inconclusive and definite CBOM
+assets absent. API success, advertisement and callback entry remain different
+facts; none establishes crypto/application success or FIPS/HSM state.
+
+Ordinary built-in default-provider initialization/query may bypass the exported
+hooks, so an actively computing application can yield zero callback counts.
+Warm/cached state, short startup, polling, invalidation and final-tail gaps also
+remain. Zero counts are not non-use. The [next-version plan](../ROADMAP.md#v040-automatic-observation)
+targets automatic table discovery and these ordinary workload paths.
+
+Inventory can cover multiple processes/cgroups; execution reports do not follow
+children or membership. Permission/namespace/backing/resource failures stay
+explicit. There is no injection, target environment reader or private-layout
+enrollment in the normal path. Current [usage](usage.md),
+[release scope](release-v0.3.0.md) and the
+[actual release record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
+take precedence over historical diagnostics below. Installed results qualify
+only the named artifacts/workflows, not every provider/platform.
+
+## Historical v0.2 fixed-profile diagnostic
+
+The remainder describes the explicit `--libcrypto` legacy route and its earlier
+qualification; its exact-build restriction does not apply to normal v0.3 discovery.
+
 The v0.2.0 foreground route observes entries into a finite set of compiled
 OpenSSL implementation callbacks in one exact enrolled library/kernel profile.
 It launches one unchanged application, counts its original thread group and

@@ -1,9 +1,42 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Roadmap
 
-v0.3.0 is a discovery preview with focused execution implemented in source.
+v0.3.0 is a released discovery preview with focused execution.
 Discovery is the normal starting point; the v0.2.0 fixed-profile foreground
 route remains a legacy diagnostic with its original qualification boundary.
+
+## v0.4.0: automatic observation
+
+Planned next milestone: make ordinary OpenSSL workloads produce useful activity
+without an enrolled build, manual offsets, application changes or a provider-
+query driver. SHA/AES examples are regression cases, not an algorithm whitelist.
+
+- Discover public provider dispatch/algorithm table candidates from each exact
+  mapped ELF, with bounded relocation, function-start and backing validation.
+  Use public table pointers to find built-in query entrypoints even when their
+  symbols are hidden. Static-only sites use entry-only counting; a shape match
+  does not authorize target-data traversal or prove runtime advertisement.
+  No private EVP/provider layout or stored build offsets.
+- Cover all discoverable operation families and algorithms, including unfamiliar
+  providers/names. Runtime table identities and physical sites determine what
+  can be observed; name registries improve labels rather than admission.
+- Combine static table candidates, naturally observed public query returns,
+  exported API activity and callback counts. Preserve their different evidence
+  levels and shared-site ambiguity; static candidates do not prove activation.
+- Automatically prearm verified dependency candidates for owned runs and handle
+  warm processes/late objects. Add bounded discovery-to-observation watch for
+  selected PID/cgroup or visible-host scopes, with explicit membership/resource
+  gaps. No universal first-call or lossless following promise.
+- Show readable candidate hints even when coverage is Unknown. Preserve strict
+  policy/CBOM semantics; API calls do not become provider execution proof.
+- Qualify the real installed command path on independent stock builds, ordinary
+  workloads across multiple crypto families and available supported kernels;
+  measure actual tracing cost separately from passive inventory.
+
+This is planned work. Public-table recovery needs production false-positive,
+relocation and safe-attachment controls; experiments are not release acceptance.
+Feature completion and truthful runtime checks decide readiness, not a fixed
+date or a fallback to a small enrolled-algorithm release.
 
 ## v0.3.0: discover first, then observe
 
@@ -35,7 +68,10 @@ or release qualification. Discovery metadata alone produces neither an executed
 CBOM nor a policy verdict. Apply the finite fixture/stock-build, lifecycle,
 namespace, resource, privacy and two-kernel checks to one unchanged installed
 CLI/companion pair; see the [release procedure](docs/release-v0.3.0.md).
-The [bounded inventory cost sample](docs/release-v0.3.0.md#measured-inventory-cost)
+The [published record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
+reports the completed finite release checks; it does not close the ordinary
+default-provider or attribution gaps. The
+[bounded inventory cost sample](docs/release-v0.3.0.md#measured-inventory-cost)
 is separate from tracing and broad performance qualification. Source completion
 alone does not authorize a release.
 
@@ -80,7 +116,7 @@ incrementally. Additional capabilities remain later work:
 - Stronger completeness/first-call guarantees and broader performance,
   platform/provider and consumer qualification.
 
-These later tracks do not replace the remaining installed/runtime delivery gates.
+These later tracks do not replace qualification of each newly shipped workflow.
 ARM64 and OpenSSL before 3.0 remain later evaluation. Platform and performance
 claims will follow actual results, with their limits documented.
 

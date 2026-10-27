@@ -88,8 +88,8 @@ features. The scoped0.2.0 workflow and its qualification are described above.
   observation exclusions remain unchanged; see
   [what it proves](docs/what-it-proves.md).
 
-`v0.1.0` remains the historical tagged baseline until owner publication of the
-source preview. Its source-specific results below do not qualify later builds.
+`v0.1.0` is an earlier tagged baseline. Later v0.2.0 and v0.3.0 releases are
+described above; its source-specific results below do not qualify later builds.
 
 ## 0.1.0 (2026-10-18)
 

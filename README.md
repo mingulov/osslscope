@@ -6,8 +6,10 @@ observe public provider interfaces and count entries at learned callback sites
 for one selected process. Normal workflows need no enrolled library profile,
 manual offsets or application changes.
 
-**v0.3.0 discovery preview.** Source implementation and fixture checks do not
-establish installed runtime or platform qualification. See
+**v0.3.0 released discovery preview.** The
+[release record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
+reports the installed/runtime checks and their artifact identities. These finite
+results do not qualify every application or platform. See
 [release scope and qualification procedure](docs/release-v0.3.0.md).
 
 ## Discover, select, observe
@@ -26,7 +28,6 @@ osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
 osslscope doctor --format json
 osslscope report --pid 1234 --duration 30 --format json --out report.json --cbom bom.json
 osslscope check --pid 1234 --duration 30 --require-executed SHA256
-osslscope report --duration 5 --format json run -- openssl dgst -sha256 /dev/null
 ```
 
 Scan/watch narrows PID, cgroup and supplied-module selectors by intersection.
@@ -52,6 +53,13 @@ success. A shared implementation contributes its physical count once.
 Candidates and their coverage remain **Unknown**; learned advertisements do
 not establish a definite algorithm/provider count or definite CBOM asset.
 Normal reports remain **PARTIAL** and algorithm checks remain inconclusive.
+
+Ordinary default-provider activity can produce no callback counts: its internal
+initialization/query path can bypass the exported hooks currently observed.
+This can affect a sustained workload, as well as short commands that finish
+before probes attach. Discovery remains useful, but a zero callback result does
+not establish non-use. The [next-version plan](ROADMAP.md#v040-automatic-observation)
+prioritizes automatic observation of these ordinary applications.
 
 There is no universal first-call guarantee. Warm/built-in activation can remain
 unknown; startup, polling, invalidation and final drain leave explicit gaps.
