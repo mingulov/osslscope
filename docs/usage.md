@@ -413,8 +413,8 @@ a per-snapshot read allowance of 256 MiB minus the initial inventory read
 charges. That allowance renews for each snapshot; repeated snapshots can
 exceed 256 MiB of total read work across the command. Counting adds at most
 512 active links, 4096 lifetime cookies, 8192 map keys, 256 possible CPUs and
-32 MiB host-state charges; the combined link bound is 1024. Charges precede allocation/attachment; cookie meanings are
-never recycled. Fixed maps bound kernel storage separately; host-state charges
+32 MiB host-state charges; the combined link bound is 1024. Charges precede
+allocation/attachment; cookie meanings are never recycled. Fixed maps bound kernel storage separately; host-state charges
 are not a total kernel memory claim. Resource/deadline failures remain gaps.
 
 The controller polls/drains every 100 ms and rescans every second, with a
@@ -432,6 +432,8 @@ and a released owned workload are left running when observation ends; signal
 the observer PID rather than a process group containing the workload. Setup
 failure resolves stopped owned children. Observer crash/SIGKILL before child
 release can strand a stopped child and requires external cleanup.
+
+<a id="exit-codes"></a>
 
 ### Execution exit codes
 
