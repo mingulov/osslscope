@@ -35,11 +35,12 @@ capabilities or changes kernel/security settings. LSM, seccomp, lockdown,
 namespace policy and target access can deny operations despite capability bits.
 
 A user-owned local prefix is usable for passive discovery and ordinary-user
-controls. Any root, set-ID, file-capability or effective/permitted-capability
-invocation requires root-owned executable/companions and protected ancestor
-directories. Files and directories must not be group/world writable. Placing
-file capabilities on a user-owned `$HOME/.local` binary does not create a
-trusted tracing install; privileged companion selection refuses it.
+controls. Automatic companion selection under root, set-ID, file-capability or
+effective/permitted-capability invocation requires root-owned executable and
+companion files, with root-owned ancestor directories. Those files and
+directories must not be group/world writable. Placing file capabilities on a
+user-owned `$HOME/.local` binary does not create a protected automatic tracing
+install; automatic companion selection refuses it under privileged invocation.
 
 An administrator can install the already built manifest into a protected prefix:
 
@@ -52,10 +53,15 @@ getcap /usr/local/bin/osslscope
 
 Review ownership/permissions through the entire prefix and use local security
 policy to decide privileges. Replacing the binary may require restoring file
-capabilities. Explicit companion overrides obey privileged trust checks too.
-Object shape/hash checks establish compatibility and identity, not the safety
-of arbitrary supplied BPF. A normal same-source build provides the retained
-companion pair without manual object flags.
+capabilities. Explicit `--observation-object` and `--count-object` paths select
+operator-trusted code snapshots. They check regular-file identity, bounded
+nonzero length, stability during reading and companion ABI, and retain the
+validated bytes. They permit symlink traversal and do not enforce the automatic
+resolver's ownership, mode or ancestor protections, including under privileged
+invocation. The operator must establish the safety and provenance of explicitly
+selected code. Object shape/hash checks establish compatibility and identity,
+not the safety of arbitrary supplied BPF. A normal same-source build provides
+the retained companion pair without manual object flags.
 
 Doctor performs scanner-owned program/map load, self-attachment and companion
 load controls, and checks inventory/namespaces. It reports denied/unavailable

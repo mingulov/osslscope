@@ -325,8 +325,12 @@ They select the fixed installed observation/focused-count companions automatical
 no `--libcrypto`, profile or manual callback offsets are required. There is no
 hidden fallback to historical diagnostics. See [install](install.md) for trust
 requirements. Explicit `--observation-object` and `--count-object` overrides are
-operator-trusted BPF code, subject to object/privilege checks; compatibility and
-hashes do not authenticate arbitrary BPF or establish its privacy.
+operator-trusted BPF code snapshots: regular-file identity, bounded nonzero
+length, read stability and companion ABI are checked before retaining bytes.
+Explicit paths permit symlink traversal and do not enforce automatic selection's
+ownership, mode or ancestor protections, including under privileged invocation.
+Compatibility and hashes do not authenticate arbitrary BPF or establish its
+privacy; the operator must establish the safety of explicitly selected code.
 
 A document covers one process incarnation and its threads. Cgroup/container
 inventory chooses a PID, not an implicit tracing group. Forks, children, process
@@ -422,8 +426,8 @@ release can strand a stopped child and requires external cleanup.
 | 0 | Help or successful doctor controls; no complete execution claim. |
 | 1 | Child failure, artifact delivery failure or usable runtime failure. |
 | 2 | Invalid arguments/policy or invalid explicit companion. |
-| 3 | PARTIAL report. |
-| 4 | Setup/environment refusal without usable observation; doctor unavailable/denied capability. |
+| 3 | PARTIAL report or doctor unavailable/denied capability. |
+| 4 | Report/check setup/environment refusal without usable observation. |
 | 10 | Definite policy violation, taking precedence over other usable-result failures. |
 | 11 | Policy inconclusive; normal Unknown-only candidate evidence cannot satisfy definite algorithm rules. |
 
