@@ -2,8 +2,9 @@
 # Usage
 
 Discovery is the starting point for the v0.3.0 development tree. v0.3.0 is not
-released; watch/scopes/namespaces (D2), provider events/interfaces (D3) and
-learned-site execution plus installed qualification (D4) remain required.
+released. Watch/scopes/namespaces are implemented with D2 acceptance still in
+progress. Provider events/interfaces (D3) and learned-site execution plus
+installed qualification (D4) remain mandatory delivery stages.
 
 ## Passive discovery
 
@@ -44,6 +45,121 @@ osslscope inspect --pid 1234
 osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
 osslscope inspect --module /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so --json
 ```
+
+### From snapshot to watch to scope
+
+Start with `osslscope scan --json` to inventory the visible population once.
+Use `osslscope scan --watch --interval 1 --duration 30 --json` to sample that
+population repeatedly. Then add `--pid`, `--cgroup` or `--module` to either
+snapshot or watch. For example:
+
+```sh
+osslscope scan --watch --pid 1234 --pid 5678 --interval 0.5 --duration 30 --json
+osslscope scan --watch --cgroup /sys/fs/cgroup/example.service --json
+osslscope scan --watch --cgroup /sys/fs/cgroup/example.service \
+  --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
+```
+
+Repeated PIDs select their union; repeated module files select any matching
+hash. Different selector families intersect, so the final example selects only
+members of that cgroup subtree with a matching mapped module. The supplied file
+must have the desired bytes; a host library with the same filename but different
+bytes does not select a container's library. Use `inspect --module` to inspect
+the supplied file independently, or `inspect --pid` for one process snapshot.
+Module inspection by itself makes no claim that a process maps the file.
+
+Use a cgroup scope to discover new members during watch. An explicit PID list
+stays a numeric PID selection; it does not grow to include children. Process
+starttime and namespace identities distinguish observed incarnations, including
+PID reuse. Review those identities when correlating samples with other tools.
+No selector grants additional access or enters a target namespace.
+
+### Host-side container workflows
+
+Run osslscope in the host procfs and cgroup view when selecting host processes.
+Docker, `kubectl` and the shell utilities below help the operator resolve a
+scope; osslscope itself has no Docker socket or Kubernetes-client dependency.
+These examples assume a host cgroup-v2 hierarchy mounted at `/sys/fs/cgroup`
+with its hierarchy root exposed. Check your mount layout independently (for
+example, `findmnt -t cgroup2`); do not concatenate a container-relative cgroup
+path with an unrelated host mount. Numeric membership must use the same PID
+coordinates as the observer's procfs.
+
+For a running ordinary Docker container, resolve its init PID on the Docker
+host, then inspect its host membership and namespace identities:
+
+```sh
+container=example-container
+host_pid=$(docker inspect --format '{{.State.Pid}}' "$container")
+test "$host_pid" -gt 0 || exit 1
+cat "/proc/$host_pid/cgroup"
+readlink "/proc/$host_pid/ns/pid" "/proc/$host_pid/ns/mnt"
+osslscope inspect --pid "$host_pid" --json
+osslscope scan --watch --pid "$host_pid" --duration 30 --json
+```
+
+This watches that PID selection, not every process in the container. To select
+its cgroup subtree, first derive and review the host path:
+
+```sh
+relative_cgroup=$(awk -F: '$1 == "0" && $2 == "" { print $3 }' "/proc/$host_pid/cgroup")
+test -n "$relative_cgroup" && test "$relative_cgroup" != / || exit 1
+cgroup_path="/sys/fs/cgroup$relative_cgroup"
+printf '%s\n' "$cgroup_path"
+```
+
+Confirm that the printed path is the intended container cgroup, rather than
+`/`, `init.scope` or another shared ancestor. Confirm its `cgroup.procs` and
+relevant descendant membership against the host PIDs you intend to include;
+then run:
+
+```sh
+osslscope scan --cgroup "$cgroup_path" --json
+osslscope scan --watch --cgroup "$cgroup_path" --duration 30 --json
+```
+
+For kind, a Docker node container is not a pod scope. Docker's `State.Pid` may
+belong to `init.scope`; neither that PID nor that scope represents all pods or
+the intended workload. Resolve the actual pod process in host coordinates.
+One way to find candidate host membership records is to obtain the pod UID
+and search host procfs for its cgroup component:
+
+```sh
+namespace=default
+pod=example-pod
+pod_uid=$(kubectl get pod -n "$namespace" "$pod" -o jsonpath='{.metadata.uid}')
+test -n "$pod_uid" || exit 1
+systemd_uid=$(printf '%s' "$pod_uid" | tr '-' '_')
+sudo grep -l -F -e "$pod_uid" -e "$systemd_uid" /proc/[0-9]*/cgroup
+```
+
+This is a candidate search, not a portable Kubernetes-to-PID resolver. Runtime,
+cgroup driver and procfs access vary, and processes can exit during resolution.
+Use your runtime's inspection tools plus host `/proc/PID/cgroup`, `status`
+(`NSpid`) and namespace links to independently confirm the workload process
+and its host PID. Select the pod subtree only after checking its membership;
+a container leaf selects only that container's subtree. If UID components are
+unavailable, resolve membership with your runtime instead of guessing an
+ancestor. Once resolved, substitute that host PID or reviewed host cgroup path
+in the same snapshot/watch commands above. A PID reported inside the kind node
+or pod is not automatically a host PID.
+
+Container mappings may remain `locator_candidate`, including on overlay
+filesystems, or be unavailable under host access restrictions. A candidate hash
+can support inventory/matching but never proves mapped backing or execution.
+Keep exit 3, `identity_unverified`, `backing_unavailable` and other gaps visible;
+do not reinterpret them as complete container coverage. Watch output reports
+namespace identities when available, not container names, pod names or a
+cluster inventory. It does not bypass permissions or discover invisible hosts.
+
+Stop a foreground watch with Ctrl-C, or send SIGINT/SIGTERM to the osslscope
+observer PID from another terminal. Watch ends with `interrupted` and exit 3;
+it sends no signal to the selected targets. Avoid sending a signal to a shell
+process group that also contains your workload. Check workload survival using
+your independent runtime/host tools. See [sampled watch](#sampled-watch) for
+cooperative cancellation and output-delivery limits.
+
+### Discovery records and limits
 
 Both JSON modes use `schema_version: "osslscope.discovery.v1"`. Process output
 has `mode: "snapshot"`, selected PIDs, process/starttime identities, relevant

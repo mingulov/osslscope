@@ -7,7 +7,8 @@ library profile, manual offsets or BPF. A separate foreground diagnostic can
 observe entries into a small catalogue of OpenSSL callbacks.
 
 **Status: discovery development toward v0.3.0; v0.3.0 is not released.**
-Passive snapshot and supplied-file inspection are implemented. Provider
+Passive snapshots, sampled watch, PID/cgroup scopes and supplied-file matching
+are implemented; scope/churn qualification remains part of D2. Provider
 activation and advertised runtime interfaces remain unknown; execution is
 `not_observed`. ELF exports and mappings do not prove activation or execution.
 The discovery result is metadata inventory, without an executed CBOM or policy
@@ -20,10 +21,19 @@ Build the host CLI using the pinned Rust toolchain:
 ```sh
 cargo build --locked --bin osslscope
 ./target/debug/osslscope scan --json
-./target/debug/osslscope scan --pid 1234 --pid 5678 --json
+./target/debug/osslscope scan --watch --interval 1 --duration 30 --json
+./target/debug/osslscope scan --watch --pid 1234 --json
+./target/debug/osslscope scan --cgroup /sys/fs/cgroup/example.service --json
+./target/debug/osslscope scan --pid 1234 --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
 ./target/debug/osslscope inspect --pid 1234 --json
 ./target/debug/osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
 ```
+
+Start with a snapshot, then watch the visible population or narrow it to a PID,
+a cgroup subtree or supplied module hashes. Selector families intersect; an empty
+or unavailable selection never expands to all processes. Watch reports sampled
+changes, not a lossless event history. Ctrl-C stops the observer and returns 3;
+the independently running targets keep running.
 
 Use actual visible PIDs and file paths on your host. Ordinary filesystem/procfs
 permissions apply. No privilege elevation or BPF setup is needed for discovery;
@@ -34,7 +44,10 @@ raw paths, process names, mapping addresses, environment or command lines.
 Only verified mapped backing has `identity_status: verified`; a
 `locator_candidate` is useful file metadata with an unverified mapping association.
 It is never an execution site. Snapshots are bounded and detect some churn;
-they are not atomic. See [usage](docs/usage.md) for bounds and exit codes.
+they are not atomic. See [usage](docs/usage.md) for bounds, exit codes and
+[host-side Docker/kind scope selection](docs/usage.md#host-side-container-workflows).
+Docker and Kubernetes tools are optional operator utilities; osslscope has no
+runtime-socket or Kubernetes-client dependency.
 
 ## Legacy foreground diagnostic (v0.2.0)
 

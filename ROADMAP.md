@@ -14,8 +14,13 @@ legacy diagnostic with its original qualification boundary.
   identity and resource gaps remain visible. Mapping candidates are distinct
   from verified backing. Activation/interfaces are unknown and execution is
   not observed.
-- **D2 — remaining:** watch, cgroup scopes, process/object following and
-  namespace-aware file access, with scope exclusion and churn qualification.
+- **D2 — implementation available; acceptance in progress:** sampled watch,
+  intersecting PID/cgroup/module selectors, namespace provenance and bounded
+  metadata reuse. Host-side container workflows use independently resolved
+  PIDs/cgroups. Watch is sampled inventory, with explicit visibility loss and
+  candidate backing; it does not establish process exit, provider unload or
+  lossless following. Native scope exclusion, churn, container and integration
+  acceptance remain required before closing D2.
 - **D3 — remaining:** observe public provider lifecycle events and external
   provider initialization/query interfaces; retain warm-process, built-in and
   attachment limitations.
@@ -62,7 +67,7 @@ Full binary-package and cross-platform qualification is later work.
 Broader OpenSSL, kernel, libc and container support will be qualified
 incrementally. Additional capabilities remain later work:
 
-- Daemon operation, Prometheus/OpenTelemetry export and operator workflows.
+- Daemon operation and Prometheus/OpenTelemetry export.
 - Latency histograms and metadata-only per-call tracing.
 - Advanced artifact identity/build provenance and DEB/RPM lifecycle support.
 - Stronger completeness/first-call guarantees and broader performance,
