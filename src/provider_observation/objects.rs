@@ -231,7 +231,10 @@ impl VerifiedProcess {
     }
     pub fn revalidate(&self) -> Result<(), ObservationGap> {
         self.process.validate()?;
-        if read_at(&self.process.directory, b"maps", MAX_MAPS)? != self.maps {
+        if !same_executable_mappings(
+            &self.maps,
+            &read_at(&self.process.directory, b"maps", MAX_MAPS)?,
+        )? {
             return Err(ObservationGap::ProcessChanged);
         }
         for (_, object) in &self.mappings {
@@ -590,6 +593,32 @@ fn live(pidfd: &File) -> Result<(), ObservationGap> {
     }
     Ok(())
 }
+fn same_executable_mappings(before: &[u8], after: &[u8]) -> Result<bool, ObservationGap> {
+    // Only executable file-backed rows can authorize retained trace sites.
+    // Keep each complete validated row as a conservative change fence, including
+    // permissions and association text; this never promotes a pathname to proof.
+    // Anonymous/non-executable rows are parsed but cannot change this identity.
+    fn relevant(bytes: &[u8]) -> impl Iterator<Item = Result<&[u8], ObservationGap>> {
+        bytes
+            .split(|b| *b == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| match parse_mapping(line) {
+                Ok(Some(_)) => Some(Ok(line)),
+                Ok(None) => None,
+                Err(gap) => Some(Err(gap)),
+            })
+    }
+    let mut before = relevant(before);
+    let mut after = relevant(after);
+    loop {
+        match (before.next().transpose()?, after.next().transpose()?) {
+            (None, None) => return Ok(true),
+            (Some(left), Some(right)) if left == right => (),
+            _ => return Ok(false),
+        }
+    }
+}
+
 fn parse_mapping(line: &[u8]) -> Result<Option<Mapping>, ObservationGap> {
     if line.contains(&0) {
         return Err(ObservationGap::MalformedMaps);
@@ -1046,6 +1075,103 @@ fn export_api_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<Observa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const CODE: &str = "1000-2000 r-xp 0000 08:01 10 /mapped/code\n";
+
+    #[test]
+    fn unrelated_anonymous_and_nonexec_mapping_changes_preserve_identity() {
+        let before = format!(
+            "{CODE}2000-3000 rw-p 0000 00:00 0 [heap]\n3000-4000 r--p 1000 08:01 10 /mapped/code\n"
+        );
+        let after = format!(
+            "{CODE}4000-5000 --xp 0000 00:00 0 [arbitrary-observer-scratch]\n5000-6000 rw-p 9000 08:02 20 /unrelated/data\n6000-7000 r-xp 0000 00:00 0\n"
+        );
+        assert_eq!(
+            same_executable_mappings(before.as_bytes(), after.as_bytes()),
+            Ok(true)
+        );
+        assert_eq!(
+            same_executable_mappings(after.as_bytes(), before.as_bytes()),
+            Ok(true)
+        );
+        assert_eq!(
+            same_executable_mappings(CODE.as_bytes(), after.as_bytes()),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn executable_file_mapping_fields_arrival_and_removal_are_identity() {
+        for changed in [
+            "1001-2000 r-xp 0000 08:01 10 /mapped/code\n",
+            "1000-2001 r-xp 0000 08:01 10 /mapped/code\n",
+            "1000-2000 --xp 0000 08:01 10 /mapped/code\n",
+            "1000-2000 rwxp 0000 08:01 10 /mapped/code\n",
+            "1000-2000 r-xs 0000 08:01 10 /mapped/code\n",
+            "1000-2000 r--p 0000 08:01 10 /mapped/code\n",
+            "1000-2000 r-xp 1000 08:01 10 /mapped/code\n",
+            "1000-2000 r-xp 0000 09:01 10 /mapped/code\n",
+            "1000-2000 r-xp 0000 08:02 10 /mapped/code\n",
+            "1000-2000 r-xp 0000 08:01 11 /mapped/code\n",
+            "1000-2000 r-xp 0000 08:01 0 /mapped/code\n",
+            "",
+        ] {
+            assert_eq!(
+                same_executable_mappings(CODE.as_bytes(), changed.as_bytes()),
+                Ok(false)
+            );
+            assert_eq!(
+                same_executable_mappings(changed.as_bytes(), CODE.as_bytes()),
+                Ok(false)
+            );
+        }
+        let added = format!("{CODE}3000-4000 r-xp 0000 08:01 20 /new/code\n");
+        assert_eq!(
+            same_executable_mappings(CODE.as_bytes(), added.as_bytes()),
+            Ok(false)
+        );
+        assert_eq!(
+            same_executable_mappings(added.as_bytes(), CODE.as_bytes()),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn mapping_association_changes_remain_a_conservative_fence() {
+        let changed = CODE.replace("/mapped/code", "/renamed/code (deleted)");
+        assert_eq!(
+            same_executable_mappings(CODE.as_bytes(), changed.as_bytes()),
+            Ok(false)
+        );
+        // Equal names cannot hide a replaced backing.
+        let replaced = CODE.replace("08:01 10", "08:01 11");
+        assert_eq!(
+            same_executable_mappings(CODE.as_bytes(), replaced.as_bytes()),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn malformed_mapping_rows_fail_closed_during_projection() {
+        for row in [
+            "2000-1000 r-xp 0000 08:01 10 /mapped/code\n",
+            "1000-2000 r-qp 0000 08:01 10 /mapped/code\n",
+            "1000-2000 r-xp nope 08:01 10 /mapped/code\n",
+            "1000-2000 r-xp 0000 no:01 10 /mapped/code\n",
+            "1000-2000 r-xp 0000 08:01 no /mapped/code\n",
+            "1000-2000 r-xp 0000 08:01 10 /mapped/\0code\n",
+            "2000-1000 rw-p 0000 00:00 0\n",
+        ] {
+            assert_eq!(
+                same_executable_mappings(CODE.as_bytes(), row.as_bytes()),
+                Err(ObservationGap::MalformedMaps)
+            );
+            assert_eq!(
+                same_executable_mappings(row.as_bytes(), CODE.as_bytes()),
+                Err(ObservationGap::MalformedMaps)
+            );
+        }
+    }
 
     #[test]
     fn shared_long_unknown_names_have_constant_finite_comparison_work() {
