@@ -114,7 +114,8 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
-        // Discovery cache and ELF identity use native fstat dev_t, never
+        // Discovery cache, verified-record dedup and ELF identity use native
+        // fstat dev_t, never
         // encoded callback/stat words. Cache keys and stability checks compare
         // descriptors in the same raw domain; ModuleInfo preserves it.
         ("src/inventory/cli.rs", "raw", "metadata.dev(),", 1),
@@ -140,19 +141,6 @@ fn h5_t3_every_device_site_names_one_domain() {
             "src/inventory/procfs.rs",
             "raw",
             "|| (metadata.dev() != mapping.device && filesystem(&file) != Some(0x9123683e))",
-            1,
-        ),
-        // Mapping uniqueness uses only the same native dev_t/inode domain.
-        (
-            "src/inventory/procfs.rs",
-            "raw",
-            "if mapping.inode == 0 || seen.contains(&(mapping.device, mapping.inode)) {",
-            1,
-        ),
-        (
-            "src/inventory/procfs.rs",
-            "raw",
-            "seen.insert((mapping.device, mapping.inode));",
             1,
         ),
         // Finite gap identities preserve native mapping or backing dev_t;

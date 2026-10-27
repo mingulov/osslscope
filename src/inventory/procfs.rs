@@ -22,6 +22,7 @@ struct Mapping<'a> {
     end: u64,
     device: u64,
     inode: u64,
+    executable: bool,
     path: &'a [u8],
 }
 impl Mapping<'_> {
@@ -74,6 +75,7 @@ fn parse_line(line: &[u8]) -> Result<Mapping<'_>, GapReason> {
         end,
         device: libc::makedev(major, minor),
         inode: number(inode, 10).ok_or(bad)?,
+        executable: permissions[2] == b'x',
         path,
     })
 }
@@ -378,7 +380,8 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         open_at(&process.directory, b"maps").map_err(|_| GapReason::ProcessUnavailable)?;
     let maps = work.read(maps_file, work.options.limits.max_maps_bytes)?;
     let mut modules = Vec::new();
-    let mut seen = BTreeSet::new();
+    let mut verified = BTreeSet::new();
+    let mut attempts = 0;
     for line in maps.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
         if let Err(reason) = work.deadline() {
             work.gap(Some(pid), None, reason);
@@ -391,16 +394,17 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                 continue;
             }
         };
-        if mapping.inode == 0 || seen.contains(&(mapping.device, mapping.inode)) {
+        if mapping.inode == 0 || !mapping.executable {
             continue;
         }
-        if seen.len() >= work.options.limits.max_objects_per_process
+        if attempts >= work.options.limits.max_objects_per_process
             || work.totals.objects_attempted >= work.options.limits.max_objects
         {
             work.gap(Some(pid), None, GapReason::ObjectLimit);
             break;
         }
-        seen.insert((mapping.device, mapping.inode));
+        // Bound mapping/open attempts even when locators collide or fail.
+        attempts += 1;
         work.totals.objects_attempted += 1;
         let (file, metadata, identity_status) = match backing(&process, &mapping) {
             Ok(bound) => bound,
@@ -413,16 +417,27 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
             work.gap(Some(pid), Some(&mapping), GapReason::IdentityUnverified);
         }
         let fingerprint = Fingerprint::from(&metadata);
+        // A maps superblock device/inode pair is not unique across Btrfs
+        // subvolumes. Only verified associations may share a retained native
+        // backing fingerprint. Uncertain locators remain separate records.
+        if identity_status == IdentityStatus::Verified && verified.contains(&fingerprint) {
+            continue;
+        }
         match work.inspect(file, &metadata) {
             Ok(info) if info.kind != ObjectKind::Other => modules.push((
                 ModuleRecord {
                     info,
                     identity_status,
                 },
-                fingerprint,
+                fingerprint.clone(),
             )),
             Ok(_) | Err(GapReason::NotElf) => {}
             Err(reason) => work.gap(Some(pid), Some(&mapping), reason),
+        }
+        // The cache holds the descriptor alive; failed admission alone is
+        // not retained identity evidence and must not suppress another VMA.
+        if identity_status == IdentityStatus::Verified && work.cache.contains_key(&fingerprint) {
+            verified.insert(fingerprint);
         }
     }
     // Recheck maps, the held proc directory's incarnation, and the actual

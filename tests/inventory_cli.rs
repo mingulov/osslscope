@@ -2,7 +2,9 @@
 //! Real CLI controls: passive metadata, finite diagnostics and numeric exits.
 use sha2::{Digest as _, Sha256};
 use std::fs;
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +51,9 @@ int PRIVATE_CANARY_symbol(void) {{ return 2; }}
 "#, self.0.join("PRIVATE_CANARY_executed").display()), true)
     }
     fn child(&self, module: &PathBuf) -> OwnedChild {
+        self.child_with_data(module, None)
+    }
+    fn child_with_data(&self, module: &PathBuf, data: Option<&PathBuf>) -> OwnedChild {
         let executable = self.build(
             "child",
             r#"
@@ -61,21 +66,30 @@ int main(int argc, char **argv) {
     (void)argc;
     int fd = open(argv[1], O_RDONLY); struct stat st;
     if (fd < 0 || fstat(fd, &st)) return 2;
-    if (mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 3;
+    if (mmap(0, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 3;
     close(fd); puts("ready"); fflush(stdout);
-    while (getchar() != EOF) {} return 0;
+    int command;
+    while ((command = getchar()) != EOF) {
+        if (command != 'm' || argc != 3) return 4;
+        fd = open(argv[2], O_RDONLY);
+        if (fd < 0 || fstat(fd, &st)) return 5;
+        if (mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 6;
+        close(fd); puts("ready"); fflush(stdout);
+    }
+    return 0;
 }
 "#,
             false,
         );
         let mut child = Command::new(executable)
             .arg(module)
+            .args(data)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
         let mut ready = String::new();
-        BufReader::new(child.stdout.take().unwrap())
+        BufReader::new(child.stdout.as_mut().unwrap())
             .read_line(&mut ready)
             .unwrap();
         assert_eq!(ready, "ready\n");
@@ -132,6 +146,90 @@ fn scan_pid_json_needs_no_profile_or_bpf() {
     );
     redacted(&output, &f);
 }
+// Catches admitting non-executable data before module/read-budget charging.
+// IN_ACCESS is an independent kernel oracle; its positive read control follows
+// all discovery calls so fixture verification cannot mask a scanner read.
+#[test]
+fn non_executable_data_is_never_read_or_charged_as_a_module() {
+    let f = Fixture::new();
+    let module = f.module();
+    let data = f.0.join("PRIVATE_CANARY_data");
+    fs::File::create(&data)
+        .unwrap()
+        .set_len(8 * 1024 * 1024)
+        .unwrap();
+    let mut child = f.child_with_data(&module, Some(&data));
+    let pid = child.0.id();
+    let options = osslscope::inventory::SnapshotOptions {
+        pids: vec![pid],
+        ..Default::default()
+    };
+    let before = osslscope::inventory::snapshot(&options);
+    let args = ["scan", "--pid", &pid.to_string(), "--json"];
+    let before_cli = json(&cli(&args));
+    // SAFETY: inotify_init1 returns an owned FD; path is a valid C string.
+    let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    assert!(raw >= 0);
+    let mut watch = unsafe { fs::File::from_raw_fd(raw) };
+    let path = std::ffi::CString::new(data.as_os_str().as_bytes()).unwrap();
+    assert!(
+        unsafe { libc::inotify_add_watch(watch.as_raw_fd(), path.as_ptr(), libc::IN_ACCESS) } >= 0
+    );
+    child.0.stdin.as_mut().unwrap().write_all(b"m").unwrap();
+    child.0.stdin.as_mut().unwrap().flush().unwrap();
+    let mut ready = String::new();
+    BufReader::new(child.0.stdout.as_mut().unwrap())
+        .read_line(&mut ready)
+        .unwrap();
+    assert_eq!(ready, "ready\n");
+    let after = osslscope::inventory::snapshot(&options);
+    let output = cli(&args);
+    let after_cli = json(&output);
+    let mut events = [0u8; 4096];
+    let observed = watch.read(&mut events);
+    assert!(
+        matches!(observed, Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "non-executable data was read: {observed:?}"
+    );
+    assert_eq!(
+        before.totals.objects_attempted,
+        after.totals.objects_attempted
+    );
+    assert_eq!(
+        before.totals.objects_inspected,
+        after.totals.objects_inspected
+    );
+    for field in ["objects_attempted", "objects_inspected"] {
+        assert_eq!(before_cli["totals"][field], after_cli["totals"][field]);
+    }
+    // Procfs text can grow with the new VMA; the 8 MiB file must not be charged.
+    assert!(after.totals.read_bytes.abs_diff(before.totals.read_bytes) < 65_536);
+    assert!(
+        after_cli["totals"]["read_bytes"]
+            .as_u64()
+            .unwrap()
+            .abs_diff(before_cli["totals"]["read_bytes"].as_u64().unwrap())
+            < 65_536
+    );
+    assert!(
+        after
+            .processes
+            .iter()
+            .any(|p| p.modules.iter().any(|m| m.info.sha256 == digest(&module)))
+    );
+    assert!(!f.0.join("PRIVATE_CANARY_executed").exists());
+    redacted(&output, &f);
+    let mut byte = [0];
+    fs::File::open(&data)
+        .unwrap()
+        .read_exact(&mut byte)
+        .unwrap();
+    assert!(
+        watch.read(&mut events).unwrap() > 0,
+        "IN_ACCESS positive control failed"
+    );
+}
+
 #[test]
 fn inspect_module_is_passive_and_redacted() {
     let f = Fixture::new();

@@ -73,7 +73,7 @@ impl Fixture {
                 for (int i = 1; i < argc; ++i) {
                     int fd = open(argv[i], O_RDONLY); struct stat st;
                     if (fd < 0 || fstat(fd, &st)) return 2;
-                    if (mmap(0, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 3;
+                    if (mmap(0, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 3;
                     close(fd);
                 }
                 puts("ready"); fflush(stdout);
@@ -319,6 +319,61 @@ fn budgets_and_malformed_maps_produce_partial() {
     }
 }
 
+// Catches bounding native dedup results instead of backing-open attempts.
+// Equal-path VMAs must still consume finite attempts before resolution; a
+// candidate association cannot prove that the other VMAs share its backing.
+#[test]
+fn repeated_locators_are_charged_before_backing_resolution() {
+    let fixture = Fixture::new();
+    let module = fixture.modules()[0].clone();
+    let child = fixture.child(&vec![module.clone(); 8]);
+    let result = snap(vec![child.pid()], Limits::default());
+    let process = result
+        .processes
+        .iter()
+        .find(|p| p.pid == child.pid())
+        .unwrap();
+    let hash = digest(&module);
+    let relevant: Vec<_> = process
+        .modules
+        .iter()
+        .filter(|m| m.info.sha256 == hash)
+        .collect();
+    assert!(!relevant.is_empty());
+    if relevant
+        .iter()
+        .all(|m| m.identity_status == IdentityStatus::LocatorCandidate)
+    {
+        assert_eq!(
+            relevant.len(),
+            8,
+            "uncertain equal-path VMAs were collapsed"
+        );
+    } else {
+        assert_eq!(
+            relevant
+                .iter()
+                .filter(|m| m.identity_status == IdentityStatus::Verified)
+                .count(),
+            1
+        );
+    }
+    for limits in [
+        Limits {
+            max_objects_per_process: 4,
+            ..Limits::default()
+        },
+        Limits {
+            max_objects: 4,
+            ..Limits::default()
+        },
+    ] {
+        let limited = snap(vec![child.pid()], limits);
+        assert_eq!(limited.totals.objects_attempted, 4);
+        assert!(has_gap(&limited, GapReason::ObjectLimit));
+    }
+}
+
 // Catches interpreting PID 0 as self and losing read failures with an empty population.
 #[test]
 fn zero_pid_is_unavailable_and_empty_limits_do_not_panic() {
@@ -344,4 +399,60 @@ fn zero_pid_is_unavailable_and_empty_limits_do_not_panic() {
         let result = snap(vec![std::process::id()], limits);
         assert_ne!(result.exit_code(), 0);
     }
+}
+
+// Catches early maps-device/inode deduplication across Btrfs subvolumes.
+// Prepare two different relevant ELF files externally in separate Btrfs
+// subvolumes with equal inode numbers; this test never creates subvolumes.
+#[test]
+#[ignore = "requires externally prepared Btrfs collision paths in OSSL_INVENTORY_BTRFS_FIRST/SECOND"]
+fn btrfs_equal_maps_identity_preserves_distinct_native_backings() {
+    let paths = ["OSSL_INVENTORY_BTRFS_FIRST", "OSSL_INVENTORY_BTRFS_SECOND"]
+        .map(|name| PathBuf::from(std::env::var_os(name).expect("Btrfs input path required")));
+    let metadata = paths.each_ref().map(|path| fs::metadata(path).unwrap());
+    assert_eq!(
+        metadata[0].ino(),
+        metadata[1].ino(),
+        "fixture inode collision required"
+    );
+    assert_ne!(
+        metadata[0].dev(),
+        metadata[1].dev(),
+        "distinct native devices required"
+    );
+    let hashes = paths.each_ref().map(|path| digest(path));
+    assert_ne!(hashes[0], hashes[1], "different fixture bytes required");
+    let fixture = Fixture::new();
+    let child = fixture.child(&paths);
+    // Inspect the owned child's maps independently of production parsing.
+    let maps = fs::read_to_string(format!("/proc/{}/maps", child.pid())).unwrap();
+    let pairs = paths.each_ref().map(|path| {
+        let line = maps
+            .lines()
+            .find(|line| line.ends_with(path.to_str().unwrap()))
+            .unwrap();
+        let fields: Vec<_> = line.split_whitespace().collect();
+        assert!(fields[1].contains('x'));
+        (fields[3].to_owned(), fields[4].to_owned())
+    });
+    assert_eq!(
+        pairs[0], pairs[1],
+        "maps superblock device/inode collision required"
+    );
+    let result = snap(vec![child.pid()], Limits::default());
+    let process = result
+        .processes
+        .iter()
+        .find(|p| p.pid == child.pid())
+        .unwrap();
+    for (index, hash) in hashes.iter().enumerate() {
+        assert!(
+            process.modules.iter().any(|m| m.info.sha256 == *hash
+                && m.info.device == metadata[index].dev()
+                && m.info.inode == metadata[index].ino()),
+            "distinct native backing missing: index={index}, result={result:?}"
+        );
+    }
+    assert!(result.totals.objects_attempted <= result.limits.max_objects);
+    assert!(result.totals.objects_attempted <= result.limits.max_objects_per_process);
 }
