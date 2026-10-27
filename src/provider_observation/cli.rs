@@ -252,13 +252,16 @@ impl Render for Record<'_> {
             let hash: String = fact.object_sha256.clone().into();
             write!(
                 writer,
-                "  fact pid={} starttime={} sha256={} generation={} api={} source={} context={} confidence={}",
+                "  fact pid={} starttime={} sha256={} generation={} api={} source={} operation={} class={} monotonic_ns={} context={} confidence={}",
                 fact.pid,
                 fact.starttime,
                 hash,
                 fact.generation,
                 finite(&fact.api)?,
                 finite(&fact.source)?,
+                finite(&fact.operation)?,
+                finite(&fact.class)?,
+                fact.monotonic_ns,
                 finite(&fact.context)?,
                 finite(&fact.confidence)?
             )?;
@@ -607,6 +610,71 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["interval"]["drain_lag_ns"], 201000000);
         assert_eq!(value["gaps"], serde_json::json!(["snapshot_lag"]));
+    }
+    #[test]
+    fn human_query_results_preserve_operation_class_and_fact_chronology() {
+        let facts = [("digest", "digest", 9), ("cipher", "cipher", 10)].map(|(operation, class, monotonic_ns)| {
+            serde_json::from_value::<super::super::ObservationFact>(serde_json::json!({
+                "pid": 12, "starttime": 100, "object_sha256": "a".repeat(64), "generation": 1,
+                "context": { "state": "unknown" }, "source": "provider_query", "api": "provider_query_callback",
+                "operation": operation, "class": class, "monotonic_ns": monotonic_ns, "confidence": "unknown",
+                "payload": { "kind": "query_result", "outcome": "success", "cacheability": "cacheable" }
+            })).unwrap()
+        });
+        let capabilities = Capabilities::new(true);
+        let record = Record {
+            schema_version: SCHEMA,
+            mode: "watch",
+            record: "observation",
+            sequence: 1,
+            interval: Interval {
+                started_elapsed_ns: 0,
+                finished_elapsed_ns: 10,
+                drain_lag_ns: 10,
+            },
+            poll_interval: Duration::from_secs(1),
+            snapshot: None,
+            facts: &facts,
+            gaps: &[],
+            capabilities: &capabilities,
+            sampled_history: "incomplete",
+        };
+        let mut human = Vec::new();
+        emit(&record, &mut human, true).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        let lines: Vec<_> = human
+            .lines()
+            .filter(|line| line.starts_with("  fact "))
+            .collect();
+        assert_eq!(lines.len(), 2);
+        for (line, operation, class, timestamp) in [
+            (
+                lines[0],
+                "operation=\"digest\"",
+                "class=\"digest\"",
+                "monotonic_ns=9",
+            ),
+            (
+                lines[1],
+                "operation=\"cipher\"",
+                "class=\"cipher\"",
+                "monotonic_ns=10",
+            ),
+        ] {
+            for expected in [operation, class, timestamp] {
+                assert!(line.contains(expected), "{line}");
+            }
+        }
+        assert_ne!(lines[0], lines[1]);
+        let mut json = Vec::new();
+        emit(&record, &mut json, false).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["facts"][0]["operation"], "digest");
+        assert_eq!(json["facts"][0]["class"], "digest");
+        assert_eq!(json["facts"][0]["monotonic_ns"], 9);
+        assert_eq!(json["facts"][1]["operation"], "cipher");
+        assert_eq!(json["facts"][1]["class"], "cipher");
+        assert_eq!(json["facts"][1]["monotonic_ns"], 10);
     }
     #[test]
     fn human_facts_render_finite_algorithm_labels_and_safe_identity() {
