@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Usage
 
-The v0.3.0 source candidate starts with passive discovery, optionally observes
+The v0.3.0 discovery preview starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
-one selected process. It is not released; installed/platform qualification
-remains required. See [candidate notes](release-v0.3.0.md).
+one selected process. Installed/platform qualification is separate from source
+behavior; see [release scope](release-v0.3.0.md).
 
 ## Passive discovery
 
@@ -410,8 +410,10 @@ The controller polls/drains every 100 ms and rescans every second, with a
 budgets, not guarantees against a stalled syscall or delayed work. Startup,
 warm/built-in activation, query races, sampling and cleanup gaps are explicit.
 There is no universal first-call or terminal-count guarantee. Normal capture
-is PARTIAL. No v0.3 scan/watch overhead measurement is claimed yet; the
-[historical matrix](overhead-matrix.md) measures an earlier route only.
+is PARTIAL. A [measured single-PID inventory sample](release-v0.3.0.md#measured-inventory-cost)
+reports scanner cost with tracing disabled; it does not establish system-wide
+or callback-tracing performance. The [historical matrix](overhead-matrix.md)
+measures an earlier route only.
 
 Timeout/cancellation closes observer resources. An independently running target
 and a released owned workload are left running when observation ends; signal

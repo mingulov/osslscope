@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# v0.3.0 source candidate
+# v0.3.0 discovery preview
 
-Scope: public source behavior and release acceptance boundary. **Unreleased.**
-This document describes implemented capabilities and required qualification;
-it does not assert that the final installed matrix has passed.
+Scope: public source behavior, bounded inventory measurements and the release
+qualification procedure. The published release record carries artifact-specific
+qualification results; this document does not assert a passed runtime/CI matrix.
 
 The normal workflow is scan/watch/inspect, select one host-visible PID, then
 report/check. Passive ELF inventory needs no profile, offsets or BPF. Opt-in
@@ -50,13 +50,51 @@ inventory-to-PID selection and churn; source-archive build/install and final
 whole-workspace/CI checks. Unavailable cells remain unresolved. Stock workload
 success alone is not observer acceptance.
 
-Final scan/watch overhead on ordinary applications remains unmeasured for this
-candidate. Publish actual measurements with workload, kernel, compiler,
-CLI/companion hashes and observation bounds before making a performance claim.
-The [older overhead matrix](overhead-matrix.md) describes historical diagnostics
-and cannot qualify this route. No timings or platform passes are inferred here.
 A source or companion rebuild requires new artifact-bound receipts. Publication
-remains gated until the mandatory release cells have actual results.
+requires actual results for the mandatory release cells; source/ABI checks alone
+are not certification.
+
+## Measured inventory cost
+
+One bounded sample measured read-only inventory of one owned stock OpenSSL 3.5.5
+process running `openssl speed -seconds 6 -bytes 16384 -evp sha256`. The
+filesystem cache was warm and BPF tracing was disabled. The observer ran on
+Linux x86-64, kernel `7.0.0-38-generic`, using a Rust 1.88.0 release build from a
+source archive. The commands selected only that process:
+
+```sh
+osslscope scan --pid PID --json
+osslscope scan --watch --pid PID --interval 1 --duration 4 --json
+```
+
+| Scanner operation | Wall time | CPU time (user + system) | Child-reported peak RSS |
+| --- | --- | --- | --- |
+| Single snapshot | 13.93 ms | 12.953 ms (6.975 + 5.978) | 13,292 KiB |
+| Watch, 1 s interval, 4 snapshots plus end | 4.003 s | 19.900 ms (13.267 + 6.633) | 13,420 KiB |
+
+The snapshot inspected 7 executable objects and charged 12,006,803 bytes of
+read work. Watch's initial snapshot inspected 7 objects and charged 12,006,788
+bytes; each of its three cached follow-ups inspected no new objects and charged
+10,280 bytes. Both commands returned 3 with `identity_unverified`
+mapping-association gaps while retaining `openssl_compatible` and
+`openssl_consumer` evidence. This is partial inventory, not fully verified
+mapping coverage. Peak RSS is the scanner child's `wait4` resource report,
+not total kernel memory or a separately isolated incremental-memory measure.
+
+Sample identity:
+
+- Source: `ce64a8efbca5856cff48092d12962cee29007659`.
+- Source archive SHA-256: `f819377db98da8baa3f8faf90df85582b02db23543e23f5ca652104942da0974`.
+- CLI: 5,131,312 bytes; SHA-256 `28a43db48a84f5cc38bdd0011d715bc4629ed63b8ed3e0d78ef84f7e29540320`.
+
+These are single samples of scanner cost for the named source/artifact and
+visibility scope. Application CPU time was 6.003319 s without the observer,
+6.003839 s during snapshot and 6.002950 s during watch. Those noisy samples do
+not establish a throughput or cryptographic-latency effect. No system-wide
+scaling, hot callback-tracing cost or broader performance budget follows from
+this measurement. It does not qualify a later rebuilt artifact. The
+[historical overhead matrix](overhead-matrix.md) measures the earlier diagnostic
+route and retains its original scope.
 
 ## Historical compatibility
 

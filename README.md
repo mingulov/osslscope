@@ -6,9 +6,9 @@ observe public provider interfaces and count entries at learned callback sites
 for one selected process. Normal workflows need no enrolled library profile,
 manual offsets or application changes.
 
-**Status: v0.3.0 source candidate; not released.** Source implementation and
-fixture checks do not establish installed runtime or platform qualification.
-See [release scope and pending gates](docs/release-v0.3.0.md).
+**v0.3.0 discovery preview.** Source implementation and fixture checks do not
+establish installed runtime or platform qualification. See
+[release scope and qualification procedure](docs/release-v0.3.0.md).
 
 ## Discover, select, observe
 
@@ -68,10 +68,12 @@ Explicit `--libcrypto PATH` selects the v0.2 fixed-profile foreground diagnostic
 Its exact enrolled-library/kernel and Count-only restrictions still apply.
 Historical results in the [v0.2 release notes](docs/release-v0.2.0.md),
 [catalogue](profiles/README.md) and [overhead matrix](docs/overhead-matrix.md)
-do not qualify the v0.3 candidate or establish v0.3 scan/watch overhead.
+retain their original scope. A separate [bounded v0.3 inventory cost
+sample](docs/release-v0.3.0.md#measured-inventory-cost) measures one selected PID
+with tracing disabled; it does not establish broad performance limits.
 
 - [CLI and policy files](docs/usage.md), [build](docs/build.md), [install](docs/install.md)
-- [v0.3 candidate notes](docs/release-v0.3.0.md), [roadmap](ROADMAP.md), [documentation index](docs/README.md)
+- [v0.3 release notes](docs/release-v0.3.0.md), [roadmap](ROADMAP.md), [documentation index](docs/README.md)
 - [Output contract](docs/observed-crypto-v2.md), [observation meaning](docs/what-it-proves.md)
 
 Permanent boundaries: no keys, passwords, plaintext or application payload

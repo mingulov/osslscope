@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Roadmap
 
-osslscope is in development toward v0.3.0. It is not released. Discovery and focused execution are implemented in source. Discovery is
-the normal starting point; the v0.2.0 fixed-profile foreground route remains a
-legacy diagnostic with its original qualification boundary.
+v0.3.0 is a discovery preview with focused execution implemented in source.
+Discovery is the normal starting point; the v0.2.0 fixed-profile foreground
+route remains a legacy diagnostic with its original qualification boundary.
 
 ## v0.3.0: discover first, then observe
 
@@ -24,18 +24,20 @@ legacy diagnostic with its original qualification boundary.
 - **D3 — source implemented:** public provider lifecycle/init/query observation,
   verified backing custody and candidate retirement. Warm/built-in activation,
   query races and unknown advertisements remain explicit limits.
-- **D4 — source implemented; final qualification pending:** learned physical
+- **D4 — source implemented; release qualification is separate:** learned physical
   callback counting, ordinary PID/run report/check, functional doctor and fixed
   installed companions. Candidate attribution stays Unknown, reports PARTIAL,
   and algorithm policy inconclusive. The independent callback fixture is a
   stimulus oracle, not installed observation acceptance.
 
-All stages are required for v0.3.0. Source implementation and local fixtures
-do not establish platform/provider or release qualification. Discovery metadata alone produces neither an executed CBOM nor a policy verdict.
-The final unchanged installed CLI/companion pair still needs the finite
-fixture/stock-build, lifecycle, namespace, resource, privacy, overhead and
-two-kernel checks described in [candidate notes](docs/release-v0.3.0.md).
-No release is authorized by source completion alone.
+Source implementation and local fixtures do not establish platform/provider
+or release qualification. Discovery metadata alone produces neither an executed
+CBOM nor a policy verdict. Apply the finite fixture/stock-build, lifecycle,
+namespace, resource, privacy and two-kernel checks to one unchanged installed
+CLI/companion pair; see the [release procedure](docs/release-v0.3.0.md).
+The [bounded inventory cost sample](docs/release-v0.3.0.md#measured-inventory-cost)
+is separate from tracing and broad performance qualification. Source completion
+alone does not authorize a release.
 
 ## v0.2.0: a usable foreground preview
 

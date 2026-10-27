@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## 0.3.0 source candidate (unreleased)
+## 0.3.0 discovery preview
 
 - Automatic ELF/process discovery, sampled watch and intersecting PID/cgroup/
   supplied-module inventory scopes without enrolled profiles or manual offsets.
@@ -16,10 +16,11 @@
   callback-counter fixture and CI compilation/fresh-object preparation coverage.
   Fixture/host/object checks do not establish installed runtime qualification.
 - Root package version 0.3.0; helper-crate versions unchanged. Explicit
-  `--libcrypto` retains historical fixed-profile diagnostics. Final installed,
-  stock-build, two-kernel, privacy/resource and overhead qualification remains
-  pending; no unrun platform or performance claim. See
-  [candidate notes](docs/release-v0.3.0.md).
+  `--libcrypto` retains historical fixed-profile diagnostics. A bounded
+  single-PID scan/watch sample reports inventory cost with tracing disabled;
+  it does not establish broad platform or performance support. Installed,
+  stock-build, two-kernel and privacy/resource qualification belong to the
+  artifact-specific release record. See [release notes](docs/release-v0.3.0.md).
 
 ## 0.2.0 source preview
 

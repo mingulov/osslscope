@@ -1,9 +1,9 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Install from source
 
-The v0.3.0 source candidate uses the pinned [build recipe](build.md) and a
-manifest-verified install. It is not released. Source/install simulations do
-not qualify actual BPF loading, provider behavior or a platform.
+The v0.3.0 discovery preview uses the pinned [build recipe](build.md) and a
+manifest-verified install. Source/install simulations do not qualify actual
+BPF loading, provider behavior or a platform.
 
 ```sh
 ./scripts/build-dev.sh
@@ -89,6 +89,6 @@ for limits, failure precedence, output delivery and cleanup.
 `--libcrypto PATH` explicitly selects the historical v0.2 exact-profile Count
 route; its [release notes](release-v0.2.0.md) and [catalogue](../profiles/README.md)
 retain their original qualification scope. They do not qualify v0.3 automatic
-discovery or focused execution. The source candidate does not claim DEB/RPM,
+discovery or focused execution. The discovery preview does not claim DEB/RPM,
 RHEL/Secure Boot, ARM64 or broader platform qualification. Packaging tooling
 in the tree does not establish a supported binary distribution.
