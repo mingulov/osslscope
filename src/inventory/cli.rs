@@ -11,9 +11,10 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
+const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
 
 struct Options {
@@ -21,6 +22,9 @@ struct Options {
     modules: Vec<PathBuf>,
     cgroup: Option<PathBuf>,
     json: bool,
+    watch: bool,
+    interval: Option<Duration>,
+    duration: Option<Duration>,
 }
 fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
     let mut options = Options {
@@ -28,11 +32,21 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
         modules: Vec::new(),
         json: false,
         cgroup: None,
+        watch: false,
+        interval: None,
+        duration: None,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" if !options.json => options.json = true,
+            "--watch" if command == "scan" && !options.watch => options.watch = true,
+            "--interval" if command == "scan" && options.interval.is_none() => {
+                options.interval = Some(seconds(args.next().ok_or(())?, true)?);
+            }
+            "--duration" if command == "scan" && options.duration.is_none() => {
+                options.duration = Some(seconds(args.next().ok_or(())?, false)?);
+            }
             "--pid" => {
                 let text = args.next().ok_or(())?;
                 if text.is_empty() || !text.bytes().all(|b| b.is_ascii_digit()) {
@@ -61,6 +75,9 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
             _ => return Err(()),
         }
     }
+    if !options.watch && (options.interval.is_some() || options.duration.is_some()) {
+        return Err(());
+    }
     if command == "inspect"
         && !((options.pids.len() == 1 && options.modules.is_empty())
             || (options.pids.is_empty() && !options.modules.is_empty()))
@@ -71,6 +88,57 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
         return Err(());
     }
     Ok(options)
+}
+
+fn seconds(text: &str, interval: bool) -> Result<Duration, ()> {
+    let seconds: f64 = text.parse().map_err(|_| ())?;
+    if !seconds.is_finite() || seconds <= 0.0 || seconds > 3600.0 || (interval && seconds < 0.05) {
+        return Err(());
+    }
+    let duration = Duration::try_from_secs_f64(seconds).map_err(|_| ())?;
+    if duration.is_zero() {
+        return Err(());
+    }
+    Ok(duration)
+}
+
+static WATCH_INTERRUPTED: AtomicBool = AtomicBool::new(false);
+extern "C" fn watch_signal(_: libc::c_int) {
+    WATCH_INTERRUPTED.store(true, Ordering::Relaxed);
+}
+/// CLI lifetime only: save/restore the observer's exact dispositions. The
+/// library API uses its caller's AtomicBool and never changes signal state.
+struct WatchSignals(Vec<(libc::c_int, libc::sigaction)>);
+impl WatchSignals {
+    fn install() -> io::Result<Self> {
+        WATCH_INTERRUPTED.store(false, Ordering::Relaxed);
+        let mut guard = Self(Vec::new());
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: both sigaction values are initialized, sigemptyset
+            // initializes the mask, and this handler only stores an atomic.
+            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+            action.sa_sigaction = watch_signal as usize;
+            unsafe {
+                libc::sigemptyset(&mut action.sa_mask);
+            }
+            if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            guard.0.push((signal, previous));
+        }
+        Ok(guard)
+    }
+}
+impl Drop for WatchSignals {
+    fn drop(&mut self) {
+        for (signal, previous) in self.0.iter().rev() {
+            // SAFETY: restoring the exact initialized disposition saved above.
+            unsafe {
+                libc::sigaction(*signal, previous, std::ptr::null_mut());
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -231,7 +299,31 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        if command == "scan" {
+        if options.watch {
+            let _signals = match WatchSignals::install() {
+                Ok(guard) => guard,
+                Err(_) => {
+                    crate::report::err_line("osslscope discovery: observer signal setup failed");
+                    return ExitCode::from(1);
+                }
+            };
+            super::watch::run_formatted(
+                &super::watch::WatchOptions {
+                    selection: super::scope::Selection {
+                        pids: options.pids,
+                        cgroup: options.cgroup,
+                        modules: options.modules,
+                    },
+                    interval: options.interval.unwrap_or(Duration::from_secs(1)),
+                    duration: options.duration,
+                    limits: Limits::default(),
+                },
+                &mut output,
+                &WATCH_INTERRUPTED,
+                !options.json,
+            )
+            .map(|outcome| outcome.exit_code())
+        } else if command == "scan" {
             let mut scanner = match super::scope::ScopedScanner::new(
                 super::scope::Selection {
                     pids: options.pids,

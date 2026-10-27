@@ -53,6 +53,7 @@ pub struct ScopedScanner {
     limits: Limits,
     scope: Scope,
     record: ScopeRecord,
+    scan_state: procfs::ScanState,
 }
 impl ScopedScanner {
     pub fn new(selection: Selection, limits: Limits) -> Result<Self, GapReason> {
@@ -135,7 +136,16 @@ impl ScopedScanner {
             limits,
             scope,
             record,
+            scan_state: procfs::ScanState::default(),
         })
+    }
+
+    pub(super) fn snapshot_for(&mut self, timeout: std::time::Duration) -> Snapshot {
+        let original = self.limits.timeout;
+        self.limits.timeout = original.min(timeout);
+        let snapshot = self.snapshot();
+        self.limits.timeout = original;
+        snapshot
     }
 
     pub fn snapshot(&mut self) -> Snapshot {
@@ -180,10 +190,11 @@ impl ScopedScanner {
         let mut limits = self.limits.clone();
         limits.max_read_bytes = limits.max_read_bytes.saturating_sub(budget.bytes);
         limits.timeout = limits.timeout.saturating_sub(budget.started.elapsed());
-        let mut result = procfs::snapshot_scoped(
+        let mut result = procfs::snapshot_reused(
             &SnapshotOptions { pids, limits },
             self.pids.is_empty() && self.cgroup.is_none(),
             !self.modules.is_empty(),
+            &mut self.scan_state,
         );
         budget.bytes = budget.bytes.saturating_add(result.totals.read_bytes);
         if let Some(before) = &before {
@@ -259,7 +270,10 @@ impl ScopedScanner {
         };
         result
     }
-    fn failed(&self, reason: GapReason, clock: &CaptureClock, bytes: u64) -> Snapshot {
+    fn failed(&mut self, reason: GapReason, clock: &CaptureClock, bytes: u64) -> Snapshot {
+        // A wholly unavailable sampling pass observed no reusable objects.
+        // Keep pinned selectors, but release obsolete sampled descriptors.
+        self.scan_state = procfs::ScanState::default();
         let mut result = procfs::snapshot_selected(
             &SnapshotOptions {
                 pids: vec![],

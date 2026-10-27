@@ -127,6 +127,14 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/inventory/procfs.rs", "raw", "dev: m.dev(),", 1),
+        // Watch compares native ModuleInfo identities, previously obtained
+        // from fstat; no join to encoded map text or display-domain values.
+        (
+            "src/inventory/watch.rs",
+            "raw",
+            "(a.info.device, a.info.inode, &a.info.sha256) == (b.info.device, b.info.inode, &b.info.sha256)",
+            1,
+        ),
         // Namespace and cgroup descriptor IDs retain native dev_t; selector
         // fingerprints compare fstat metadata only, never encoded map IDs.
         ("src/inventory/procfs.rs", "raw", "device: m.dev(),", 1),

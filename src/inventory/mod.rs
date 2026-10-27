@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod elf;
 pub mod scope;
+pub mod watch;
 
 use serde::{Deserialize, Serialize};
 

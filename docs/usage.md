@@ -8,7 +8,7 @@ learned-site execution plus installed qualification (D4) remain required.
 ## Passive discovery
 
 ```sh
-osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--json]
+osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]
 osslscope inspect --pid PID [--json]
 osslscope inspect --module PATH [--module PATH ...] [--json]
 ```
@@ -23,7 +23,7 @@ Physical copies with the same hash retain their distinct native file identities.
 `inspect` requires exactly one positive PID or one or more module paths;
 its selector families cannot be mixed. Unknown, missing or conflicting arguments
 fail with exit 2 before discovery IO. `scan --help` and `inspect --help` exit 0.
-Watch flags are not yet supported.
+`scan --watch` streams sampled changes; `inspect` keeps its snapshot/file grammar.
 
 No `--libcrypto`, enrolled profile, manual offset, BPF object, or privilege
 setup is required. Normal procfs and filesystem permissions apply. No supplied
@@ -115,6 +115,68 @@ failure; **3** useful partial inventory; **4** wholly unavailable observation;
 inventory does not imply activation, execution or completeness beyond the
 requested visible scope. An accepted process with no relevant modules remains
 useful inventory. Output failure takes exit 1 even if discovery was partial.
+
+## Sampled watch
+
+```sh
+osslscope scan --watch --pid 1234 --interval 1 --duration 30 --json
+osslscope scan --watch --cgroup /sys/fs/cgroup/example.service \
+  --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3
+```
+
+`--interval` defaults to one second and accepts `[0.05,3600]` seconds.
+`--duration` accepts `(0,3600]` seconds; omit it to watch until cancellation.
+Timing options require `--watch`. Repeated flags, nonfinite values, values
+outside those ranges, and positive durations rounding to zero are usage errors
+before scope acquisition. Sampling starts immediately. The interval is the
+minimum period between sample starts; a slow sample delays the next one, with
+no catch-up queue. A duration also caps each remaining cooperative sample
+budget. Neither duration nor cancellation can interrupt a stalled filesystem
+syscall or an already admitted bounded ELF parse. Selector preparation is
+separately bounded as described above and consumes elapsed watch time.
+
+JSON watch output is NDJSON: one compact `osslscope.discovery.v1` record per
+sample, followed by one end record. Sample records have `mode: "watch"`,
+`record: "snapshot"`, increasing `sequence` starting at 1, observer `interval`,
+requested `poll_interval`, the ordinary `snapshot`, and finite `changes`.
+Duration fields use `{ "secs": N, "nanos": N }`. Changes carry a finite `kind`,
+PID/starttime, and optional module metadata. `process_seen` and `module_seen`
+mean present in this sample relative to the previous one. They do not mean a
+process just started or a provider just loaded. `process_not_seen` and
+`module_not_seen` require usable current inventory for that process; they mean
+absent from the sampled selection, never process exit or provider unload.
+Read, backing, membership, namespace, identity-change and resource failures
+produce `visibility_lost` instead of absence claims. Successfully enumerated
+locator candidates keep their candidate status; this association gap alone
+does not hide a mapping-list observation. A newly visible incarnation or
+namespace is a fresh observation. Human output shows the same finite changes.
+
+All watch records state `sampled_history: "incomplete"`, independently of the
+snapshot's inventory completeness. Polling can miss activity entirely between
+samples and has sampling/read lag. Only the immediately previous bounded
+snapshot is retained, so visibility recovery may report `seen` again. Watch
+establishes no lossless event history, activation, execution or non-use claim.
+
+`ScopedScanner` retains at most `max_objects` metadata/descriptor cache entries
+between snapshots. Stable native file fingerprints reuse parsed metadata;
+file bytes and maps buffers are transient. Changed or no-longer-seen entries
+are evicted; stale parse failures cannot survive fingerprint validation.
+Cache hits still resolve each executable mapping's backing and recheck held
+file metadata. They save ELF read/hash work rather than bypassing mapping or
+process identity checks. Work totals count only each snapshot's new inspections
+and charged reads. Repeated caps use circular PID admission/progression; they
+remain partial inventory, and changing/inaccessible populations have no fixed
+coverage-time guarantee.
+
+End records carry `record: "end"`, snapshot count in `sequence`, `elapsed`,
+`limits`, numeric `status`, optional finite `gap`, and reason `duration`,
+`interrupted`, `scope_unavailable` or `output`. Normal duration expiry returns
+the last snapshot status (or 4 if none could be sampled). SIGINT/SIGTERM stop
+only the observer, restore its prior signal handlers, and end with exit 3;
+workloads keep running. The library `watch::run` uses a caller-supplied
+`AtomicBool` and never installs signal handlers. Output failure returns exit 1
+and stops acquisition. An output end record is attempted once, but a failed
+sink may prevent delivery, including delivery of the end record itself.
 
 ## Legacy foreground diagnostic
 

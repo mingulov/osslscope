@@ -209,6 +209,14 @@ struct Cached {
     // underneath this cache simply because a mapped pathname was unlinked.
     file: File,
     info: Result<ModuleInfo, GapReason>,
+    seen: bool,
+}
+
+/// Metadata and retained descriptors only; no mapped bytes or history.
+#[derive(Default)]
+pub(super) struct ScanState {
+    cache: BTreeMap<Fingerprint, Cached>,
+    cursor: Option<u32>,
 }
 struct Work<'a> {
     options: &'a SnapshotOptions,
@@ -273,7 +281,8 @@ impl Work<'_> {
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
         }
-        if let Some(cached) = self.cache.get(&fingerprint) {
+        if let Some(cached) = self.cache.get_mut(&fingerprint) {
+            cached.seen = true;
             return cached.info.clone();
         }
         self.deadline()?;
@@ -296,11 +305,24 @@ impl Work<'_> {
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
         }
+        // Current-snapshot attempts are capped by max_objects. Prefer dropping
+        // an unseen retained entry before admitting a newly observed object.
+        if self.cache.len() >= self.options.limits.max_objects {
+            let victim = self
+                .cache
+                .iter()
+                .find(|(_, value)| !value.seen)
+                .map(|(key, _)| key.clone());
+            if let Some(victim) = victim {
+                self.cache.remove(&victim);
+            }
+        }
         self.cache.insert(
             fingerprint,
             Cached {
                 file,
                 info: result.clone(),
+                seen: true,
             },
         );
         result
@@ -536,29 +558,58 @@ pub(super) fn snapshot_scoped(
     system: bool,
     include_other: bool,
 ) -> Snapshot {
+    snapshot_reused(options, system, include_other, &mut ScanState::default())
+}
+
+pub(super) fn snapshot_reused(
+    options: &SnapshotOptions,
+    system: bool,
+    include_other: bool,
+    state: &mut ScanState,
+) -> Snapshot {
     let clock = CaptureClock::start();
+    let started = Instant::now();
+    let mut cache = std::mem::take(&mut state.cache);
+    cache.retain(|key, value| {
+        value.seen = false;
+        started.elapsed() < options.limits.timeout
+            && value
+                .file
+                .metadata()
+                .is_ok_and(|m| Fingerprint::from(&m) == *key)
+    });
+    while cache.len() > options.limits.max_objects {
+        cache.pop_first();
+    }
     let mut work = Work {
         include_other,
         options,
-        started: Instant::now(),
+        started,
         totals: WorkTotals::default(),
         gaps: BTreeSet::new(),
-        cache: BTreeMap::new(),
+        cache,
     };
-    let mut pids = BTreeSet::new();
+    // Keep at most two bounded prefixes while enumerating: the next PIDs
+    // above the previous cursor, then wrap. Enumerating itself is deadline
+    // bounded, so reaching an admission cap never permanently hides high PIDs.
+    let mut above = BTreeSet::new();
+    let mut wrapped = BTreeSet::new();
+    let mut overflow = false;
     let mut admit = |pid, work: &mut Work<'_>| {
         if let Err(reason) = work.deadline() {
             work.gap(None, None, reason);
             return false;
         }
-        if pids.contains(&pid) {
-            return true;
+        let set = if state.cursor.is_none_or(|cursor| pid > cursor) {
+            &mut above
+        } else {
+            &mut wrapped
+        };
+        set.insert(pid);
+        if set.len() > options.limits.max_pids {
+            set.pop_last();
+            overflow = true;
         }
-        if pids.len() >= options.limits.max_pids {
-            work.gap(None, None, GapReason::ProcessLimit);
-            return false;
-        }
-        pids.insert(pid);
         true
     };
     if system {
@@ -592,19 +643,54 @@ pub(super) fn snapshot_scoped(
             }
         }
     }
-    let selected_pids: Vec<_> = pids.into_iter().collect();
+    if overflow || above.len().saturating_add(wrapped.len()) > options.limits.max_pids {
+        work.gap(None, None, GapReason::ProcessLimit);
+    }
+    let order: Vec<_> = above
+        .into_iter()
+        .chain(wrapped)
+        .take(options.limits.max_pids)
+        .collect();
+    let mut selected_pids = order.clone();
+    selected_pids.sort_unstable();
     let mut processes = Vec::new();
-    for &pid in &selected_pids {
+    for &pid in &order {
         if let Err(reason) = work.deadline() {
             work.gap(Some(pid), None, reason);
             break;
         }
+        state.cursor = Some(pid);
         work.totals.processes_attempted += 1;
         match process(pid, &mut work) {
             Ok(process) => processes.push(process),
             Err(reason) => work.gap(Some(pid), None, reason),
         }
+        if work.totals.objects_attempted >= options.limits.max_objects || work.remaining() == 0 {
+            // The next poll resumes at a different process, even when this
+            // process consumed the entire snapshot allowance.
+            if order.last() != Some(&pid) {
+                work.gap(
+                    None,
+                    None,
+                    if work.remaining() == 0 {
+                        GapReason::ReadLimit
+                    } else {
+                        GapReason::ObjectLimit
+                    },
+                );
+            }
+            break;
+        }
     }
+    processes.sort_by_key(|p| p.pid);
+    work.cache.retain(|key, value| {
+        value.seen
+            && value
+                .file
+                .metadata()
+                .is_ok_and(|m| Fingerprint::from(&m) == *key)
+    });
+    state.cache = std::mem::take(&mut work.cache);
     let inventory = if work.gaps.is_empty() {
         InventoryState::Complete
     } else if processes.is_empty() {
