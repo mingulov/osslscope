@@ -431,3 +431,76 @@ fn metadata_bounds_preserve_128_mib_file_admission() {
         .unwrap();
     assert_eq!(inspect_module(&path, LIMIT).unwrap().size_bytes, LIMIT);
 }
+
+// A procfs pseudofile can report S_IFREG/size0 while exposing process data.
+// Exercise only harmless stat metadata in RED, never memory/environment/argv.
+#[test]
+fn procfs_pseudofiles_and_descriptor_aliases_are_refused_before_reading() {
+    use std::os::fd::AsRawFd as _;
+    let mut file = File::open("/proc/self/stat").unwrap();
+    assert_eq!(inspect_file(&mut file, LIMIT), Err(GapReason::Unavailable));
+    assert_eq!(
+        inspect_module(Path::new("/proc/self/stat"), LIMIT),
+        Err(GapReason::Unavailable)
+    );
+    let alias = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    assert_eq!(inspect_module(&alias, LIMIT), Err(GapReason::Unavailable));
+}
+
+#[test]
+fn procfs_links_to_native_elf_backing_remain_supported() {
+    use std::os::fd::AsRawFd as _;
+    let f = Fixture::new();
+    let module = f.build("native", "int OSSL_provider_init(void) { return 1; }", &[]);
+    let expected = inspect_module(&module, LIMIT).unwrap();
+    let file = File::open(&module).unwrap();
+    let alias = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    assert_eq!(inspect_module(&alias, LIMIT).unwrap(), expected);
+    // /proc/self/exe resolves to native backing even when this test harness is
+    // intentionally larger than the normal module cap: it reaches TooLarge,
+    // never the procfs refusal.
+    assert_eq!(
+        inspect_module(Path::new("/proc/self/exe"), 0),
+        Err(GapReason::TooLarge)
+    );
+}
+
+// IN_ACCESS is an independent Linux read oracle. Even the old EOF probe on
+// an empty regular file generated it; a length guard must issue no read.
+#[test]
+fn files_shorter_than_elf_magic_are_rejected_without_a_read() {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    let f = Fixture::new();
+    for size in 0..4 {
+        let path = f.0.join(format!("short-{size}"));
+        fs::write(&path, vec![b'x'; size]).unwrap();
+        // SAFETY: returns a fresh descriptor, transferred once to OwnedFd.
+        let raw = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+        assert!(raw >= 0);
+        let notifications = unsafe { OwnedFd::from_raw_fd(raw) };
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: owned FD and NUL-terminated path remain live.
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(notifications.as_raw_fd(), c_path.as_ptr(), libc::IN_ACCESS)
+            } >= 0
+        );
+        assert_eq!(inspect_module(&path, LIMIT), Err(GapReason::NotElf));
+        let mut events = [0u8; 4096];
+        // SAFETY: destination buffer is valid for its full supplied size.
+        let bytes = unsafe {
+            libc::read(
+                notifications.as_raw_fd(),
+                events.as_mut_ptr().cast(),
+                events.len(),
+            )
+        };
+        assert_eq!(bytes, -1, "short file contents were read");
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}

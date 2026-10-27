@@ -114,6 +114,67 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Discovery cache and ELF identity use native fstat dev_t, never
+        // encoded callback/stat words. Cache keys and stability checks compare
+        // descriptors in the same raw domain; ModuleInfo preserves it.
+        ("src/inventory/cli.rs", "raw", "metadata.dev(),", 1),
+        ("src/inventory/elf.rs", "raw", "device: before.dev(),", 1),
+        (
+            "src/inventory/elf.rs",
+            "raw",
+            "if before.dev() != after.dev()",
+            1,
+        ),
+        ("src/inventory/procfs.rs", "raw", "dev: m.dev(),", 1),
+        // Mapping text major/minor is converted with libc::makedev before
+        // all joins. The explicit Btrfs branch permits its known distinct
+        // subvolume st_dev; it does not convert device domains or establish
+        // a path lookup as verified association.
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "&& (metadata.dev() == mapping.device || filesystem(&file) == Some(0x9123683e))",
+            1,
+        ),
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "|| (metadata.dev() != mapping.device && filesystem(&file) != Some(0x9123683e))",
+            1,
+        ),
+        // Mapping uniqueness uses only the same native dev_t/inode domain.
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "if mapping.inode == 0 || seen.contains(&(mapping.device, mapping.inode)) {",
+            1,
+        ),
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "seen.insert((mapping.device, mapping.inode));",
+            1,
+        ),
+        // Finite gap identities preserve native mapping or backing dev_t;
+        // sorting uses that same raw identity without re-encoding it.
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "device: mapping.map(|m| m.device),",
+            1,
+        ),
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "device: Some(module.info.device),",
+            1,
+        ),
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            ".sort_by(|a, b| (a.0.info.device, a.0.info.inode).cmp(&(b.0.info.device, b.0.info.inode)));",
+            1,
+        ),
         // Preview: raw Metadata dev_t is encoded once, then joins use stat words.
         (
             "src/capture/profiled.rs",

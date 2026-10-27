@@ -2,6 +2,7 @@
 //! Passive, file-backed interface inventory. Compatibility is a candidate
 //! property; it proves neither vendor authenticity nor provider activation.
 
+pub mod cli;
 pub mod elf;
 
 use serde::{Deserialize, Serialize};

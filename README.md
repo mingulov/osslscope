@@ -1,18 +1,42 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # osslscope
 
-Observe entries into enrolled OpenSSL implementation callbacks with eBPF
-uprobes, without changing application code, libraries or configuration.
-Counts stay attached to physical code sites; shared candidates retain their
-uncertainty and each entry is counted once.
+Discover OpenSSL-compatible libraries, provider modules and consumers from
+ELF interfaces and running-process mappings. Discovery needs no enrolled
+library profile, manual offsets or BPF. A separate foreground diagnostic can
+observe entries into a small catalogue of OpenSSL callbacks.
 
-**Status: v0.2.0 source preview candidate.** The foreground count-only route
-has native count, isolation, policy and lifecycle checks on the exact profile
-below. This is a bounded inventory tool with material overhead on tight loops;
-see [measured limits](docs/overhead-matrix.md). Reports use the
-[observed-crypto-v2.3 contract](docs/observed-crypto-v2.md).
+**Status: discovery development toward v0.3.0; v0.3.0 is not released.**
+Passive snapshot and supplied-file inspection are implemented. Provider
+activation and advertised runtime interfaces remain unknown; execution is
+`not_observed`. ELF exports and mappings do not prove activation or execution.
+The discovery result is metadata inventory, without an executed CBOM or policy
+verdict. Remaining delivery stages are listed in the [roadmap](ROADMAP.md).
 
-## The foreground preview
+## Discover processes and files
+
+Build the host CLI using the pinned Rust toolchain:
+
+```sh
+cargo build --locked --bin osslscope
+./target/debug/osslscope scan --json
+./target/debug/osslscope scan --pid 1234 --pid 5678 --json
+./target/debug/osslscope inspect --pid 1234 --json
+./target/debug/osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
+```
+
+Use actual visible PIDs and file paths on your host. Ordinary filesystem/procfs
+permissions apply. No privilege elevation or BPF setup is needed for discovery;
+unreadable or unverifiable backing produces explicit partial/unavailable
+results. System scan means the processes visible in the observer's procfs view.
+Output contains finite interface labels and numeric identities/hashes, without
+raw paths, process names, mapping addresses, environment or command lines.
+Only verified mapped backing has `identity_status: verified`; a
+`locator_candidate` is useful file metadata with an unverified mapping association.
+It is never an execution site. Snapshots are bounded and detect some churn;
+they are not atomic. See [usage](docs/usage.md) for bounds and exit codes.
+
+## Legacy foreground diagnostic (v0.2.0)
 
 The initial enrollment is one exact Ubuntu OpenSSL `3.5.5-1ubuntu3.7` amd64
 library and kernel `7.0.0-38-generic` build. Admission checks the actual library
@@ -22,7 +46,8 @@ sites: definite SHA-256 and AES-256-GCM context creation entries, plus a shared
 GCM update with seven possible algorithm meanings. Qualification covers this
 exact profile; additional OpenSSL and Linux builds need separate enrollment.
 
-Supported commands are `doctor`, `report`, `check` and offline `alias-audit`.
+The legacy diagnostic commands are `doctor`, `report`, `check` and offline
+`alias-audit`. They retain the v0.2.0 fixed-profile behavior.
 `report` and `check` launch one owned foreground process and observe its threads.
 They require `--libcrypto PATH` and load only the Count object. There are no
 target-memory discovery readers in this route.
@@ -33,9 +58,10 @@ Callback entry does not establish message processing, crypto success, key size,
 runtime provider activation or FIPS state. Shared counts are not duplicated
 across candidate algorithms. CBOM exports contain definite assets only.
 
-Foreign `--pid`, live `inspect`, dynamic provider discovery, reader-object
-selection, provider/ENGINE policy rules, services and process following are
-deferred. See the [roadmap](ROADMAP.md) for later releases.
+Foreign execution attach, dynamic provider activation/interface observation,
+reader-object selection, provider/ENGINE policy rules, services and process
+following remain deferred. Passive `scan`/`inspect` do not change the legacy
+`report`/`check` restrictions.
 
 ## Build and try the development route
 
@@ -104,8 +130,8 @@ startup custody.
 - [v0.2.0 source release notes](docs/release-v0.2.0.md)
 
 Permanent boundaries: no keys, passwords, plaintext or application payload
-capture; no TLS interception or interposition. The broader discovery/package
-source and its developer references remain for later releases.
+capture; no TLS interception or interposition. Broader discovery, execution and
+package qualification remain in development.
 
 ## License
 

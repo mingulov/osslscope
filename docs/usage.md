@@ -1,11 +1,90 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Foreground preview usage
+# Usage
 
-The v0.2.0 foreground preview supports one exact enrolled x86-64 library/kernel
+Discovery is the starting point for the v0.3.0 development tree. v0.3.0 is not
+released; watch/scopes/namespaces (D2), provider events/interfaces (D3) and
+learned-site execution plus installed qualification (D4) remain required.
+
+## Passive discovery
+
+```sh
+osslscope scan [--pid PID ...] [--json]
+osslscope inspect --pid PID [--json]
+osslscope inspect --module PATH [--module PATH ...] [--json]
+```
+
+With no PID, `scan` inventories visible numeric entries in the observer's
+procfs view. Repeated PIDs are deduplicated. `inspect` requires exactly one
+positive PID or one or more module paths; selector families cannot be mixed.
+Unknown, missing or conflicting arguments fail with exit 2 before discovery IO.
+`scan --help` and `inspect --help` exit 0. Watch and cgroup flags are not yet
+supported. PID namespaces and mount namespaces are not exhaustively resolved.
+
+No `--libcrypto`, enrolled profile, manual offset, BPF object, or privilege
+setup is required. Normal procfs and filesystem permissions apply. No supplied
+module is loaded or executed. Process discovery reads file-backed metadata,
+not target memory, environment, command lines, keys or payloads; it sends no
+signals to targets. It does not inject code or change the target. Procfs
+pseudofiles are unavailable as module inputs; procfs links to ordinary ELF
+backing (such as `/proc/PID/exe` or `/proc/self/fd/N`) remain supported.
+
+For example, substitute a visible PID and actual file paths:
+
+```sh
+osslscope scan --pid 1234 --pid 5678 --json
+osslscope inspect --pid 1234
+osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
+osslscope inspect --module /usr/lib/x86_64-linux-gnu/ossl-modules/legacy.so --json
+```
+
+Both JSON modes use `schema_version: "osslscope.discovery.v1"`. Process output
+has `mode: "snapshot"`, selected PIDs, process/starttime identities, relevant
+module metadata, finite gaps, work totals, limits and capability status.
+Module output has `mode: "module"`, deduplicated `modules`, finite `errors`
+with zero-based `input_index`, work totals, limits and capability status. No
+raw target paths, names, symbol strings or mapping addresses enter either
+output or discovery diagnostics. Human output includes the interpretation
+followed by the same readable structured records.
+
+Module metadata describes a SHA-256, numeric device/inode/size, architecture,
+finite recognized exports and dependency flags. The interface classifications
+are `openssl_compatible`, `provider_module`, `openssl_consumer` or `other`;
+they do not authenticate a vendor. Mapped records distinguish `verified`
+backing association from `locator_candidate` file metadata. A path lookup or
+matching device/inode alone never promotes a candidate to verified backing;
+permissions and filesystem semantics may leave useful candidates and gaps.
+
+**ELF exports and mappings do not prove activation or execution.** Provider
+activation and advertised runtime interfaces remain `unknown`; execution is
+`not_observed`, including for warm processes. Unknown prior activation is
+normal capability status. These commands create no executed CBOM or policy
+verdict and do not prove non-use when no module is found.
+
+All modes bound work with the shared defaults: 128 MiB per module, 4 MiB per
+maps read, 4096 processes, 1024 objects per process, 16384 total object attempts,
+1 GiB aggregate charged read work and a 30-second cooperative deadline.
+Supplied files use the module, total object, read and deadline limits, with
+repeated unchanged files cached rather than hashed again. Read totals are
+conservative charges including EOF probes, not exact kernel byte counts. The
+deadline is checked between operations; it cannot interrupt a stalled syscall
+or an admitted bounded parse. A budget failure preserves earlier independent
+results and reports a finite gap/error. Discovery snapshots are not atomic;
+detectable mapping/file/process churn is reported, and later changes or
+undetectable mutate-and-restore races are not ruled out.
+
+Discovery exits: **0** requested inventory completed without access/resource
+failure; **3** useful partial inventory; **4** wholly unavailable observation;
+**2** invalid arguments; **1** output/internal failure. Complete metadata
+inventory does not imply activation, execution or completeness beyond the
+requested visible scope. An accepted process with no relevant modules remains
+useful inventory. Output failure takes exit 1 even if discovery was partial.
+
+## Legacy foreground diagnostic
+
+The v0.2.0 foreground route supports one exact enrolled x86-64 library/kernel
 profile, one owned foreground process and its threads. Native qualification is
-described in the [release notes](release-v0.2.0.md). Start with [build](build.md), [install](install.md) and the
-[catalogue](../profiles/README.md). Broader modes in older developer references
-are deferred; their flags are rejected by the current CLI.
+described in the [release notes](release-v0.2.0.md). Start with [build](build.md),
+[install](install.md) and the [catalogue](../profiles/README.md).
 
 ## Commands
 
@@ -106,7 +185,7 @@ failure/SIGINT/SIGTERM resolves stopped children and count resources. A crash or
 SIGKILL in the stopped pre-exec interval can strand the child; external cleanup
 is then required. There is no crash-safe startup custodian in this preview.
 
-## Exit codes
+## Legacy foreground exit codes
 
 | Code | Meaning |
 | --- | --- |
@@ -118,7 +197,7 @@ is then required. There is no crash-safe startup custodian in this preview.
 | 10 | A definite policy violation; dominates child, artifact and usable runtime failure. |
 | 11 | Policy inconclusive, including known algorithms unobserved under incomplete coverage. |
 
-Live `inspect`, foreign `--pid`, `--provider`, `--builtin`, `--object`,
+For `report`/`check`, foreign `--pid`, `--provider`, `--builtin`, `--object`,
 `--members-object`, `--dev-bundle`, table/offset overrides, `--settle`,
 `--image-digest`, provider/ENGINE/weak rules, services and following are deferred.
 Offline `alias-audit` remains available for an existing harvest document; it

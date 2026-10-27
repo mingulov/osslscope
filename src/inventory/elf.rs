@@ -8,6 +8,7 @@ use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io;
+use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
@@ -30,8 +31,27 @@ pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapRe
     if !before.is_file() {
         return Err(GapReason::NonRegular);
     }
+    // Procfs pseudofiles can claim to be regular, including memory,
+    // environment and argv views. Inspect the opened descriptor's actual
+    // filesystem before any read; /proc links to ordinary backing remain
+    // valid because fstatfs follows the descriptor, not its locator path.
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: the live FD and properly sized output storage are valid. Only
+    // a successful fstatfs result is subsequently initialized/read.
+    if unsafe { libc::fstatfs(file.as_raw_fd(), filesystem.as_mut_ptr()) } != 0 {
+        return Err(GapReason::Unavailable);
+    }
+    let filesystem = unsafe { filesystem.assume_init() };
+    if filesystem.f_type == libc::PROC_SUPER_MAGIC {
+        return Err(GapReason::Unavailable);
+    }
     if before.len() > max_bytes {
         return Err(GapReason::TooLarge);
+    }
+    // A file shorter than ELF magic cannot be a module. Avoid even an EOF
+    // probe on empty or short inputs.
+    if before.len() < 4 {
+        return Err(GapReason::NotElf);
     }
     let bytes = read_bounded(file, before.len());
     verify_unchanged(file, &before)?;

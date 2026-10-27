@@ -82,7 +82,12 @@ fn package_admission_failure_precedes_effects() {
         .args(["inspect", "--help"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .contains("inspect --module")
+    );
     for (verb, args) in [
         (
             "inspect",

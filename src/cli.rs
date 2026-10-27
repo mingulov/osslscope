@@ -8,18 +8,13 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
     match cmd {
         "doctor" => crate::doctor::profiled::run(&argv[1..]),
-        "inspect" => {
-            crate::report::err_line(
-                "osslscope inspect: deferred beyond v0.2; use report --libcrypto PATH run -- COMMAND",
-            );
-            ExitCode::from(2)
-        }
+        "scan" | "inspect" => crate::inventory::cli::run(cmd, &argv[1..]),
         "alias-audit" => crate::aliases::run(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
         "check" => crate::check::run(&argv[1..]),
         "help" | "--help" | "-h" => {
             println!("osslscope — non-interposing OpenSSL observer");
-            println!("usage: osslscope <doctor|report|check|alias-audit> [args]");
+            println!("usage: osslscope <scan|inspect|doctor|report|check|alias-audit> [args]");
             println!(
                 "  doctor       preflight for one exact library/kernel profile and Count object"
             );
@@ -29,7 +24,10 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             println!(
                 "  report/check require --libcrypto PATH and run -- COMMAND; coverage is PARTIAL"
             );
-            println!("  live inspect, foreign PID and dynamic providers are deferred beyond v0.2");
+            println!(
+                "  scan/inspect  passive process/module discovery; no profile or BPF required"
+            );
+            println!("  discovery does not prove provider activation or execution");
             ExitCode::SUCCESS
         }
         "--version" | "-V" => {
@@ -93,10 +91,10 @@ pub fn prepare(args: impl Iterator<Item = String>) -> PreparedCommand {
 mod preview_tests {
     use super::*;
     #[test]
-    fn live_inspect_is_explicitly_deferred() {
+    fn inventory_help_is_supported() {
         let args = ["inspect", "--help"].map(String::from);
         assert!(
-            matches!(prepare(args.into_iter()), PreparedCommand::Immediate(code) if code == ExitCode::from(2))
+            matches!(prepare(args.into_iter()), PreparedCommand::Immediate(code) if code == ExitCode::SUCCESS)
         );
     }
 }

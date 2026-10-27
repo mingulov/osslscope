@@ -1,8 +1,31 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Roadmap
 
-osslscope is in development. The v0.2.0 source preview has one qualified
-foreground workflow. Broader features remain planned releases.
+osslscope is in development toward v0.3.0. It is not released. Discovery is
+the normal starting point; the v0.2.0 fixed-profile foreground route remains a
+legacy diagnostic with its original qualification boundary.
+
+## v0.3.0: discover first, then observe
+
+- **D1 — implemented snapshot surface, acceptance in progress.** `scan` inventories
+  visible processes or selected PIDs; `inspect` inventories one PID or supplied
+  ELF files. The same bounded parser recognizes finite OpenSSL interfaces from
+  file bytes without profiles, manual offsets, code loading or BPF. Access,
+  identity and resource gaps remain visible. Mapping candidates are distinct
+  from verified backing. Activation/interfaces are unknown and execution is
+  not observed.
+- **D2 — remaining:** watch, cgroup scopes, process/object following and
+  namespace-aware file access, with scope exclusion and churn qualification.
+- **D3 — remaining:** observe public provider lifecycle events and external
+  provider initialization/query interfaces; retain warm-process, built-in and
+  attachment limitations.
+- **D4 — remaining:** count execution at learned callback sites, integrate
+  report/check, and qualify installed workflows, ambiguity, conservation,
+  privacy, failures, resources, overhead and kernel compatibility.
+
+All stages are required for v0.3.0. Source implementation and local fixtures
+do not establish platform/provider or release qualification. Discovery metadata
+alone produces neither an executed CBOM nor a policy verdict.
 
 ## v0.2.0: a usable foreground preview
 
@@ -34,23 +57,18 @@ exclusion, policy/output behavior and normal cleanup, with
 crash limitation remains explicit. See [release notes](docs/release-v0.2.0.md).
 Full binary-package and cross-platform qualification is later work.
 
-## After v0.2.0
+## Beyond this delivery
 
-The next priorities are additional useful profiles/algorithms, external-process
-attach and general provider discovery with the required identity/privacy
-controls. Broader OpenSSL, kernel, libc and container support will be qualified
-incrementally.
+Broader OpenSSL, kernel, libc and container support will be qualified
+incrementally. Additional capabilities remain later work:
 
-Later releases can add independently useful features:
-
-- Multiple processes, cgroups and process following.
 - Daemon operation, Prometheus/OpenTelemetry export and operator workflows.
 - Latency histograms and metadata-only per-call tracing.
 - Advanced artifact identity/build provenance and DEB/RPM lifecycle support.
 - Stronger completeness/first-call guarantees and broader performance,
   platform/provider and consumer qualification.
 
-These are future tracks, not prerequisites for the first usable preview.
+These later tracks do not replace the remaining D2–D4 delivery gates.
 ARM64 and OpenSSL before 3.0 remain later evaluation. Platform and performance
 claims will follow actual results, with their limits documented.
 
