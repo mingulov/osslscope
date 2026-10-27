@@ -2,7 +2,8 @@
 //! Data parsing only: no loader calls, symbol execution or target inspection.
 
 use super::{Api, Architecture, GapReason, ModuleInfo, ObjectKind};
-use goblin::elf::{Elf, header, program_header, section_header, sym};
+use goblin::container::{Container, Ctx, Endian};
+use goblin::elf::{Elf, dynamic, header, program_header, section_header, sym};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{File, Metadata, OpenOptions};
@@ -41,7 +42,11 @@ pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapRe
     if !bytes.starts_with(b"\x7fELF") {
         return Err(GapReason::NotElf);
     }
+    admit_parser_metadata(&bytes)?;
     let elf = Elf::parse(&bytes).map_err(|_| GapReason::MalformedElf)?;
+    if elf.dynsyms.len() > MAX_SYMBOLS {
+        return Err(GapReason::ReadLimit);
+    }
     let architecture = match elf.header.e_machine {
         header::EM_X86_64 => Architecture::X86_64,
         header::EM_AARCH64 => Architecture::Aarch64,
@@ -108,6 +113,239 @@ pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapRe
     };
     verify_unchanged(file, &before)?;
     Ok(result)
+}
+
+// These are aggregate metadata limits, independent of the caller's file-byte
+// limit (including 128 MiB objects). Goblin 0.10 eagerly allocates headers,
+// dynamic records, string indexes, dependency/path vectors and relocation
+// descriptors; symbols, relocation contents and version sections are borrowed.
+const MAX_HEADERS: usize = 4_096;
+const MAX_DYNAMIC_ENTRIES: usize = 16_384;
+const MAX_STRING_ROWS: usize = 65_536;
+const MAX_METADATA_BYTES: usize = 16 * 1024 * 1024;
+const MAX_SYMBOLS: usize = 262_144;
+const MAX_HASH_STEPS: usize = 262_144;
+
+#[derive(Default)]
+struct ParserBudget {
+    bytes: usize,
+    strings: usize,
+}
+
+impl ParserBudget {
+    fn charge(&mut self, size: usize) -> Result<(), GapReason> {
+        self.bytes = self.bytes.checked_add(size).ok_or(GapReason::ReadLimit)?;
+        if self.bytes > MAX_METADATA_BYTES {
+            return Err(GapReason::ReadLimit);
+        }
+        Ok(())
+    }
+
+    fn strings(&mut self, bytes: &[u8], offset: u64, size: u64) -> Result<(), GapReason> {
+        let size = usize::try_from(size).map_err(|_| GapReason::ReadLimit)?;
+        self.charge(size)?;
+        let table = file_slice(bytes, offset, size)?;
+        // Each delimiter is one eager row, including empty strings. Charge a
+        // final unterminated entry too; the parser will reject invalid data.
+        let rows = table.iter().filter(|&&byte| byte == 0).count()
+            + usize::from(table.last().is_some_and(|&byte| byte != 0));
+        self.strings = self.strings.checked_add(rows).ok_or(GapReason::ReadLimit)?;
+        if self.strings > MAX_STRING_ROWS {
+            return Err(GapReason::ReadLimit);
+        }
+        Ok(())
+    }
+}
+
+/// Admit every eager allocation class before invoking Elf::parse. Repeated
+/// references count repeatedly: Goblin builds separate indexes even when
+/// section-name, ordinary symbol-name and dynamic string tables alias.
+fn admit_parser_metadata(bytes: &[u8]) -> Result<(), GapReason> {
+    let h = Elf::parse_header(bytes).map_err(|_| GapReason::MalformedElf)?;
+    let container = match h.e_ident[header::EI_CLASS] {
+        header::ELFCLASS64 => Container::Big,
+        header::ELFCLASS32 => Container::Little,
+        _ => return Err(GapReason::MalformedElf),
+    };
+    let endian = match h.e_ident[header::EI_DATA] {
+        header::ELFDATA2LSB => Endian::Little,
+        header::ELFDATA2MSB => Endian::Big,
+        _ => return Err(GapReason::MalformedElf),
+    };
+    let ctx = Ctx::new(container, endian);
+    let mut budget = ParserBudget::default();
+    let mut section_count = usize::from(h.e_shnum);
+    if h.e_shoff == 0 {
+        section_count = 0;
+    } else if section_count == 0 {
+        // A count of zero invokes ELF's extended section count. Decode only
+        // the first fixed-size header before admitting the resulting vector.
+        let first = section_header::SectionHeader::parse(bytes, h.e_shoff as usize, 1, ctx)
+            .map_err(|_| GapReason::MalformedElf)?;
+        section_count = usize::try_from(first[0].sh_size).map_err(|_| GapReason::ReadLimit)?;
+        // Goblin still pushes the null header for an extended zero count.
+        section_count = section_count.max(1);
+    }
+    let program_count = usize::from(h.e_phnum);
+    if section_count > MAX_HEADERS || program_count > MAX_HEADERS - section_count {
+        return Err(GapReason::ReadLimit);
+    }
+    budget.charge(section_count * section_header::SectionHeader::size(ctx))?;
+    budget.charge(program_count * program_header::ProgramHeader::size(ctx))?;
+    let sections =
+        section_header::SectionHeader::parse(bytes, h.e_shoff as usize, section_count, ctx)
+            .map_err(|_| GapReason::MalformedElf)?;
+    let programs =
+        program_header::ProgramHeader::parse(bytes, h.e_phoff as usize, program_count, ctx)
+            .map_err(|_| GapReason::MalformedElf)?;
+
+    let mut string_index = usize::from(h.e_shstrndx);
+    if string_index == section_header::SHN_XINDEX as usize {
+        string_index = sections.first().map_or(0, |s| s.sh_link as usize);
+    }
+    if let Some(s) = sections.get(string_index) {
+        budget.strings(bytes, s.sh_offset, s.sh_size)?;
+    }
+    if let Some(s) = sections
+        .iter()
+        .rfind(|s| s.sh_type == section_header::SHT_SYMTAB)
+    {
+        let count = if s.sh_entsize == 0 {
+            0
+        } else {
+            s.sh_size / s.sh_entsize
+        };
+        if count > MAX_SYMBOLS as u64 {
+            return Err(GapReason::ReadLimit);
+        }
+        budget.charge(count as usize * sym::Sym::size(container))?;
+        // get_strtab treats SHN_XINDEX specially even for an ordinary link.
+        let link = if s.sh_link == section_header::SHN_XINDEX {
+            sections.first().map_or(0, |s| s.sh_link as usize)
+        } else {
+            s.sh_link as usize
+        };
+        if let Some(s) = sections.get(link) {
+            budget.strings(bytes, s.sh_offset, s.sh_size)?;
+        }
+    }
+    for s in &sections {
+        if matches!(
+            s.sh_type,
+            section_header::SHT_REL | section_header::SHT_RELA
+        ) {
+            budget.charge(usize::try_from(s.sh_size).map_err(|_| GapReason::ReadLimit)?)?;
+        }
+    }
+    for p in &programs {
+        if p.p_type == program_header::PT_INTERP {
+            budget.charge(usize::try_from(p.p_filesz).map_err(|_| GapReason::ReadLimit)?)?;
+        }
+    }
+    if let Some(p) = programs
+        .iter()
+        .find(|p| p.p_type == program_header::PT_DYNAMIC)
+    {
+        let size = usize::try_from(p.p_filesz).map_err(|_| GapReason::ReadLimit)?;
+        if size / dynamic::Dyn::size(container) > MAX_DYNAMIC_ENTRIES {
+            return Err(GapReason::ReadLimit);
+        }
+        budget.charge(size)?;
+    }
+    // Dynamic::parse is safe to invoke now: its sole vector capacity is
+    // admitted above, including records after an early DT_NULL terminator.
+    if let Some(d) =
+        dynamic::Dynamic::parse(bytes, &programs, ctx).map_err(|_| GapReason::MalformedElf)?
+    {
+        let info = &d.info;
+        budget.strings(bytes, info.strtab as u64, info.strsz as u64)?;
+        for size in [info.relasz, info.relsz, info.pltrelsz] {
+            budget.charge(size)?;
+        }
+        admit_hash_work(bytes, info, ctx, &mut budget)?;
+    }
+    Ok(())
+}
+
+fn file_slice(bytes: &[u8], offset: u64, size: usize) -> Result<&[u8], GapReason> {
+    let start = usize::try_from(offset).map_err(|_| GapReason::MalformedElf)?;
+    let end = start.checked_add(size).ok_or(GapReason::MalformedElf)?;
+    bytes.get(start..end).ok_or(GapReason::MalformedElf)
+}
+
+fn read_word(bytes: &[u8], offset: usize, ctx: Ctx) -> Result<u32, GapReason> {
+    let word: [u8; 4] = file_slice(bytes, offset as u64, 4)?.try_into().unwrap();
+    Ok(if ctx.is_little_endian() {
+        u32::from_le_bytes(word)
+    } else {
+        u32::from_be_bytes(word)
+    })
+}
+
+// Mirror only Goblin's bounded GNU hash extent walk, not its parser. SYSV hash
+// and relocation-derived symbol counts are borrowed and checked after parsing.
+fn admit_hash_work(
+    bytes: &[u8],
+    info: &dynamic::DynamicInfo,
+    ctx: Ctx,
+    budget: &mut ParserBudget,
+) -> Result<(), GapReason> {
+    let Some(offset) = info.gnu_hash else {
+        return Ok(());
+    };
+    let offset = usize::try_from(offset).map_err(|_| GapReason::MalformedElf)?;
+    let buckets = read_word(bytes, offset, ctx)? as usize;
+    let minimum = read_word(
+        bytes,
+        offset.checked_add(4).ok_or(GapReason::MalformedElf)?,
+        ctx,
+    )? as usize;
+    let bloom = read_word(
+        bytes,
+        offset.checked_add(8).ok_or(GapReason::MalformedElf)?,
+        ctx,
+    )? as usize;
+    if buckets == 0 || minimum == 0 || bloom == 0 {
+        return Err(GapReason::MalformedElf);
+    }
+    if buckets > MAX_HASH_STEPS || minimum > MAX_SYMBOLS {
+        return Err(GapReason::ReadLimit);
+    }
+    let bloom_bytes = bloom.checked_mul(ctx.size()).ok_or(GapReason::ReadLimit)?;
+    budget.charge(bloom_bytes)?;
+    budget.charge(buckets * 4)?;
+    let bucket_offset = offset
+        .checked_add(16)
+        .and_then(|n| n.checked_add(bloom_bytes))
+        .ok_or(GapReason::MalformedElf)?;
+    let bucket_bytes = file_slice(bytes, bucket_offset as u64, buckets * 4)?;
+    let mut maximum = 0;
+    for offset in (0..bucket_bytes.len()).step_by(4) {
+        maximum = maximum.max(read_word(bucket_bytes, offset, ctx)? as usize);
+    }
+    if maximum < minimum {
+        return Ok(());
+    }
+    if maximum >= MAX_SYMBOLS {
+        return Err(GapReason::ReadLimit);
+    }
+    let mut chain_offset = bucket_offset
+        .checked_add(buckets * 4)
+        .and_then(|n| n.checked_add((maximum - minimum) * 4))
+        .ok_or(GapReason::MalformedElf)?;
+    for _ in 0..MAX_HASH_STEPS - buckets {
+        let word = read_word(bytes, chain_offset, ctx)?;
+        budget.charge(4)?;
+        maximum += 1;
+        if maximum > MAX_SYMBOLS {
+            return Err(GapReason::ReadLimit);
+        }
+        if word & 1 != 0 {
+            return Ok(());
+        }
+        chain_offset = chain_offset.checked_add(4).ok_or(GapReason::MalformedElf)?;
+    }
+    Err(GapReason::ReadLimit)
 }
 
 fn read_bounded(file: &File, size: u64) -> Result<Vec<u8>, GapReason> {

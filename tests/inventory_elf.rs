@@ -341,3 +341,93 @@ fn invalid_symbol_section_cannot_establish_an_interface() {
     assert!(metadata.exports.is_empty());
     assert_eq!(metadata.kind, ObjectKind::Other);
 }
+
+// Minimal ELF64 with a section-name table, optionally reused as the ordinary
+// symbol-name table. Thousands of empty entries amplify Goblin's eager index.
+fn string_table_elf(size: usize, ordinary_symbols: bool) -> Vec<u8> {
+    let mut bytes = vec![0; 256 + size];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[16..18].copy_from_slice(&3_u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[40..48].copy_from_slice(&64_u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+    bytes[60..62].copy_from_slice(&3_u16.to_le_bytes());
+    bytes[62..64].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[132..136].copy_from_slice(&3_u32.to_le_bytes()); // SHT_STRTAB
+    bytes[152..160].copy_from_slice(&256_u64.to_le_bytes());
+    bytes[160..168].copy_from_slice(&(size as u64).to_le_bytes());
+    if ordinary_symbols {
+        bytes[196..200].copy_from_slice(&2_u32.to_le_bytes()); // SHT_SYMTAB
+        bytes[232..236].copy_from_slice(&1_u32.to_le_bytes()); // sh_link
+        bytes[248..256].copy_from_slice(&24_u64.to_le_bytes());
+    }
+    bytes
+}
+
+// Catches file-byte admission permitting an unbounded eager string index.
+#[test]
+fn metadata_string_rows_are_bounded_before_eager_parsing() {
+    let f = Fixture::new();
+    let path = f.0.join("many-strings");
+    fs::write(&path, string_table_elf(65_537, false)).unwrap();
+    assert_eq!(inspect_module(&path, LIMIT), Err(GapReason::ReadLimit));
+    // The same bytes with one long string do not expand into thousands of rows.
+    let mut control = string_table_elf(65_537, false);
+    control[257..].fill(b'x');
+    *control.last_mut().unwrap() = 0;
+    fs::write(&path, control).unwrap();
+    assert_eq!(
+        inspect_module(&path, LIMIT).unwrap().kind,
+        ObjectKind::Other
+    );
+}
+
+// Catches per-table limits missing aggregate expansion, including aliased data.
+#[test]
+fn metadata_string_rows_are_aggregated_across_selected_tables() {
+    let f = Fixture::new();
+    let path = f.0.join("reused-strings");
+    fs::write(&path, string_table_elf(40_000, true)).unwrap();
+    assert_eq!(inspect_module(&path, LIMIT), Err(GapReason::ReadLimit));
+}
+
+// Catches Dynamic::parse reserving a huge vector despite an early DT_NULL.
+#[test]
+fn metadata_dynamic_capacity_is_bounded_before_eager_parsing() {
+    let f = Fixture::new();
+    let path = f.build("many-dynamic", "int unrelated(void) { return 1; }", &[]);
+    let mut bytes = fs::read(&path).unwrap();
+    let dynamic_header = {
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let index = elf
+            .program_headers
+            .iter()
+            .position(|header| header.p_type == goblin::elf::program_header::PT_DYNAMIC)
+            .unwrap();
+        elf.header.e_phoff as usize + index * 56
+    };
+    let offset = bytes.len() as u64;
+    let size = 16_385_u64 * 16;
+    bytes.resize(bytes.len() + size as usize, 0);
+    bytes[dynamic_header + 8..dynamic_header + 16].copy_from_slice(&offset.to_le_bytes());
+    bytes[dynamic_header + 32..dynamic_header + 40].copy_from_slice(&size.to_le_bytes());
+    fs::write(&path, bytes).unwrap();
+    assert_eq!(inspect_module(&path, LIMIT), Err(GapReason::ReadLimit));
+}
+
+// Prevents addressing metadata amplification by reducing the file byte limit.
+#[test]
+fn metadata_bounds_preserve_128_mib_file_admission() {
+    let f = Fixture::new();
+    let path = f.0.join("large-object");
+    fs::write(&path, string_table_elf(1, false)).unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(LIMIT)
+        .unwrap();
+    assert_eq!(inspect_module(&path, LIMIT).unwrap().size_bytes, LIMIT);
+}
