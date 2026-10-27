@@ -452,3 +452,115 @@ fn focused_output_and_cbom_share_the_actual_document() {
     assert_eq!(std::fs::read(workload).unwrap(), b"fixture-output\n");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+fn assert_closed_workload_fd_delivers_failure_artifacts(command: &str) {
+    let dir = std::env::temp_dir().join(format!(
+        "osslscope-closed-workload-fd-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(dir.clone());
+    let marker = dir.join("workload-executed");
+    let script = format!("touch {}", marker.display());
+    for primary_file in [false, true] {
+        let primary = dir.join(format!("{command}-{primary_file}.json"));
+        let cbom = dir.join(format!("{command}-{primary_file}.cdx.json"));
+        let mut args = vec![
+            "--format",
+            "json",
+            "--cbom",
+            cbom.to_str().unwrap(),
+            "--workload-out-fd",
+            "2147483647",
+        ];
+        if primary_file {
+            args.extend(["--out", primary.to_str().unwrap()]);
+        }
+        args.extend(["run", "--", "/bin/sh", "-c", &script]);
+        let out = cli(command, &args);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{command}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!marker.exists(), "invalid sink executed the workload");
+        let doc: serde_json::Value = if primary_file {
+            assert!(out.stdout.is_empty());
+            serde_json::from_slice(&std::fs::read(primary).unwrap()).unwrap()
+        } else {
+            parsed(&out)
+        };
+        osslscope::schema::validate_v2(&doc).unwrap();
+        osslscope::schema::check_v2_semantics(&doc).unwrap();
+        assert_eq!(doc["completeness"]["status"], "FATAL");
+        if command == "check" {
+            assert_eq!(doc["policy"]["verdict"], "no-verdict");
+        }
+        let bom: serde_json::Value = serde_json::from_slice(&std::fs::read(cbom).unwrap()).unwrap();
+        assert_eq!(bom["bomFormat"], "CycloneDX");
+        assert!(!String::from_utf8_lossy(&out.stderr).contains("focused callbacks attached"));
+    }
+}
+
+#[test]
+fn report_closed_workload_fd_delivers_failure_artifacts_without_workload() {
+    assert_closed_workload_fd_delivers_failure_artifacts("report");
+}
+#[test]
+fn check_closed_workload_fd_delivers_failure_artifacts_without_workload() {
+    assert_closed_workload_fd_delivers_failure_artifacts("check");
+}
+
+#[test]
+#[ignore = "requires an explicitly supplied legacy Count object; no BPF load"]
+fn legacy_closed_workload_fd_preserves_entrypoint_preflight() {
+    let count =
+        std::env::var("OSSLSCOPE_LEGACY_COUNT_OBJECT").expect("legacy Count object required");
+    let marker =
+        std::env::temp_dir().join(format!("osslscope-legacy-closed-fd-{}", std::process::id()));
+    let script = format!("touch {}", marker.display());
+    for command in ["report", "check"] {
+        let out = cli(
+            command,
+            &[
+                "--libcrypto",
+                "/missing-library",
+                "--count-object",
+                &count,
+                "--format",
+                "json",
+                "--workload-out-fd",
+                "2147483647",
+                "run",
+                "--",
+                "/bin/sh",
+                "-c",
+                &script,
+            ],
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("workload fd:"),
+            "legacy route did not reach main's existing preflight: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            !marker.exists(),
+            "legacy invalid sink executed the workload"
+        );
+    }
+}

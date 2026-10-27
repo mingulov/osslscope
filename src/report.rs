@@ -439,6 +439,9 @@ enum PreparedRoute {
     },
 }
 impl Prepared {
+    pub(crate) fn is_focused(&self) -> bool {
+        matches!(self.route, PreparedRoute::Focused { .. })
+    }
     pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
         Some(self.setup_deadline)
     }
@@ -451,6 +454,13 @@ impl Prepared {
         }
     }
     pub(crate) fn execute(self) -> crate::report::CaptureCommandResult {
+        // Validate before invoking the controller: invalid workload delivery
+        // must acquire neither target custody nor observer/count resources.
+        let workload_fd_error = if self.is_focused() {
+            self.workload_fd().err()
+        } else {
+            None
+        };
         let args = self.args;
         let req = OutputRequest {
             format: if args.format == "json" {
@@ -475,7 +485,15 @@ impl Prepared {
         );
         match self.route {
             PreparedRoute::Focused { config, objects } => crate::report::consume_focused_result(
-                crate::focused_capture::run(config, args.target, objects, self.setup_deadline),
+                match workload_fd_error {
+                    Some(error) => Err(error.into()),
+                    None => crate::focused_capture::run(
+                        config,
+                        args.target,
+                        objects,
+                        self.setup_deadline,
+                    ),
+                },
                 CaptureCommand::Report,
                 &req,
             ),

@@ -63,6 +63,14 @@ pub enum PreparedCommand {
     Check(crate::check::Prepared),
 }
 impl PreparedCommand {
+    /// Parsed normal/legacy routing; workload argv never participates.
+    pub fn is_focused(&self) -> bool {
+        match self {
+            Self::Report(p) => p.is_focused(),
+            Self::Check(p) => p.is_focused(),
+            Self::Immediate(_) => false,
+        }
+    }
     pub fn setup_deadline(&self) -> Option<std::time::Instant> {
         match self {
             Self::Report(p) => p.setup_deadline(),

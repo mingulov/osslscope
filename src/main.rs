@@ -26,9 +26,14 @@ fn main() -> ExitCode {
         osslscope::report::err_line("osslscope: setup deadline overflow");
         return ExitCode::from(2);
     }
-    if let Err(error) = prepared.workload_fd() {
-        osslscope::report::err_line(&format!("osslscope: workload fd: {error}"));
-        return ExitCode::from(4);
+    // Focused commands validate the sink before controller acquisition and
+    // deliver failures through their requested document/artifact outputs.
+    // Explicit legacy diagnostics retain their entrypoint preflight contract.
+    if !prepared.is_focused() {
+        if let Err(error) = prepared.workload_fd() {
+            osslscope::report::err_line(&format!("osslscope: workload fd: {error}"));
+            return ExitCode::from(4);
+        }
     }
     // Focused and explicit legacy runs acquire stopped-child custody before
     // BPF resources. The synchronous controller owns discovery and teardown.
