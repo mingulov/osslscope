@@ -114,6 +114,15 @@ fn role_site(pid: u32, starttime: u64, site: &VerifiedSite) -> RoleSite {
         site.file_offset(),
     ]
 }
+fn validate_candidate_member(member: &c::Member, generation: u64) -> Result<(), ObservationGap> {
+    // Epoch is the producer's cursor-continuation lease. Disabled cursors do
+    // not invalidate the process/code binding of a later current return.
+    if member.generation != generation || !matches!(member.epoch, 0 | 1) {
+        Err(ObservationGap::MembershipUnknown)
+    } else {
+        Ok(())
+    }
+}
 fn reconcile_retirement_gap(
     current_starttime: Option<u64>,
     expected_starttime: u64,
@@ -211,7 +220,9 @@ fn specs() -> Vec<loader::MapSpec> {
 }
 impl ProviderSession {
     /// Validate enclosing process and current membership, preserving the separate
-    /// D3 membership epoch and mapped-object generation domains.
+    /// D3 membership epoch and mapped-object generation domains. This proves
+    /// current process/code binding, not renewal of a borrowed table lease;
+    /// the controller owns invalidation, batch discard and fresh-return rearm.
     pub fn revalidate_candidate(
         &self,
         candidate: &VerifiedSiteCandidate,
@@ -230,9 +241,7 @@ impl ProviderSession {
             .members
             .get(&candidate.pid, 0)
             .map_err(|_| ObservationGap::MembershipUnknown)?;
-        if member.generation != target.generation || member.epoch != 1 {
-            return Err(ObservationGap::MembershipUnknown);
-        }
+        validate_candidate_member(&member, target.generation)?;
         target.process.revalidate()?;
         candidate.site.revalidate_object()
     }
@@ -1127,6 +1136,36 @@ fn object_id(site: &VerifiedSite) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn candidate_membership_accepts_current_return_after_cursor_disable() {
+        for epoch in [0, 1] {
+            let member = c::Member {
+                generation: 7,
+                epoch,
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_candidate_member(&member, 7),
+                Ok(()),
+                "epoch {epoch}"
+            );
+            assert_eq!(
+                validate_candidate_member(&member, 8),
+                Err(ObservationGap::MembershipUnknown)
+            );
+        }
+        for epoch in [2, u64::MAX] {
+            let member = c::Member {
+                generation: 7,
+                epoch,
+                ..Default::default()
+            };
+            assert_eq!(
+                validate_candidate_member(&member, 7),
+                Err(ObservationGap::MembershipUnknown)
+            );
+        }
+    }
     #[test]
     fn reconcile_preserves_membership_and_revalidation_retirement_causes() {
         assert_eq!(

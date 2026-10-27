@@ -4,7 +4,10 @@ use osslscope::{
     focused_capture::{FocusedConfig, batch_requires_retirement, project},
     focused_count::CountSample,
     policy::{self, PolicyRule},
-    provider_observation::{ObservationBatch, ObservationFact, ObservationGap},
+    provider_observation::{
+        ApiOutcome, Cacheability, ObservationBatch, ObservationFact, ObservationGap,
+        ObservationPayload,
+    },
     report, schema,
 };
 use std::time::Duration;
@@ -346,4 +349,32 @@ fn zero_hit_row_does_not_skip_a_later_invalid_execution_row() {
     value["sites"][1]["first_ns"] = 0.into();
     value["sites"][1]["last_ns"] = 0.into();
     assert!(schema::check_v2_semantics(&value).is_err());
+}
+
+#[test]
+fn query_cacheability_retires_selected_pid_without_an_invalidation_fact() {
+    for (cacheability, retire) in [
+        (Cacheability::Cacheable, false),
+        (Cacheability::Volatile, true),
+        (Cacheability::Unknown, true),
+    ] {
+        let mut fact = invalidation();
+        fact.payload = ObservationPayload::QueryResult {
+            outcome: ApiOutcome::Success,
+            cacheability,
+        };
+        let batch = ObservationBatch {
+            facts: vec![fact],
+            ..Default::default()
+        };
+        assert_eq!(
+            batch_requires_retirement(&batch, 42),
+            retire,
+            "{cacheability:?}"
+        );
+        assert!(
+            !batch_requires_retirement(&batch, 43),
+            "unrelated PID {cacheability:?}"
+        );
+    }
 }

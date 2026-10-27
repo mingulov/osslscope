@@ -10,8 +10,8 @@ use crate::{
         scope::{ScopedScanner, Selection},
     },
     provider_observation::{
-        AliasStatus, ObservationBatch, ObservationGap, ObservationLimits, ObservationPayload,
-        ProviderSession, VerifiedSiteCandidate, cli::Signals,
+        AliasStatus, Cacheability, ObservationBatch, ObservationGap, ObservationLimits,
+        ObservationPayload, ProviderSession, VerifiedSiteCandidate, cli::Signals,
     },
     target::{OwnedTarget, TargetDisposition},
 };
@@ -72,37 +72,43 @@ pub struct FocusedResult {
 /// No event-order proof is exposed within a batch. Retirement therefore also
 /// forbids admitting that batch's candidates; only a later return can rearm.
 pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
-    batch
-        .facts
-        .iter()
-        .any(|f| f.pid == pid && matches!(f.payload, ObservationPayload::Invalidation { .. }))
-        || batch.gaps.iter().any(|g| {
-            matches!(
-                g,
-                ObservationGap::ProcessUnavailable
-                    | ObservationGap::ProcessChanged
-                    | ObservationGap::NamespaceChanged
-                    | ObservationGap::BackingUnavailable
-                    | ObservationGap::IdentityUnverified
-                    | ObservationGap::ObjectChanged
-                    | ObservationGap::MalformedMaps
-                    | ObservationGap::QueueLoss
-                    | ObservationGap::PendingLimit
-                    | ObservationGap::DepthLimit
-                    | ObservationGap::DrainOverrun
-                    | ObservationGap::SnapshotLag
-                    | ObservationGap::InvalidWire
-                    | ObservationGap::TargetReadFailed
-                    | ObservationGap::UnpairedReturn
-                    | ObservationGap::RelocationRefused
-                    | ObservationGap::MembershipUnknown
-                    | ObservationGap::RegistrationRace
-                    | ObservationGap::Invalidated
-                    | ObservationGap::BpfUnavailable
-                    | ObservationGap::FactLimit
-                    | ObservationGap::StateLimit
+    batch.facts.iter().any(|f| {
+        f.pid == pid
+            && matches!(
+                f.payload,
+                ObservationPayload::Invalidation { .. }
+                    | ObservationPayload::QueryResult {
+                        cacheability: Cacheability::Volatile | Cacheability::Unknown,
+                        ..
+                    }
             )
-        })
+    }) || batch.gaps.iter().any(|g| {
+        matches!(
+            g,
+            ObservationGap::ProcessUnavailable
+                | ObservationGap::ProcessChanged
+                | ObservationGap::NamespaceChanged
+                | ObservationGap::BackingUnavailable
+                | ObservationGap::IdentityUnverified
+                | ObservationGap::ObjectChanged
+                | ObservationGap::MalformedMaps
+                | ObservationGap::QueueLoss
+                | ObservationGap::PendingLimit
+                | ObservationGap::DepthLimit
+                | ObservationGap::DrainOverrun
+                | ObservationGap::SnapshotLag
+                | ObservationGap::InvalidWire
+                | ObservationGap::TargetReadFailed
+                | ObservationGap::UnpairedReturn
+                | ObservationGap::RelocationRefused
+                | ObservationGap::MembershipUnknown
+                | ObservationGap::RegistrationRace
+                | ObservationGap::Invalidated
+                | ObservationGap::BpfUnavailable
+                | ObservationGap::FactLimit
+                | ObservationGap::StateLimit
+        )
+    })
 }
 fn loss(name: &str, source: CounterSource, value: u64) -> GapCounter {
     GapCounter {
@@ -460,7 +466,9 @@ pub fn run(
             break;
         }
         if let Some(child) = &mut owned.1 {
-            if child.poll_exit()?.is_some() {
+            // Preserve waitability until count admission/links and observer
+            // resources close. finish_observation below consumes the exit.
+            if child.peek_exit()?.is_some() {
                 break;
             }
         }
