@@ -73,6 +73,51 @@ impl VerifiedSiteCandidate {
         self.function
     }
 }
+type RoleSite = [u64; 5];
+#[derive(Default)]
+struct Roles(BTreeMap<RoleSite, Option<u32>>);
+impl Roles {
+    fn observe(
+        &mut self,
+        site: RoleSite,
+        api: u32,
+        budget: &ObservationBudget,
+    ) -> Result<bool, ObservationGap> {
+        if let Some(role) = self.0.get_mut(&site) {
+            if *role == Some(api) {
+                return Ok(true);
+            }
+            *role = None;
+            return Ok(false);
+        }
+        if self.0.len() >= budget.limits.max_learned_sites {
+            return Err(ObservationGap::SiteLimit);
+        }
+        budget.state(96)?;
+        self.0.insert(site, Some(api));
+        Ok(true)
+    }
+    fn accepts(&self, site: RoleSite, api: u32) -> bool {
+        self.0.get(&site) == Some(&Some(api))
+    }
+}
+fn role_site(pid: u32, starttime: u64, site: &VerifiedSite) -> RoleSite {
+    [
+        pid as u64,
+        starttime,
+        site.native_device(),
+        site.inode(),
+        site.file_offset(),
+    ]
+}
+fn validate_then_arm(
+    mut validate: impl FnMut() -> Result<(), ObservationGap>,
+    arm: impl FnOnce() -> Result<(), ObservationGap>,
+) -> Result<(), ObservationGap> {
+    validate()?;
+    arm()?;
+    validate()
+}
 struct Attachment {
     links: Vec<OwnedFd>,
     site: VerifiedSite,
@@ -95,6 +140,7 @@ pub struct ProviderSession {
     ranges: BpfMap<MapData, c::RangeKey, c::Range>,
     loss: PerCpuArray<MapData, u64>,
     targets: BTreeMap<u32, Target>,
+    roles: Roles,
     budget: ObservationBudget,
     next_cookie: u64,
     next_generation: u64,
@@ -235,6 +281,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             targets: BTreeMap::new(),
+            roles: Roles::default(),
             budget,
             next_cookie: 1,
             next_generation: 1,
@@ -251,10 +298,9 @@ impl ProviderSession {
             .map(|t| t.attachments.iter().map(|a| a.links.len()).sum::<usize>())
             .sum()
     }
-    fn attach(
+    fn attach_pair(
         &mut self,
         pid: u32,
-        generation: u64,
         api: u32,
         site: VerifiedSite,
         advertisers: Vec<ObjectHash>,
@@ -275,7 +321,7 @@ impl ProviderSession {
             site.attachment_fd().as_raw_fd()
         ))
         .map_err(|_| ObservationGap::AttachFailed)?;
-        let result = (|| {
+        (|| {
             let links = paired_links(
                 || {
                     ossl_bpf_sys::link_create_uprobe_multi(
@@ -299,18 +345,6 @@ impl ProviderSession {
                 },
             )?;
             site.revalidate_object()?;
-            self.config
-                .insert(
-                    cookie,
-                    c::Config {
-                        generation,
-                        object: object_id(&site),
-                        pid,
-                        api,
-                    },
-                    0,
-                )
-                .map_err(|_| ObservationGap::AttachFailed)?;
             Ok(Attachment {
                 links,
                 site,
@@ -318,13 +352,10 @@ impl ProviderSession {
                 api,
                 advertisers,
             })
-        })();
-        if result.is_err() {
-            let _ = self.config.remove(&cookie);
-        }
-        result
+        })()
     }
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) {
+        b.learned_sites.retain(|site| site.pid != pid);
         // Disarm before dropping links. Never walk kernel-private opaque joins.
         if self.members.remove(&pid).is_err() {
             b.gap(ObservationGap::Invalidated)
@@ -418,12 +449,17 @@ impl ProviderSession {
             }
             for id in 1..=15 {
                 for resolved in target.process.resolve_api(wire::api(id)?) {
+                    let key = role_site(pid, record.starttime, &resolved.site);
+                    if !self.roles.observe(key, id, &self.budget)? {
+                        disarm_site(&mut target, &resolved.site, &mut self.config)?;
+                        b.gap(ObservationGap::AmbiguousSite);
+                        continue;
+                    }
                     if target
                         .attachments
                         .iter()
                         .any(|a| same_site(&a.site, &resolved.site))
                     {
-                        b.gap(ObservationGap::AmbiguousSite);
                         continue;
                     }
                     let advertisers = if id == c::PROVIDER_INIT {
@@ -431,15 +467,17 @@ impl ProviderSession {
                     } else {
                         Vec::new()
                     };
-                    match self.attach(
+                    match self.attach_pair(
                         pid,
-                        generation,
                         id,
                         resolved.site,
                         advertisers,
                         target.attachments.len() * 2,
                     ) {
-                        Ok(a) => target.attachments.push(a),
+                        Ok(a) => {
+                            arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
+                            target.attachments.push(a)
+                        }
                         Err(g) => b.gap(g),
                     }
                 }
@@ -546,6 +584,13 @@ impl ProviderSession {
             b.gap(ObservationGap::InvalidWire);
             return;
         };
+        if !self
+            .roles
+            .accepts(role_site(r.pid, target.starttime, &attachment.site), r.api)
+        {
+            b.gap(ObservationGap::AmbiguousSite);
+            return;
+        }
         let hash = attachment.site.object_hash().clone();
         let advertisers = attachment.advertisers.clone();
         let starttime = target.starttime;
@@ -558,6 +603,9 @@ impl ProviderSession {
                 Ok(s) => s,
                 Err(g) => {
                     b.gap(g);
+                    if identity_failure(g) {
+                        self.retire(r.pid, b)
+                    }
                     return;
                 }
             };
@@ -690,18 +738,38 @@ impl ProviderSession {
         advertisers: Vec<ObjectHash>,
         b: &mut ObservationBatch,
     ) {
-        let Some(target) = self.targets.get_mut(&pid) else {
+        let Some(target) = self.targets.get(&pid) else {
             return;
         };
+        let key = role_site(pid, target.starttime, &site);
+        match self.roles.observe(key, api, &self.budget) {
+            Ok(true) => {}
+            Ok(false) => {
+                let result =
+                    disarm_site(self.targets.get_mut(&pid).unwrap(), &site, &mut self.config);
+                // A conflict may be discovered after earlier queued records in this
+                // batch. Do not return those facts/candidates as usable evidence.
+                b.facts.retain(|fact| fact.pid != pid);
+                b.learned_sites.retain(|candidate| candidate.pid != pid);
+                b.gap(ObservationGap::AmbiguousSite);
+                b.gap(ObservationGap::Invalidated);
+                if let Err(g) = result {
+                    b.gap(g);
+                    self.retire(pid, b)
+                }
+                return;
+            }
+            Err(g) => {
+                b.gap(g);
+                return;
+            }
+        }
+        let target = self.targets.get_mut(&pid).unwrap();
         if let Some(existing) = target
             .attachments
             .iter_mut()
             .find(|a| same_site(&a.site, &site))
         {
-            if existing.api != api {
-                b.gap(ObservationGap::AmbiguousSite);
-                return;
-            }
             if let Err(g) = merge_candidates(&mut existing.advertisers, advertisers, &self.budget) {
                 b.gap(g)
             }
@@ -709,21 +777,34 @@ impl ProviderSession {
         }
         if let Err(g) = target.process.revalidate() {
             b.gap(g);
+            self.retire(pid, b);
             return;
         }
         let generation = target.generation;
-        match self.attach(pid, generation, api, site, advertisers, 0) {
+        match self.attach_pair(pid, api, site, advertisers, 0) {
             Ok(a) => {
-                if let Some(target) = self.targets.get_mut(&pid) {
-                    if let Err(g) = target.process.revalidate() {
-                        let _ = self.config.remove(&a.cookie);
-                        b.gap(g);
-                        return;
-                    }
-                    target.attachments.push(a);
+                // Pair exists but CONFIG is absent: full process/maps/object
+                // validation precedes the only arm operation, and runs again after it.
+                let result = arm_attachment(
+                    &mut self.config,
+                    &self.targets[&pid].process,
+                    &a,
+                    pid,
+                    generation,
+                );
+                if let Err(g) = result {
+                    b.gap(g);
+                    self.retire(pid, b);
+                    return;
+                }
+                self.targets.get_mut(&pid).unwrap().attachments.push(a);
+            }
+            Err(g) => {
+                b.gap(g);
+                if identity_failure(g) {
+                    self.retire(pid, b)
                 }
             }
-            Err(g) => b.gap(g),
         }
     }
     pub fn close(mut self) -> ObservationBatch {
@@ -743,6 +824,87 @@ impl Drop for ProviderSession {
         for pid in pids {
             self.retire(pid, &mut b)
         }
+    }
+}
+fn identity_failure(gap: ObservationGap) -> bool {
+    matches!(
+        gap,
+        ObservationGap::ProcessUnavailable
+            | ObservationGap::ProcessChanged
+            | ObservationGap::NamespaceChanged
+            | ObservationGap::ObjectChanged
+            | ObservationGap::IdentityUnverified
+            | ObservationGap::BackingUnavailable
+    )
+}
+fn arm_attachment(
+    config: &mut BpfMap<MapData, u64, c::Config>,
+    process: &VerifiedProcess,
+    a: &Attachment,
+    pid: u32,
+    generation: u64,
+) -> Result<(), ObservationGap> {
+    let result = validate_then_arm(
+        || {
+            process.revalidate()?;
+            a.site.revalidate_object()
+        },
+        || {
+            config
+                .insert(
+                    a.cookie,
+                    c::Config {
+                        generation,
+                        object: object_id(&a.site),
+                        pid,
+                        api: a.api,
+                    },
+                    0,
+                )
+                .map_err(|_| ObservationGap::AttachFailed)
+        },
+    );
+    if result.is_err() {
+        let _ = config.remove(&a.cookie);
+    }
+    result
+}
+fn disarm_links(
+    links: Vec<OwnedFd>,
+    disarm: impl FnOnce() -> Result<(), ObservationGap>,
+) -> Result<(), ObservationGap> {
+    let result = disarm();
+    drop(links);
+    result
+}
+fn disarm_site(
+    target: &mut Target,
+    site: &VerifiedSite,
+    config: &mut BpfMap<MapData, u64, c::Config>,
+) -> Result<(), ObservationGap> {
+    let mut failed = false;
+    while let Some(index) = target
+        .attachments
+        .iter()
+        .position(|a| same_site(&a.site, site))
+    {
+        let a = target.attachments.swap_remove(index);
+        // Both links close after disarming even if map deletion fails; the
+        // caller then retires process membership. Keep site custody until closure.
+        if disarm_links(a.links, || {
+            config
+                .remove(&a.cookie)
+                .map_err(|_| ObservationGap::AttachFailed)
+        })
+        .is_err()
+        {
+            failed = true
+        }
+    }
+    if failed {
+        Err(ObservationGap::AttachFailed)
+    } else {
+        Ok(())
     }
 }
 fn merge_candidates(
@@ -788,6 +950,131 @@ fn object_id(site: &VerifiedSite) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn role_conflicts_retire_both_discovery_orders_and_cannot_rearm() {
+        for (first, second) in [
+            (c::QUERY_CALLBACK, c::UNQUERY_CALLBACK),
+            (c::UNQUERY_CALLBACK, c::QUERY_CALLBACK),
+            (c::PUBLIC_QUERY, c::PUBLIC_UNQUERY),
+            (c::PUBLIC_UNQUERY, c::PUBLIC_QUERY),
+        ] {
+            let mut roles = Roles::default();
+            let key = [1, 2, 3, 4, 5];
+            let budget = ObservationBudget::default();
+            assert_eq!(roles.observe(key, first, &budget), Ok(true));
+            assert!(roles.accepts(key, first));
+            assert_eq!(roles.observe(key, second, &budget), Ok(false));
+            assert!(
+                !roles.accepts(key, first),
+                "retired-cookie queued records must not be accepted"
+            );
+            assert!(!roles.accepts(key, second));
+            assert_eq!(roles.observe(key, first, &budget), Ok(false));
+            assert_eq!(roles.observe(key, second, &budget), Ok(false));
+            assert_eq!(roles.0.len(), 1);
+        }
+    }
+    #[test]
+    fn conflict_disarm_closes_both_links_even_on_map_failure() {
+        use std::os::fd::FromRawFd;
+        for fail in [false, true] {
+            let raw = [unsafe { libc::eventfd(0, libc::EFD_CLOEXEC) }, unsafe {
+                libc::eventfd(0, libc::EFD_CLOEXEC)
+            }];
+            assert!(raw.iter().all(|fd| *fd >= 0));
+            let links = raw
+                .into_iter()
+                .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+                .collect();
+            let result = disarm_links(links, || {
+                for fd in raw {
+                    assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+                }
+                if fail {
+                    Err(ObservationGap::AttachFailed)
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            for fd in raw {
+                assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1)
+            }
+        }
+    }
+    #[test]
+    fn conflict_markers_are_bounded_and_survive_admission_exhaustion() {
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_learned_sites: 1,
+            ..Default::default()
+        });
+        let mut roles = Roles::default();
+        let key = [1, 2, 3, 4, 5];
+        assert_eq!(roles.observe(key, c::QUERY_CALLBACK, &budget), Ok(true));
+        assert_eq!(
+            roles.observe([2, 2, 3, 4, 5], c::QUERY_CALLBACK, &budget),
+            Err(ObservationGap::SiteLimit)
+        );
+        assert_eq!(roles.observe(key, c::UNQUERY_CALLBACK, &budget), Ok(false));
+        assert!(!roles.accepts(key, c::QUERY_CALLBACK));
+        assert_eq!(roles.0.len(), 1);
+    }
+    #[test]
+    fn post_arm_maps_change_fails_the_transaction() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let count = std::cell::Cell::new(0);
+        let result = validate_then_arm(
+            || {
+                calls.borrow_mut().push("validate");
+                count.set(count.get() + 1);
+                if count.get() == 2 {
+                    Err(ObservationGap::ProcessChanged)
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                calls.borrow_mut().push("arm");
+                Ok(())
+            },
+        );
+        assert_eq!(result, Err(ObservationGap::ProcessChanged));
+        assert_eq!(*calls.borrow(), vec!["validate", "arm", "validate"]);
+    }
+    #[test]
+    fn changed_maps_between_pair_and_arm_never_activate_config() {
+        let armed = std::cell::Cell::new(false);
+        assert_eq!(
+            validate_then_arm(
+                || Err(ObservationGap::ProcessChanged),
+                || {
+                    armed.set(true);
+                    Ok(())
+                }
+            ),
+            Err(ObservationGap::ProcessChanged)
+        );
+        assert!(
+            !armed.get(),
+            "CONFIG became live before full post-pair validation"
+        );
+    }
+    #[test]
+    fn successful_arm_has_pre_and_post_full_validation() {
+        let calls = std::cell::RefCell::new(Vec::new());
+        validate_then_arm(
+            || {
+                calls.borrow_mut().push("validate");
+                Ok(())
+            },
+            || {
+                calls.borrow_mut().push("arm");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), vec!["validate", "arm", "validate"]);
+    }
     #[test]
     fn same_site_multiple_candidates() {
         let a: ObjectHash = "a".repeat(64).try_into().unwrap();

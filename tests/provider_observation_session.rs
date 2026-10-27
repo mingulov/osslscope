@@ -95,6 +95,132 @@ fn corehandle_libctx_provctx_not_equated() {
     assert!(!json.contains("context"));
 }
 
+fn fixture_ack(line: &str, command: char, expected: [u32; 5]) -> Result<(), &'static str> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    if fields.len() != 8
+        || fields.first() != Some(&"ack")
+        || fields.get(1) != Some(&command.to_string().as_str())
+        || fields.get(2) != Some(&"1")
+    {
+        return Err("bad_ack");
+    }
+    for (field, expected) in fields[3..].iter().zip(expected) {
+        if field.parse::<u32>() != Ok(expected) {
+            return Err("counter_mismatch");
+        }
+    }
+    Ok(())
+}
+fn query_phase_complete(
+    batch: &po::ObservationBatch,
+    volatile: bool,
+    other: bool,
+) -> Result<(), &'static str> {
+    let cache = if volatile {
+        po::Cacheability::Volatile
+    } else {
+        po::Cacheability::Cacheable
+    };
+    let callback = |f: &po::ObservationFact| {
+        f.api == po::ObservationApi::ProviderQueryCallback && f.operation == po::Operation::Digest
+    };
+    if !batch.facts.iter().any(|f|callback(f) && matches!(f.payload,po::ObservationPayload::QueryResult{outcome:po::ApiOutcome::Success,cacheability} if cacheability==cache)){return Err("callback_query_missing")}
+    if !batch.facts.iter().any(|f|callback(f) && matches!(f.payload,po::ObservationPayload::Algorithm{algorithm,cacheability} if cacheability==cache && (algorithm.label()=="other")==other)){return Err("callback_algorithm_missing")}
+    let implementation=batch.facts.iter().find(|f|callback(f) && matches!(&f.payload,po::ObservationPayload::Implementation{algorithm,function,cacheability,advertiser_candidates,backing_sha256} if *cacheability==cache && (algorithm.label()=="other")==other && function.id()!=0 && !advertiser_candidates.is_empty() && backing_sha256.is_some()!=volatile));
+    let Some(fact) = implementation else {
+        return Err("callback_implementation_missing");
+    };
+    if volatile {
+        if !batch.learned_sites.is_empty() {
+            return Err("volatile_site_retained");
+        }
+        if batch.facts.iter().any(|f| {
+            matches!(
+                &f.payload,
+                po::ObservationPayload::Implementation {
+                    backing_sha256: Some(_),
+                    ..
+                }
+            )
+        }) {
+            return Err("volatile_backing_retained");
+        }
+    } else if let po::ObservationPayload::Implementation {
+        algorithm,
+        function,
+        backing_sha256: Some(backing),
+        advertiser_candidates,
+        ..
+    } = &fact.payload
+    {
+        if !batch.learned_sites.iter().any(|site| {
+            site.pid() == fact.pid
+                && site.generation() == fact.generation
+                && site.algorithm() == *algorithm
+                && site.function() == *function
+                && site.site().object_hash() == backing
+                && !site.advertiser_candidates().is_empty()
+                && site.advertiser_candidates() == advertiser_candidates
+        }) {
+            return Err("verified_site_missing");
+        }
+    }
+    Ok(())
+}
+#[test]
+fn native_ack_checks_each_independent_counter() {
+    let expected = [1, 1, 4, 1, 1];
+    assert_eq!(fixture_ack("ack X 1 1 1 4 1 1\n", 'X', expected), Ok(()));
+    for index in 0..5 {
+        let mut changed = expected;
+        changed[index] += 1;
+        assert_eq!(
+            fixture_ack(
+                &format!(
+                    "ack X 1 {} {} {} {} {}",
+                    changed[0], changed[1], changed[2], changed[3], changed[4]
+                ),
+                'X',
+                expected
+            ),
+            Err("counter_mismatch")
+        );
+    }
+}
+#[test]
+fn native_query_oracle_refuses_public_only_evidence() {
+    let fact = |payload| po::ObservationFact {
+        pid: 42,
+        starttime: 1,
+        object_sha256: "a".repeat(64).try_into().unwrap(),
+        generation: 1,
+        context: po::ContextIdentity::Unknown {},
+        source: po::ObservationSource::ProviderQuery,
+        api: po::ObservationApi::Inventoried(osslscope::inventory::Api::OsslProviderQueryOperation),
+        operation: po::Operation::Digest,
+        class: po::AlgorithmClass::Digest,
+        monotonic_ns: 1,
+        confidence: po::ScopeConfidence::Observed,
+        payload,
+    };
+    let batch = po::ObservationBatch {
+        facts: vec![
+            fact(po::ObservationPayload::QueryResult {
+                outcome: po::ApiOutcome::Success,
+                cacheability: po::Cacheability::Cacheable,
+            }),
+            fact(po::ObservationPayload::Algorithm {
+                algorithm: po::AlgorithmId::try_from(u16::MAX).unwrap(),
+                cacheability: po::Cacheability::Cacheable,
+            }),
+        ],
+        ..Default::default()
+    };
+    assert_eq!(
+        query_phase_complete(&batch, false, true),
+        Err("callback_query_missing")
+    );
+}
 #[test]
 #[ignore = "Root review gate: requires actual map_files and BPF privileges"]
 fn native_provider_observation() {
@@ -189,18 +315,27 @@ fn native_provider_observation() {
     let mut facts = Vec::new();
     let mut gaps = Vec::new();
     let mut volatile = false;
-    for command in ['I', 'F', 'Q', 'Q', 'U', 'Q', 'V', 'Q', 'S', 'H', 'X'] {
+    for (command, counters) in [
+        ('I', [1, 0, 0, 1, 0]),
+        ('F', [1, 1, 0, 1, 0]),
+        ('Q', [1, 1, 1, 1, 0]),
+        ('Q', [1, 1, 2, 1, 0]),
+        ('U', [1, 1, 2, 1, 0]),
+        ('Q', [1, 1, 3, 1, 0]),
+        ('V', [1, 1, 3, 1, 0]),
+        ('Q', [1, 1, 4, 1, 0]),
+        ('S', [1, 1, 4, 1, 0]),
+        ('H', [1, 1, 4, 1, 0]),
+        ('X', [1, 1, 4, 1, 1]),
+    ] {
         writeln!(child.0.stdin.as_mut().unwrap(), "{command}").unwrap();
         child.0.stdin.as_mut().unwrap().flush().unwrap();
         line.clear();
         output.read_line(&mut line).unwrap();
-        let fields: Vec<_> = line.split_whitespace().collect();
-        assert_eq!(fields.first(), Some(&"ack"));
-        assert_eq!(fields.get(1), Some(&command.to_string().as_str()));
         assert_eq!(
-            fields.get(2),
-            Some(&"1"),
-            "fixture oracle refused phase {command}"
+            fixture_ack(&line, command, counters),
+            Ok(()),
+            "fixture counters in phase {command}"
         );
         // ACK establishes return completion; no timing-based producer assumption.
         let b = session.drain(Instant::now() + Duration::from_millis(100));
@@ -209,8 +344,53 @@ fn native_provider_observation() {
         } else if command == 'S' {
             volatile = false
         }
-        if command == 'Q' && volatile {
-            assert!(b.learned_sites.is_empty(), "volatile query retained a site");
+        if command == 'Q' {
+            // The third Q follows acknowledged unquery and must restart at the
+            // known first entry. The second Q must independently reach Other.
+            assert_eq!(
+                query_phase_complete(&b, volatile, counters[2] == 2),
+                Ok(()),
+                "query phase {}: gaps={:?}",
+                counters[2],
+                b.gaps
+            );
+        }
+        if matches!(command, 'I' | 'F') {
+            let wanted = if command == 'I' {
+                po::ApiOutcome::Success
+            } else {
+                po::ApiOutcome::Failure
+            };
+            assert!(b.facts.iter().any(|f|f.api==po::ObservationApi::Inventoried(inventory::Api::OsslProviderLoad) && matches!(f.payload,po::ObservationPayload::ApiResult{outcome,name:po::ProviderNameClass::Other} if outcome==wanted)),"load phase {command}: gaps={:?}",b.gaps);
+        }
+        if command == 'I' {
+            assert!(
+                b.facts.iter().any(|f| f.api
+                    == po::ObservationApi::Inventoried(inventory::Api::OsslProviderInit)
+                    && matches!(
+                        f.payload,
+                        po::ObservationPayload::InitResult {
+                            outcome: po::ApiOutcome::Success
+                        }
+                    )),
+                "init success missing: gaps={:?}",
+                b.gaps
+            );
+        }
+        if command == 'U' {
+            assert!(
+                b.facts
+                    .iter()
+                    .any(|f| f.api == po::ObservationApi::ProviderUnqueryCallback
+                        && matches!(
+                            f.payload,
+                            po::ObservationPayload::Invalidation {
+                                cause: po::InvalidationCause::Unquery
+                            }
+                        )),
+                "learned unquery callback missing: gaps={:?}",
+                b.gaps
+            );
         }
         facts.extend(b.facts);
         gaps.extend(b.gaps);
@@ -232,7 +412,7 @@ fn native_provider_observation() {
     child.0.stdin.as_mut().unwrap().flush().unwrap();
     line.clear();
     output.read_line(&mut line).unwrap();
-    assert!(line.starts_with("ack H 1 "));
+    assert_eq!(fixture_ack(&line, 'H', [1, 1, 4, 1, 1]), Ok(()));
     assert!(
         session
             .drain(Instant::now() + Duration::from_millis(100))
@@ -253,7 +433,7 @@ fn native_provider_observation() {
         child.0.stdin.as_mut().unwrap().flush().unwrap();
         line.clear();
         output.read_line(&mut line).unwrap();
-        assert!(line.starts_with("ack H 1 "));
+        assert_eq!(fixture_ack(&line, 'H', [1, 1, 4, 1, 1]), Ok(()));
     }
     let bounded = capped.drain(Instant::now() + Duration::from_millis(100));
     assert_eq!(bounded.facts.len(), 1);
@@ -271,23 +451,29 @@ fn native_provider_observation() {
     facts.extend(b.facts);
     gaps.extend(b.gaps);
     assert!(
-        facts.iter().any(|f| matches!(
-            f.payload,
-            po::ObservationPayload::ApiResult {
-                outcome: po::ApiOutcome::Success,
-                ..
-            }
-        )),
+        facts
+            .iter()
+            .filter(|f| f.api == po::ObservationApi::Inventoried(inventory::Api::OsslProviderLoad))
+            .any(|f| matches!(
+                f.payload,
+                po::ObservationPayload::ApiResult {
+                    outcome: po::ApiOutcome::Success,
+                    ..
+                }
+            )),
         "no success; gaps={gaps:?}"
     );
     assert!(
-        facts.iter().any(|f| matches!(
-            f.payload,
-            po::ObservationPayload::ApiResult {
-                outcome: po::ApiOutcome::Failure,
-                ..
-            }
-        )),
+        facts
+            .iter()
+            .filter(|f| f.api == po::ObservationApi::Inventoried(inventory::Api::OsslProviderLoad))
+            .any(|f| matches!(
+                f.payload,
+                po::ObservationPayload::ApiResult {
+                    outcome: po::ApiOutcome::Failure,
+                    ..
+                }
+            )),
         "no failure; gaps={gaps:?}"
     );
     assert!(

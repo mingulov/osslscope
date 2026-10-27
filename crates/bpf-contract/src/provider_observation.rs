@@ -161,7 +161,10 @@ pub fn suppress_wrapper(parent: &Pending, child: &Pending) -> bool {
 /// Sample policy is shared with the consumer tests; no table pointer participates.
 pub const fn sample_index(cacheability: u32, stored: u32) -> Option<u32> {
     let index = if cacheability == 1 { stored } else { 0 };
-    if index < 512 { Some(index) } else { None }
+    match index {
+        0..=511 => Some(index),
+        _ => None,
+    }
 }
 impl Thread {
     pub fn enter(&mut self) -> Option<u64> {
