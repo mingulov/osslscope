@@ -140,6 +140,9 @@ fn schema_rejects_raw_fields() {
         class: AlgorithmClass::Other,
         monotonic_ns: 3,
         confidence: ScopeConfidence::Observed,
+        payload: ObservationPayload::InitResult {
+            outcome: ApiOutcome::Success,
+        },
     };
     let value = serde_json::to_value(&fact).unwrap();
     assert_eq!(

@@ -32,6 +32,19 @@ pub enum ObservationGap {
     SnapshotLag,
     FirstQueryUnknown,
     IntervalUnknown,
+    BpfUnavailable,
+    InvalidObject,
+    InvalidWire,
+    AttachFailed,
+    ClassifierFailed,
+    TargetReadFailed,
+    UnpairedReturn,
+    RelocationRefused,
+    DispatchPartial,
+    SamplingPartial,
+    MembershipUnknown,
+    RegistrationRace,
+    Invalidated,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,11 +150,17 @@ impl ObservationBudget {
 pub enum ObservationApi {
     Inventoried(inventory::Api),
     OsslProviderUnqueryOperation,
+    ProviderQueryCallback,
+    ProviderTeardownCallback,
+    ProviderUnqueryCallback,
 }
 impl ObservationApi {
     pub fn export_name(self) -> Option<&'static str> {
         use inventory::Api::*;
         Some(match self {
+            Self::ProviderQueryCallback
+            | Self::ProviderTeardownCallback
+            | Self::ProviderUnqueryCallback => return None,
             Self::OsslProviderUnqueryOperation => "OSSL_PROVIDER_unquery_operation",
             Self::Inventoried(api) => match api {
                 OsslProviderInit => "OSSL_provider_init",
@@ -282,4 +301,166 @@ pub struct ObservationFact {
     pub class: AlgorithmClass,
     pub monotonic_ns: u64,
     pub confidence: ScopeConfidence,
+    pub payload: ObservationPayload,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiOutcome {
+    Success,
+    Failure,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderNameClass {
+    Default,
+    Legacy,
+    Fips,
+    Other,
+    Unreadable,
+    Overlong,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Cacheability {
+    Cacheable,
+    Volatile,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvalidationCause {
+    Unload,
+    Unquery,
+    Teardown,
+    IdentityChanged,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u16", into = "u16")]
+pub struct AlgorithmId(u16);
+impl TryFrom<u16> for AlgorithmId {
+    type Error = &'static str;
+    fn try_from(id: u16) -> Result<Self, Self::Error> {
+        crate::kinds::alg_class_label(id)
+            .map(|_| Self(id))
+            .ok_or("invalid_algorithm_id")
+    }
+}
+impl From<AlgorithmId> for u16 {
+    fn from(id: AlgorithmId) -> Self {
+        id.0
+    }
+}
+impl AlgorithmId {
+    pub fn label(self) -> &'static str {
+        crate::kinds::alg_class_label(self.0).unwrap_or("other")
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "(Operation, u32)", into = "(Operation, u32)")]
+pub struct FunctionIdentity {
+    operation: Operation,
+    id: u32,
+}
+impl FunctionIdentity {
+    pub fn new(operation: Operation, id: u32) -> Result<Self, &'static str> {
+        if id == 0
+            || crate::kinds::FUNCS
+                .iter()
+                .any(|f| f.id == id && f.op == operation.registry_name() && f.op.is_some())
+        {
+            Ok(Self { operation, id })
+        } else {
+            Err("invalid_function_id")
+        }
+    }
+    pub fn operation(self) -> Operation {
+        self.operation
+    }
+    pub fn id(self) -> u32 {
+        self.id
+    }
+}
+impl TryFrom<(Operation, u32)> for FunctionIdentity {
+    type Error = &'static str;
+    fn try_from(v: (Operation, u32)) -> Result<Self, Self::Error> {
+        Self::new(v.0, v.1)
+    }
+}
+impl From<FunctionIdentity> for (Operation, u32) {
+    fn from(v: FunctionIdentity) -> Self {
+        (v.operation, v.id)
+    }
+}
+impl Operation {
+    pub fn registry_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Digest => "OSSL_OP_DIGEST",
+            Self::Cipher => "OSSL_OP_CIPHER",
+            Self::Mac => "OSSL_OP_MAC",
+            Self::Kdf => "OSSL_OP_KDF",
+            Self::Rand => "OSSL_OP_RAND",
+            Self::Keymgmt => "OSSL_OP_KEYMGMT",
+            Self::Keyexch => "OSSL_OP_KEYEXCH",
+            Self::Signature => "OSSL_OP_SIGNATURE",
+            Self::AsymCipher => "OSSL_OP_ASYM_CIPHER",
+            Self::Kem => "OSSL_OP_KEM",
+            Self::Encoder => "OSSL_OP_ENCODER",
+            Self::Decoder => "OSSL_OP_DECODER",
+            Self::Store => "OSSL_OP_STORE",
+            Self::Other => return None,
+        })
+    }
+    pub fn from_id(id: u32) -> Option<Self> {
+        Some(match id {
+            0 => Self::Other,
+            1 => Self::Digest,
+            2 => Self::Cipher,
+            3 => Self::Mac,
+            4 => Self::Kdf,
+            5 => Self::Rand,
+            10 => Self::Keymgmt,
+            11 => Self::Keyexch,
+            12 => Self::Signature,
+            13 => Self::AsymCipher,
+            14 => Self::Kem,
+            20 => Self::Encoder,
+            21 => Self::Decoder,
+            22 => Self::Store,
+            _ => return None,
+        })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ObservationPayload {
+    ApiAttempt {
+        name: ProviderNameClass,
+    },
+    ApiResult {
+        name: ProviderNameClass,
+        outcome: ApiOutcome,
+    },
+    InitResult {
+        outcome: ApiOutcome,
+    },
+    QueryResult {
+        outcome: ApiOutcome,
+        cacheability: Cacheability,
+    },
+    Algorithm {
+        algorithm: AlgorithmId,
+        cacheability: Cacheability,
+    },
+    Implementation {
+        algorithm: AlgorithmId,
+        function: FunctionIdentity,
+        cacheability: Cacheability,
+        advertiser_candidates: Vec<ObjectHash>,
+        backing_sha256: Option<ObjectHash>,
+    },
+    Invalidation {
+        cause: InvalidationCause,
+    },
 }

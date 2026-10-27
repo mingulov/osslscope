@@ -23,3 +23,5 @@ pub mod onboard;
 pub mod provider;
 pub mod schema;
 pub mod session;
+
+pub(crate) use classifier_maps::{ClassifierRole, initialize_classifier_maps};

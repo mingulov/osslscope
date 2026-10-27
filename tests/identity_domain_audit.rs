@@ -114,6 +114,14 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Native st_dev of the observer PID namespace FD, consumed only by
+        // bpf_get_ns_current_pid_tgid; never joined with maps text devices.
+        (
+            "src/provider_observation/session.rs",
+            "raw",
+            "device: ns.dev(),",
+            1,
+        ),
         // Provider observations retain native fstat identities throughout.
         // The map_files association uses makedev-decoded maps dev_t and the
         // same reviewed Btrfs exception as inventory; only the retained FD's

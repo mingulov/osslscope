@@ -8,3 +8,7 @@ pub use objects::{
     inspect_expected_exports, inspect_exports,
 };
 pub use schema::*;
+
+pub mod session;
+pub mod wire;
+pub use session::{ObservationBatch, ProviderSession, VerifiedSiteCandidate};

@@ -123,6 +123,7 @@ impl TransientCodeAddress {
 }
 /// Descriptor-backed site. Keep this value alive until its links are closed.
 /// It cannot be serialized or formatted, and exposes no pathname.
+#[derive(Clone)]
 pub struct VerifiedSite {
     process: Rc<Process>,
     object: Rc<Object>,
@@ -203,6 +204,18 @@ impl Process {
     }
 }
 impl VerifiedProcess {
+    /// Verified executable VMA bounds; private relocation admission only.
+    pub(crate) fn executable_ranges(&self) -> Result<Vec<(u64, u64)>, ObservationGap> {
+        self.revalidate()?;
+        if self.mappings.len() > 128 {
+            return Err(ObservationGap::SiteLimit);
+        }
+        Ok(self
+            .mappings
+            .iter()
+            .map(|(m, _)| (m.start, m.end))
+            .collect())
+    }
     pub fn retained_objects(&self) -> usize {
         let mut identities = std::collections::BTreeSet::new();
         for (_, object) in &self.mappings {

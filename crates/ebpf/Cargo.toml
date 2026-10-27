@@ -31,3 +31,7 @@ path = "src/bin/count.rs"
 [[bin]]
 name = "osslscope-members"
 path = "src/bin/members.rs"
+
+[[bin]]
+name = "osslscope-provider-observation"
+path = "src/bin/provider_observation.rs"
