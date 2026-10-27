@@ -12,6 +12,19 @@ use std::{
     path::{Component, Path},
 };
 const NAME: &str = "osslscope-provider-observation";
+#[derive(Clone, Copy)]
+pub(crate) enum Companion {
+    Observation,
+    FocusedCount,
+}
+impl Companion {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Observation => NAME,
+            Self::FocusedCount => "osslscope-focused-count",
+        }
+    }
+}
 const MAX_BYTES: u64 = 16 << 20;
 type Identity = (u64, u64, u64, i64, i64, i64, i64);
 fn identity(m: &Metadata) -> Identity {
@@ -76,8 +89,8 @@ fn directory(path: &Path, privileged: bool) -> Result<File, ObservationGap> {
     }
     Ok(file)
 }
-fn read_at(parent: &File, privileged: bool) -> Result<Vec<u8>, ObservationGap> {
-    let mut file = open_at(parent, std::ffi::OsStr::new(NAME), false)?;
+fn read_at(parent: &File, privileged: bool, name: &str) -> Result<Vec<u8>, ObservationGap> {
+    let mut file = open_at(parent, std::ffi::OsStr::new(name), false)?;
     let before = file
         .metadata()
         .map_err(|_| ObservationGap::BpfUnavailable)?;
@@ -137,11 +150,23 @@ fn privilege_status(bytes: &str, secure: bool) -> bool {
 /// Resolve only the sibling or prefix/lib/osslscope fixed basename. Open and
 /// verify the host executable before consulting its directory. No CWD/env path.
 pub fn load() -> Result<Vec<u8>, ObservationGap> {
+    load_companion(Companion::Observation)
+}
+pub(crate) fn load_companion(role: Companion) -> Result<Vec<u8>, ObservationGap> {
     let executable = File::open("/proc/self/exe").map_err(|_| ObservationGap::BpfUnavailable)?;
     let path = std::fs::read_link("/proc/self/exe").map_err(|_| ObservationGap::BpfUnavailable)?;
-    load_for(&executable, &path, privileged())
+    load_role_for(&executable, &path, privileged(), role)
 }
+#[cfg(test)]
 fn load_for(executable: &File, path: &Path, privileged: bool) -> Result<Vec<u8>, ObservationGap> {
+    load_role_for(executable, path, privileged, Companion::Observation)
+}
+fn load_role_for(
+    executable: &File,
+    path: &Path,
+    privileged: bool,
+    role: Companion,
+) -> Result<Vec<u8>, ObservationGap> {
     let parent_path = path.parent().ok_or(ObservationGap::BpfUnavailable)?;
     let parent = directory(parent_path, privileged)?;
     let reopened = open_at(
@@ -161,7 +186,7 @@ fn load_for(executable: &File, path: &Path, privileged: bool) -> Result<Vec<u8>,
     {
         return Err(ObservationGap::BpfUnavailable);
     }
-    if let Ok(bytes) = read_at(&parent, privileged) {
+    if let Ok(bytes) = read_at(&parent, privileged, role.name()) {
         return Ok(bytes);
     }
     if parent_path.file_name() != Some(std::ffi::OsStr::new("bin")) {
@@ -171,6 +196,7 @@ fn load_for(executable: &File, path: &Path, privileged: bool) -> Result<Vec<u8>,
     read_at(
         &directory(&prefix.join("lib/osslscope"), privileged)?,
         privileged,
+        role.name(),
     )
 }
 
@@ -206,6 +232,30 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    #[test]
+    fn focused_pair_uses_the_same_nofollow_and_retained_executable_policy() {
+        for role in [Companion::Observation, Companion::FocusedCount] {
+            let f = Fixture::new();
+            let name = role.name();
+            fs::write(f.0.join(name), b"companion").unwrap();
+            let exe = File::open(f.0.join("osslscope")).unwrap();
+            assert_eq!(
+                load_role_for(&exe, &f.0.join("osslscope"), false, role).unwrap(),
+                b"companion"
+            );
+            fs::remove_file(f.0.join(name)).unwrap();
+            fs::write(f.0.join("data"), b"replacement").unwrap();
+            symlink("data", f.0.join(name)).unwrap();
+            assert!(load_role_for(&exe, &f.0.join("osslscope"), false, role).is_err());
+            fs::remove_file(f.0.join(name)).unwrap();
+            fs::write(f.0.join(name), b"companion").unwrap();
+            fs::set_permissions(f.0.join(name), fs::Permissions::from_mode(0o666)).unwrap();
+            assert!(load_role_for(&exe, &f.0.join("osslscope"), true, role).is_err());
+            fs::rename(f.0.join("osslscope"), f.0.join("old")).unwrap();
+            fs::write(f.0.join("osslscope"), b"new host").unwrap();
+            assert!(load_role_for(&exe, &f.0.join("osslscope"), false, role).is_err());
         }
     }
     #[test]

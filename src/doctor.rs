@@ -29,6 +29,7 @@
 //! needs `--table` enrollment) — and privilege/capability,
 //! target-support, and cold/coverage caveats are independent rows:
 //! a caps failure never masks a target verdict and vice versa.
+pub(crate) mod focused;
 pub(crate) mod profiled;
 
 use crate::discovery::legacy;

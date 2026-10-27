@@ -10,6 +10,8 @@
 #   $PREFIX/bin/osslscope
 #   $PREFIX/lib/osslscope/osslscope-harvest
 #   $PREFIX/lib/osslscope/osslscope-count
+#   $PREFIX/lib/osslscope/osslscope-provider-observation (when in manifest)
+#   $PREFIX/lib/osslscope/osslscope-focused-count (when in manifest)
 #   $PREFIX/lib/osslscope/osslscope-members (traversal runs only; pair-only
 #     installs stay valid — the members object installs only when the
 #     build manifest lists it or --members names it explicitly)
@@ -190,6 +192,8 @@ host = arts.get("host-binary", {})
 harvest = next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {})
 count = next((a for a in bpf if a.get("bin") == "osslscope-count"), {})
 members = next((a for a in bpf if a.get("bin") == "osslscope-members"), {})
+observation = next((a for a in bpf if a.get("bin") == "osslscope-provider-observation"), {})
+focused = next((a for a in bpf if a.get("bin") == "osslscope-focused-count"), {})
 def s(v):
     return "" if v is None else str(v)
 # One value per line: tab cannot delimit here (tab is IFS whitespace, so
@@ -201,7 +205,8 @@ def s(v):
 vals = [
     s(host.get("path") or ""), s(harvest.get("path") or ""),
     s(count.get("path") or ""), s(members.get("path") or ""),
-    s(m.get("product_ref") or ""), s(m.get("product_dirty", ""))]
+    s(m.get("product_ref") or ""), s(m.get("product_dirty", "")),
+    s(observation.get("path") or ""), s(focused.get("path") or "")]
 for v in vals:
     if "\n" in v or "\r" in v:
         sys.exit("error: build manifest %s carries a newline in a field "
@@ -215,6 +220,10 @@ HOST_BIN="$BIN_OVERRIDE"
 HARVEST_OBJ="$HARVEST_OVERRIDE"
 COUNT_OBJ="$COUNT_OVERRIDE"
 MEMBERS_OBJ="$MEMBERS_OVERRIDE"
+OBSERVATION_OBJ=""
+FOCUSED_OBJ=""
+SEL_OBSERVATION="not-installed"
+SEL_FOCUSED="not-installed"
 PRODUCT_REF=""
 PRODUCT_DIRTY=""
 SEL_HOST="explicit-override"
@@ -225,7 +234,7 @@ if [ -n "$MANIFEST_PATHS" ]; then
     # Pre-initialized: command substitution strips trailing empty lines, so
     # a manifest without revision keys would otherwise make the last read
     # hit EOF and abort under set -e. Missing keys mean empty metadata.
-    _m_host=""; _m_harvest=""; _m_count=""; _m_members=""; _m_ref=""; _m_dirty=""
+    _m_host=""; _m_harvest=""; _m_count=""; _m_members=""; _m_ref=""; _m_dirty=""; _m_observation=""; _m_focused=""
     {
         IFS= read -r _m_host || true
         IFS= read -r _m_harvest || true
@@ -233,6 +242,8 @@ if [ -n "$MANIFEST_PATHS" ]; then
         IFS= read -r _m_members || true
         IFS= read -r _m_ref || true
         IFS= read -r _m_dirty || true
+        IFS= read -r _m_observation || true
+        IFS= read -r _m_focused || true
     } <<EOF2
 $MANIFEST_PATHS
 EOF2
@@ -245,6 +256,10 @@ EOF2
         MEMBERS_OBJ="$_m_members"
         if [ -n "$MEMBERS_OBJ" ]; then SEL_MEMBERS="manifest-verified"; else SEL_MEMBERS="not-installed"; fi
     fi
+    OBSERVATION_OBJ="$_m_observation"
+    FOCUSED_OBJ="$_m_focused"
+    if [ -n "$OBSERVATION_OBJ" ]; then SEL_OBSERVATION="manifest-verified"; fi
+    if [ -n "$FOCUSED_OBJ" ]; then SEL_FOCUSED="manifest-verified"; fi
     PRODUCT_REF="$_m_ref"
     PRODUCT_DIRTY="$_m_dirty"
 fi
@@ -272,6 +287,8 @@ STAGE_HOST="$STAGE/host-binary"
 STAGE_HARVEST="$STAGE/bpf-harvest"
 STAGE_COUNT="$STAGE/bpf-count"
 STAGE_MEMBERS="$STAGE/bpf-members"
+STAGE_OBSERVATION="$STAGE/bpf-observation"
+STAGE_FOCUSED="$STAGE/bpf-focused"
 cp "$HOST_BIN" "$STAGE_HOST" \
     || { echo "error: cannot stage host binary: $HOST_BIN" >&2; exit 1; }
 cp "$HARVEST_OBJ" "$STAGE_HARVEST" \
@@ -283,11 +300,20 @@ if [ -n "$MEMBERS_OBJ" ]; then
         || { echo "error: cannot stage members object: $MEMBERS_OBJ" >&2; exit 1; }
 fi
 
+for _role in observation focused; do
+    case "$_role" in observation) _source="$OBSERVATION_OBJ"; _stage="$STAGE_OBSERVATION" ;; focused) _source="$FOCUSED_OBJ"; _stage="$STAGE_FOCUSED" ;; esac
+    if [ -n "$_source" ]; then
+        [ -f "$_source" ] && [ -s "$_source" ] || { echo "error: invalid $_role companion artifact" >&2; exit 1; }
+        cp "$_source" "$_stage" || { echo "error: cannot stage $_role companion" >&2; exit 1; }
+    fi
+done
+
 # --- manifest integrity: manifest-selected entries must carry a valid
 # recorded sha256 + byte length and match the staged bytes that will be
 # installed. Explicit overrides are never checked against the manifest. ---
 export STAGE_HOST STAGE_HARVEST STAGE_COUNT STAGE_MEMBERS MANIFEST MANIFEST_SNAP
-export SEL_HOST SEL_HARVEST SEL_COUNT SEL_MEMBERS
+export SEL_HOST SEL_HARVEST SEL_COUNT SEL_MEMBERS SEL_OBSERVATION SEL_FOCUSED
+export STAGE_OBSERVATION STAGE_FOCUSED OBSERVATION_OBJ FOCUSED_OBJ
 verify_staged() {
     # Checks staged bytes against the single manifest snapshot; called
     # before replacement and again before the receipt publishes.
@@ -301,6 +327,9 @@ jobs = [
 ]
 if e.get("SEL_MEMBERS") == "manifest-verified":
     jobs.append(("members object", e["STAGE_MEMBERS"], e["SEL_MEMBERS"]))
+for label, key in (("observation companion", "OBSERVATION"), ("focused companion", "FOCUSED")):
+    if e.get("SEL_" + key) == "manifest-verified":
+        jobs.append((label, e["STAGE_" + key], e["SEL_" + key]))
 # Selection and verification together: recorded identities come from the
 # single manifest snapshot, never through the flattened shell channel,
 # so a newline-bearing JSON value cannot spoof another artifact's
@@ -319,6 +348,8 @@ if any(sel == "manifest-verified" for _, _, sel in jobs):
         "harvest object": next((a for a in bpf if a.get("bin") == "osslscope-harvest"), {}),
         "count object": next((a for a in bpf if a.get("bin") == "osslscope-count"), {}),
         "members object": next((a for a in bpf if a.get("bin") == "osslscope-members"), {}),
+        "observation companion": next((a for a in bpf if a.get("bin") == "osslscope-provider-observation"), {}),
+        "focused companion": next((a for a in bpf if a.get("bin") == "osslscope-focused-count"), {}),
     }
 for role, staged, sel in jobs:
     if sel != "manifest-verified":
@@ -404,6 +435,9 @@ if [ -n "$MEMBERS_OBJ" ]; then
     check_bpf "$STAGE_MEMBERS" "$MEMBERS_OBJ" members
 fi
 
+if [ -n "$OBSERVATION_OBJ" ]; then check_bpf "$STAGE_OBSERVATION" "$OBSERVATION_OBJ" observation; fi
+if [ -n "$FOCUSED_OBJ" ]; then check_bpf "$STAGE_FOCUSED" "$FOCUSED_OBJ" focused; fi
+
 # --- install (from staged bytes: everything above already passed) ---
 mkdir -p "$PREFIX/bin" "$PREFIX/lib/osslscope" "$PREFIX/share/doc/osslscope" "$PREFIX/share/osslscope"
 # S2 (round 2): establish traversable modes on the FULL ancestry
@@ -422,6 +456,8 @@ BIN_DEST="$PREFIX/bin/osslscope"
 HARVEST_DEST="$PREFIX/lib/osslscope/osslscope-harvest"
 COUNT_DEST="$PREFIX/lib/osslscope/osslscope-count"
 MEMBERS_DEST="$PREFIX/lib/osslscope/osslscope-members"
+OBSERVATION_DEST="$PREFIX/lib/osslscope/osslscope-provider-observation"
+FOCUSED_DEST="$PREFIX/lib/osslscope/osslscope-focused-count"
 DOC_DEST="$PREFIX/share/doc/osslscope/install.md"
 INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
 # Each destination is replaced through a FRESH uniquely-owned temporary
@@ -433,6 +469,7 @@ INST_MANIFEST="$PREFIX/share/osslscope/install-manifest.json"
 # cleanup trap below only ever removes paths this run created.
 for _legacy in "$BIN_DEST.install-tmp" "$HARVEST_DEST.install-tmp" \
         "$COUNT_DEST.install-tmp" "$MEMBERS_DEST.install-tmp" \
+        "$OBSERVATION_DEST.install-tmp" "$FOCUSED_DEST.install-tmp" \
         "$DOC_DEST.install-tmp" \
         "$INST_MANIFEST.install-tmp"; do
     if [ -e "$_legacy" ] || [ -L "$_legacy" ]; then
@@ -444,8 +481,8 @@ for _legacy in "$BIN_DEST.install-tmp" "$HARVEST_DEST.install-tmp" \
         exit 1
     fi
 done
-BIN_TMP=""; HARVEST_TMP=""; COUNT_TMP=""; DOC_TMP=""; RECEIPT_TMP=""; MEMBERS_TMP=""
-trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP" "$MEMBERS_TMP"' EXIT INT TERM
+BIN_TMP=""; HARVEST_TMP=""; COUNT_TMP=""; DOC_TMP=""; RECEIPT_TMP=""; MEMBERS_TMP=""; OBSERVATION_TMP=""; FOCUSED_TMP=""
+trap 'rm -rf "$STAGE"; rm -f "$BIN_TMP" "$HARVEST_TMP" "$COUNT_TMP" "$DOC_TMP" "$RECEIPT_TMP" "$MEMBERS_TMP" "$OBSERVATION_TMP" "$FOCUSED_TMP"' EXIT INT TERM
 BIN_TMP="$(mktemp "$BIN_DEST.install-tmp.XXXXXX")" \
     || { echo "error: cannot create temporary file for $BIN_DEST" >&2; exit 1; }
 HARVEST_TMP="$(mktemp "$HARVEST_DEST.install-tmp.XXXXXX")" \
@@ -461,6 +498,12 @@ if [ -n "$MEMBERS_OBJ" ]; then
         || { echo "error: cannot create temporary file for $MEMBERS_DEST" >&2; exit 1; }
 else
     MEMBERS_TMP=""
+fi
+if [ -n "$OBSERVATION_OBJ" ]; then
+    OBSERVATION_TMP="$(mktemp "$OBSERVATION_DEST.install-tmp.XXXXXX")" || exit 1
+fi
+if [ -n "$FOCUSED_OBJ" ]; then
+    FOCUSED_TMP="$(mktemp "$FOCUSED_DEST.install-tmp.XXXXXX")" || exit 1
 fi
 install_one() {
     # $1 = staged source, $2 = destination, $3 = temp file, $4 = mode, $5 = role label.
@@ -483,6 +526,12 @@ install_one "$STAGE_COUNT" "$COUNT_DEST" "$COUNT_TMP" 644 "count object"
 if [ -n "$MEMBERS_OBJ" ]; then
     install_one "$STAGE_MEMBERS" "$MEMBERS_DEST" "$MEMBERS_TMP" 644 "members object"
 fi
+if [ -n "$OBSERVATION_OBJ" ]; then
+    install_one "$STAGE_OBSERVATION" "$OBSERVATION_DEST" "$OBSERVATION_TMP" 644 "observation companion"
+fi
+if [ -n "$FOCUSED_OBJ" ]; then
+    install_one "$STAGE_FOCUSED" "$FOCUSED_DEST" "$FOCUSED_TMP" 644 "focused companion"
+fi
 # Publication verifies the bytes actually retained: the installed set
 # must still match the verified staged set before any receipt is written.
 cmp -s "$STAGE_HOST" "$BIN_DEST" \
@@ -495,6 +544,17 @@ if [ -n "$MEMBERS_OBJ" ]; then
     cmp -s "$STAGE_MEMBERS" "$MEMBERS_DEST" \
         || { echo "error: installed members object no longer matches verified staged bytes: $MEMBERS_DEST" >&2; exit 1; }
 fi
+for _role in observation focused; do
+    case "$_role" in observation) _source="$OBSERVATION_OBJ"; _stage="$STAGE_OBSERVATION"; _dest="$OBSERVATION_DEST" ;; focused) _source="$FOCUSED_OBJ"; _stage="$STAGE_FOCUSED"; _dest="$FOCUSED_DEST" ;; esac
+    if [ -n "$_source" ]; then
+        cmp -s "$_stage" "$_dest" || { echo "error: installed $_role companion changed" >&2; exit 1; }
+    elif [ -L "$_dest" ]; then
+        echo "error: refusing stale symlink companion: $_dest" >&2; exit 1
+    elif [ -e "$_dest" ]; then
+        [ -f "$_dest" ] || { echo "error: stale companion is not a regular file" >&2; exit 1; }
+        rm -f "$_dest"
+    fi
+done
 # S1: a pair-only install over a prefix that still carries a members
 # object from an earlier triple install must not leave the stale file
 # behind (auto-resolution finds the unlisted leftover and refuses the
@@ -596,6 +656,12 @@ if e.get("MEMBERS_OBJ"):
          "selection": e["SEL_MEMBERS"],
          "product_ref": ref(e["SEL_MEMBERS"]), "product_dirty": dirty(e["SEL_MEMBERS"])},
     )
+for name, key in (("osslscope-provider-observation", "OBSERVATION"), ("osslscope-focused-count", "FOCUSED")):
+    if e.get(key + "_OBJ"):
+        selection = e["SEL_" + key]
+        arts.append({"role": "bpf-object", "bin": name, "src": e[key + "_OBJ"],
+                     "dest": pfx + "/lib/osslscope/" + name, "selection": selection,
+                     "product_ref": ref(selection), "product_dirty": dirty(selection)})
 for a in arts:
     # Hashes of the installed bytes, which the retained-identity check
     # above proved still match the verified staged bytes.
@@ -637,6 +703,8 @@ echo "installed:"
 echo "  binary:  $PREFIX/bin/osslscope"
 echo "  harvest: $PREFIX/lib/osslscope/osslscope-harvest"
 echo "  count:   $PREFIX/lib/osslscope/osslscope-count"
+if [ -n "$OBSERVATION_OBJ" ]; then echo "  observation: $OBSERVATION_DEST"; fi
+if [ -n "$FOCUSED_OBJ" ]; then echo "  focused: $FOCUSED_DEST"; fi
 if [ -n "$MEMBERS_OBJ" ]; then
     echo "  members: $PREFIX/lib/osslscope/osslscope-members"
 fi
@@ -656,6 +724,10 @@ if [ "$SETCAP" -eq 1 ]; then
 else
     echo "next: grant caps once (needs privilege), then verify:"
     echo "  sudo setcap cap_bpf,cap_perfmon+ep '$PREFIX/bin/osslscope'"
-    echo "  '$PREFIX/bin/osslscope' doctor --libcrypto /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --count-object '$PREFIX/lib/osslscope/osslscope-count'"
+    if [ -n "$OBSERVATION_OBJ" ] && [ -n "$FOCUSED_OBJ" ]; then
+        echo "  '$PREFIX/bin/osslscope' doctor"
+    else
+        echo "  '$PREFIX/bin/osslscope' doctor --libcrypto /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --count-object '$PREFIX/lib/osslscope/osslscope-count'"
+    fi
 fi
 echo "done."

@@ -1418,6 +1418,45 @@ else
     bad "explicit override clears inherited revision (artifact + top level), keeps verified peers"
 fi
 
+# Focused companions are installed from the same verified manifest snapshot.
+mk_manifest "$T/focused-manifest.json" \
+    "host-binary::$T/host-bin" \
+    "bpf-object:osslscope-harvest:$T/harvest.o" \
+    "bpf-object:osslscope-count:$T/count.o" \
+    "bpf-object:osslscope-provider-observation:$T/harvest.o" \
+    "bpf-object:osslscope-focused-count:$T/count.o"
+if "$SH_BIN" "$INSTALL" --manifest "$T/focused-manifest.json" --prefix "$T/focused-pfx" >"$T/out" 2>&1 \
+   && cmp -s "$T/harvest.o" "$T/focused-pfx/lib/osslscope/osslscope-provider-observation" \
+   && cmp -s "$T/count.o" "$T/focused-pfx/lib/osslscope/osslscope-focused-count"; then
+    ok "focused pair installs exact retained manifest bytes"
+else
+    bad "focused pair installs exact retained manifest bytes"
+fi
+if python3 - "$T/focused-pfx/share/osslscope/install-manifest.json" <<'EOF'
+import hashlib,json,sys
+m=json.load(open(sys.argv[1]))
+for name in ('osslscope-provider-observation','osslscope-focused-count'):
+    a=next(a for a in m['artifacts'] if a.get('bin') == name)
+    b=open(a['dest'],'rb').read()
+    assert a['selection']=='manifest-verified' and a['sha256']==hashlib.sha256(b).hexdigest() and a['bytes']==len(b)
+EOF
+then ok "focused pair receipt binds finite names, bytes and hashes"
+else bad "focused pair receipt binds finite names, bytes and hashes"
+fi
+python3 - "$T/focused-manifest.json" "$T/focused-tampered.json" <<'EOF'
+import json,sys
+m=json.load(open(sys.argv[1]))
+for a in m['artifacts']:
+    if a.get('bin')=='osslscope-focused-count': a['sha256']='0'*64
+json.dump(m,open(sys.argv[2],'w'))
+EOF
+if "$SH_BIN" "$INSTALL" --manifest "$T/focused-tampered.json" --prefix "$T/focused-refused" >"$T/out" 2>&1; then
+    bad "focused Count manifest hash mismatch refused before install"
+else
+    if [ ! -e "$T/focused-refused/bin/osslscope" ]; then ok "focused Count manifest hash mismatch refused before install"
+    else bad "focused Count mismatch changed prefix"; fi
+fi
+
 echo "---"
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" -eq 0 ]

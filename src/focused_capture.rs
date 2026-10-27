@@ -63,6 +63,15 @@ pub struct FocusedObjects {
     pub count: Arc<[u8]>,
     pub count_sha256: [u8; 32],
 }
+/// Target acquisition has no usable selected-process observation.
+#[derive(Debug)]
+pub struct TargetUnavailable;
+impl std::fmt::Display for TargetUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("focused target unavailable")
+    }
+}
+impl std::error::Error for TargetUnavailable {}
 pub struct FocusedResult {
     pub document: CaptureDocument,
     pub child_exit: Option<i32>,
@@ -241,7 +250,7 @@ fn unix_ns() -> Option<u64> {
     )
     .ok()
 }
-fn observer_namespace() -> anyhow::Result<inventory::NamespaceId> {
+pub(crate) fn observer_namespace() -> anyhow::Result<inventory::NamespaceId> {
     let metadata = std::fs::File::open("/proc/self/ns/pid")?.metadata()?;
     Ok(inventory::NamespaceId {
         device: metadata.dev(),
@@ -361,7 +370,7 @@ pub fn run(
     let cancel = signals.cancel();
     let mut owned = match target {
         capture::Target::Pid(pid) if pid > 0 && pid <= i32::MAX as u32 => (pid, None),
-        capture::Target::Pid(_) => bail!("focused target unavailable"),
+        capture::Target::Pid(_) => return Err(TargetUnavailable.into()),
         capture::Target::Spawn { argv, workload } => {
             let child =
                 OwnedTarget::spawn_stopped_with_control(&argv, workload, setup_deadline, cancel)?;
@@ -372,6 +381,27 @@ pub fn run(
     if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
         bail!("focused setup interrupted or expired");
     }
+    // Readable target acquisition is independent of tracing availability.
+    // Acquire only proc/maps identity before release. Inspecting inherited
+    // observer mappings here can spend the setup budget on an unrelated ELF;
+    // actual object inventory/reconciliation starts after release below.
+    let initial = inventory::snapshot(&inventory::SnapshotOptions {
+        pids: vec![pid],
+        limits: inventory::Limits {
+            max_pids: 1,
+            max_objects_per_process: 0,
+            max_objects: 256,
+            max_read_bytes: 256 << 20,
+            timeout: RESCAN.min(setup_deadline.saturating_duration_since(Instant::now())),
+            ..Default::default()
+        },
+    });
+    let starttime = initial
+        .processes
+        .iter()
+        .find(|p| p.pid == pid)
+        .map(|p| p.starttime)
+        .ok_or(TargetUnavailable)?;
     let mut scanner = ScopedScanner::new(
         Selection {
             pids: vec![pid],
@@ -381,33 +411,30 @@ pub fn run(
             max_pids: 1,
             max_objects_per_process: 256,
             max_objects: 256,
-            max_read_bytes: 256 << 20,
+            max_read_bytes: (256u64 << 20).saturating_sub(initial.totals.read_bytes),
             timeout: RESCAN.min(setup_deadline.saturating_duration_since(Instant::now())),
             ..Default::default()
         },
     )
-    .map_err(|_| anyhow::anyhow!("focused target scope unavailable"))?;
-    // Readable target acquisition is independent of tracing availability.
-    let initial = scanner.snapshot();
-    let starttime = initial
-        .processes
-        .iter()
-        .find(|p| p.pid == pid)
-        .map(|p| p.starttime)
-        .context("focused target unavailable")?;
+    .map_err(|_| TargetUnavailable)?;
     let mut gaps = BTreeSet::new();
-    let mut session = match ProviderSession::open(
-        ObservationLimits {
-            max_processes: 1,
-            max_links: 512,
-            ..Default::default()
-        },
-        &objects.observation,
-    ) {
-        Ok(s) => Some(s),
-        Err(gap) => {
-            gaps.insert(gap);
-            None
+    let mut session = if objects.observation.is_empty() {
+        gaps.insert(ObservationGap::BpfUnavailable);
+        None
+    } else {
+        match ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                max_links: 512,
+                ..Default::default()
+            },
+            &objects.observation,
+        ) {
+            Ok(s) => Some(s),
+            Err(gap) => {
+                gaps.insert(gap);
+                None
+            }
         }
     };
     if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
@@ -421,29 +448,34 @@ pub fn run(
     let end = Instant::now()
         .checked_add(config.duration)
         .context("focused duration overflow")?;
-    let mut counter = match observer_namespace() {
-        Ok(namespace) => match FocusedCounter::open(
-            &objects.count,
-            pid,
-            namespace,
-            CountLimits {
-                window: CountAdmissionWindow {
-                    start_ns,
-                    deadline_ns,
+    let mut counter = if objects.count.is_empty() {
+        gaps.insert(ObservationGap::BpfUnavailable);
+        None
+    } else {
+        match observer_namespace() {
+            Ok(namespace) => match FocusedCounter::open(
+                &objects.count,
+                pid,
+                namespace,
+                CountLimits {
+                    window: CountAdmissionWindow {
+                        start_ns,
+                        deadline_ns,
+                    },
+                    max_state_bytes: 24 << 20,
+                    ..Default::default()
                 },
-                max_state_bytes: 24 << 20,
-                ..Default::default()
+            ) {
+                Ok(c) => Some(c),
+                Err(_) => {
+                    gaps.insert(ObservationGap::BpfUnavailable);
+                    None
+                }
             },
-        ) {
-            Ok(c) => Some(c),
             Err(_) => {
-                gaps.insert(ObservationGap::BpfUnavailable);
+                gaps.insert(ObservationGap::NamespaceChanged);
                 None
             }
-        },
-        Err(_) => {
-            gaps.insert(ObservationGap::NamespaceChanged);
-            None
         }
     };
     if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {

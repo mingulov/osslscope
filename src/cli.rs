@@ -10,7 +10,10 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "doctor" if argv[1..].iter().any(|arg| arg == "--discovery") => {
             crate::doctor::discovery(&argv[1..])
         }
-        "doctor" => crate::doctor::profiled::run(&argv[1..]),
+        "doctor" if argv[1..].iter().any(|arg| arg == "--libcrypto") => {
+            crate::doctor::profiled::run(&argv[1..])
+        }
+        "doctor" => crate::doctor::focused::run(&argv[1..]),
         "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-providers") => {
             crate::provider_observation::cli::run(&argv)
         }
@@ -22,13 +25,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             println!("osslscope — non-interposing OpenSSL observer");
             println!("usage: osslscope <scan|inspect|doctor|report|check|alias-audit> [args]");
             println!(
-                "  doctor       preflight for one exact library/kernel profile and Count object"
+                "  doctor       inventory, companion integrity and functional tracing preflight"
             );
-            println!("  report       count enrolled callbacks in an owned foreground run");
+            println!(
+                "  report       observe learned callbacks in one selected PID or foreground run"
+            );
             println!("  check        policy gate over a window (CI use; exits 10 on violation)");
             println!("  alias-audit  group a harvest doc's rows by shared address");
             println!(
-                "  report/check require --libcrypto PATH and run -- COMMAND; coverage is PARTIAL"
+                "  report/check use --pid PID or run -- COMMAND; --libcrypto selects legacy diagnostics"
             );
             println!(
                 "  scan/inspect  passive process/module discovery; no profile or BPF required"

@@ -55,6 +55,7 @@ fn policy_rules(rules: &RuleSet) -> Vec<PolicyRule> {
 struct Args {
     cfg: capture::Config,
     libcrypto: Option<PathBuf>,
+    observation_object: Option<PathBuf>,
     settle_explicit: bool,
     target: capture::Target,
     format: String,
@@ -88,6 +89,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
     let mut libcrypto: Option<String> = None;
+    let mut observation_object: Option<PathBuf> = None;
     let mut members_object: Option<String> = None;
     let mut dev_bundle: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
@@ -95,6 +97,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
     let mut image_digest = String::new();
+    let mut image_digest_explicit = false;
     let mut pid: Option<u32> = None;
     let mut run_at: Option<usize> = None;
     let mut workload_out: Option<String> = None;
@@ -139,6 +142,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--observation-object" => {
+                if observation_object.is_some() {
+                    return Err("--observation-object may occur only once".into());
+                }
+                observation_object = Some(val(a)?.into());
+            }
             "--libcrypto" => {
                 if libcrypto.is_some() {
                     return Err("--libcrypto may occur only once".into());
@@ -159,10 +168,22 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
-            "--image-digest" => image_digest = val(a)?,
+            "--image-digest" => {
+                image_digest_explicit = true;
+                image_digest = val(a)?;
+            }
             "--workload-out" => workload_out = Some(val(a)?),
             "--workload-out-fd" => workload_out_fd = Some(val(a)?),
-            "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
+            "--pid" => {
+                if pid.is_some() {
+                    return Err("--pid may occur only once".into());
+                }
+                let value: u32 = val(a)?.parse().map_err(|_| "--pid needs an integer")?;
+                if value == 0 || value > i32::MAX as u32 {
+                    return Err("--pid is out of range".into());
+                }
+                pid = Some(value);
+            }
             "--require-provider" => rules
                 .require_provider
                 .push(crate::args::parse_provider_matcher(a, val(a)?)?),
@@ -254,7 +275,29 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 .to_string(),
         );
     }
+    if libcrypto.is_some() && (pid.is_some() || observation_object.is_some()) {
+        return Err("--libcrypto conflicts with --pid and --observation-object".into());
+    }
+    if libcrypto.is_none() {
+        if provider.is_some()
+            || builtin
+            || object.is_some()
+            || members_object.is_some()
+            || dev_bundle.is_some()
+            || force_offset_raw.is_some()
+            || settle_raw.is_some()
+            || image_digest_explicit
+        {
+            return Err(
+                "legacy discovery/enrollment flags require explicit --libcrypto diagnostics".into(),
+            );
+        }
+        if timeout.is_zero() || grace.is_zero() {
+            return Err("--timeout and --grace must be positive".into());
+        }
+    }
     Ok(Args {
+        observation_object,
         libcrypto: libcrypto.map(PathBuf::from),
         settle_explicit: settle_raw.is_some(),
         cfg: capture::Config {
@@ -512,8 +555,8 @@ pub(crate) fn assemble_checked_document(
 }
 
 const USAGE: [&str; 2] = [
-    "usage: check --libcrypto PATH [--count-object PATH] [--policy FILE] [--duration S] [--format human|json] [--out FILE] [--cbom FILE] [--timeout S] [--grace S] [--workload-out FILE | --workload-out-fd N] [rules] run -- COMMAND",
-    "rules: --require-executed ALGORITHM | --deny-algorithm ALGORITHM (repeatable; at least one required)",
+    "usage: check [--observation-object PATH] [--count-object PATH] [--policy FILE] [--duration S] [--format human|json] [--out FILE] [--cbom FILE] [--timeout S] [--grace S] [--workload-out FILE | --workload-out-fd N] [rules] {--pid PID | run -- COMMAND}; --libcrypto PATH selects legacy diagnostics",
+    "rules: --require-executed ALGORITHM | --deny-algorithm ALGORITHM | --require-provider P | --deny-provider P | --deny-engine | --deny-weak (at least one required)",
 ];
 
 pub fn run(argv: &[String]) -> ExitCode {
@@ -545,9 +588,39 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             return Err(ExitCode::from(2));
         }
     };
-    if let Err(error) = args.rules.require_preview() {
+    if let Err(error) = if args.libcrypto.is_some() {
+        args.rules.require_preview()
+    } else {
+        Ok(())
+    } {
         crate::report::err_line(&format!("osslscope check: {error}"));
         return Err(ExitCode::from(2));
+    }
+    let setup_deadline = std::time::Instant::now()
+        .checked_add(args.cfg.harvest_timeout)
+        .ok_or_else(|| {
+            crate::report::err_line("setup deadline overflow");
+            ExitCode::from(2)
+        })?;
+    if args.libcrypto.is_none() {
+        let objects = crate::package::commands::resolve_focused_objects(
+            args.observation_object.as_deref(),
+            args.cfg.count_object.as_deref(),
+        )
+        .map_err(|e| {
+            crate::report::err_line(&format!("osslscope: {e}"));
+            ExitCode::from(2)
+        })?;
+        let config = crate::focused_capture::FocusedConfig {
+            duration: args.cfg.duration,
+            timeout: args.cfg.harvest_timeout,
+            grace: args.cfg.grace,
+        };
+        return Ok(Prepared {
+            args,
+            route: PreparedRoute::Focused { config, objects },
+            setup_deadline,
+        });
     }
     let preview = match capture::profiled::ProfiledConfig::for_command(
         args.libcrypto.clone(),
@@ -595,24 +668,26 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
                 return Err(ExitCode::from(result.exit_code));
             }
         };
-    let setup_deadline = std::time::Instant::now()
-        .checked_add(args.cfg.harvest_timeout)
-        .ok_or_else(|| {
-            crate::report::err_line("setup deadline overflow");
-            ExitCode::from(2)
-        })?;
     Ok(Prepared {
         args,
-        preview,
-        objects,
+        route: PreparedRoute::Legacy { preview, objects },
         setup_deadline,
     })
 }
 pub struct Prepared {
     setup_deadline: std::time::Instant,
     args: Args,
-    objects: crate::package::commands::ProfiledCount,
-    preview: capture::profiled::ProfiledConfig,
+    route: PreparedRoute,
+}
+enum PreparedRoute {
+    Focused {
+        config: crate::focused_capture::FocusedConfig,
+        objects: crate::focused_capture::FocusedObjects,
+    },
+    Legacy {
+        objects: crate::package::commands::ProfiledCount,
+        preview: capture::profiled::ProfiledConfig,
+    },
 }
 impl Prepared {
     pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
@@ -649,19 +724,28 @@ impl Prepared {
                 ..
             }
         );
-        crate::report::consume_capture_result(
-            capture::profiled::run_profiled_before(
-                &self.preview,
-                args.target,
-                self.objects,
-                Some(self.setup_deadline),
+        match self.route {
+            PreparedRoute::Focused { config, objects } => crate::report::consume_focused_result(
+                crate::focused_capture::run(config, args.target, objects, self.setup_deadline),
+                crate::report::CaptureCommand::Check {
+                    rules: &policy_rules(&args.rules),
+                },
+                &req,
             ),
-            crate::report::CaptureCommand::Check {
-                rules: &policy_rules(&args.rules),
-            },
-            &req,
-            workload_discarded,
-        )
+            PreparedRoute::Legacy { preview, objects } => crate::report::consume_capture_result(
+                capture::profiled::run_profiled_before(
+                    &preview,
+                    args.target,
+                    objects,
+                    Some(self.setup_deadline),
+                ),
+                crate::report::CaptureCommand::Check {
+                    rules: &policy_rules(&args.rules),
+                },
+                &req,
+                workload_discarded,
+            ),
+        }
     }
 }
 
@@ -1049,9 +1133,7 @@ require-executed=["SHA2-256"]
     fn parse_rules_matrix() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let base = vec![
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -1463,9 +1545,7 @@ require-executed=["SHA2-256"]
     fn empty_provider_matchers_rejected_on_every_occurrence() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let base = vec![
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -1651,7 +1731,7 @@ pub(crate) fn with_check_objects<R>(
 
 #[cfg(test)]
 #[test]
-fn identity_v2_prepare_selection() {
+fn normal_command_refuses_identity_v2_selection() {
     let args = [
         "--dev-bundle",
         "/missing/identity-v2",
@@ -1660,5 +1740,8 @@ fn identity_v2_prepare_selection() {
         "--deny-weak",
     ]
     .map(String::from);
-    assert!(parse(&args).is_ok(), "must select the dev admission route");
+    assert!(
+        parse(&args).is_err(),
+        "normal commands refuse legacy bundle selection"
+    );
 }

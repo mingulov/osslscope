@@ -33,7 +33,7 @@ set -eu
 
 HOST_TOOLCHAIN="1.88.0"
 BPF_TOOLCHAIN="nightly-2026-05-20"
-BPF_BINS="osslscope-harvest osslscope-count osslscope-members osslscope-provider-observation"
+BPF_BINS="osslscope-harvest osslscope-count osslscope-members osslscope-provider-observation osslscope-focused-count"
 BPF_TARGET="bpfel-unknown-none"
 
 MODE="both"        # both | host | bpf
@@ -359,7 +359,7 @@ $_object"
         [ -x "$HOST_BIN" ] || { echo "error: expected host binary missing: $HOST_BIN" >&2; exit 1; }
     fi
     if [ "$MODE" != "host" ] && [ -z "$IDENTITY_INPUTS" ]; then
-        BPF_CMD="cargo +$BPF_TOOLCHAIN build --locked -Z build-std=core --target $BPF_TARGET --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-provider-observation $MSG_FMT (in crates/ebpf)"
+        BPF_CMD="cargo +$BPF_TOOLCHAIN build --locked -Z build-std=core --target $BPF_TARGET --release --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-provider-observation --bin osslscope-focused-count $MSG_FMT (in crates/ebpf)"
         # No subshell: run_cargo_locked must propagate OFFLINE_USED to the manifest.
         _cwd="$(pwd)"
         cd "$REPO/crates/ebpf"
@@ -367,7 +367,7 @@ $_object"
         : >"$CARGO_STDOUT"
         if ! run_cargo_locked "$BPF_TOOLCHAIN" build \
             -Z build-std=core --target "$BPF_TARGET" --release \
-            --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-provider-observation "$MSG_FMT"; then
+            --bin osslscope-harvest --bin osslscope-count --bin osslscope-members --bin osslscope-provider-observation --bin osslscope-focused-count "$MSG_FMT"; then
             cd "$_cwd"
             exit 1
         fi
@@ -379,10 +379,10 @@ $_object"
             [ -f "$_p" ] || { echo "error: expected BPF object missing: $_p" >&2; exit 1; }
             BPF_BIN_PATHS="$BPF_BIN_PATHS
 $_p"
-            if [ "$b" = "osslscope-provider-observation" ] && [ -n "$HOST_BIN" ]; then
+            if { [ "$b" = "osslscope-provider-observation" ] || [ "$b" = "osslscope-focused-count" ]; } && [ -n "$HOST_BIN" ]; then
                 # Cargo's emitted paths also cover custom target directories,
                 # target triples and profiles. Never guess a default target/.
-                cp --remove-destination "$_p" "$(dirname "$HOST_BIN")/osslscope-provider-observation"
+                cp --remove-destination "$_p" "$(dirname "$HOST_BIN")/$b"
             fi
         done
         BPF_BIN_PATHS="$(printf '%s' "$BPF_BIN_PATHS" | sed '/^$/d')"
@@ -485,6 +485,7 @@ manifest = {
         "bpf-object:osslscope-count": "lib/osslscope/osslscope-count",
         "bpf-object:osslscope-members": "lib/osslscope/osslscope-members",
         "bpf-object:osslscope-provider-observation": "lib/osslscope/osslscope-provider-observation",
+        "bpf-object:osslscope-focused-count": "lib/osslscope/osslscope-focused-count",
     },
 }
 mpath = e["MANIFEST"]

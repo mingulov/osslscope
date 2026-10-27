@@ -1087,6 +1087,21 @@ fn h5_t3_every_device_site_names_one_domain() {
         ("src/package/commands.rs", "raw", "dev: m.dev(),", 1),
         // Retained artifacts compare raw fstat metadata before/after reads;
         // their identity never joins encoded or maps device domains.
+        // Focused Count already encoded this SiteKey's device as a stat word;
+        // projection copies it into ObjectRecord dedup keys in that same domain.
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "objects.insert((site.site.object.clone(), site.site.device, site.site.inode));",
+            1,
+        ),
+        // Scanner-owned native PID namespace FD; never maps-text metadata.
+        (
+            "src/focused_capture.rs",
+            "raw",
+            "device: metadata.dev(),",
+            1,
+        ),
         ("src/package/build.rs", "raw", "dev: m.dev(),", 1),
         // Task 2 trusted file identities use the same raw FD metadata domain.
         ("src/package/trusted.rs", "raw", "dev: m.dev(),", 1),

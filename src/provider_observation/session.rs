@@ -142,6 +142,14 @@ fn validate_then_arm(
     arm()?;
     validate()
 }
+/// Pure object ABI admission, shared with ordinary command preflight.
+pub(crate) fn prepare_object(object: &[u8]) -> Result<loader::Prepared, ObservationGap> {
+    let programs = [
+        loader::ProgSpec::uprobe("observation_entry"),
+        loader::ProgSpec::uretprobe("observation_return"),
+    ];
+    loader::prepare(object, &specs(), &programs).map_err(|_| ObservationGap::InvalidObject)
+}
 struct Attachment {
     links: Vec<OwnedFd>,
     site: VerifiedSite,
@@ -269,12 +277,7 @@ impl ProviderSession {
                 .checked_mul(4)
                 .ok_or(ObservationGap::StateLimit)?,
         )?;
-        let programs = [
-            loader::ProgSpec::uprobe("observation_entry"),
-            loader::ProgSpec::uretprobe("observation_return"),
-        ];
-        let mut prepared = loader::prepare(object, &specs(), &programs)
-            .map_err(|_| ObservationGap::InvalidObject)?;
+        let mut prepared = prepare_object(object)?;
         // Retain hard bounds while honoring lower pending/process limits in actual maps.
         for m in &mut prepared.maps {
             if matches!(m.name.as_str(), "PENDING" | "THREADS" | "CURSORS") {

@@ -220,6 +220,49 @@ pub(crate) struct ProfiledCount {
     pub selection: RoleSelection,
 }
 
+/// Focused companions are finite executable-relative artifacts, independent of
+/// the historical package-builder admission graph. Explicit paths trust the
+/// operator's code choice, while retaining and validating actual bytes.
+pub fn resolve_focused_objects(
+    observation_override: Option<&Path>,
+    count_override: Option<&Path>,
+) -> Result<crate::focused_capture::FocusedObjects, PackageError> {
+    use crate::provider_observation::artifact::{Companion, load_companion};
+    fn validate(role: Companion, bytes: &[u8]) -> Result<(), PackageError> {
+        match role {
+            Companion::Observation => crate::provider_observation::session::prepare_object(bytes)
+                .map(|_| ())
+                .map_err(|_| PackageError::invalid("observation companion ABI")),
+            Companion::FocusedCount => crate::loader::prepare_focused_count(bytes)
+                .map(|_| ())
+                .map_err(|_| PackageError::invalid("focused Count companion ABI")),
+        }
+    }
+    fn snapshot(path: Option<&Path>, role: Companion) -> Result<Arc<[u8]>, PackageError> {
+        match path {
+            Some(path) => Ok(
+                snapshot_explicit_with(Role::Count, path, 16 << 20, |_, bytes| {
+                    validate(role, bytes)
+                })?
+                .bytes,
+            ),
+            // Missing, untrusted or malformed automatic companions are absent,
+            // never loaded. A local override always reports invalid bytes.
+            None => Ok(match load_companion(role) {
+                Ok(bytes) if validate(role, &bytes).is_ok() => bytes.into(),
+                _ => Arc::from([]),
+            }),
+        }
+    }
+    let observation = snapshot(observation_override, Companion::Observation)?;
+    let count = snapshot(count_override, Companion::FocusedCount)?;
+    Ok(crate::focused_capture::FocusedObjects {
+        observation,
+        count_sha256: sha256(&count).0,
+        count,
+    })
+}
+
 pub(crate) fn resolve_profiled_count(
     override_path: Option<&Path>,
 ) -> Result<ProfiledCount, PackageError> {

@@ -17,6 +17,7 @@ pub(crate) const DEFAULT_DURATION_SECS: f64 = 30.0;
 struct Args {
     cfg: capture::Config,
     libcrypto: Option<PathBuf>,
+    observation_object: Option<PathBuf>,
     settle_explicit: bool,
     target: capture::Target,
     format: String,
@@ -35,6 +36,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut object: Option<String> = None;
     let mut count_object: Option<String> = None;
     let mut libcrypto: Option<String> = None;
+    let mut observation_object: Option<PathBuf> = None;
     let mut members_object: Option<String> = None;
     let mut dev_bundle: Option<String> = None;
     let mut force_offset_raw: Option<String> = None;
@@ -43,6 +45,7 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut grace_raw: Option<String> = None;
     let mut pid: Option<u32> = None;
     let mut image_digest = String::new();
+    let mut image_digest_explicit = false;
     let mut cbom: Option<String> = None;
     let mut workload_out: Option<String> = None;
     let mut workload_out_fd: Option<String> = None;
@@ -71,6 +74,12 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             }
             "--object" => object = Some(val(a)?),
             "--count-object" => count_object = Some(val(a)?),
+            "--observation-object" => {
+                if observation_object.is_some() {
+                    return Err("--observation-object may occur only once".into());
+                }
+                observation_object = Some(val(a)?.into());
+            }
             "--libcrypto" => {
                 if libcrypto.is_some() {
                     return Err("--libcrypto may occur only once".into());
@@ -91,8 +100,20 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--settle" => settle_raw = Some(val(a)?),
             "--timeout" => timeout_raw = Some(val(a)?),
             "--grace" => grace_raw = Some(val(a)?),
-            "--pid" => pid = Some(val(a)?.parse().map_err(|_| "--pid needs an integer")?),
-            "--image-digest" => image_digest = val(a)?,
+            "--pid" => {
+                if pid.is_some() {
+                    return Err("--pid may occur only once".into());
+                }
+                let value: u32 = val(a)?.parse().map_err(|_| "--pid needs an integer")?;
+                if value == 0 || value > i32::MAX as u32 {
+                    return Err("--pid is out of range".into());
+                }
+                pid = Some(value);
+            }
+            "--image-digest" => {
+                image_digest_explicit = true;
+                image_digest = val(a)?;
+            }
             "--cbom" => cbom = Some(val(a)?),
             "--workload-out" => workload_out = Some(val(a)?),
             "--workload-out-fd" => workload_out_fd = Some(val(a)?),
@@ -151,7 +172,29 @@ fn parse(argv: &[String]) -> Result<Args, String> {
         Some(s) => Some(crate::args::parse_force_offset(s)?),
         None => None,
     };
+    if libcrypto.is_some() && (pid.is_some() || observation_object.is_some()) {
+        return Err("--libcrypto conflicts with --pid and --observation-object".into());
+    }
+    if libcrypto.is_none() {
+        if provider.is_some()
+            || builtin
+            || object.is_some()
+            || members_object.is_some()
+            || dev_bundle.is_some()
+            || force_offset_raw.is_some()
+            || settle_raw.is_some()
+            || image_digest_explicit
+        {
+            return Err(
+                "legacy discovery/enrollment flags require explicit --libcrypto diagnostics".into(),
+            );
+        }
+        if timeout.is_zero() || grace.is_zero() {
+            return Err("--timeout and --grace must be positive".into());
+        }
+    }
     Ok(Args {
+        observation_object,
         libcrypto: libcrypto.map(PathBuf::from),
         settle_explicit: settle_raw.is_some(),
         cfg: capture::Config {
@@ -273,7 +316,7 @@ pub(crate) fn grouped(n: u64) -> String {
     out
 }
 
-const USAGE: &str = "usage: report --libcrypto PATH [--count-object PATH] [--duration S] [--format human|json] [--out FILE] [--cbom FILE] [--timeout S] [--grace S] [--workload-out FILE | --workload-out-fd N] run -- COMMAND";
+const USAGE: &str = "usage: report [--observation-object PATH] [--count-object PATH] [--duration S] [--format human|json] [--out FILE] [--cbom FILE] [--timeout S] [--grace S] [--workload-out FILE | --workload-out-fd N] {--pid PID | run -- COMMAND}\n  --libcrypto PATH selects legacy count-only diagnostics (run only).";
 
 pub fn run(argv: &[String]) -> ExitCode {
     match prepare(argv) {
@@ -304,6 +347,32 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
     // observed-crypto-v2.3; v1 fixtures are history.
+    let setup_deadline = std::time::Instant::now()
+        .checked_add(args.cfg.harvest_timeout)
+        .ok_or_else(|| {
+            crate::report::err_line("setup deadline overflow");
+            ExitCode::from(2)
+        })?;
+    if args.libcrypto.is_none() {
+        let objects = crate::package::commands::resolve_focused_objects(
+            args.observation_object.as_deref(),
+            args.cfg.count_object.as_deref(),
+        )
+        .map_err(|e| {
+            crate::report::err_line(&format!("osslscope: {e}"));
+            ExitCode::from(2)
+        })?;
+        let config = crate::focused_capture::FocusedConfig {
+            duration: args.cfg.duration,
+            timeout: args.cfg.harvest_timeout,
+            grace: args.cfg.grace,
+        };
+        return Ok(Prepared {
+            args,
+            route: PreparedRoute::Focused { config, objects },
+            setup_deadline,
+        });
+    }
     let preview = match capture::profiled::ProfiledConfig::for_command(
         args.libcrypto.clone(),
         &args.cfg,
@@ -348,24 +417,26 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
                 return Err(ExitCode::from(result.exit_code));
             }
         };
-    let setup_deadline = std::time::Instant::now()
-        .checked_add(args.cfg.harvest_timeout)
-        .ok_or_else(|| {
-            crate::report::err_line("setup deadline overflow");
-            ExitCode::from(2)
-        })?;
     Ok(Prepared {
         args,
-        preview,
-        objects,
+        route: PreparedRoute::Legacy { preview, objects },
         setup_deadline,
     })
 }
 pub struct Prepared {
     setup_deadline: std::time::Instant,
     args: Args,
-    objects: crate::package::commands::ProfiledCount,
-    preview: capture::profiled::ProfiledConfig,
+    route: PreparedRoute,
+}
+enum PreparedRoute {
+    Focused {
+        config: crate::focused_capture::FocusedConfig,
+        objects: crate::focused_capture::FocusedObjects,
+    },
+    Legacy {
+        objects: crate::package::commands::ProfiledCount,
+        preview: capture::profiled::ProfiledConfig,
+    },
 }
 impl Prepared {
     pub(crate) fn setup_deadline(&self) -> Option<std::time::Instant> {
@@ -402,17 +473,24 @@ impl Prepared {
                 ..
             }
         );
-        consume_capture_result(
-            capture::profiled::run_profiled_before(
-                &self.preview,
-                args.target,
-                self.objects,
-                Some(self.setup_deadline),
+        match self.route {
+            PreparedRoute::Focused { config, objects } => crate::report::consume_focused_result(
+                crate::focused_capture::run(config, args.target, objects, self.setup_deadline),
+                CaptureCommand::Report,
+                &req,
             ),
-            CaptureCommand::Report,
-            &req,
-            workload_discarded,
-        )
+            PreparedRoute::Legacy { preview, objects } => crate::report::consume_capture_result(
+                capture::profiled::run_profiled_before(
+                    &preview,
+                    args.target,
+                    objects,
+                    Some(self.setup_deadline),
+                ),
+                CaptureCommand::Report,
+                &req,
+                workload_discarded,
+            ),
+        }
     }
 }
 
@@ -767,7 +845,7 @@ pub fn consume_capture_result_with_diagnostics(
             CaptureFailureClass::UntypedSetup { detail } => unknown_detail = Some(detail),
         },
     }
-    let (mut document, legacy, child_exit, disposition, failure_context) =
+    let (document, legacy, child_exit, disposition, failure_context) =
         if let Some(c) = capture_result {
             if lines.is_empty() && c.failure_context.is_some() {
                 lines.push(
@@ -829,22 +907,7 @@ pub fn consume_capture_result_with_diagnostics(
     if let Some(context) = &failure_context {
         failure_diagnostics(context, &mut lines);
     }
-    let outcome = match command {
-        CaptureCommand::Report => {
-            document.policy = None;
-            if matches!(document.status, Completeness::Fatal { .. }) {
-                crate::policy::PolicyOutcome::NoVerdict
-            } else {
-                crate::policy::PolicyOutcome::Pass
-            }
-        }
-        CaptureCommand::Check { rules } => {
-            let (verdict, checked) =
-                crate::check::assemble_checked_document(rules, document, &legacy);
-            document = checked;
-            verdict.overall()
-        }
-    };
+    let (document, outcome) = evaluate_command_document(document, &legacy, command);
     if let Some(hint) = workload_hint(child_exit, workload_discarded && !observer_cancelled_child) {
         lines.push(hint);
     }
@@ -888,6 +951,108 @@ pub fn consume_capture_result_with_diagnostics(
         exit_code,
         diagnostics: lines,
         failure_context,
+    }
+}
+
+fn evaluate_command_document(
+    mut document: CaptureDocument,
+    legacy: &serde_json::Value,
+    command: CaptureCommand<'_>,
+) -> (CaptureDocument, crate::policy::PolicyOutcome) {
+    let outcome = match command {
+        CaptureCommand::Report => {
+            document.policy = None;
+            if matches!(document.status, Completeness::Fatal { .. }) {
+                crate::policy::PolicyOutcome::NoVerdict
+            } else {
+                crate::policy::PolicyOutcome::Pass
+            }
+        }
+        CaptureCommand::Check { rules } => {
+            let (verdict, checked) =
+                crate::check::assemble_checked_document(rules, document, legacy);
+            document = checked;
+            verdict.overall()
+        }
+    };
+    (document, outcome)
+}
+
+/// Deliver the actual focused document through the established policy,
+/// rendering, artifact and execution-exit contract.
+pub fn consume_document(
+    result: crate::focused_capture::FocusedResult,
+    command: CaptureCommand<'_>,
+    request: &OutputRequest,
+) -> CaptureCommandResult {
+    let disposition = result
+        .document
+        .disposition
+        .and_then(|record| match record.outcome {
+            DispositionOutcome::Exited => record
+                .code
+                .map(|code| crate::target::TargetDisposition::Exited { code }),
+            DispositionOutcome::DetachedRunning => record
+                .pid
+                .map(|pid| crate::target::TargetDisposition::Detached { pid }),
+            DispositionOutcome::ForeignObserved => None,
+        });
+    let (document, outcome) =
+        evaluate_command_document(result.document, &serde_json::Value::Null, command);
+    let mut diagnostics = Vec::new();
+    if let Some(hint) = workload_hint(result.child_exit, result.workload_discarded) {
+        err_line(&format!("osslscope: {hint}"));
+        diagnostics.push(hint);
+    }
+    let delivery = write_artifacts(&document, request);
+    emit_diagnostics(&delivery);
+    diagnostics.extend(delivery.diagnostics.iter().cloned());
+    let exit_code = exit_for(outcome, result.child_exit, &document, &delivery);
+    CaptureCommandResult {
+        document,
+        child_exit: result.child_exit,
+        disposition,
+        delivery,
+        exit_code,
+        diagnostics,
+        failure_context: None,
+    }
+}
+pub(crate) fn consume_focused_result(
+    result: anyhow::Result<crate::focused_capture::FocusedResult>,
+    command: CaptureCommand<'_>,
+    request: &OutputRequest,
+) -> CaptureCommandResult {
+    match result {
+        Ok(result) => consume_document(result, command, request),
+        Err(error) => {
+            let unavailable = error.is::<crate::focused_capture::TargetUnavailable>();
+            let mut delivered = consume_document(
+                crate::focused_capture::FocusedResult {
+                    document: setup_failure_document(FatalKind::Environment(if unavailable {
+                        "focused target unavailable".into()
+                    } else {
+                        "focused runtime failed".into()
+                    })),
+                    child_exit: None,
+                    workload_discarded: false,
+                },
+                command,
+                request,
+            );
+            // Delivery/runtime failures keep their execution failure exit.
+            delivered.exit_code = if unavailable && !delivered.delivery.failed() {
+                4
+            } else {
+                1
+            };
+            err_line(if unavailable {
+                "osslscope: focused target unavailable"
+            } else {
+                "osslscope: focused runtime failed"
+            });
+            delivered
+        }
     }
 }
 
@@ -2668,9 +2833,7 @@ mod tests {
     fn cbom_flag_parses() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let a = parse(&v(vec![
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -2682,9 +2845,7 @@ mod tests {
         .unwrap();
         assert_eq!(a.cbom, Some("/tmp/x.cdx.json".to_string()));
         let a = parse(&v(vec![
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -2712,9 +2873,7 @@ mod tests {
     fn duration_defaults_to_30s() {
         let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
         let no_dur = vec![
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -2728,9 +2887,7 @@ mod tests {
         let explicit = vec![
             "--duration",
             "5",
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -2749,9 +2906,7 @@ mod tests {
         let base = vec![
             "--duration",
             "5",
-            "--provider",
-            "p",
-            "--object",
+            "--observation-object",
             "o",
             "--count-object",
             "c",
@@ -2783,22 +2938,31 @@ mod tests {
         assert!(parse(&v(bad_force)).is_err());
         let mut force = vec!["--pid", "9"];
         force.extend(["--force-offset", "0x10"]);
-        assert_eq!(parse(&v(force)).unwrap().cfg.force_offset, Some(0x10));
+        assert!(parse(&v(force)).is_err());
+        let legacy_force = parse(&v(vec![
+            "--libcrypto",
+            "lib",
+            "--force-offset",
+            "0x10",
+            "run",
+            "--",
+            "x",
+        ]))
+        .unwrap();
+        assert_eq!(legacy_force.cfg.force_offset, Some(0x10));
         let mut yaml = base.clone();
         yaml.extend(["--pid", "9", "--format", "yaml"]);
         assert!(parse(&v(yaml)).is_err());
         let mut digest = base.clone();
         digest.extend(["--pid", "9", "--image-digest", "sha256:abc"]);
-        assert_eq!(parse(&v(digest)).unwrap().cfg.image_digest, "sha256:abc");
+        assert!(parse(&v(digest)).is_err());
         let mut no_digest = base.clone();
         no_digest.extend(["--pid", "9"]);
         assert_eq!(parse(&v(no_digest)).unwrap().cfg.image_digest, "");
         // Valueless flags consume one slot (mid-argv position).
         let mut bi = base.clone();
         bi.extend(["--builtin", "--pid", "9"]);
-        let a = parse(&v(bi)).unwrap();
-        assert!(a.cfg.builtin);
-        assert!(matches!(a.target, capture::Target::Pid(9)));
+        assert!(parse(&v(bi)).is_err());
     }
 }
 
@@ -2855,7 +3019,10 @@ pub fn apply_producer_shutdown(
 
 #[cfg(test)]
 #[test]
-fn identity_v2_prepare_selection() {
+fn normal_command_refuses_identity_v2_selection() {
     let args = ["--dev-bundle", "/missing/identity-v2", "--pid", "1"].map(String::from);
-    assert!(parse(&args).is_ok(), "must select the dev admission route");
+    assert!(
+        parse(&args).is_err(),
+        "normal commands refuse legacy bundle selection"
+    );
 }

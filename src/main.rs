@@ -30,8 +30,8 @@ fn main() -> ExitCode {
         osslscope::report::err_line(&format!("osslscope: workload fd: {error}"));
         return ExitCode::from(4);
     }
-    // The preview acquires the stopped child before count resources and has no
-    // discovery producer. Bootstrap no lifecycle runtime or reader process.
+    // Focused and explicit legacy runs acquire stopped-child custody before
+    // BPF resources. The synchronous controller owns discovery and teardown.
     std::panic::set_hook(Box::new(|_| {
         osslscope::report::err_line("osslscope: capture panicked")
     }));
