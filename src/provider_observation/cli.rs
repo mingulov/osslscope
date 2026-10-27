@@ -100,9 +100,12 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn signal(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
-struct Signals(Vec<(libc::c_int, libc::sigaction)>);
+pub(crate) struct Signals(Vec<(libc::c_int, libc::sigaction)>);
 impl Signals {
-    fn install() -> io::Result<Self> {
+    pub(crate) fn cancel(&self) -> &AtomicBool {
+        &INTERRUPTED
+    }
+    pub(crate) fn install() -> io::Result<Self> {
         INTERRUPTED.store(false, Ordering::Relaxed);
         let mut guard = Self(Vec::new());
         for number in [libc::SIGINT, libc::SIGTERM] {

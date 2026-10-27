@@ -766,10 +766,12 @@ pub struct LegacyCallPartition {
     /// Calls on sites whose every candidate is legacy-class and
     /// whose backing (device, inode) is the legacy provider file.
     pub legacy_exclusive: u64,
-    /// Calls on sites with no legacy-class candidate.
+    /// Calls on sites with a complete candidate set and no legacy-class candidate.
     pub non_legacy_exclusive: u64,
     /// Calls on sites mixing legacy with non-legacy candidates, or
-    /// all-legacy candidates backed by a foreign file.
+    /// all-legacy candidates backed by a foreign file. Also includes nonempty
+    /// candidate sets with unknown coverage: omitted legacy candidates remain
+    /// possible even when every advertised candidate has another class.
     pub shared_ambiguous: u64,
     /// Calls on sites carrying no candidates (no partition key).
     pub unfenced_tails: u64,

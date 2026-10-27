@@ -114,6 +114,17 @@ fn role_site(pid: u32, starttime: u64, site: &VerifiedSite) -> RoleSite {
         site.file_offset(),
     ]
 }
+fn reconcile_retirement_gap(
+    current_starttime: Option<u64>,
+    expected_starttime: u64,
+    revalidate: impl FnOnce() -> Result<(), ObservationGap>,
+) -> Option<ObservationGap> {
+    match current_starttime {
+        None => Some(ObservationGap::MembershipUnknown),
+        Some(current) if current != expected_starttime => Some(ObservationGap::ProcessChanged),
+        Some(_) => revalidate().err(),
+    }
+}
 fn validate_then_arm(
     mut validate: impl FnMut() -> Result<(), ObservationGap>,
     arm: impl FnOnce() -> Result<(), ObservationGap>,
@@ -199,6 +210,33 @@ fn specs() -> Vec<loader::MapSpec> {
         .collect()
 }
 impl ProviderSession {
+    /// Validate enclosing process and current membership, preserving the separate
+    /// D3 membership epoch and mapped-object generation domains.
+    pub fn revalidate_candidate(
+        &self,
+        candidate: &VerifiedSiteCandidate,
+    ) -> Result<(), ObservationGap> {
+        if self.closed {
+            return Err(ObservationGap::Invalidated);
+        }
+        let target = self
+            .targets
+            .get(&candidate.pid)
+            .ok_or(ObservationGap::MembershipUnknown)?;
+        if target.starttime != candidate.starttime || target.generation != candidate.generation {
+            return Err(ObservationGap::ProcessChanged);
+        }
+        let member = self
+            .members
+            .get(&candidate.pid, 0)
+            .map_err(|_| ObservationGap::MembershipUnknown)?;
+        if member.generation != target.generation || member.epoch != 1 {
+            return Err(ObservationGap::MembershipUnknown);
+        }
+        target.process.revalidate()?;
+        candidate.site.revalidate_object()
+    }
+
     pub fn open(limits: ObservationLimits, object: &[u8]) -> Result<Self, ObservationGap> {
         let max = ObservationLimits::default();
         if object.len() > 16 << 20 {
@@ -389,20 +427,21 @@ impl ProviderSession {
             .targets
             .iter()
             .filter_map(|(&pid, t)| {
-                if !snapshot
-                    .processes
-                    .iter()
-                    .any(|p| p.pid == pid && p.starttime == t.starttime)
-                    || t.process.revalidate().is_err()
-                {
-                    Some(pid)
-                } else {
-                    None
-                }
+                reconcile_retirement_gap(
+                    snapshot
+                        .processes
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| p.starttime),
+                    t.starttime,
+                    || t.process.revalidate(),
+                )
+                .map(|gap| (pid, gap))
             })
             .collect();
-        for pid in retire {
+        for (pid, gap) in retire {
             self.retire(pid, &mut b);
+            b.gap(gap);
             b.gap(ObservationGap::IntervalUnknown)
         }
         for record in &snapshot.processes {
@@ -1088,6 +1127,29 @@ fn object_id(site: &VerifiedSite) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reconcile_preserves_membership_and_revalidation_retirement_causes() {
+        assert_eq!(
+            reconcile_retirement_gap(None, 4, || panic!("missing membership must not revalidate")),
+            Some(ObservationGap::MembershipUnknown)
+        );
+        assert_eq!(
+            reconcile_retirement_gap(Some(5), 4, || panic!(
+                "recycled membership must not revalidate"
+            )),
+            Some(ObservationGap::ProcessChanged)
+        );
+        for gap in [
+            ObservationGap::ProcessChanged,
+            ObservationGap::NamespaceChanged,
+            ObservationGap::ObjectChanged,
+            ObservationGap::IdentityUnverified,
+        ] {
+            assert_eq!(reconcile_retirement_gap(Some(4), 4, || Err(gap)), Some(gap));
+        }
+        assert_eq!(reconcile_retirement_gap(Some(4), 4, || Ok(())), None);
+    }
+
     use super::*;
     #[test]
     fn no_source_snapshots_preserve_admission_for_late_source() {

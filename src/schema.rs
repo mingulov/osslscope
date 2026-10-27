@@ -1261,6 +1261,11 @@ fn check_records(
         if first > last {
             return Err(format!("{ctx}: first_ns {first} is past last_ns {last}"));
         }
+        // A retained attachment with no calls has no activity timestamps. The
+        // exact zero sentinel is not a claim that activity occurred at epoch 0.
+        if get_u64(record, "calls", ctx)? == 0 && first == 0 && last == 0 {
+            return Ok(());
+        }
         if first < bounds.start
             || match bounds.admission_end {
                 Some(deadline) => last >= deadline,

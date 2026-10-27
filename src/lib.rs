@@ -41,3 +41,5 @@ pub mod schema;
 pub mod target;
 
 pub mod focused_count;
+
+pub mod focused_capture;

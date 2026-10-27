@@ -209,6 +209,10 @@ impl FocusedCounter {
             drop(candidates);
         }
     }
+    /// Scalar readiness derived from owned physical links, not advertisements.
+    pub fn active_site_count(&self) -> usize {
+        self.attachments.len()
+    }
     pub fn retire(&mut self) {
         if self.retired && self.attachments.is_empty() {
             return;
