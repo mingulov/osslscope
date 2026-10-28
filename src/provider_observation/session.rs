@@ -299,6 +299,31 @@ fn rejects_history(gap: ObservationGap) -> bool {
 fn recorded_refusal(process: &VerifiedProcess) -> Option<ObservationGap> {
     process.gaps().into_iter().find(|&gap| rejects_history(gap))
 }
+fn cold_attach_error(
+    gap: ObservationGap,
+    batch: &mut ObservationBatch,
+) -> Result<(), ObservationGap> {
+    batch.gap(gap);
+    if rejects_history(gap) {
+        Err(gap)
+    } else {
+        Ok(())
+    }
+}
+fn process_retirement_gap(process: &VerifiedProcess) -> Option<ObservationGap> {
+    recorded_refusal(process).or_else(|| process.revalidate().err())
+}
+fn candidate_validation_result(
+    process: &VerifiedProcess,
+    result: Result<(), ObservationGap>,
+) -> Result<(), ObservationGap> {
+    if let Err(gap) = result {
+        if rejects_history(gap) {
+            process.remember_refusal(gap);
+        }
+    }
+    result
+}
 /// Shared retirement boundary for reconcile/acquisition failures and drain.
 /// The descriptor/map operation is supplied by the session; source ownership
 /// and pending assembler state have one production transition.
@@ -489,13 +514,21 @@ impl ProviderSession {
         if target.starttime != candidate.starttime || target.generation != candidate.generation {
             return Err(ObservationGap::ProcessChanged);
         }
+        if let Some(gap) = recorded_refusal(&target.process) {
+            return Err(gap);
+        }
         let member = self
             .members
             .get(&candidate.pid, 0)
             .map_err(|_| ObservationGap::MembershipUnknown)?;
         validate_candidate_member(&member, target.generation)?;
-        target.process.revalidate()?;
-        candidate.site.revalidate_object()
+        candidate_validation_result(
+            &target.process,
+            target
+                .process
+                .revalidate()
+                .and_then(|()| candidate.site.revalidate_object()),
+        )
     }
 
     pub fn open(limits: ObservationLimits, object: &[u8]) -> Result<Self, ObservationGap> {
@@ -781,7 +814,7 @@ impl ProviderSession {
                 reconcile_retirement_gap(
                     records.iter().find(|p| p.pid == pid).map(|p| p.starttime),
                     t.starttime,
-                    || t.process.revalidate(),
+                    || process_retirement_gap(&t.process).map_or(Ok(()), Err),
                 )
                 .map(|gap| (pid, gap))
             })
@@ -1015,7 +1048,7 @@ impl ProviderSession {
                         arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
                         target.attachments.push(a)
                     }
-                    Err(g) => b.gap(g),
+                    Err(g) => cold_attach_error(g, b)?,
                 }
             }
             drop(staging);
@@ -1077,7 +1110,7 @@ impl ProviderSession {
         let retired: Vec<_> = self
             .targets
             .iter()
-            .filter_map(|(&pid, t)| t.process.revalidate().err().map(|g| (pid, g)))
+            .filter_map(|(&pid, t)| process_retirement_gap(&t.process).map(|g| (pid, g)))
             .collect();
         for (pid, gap) in retired {
             self.retire_for_gap(pid, None, gap, &mut b);
@@ -3317,6 +3350,195 @@ mod startup_api_controls {
                 "cached confirmed {confirmed:?} was lost behind later unavailability"
             );
             assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+            fixture.child.finish_observation().unwrap();
+        }
+    }
+    #[test]
+    fn cold_attach_refusal_retires_before_later_exit_can_override_it() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for expected in [
+            ObservationGap::NamespaceChanged,
+            ObservationGap::ProcessChanged,
+            ObservationGap::ProcessUnavailable,
+        ] {
+            let mut fixture = reconcile_fixture(true);
+            let pid = fixture.child.pid();
+            let mut compared = fixture.record.clone();
+            match expected {
+                ObservationGap::NamespaceChanged => {
+                    compared.namespaces.mount.as_mut().unwrap().inode += 1
+                }
+                ObservationGap::ProcessChanged => compared.starttime += 1,
+                _ => (),
+            }
+            let mut batch = ObservationBatch::default();
+            let mut later_signature = false;
+            let confirmed = if expected == ObservationGap::ProcessUnavailable {
+                None
+            } else {
+                Some(objects::acquire_incarnation(&compared).err().unwrap())
+            };
+            if let Some(gap) = confirmed {
+                assert_eq!(gap, expected);
+            }
+            // Enter the exact cold attach-pair error branch. Its propagated
+            // reason must survive before any later signature can be attempted.
+            let setup = (|| {
+                cold_attach_error(confirmed.unwrap_or(expected), &mut batch)?;
+                later_signature = true;
+                Ok(())
+            })();
+            fixture.child.release_retaining_exit().unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while fixture.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let unavailable = fixture.targets[&pid].process.revalidate().unwrap_err();
+            assert_eq!(unavailable, ObservationGap::ProcessUnavailable);
+            let mut aliases = super::super::assembly::Sequences::default();
+            let preserve = retire_source_owners(
+                (&mut fixture.startup, &mut fixture.targets),
+                &mut aliases,
+                pid,
+                None,
+                setup.err().unwrap_or(unavailable),
+                &mut batch,
+                |_, _| Ok(()),
+            );
+            if confirmed.is_some() {
+                assert!(
+                    !later_signature,
+                    "cold {expected:?} permitted another signature attempt"
+                );
+                assert!(
+                    !preserve,
+                    "cold {expected:?} was replaced by later unavailability"
+                );
+                assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+            } else {
+                assert!(
+                    later_signature && preserve,
+                    "unavailability requires independent terminal-original checks"
+                );
+                assert!(fixture.targets.is_empty());
+                assert!(
+                    fixture.startup[&pid]
+                        .iter()
+                        .all(|a| a.historical && a.links.is_empty())
+                );
+            }
+            assert!(batch.gaps.contains(&expected));
+            fixture.child.finish_observation().unwrap();
+        }
+    }
+    #[test]
+    fn ordinary_cold_attach_failure_remains_partial() {
+        let mut batch = ObservationBatch::default();
+        assert_eq!(
+            cold_attach_error(ObservationGap::AttachFailed, &mut batch),
+            Ok(())
+        );
+        assert!(batch.gaps.contains(&ObservationGap::AttachFailed));
+    }
+    #[test]
+    fn cold_attach_unavailability_does_not_grant_live_history() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let mut batch = ObservationBatch::default();
+        assert_eq!(
+            cold_attach_error(ObservationGap::ProcessUnavailable, &mut batch),
+            Ok(())
+        );
+        let mut aliases = super::super::assembly::Sequences::default();
+        assert!(
+            !retire_source_owners(
+                (&mut fixture.startup, &mut fixture.targets),
+                &mut aliases,
+                pid,
+                None,
+                ObservationGap::ProcessUnavailable,
+                &mut batch,
+                |_, _| Ok(())
+            ),
+            "an unavailable error cannot substitute for an independently terminal original pidfd"
+        );
+        assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+    }
+    #[test]
+    fn candidate_validation_refusal_survives_controller_gap_then_exit() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for expected in [
+            ObservationGap::NamespaceChanged,
+            ObservationGap::ProcessChanged,
+            ObservationGap::ProcessUnavailable,
+        ] {
+            let mut fixture = reconcile_fixture(true);
+            let pid = fixture.child.pid();
+            let mut compared = fixture.record.clone();
+            match expected {
+                ObservationGap::NamespaceChanged => {
+                    compared.namespaces.mount.as_mut().unwrap().inode += 1
+                }
+                ObservationGap::ProcessChanged => compared.starttime += 1,
+                _ => compared.namespaces.mount = None,
+            }
+            assert_eq!(
+                candidate_validation_result(
+                    &fixture.targets[&pid].process,
+                    fixture.targets[&pid].process.revalidate()
+                ),
+                Ok(())
+            );
+            assert_eq!(process_retirement_gap(&fixture.targets[&pid].process), None);
+            let validation = objects::acquire_incarnation(&compared).map(|_| ());
+            assert_eq!(validation, Err(expected));
+            assert_eq!(
+                candidate_validation_result(&fixture.targets[&pid].process, validation),
+                Err(expected)
+            );
+            assert_eq!(fixture.targets[&pid].process.revalidate(), Ok(()));
+            assert_eq!(
+                process_retirement_gap(&fixture.targets[&pid].process),
+                if expected == ObservationGap::ProcessUnavailable {
+                    None
+                } else {
+                    Some(expected)
+                }
+            );
+            // The controller keeps the diagnostic and retires Count. Provider
+            // ownership must still remember confirmed validation provenance.
+            fixture.child.release_retaining_exit().unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while fixture.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let mut aliases = super::super::assembly::Sequences::default();
+            let mut batch = ObservationBatch::default();
+            let preserve = retire_source_owners(
+                (&mut fixture.startup, &mut fixture.targets),
+                &mut aliases,
+                pid,
+                None,
+                ObservationGap::ProcessUnavailable,
+                &mut batch,
+                |_, _| Ok(()),
+            );
+            if expected == ObservationGap::ProcessUnavailable {
+                assert!(
+                    preserve,
+                    "unavailability must not become confirmed source refusal"
+                );
+            } else {
+                assert!(
+                    !preserve,
+                    "candidate {expected:?} became only a controller diagnostic before exit"
+                );
+                assert!(batch.gaps.contains(&expected));
+                assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+            }
             fixture.child.finish_observation().unwrap();
         }
     }

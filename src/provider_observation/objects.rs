@@ -636,6 +636,9 @@ impl VerifiedProcess {
     pub fn gaps(&self) -> Vec<ObservationGap> {
         self.gaps.borrow().iter().copied().collect()
     }
+    pub(super) fn remember_refusal(&self, gap: ObservationGap) {
+        self.gaps.borrow_mut().insert(gap);
+    }
     pub(crate) fn retained_incarnation(&self) -> ProcessIncarnation {
         ProcessIncarnation(self.process.clone())
     }
