@@ -6,6 +6,63 @@ public provider interfaces, and counts learned physical callback entries for
 one selected process. Installed/platform qualification is separate from source
 behavior; see [release scope](release-v0.3.0.md).
 
+## Automatic crypto watch
+
+```sh
+osslscope scan --watch --observe-crypto --duration 30 --json
+osslscope scan --watch --observe-crypto --pid 1234 --pid 5678 --json
+osslscope scan --watch --observe-crypto --cgroup /sys/fs/cgroup/example.service --json
+osslscope scan --watch --observe-crypto --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
+```
+
+With no selectors this watches the visible host population. PID, cgroup and
+module selectors retain the intersection rules below. A module selector chooses
+processes with matching mapped content; observation then covers the selected
+process's full discovered inventory, including other compatible libraries.
+`--observe-crypto` requires `scan --watch` and cannot be combined with
+`--observe-providers`. Report/check retain their one-process contract.
+
+The default duration is 30 seconds, with a one-second rescan interval, at most
+four active processes, and 256 MiB of accounted observer state shared by sessions,
+scanner metadata, parser scratch and output. The slot cap does not promise four
+maximal sessions fit. Larger inputs can exhaust the shared budget without
+changing file or algorithm eligibility. `--interval` controls sampled discovery;
+setup, parsing and output can delay sampling. Cancellation is checked between
+bounded work phases; a stalled filesystem/output syscall is not interruptible.
+
+Sessions start when a sample finds compatible-library, provider or consumer
+interfaces/dependencies. No-candidate processes remain visible and are rescanned
+for later loads. “No candidate interfaces in this sample” is not proof of no
+OpenSSL or crypto use; visibility/read/limit failures remain explicit uncertainty.
+Library names, versions and algorithms do not select the tracing backend.
+
+Output is NDJSON with `schema_version: "crypto-watch-v1"` and increasing
+`sequence`. Without `--json`, a short explanation also goes to stderr. Records:
+
+- `start`: duration, interval and resource bounds.
+- `discovery`: the existing sanitized passive `ProcessRecord`, including file
+  identities, finite interfaces, namespaces and sample timing. These facts stay
+  available when tracing is unavailable or a member exceeds an admission cap.
+- `membership`: sampled identity and admission/retirement reason. Segment zero
+  means discovery only; each admitted segment gets its own increasing number.
+- `gap`, `tracing_gap`, `session_gap`, `limit`: visibility, tracing, acquisition
+  or resource uncertainty. Known uncovered members retain their incarnation;
+  a scope-wide gap does not invent identities for unseen members.
+- `process_observation`: one ordinary `observed-crypto-v2.4` document, its
+  incarnation, segment and retirement reason. Links close before that document
+  is streamed. Physical entries and public API activity remain separate.
+- `end`: stop reason, segment count and peak declared accounting (not measured
+  RSS). Coverage remains partial; records never manufacture a cross-process
+  execution total, definite CBOM asset or policy result.
+
+Membership is sampled. Removal/reentry produces distinct segments even for the
+same incarnation. PID reuse or missing/denied visibility never becomes a claim
+that the old process exited. Observations between samples, before attachment or
+after retirement remain uncovered. SIGINT/SIGTERM stops the observer and retires
+its links; it never signals the foreign applications. Exit 3 means at least one
+partial process observation; exit 4 means none could be observed, including
+useful discovery-only output. Invalid grammar exits 2; output failure exits 1.
+
 ## Passive discovery
 
 ```sh

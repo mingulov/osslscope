@@ -1207,7 +1207,7 @@ fn engine_window_str(window: EngineWindow) -> &'static str {
     }
 }
 
-fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
+pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     let fatal_kind = match &doc.status {
         Completeness::Fatal {
             kind: FatalKind::Recycled,

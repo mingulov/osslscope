@@ -61,6 +61,7 @@ impl FocusedConfig {
         Ok(())
     }
 }
+#[derive(Clone)]
 pub struct FocusedObjects {
     pub observation: Arc<[u8]>,
     pub count: Arc<[u8]>,
@@ -480,6 +481,44 @@ impl FocusedSession {
         expected: Option<&inventory::ProcessRecord>,
         reservation: crate::observation_memory::MemoryLease,
     ) -> anyhow::Result<Self> {
+        Self::open_reserved_window(
+            config,
+            target,
+            objects,
+            (setup_deadline, None),
+            cancel,
+            expected,
+            reservation,
+        )
+    }
+    pub(crate) fn open_scanned_reserved(
+        config: FocusedConfig,
+        objects: FocusedObjects,
+        deadlines: (Instant, Instant),
+        cancel: &AtomicBool,
+        expected: &inventory::ProcessRecord,
+        reservation: crate::observation_memory::MemoryLease,
+    ) -> anyhow::Result<Self> {
+        Self::open_reserved_window(
+            config,
+            capture::Target::Pid(expected.pid),
+            objects,
+            (deadlines.0, Some(deadlines.1)),
+            cancel,
+            Some(expected),
+            reservation,
+        )
+    }
+    fn open_reserved_window(
+        config: FocusedConfig,
+        target: capture::Target,
+        objects: FocusedObjects,
+        deadlines: (Instant, Option<Instant>),
+        cancel: &AtomicBool,
+        expected: Option<&inventory::ProcessRecord>,
+        reservation: crate::observation_memory::MemoryLease,
+    ) -> anyhow::Result<Self> {
+        let (setup_deadline, observation_end) = deadlines;
         config.validate()?;
         if reservation.bytes() < Self::reservation_bytes(&objects)? {
             bail!("focused memory reservation too small");
@@ -631,12 +670,18 @@ impl FocusedSession {
         };
         let start_ns = now_ns()?;
         let wall_start = unix_ns();
-        let deadline_ns = start_ns
-            .checked_add(u64::try_from(config.duration.as_nanos())?)
-            .context("focused admission overflow")?;
-        let end = Instant::now()
+        // Foreign watch sessions share the coordinator's absolute end. Setup
+        // consumes that window; later members cannot extend earlier BPF windows.
+        let now = Instant::now();
+        let end = now
             .checked_add(config.duration)
             .context("focused duration overflow")?;
+        let end = observation_end.map_or(end, |limit| limit.min(end));
+        let deadline_ns = start_ns
+            .checked_add(u64::try_from(
+                end.saturating_duration_since(now).as_nanos(),
+            )?)
+            .context("focused admission overflow")?;
         let mut counter = if objects.count.is_empty() {
             gaps.insert(ObservationGap::BpfUnavailable);
             None
@@ -787,6 +832,31 @@ impl FocusedSession {
         now: Instant,
         cancel: &AtomicBool,
     ) -> anyhow::Result<SessionProgress> {
+        self.poll_inner(now, now + RESCAN, cancel, None)
+    }
+    /// Coordinator-owned discovery. None records means drain only; an empty
+    /// supplied slice means visibility loss. Never fall back to numeric PID scans.
+    pub(crate) fn poll_scanned(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        records: Option<&[inventory::ProcessRecord]>,
+        inventory_partial: bool,
+    ) -> anyhow::Result<SessionProgress> {
+        if inventory_partial {
+            self.inventory_gaps = self.inventory_gaps.saturating_add(1);
+        }
+        self.initial_metadata = None;
+        self.poll_inner(now, deadline, cancel, Some(records))
+    }
+    fn poll_inner(
+        &mut self,
+        now: Instant,
+        deadline: Instant,
+        cancel: &AtomicBool,
+        scanned: Option<Option<&[inventory::ProcessRecord]>>,
+    ) -> anyhow::Result<SessionProgress> {
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         if self.signal_cut || now >= self.end || Instant::now() >= self.end {
             self.pending = None;
@@ -800,7 +870,7 @@ impl FocusedSession {
                 return Ok(SessionProgress::Exited);
             }
         }
-        let tick_end = (now + RESCAN).min(self.end);
+        let tick_end = (now + RESCAN).min(self.end).min(deadline);
         if let Some(session) = &self.session {
             session.set_deadline(tick_end);
         }
@@ -810,17 +880,24 @@ impl FocusedSession {
                 return Ok(SessionProgress::Running);
             }
         }
-        if now >= self.next_snapshot {
-            let records = if let Some(record) = self.initial_metadata.take() {
-                vec![record]
+        if scanned.is_some_and(|r| r.is_some()) || (scanned.is_none() && now >= self.next_snapshot)
+        {
+            let owned_records;
+            let records = if let Some(Some(records)) = scanned {
+                records
             } else {
-                let snapshot = self
-                    .scanner
-                    .snapshot_for(tick_end.saturating_duration_since(Instant::now()));
-                if !snapshot.gaps.is_empty() {
-                    self.inventory_gaps = self.inventory_gaps.saturating_add(1);
-                }
-                snapshot.processes
+                owned_records = if let Some(record) = self.initial_metadata.take() {
+                    vec![record]
+                } else {
+                    let snapshot = self
+                        .scanner
+                        .snapshot_for(tick_end.saturating_duration_since(Instant::now()));
+                    if !snapshot.gaps.is_empty() {
+                        self.inventory_gaps = self.inventory_gaps.saturating_add(1);
+                    }
+                    snapshot.processes
+                };
+                &owned_records
             };
             if !records.iter().any(|p| {
                 p.pid == self.pid
@@ -844,7 +921,7 @@ impl FocusedSession {
                 });
             }
             if let Some(s) = &mut self.session {
-                let batch = s.reconcile_records(&records);
+                let batch = s.reconcile_records(records);
                 self.apply_batch(batch, tick_end, cancel)?;
             }
             self.next_snapshot = Instant::now() + RESCAN;
@@ -878,6 +955,26 @@ impl FocusedSession {
             }
         }
         Ok(SessionProgress::Running)
+    }
+    /// Fence active counting before another member's final output can block.
+    pub(crate) fn stop_admission(&mut self, cancel: &AtomicBool) {
+        self.signal_cut |= cancel.load(Ordering::Relaxed);
+        self.pending = None;
+        if let Some(counter) = &mut self.counter {
+            counter.retire();
+        }
+        if let Some(session) = &mut self.session {
+            match now_ns().and_then(|cut| {
+                session
+                    .set_api_window(self.start_ns, cut.min(self.deadline_ns))
+                    .map_err(|_| anyhow::anyhow!("API admission stop failed"))
+            }) {
+                Ok(()) => (),
+                Err(_) => {
+                    self.gaps.insert(ObservationGap::AttachFailed);
+                }
+            }
+        }
     }
     pub(crate) fn finish(mut self, deadline: Instant) -> anyhow::Result<FocusedResult> {
         self.pending = None;
@@ -1004,6 +1101,43 @@ mod session_tests {
         })
         .processes
         .remove(0)
+    }
+    #[test]
+    fn scanned_session_clips_kernel_window_and_uses_fresh_incarnation() {
+        let expected = record();
+        let objects = objects();
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let lease = pool
+            .reserve(FocusedSession::reservation_bytes(&objects).unwrap())
+            .unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open_scanned_reserved(
+            FocusedConfig::default(),
+            objects,
+            (end, end),
+            &cancel,
+            &expected,
+            lease,
+        )
+        .unwrap();
+        assert!(session.end <= end);
+        assert!(session.deadline_ns - session.start_ns <= 2_000_000_000);
+        assert_eq!(
+            session
+                .poll_scanned(Instant::now(), end, &cancel, None, false)
+                .unwrap(),
+            SessionProgress::Running
+        );
+        let mut replacement = expected;
+        replacement.starttime += 1;
+        assert_eq!(
+            session
+                .poll_scanned(Instant::now(), end, &cancel, Some(&[replacement]), false)
+                .unwrap(),
+            SessionProgress::Unverifiable
+        );
+        assert!(session.gaps.contains(&ObservationGap::ProcessChanged));
     }
     #[test]
     fn session_reservation_precedes_open_and_shares_parser_headroom() {

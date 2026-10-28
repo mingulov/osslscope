@@ -3,7 +3,8 @@
 
 Discover OpenSSL-compatible libraries, provider modules and consumers, then
 observe public provider interfaces and count entries at learned callback sites
-for one selected process. Normal workflows need no enrolled library profile,
+for selected processes or automatically discovered watched scopes. Normal workflows
+need no enrolled library profile,
 manual offsets or application changes.
 
 **v0.3.0 released discovery preview.** The
@@ -22,6 +23,7 @@ Use actual host-visible PIDs and file paths:
 ```sh
 osslscope scan --json
 osslscope scan --watch --interval 1 --duration 30 --json
+osslscope scan --watch --observe-crypto --duration 30 --json
 osslscope scan --cgroup /sys/fs/cgroup/example.service --json
 osslscope inspect --pid 1234 --json
 osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
@@ -33,8 +35,10 @@ osslscope check --pid 1234 --duration 30 --require-executed SHA256
 Scan/watch narrows PID, cgroup and supplied-module selectors by intersection.
 For [Docker/kind](docs/usage.md#host-side-container-workflows), independently
 resolve the workload in host PID/cgroup coordinates, inventory it, then pass
-one selected PID to report/check. Execution documents cover one process
-incarnation and its threads; they do not follow children or cgroup membership.
+one selected PID to report/check, or watch the scope with `--observe-crypto`.
+Report/check cover one process incarnation and its threads. Crypto watch streams
+separate per-incarnation documents as eligible processes enter and leave the
+sampled scope; it never creates a cross-process aggregate.
 
 Passive discovery uses ordinary procfs/filesystem access and loads no supplied
 module. Add `--observe-providers` to a PID scan/watch or PID inspection for

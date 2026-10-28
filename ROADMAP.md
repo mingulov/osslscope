@@ -24,16 +24,17 @@ query driver. SHA/AES examples are regression cases, not an algorithm whitelist.
   exported API activity and callback counts. Preserve their different evidence
   levels and shared-site ambiguity; static candidates do not prove activation.
 - Automatically prearm verified dependency candidates for owned runs and handle
-  warm processes/late objects. Add bounded discovery-to-observation watch for
-  selected PID/cgroup or visible-host scopes, with explicit membership/resource
-  gaps. No universal first-call or lossless following promise.
+  warm processes/late objects. Source now includes `scan --watch --observe-crypto`
+  for PID/cgroup/module or visible-host scopes, separate per-incarnation v2.4
+  documents, retained passive inventory and explicit membership/resource gaps.
+  No universal first-call or lossless following promise.
 - Show readable candidate hints even when coverage is Unknown. Preserve strict
   policy/CBOM semantics; API calls do not become provider execution proof.
 - Qualify the real installed command path on independent stock builds, ordinary
   workloads across multiple crypto families and available supported kernels;
   measure actual tracing cost separately from passive inventory.
 
-This is planned work. Public-table recovery needs production false-positive,
+This milestone remains unreleased. Public-table recovery needs production false-positive,
 relocation and safe-attachment controls; experiments are not release acceptance.
 Feature completion and truthful runtime checks decide readiness, not a fixed
 date or a fallback to a small enrolled-algorithm release.

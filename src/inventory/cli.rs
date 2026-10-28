@@ -14,19 +14,26 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
+const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
 
-struct Options {
-    pids: Vec<u32>,
-    modules: Vec<PathBuf>,
-    cgroup: Option<PathBuf>,
-    json: bool,
-    watch: bool,
-    interval: Option<Duration>,
-    duration: Option<Duration>,
+pub(crate) struct Options {
+    pub(crate) pids: Vec<u32>,
+    pub(crate) modules: Vec<PathBuf>,
+    pub(crate) cgroup: Option<PathBuf>,
+    pub(crate) json: bool,
+    pub(crate) watch: bool,
+    pub(crate) interval: Option<Duration>,
+    pub(crate) duration: Option<Duration>,
 }
-fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
+pub(crate) fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
+    parse_inner(command, args, false)
+}
+pub(crate) fn parse_crypto_watch(args: &[String]) -> Result<Options, ()> {
+    parse_inner("scan", args, true)
+}
+fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Options, ()> {
+    let mut crypto = false;
     let mut options = Options {
         pids: Vec::new(),
         modules: Vec::new(),
@@ -40,6 +47,7 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" if !options.json => options.json = true,
+            "--observe-crypto" if allow_crypto && !crypto => crypto = true,
             "--watch" if command == "scan" && !options.watch => options.watch = true,
             "--interval" if command == "scan" && options.interval.is_none() => {
                 options.interval = Some(seconds(args.next().ok_or(())?, true)?);
@@ -74,6 +82,9 @@ fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
             }
             _ => return Err(()),
         }
+    }
+    if allow_crypto && (!crypto || !options.watch) {
+        return Err(());
     }
     if !options.watch && (options.interval.is_some() || options.duration.is_some()) {
         return Err(());

@@ -14,6 +14,9 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             crate::doctor::profiled::run(&argv[1..])
         }
         "doctor" => crate::doctor::focused::run(&argv[1..]),
+        "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-crypto") => {
+            crate::crypto_watch::run(&argv)
+        }
         "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-providers") => {
             crate::provider_observation::cli::run(&argv)
         }
@@ -37,6 +40,9 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             );
             println!(
                 "  scan/inspect  passive process/module discovery; no profile or BPF required"
+            );
+            println!(
+                "  scan --watch --observe-crypto  observe discovered scope members separately"
             );
             println!("  --observe-providers  public provider API observation (default 30 seconds)");
             println!("  doctor --discovery  capability checks without a build catalogue");

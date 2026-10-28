@@ -205,6 +205,7 @@ impl From<&Metadata> for Fingerprint {
     }
 }
 struct Cached {
+    _memory: Option<crate::observation_memory::MemoryLease>,
     // Keep the inode alive across reuse; an inode number cannot be recycled
     // underneath this cache simply because a mapped pathname was unlinked.
     file: File,
@@ -216,10 +217,12 @@ struct Cached {
 #[derive(Default)]
 pub(super) struct ScanState {
     pub(super) memory: Option<crate::observation_memory::MemoryPool>,
+    pub(super) records_memory: Vec<crate::observation_memory::MemoryLease>,
     cache: BTreeMap<Fingerprint, Cached>,
     cursor: Option<u32>,
 }
 struct Work<'a> {
+    records_memory: Vec<crate::observation_memory::MemoryLease>,
     memory: Option<crate::observation_memory::MemoryPool>,
     options: &'a SnapshotOptions,
     include_other: bool,
@@ -228,7 +231,29 @@ struct Work<'a> {
     gaps: BTreeSet<Gap>,
     cache: BTreeMap<Fingerprint, Cached>,
 }
+struct ReadBuffer {
+    bytes: Vec<u8>,
+    _memory: Vec<crate::observation_memory::MemoryLease>,
+}
+impl std::ops::Deref for ReadBuffer {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+impl PartialEq for ReadBuffer {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
 impl Work<'_> {
+    fn reserve_record(&mut self, bytes: usize) -> Result<(), GapReason> {
+        if let Some(pool) = &self.memory {
+            self.records_memory
+                .push(pool.reserve(bytes + 64).ok_or(GapReason::ReadLimit)?);
+        }
+        Ok(())
+    }
     fn deadline(&self) -> Result<(), GapReason> {
         if self.started.elapsed() >= self.options.limits.timeout {
             Err(GapReason::Deadline)
@@ -237,6 +262,15 @@ impl Work<'_> {
         }
     }
     fn gap(&mut self, pid: Option<u32>, mapping: Option<&Mapping<'_>>, reason: GapReason) {
+        if self.reserve_record(256).is_err() {
+            self.gaps.insert(Gap {
+                pid: None,
+                device: None,
+                inode: None,
+                reason: GapReason::ReadLimit,
+            });
+            return;
+        }
         self.gaps.insert(Gap {
             pid,
             device: mapping.map(|m| m.device),
@@ -250,8 +284,9 @@ impl Work<'_> {
             .max_read_bytes
             .saturating_sub(self.totals.read_bytes)
     }
-    fn read(&mut self, mut file: File, maximum: usize) -> Result<Vec<u8>, GapReason> {
+    fn read(&mut self, mut file: File, maximum: usize) -> Result<ReadBuffer, GapReason> {
         let mut bytes = Vec::new();
+        let mut leases = Vec::new();
         let mut chunk = [0u8; 8192];
         loop {
             self.deadline()?;
@@ -269,12 +304,20 @@ impl Work<'_> {
                 .map_err(|_| GapReason::Unavailable)?;
             self.totals.read_bytes += read as u64;
             if read == 0 {
-                return Ok(bytes);
+                return Ok(ReadBuffer {
+                    bytes,
+                    _memory: leases,
+                });
             }
             if read > maximum.saturating_sub(bytes.len()) {
                 return Err(GapReason::ReadLimit);
             }
-            bytes.try_reserve(read).map_err(|_| GapReason::ReadLimit)?;
+            if let Some(pool) = &self.memory {
+                leases.push(pool.reserve(read * 2 + 64).ok_or(GapReason::ReadLimit)?);
+            }
+            bytes
+                .try_reserve_exact(read)
+                .map_err(|_| GapReason::ReadLimit)?;
             bytes.extend_from_slice(&chunk[..read]);
         }
     }
@@ -302,6 +345,11 @@ impl Work<'_> {
         self.totals.objects_inspected += 1;
         // An object growing between our admission and the ELF inspector's
         // fstat must never read beyond the aggregate work already charged.
+        let lease = self
+            .memory
+            .as_ref()
+            .map(|pool| pool.reserve(2048).ok_or(GapReason::ReadLimit))
+            .transpose()?;
         let result = elf::inspect_file_budgeted(&mut file, metadata.len(), self.memory.as_ref());
         self.deadline()?;
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
@@ -322,6 +370,7 @@ impl Work<'_> {
         self.cache.insert(
             fingerprint,
             Cached {
+                _memory: lease,
                 file,
                 info: result.clone(),
                 seen: true,
@@ -404,6 +453,7 @@ fn backing(
 
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     let clock = CaptureClock::start();
+    work.reserve_record(1024)?;
     let process = Process::open(pid, work)?;
     let namespace = |name: &[u8]| {
         open_at(&process.directory, name).ok().and_then(|f| {
@@ -470,6 +520,9 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         if identity_status == IdentityStatus::Verified && verified.contains(&fingerprint) {
             continue;
         }
+        // Charge metadata, vector growth and temporary fingerprint/set copies
+        // before cloning cached or newly inspected module metadata.
+        work.reserve_record(2048)?;
         match work.inspect(file, &metadata) {
             Ok(info) if work.include_other || info.kind != ObjectKind::Other => modules.push((
                 ModuleRecord {
@@ -572,6 +625,7 @@ pub(super) fn snapshot_reused(
     include_other: bool,
     state: &mut ScanState,
 ) -> Snapshot {
+    state.records_memory.clear();
     let clock = CaptureClock::start();
     let started = Instant::now();
     let mut cache = std::mem::take(&mut state.cache);
@@ -587,6 +641,7 @@ pub(super) fn snapshot_reused(
         cache.pop_first();
     }
     let mut work = Work {
+        records_memory: Vec::new(),
         memory: state.memory.clone(),
         include_other,
         options,
@@ -598,10 +653,15 @@ pub(super) fn snapshot_reused(
     // Keep at most two bounded prefixes while enumerating: the next PIDs
     // above the previous cursor, then wrap. Enumerating itself is deadline
     // bounded, so reaching an admission cap never permanently hides high PIDs.
+    let pid_memory = work.reserve_record(options.limits.max_pids.saturating_mul(160));
     let mut above = BTreeSet::new();
     let mut wrapped = BTreeSet::new();
     let mut overflow = false;
     let mut admit = |pid, work: &mut Work<'_>| {
+        if let Err(reason) = pid_memory {
+            work.gap(None, None, reason);
+            return false;
+        }
         if let Err(reason) = work.deadline() {
             work.gap(None, None, reason);
             return false;
@@ -668,6 +728,7 @@ pub(super) fn snapshot_reused(
                 .is_ok_and(|m| Fingerprint::from(&m) == *key)
     });
     state.cache = std::mem::take(&mut work.cache);
+    state.records_memory = std::mem::take(&mut work.records_memory);
     let inventory = if work.gaps.is_empty() {
         InventoryState::Complete
     } else if processes.is_empty() {
@@ -747,6 +808,7 @@ mod tests {
             },
         };
         let mut work = Work {
+            records_memory: Vec::new(),
             memory: None,
             options: &options,
             include_other: false,
@@ -798,6 +860,7 @@ mod tests {
         let metadata = writer.metadata().unwrap();
         let options = SnapshotOptions::default();
         let mut work = Work {
+            records_memory: Vec::new(),
             memory: None,
             options: &options,
             include_other: false,
@@ -816,6 +879,7 @@ mod tests {
             Err(GapReason::Changed)
         );
         let mut fresh = Work {
+            records_memory: Vec::new(),
             memory: None,
             options: &options,
             include_other: false,

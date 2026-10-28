@@ -7,6 +7,7 @@ pub(crate) struct MemoryPool(Rc<State>);
 struct State {
     limit: usize,
     used: Cell<usize>,
+    peak: Cell<usize>,
 }
 pub(crate) struct MemoryLease {
     pool: MemoryPool,
@@ -17,7 +18,11 @@ impl MemoryPool {
         Self(Rc::new(State {
             limit,
             used: Cell::new(0),
+            peak: Cell::new(0),
         }))
+    }
+    pub(crate) fn peak(&self) -> usize {
+        self.0.peak.get()
     }
     pub(crate) fn reserve(&self, bytes: usize) -> Option<MemoryLease> {
         let next = self.0.used.get().checked_add(bytes)?;
@@ -25,6 +30,7 @@ impl MemoryPool {
             return None;
         }
         self.0.used.set(next);
+        self.0.peak.set(self.0.peak.get().max(next));
         Some(MemoryLease {
             pool: self.clone(),
             bytes,

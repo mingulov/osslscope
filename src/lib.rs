@@ -47,3 +47,5 @@ pub(crate) mod observation_memory;
 pub(crate) mod startup_objects;
 
 pub mod api_activity;
+
+pub mod crypto_watch;

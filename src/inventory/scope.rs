@@ -57,6 +57,13 @@ pub struct ScopedScanner {
 }
 impl ScopedScanner {
     pub fn new(selection: Selection, limits: Limits) -> Result<Self, GapReason> {
+        Self::new_budgeted(selection, limits, None)
+    }
+    pub(crate) fn new_budgeted(
+        selection: Selection,
+        limits: Limits,
+        memory: Option<crate::observation_memory::MemoryPool>,
+    ) -> Result<Self, GapReason> {
         let count = usize::from(!selection.pids.is_empty())
             + usize::from(selection.cgroup.is_some())
             + usize::from(!selection.modules.is_empty());
@@ -71,6 +78,7 @@ impl ScopedScanner {
             return Err(GapReason::ObjectLimit);
         }
         let mut budget = Budget::new(&limits);
+        budget.memory = memory.clone();
         let cgroup = selection
             .cgroup
             .map(|path| {
@@ -109,7 +117,7 @@ impl ScopedScanner {
                 continue;
             }
             budget.charge(metadata.len().checked_add(1).ok_or(GapReason::ReadLimit)?)?;
-            let info = elf::inspect_file(&mut file, metadata.len())?;
+            let info = elf::inspect_file_budgeted(&mut file, metadata.len(), memory.as_ref())?;
             budget.deadline()?;
             if file.metadata().map(|m| fingerprint(&m)).ok() != Some(key) {
                 return Err(GapReason::Changed);
@@ -136,7 +144,11 @@ impl ScopedScanner {
             limits,
             scope,
             record,
-            scan_state: procfs::ScanState::default(),
+            scan_state: {
+                let mut state = procfs::ScanState::default();
+                state.memory = memory;
+                state
+            },
         })
     }
 
@@ -151,9 +163,26 @@ impl ScopedScanner {
         snapshot
     }
 
+    pub(crate) fn observation_snapshot_for(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> ObservationSnapshot {
+        let original = self.limits.timeout;
+        self.limits.timeout = original.min(timeout);
+        let snapshot = self.snapshot_inner(true);
+        self.limits.timeout = original;
+        ObservationSnapshot {
+            snapshot,
+            _memory: std::mem::take(&mut self.scan_state.records_memory),
+        }
+    }
     pub fn snapshot(&mut self) -> Snapshot {
+        self.snapshot_inner(false)
+    }
+    fn snapshot_inner(&mut self, full: bool) -> Snapshot {
         let clock = CaptureClock::start();
         let mut budget = Budget::new(&self.limits);
+        budget.memory = self.scan_state.memory.clone();
         let valid = self
             .modules
             .iter()
@@ -242,10 +271,14 @@ impl ScopedScanner {
         }
         if !self.modules.is_empty() {
             let hashes: BTreeSet<_> = self.record.modules.iter().collect();
-            for process in &mut result.processes {
-                process.modules.retain(|m| hashes.contains(&m.info.sha256));
+            result
+                .processes
+                .retain(|p| p.modules.iter().any(|m| hashes.contains(&m.info.sha256)));
+            if !full {
+                for process in &mut result.processes {
+                    process.modules.retain(|m| hashes.contains(&m.info.sha256));
+                }
             }
-            result.processes.retain(|p| !p.modules.is_empty());
             let matched: BTreeSet<_> = result.processes.iter().map(|p| p.pid).collect();
             result.selected_pids.retain(|pid| matched.contains(pid));
         }
@@ -305,7 +338,13 @@ fn add_gap(result: &mut Snapshot, reason: GapReason) {
     result.gaps.sort();
     result.gaps.dedup();
 }
+pub(crate) struct ObservationSnapshot {
+    pub(crate) snapshot: Snapshot,
+    _memory: Vec<crate::observation_memory::MemoryLease>,
+}
 struct Budget<'a> {
+    memory: Option<crate::observation_memory::MemoryPool>,
+    leases: Vec<crate::observation_memory::MemoryLease>,
     limits: &'a Limits,
     started: Instant,
     bytes: u64,
@@ -316,6 +355,8 @@ impl<'a> Budget<'a> {
     fn new(limits: &'a Limits) -> Self {
         Self {
             limits,
+            memory: None,
+            leases: Vec::new(),
             started: Instant::now(),
             bytes: 0,
             membership_bytes: 0,
@@ -327,6 +368,7 @@ impl<'a> Budget<'a> {
         if self.directory_visits >= 4096 {
             return Err(GapReason::CgroupLimit);
         }
+        self.reserve(2048)?;
         self.directory_visits += 1;
         Ok(())
     }
@@ -336,6 +378,13 @@ impl<'a> Budget<'a> {
         } else {
             Ok(())
         }
+    }
+    fn reserve(&mut self, bytes: usize) -> Result<(), GapReason> {
+        if let Some(pool) = &self.memory {
+            self.leases
+                .push(pool.reserve(bytes + 64).ok_or(GapReason::ReadLimit)?);
+        }
+        Ok(())
     }
     fn charge(&mut self, count: u64) -> Result<(), GapReason> {
         if count > self.limits.max_read_bytes.saturating_sub(self.bytes) {
@@ -387,6 +436,12 @@ impl<'a> Budget<'a> {
             if n > maximum.saturating_sub(bytes.len()) {
                 return Err(GapReason::CgroupLimit);
             }
+            // Cover the buffer plus all membership/tree copies produced from
+            // these bytes through both membership samples and reconciliation.
+            self.reserve(n.saturating_mul(if membership { 256 } else { 2 }))?;
+            bytes
+                .try_reserve_exact(n)
+                .map_err(|_| GapReason::ReadLimit)?;
             bytes.extend_from_slice(&chunk[..n]);
         }
     }
@@ -702,5 +757,60 @@ mod tests {
             (second, BTreeSet::from([4, 6])),
         ]);
         assert_eq!(stable_members(&before, &after), BTreeSet::from([3]));
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+    #[test]
+    fn pooled_selector_cannot_parse_without_scratch_and_full_snapshot_keeps_other_modules() {
+        let path = std::fs::canonicalize("/usr/bin/openssl").unwrap();
+        let selection = Selection {
+            modules: vec![path.clone()],
+            ..Default::default()
+        };
+        assert!(matches!(
+            ScopedScanner::new_budgeted(
+                selection.clone(),
+                Limits::default(),
+                Some(crate::observation_memory::MemoryPool::new(0))
+            ),
+            Err(GapReason::ReadLimit)
+        ));
+        let mut child = std::process::Command::new(&path)
+            .args([
+                "speed", "-elapsed", "-seconds", "20", "-evp", "SHA512", "-bytes", "64",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let mut scanner = ScopedScanner::new_budgeted(
+            Selection {
+                pids: vec![child.id()],
+                ..selection
+            },
+            Limits::default(),
+            Some(pool.clone()),
+        )
+        .unwrap();
+        let passive = scanner.snapshot();
+        let full = scanner.observation_snapshot_for(std::time::Duration::from_secs(10));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(passive.processes.len(), 1);
+        assert_eq!(full.snapshot.processes.len(), 1);
+        assert_eq!(passive.processes[0].modules.len(), 1);
+        assert!(full.snapshot.processes[0].modules.len() > 1);
+        drop(scanner);
+        assert!(
+            pool.reserve(256 << 20).is_none(),
+            "snapshot retains its accounting after scanner destruction"
+        );
+        drop(full);
+        assert!(pool.reserve(256 << 20).is_some());
     }
 }
