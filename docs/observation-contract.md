@@ -35,3 +35,21 @@ argument reads. Forwarded public query visibility does not by itself prove
 which algorithm produced a callback entry, establish definite algorithm
 attribution, or qualify a COMPLETE observation window. Existing partial
 coverage and attribution limits still apply.
+
+For an owned process held before exec, independently exported provider load,
+try-load, unload, built-in registration, init, query, unquery and dispatch-getter
+roles can be armed on retained startup files alongside scalar operational APIs.
+All public roles participate in collision refusal; fetch stays mapped-only.
+Startup metadata uses the same reviewed public ABI and finite read allowlist.
+It grants no executable address ranges. Algorithm advertisements can therefore
+be observed while callback/code relocation is explicitly refused.
+
+The first independently validated mapped authority adopts matching startup
+links, cookies, generation and pending event sequences. It retains original
+held-process custody and does not renew an invalidated advertisement lease.
+Already queued startup records can also be drained after the original owned
+process exits, bound to its retained pidfd, cookie, generation and unchanged
+file. This historical drain grants no new attachment or relocation authority;
+unavailable current process/namespace checks and prior losses remain explicit.
+Neither startup nor historical metadata establishes execution-backed algorithm
+attribution or a COMPLETE window.

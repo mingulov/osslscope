@@ -230,6 +230,25 @@ pub enum ObservationApi {
     ProviderUnqueryCallback,
 }
 impl ObservationApi {
+    pub(crate) fn startup_supported(self) -> bool {
+        use inventory::Api::*;
+        matches!(
+            self,
+            Self::Operational(_)
+                | Self::OsslProviderUnqueryOperation
+                | Self::Inventoried(
+                    OsslProviderInit
+                        | OsslProviderLoad
+                        | OsslProviderTryLoad
+                        | OsslProviderUnload
+                        | OsslProviderLoadEx
+                        | OsslProviderTryLoadEx
+                        | OsslProviderAddBuiltin
+                        | OsslProviderGet0Dispatch
+                        | OsslProviderQueryOperation
+                )
+        )
+    }
     pub fn export_name(self) -> Option<&'static str> {
         use inventory::Api::*;
         Some(match self {

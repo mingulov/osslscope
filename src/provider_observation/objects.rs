@@ -218,7 +218,7 @@ impl SiteCustody {
 }
 /// Sealed by the held OwnedTarget constructor. Exec is allowed, but PID and
 /// namespace changes are not. Static shapes mint entry-only sites; separately
-/// validated operational exports can mint scalar-only startup capabilities.
+/// validated public exports can mint their existing typed ABI capabilities.
 pub(crate) struct StartupProcess {
     original: crate::pin::StartupGroupRetention,
     directory: File,
@@ -267,7 +267,7 @@ impl StartupProcess {
     }
 }
 /// Retain and parse the exact file already opened by bounded dependency discovery.
-/// Operational capabilities require an independently validated public export.
+/// Typed capabilities require an independently validated public export.
 pub(crate) fn startup_candidates(
     process: Rc<StartupProcess>,
     file: File,
@@ -291,29 +291,32 @@ pub(crate) fn startup_candidates(
     });
     let parsed = object.parsed(budget)?;
     let mut apis = Vec::new();
+    let mut conflict = false;
     for &(api, offset) in &parsed.exports {
-        if let ObservationApi::Operational(api) = api {
-            // Consider all public roles, including legacy target-reading APIs,
-            // before minting even a scalar-only startup capability.
-            if parsed
-                .exports
-                .iter()
-                .any(|&(other, at)| at == offset && other != ObservationApi::Operational(api))
-            {
-                continue;
-            }
-            budget.state(256)?;
-            apis.push(StartupApiSite {
-                api,
-                site: VerifiedSite {
-                    custody: SiteCustody::Startup(process.clone()),
-                    object: object.clone(),
-                    offset,
-                    generation: process.generation,
-                    hash: parsed.hash.clone(),
-                },
-            });
+        // Fetch remains mapped-only. All exported roles still arbitrate collisions
+        // before granting any signature, including a scalar operational role.
+        if parsed
+            .exports
+            .iter()
+            .any(|&(other, at)| at == offset && other != api)
+        {
+            conflict = true;
+            continue;
         }
+        if !api.startup_supported() {
+            continue;
+        }
+        budget.state(256)?;
+        apis.push(StartupApiSite {
+            api,
+            site: VerifiedSite {
+                custody: SiteCustody::Startup(process.clone()),
+                object: object.clone(),
+                offset,
+                generation: process.generation,
+                hash: parsed.hash.clone(),
+            },
+        });
     }
     let tables =
         static_tables::discover_tables_budgeted(&object.file, TableLimits::default(), budget)
@@ -345,7 +348,7 @@ pub(crate) fn startup_candidates(
     }
     object.unchanged()?;
     process.validate()?;
-    Ok((candidates, apis, !tables.gaps().is_empty()))
+    Ok((candidates, apis, conflict || !tables.gaps().is_empty()))
 }
 
 /// Explicit privileged event operand, never a transport value.
@@ -415,6 +418,43 @@ impl VerifiedSite {
     pub fn object_hash(&self) -> &ObjectHash {
         &self.hash
     }
+    /// Existing queued records only. A terminal original pidfd cannot authorize
+    /// new links, reads or mapped relocation. Missing post-exit proc metadata is
+    /// uncertainty, never a successful current namespace validation.
+    pub(crate) fn revalidate_queued(&self) -> Result<bool, ObservationGap> {
+        let SiteCustody::Startup(original) = &self.custody else {
+            self.revalidate_object()?;
+            return Ok(false);
+        };
+        let mut pfd = libc::pollfd {
+            fd: original.original.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+        if ready < 0
+            || pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+            || ready > 0 && pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0
+        {
+            return Err(ObservationGap::ProcessUnavailable);
+        }
+        if ready == 0 {
+            self.revalidate_object()?;
+            return Ok(false);
+        }
+        if let Ok(current) = starttime(&original.directory) {
+            if current != original.starttime {
+                return Err(ObservationGap::ProcessChanged);
+            }
+        }
+        if let Ok(current) = namespaces(&original.directory) {
+            if current != original.namespaces {
+                return Err(ObservationGap::NamespaceChanged);
+            }
+        }
+        self.object.unchanged()?;
+        Ok(true)
+    }
     pub fn revalidate_object(&self) -> Result<(), ObservationGap> {
         self.custody.validate()?;
         self.object.unchanged()
@@ -470,11 +510,11 @@ impl VerifiedStaticCandidate {
 }
 /// Only retained ELF public-export validation can construct this capability.
 pub(crate) struct StartupApiSite {
-    api: crate::api_activity::ApiId,
+    api: ObservationApi,
     site: VerifiedSite,
 }
 impl StartupApiSite {
-    pub(crate) fn into_parts(self) -> (crate::api_activity::ApiId, VerifiedSite) {
+    pub(crate) fn into_parts(self) -> (ObservationApi, VerifiedSite) {
         (self.api, self.site)
     }
 }
@@ -2008,3 +2048,53 @@ mod tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "forwarder_tests.rs"]
 mod forwarder_tests;
+
+/// Host fixtures supply the descriptor that privileged map_files acquisition
+/// normally opens. Actual process, maps, inode, stamp and ELF checks still run;
+/// this utility grants no production acquisition fallback.
+#[cfg(test)]
+pub(super) mod fixture_support {
+    use super::*;
+    pub fn mapped_process(
+        record: &ProcessRecord,
+        file: File,
+        budget: &ObservationBudget,
+    ) -> VerifiedProcess {
+        let process = acquire_incarnation(record).unwrap().0;
+        let maps = Rc::new(read_at(&process.directory, b"maps", MAX_MAPS).unwrap());
+        let metadata = file.metadata().unwrap();
+        let expected =
+            inventory::elf::inspect_file(&mut file.try_clone().unwrap(), u64::MAX).unwrap();
+        let object = Rc::new(Object {
+            file,
+            stamp: Stamp::of(&metadata),
+            expected: Some(expected),
+            parsed: OnceCell::new(),
+            tables: OnceCell::new(),
+            parse_deferred: Cell::new(false),
+        });
+        let mappings: Vec<_> = maps
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| parse_mapping(line).unwrap())
+            .filter(|map| association(&object.file, &metadata, map))
+            .map(|map| (map, object.clone()))
+            .collect();
+        assert!(
+            !mappings.is_empty(),
+            "fixture descriptor must match actual executable mappings"
+        );
+        let verified = VerifiedProcess {
+            process,
+            maps,
+            mappings,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+            budget: budget.clone(),
+            gaps: RefCell::default(),
+            static_discovery: RefCell::default(),
+            refused_inventory: Vec::new(),
+        };
+        verified.revalidate().unwrap();
+        verified
+    }
+}

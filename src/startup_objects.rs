@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded pre-exec file discovery. Predictions are never mapped authority or a
-//! public ABI: only retained-file, original-owned-group entry counters result.
+//! public ABI: static shapes grant entry counting only; independently validated
+//! public exports grant their existing typed ABI under original-owned custody.
 use crate::{
     provider_observation::{
         ObservationBudget, ObservationGap,
@@ -279,6 +280,47 @@ pub(crate) fn prepare_owned_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_static_impostor_never_receives_a_metadata_signature() {
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-startup-impostor-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let path = dir.join("impostor.so");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-shared", "-fPIC", "-O2", "-Wl,-z,relro", "-o"])
+                .arg(&path)
+                .arg("tests/fixtures/static_tables.c")
+                .status()
+                .unwrap()
+                .success()
+        );
+        let child =
+            OwnedTarget::spawn_stopped(&["/bin/true".into()], crate::target::WorkloadDest::Null)
+                .unwrap();
+        let (candidates, apis, _) = objects::startup_candidates(
+            objects::StartupProcess::held(&child).unwrap(),
+            File::open(path).unwrap(),
+            &ObservationBudget::default(),
+        )
+        .unwrap();
+        assert!(
+            !candidates.is_empty(),
+            "public table-shaped fixture is a real entry-count candidate"
+        );
+        assert!(
+            apis.is_empty(),
+            "public tables and executable callbacks cannot mint any argument-reading role"
+        );
+        assert!(candidates.iter().all(|c| c.site().is_startup()));
+    }
     #[test]
     fn startup_requires_held_original_and_honors_cancel_and_deadline() {
         let argv = vec!["/bin/true".into()];

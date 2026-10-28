@@ -737,7 +737,7 @@ impl FocusedSession {
         }
         if let Some(session) = &mut session {
             if let Some(preexec) = &mut preexec {
-                if let Err(gap) = session.prearm_operational(
+                if let Err(gap) = session.prearm_startup(
                     std::mem::take(&mut preexec.apis),
                     setup_deadline,
                     cancel,

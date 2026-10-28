@@ -22,8 +22,9 @@ pub struct ForwarderFixture {
 impl ForwarderFixture {
     pub fn new(query: &str, unquery: &str) -> Self {
         let directory = std::env::temp_dir().join(format!(
-            "osslscope-forwarder-{}-{}",
+            "osslscope-forwarder-{}-{}-{}",
             std::process::id(),
+            module_path!(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&directory).unwrap();

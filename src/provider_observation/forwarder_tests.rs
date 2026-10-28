@@ -6,6 +6,99 @@ use fixture::{ForwarderFixture, OTHER, QUERY, UNQUERY};
 const NEAR: &str = ".byte 0xe9\n.long query_impl-.-4";
 const SHORT_BACK: &str = ".byte 0xeb\n.byte unquery_impl-.-1";
 
+#[test]
+fn startup_admits_typed_metadata_at_real_forwarded_sites() {
+    let f = ForwarderFixture::new(NEAR, SHORT_BACK);
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let custody = StartupProcess::held(&child).unwrap();
+    let (_, sites, _) =
+        startup_candidates(custody, f.file(), &ObservationBudget::default()).unwrap();
+    let offsets: Vec<_> = sites
+        .into_iter()
+        .map(|s| s.into_parts().1.file_offset())
+        .collect();
+    assert_eq!(
+        offsets.len(),
+        2,
+        "query/unquery public signatures must prearm before exec; fetch remains mapped-only"
+    );
+    assert!(offsets.contains(&f.offsets["query_impl"]));
+    assert!(offsets.contains(&f.offsets["unquery_impl"]));
+}
+
+#[test]
+fn startup_metadata_alias_conflict_with_any_public_role_refuses_reader() {
+    let mut f = ForwarderFixture::new(NEAR, SHORT_BACK);
+    let at = f.symbols[OTHER] + 8;
+    f.image[at..at + 8].copy_from_slice(&f.addresses[QUERY].to_le_bytes());
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let (_, sites, partial) = startup_candidates(
+        StartupProcess::held(&child).unwrap(),
+        f.file(),
+        &ObservationBudget::default(),
+    )
+    .unwrap();
+    let offsets: Vec<_> = sites
+        .into_iter()
+        .map(|s| s.into_parts().1.file_offset())
+        .collect();
+    assert_eq!(
+        offsets,
+        vec![f.offsets["unquery_impl"]],
+        "fetch alias must arbitrate even though fetch is not prearmed"
+    );
+    assert!(partial, "refused public role ambiguity must be disclosed");
+}
+
+#[test]
+fn queued_startup_authority_survives_owned_exit_but_cannot_rearm() {
+    let f = ForwarderFixture::new(NEAR, SHORT_BACK);
+    let mut child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let (_, sites, _) = startup_candidates(
+        StartupProcess::held(&child).unwrap(),
+        f.file(),
+        &ObservationBudget::default(),
+    )
+    .unwrap();
+    let (_, site) = sites.into_iter().next().unwrap().into_parts();
+    site.revalidate_object().unwrap();
+    child.release_retaining_exit().unwrap();
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while child.peek_exit().unwrap().is_none() {
+        assert!(std::time::Instant::now() < until);
+        std::thread::yield_now();
+    }
+    assert!(
+        site.revalidate_object().is_err(),
+        "queued history cannot arm a new reader"
+    );
+    assert!(
+        site.revalidate_queued().unwrap(),
+        "exact retained pidfd permits historical queued records"
+    );
+    child.finish_observation().unwrap();
+    assert!(
+        site.revalidate_queued().unwrap(),
+        "consuming wait cannot recycle retained original authority"
+    );
+    use std::os::unix::fs::PermissionsExt;
+    let path = format!("/proc/self/fd/{}", site.attachment_fd().as_raw_fd());
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(site.revalidate_queued(), Err(ObservationGap::ObjectChanged));
+}
+
 fn parsed(f: &ForwarderFixture) -> ElfObject {
     let file = f.file();
     let expected = inventory::elf::inspect_file(&mut file.try_clone().unwrap(), u64::MAX).unwrap();

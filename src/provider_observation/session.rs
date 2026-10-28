@@ -151,6 +151,21 @@ fn validate_candidate_member(member: &c::Member, generation: u64) -> Result<(), 
         Ok(())
     }
 }
+fn mapped_member(
+    previous: Option<c::Member>,
+    generation: u64,
+    ranges: usize,
+) -> Result<c::Member, ObservationGap> {
+    if let Some(member) = &previous {
+        validate_candidate_member(member, generation)?;
+    }
+    Ok(c::Member {
+        generation,
+        epoch: previous.map_or(1, |member| member.epoch),
+        range_count: ranges as u32,
+        reserved: 0,
+    })
+}
 fn reconcile_retirement_gap(
     current_starttime: Option<u64>,
     expected_starttime: u64,
@@ -170,6 +185,16 @@ fn validate_then_arm(
     arm()?;
     validate()
 }
+fn retain_and_arm(
+    startup: &mut BTreeMap<u32, Vec<Attachment>>,
+    pid: u32,
+    attachment: Attachment,
+    arm: impl FnOnce(&Attachment) -> Result<(), ObservationGap>,
+) -> Result<(), ObservationGap> {
+    let rows = startup.entry(pid).or_default();
+    rows.push(attachment);
+    arm(rows.last().unwrap())
+}
 /// Pure object ABI admission, shared with ordinary command preflight.
 pub(crate) fn prepare_object(object: &[u8]) -> Result<loader::Prepared, ObservationGap> {
     let programs = [
@@ -184,6 +209,20 @@ struct Attachment {
     cookie: u64,
     api: u32,
     advertisers: Vec<ObjectHash>,
+    generation: u64,
+    object: u64,
+    original: Option<VerifiedSite>,
+}
+impl Attachment {
+    fn adopt_site(&mut self, mapped: VerifiedSite) -> Result<(), ObservationGap> {
+        self.site.revalidate_object()?;
+        mapped.revalidate_object()?;
+        if !mapped.matches_retained(&self.site)? {
+            return Err(ObservationGap::ObjectChanged);
+        }
+        self.original = Some(std::mem::replace(&mut self.site, mapped));
+        Ok(())
+    }
 }
 #[cfg(test)]
 thread_local! { static EXPIRE_STATIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -220,6 +259,56 @@ pub struct ProviderSession {
     last_loss: [u64; 8],
     last_drain: Instant,
     closed: bool,
+}
+struct RecordBinding<'a> {
+    attachment: &'a Attachment,
+    starttime: u64,
+    process: Option<&'a VerifiedProcess>,
+}
+fn record_binding<'a>(
+    targets: &'a BTreeMap<u32, Target>,
+    startup: &'a BTreeMap<u32, Vec<Attachment>>,
+    r: &c::Record,
+) -> Result<Option<RecordBinding<'a>>, ObservationGap> {
+    if let Some(target) = targets.get(&r.pid).filter(|t| t.generation == r.generation) {
+        if let Some(attachment) = target
+            .attachments
+            .iter()
+            .find(|a| a.cookie == r.cookie && a.api == r.api && a.generation == r.generation)
+        {
+            return Ok(Some(RecordBinding {
+                attachment,
+                starttime: target.starttime,
+                process: Some(&target.process),
+            }));
+        }
+    }
+    // During partial first adoption some physical pairs are already mapped and
+    // others are still retained startup authorities. Never hide either half.
+    if let Some(rows) = startup.get(&r.pid) {
+        if let Some(attachment) = rows.iter().find(|a| {
+            a.cookie == r.cookie
+                && a.api == r.api
+                && a.generation == r.generation
+                && a.site.pid() == r.pid
+        }) {
+            return Ok(Some(RecordBinding {
+                attachment,
+                starttime: attachment.site.starttime(),
+                process: None,
+            }));
+        }
+        if rows.iter().any(|a| a.generation == r.generation) {
+            return Err(ObservationGap::InvalidWire);
+        }
+    }
+    if targets
+        .get(&r.pid)
+        .is_some_and(|t| t.generation == r.generation)
+    {
+        return Err(ObservationGap::InvalidWire);
+    }
+    Ok(None)
 }
 fn map_data(loaded: &loader::Loaded, name: &str) -> Result<MapData, ObservationGap> {
     MapData::from_fd(
@@ -417,6 +506,7 @@ impl ProviderSession {
         site: VerifiedSite,
         advertisers: Vec<ObjectHash>,
         existing: usize,
+        generation: u64,
     ) -> Result<Attachment, ObservationGap> {
         if self.link_count() + existing + 2 > self.budget.limits.max_links {
             return Err(ObservationGap::LinkLimit);
@@ -478,6 +568,9 @@ impl ProviderSession {
                 self.api_owners.insert(cookie, (pid, site.starttime(), api));
             }
             Ok(Attachment {
+                object: object_id(&site),
+                generation,
+                original: None,
                 links,
                 site,
                 cookie,
@@ -585,7 +678,12 @@ impl ProviderSession {
             }
             match self.add_target(record, &mut b) {
                 Ok(()) => {}
-                Err(g) => b.gap(g),
+                Err(g) => {
+                    if identity_failure(g) {
+                        self.retire(record.pid, &mut b);
+                    }
+                    b.gap(g);
+                }
             }
         }
         b.gap(ObservationGap::IntervalUnknown);
@@ -609,7 +707,7 @@ impl ProviderSession {
             };
             self.refreshing.remove(&record.pid);
             // Only the first mapped adoption of the original held incarnation
-            // may retain its scalar epoch. Real retirement/remapping allocates a
+            // may retain its observation generation. Real retirement/remapping allocates a
             // fresh generation and fresh cookies as before.
             let generation = if let Some(startup) = self
                 .startup
@@ -713,19 +811,16 @@ impl ProviderSession {
                 }) {
                     let mut a = self.startup.get_mut(&pid).unwrap().swap_remove(index);
                     let adopt = (|| {
-                        a.site.revalidate_object()?;
-                        resolved.site.revalidate_object()?;
-                        if a.site.object_hash() != resolved.site.object_hash() {
-                            return Err(ObservationGap::ObjectChanged);
-                        }
-                        a.site = resolved.site;
+                        a.adopt_site(resolved.site)?;
                         arm_attachment(&mut self.config, &target.process, &a, pid, generation)
                     })();
+                    target.attachments.push(a);
                     if let Err(gap) = adopt {
-                        let _ = self.config.remove(&a.cookie);
+                        let _ = self
+                            .config
+                            .remove(&target.attachments.last().unwrap().cookie);
                         return Err(gap);
                     }
-                    target.attachments.push(a);
                     continue;
                 }
                 let advertisers = if id == c::PROVIDER_INIT {
@@ -739,6 +834,7 @@ impl ProviderSession {
                     resolved.site,
                     advertisers,
                     target.attachments.len() * 2,
+                    generation,
                 ) {
                     Ok(a) => {
                         arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
@@ -763,17 +859,13 @@ impl ProviderSession {
             if target.attachments.is_empty() && b.static_candidates.is_empty() {
                 return Err(ObservationGap::SymbolUnavailable);
             }
+            let previous = match self.members.get(&pid, 0) {
+                Ok(member) => Some(member),
+                Err(aya::maps::MapError::KeyNotFound) => None,
+                Err(_) => return Err(ObservationGap::MembershipUnknown),
+            };
             self.members
-                .insert(
-                    pid,
-                    c::Member {
-                        generation,
-                        epoch: 1,
-                        range_count: target.ranges as u32,
-                        reserved: 0,
-                    },
-                    0,
-                )
+                .insert(pid, mapped_member(previous, generation, target.ranges)?, 0)
                 .map_err(|_| ObservationGap::AttachFailed)?;
             self.retire_startup(pid);
             // The second check fences setup changes after all links and membership.
@@ -798,19 +890,6 @@ impl ProviderSession {
     }
     pub fn drain(&mut self, deadline: Instant) -> ObservationBatch {
         let mut b = ObservationBatch::default();
-        let invalid: Vec<_> = self
-            .startup
-            .iter()
-            .filter_map(|(&pid, rows)| {
-                rows.iter()
-                    .find_map(|a| a.site.revalidate_object().err())
-                    .map(|gap| (pid, gap))
-            })
-            .collect();
-        for (pid, gap) in invalid {
-            b.gap(gap);
-            self.retire(pid, &mut b);
-        }
         if self.last_drain.elapsed() > Duration::from_millis(200) {
             b.gap(ObservationGap::SnapshotLag)
         }
@@ -820,9 +899,76 @@ impl ProviderSession {
             .iter()
             .filter_map(|(&pid, t)| t.process.revalidate().err().map(|g| (pid, g)))
             .collect();
-        for (pid, g) in retired {
-            self.retire(pid, &mut b);
-            b.gap(g)
+        for (pid, gap) in retired {
+            // Only retained original startup authorities may survive an exit as
+            // historical event owners. Drop every mapped authority and range;
+            // no historical code address is relocated or attached.
+            if gap == ObservationGap::ProcessUnavailable {
+                if let Some(target) = self.targets.remove(&pid) {
+                    for mut a in target.attachments {
+                        if let Some(original) = a.original.take() {
+                            a.site = original;
+                            self.startup.entry(pid).or_default().push(a);
+                        } else {
+                            let _ = self.config.remove(&a.cookie);
+                            drop(a.links);
+                        }
+                    }
+                    for index in 0..target.ranges {
+                        let _ = self.ranges.remove(&c::RangeKey {
+                            pid,
+                            index: index as u32,
+                        });
+                    }
+                }
+                if self.startup.get(&pid).is_none_or(|rows| rows.is_empty()) {
+                    self.retire(pid, &mut b);
+                }
+            } else {
+                self.retire(pid, &mut b);
+            }
+            b.gap(gap);
+        }
+        if !self.startup.is_empty() {
+            b.gap(ObservationGap::FirstQueryUnknown);
+            b.gap(ObservationGap::SamplingPartial);
+        }
+        let mut terminal = Vec::new();
+        let validation: Vec<_> = self
+            .startup
+            .iter()
+            .map(|(&pid, rows)| {
+                let mut exited = false;
+                let result = rows.iter().try_for_each(|a| {
+                    exited |= a.site.revalidate_queued()?;
+                    Ok::<_, ObservationGap>(())
+                });
+                (pid, result.map(|()| exited))
+            })
+            .collect();
+        for (pid, result) in validation {
+            match result {
+                Err(gap) => {
+                    self.retire(pid, &mut b);
+                    b.gap(gap);
+                }
+                Ok(true) => {
+                    // Disarm now, retain link/file/cookie owners through the
+                    // bounded ring drain, then release links before files.
+                    if self.members.remove(&pid).is_err() {
+                        b.gap(ObservationGap::Invalidated);
+                    }
+                    for a in &self.startup[&pid] {
+                        if self.config.remove(&a.cookie).is_err() {
+                            b.gap(ObservationGap::Invalidated);
+                        }
+                    }
+                    terminal.push(pid);
+                    b.gap(ObservationGap::ProcessUnavailable);
+                    b.gap(ObservationGap::IntervalUnknown);
+                }
+                Ok(false) => (),
+            }
         }
         loop {
             if Instant::now() >= deadline {
@@ -873,6 +1019,10 @@ impl ProviderSession {
                 }
             }
         }
+        for pid in terminal {
+            self.retire_startup(pid);
+            self.aliases.retire(pid);
+        }
         if self.aliases.incomplete() {
             b.gap(ObservationGap::IntervalUnknown);
         }
@@ -880,38 +1030,34 @@ impl ProviderSession {
     }
     fn consume(&mut self, event: wire::Transport, b: &mut ObservationBatch) {
         let r = event.record();
-        let Some(target) = self.targets.get(&r.pid) else {
-            return;
+        let binding = match record_binding(&self.targets, &self.startup, &r) {
+            Ok(Some(binding)) => binding,
+            Ok(None) => return,
+            Err(gap) => {
+                b.gap(gap);
+                return;
+            }
         };
-        if target.generation != r.generation {
-            return;
-        }
-        let Some(attachment) = target
-            .attachments
-            .iter()
-            .find(|a| a.cookie == r.cookie && a.api == r.api)
-        else {
-            b.gap(ObservationGap::InvalidWire);
-            return;
-        };
+        let attachment = binding.attachment;
         if !self
             .roles
-            .accepts(role_site(r.pid, target.starttime, &attachment.site), r.api)
+            .accepts(role_site(r.pid, binding.starttime, &attachment.site), r.api)
         {
             b.gap(ObservationGap::AmbiguousSite);
             return;
         }
         let hash = attachment.site.object_hash().clone();
         let advertisers = attachment.advertisers.clone();
-        let starttime = target.starttime;
+        let starttime = binding.starttime;
         let Some(mut payload) = assemble_payload(event, &mut self.aliases, &self.budget, b) else {
             return;
         };
         if r.code != 0 {
-            let site = match target
-                .process
-                .relocate(TransientCodeAddress::from_kernel_event(r.code))
-            {
+            let Some(process) = binding.process else {
+                b.gap(ObservationGap::RelocationRefused);
+                return;
+            };
+            let site = match process.relocate(TransientCodeAddress::from_kernel_event(r.code)) {
                 Ok(s) => s,
                 Err(g) => {
                     b.gap(g);
@@ -1098,7 +1244,7 @@ impl ProviderSession {
             return;
         }
         let generation = target.generation;
-        match self.attach_pair(pid, api, site, advertisers, 0) {
+        match self.attach_pair(pid, api, site, advertisers, 0, generation) {
             Ok(a) => {
                 // Pair exists but CONFIG is absent: full process/maps/object
                 // validation precedes the only arm operation, and runs again after it.
@@ -1137,8 +1283,8 @@ impl ProviderSession {
             }
         }
     }
-    /// Separate sealed operational export capability: no static candidate casts.
-    pub(crate) fn prearm_operational(
+    /// Sealed public-export capability: static table shapes never grant an ABI.
+    pub(crate) fn prearm_startup(
         &mut self,
         sites: Vec<super::objects::StartupApiSite>,
         deadline: Instant,
@@ -1147,16 +1293,37 @@ impl ProviderSession {
         let mut resolved = Vec::new();
         for site in sites {
             let (api, site) = site.into_parts();
-            let id = u32::from(api);
+            let id = (1..=16)
+                .chain(20..=48)
+                .find(|&id| wire::api(id) == Ok(api))
+                .ok_or(ObservationGap::InvalidWire)?;
             let key = role_site(site.pid(), site.starttime(), &site);
             self.roles.observe(key, id, &self.budget)?;
             resolved.push((id, site));
         }
-        let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(ObservationGap::ProcessLimit)?;
+        if let Some(pid) = resolved.iter().find_map(|(api, site)| {
+            (!self
+                .roles
+                .accepts(role_site(site.pid(), site.starttime(), site), *api))
+            .then_some(site.pid())
+        }) {
+            self.retire(pid, &mut ObservationBatch::default());
+            return Err(ObservationGap::AmbiguousSite);
+        }
+        let generation = if let Some(a) = resolved
+            .first()
+            .and_then(|(_, s)| self.startup.get(&s.pid()))
+            .and_then(|rows| rows.first())
+        {
+            a.generation
+        } else {
+            let generation = self.next_generation;
+            self.next_generation = self
+                .next_generation
+                .checked_add(1)
+                .ok_or(ObservationGap::ProcessLimit)?;
+            generation
+        };
         for (api, site) in resolved {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
                 return Err(ObservationGap::SnapshotLag);
@@ -1175,34 +1342,47 @@ impl ProviderSession {
             {
                 continue;
             }
-            let a = self.attach_pair(pid, api, site, Vec::new(), 0)?;
-            a.site.revalidate_object()?;
-            self.config
-                .insert(
-                    a.cookie,
-                    c::Config {
-                        generation,
-                        object: 0,
-                        pid,
-                        api,
+            let advertisers = if api == c::PROVIDER_INIT {
+                vec![site.object_hash().clone()]
+            } else {
+                Vec::new()
+            };
+            let a = self.attach_pair(pid, api, site, advertisers, 0, generation)?;
+            retain_and_arm(&mut self.startup, pid, a, |a| {
+                let result = validate_then_arm(
+                    || a.site.revalidate_object(),
+                    || {
+                        self.config
+                            .insert(
+                                a.cookie,
+                                c::Config {
+                                    generation,
+                                    object: a.object,
+                                    pid,
+                                    api,
+                                },
+                                0,
+                            )
+                            .map_err(|_| ObservationGap::AttachFailed)?;
+                        self.members
+                            .insert(
+                                pid,
+                                c::Member {
+                                    generation,
+                                    epoch: 1,
+                                    range_count: 0,
+                                    reserved: 0,
+                                },
+                                0,
+                            )
+                            .map_err(|_| ObservationGap::AttachFailed)
                     },
-                    0,
-                )
-                .map_err(|_| ObservationGap::AttachFailed)?;
-            a.site.revalidate_object()?;
-            self.startup.entry(pid).or_default().push(a);
-            self.members
-                .insert(
-                    pid,
-                    c::Member {
-                        generation,
-                        epoch: 1,
-                        range_count: 0,
-                        reserved: 0,
-                    },
-                    0,
-                )
-                .map_err(|_| ObservationGap::AttachFailed)?;
+                );
+                if result.is_err() {
+                    let _ = self.config.remove(&a.cookie);
+                }
+                result
+            })?;
         }
         Ok(())
     }
@@ -1431,7 +1611,7 @@ fn arm_attachment(
                     a.cookie,
                     c::Config {
                         generation,
-                        object: object_id(&a.site),
+                        object: a.object,
                         pid,
                         api: a.api,
                     },
@@ -2467,12 +2647,395 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "../../tests/support/provider_forwarder.rs"]
+mod startup_fixture;
+#[cfg(all(test, target_arch = "x86_64"))]
 mod startup_api_controls {
     use super::*;
     #[test]
+    fn startup_mapped_membership_never_renews_an_invalidated_advertisement_lease() {
+        let previous = c::Member {
+            generation: 19,
+            epoch: 0,
+            range_count: 0,
+            reserved: 0,
+        };
+        let adopted = mapped_member(Some(previous), 19, 7).unwrap();
+        assert_eq!(
+            (adopted.generation, adopted.epoch, adopted.range_count),
+            (19, 0, 7)
+        );
+        assert!(mapped_member(Some(previous), 20, 7).is_err());
+        assert_eq!(mapped_member(None, 20, 7).unwrap().epoch, 1);
+    }
+    fn metadata_attachment(
+        child: &crate::target::OwnedTarget,
+    ) -> (startup_fixture::ForwarderFixture, Attachment) {
+        let f = startup_fixture::ForwarderFixture::new(
+            ".byte 0xe9\n.long query_impl-.-4",
+            ".byte 0xeb\n.byte unquery_impl-.-1",
+        );
+        let (_, sites, _) = objects::startup_candidates(
+            objects::StartupProcess::held(child).unwrap(),
+            f.file(),
+            &ObservationBudget::default(),
+        )
+        .unwrap();
+        let (_, site) = sites
+            .into_iter()
+            .map(|s| s.into_parts())
+            .find(|(api, _)| *api == wire::api(c::PUBLIC_QUERY).unwrap())
+            .unwrap();
+        let attachment = Attachment {
+            object: object_id(&site),
+            site,
+            links: Vec::new(),
+            cookie: 81,
+            api: c::PUBLIC_QUERY,
+            generation: 19,
+            advertisers: Vec::new(),
+            original: None,
+        };
+        (f, attachment)
+    }
+    #[test]
+    fn startup_query_binding_preserves_identity_and_refuses_stale_records() {
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .unwrap();
+        let (_fixture, a) = metadata_attachment(&child);
+        let starttime = a.site.starttime();
+        let hash = a.site.object_hash().clone();
+        let r = c::Record {
+            pid: child.pid(),
+            tid: child.pid(),
+            generation: 19,
+            cookie: 81,
+            api: c::PUBLIC_QUERY,
+            ..Default::default()
+        };
+        let startup = BTreeMap::from([(child.pid(), vec![a])]);
+        let targets = BTreeMap::new();
+        let binding = record_binding(&targets, &startup, &r)
+            .unwrap()
+            .expect("first natural query must reach the assembler before any mapped snapshot");
+        assert_eq!(binding.starttime, starttime);
+        assert_eq!(binding.attachment.site.object_hash(), &hash);
+        assert_ne!(binding.attachment.object, 0);
+        assert!(
+            binding.process.is_none(),
+            "startup grants no mapped code authority"
+        );
+        let mut stale = r;
+        stale.generation += 1;
+        assert!(
+            record_binding(&targets, &startup, &stale)
+                .unwrap()
+                .is_none()
+        );
+        let mut stale = r;
+        stale.cookie += 1;
+        assert!(record_binding(&targets, &startup, &stale).is_err());
+        let mut stale = r;
+        stale.api = c::GET_DISPATCH;
+        assert!(record_binding(&targets, &startup, &stale).is_err());
+    }
+    #[test]
+    fn startup_partial_arm_failure_keeps_link_and_file_owners_until_cleanup() {
+        use std::os::fd::AsRawFd;
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .unwrap();
+        for gap in [
+            ObservationGap::AttachFailed,
+            ObservationGap::SnapshotLag,
+            ObservationGap::ObjectChanged,
+        ] {
+            let (_fixture, mut a) = metadata_attachment(&child);
+            a.links
+                .push(std::fs::File::open("/dev/null").unwrap().into());
+            let fd = a.links[0].as_raw_fd();
+            let file = a.site.attachment_fd().as_raw_fd();
+            let mut startup = BTreeMap::new();
+            assert_eq!(
+                retain_and_arm(&mut startup, child.pid(), a, |_| Err(gap)),
+                Err(gap)
+            );
+            assert_eq!(startup[&child.pid()].len(), 1);
+            assert!(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            assert!(unsafe { libc::fcntl(file, libc::F_GETFD) } >= 0);
+            let a = startup.remove(&child.pid()).unwrap().pop().unwrap();
+            disarm_links(a.links, || {
+                assert!(
+                    unsafe { libc::fcntl(file, libc::F_GETFD) } >= 0,
+                    "file custody must outlive disarming links"
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            assert!(unsafe { libc::fcntl(file, libc::F_GETFD) } >= 0);
+            drop(a.site);
+            assert_eq!(unsafe { libc::fcntl(file, libc::F_GETFD) }, -1);
+        }
+    }
+    #[test]
     #[ignore = "requires fresh observation object and native tracing privileges"]
-    fn mapped_transition_reuses_prearmed_operational_cookies() {
+    fn first_natural_stock_queries_survive_without_a_mapped_snapshot() {
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        for algorithm in ["-sha512", "-sha3-256"] {
+            let argv = ["/usr/bin/openssl", "dgst", algorithm, "/dev/null"]
+                .map(str::to_owned)
+                .to_vec();
+            let mut child =
+                crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                    .unwrap();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut budget = ObservationBudget::default();
+            let startup = crate::startup_objects::prepare_owned_startup(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+            )
+            .unwrap();
+            let mut session = ProviderSession::open_budgeted(budget, &object).unwrap();
+            session
+                .prearm_startup(
+                    startup.apis,
+                    Instant::now() + Duration::from_secs(5),
+                    &cancel,
+                )
+                .unwrap();
+            let rows = &session.startup[&child.pid()];
+            let query = rows
+                .iter()
+                .find(|a| a.api == c::PUBLIC_QUERY)
+                .expect("typed natural public query site");
+            let identity = (
+                query.site.starttime(),
+                query.generation,
+                query.site.object_hash().clone(),
+            );
+            assert!(session.targets.is_empty());
+            let member = session.members.get(&child.pid(), 0).unwrap();
+            assert_eq!(
+                member.range_count, 0,
+                "held process cannot supply predicted code ranges"
+            );
+            child.release_retaining_exit().unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            while child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            assert_eq!(child.peek_exit().unwrap(), Some(0));
+            // One bounded drain after ordinary exit; no readiness/query/getter
+            // protocol, sleeps, target pacing or repeated library contexts.
+            let batch = session.close_until(Instant::now() + Duration::from_secs(2));
+            let facts: Vec<_> = batch
+                .facts
+                .iter()
+                .filter(|f| f.api == wire::api(c::PUBLIC_QUERY).unwrap())
+                .collect();
+            let queries = facts
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.payload,
+                        ObservationPayload::QueryResult {
+                            outcome: ApiOutcome::Success,
+                            ..
+                        }
+                    )
+                })
+                .count();
+            let advertisements = facts
+                .iter()
+                .filter(|f| matches!(f.payload, ObservationPayload::Algorithm { .. }))
+                .count();
+            assert!(
+                queries > 0 && advertisements > 0,
+                "{algorithm}: natural query={queries}, advertisements={advertisements}, gaps={:?}",
+                batch.gaps
+            );
+            assert!(facts.iter().all(|f| f.pid == child.pid()
+                && f.starttime == identity.0
+                && f.generation == identity.1
+                && f.object_sha256 == identity.2));
+            assert!(
+                batch.learned_sites.is_empty(),
+                "unmapped startup grants no learned callback authority"
+            );
+            assert!(batch.gaps.contains(&ObservationGap::ProcessUnavailable));
+            assert!(batch.gaps.contains(&ObservationGap::IntervalUnknown));
+            assert!(batch.gaps.contains(&ObservationGap::FirstQueryUnknown));
+            assert!(batch.gaps.contains(&ObservationGap::SamplingPartial));
+            child.finish_observation().unwrap();
+            println!(
+                "{algorithm}: {queries} natural public query successes, {advertisements} algorithm advertisements; correct retained identity; ranges unknown; no callback attribution or COMPLETE; gaps={:?}",
+                batch.gaps
+            );
+        }
+    }
+    #[test]
+    fn startup_pending_aliases_and_cookie_survive_first_mapped_authority() {
+        use std::os::fd::AsRawFd;
+        let f = startup_fixture::ForwarderFixture::new(
+            ".byte 0xe9\n.long query_impl-.-4",
+            ".byte 0xeb\n.byte unquery_impl-.-1",
+        );
+        let file = f.file();
+        let len = file.metadata().unwrap().len() as usize;
+        // Map real retained executable bytes before fork. The held child
+        // inherits this fixture map; no fixture function or target protocol runs.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        struct Mapping(*mut libc::c_void, usize);
+        impl Drop for Mapping {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::munmap(self.0, self.1);
+                }
+            }
+        }
+        let _mapping = Mapping(address, len);
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .unwrap();
+        let budget = ObservationBudget::default();
+        let mapped_file = file.try_clone().unwrap();
+        let (_, sites, _) = objects::startup_candidates(
+            objects::StartupProcess::held(&child).unwrap(),
+            file,
+            &budget,
+        )
+        .unwrap();
+        let (_, site) = sites
+            .into_iter()
+            .map(|s| s.into_parts())
+            .find(|(api, _)| *api == wire::api(c::PUBLIC_QUERY).unwrap())
+            .unwrap();
+        let object = object_id(&site);
+        let starttime = site.starttime();
+        let hash = site.object_hash().clone();
+        let a = Attachment {
+            site,
+            object,
+            links: Vec::new(),
+            cookie: 81,
+            generation: 19,
+            api: c::PUBLIC_QUERY,
+            advertisers: Vec::new(),
+            original: None,
+        };
+        let records = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes;
+        let process = objects::fixture_support::mapped_process(&records[0], mapped_file, &budget);
+        let mapped = process
+            .resolve_api(wire::api(c::PUBLIC_QUERY).unwrap())
+            .into_iter()
+            .find(|s| s.site.object_hash() == &hash)
+            .expect("independently mapped fixture authority")
+            .site;
+        let mut targets = BTreeMap::from([(
+            child.pid(),
+            Target {
+                process,
+                starttime,
+                generation: 19,
+                attachments: Vec::new(),
+                ranges: 0,
+                ready: false,
+            },
+        )]);
+        let mut startup = BTreeMap::from([(child.pid(), vec![a])]);
+        let mut r = c::Record {
+            version: c::VERSION,
+            size: 96,
+            kind: c::ALGORITHM_BEGIN,
+            pid: child.pid(),
+            tid: child.pid(),
+            cookie: 81,
+            generation: 19,
+            invocation: 7,
+            api: c::PUBLIC_QUERY,
+            operation: 1,
+            outcome: 1,
+            cacheability: 1,
+            ..Default::default()
+        };
+        let decode = |r: &c::Record| {
+            wire::decode_transport(unsafe {
+                std::slice::from_raw_parts((r as *const c::Record).cast(), 96)
+            })
+            .unwrap()
+        };
+        let mut aliases = super::super::assembly::Sequences::default();
+        let mut batch = ObservationBatch::default();
+        assert!(
+            record_binding(&targets, &startup, &r)
+                .unwrap()
+                .unwrap()
+                .process
+                .is_none()
+        );
+        assert!(assemble_payload(decode(&r), &mut aliases, &budget, &mut batch).is_none());
+        assert!(aliases.incomplete());
+        let mut a = startup.get_mut(&child.pid()).unwrap().pop().unwrap();
+        a.adopt_site(mapped).unwrap();
+        assert_eq!((a.cookie, a.generation, a.object), (81, 19, object));
+        assert!(a.original.as_ref().unwrap().is_startup());
+        targets.get_mut(&child.pid()).unwrap().attachments.push(a);
+        let binding = record_binding(&targets, &startup, &r).unwrap().unwrap();
+        assert_eq!(binding.starttime, starttime);
+        assert_eq!(binding.attachment.site.object_hash(), &hash);
+        assert!(binding.process.is_some());
+        r.kind = c::ALIAS;
+        r.algorithm = c::OTHER;
+        r.function = c::OTHER;
+        r.outcome = 0;
+        assert!(assemble_payload(decode(&r), &mut aliases, &budget, &mut batch).is_none());
+        r.kind = c::ALIAS_END;
+        r.function = 1;
+        let payload = assemble_payload(decode(&r), &mut aliases, &budget, &mut batch).unwrap();
+        assert!(matches!(payload, ObservationPayload::Algorithm { .. }));
+        assert!(!aliases.incomplete());
+        assert!(
+            batch.gaps.is_empty(),
+            "handoff lost pending alias boundary: {:?}",
+            batch.gaps
+        );
+        assemble_payload(decode(&r), &mut aliases, &budget, &mut batch);
+        assert!(
+            batch.gaps.contains(&ObservationGap::InvalidWire),
+            "replayed terminal alias cannot become fresh evidence"
+        );
+    }
+    #[test]
+    #[ignore = "requires fresh observation object and native tracing privileges"]
+    fn mapped_transition_reuses_prearmed_operational_and_metadata_cookies() {
         let dir = std::env::temp_dir().join(format!("osslscope-api-adopt-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let source = dir.join("app.c");
@@ -2484,10 +3047,20 @@ mod startup_api_controls {
 #include <unistd.h>
 #include <stddef.h>
 static const char *ready, *go, *done;
-__attribute__((noinline)) int EVP_DigestUpdate(void *ctx,const void *data,size_t len) {
+struct dispatch { int id; void (*fn)(void); };
+struct algorithm { const char *names, *properties; const struct dispatch *implementation; const char *description; };
+__attribute__((noinline)) static void implementation(void) { __asm__ volatile(""); }
+static const struct dispatch dispatch[] = { { 70001, implementation }, { 0, 0 } };
+static const struct algorithm algorithms[] = { { "FUTURE-DIGEST", 0, dispatch, 0 }, { 0, 0, 0, 0 } };
+__attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider,int op,int *no_cache) {
+ *no_cache=0;
  FILE *f=fopen(ready,"w"); if(!f) return 0; fclose(f);
  for(int i=0;i<15000 && access(go,F_OK);i++) usleep(1000);
- return access(go,F_OK)==0;
+ return access(go,F_OK)==0 ? algorithms : 0;
+}
+__attribute__((noinline)) int EVP_DigestUpdate(void *ctx,const void *data,size_t len) {
+ int no_cache=-1;
+ return OSSL_PROVIDER_query_operation((void*)1,1,&no_cache)!=0;
 }
 int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];done=argv[3];
  if(EVP_DigestUpdate((void*)1,(void*)2,3)!=1) return 3;
@@ -2527,7 +3100,7 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
         let mut session = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
         session
-            .prearm_operational(
+            .prearm_startup(
                 startup.apis,
                 Instant::now() + Duration::from_secs(5),
                 &cancel,
@@ -2535,6 +3108,17 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             .unwrap();
         let before: BTreeSet<_> = session.api_owners.keys().copied().collect();
         assert_eq!(before.len(), 1);
+        let query = session.startup[&child.pid()]
+            .iter()
+            .find(|a| a.api == c::PUBLIC_QUERY)
+            .unwrap();
+        let metadata_identity = (
+            query.cookie,
+            query.generation,
+            query.object,
+            query.site.starttime(),
+            query.site.object_hash().clone(),
+        );
         child.release_retaining_exit().unwrap();
         let until = Instant::now() + Duration::from_secs(10);
         while !ready.exists() {
@@ -2557,6 +3141,20 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             "same-site API handoff minted duplicate physical probes"
         );
         assert!(session.startup.is_empty());
+        let query = session.targets[&child.pid()]
+            .attachments
+            .iter()
+            .find(|a| a.api == c::PUBLIC_QUERY)
+            .unwrap();
+        assert_eq!(
+            (query.cookie, query.generation, query.object),
+            (
+                metadata_identity.0,
+                metadata_identity.1,
+                metadata_identity.2
+            )
+        );
+        assert!(query.original.is_some());
         std::fs::write(&go, b"go").unwrap();
         while !done.exists() {
             assert!(Instant::now() < until);
@@ -2580,8 +3178,37 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             ),
             (1, 1, 0, 0, 0)
         );
+        let facts: Vec<_> = final_batch
+            .facts
+            .iter()
+            .filter(|f| f.api == wire::api(c::PUBLIC_QUERY).unwrap())
+            .collect();
+        assert!(
+            facts.iter().any(|f| matches!(
+                f.payload,
+                ObservationPayload::QueryResult {
+                    outcome: ApiOutcome::Success,
+                    ..
+                }
+            )),
+            "pending startup query return was orphaned"
+        );
+        assert!(
+            facts
+                .iter()
+                .any(|f| matches!(f.payload, ObservationPayload::Algorithm { .. })),
+            "pending startup advertisement was lost"
+        );
+        assert!(facts.iter().all(|f| f.starttime == metadata_identity.3
+            && f.generation == metadata_identity.1
+            && f.object_sha256 == metadata_identity.4));
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        child.finish_observation().unwrap();
         println!(
-            "mapped handoff: same cookie, one entry, one paired successful return, no tail/unpaired gap"
+            "mapped handoff: same operational/metadata cookies and generation; one paired scalar success; pending natural fixture query/advertisement retained; no tail/unpaired gap"
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
