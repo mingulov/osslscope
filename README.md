@@ -15,7 +15,7 @@ record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0) retains its
 historical artifact-specific scope; this candidate has not been published.
 
 Tracing hot loops can be costly: the finite stock SHA-256 sample measured a
-4.67× baseline/observed throughput ratio. See [measured cost and limits](docs/release-v0.4.0.md#measured-cost-and-practical-limits).
+4.66× baseline/observed throughput ratio. See [measured cost and limits](docs/release-v0.4.0.md#measured-cost-and-practical-limits).
 
 ## Discover, select, observe
 
@@ -27,7 +27,7 @@ Use actual host-visible PIDs and file paths:
 ```sh
 osslscope scan --json
 osslscope scan --watch --interval 1 --duration 30 --json
-osslscope scan --watch --observe-crypto --duration 30 --json
+osslscope scan --watch --observe-crypto --duration 30
 osslscope scan --cgroup /sys/fs/cgroup/example.service --json
 osslscope inspect --pid 1234 --json
 osslscope inspect --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json

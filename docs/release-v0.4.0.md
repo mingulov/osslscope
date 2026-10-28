@@ -36,17 +36,17 @@ ARM64, pre-3.0, RHEL and Secure Boot remain outside this candidate's evidence.
 Installed runtime receipts must bind the CLI and all five BPF object hashes.
 Source checks and fresh-object preparation do not substitute for those receipts.
 The following finite results bind the ordinary release build from source
-`acd7cf84f0ab6d137148755f9bc214b03d382f18`. Later identity-audit test and release
-prose changes leave these runtime bytes unchanged. This is a source-prefix
+`03e053c00c1bcd8c44e151373cac0c18bf038595`. Later release-prose changes
+leave these runtime bytes unchanged. This is a source-prefix
 installation qualification, not binary-package or publication acceptance.
 
 ## Measured cost and practical limits
 
-**Tracing reduced this SHA-256 hot loop's throughput by about 4.67×**: the
-median baseline/observed ratio was 4.673, range 4.649–4.691. Five paired runs
+**Tracing reduced this SHA-256 hot loop's throughput by about 4.66×**: the
+median baseline/observed ratio was 4.664, range 4.637–4.699. Five paired runs
 followed one warmup pair and alternated order, using the identical stock command
 `openssl speed -elapsed -seconds 6 -bytes 16384 -evp sha256`. Median throughput
-was 2.500 GB/s alone and 0.535 GB/s under ordinary `report run`. Both the workload
+was 2.498 GB/s alone and 0.535 GB/s under ordinary `report run`. Both the workload
 exit and positive physical/API evidence were checked independently.
 
 This sample uses host kernel 7.0.0-38-generic, stock OpenSSL 3.5.5, warm caches,
@@ -56,9 +56,9 @@ guarantee is claimed.
 
 | Separate measurement | Observed finite result |
 | --- | --- |
-| One-PID passive scan, five runs | 10.63–10.84 ms scanner interval; 10,968–11,352 KiB peak RSS; seven objects and 12,006,788 charged read bytes per invocation |
-| Four-second passive watch | 0.01 s user CPU, system CPU below the timer's 0.01 s display resolution; 10,972 KiB peak RSS; subsequent cached samples charged 10,280 bytes each |
-| Observer process under tracing | Per-run mean CPU 21.5–24.2% of one CPU, including setup; one-second samples 0–99%; sampled RSS at most 30,324 KiB |
+| One-PID passive scan, five runs | 13.16–13.49 ms scanner interval; 11,180–11,296 KiB peak RSS; seven objects and 12,006,791 charged read bytes per invocation |
+| Four-second passive watch | 0.01 s user CPU, system CPU below the timer's 0.01 s display resolution; 11,316 KiB peak RSS; subsequent cached samples charged 10,283 bytes each |
+| Observer process under tracing | Per-run mean CPU 21.4–24.1% of one CPU, including setup; one-second samples 0–100%; sampled RSS at most 30,216 KiB |
 
 The observer CPU samples select only the observer PID. They do not measure total
 kernel/probe CPU, workload CPU or per-call latency. Sampled RSS excludes kernel
@@ -79,6 +79,7 @@ raised for qualification.
 | Host Linux x86-64, kernel 7.0.0-38-generic, stock OpenSSL 3.5.5 | Short/warm CLI, six-family public-API client, default and legacy provider, unmodified curl TLS, installed scope/cancellation/privacy/resource controls |
 | Same host, independent Debian OpenSSL 3.5.7 library/module build | Matching-library public-API client; short digest and warm external-provider activity with the stock 3-linked CLI selecting those ABI-compatible libraries |
 | Same host, official stable OpenSSL 4.0.3 | Its own 4-linked CLI/client and matching libraries; static tables, public query/dispatch facts, six-family API activity, default/legacy, short/warm observations |
+| Host observer selecting two Docker containers with distinct PID/mount namespaces | Passive and automatic-watch PID/cgroup/module intersections, sibling exclusion, matching host incarnation coordinates, explicit backing refusal and workload survival |
 | Cached kernel 6.12.114-0612114-generic | Unchanged observer artifacts; seven installed focused controls plus both stock 3 public-API clients on verified guest-local tmpfs backing |
 
 All six-family clients exited successfully. SHA3/BLAKE2 digest values matched
@@ -91,15 +92,24 @@ process. Native controls include lookalikes, shared and unused callbacks, rename
 replaced/unlinked/late objects, denied access, actual PID reuse and global caps.
 Reports remain PARTIAL and checked algorithm policy remains inconclusive.
 
-The guest's original overlayfs root backing was refused at mapped-file
-association. Warm/sustained controls passed with byte-identical executable and
-loaded dependencies on verified tmpfs. These results do not qualify overlayfs
-or 9p backing. The table is the performed set, not a complete cross-product of
-applications, algorithms, libraries and kernels. OpenSSL 4.0.3 is one pinned
+Default crypto-watch output now provides bounded human process/object/activity
+summaries with separate physical and API entries; `--json` retains NDJSON.
+Native authority-refresh control prearmed 2,860 physical sites on four links,
+then supplied partial and stronger verified inventory. Independent calls before
+and after refresh conserved 37 + 11 = 48 without replaying cookies or duplicating
+links. Stable snapshots added no read/accounting churn; a real backing-file
+change retired the links. The 4,096-cookie ceiling remains unchanged.
+
+Container-backed crypto files remained locator-only, with explicit identity/read
+gaps and zero observed activity, not an inactivity verdict. Guest warm/sustained
+controls passed with byte-identical executable and loaded dependencies whose
+actual mapped backing was verified as tmpfs. These results do not qualify
+overlayfs or 9p backing. The table is the performed set, not a complete
+cross-product of applications, algorithms, libraries and kernels. OpenSSL 4.0.3 is one pinned
 compatibility lane; broader OpenSSL 4 qualification remains open.
 
-Source checks pass with 2,055 tests and 136 explicit ignores. Fifteen fresh-object
-preparation controls, thirteen installed host-command controls and seven direct
+Source checks pass with 2,058 tests and 138 explicit ignores. Fifteen fresh-object
+preparation controls, fourteen installed host-command controls and nine direct
 native source/producer controls pass; source tests and capability skips are not
 runtime passes. Known shared-test-helper warnings and the pinned BPF-linker's
 LLVM fallback warning remain disclosed. Whole-change independent review remains
@@ -112,7 +122,7 @@ installation produced these SHA-256 values; guest copies were checked unchanged:
 
 | Artifact | SHA-256 |
 | --- | --- |
-| `osslscope` | `3aeb8138fbb3c94c6bb1d815a5dce497a3b9921e5ce85cb004626c0207968514` |
+| `osslscope` | `72a1ee2b215d3b3829571259c817c83a5d4c6aea35b53ae79360385409d7ec51` |
 | `osslscope-harvest` | `fa4f1ee35f5bce8a0e86232e25c15fcab372f98af3d137995caf3f0f2b7ffca2` |
 | `osslscope-count` | `a6ddb29c44cc9845875cdd8f48558e856e30170101323fe187db91f52a76ea75` |
 | `osslscope-members` | `abda2a14b3a32a416cc3e4ce3678cc3bb498854f0cdb806d1518a2e46f628800` |
