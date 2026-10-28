@@ -196,6 +196,20 @@ fn h5_t3_every_device_site_names_one_domain() {
             "e.device != before.dev() || e.inode != before.ino() || e.size_bytes != before.len()",
             1,
         ),
+        // Refused inventory hints compare ModuleInfo native st_dev/inode only;
+        // they request fresh acquisition and never confer attachment authority.
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            ".contains(&(module.info.device, module.info.inode))",
+            1,
+        ),
+        (
+            "src/provider_observation/objects.rs",
+            "raw",
+            ".map(|m| (m.info.device, m.info.inode)),",
+            1,
+        ),
         // Discovery cache, verified-record dedup and ELF identity use native
         // fstat dev_t, never
         // encoded callback/stat words. Cache keys and stability checks compare
