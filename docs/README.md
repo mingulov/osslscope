@@ -1,13 +1,13 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # docs
 
-Current v0.3.0 workflows include passive discovery/watch, PID/cgroup/module
+Current v0.4.0 candidate workflows include passive discovery/watch, PID/cgroup/module
 inventory, public provider observation and focused PID/owned-run callback
 counting. Start with [usage](usage.md), [build](build.md), [install](install.md),
-[meaning and limits](what-it-proves.md), [release notes](release-v0.3.0.md) and
+[meaning and limits](what-it-proves.md), [candidate release notes](release-v0.4.0.md) and
 the [roadmap](../ROADMAP.md). The
 [published release record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
-records actual installed checks; it does not remove the default-provider,
+records historical v0.3 installed checks; it does not qualify this candidate or remove
 attribution, startup or completeness gaps.
 
 - `build.md` - reproducible source build (host + BPF), manifests, lockfiles
@@ -15,6 +15,7 @@ attribution, startup or completeness gaps.
 - `install.md` - local prefix and package install, doctor-first verify, uninstall
 - `usage.md` - discovery, watch, provider observation, PID/run reports and policy
 - `what-it-proves.md` - claim chain, non-goals, who-should-NOT-adopt
+- `release-v0.4.0.md` - automatic observation candidate and artifact-specific limits
 - `release-v0.3.0.md` - discovery preview scope, qualification procedure and inventory cost
 - `release-v0.2.0.md` - source preview scope, native checks and limits
 - `overhead-matrix.md` - measured preview timings and historical broader matrix

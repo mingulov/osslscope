@@ -2393,13 +2393,16 @@ fn check_dynamic_sections(root: &serde_json::Map<String, serde_json::Value>) -> 
             .checked_add(row.observed_failure)
             .and_then(|v| v.checked_add(row.gaps.unsupported_return))
             .ok_or("API count overflow")?;
+        let failure_subsets = row
+            .verification_mismatch
+            .checked_add(row.unsupported)
+            .ok_or("API failure subset overflow")?;
         let api = u32::from(row.api);
         if !apis.insert(api)
             || row.gaps.not_attached && (row.entries != 0 || paired != 0)
             || paired > row.entries
             || row.gaps.tail != row.entries - paired
-            || row.verification_mismatch > row.observed_failure
-            || row.unsupported > row.observed_failure
+            || failure_subsets > row.observed_failure
             || row.verification_mismatch > 0 && !matches!(api, 40 | 45 | 47)
             || row.unsupported > 0 && !(39..=43).contains(&api)
         {

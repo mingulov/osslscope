@@ -1,6 +1,21 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## 0.4.0 automatic observation candidate
+
+- Recover bounded public-table candidates from verified ELF files, prearm owned
+  startup dependencies and retain warm-process physical entry evidence without
+  algorithm/version admission profiles. Static shapes remain entry-only hints.
+- Separate independently observed public-ABI advertisements, physical callback
+  totals, dynamic candidate identities and scalar public API activity in optional
+  `observed-crypto-v2.4` sections. Reject overlapping API failure subsets.
+- Add `crypto-watch-v1` sampled discovery and per-incarnation observation with
+  four active slots and one shared 256 MiB accounted state budget. Temporary
+  capacity pressure preserves retained discovery progress for later resumption.
+- Root package version 0.4.0; helper crates retain their versions. Reports remain
+  PARTIAL, attribution Unknown and algorithm policy inconclusive. See
+  [candidate qualification and limits](docs/release-v0.4.0.md).
+
 ## 0.3.0 discovery preview
 
 - Automatic ELF/process discovery, sampled watch and intersecting PID/cgroup/

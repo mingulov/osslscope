@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Usage
 
-The v0.3.0 discovery preview starts with passive discovery, optionally observes
+The v0.4.0 automatic observation candidate starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
 one selected process. Installed/platform qualification is separate from source
-behavior; see [release scope](release-v0.3.0.md).
+behavior; see [release scope](release-v0.4.0.md).
 
 ## Automatic crypto watch
 
@@ -54,6 +54,13 @@ Output is NDJSON with `schema_version: "crypto-watch-v1"` and increasing
 - `end`: stop reason, segment count and peak declared accounting (not measured
   RSS). Coverage remains partial; records never manufacture a cross-process
   execution total, definite CBOM asset or policy result.
+
+Consumer identity domains differ: discovery `ModuleInfo.device` is native Linux
+`st_dev`; report `site.device` encodes `(major << 32) | minor`. For major 8,
+minor 1 these values are **2049** and **34359738369**, respectively. Decode the
+proper domain before correlating device/inode identities; never join raw values.
+Discovery `process.execution = "not_observed"` describes the passive inventory
+view. It does not override positive evidence in a `process_observation` record.
 
 Membership is sampled. Removal/reentry produces distinct segments even for the
 same incarnation. PID reuse or missing/denied visibility never becomes a claim

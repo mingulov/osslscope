@@ -1,10 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
-Build the v0.3.0 discovery preview for Linux x86-64 using pinned host/BPF
+Build the v0.4.0 automatic observation candidate for Linux x86-64 using pinned host/BPF
 toolchains and locked dependencies. Compilation and pure object preparation
 are separate from installed verifier/runtime qualification; see the
-[release qualification procedure](release-v0.3.0.md). The historical exact-profile
+[release qualification procedure](release-v0.4.0.md). The historical exact-profile
 diagnostic is selected only with `--libcrypto`.
 
 The host/common, BPF programs and independent BPF contract have distinct terms

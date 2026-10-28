@@ -4967,3 +4967,22 @@ fn dynamic_metadata_rejects_invented_authority_and_raw_fields() {
     bad["algorithm_identities"][0]["id"] = json!("raw-custom-name");
     assert!(check_v2_semantics(&bad).is_err());
 }
+
+#[test]
+fn v24_api_failure_subsets_are_disjoint_and_cannot_overflow() {
+    for (failures, mismatch, unsupported) in [(1u64, 1u64, 1u64), (u64::MAX, u64::MAX, 1)] {
+        let mut value = serde_json::to_value(finalize_honest(input_base())).unwrap();
+        value["api_activity"] = json!([{
+            "api": 40, "entries": failures, "observed_success": 0, "observed_failure": failures,
+            "verification_mismatch": mismatch, "unsupported": unsupported,
+            "gaps": {"map": 0, "depth": 0, "unpaired": 0, "tail": 0, "unsupported_return": 0, "attachment": true, "finality": true, "not_attached": false, "saturated": failures == u64::MAX}
+        }]);
+        let doc: CaptureDocument = serde_json::from_value(value).unwrap();
+        let value = json_of(&doc);
+        validate_v2(&value).unwrap();
+        assert!(
+            check_v2_semantics(&value).is_err(),
+            "overlapping failure subsets accepted"
+        );
+    }
+}

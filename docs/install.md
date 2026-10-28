@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Install from source
 
-The v0.3.0 discovery preview uses the pinned [build recipe](build.md) and a
+The v0.4.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
 manifest-verified install. Source/install simulations do not qualify actual
 BPF loading, provider behavior or a platform.
 

@@ -318,9 +318,12 @@ pub(crate) fn activity(
         .checked_add(v.failure)
         .and_then(|n| n.checked_add(v.unsupported_return))
         .ok_or(ObservationGap::InvalidWire)?;
+    let failure_subsets = v
+        .mismatch
+        .checked_add(v.unsupported)
+        .ok_or(ObservationGap::InvalidWire)?;
     if paired > v.entries
-        || v.mismatch > v.failure
-        || v.unsupported > v.failure
+        || failure_subsets > v.failure
         || v.mismatch > 0 && !matches!(api, 40 | 45 | 47)
         || v.unsupported > 0 && !(39..=43).contains(&api)
     {

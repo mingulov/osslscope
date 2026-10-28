@@ -1245,3 +1245,22 @@ int main(void) { if(EVP_DigestUpdate((void*)1,(void*)2,99) != 1) return 0;
     drop(child);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn scalar_failure_subsets_are_disjoint_and_cannot_overflow() {
+    for (failures, mismatch, unsupported) in [(1u64, 1u64, 1u64), (u64::MAX, u64::MAX, 1)] {
+        let mut bytes = vec![0; 72];
+        for (at, n) in [
+            (0, failures),
+            (16, failures),
+            (24, mismatch),
+            (32, unsupported),
+        ] {
+            bytes[at..at + 8].copy_from_slice(&n.to_ne_bytes());
+        }
+        assert!(
+            wire::decode_activity(40, &bytes).is_err(),
+            "overlapping failure subsets accepted"
+        );
+    }
+}

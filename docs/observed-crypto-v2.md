@@ -638,7 +638,8 @@ API entries are not unique cryptographic operations. Nested wrappers may produce
 several rows; a successful size query may produce no cryptographic output. No
 arguments, opaque contexts, buffers, runtime aliases or provider handles are
 read by the operational probes. Verification mismatch and documented unsupported
-returns are subsets of failure returns, never extra entries. Unknown return
+returns are mutually exclusive subsets of failure returns, never extra entries.
+Their checked sum cannot exceed observed failures. Unknown return
 values remain `unsupported_return` gaps. `tail` is entries without a classified
 paired return, including depth/pending losses and in-flight calls. Other gap
 counters can overlap it and must not be summed as a call total. `not_attached`

@@ -7,11 +7,12 @@ for selected processes or automatically discovered watched scopes. Normal workfl
 need no enrolled library profile,
 manual offsets or application changes.
 
-**v0.3.0 released discovery preview.** The
-[release record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
-reports the installed/runtime checks and their artifact identities. These finite
-results do not qualify every application or platform. See
-[release scope and qualification procedure](docs/release-v0.3.0.md).
+**v0.4.0 automatic observation release candidate.** Short owned commands,
+warm processes and sampled watched scopes expose physical callback entries and
+separate public API activity. See the [candidate scope and qualification
+limits](docs/release-v0.4.0.md). The [v0.3.0 release
+record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0) retains its
+historical artifact-specific scope; this candidate has not been published.
 
 ## Discover, select, observe
 
@@ -79,8 +80,9 @@ unknown; startup, polling, invalidation and final drain leave explicit gaps.
 Calls before attachment or after retirement are uncovered. Unavailable backing,
 permissions, namespace mismatch and resource caps retain partial/unavailable
 semantics. Linux x86-64/OpenSSL 3 is the initial scope; kernel admission is
-feature based. ARM64, pre-3.0/OpenSSL 4, RHEL/Secure Boot and broader platform
-qualification remain deferred. See [usage](docs/usage.md) for bounds, privacy,
+feature based. A pinned OpenSSL 4.0.3 compatibility lane is included in the candidate
+qualification; broader OpenSSL 4 matrices, ARM64, pre-3.0 and RHEL/Secure Boot
+remain deferred. See [usage](docs/usage.md) for bounds, privacy,
 exit codes and cancellation.
 
 ## Historical diagnostics and documentation
