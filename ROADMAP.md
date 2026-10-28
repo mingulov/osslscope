@@ -25,6 +25,9 @@ that can support a useful policy decision or CBOM.
   comparisons across different builds.
 - Extend operational API observations, including KEM and key generation.
   Algorithm admission remains dynamic; finite test examples do not limit use.
+- Qualify installed workflows against OpenSSL 3.0.x, 3.5.x and 4.x with matching
+  libraries and providers. Detect available interfaces dynamically and preserve
+  useful observations when newer APIs or algorithms are absent.
 - Improve tracing cost from measured causes and preserve useful identity and
   provenance within bounded reports. Publish actual workload impact and limits.
 - Support active observation of ordinary overlay-backed Docker and kind

@@ -169,3 +169,28 @@ Live capture checks require an authorized supported host. CI builds all five
 objects and explicitly selects the pure fresh-object preparation controls for
 provider-observation and focused-count; those controls never load BPF. Neither
 host tests nor object-shape success establish runtime/platform qualification.
+
+## OpenSSL compatibility controls
+
+The v0.5 test matrix includes OpenSSL 3.0.x, 3.5.x and 4.x. Each lane uses its
+matching CLI, libraries and provider modules. These are test inputs, not a
+version or algorithm admission list. An absent newer API or algorithm is a
+capability limit; it does not exclude the library from discovery or testing.
+For example, OpenSSL 3.0 provides RSA-KEM library APIs while its CLI lacks the
+later encapsulation command, so its KEM control needs an ordinary public-API
+application.
+
+On an authorized native tracing host, the ignored library test
+`provider_observation::session::startup_api_controls::first_natural_stock_queries_survive_without_a_mapped_snapshot`
+accepts `OSSLSCOPE_TEST_OPENSSL` (default `/usr/bin/openssl`) and inherits the
+matching `LD_LIBRARY_PATH`. Set `OSSL_PROVIDER_OBSERVATION_TEST_BPF` to the
+freshly built provider-observation object. Prepare the current test artifacts
+as described above; run the selected libtest executable with the required
+tracing privileges and an owned temporary directory.
+
+The control runs unchanged SHA-512 and SHA3-256 commands and checks retained
+natural query/advertisement facts after exit. It adds no getter or query calls
+to the application. This is a startup metadata control; it does not establish
+definite algorithm/provider execution, complete coverage or full compatibility.
+Installed application workflows and the broader family/provider controls remain
+separate release gates.
