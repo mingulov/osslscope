@@ -87,7 +87,10 @@ caps, `%preun` clears only for erase (`$1 == 0`), and `%posttrans` restores caps
 after the old package's scriptlets. This retains migration handling for older
 unguarded `%preun` scripts. Missing/denied `setcap` produces a labeled-sudo
 remediation and leaves the transaction successful; `doctor` reports the limit.
-RPM's build must not strip or mutate receipt-bound prebuilt bytes.
+RPM's build must not strip or mutate receipt-bound prebuilt bytes. Its CLI file
+entry declares the same capabilities in RPM metadata, so `rpm -V` verifies the
+intended capability state. RPM installation requires filesystem/filecap support;
+the existing scriptlets retain upgrade and old-scriptlet recovery behavior.
 
 On an authorized qualification host, install the selected package with `dpkg -i`
 or `dnf install`, then run ordinary-user `osslscope doctor`, `scan`, `report` and
@@ -107,3 +110,14 @@ python3 packaging/tests/test-current-package.py
 Synthetic ELF staging and scriptlet fixtures do not qualify installed runtime
 behavior. Repeated construction from one build is also not a clean double-build
 reproducibility result.
+
+
+Check the actual constructed RPM's capability header without installing it:
+
+```sh
+python3 packaging/tests/test-rpm-metadata.py dist/current/osslscope-*.x86_64.rpm
+```
+
+This header check does not establish installed filecap behavior; verify the real
+installation with `getcap /usr/bin/osslscope` and `rpm -V osslscope` on the
+qualification host.
