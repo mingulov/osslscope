@@ -52,8 +52,24 @@ impl Default for TableLimits {
 pub struct DynamicAlgorithmId([u8; 32]);
 impl DynamicAlgorithmId {
     /// Observer-generated identity of one public algorithm observation. Only
-    /// observer IDs, object fingerprint and bounded ordinal enter this digest.
-    pub(crate) fn observed(object: &super::ObjectHash, identity: [u64; 7]) -> Self {
+    /// observer identities, object fingerprint and bounded ordinal enter this digest.
+    /// Invocation numbers are local to (pid, tid, generation); retain that full
+    /// scope while excluding per-function addresses, IDs and emission times.
+    pub(crate) fn observed(
+        object: &super::ObjectHash,
+        starttime: u64,
+        record: &super::wire::contract::Record,
+    ) -> Self {
+        let identity = [
+            record.pid as u64,
+            record.tid as u64,
+            starttime,
+            record.generation,
+            record.cookie,
+            record.invocation,
+            record.operation as u64,
+            record.algorithm_index as u64,
+        ];
         let mut hash = Sha256::new();
         hash.update(b"osslscope-public-algorithm-v1");
         hash.update(String::from(object.clone()).as_bytes());

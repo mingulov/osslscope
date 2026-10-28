@@ -735,16 +735,7 @@ impl ProviderSession {
                             operation: Operation::from_id(r.operation).unwrap_or(Operation::Other),
                             numeric_operation: r.operation,
                             dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
-                                &hash,
-                                [
-                                    r.pid as u64,
-                                    starttime,
-                                    r.generation,
-                                    r.cookie,
-                                    r.invocation,
-                                    r.operation as u64,
-                                    r.algorithm_index as u64,
-                                ],
+                                &hash, starttime, &r,
                             ),
                             observed_ns: r.monotonic_ns,
                             algorithm: *algorithm,
@@ -1154,6 +1145,60 @@ fn object_id(site: &VerifiedSite) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_algorithm_identity_separates_thread_local_invocations() {
+        use super::super::static_tables::DynamicAlgorithmId;
+        let object: ObjectHash = "a".repeat(64).try_into().unwrap();
+        let first = c::Record {
+            pid: 101,
+            tid: 102,
+            generation: 3,
+            cookie: 4,
+            invocation: 1,
+            operation: 50001,
+            algorithm_index: 0,
+            algorithm: c::OTHER,
+            function: 70001,
+            ..Default::default()
+        };
+        let other_thread = c::Record { tid: 103, ..first };
+        assert_ne!(
+            DynamicAlgorithmId::observed(&object, 20, &first),
+            DynamicAlgorithmId::observed(&object, 20, &other_thread),
+            "different threads' first unknown rows must not collapse"
+        );
+    }
+
+    #[test]
+    fn live_algorithm_identity_unifies_functions_of_one_observed_row() {
+        use super::super::static_tables::DynamicAlgorithmId;
+        let object: ObjectHash = "a".repeat(64).try_into().unwrap();
+        let first = c::Record {
+            pid: 101,
+            tid: 102,
+            generation: 3,
+            cookie: 4,
+            invocation: 1,
+            operation: 50001,
+            algorithm_index: 0,
+            algorithm: c::OTHER,
+            function: 2,
+            monotonic_ns: 30,
+            code: 0x1000,
+            ..Default::default()
+        };
+        let next_function = c::Record {
+            function: 70001,
+            monotonic_ns: 31,
+            code: 0x2000,
+            ..first
+        };
+        assert_eq!(
+            DynamicAlgorithmId::observed(&object, 20, &first),
+            DynamicAlgorithmId::observed(&object, 20, &next_function),
+            "function, timestamp and callback address do not split one algorithm row"
+        );
+    }
     #[test]
     fn candidate_membership_accepts_current_return_after_lease_invalidation() {
         for epoch in [0, 1] {
