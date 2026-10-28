@@ -2,6 +2,8 @@
 //! Public ABI producer. Target strings only exist in stack classifier scratch.
 #![no_std]
 #![no_main]
+#[path = "../writer_gate.rs"]
+mod writer_gate;
 use aya_ebpf::{
     bindings::bpf_pidns_info,
     helpers,
@@ -220,6 +222,9 @@ pub fn provider_name(pointer: u64) -> u32 {
 }
 #[uprobe]
 pub fn observation_entry(ctx: ProbeContext) -> u32 {
+    if !writer_gate::admitted() {
+        return 0;
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some((cfg, key)) = identity(cookie) else {
         return 0;
@@ -763,6 +768,9 @@ pub fn pop_return(cookie: u64, out_key: &mut ThreadKey, out_pending: &mut Pendin
 }
 #[uretprobe]
 pub fn observation_return(ctx: RetProbeContext) -> u32 {
+    if !writer_gate::admitted() {
+        return 0;
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     if let Some((cfg, key)) = identity(cookie) {
         if operational_api(cfg.api) {

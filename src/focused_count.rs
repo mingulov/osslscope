@@ -177,6 +177,7 @@ thread_local! {
 /// Owns maps, retained namespace, links and candidate custody. Links are closed
 /// before candidate custody is released, including during unwinding/Drop.
 pub struct FocusedCounter {
+    gate: crate::writer_gate::WriterGate,
     loaded: loader::Loaded,
     namespace: File,
     expected_namespace: NamespaceId,
@@ -202,6 +203,30 @@ impl FocusedCounter {
         limits: CountLimits,
     ) -> Result<Self, CountFailure> {
         limits.validate()?;
+        loader::prepare_focused_count(bytes).map_err(|_| CountFailure::Object)?;
+        if pid == 0 {
+            return Err(CountFailure::Identity);
+        }
+        if limits.window.start_ns == 0 || limits.window.deadline_ns <= limits.window.start_ns {
+            return Err(CountFailure::Object);
+        }
+        let ns = File::open("/proc/self/ns/pid").map_err(|_| CountFailure::Namespace)?;
+        validate_namespace(&ns, namespace)?;
+        let pool = crate::observation_memory::MemoryPool::new(limits.max_state_bytes);
+        let gate =
+            crate::writer_gate::WriterGate::create(&pool).map_err(|_| CountFailure::Object)?;
+        let counter = Self::open_gated(bytes, pid, namespace, limits, gate.clone())?;
+        gate.open().map_err(|_| CountFailure::Object)?;
+        Ok(counter)
+    }
+    pub(crate) fn open_gated(
+        bytes: &[u8],
+        pid: u32,
+        namespace: NamespaceId,
+        limits: CountLimits,
+        gate: crate::writer_gate::WriterGate,
+    ) -> Result<Self, CountFailure> {
+        limits.validate()?;
         if pid == 0 {
             return Err(CountFailure::Identity);
         }
@@ -209,6 +234,7 @@ impl FocusedCounter {
             return Err(CountFailure::Object);
         }
         let mut fold = CountFold::new(limits)?;
+        fold.charge(crate::writer_gate::RESERVATION_BYTES + crate::writer_gate::INJECTION_BYTES)?;
         fold.charge(bytes.len().checked_mul(4).ok_or(CountFailure::Resource)?)?;
         let prepared = loader::prepare_focused_count(bytes).map_err(|_| CountFailure::Object)?;
         let cpus = aya::util::nr_cpus().map_err(|_| CountFailure::Read)?;
@@ -222,12 +248,13 @@ impl FocusedCounter {
         )?;
         let ns = File::open("/proc/self/ns/pid").map_err(|_| CountFailure::Namespace)?;
         validate_namespace(&ns, namespace)?;
-        let loaded = loader::load(&prepared).map_err(|_| CountFailure::Object)?;
+        let loaded = loader::load_gated(&prepared, &gate).map_err(|_| CountFailure::Object)?;
         // Inspect actual kernel FDs before every typed-sized IO, including init.
         for shape in loader::FOCUSED_COUNT_MAPS {
             checked_map(&loaded, shape.name)?;
         }
         let mut counter = Self {
+            gate,
             loaded,
             namespace: ns,
             expected_namespace: namespace,
@@ -260,6 +287,9 @@ impl FocusedCounter {
         Ok(counter)
     }
     fn write(&self, name: &str, key: u32, value: &[u8]) -> Result<(), CountFailure> {
+        if !self.gate.admitting() {
+            return Err(CountFailure::Close);
+        }
         checked_map(&self.loaded, name)?
             .update(&key.to_ne_bytes(), value)
             .map_err(|_| CountFailure::Map)
@@ -404,6 +434,9 @@ impl FocusedCounter {
         installed_ns: u64,
         control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
     ) -> Result<(), CountFailure> {
+        if !self.gate.admitting() {
+            return Err(CountFailure::Close);
+        }
         let hard_deadline = self.limits.window.deadline_ns;
         let checkpoint = |native: bool| {
             use crate::capture::ClockPort;
@@ -755,8 +788,12 @@ impl FocusedCounter {
                 .gaps
                 .push(gap("focused_namespace_failures", sample.namespace_failures));
         }
-        // Concurrent reads are prefixes, not a consistent terminal cut. A
-        // mismatch stays a gap; never invent counts to balance the ledger.
+        // Live reads remain concurrent prefixes. A retained successful delete
+        // makes this a stable writer cut; failed reads/conservation stay gaps.
+        if !self.gate.admitting() && self.gate.receipt().is_none() {
+            sample.gaps.push(gap("focused_cut_unavailable", 1));
+        }
+        // Never invent counts to balance the ledger.
         let counted = SiteExecution::sum_calls(&sample.sites)
             .saturating_add(SiteExecution::sum_calls(&sample.fenced))
             .saturating_add(sample.unattributed)
@@ -817,13 +854,17 @@ impl FocusedCounter {
         check()
     }
     pub fn close(mut self, deadline: Instant) -> CountSample {
-        self.retire();
+        if self.gate.close().is_err() {
+            self.failure(CountFailure::Close);
+        }
+        // Retain links and code guards through the final read; Drop closes links
+        // before releasing those owners. Live retire/fence is a separate policy.
         self.sample(deadline)
     }
 }
 impl Drop for FocusedCounter {
     fn drop(&mut self) {
-        if !self.retired {
+        if !self.retired && self.gate.admitting() {
             let _ = self.write("TARGET", 0, &0u64.to_ne_bytes());
         }
         self.close_links();

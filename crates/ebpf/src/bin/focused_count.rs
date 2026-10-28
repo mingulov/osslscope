@@ -20,6 +20,8 @@
 //! Userspace retains separate ABI-compatible common types.
 #![no_std]
 #![no_main]
+#[path = "../writer_gate.rs"]
+mod writer_gate;
 
 use aya_ebpf::{
     bindings::bpf_pidns_info,
@@ -88,6 +90,9 @@ static LATC: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
 #[uprobe]
 pub fn count_entry(ctx: ProbeContext) -> u32 {
     let t0 = unsafe { helpers::bpf_ktime_get_ns() };
+    if !writer_gate::admitted() {
+        return 0;
+    }
     let target = match TARGET.get(0) {
         Some(t) if *t != 0 => *t,
         _ => return 0,

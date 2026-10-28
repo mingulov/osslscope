@@ -239,6 +239,9 @@ struct Target {
     ready: bool,
 }
 pub struct ProviderSession {
+    gate: crate::writer_gate::WriterGate,
+    final_drain: bool,
+    final_refusals: BTreeMap<u32, ObservationGap>,
     loaded: loader::Loaded,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
@@ -401,6 +404,47 @@ fn retire_source_owners(
     }
     preserve
 }
+fn final_source_refusals(
+    targets: &BTreeMap<u32, Target>,
+    startup: &BTreeMap<u32, Vec<Attachment>>,
+    b: &mut ObservationBatch,
+    deadline: Instant,
+) -> BTreeMap<u32, ObservationGap> {
+    let mut refusals = BTreeMap::new();
+    // Retain every immutable owner. A terminal original may authorize
+    // queued records, but ordinary unavailability cannot become history.
+    for (&pid, target) in targets {
+        if Instant::now() >= deadline {
+            refusals.insert(pid, ObservationGap::DrainOverrun);
+            b.gap(ObservationGap::DrainOverrun);
+            continue;
+        }
+        if let Some(gap) = process_retirement_gap(&target.process) {
+            let rows = startup.get(&pid).map_or(&[][..], Vec::as_slice);
+            let terminal = !rejects_history(gap)
+                && recorded_refusal(&target.process).is_none()
+                && terminal_originals(rows, Some(target), None) == Ok(true);
+            if !terminal {
+                refusals.insert(pid, gap);
+            }
+            b.gap(gap);
+        }
+    }
+    for (&pid, rows) in startup {
+        for attachment in rows {
+            if Instant::now() >= deadline {
+                refusals.insert(pid, ObservationGap::DrainOverrun);
+                b.gap(ObservationGap::DrainOverrun);
+                break;
+            }
+            if let Err(gap) = attachment.site.revalidate_queued() {
+                refusals.insert(pid, gap);
+                b.gap(gap);
+            }
+        }
+    }
+    refusals
+}
 struct RecordBinding<'a> {
     attachment: &'a Attachment,
     starttime: u64,
@@ -467,6 +511,7 @@ fn map(loaded: &loader::Loaded, name: &str) -> Result<Map, ObservationGap> {
 }
 pub(crate) fn specs() -> Vec<loader::MapSpec> {
     let shapes = [
+        ("ADMIT", 12, 4, 4, 1),
         ("EVENTS", 27, 0, 0, 1 << 20),
         ("CONFIG", 1, 8, 24, 1024),
         ("MEMBERS", 1, 4, 24, 64),
@@ -538,6 +583,23 @@ impl ProviderSession {
         budget: ObservationBudget,
         object: &[u8],
     ) -> Result<Self, ObservationGap> {
+        prepare_object(object)?;
+        budget.state(crate::writer_gate::RESERVATION_BYTES)?;
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        let session = Self::open_gated(budget, object, gate.clone())?;
+        gate.open().map_err(|_| ObservationGap::BpfUnavailable)?;
+        Ok(session)
+    }
+    pub(crate) fn open_gated(
+        budget: ObservationBudget,
+        object: &[u8],
+        gate: crate::writer_gate::WriterGate,
+    ) -> Result<Self, ObservationGap> {
+        budget.state(crate::writer_gate::INJECTION_BYTES)?;
         let limits = &budget.limits;
         let max = ObservationLimits::default();
         if object.len() > 16 << 20 {
@@ -570,7 +632,8 @@ impl ProviderSession {
                 m.max_entries = budget.limits.max_processes.max(1) as u32;
             }
         }
-        let loaded = loader::load(&prepared).map_err(|_| ObservationGap::BpfUnavailable)?;
+        let loaded =
+            loader::load_gated(&prepared, &gate).map_err(|_| ObservationGap::BpfUnavailable)?;
         crate::discovery::initialize_classifier_maps(
             &loaded.maps,
             crate::discovery::ClassifierRole::Harvest,
@@ -606,6 +669,9 @@ impl ProviderSession {
             )
             .map_err(|_| ObservationGap::BpfUnavailable)?;
         Ok(Self {
+            gate,
+            final_drain: false,
+            final_refusals: BTreeMap::new(),
             api_totals: PerCpuHashMap::try_from(map(&loaded, "API_TOTALS")?)
                 .map_err(|_| ObservationGap::InvalidObject)?,
             api_window,
@@ -657,6 +723,9 @@ impl ProviderSession {
         existing: usize,
         generation: u64,
     ) -> Result<Attachment, ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
         if self.link_count() + existing + 2 > self.budget.limits.max_links {
             return Err(ObservationGap::LinkLimit);
         }
@@ -739,6 +808,11 @@ impl ProviderSession {
         gap: ObservationGap,
         b: &mut ObservationBatch,
     ) -> bool {
+        if self.final_drain {
+            self.final_refusals.insert(pid, gap);
+            b.gap(gap);
+            return false;
+        }
         self.refreshing.remove(&pid);
         retire_source_owners(
             (&mut self.startup, &mut self.targets),
@@ -788,7 +862,8 @@ impl ProviderSession {
         records: &[inventory::ProcessRecord],
     ) -> ObservationBatch {
         let mut b = ObservationBatch::default();
-        if self.closed {
+        if self.closed || self.final_drain || !self.gate.admitting() {
+            b.gap(ObservationGap::Invalidated);
             return b;
         }
         let invalid_refresh: Vec<_> = self
@@ -1107,44 +1182,63 @@ impl ProviderSession {
             b.gap(ObservationGap::SnapshotLag)
         }
         self.last_drain = Instant::now();
-        let retired: Vec<_> = self
-            .targets
-            .iter()
-            .filter_map(|(&pid, t)| process_retirement_gap(&t.process).map(|g| (pid, g)))
-            .collect();
-        for (pid, gap) in retired {
-            self.retire_for_gap(pid, None, gap, &mut b);
-            b.gap(gap);
-        }
         if !self.startup.is_empty() {
             b.gap(ObservationGap::FirstQueryUnknown);
             b.gap(ObservationGap::SamplingPartial);
         }
+        if self.final_drain {
+            self.final_refusals.extend(final_source_refusals(
+                &self.targets,
+                &self.startup,
+                &mut b,
+                deadline,
+            ));
+        }
         let mut terminal = Vec::new();
-        let validation: Vec<_> = self
-            .startup
-            .iter()
-            .map(|(&pid, rows)| {
-                let mut exited = false;
-                let result = rows.iter().try_for_each(|a| {
-                    exited |= a.site.revalidate_queued()?;
-                    Ok::<_, ObservationGap>(())
-                });
-                (pid, result.map(|()| exited))
-            })
-            .collect();
-        for (pid, result) in validation {
-            match result {
-                Err(gap) => {
-                    self.retire_for_gap(pid, None, gap, &mut b);
-                    b.gap(gap);
-                }
-                Ok(true) => {
-                    if self.retire_for_gap(pid, None, ObservationGap::ProcessUnavailable, &mut b) {
-                        terminal.push(pid);
+        if !self.final_drain {
+            let retired: Vec<_> = self
+                .targets
+                .iter()
+                .filter_map(|(&pid, t)| process_retirement_gap(&t.process).map(|g| (pid, g)))
+                .collect();
+            for (pid, gap) in retired {
+                self.retire_for_gap(pid, None, gap, &mut b);
+                b.gap(gap);
+            }
+            if !self.startup.is_empty() {
+                b.gap(ObservationGap::FirstQueryUnknown);
+                b.gap(ObservationGap::SamplingPartial);
+            }
+            let validation: Vec<_> = self
+                .startup
+                .iter()
+                .map(|(&pid, rows)| {
+                    let mut exited = false;
+                    let result = rows.iter().try_for_each(|a| {
+                        exited |= a.site.revalidate_queued()?;
+                        Ok::<_, ObservationGap>(())
+                    });
+                    (pid, result.map(|()| exited))
+                })
+                .collect();
+            for (pid, result) in validation {
+                match result {
+                    Err(gap) => {
+                        self.retire_for_gap(pid, None, gap, &mut b);
+                        b.gap(gap);
                     }
+                    Ok(true) => {
+                        if self.retire_for_gap(
+                            pid,
+                            None,
+                            ObservationGap::ProcessUnavailable,
+                            &mut b,
+                        ) {
+                            terminal.push(pid);
+                        }
+                    }
+                    Ok(false) => (),
                 }
-                Ok(false) => (),
             }
         }
         loop {
@@ -1207,6 +1301,10 @@ impl ProviderSession {
     }
     fn consume(&mut self, event: wire::Transport, b: &mut ObservationBatch) {
         let r = event.record();
+        if let Some(&gap) = self.final_refusals.get(&r.pid) {
+            b.gap(gap);
+            return;
+        }
         let binding = match record_binding(&self.targets, &self.startup, &r) {
             Ok(Some(binding)) => binding,
             Ok(None) => return,
@@ -1229,7 +1327,16 @@ impl ProviderSession {
         let Some(mut payload) = assemble_payload(event, &mut self.aliases, &self.budget, b) else {
             return;
         };
-        if r.code != 0 {
+        if self.final_drain && r.code != 0 {
+            // Close-only decoding never relocates code or attaches a discovered
+            // role. Keep finite metadata while marking its backing unavailable.
+            b.gap(ObservationGap::RelocationRefused);
+            if r.kind == c::INIT {
+                b.gap(ObservationGap::FirstQueryUnknown);
+                return;
+            }
+        }
+        if r.code != 0 && !self.final_drain {
             let Some(process) = binding.process else {
                 b.gap(ObservationGap::RelocationRefused);
                 return;
@@ -1448,6 +1555,9 @@ impl ProviderSession {
         }
     }
     pub(crate) fn set_api_window(&mut self, start: u64, end: u64) -> Result<(), ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
         self.api_window
             .set(0, c::Range { start, end }, 0)
             .map_err(|_| ObservationGap::BpfUnavailable)
@@ -1467,6 +1577,9 @@ impl ProviderSession {
         deadline: Instant,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(), ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
         let mut resolved = Vec::new();
         for site in sites {
             let (api, site) = site.into_parts();
@@ -1574,43 +1687,54 @@ impl ProviderSession {
         self.close_until(Instant::now() + Duration::from_millis(100))
     }
     pub(crate) fn close_until(mut self, deadline: Instant) -> ObservationBatch {
+        self.finalize_until(deadline)
+    }
+    // The combined physical/metadata owner keeps this session alive through
+    // its physical snapshot; standalone close disposes only after this returns.
+    pub(crate) fn finalize_until(&mut self, deadline: Instant) -> ObservationBatch {
+        self.final_drain = true;
+        if self.gate.close().is_err() {
+            let mut b = ObservationBatch::default();
+            b.gap(ObservationGap::BpfUnavailable);
+            b.gap(ObservationGap::IntervalUnknown);
+            return b;
+        }
+        // Store the receipt in the shared owner before fallible drain/read.
+        // Final decoding uses its own bounded budget, not the expired live tick.
+        self.budget.set_deadline(deadline);
         let mut b = self.drain(deadline);
-        let pids: Vec<_> = self.targets.keys().copied().collect();
-        for pid in pids {
-            self.retire(pid, &mut b)
-        }
-        let pids: Vec<_> = self.startup.keys().copied().collect();
-        for pid in pids {
-            self.retire(pid, &mut b);
-        }
+        b.gap(ObservationGap::IntervalUnknown); // in-flight returns are not synthesized
         for (&cookie, &(pid, starttime, api)) in &self.api_owners {
-            match self
-                .api_totals
-                .get(&cookie, 0)
-                .map_err(|_| ObservationGap::InvalidWire)
-                .and_then(|values| {
-                    let mut total = c::ApiAggregate::default();
-                    for v in values.iter() {
-                        macro_rules! sum {
-                            ($field:ident) => {
-                                total.$field = total
-                                    .$field
-                                    .checked_add(v.$field)
-                                    .ok_or(ObservationGap::InvalidWire)?;
-                            };
-                        }
-                        sum!(entries);
-                        sum!(success);
-                        sum!(failure);
-                        sum!(mismatch);
-                        sum!(unsupported);
-                        sum!(unsupported_return);
-                        sum!(map);
-                        sum!(depth);
-                        sum!(unpaired);
+            let values = if Instant::now() >= deadline {
+                Err(ObservationGap::DrainOverrun)
+            } else {
+                self.api_totals
+                    .get(&cookie, 0)
+                    .map_err(|_| ObservationGap::InvalidWire)
+            };
+            match values.and_then(|values| {
+                let mut total = c::ApiAggregate::default();
+                for v in values.iter() {
+                    macro_rules! sum {
+                        ($field:ident) => {
+                            total.$field = total
+                                .$field
+                                .checked_add(v.$field)
+                                .ok_or(ObservationGap::InvalidWire)?;
+                        };
                     }
-                    wire::activity(api, total)
-                }) {
+                    sum!(entries);
+                    sum!(success);
+                    sum!(failure);
+                    sum!(mismatch);
+                    sum!(unsupported);
+                    sum!(unsupported_return);
+                    sum!(map);
+                    sum!(depth);
+                    sum!(unpaired);
+                }
+                wire::activity(api, total)
+            }) {
                 Ok(row) => b.api_activity.push(ProcessApiActivity {
                     pid,
                     starttime,
@@ -1631,13 +1755,23 @@ impl ProviderSession {
                 }
             }
         }
-        self.refreshing.clear();
         self.closed = true;
         b
     }
 }
 impl Drop for ProviderSession {
     fn drop(&mut self) {
+        if self.final_drain || !self.gate.admitting() {
+            for a in self
+                .startup
+                .values_mut()
+                .flatten()
+                .chain(self.targets.values_mut().flat_map(|t| &mut t.attachments))
+            {
+                a.links.clear();
+            }
+            return;
+        }
         let pids: Vec<_> = self
             .targets
             .keys()
@@ -2949,6 +3083,51 @@ mod startup_api_controls {
             _mapping: mapping,
             _file: f,
             budget,
+        }
+    }
+    #[test]
+    fn final_cut_validation_retains_terminal_owners_and_permanent_refusals() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for poisoned in [false, true] {
+            let mut fixture = reconcile_fixture(true);
+            let pid = fixture.child.pid();
+            if poisoned {
+                fixture.targets[&pid]
+                    .process
+                    .remember_refusal(ObservationGap::ObjectChanged);
+            }
+            fixture.child.finish_observation().unwrap();
+            let mut batch = ObservationBatch::default();
+            let refused = final_source_refusals(
+                &fixture.targets,
+                &fixture.startup,
+                &mut batch,
+                Instant::now() + Duration::from_secs(2),
+            );
+            assert_eq!(
+                refused.get(&pid).copied(),
+                poisoned.then_some(ObservationGap::ObjectChanged)
+            );
+            // Validation must not close links or erase binding owners, including
+            // rejected sources: disposal belongs after bounded decode/seal.
+            assert_eq!(fixture.targets[&pid].attachments.len(), 1);
+            use std::io::Read;
+            assert_eq!(
+                fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            let r = c::Record {
+                pid,
+                cookie: 81,
+                api: c::PUBLIC_QUERY,
+                generation: 19,
+                ..Default::default()
+            };
+            assert!(
+                record_binding(&fixture.targets, &fixture.startup, &r)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
     #[test]

@@ -49,3 +49,5 @@ pub(crate) mod startup_objects;
 pub mod api_activity;
 
 pub mod crypto_watch;
+
+pub(crate) mod writer_gate;

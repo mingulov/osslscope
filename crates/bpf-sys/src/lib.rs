@@ -236,6 +236,68 @@ pub fn map_create(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Create the single-slot writer admission outer map. The template is an
+/// observer-owned ARRAY (u32 key, u64 value, one entry), never a target value.
+pub fn writer_gate_outer(inner: &OwnedFd) -> io::Result<OwnedFd> {
+    use std::os::fd::AsRawFd;
+    let mut attr: MapAttr = zeroed();
+    attr.map_type = 12; // BPF_MAP_TYPE_ARRAY_OF_MAPS
+    attr.key_size = 4;
+    attr.value_size = 4;
+    attr.max_entries = 1;
+    attr.inner_map_fd = inner.as_raw_fd() as u32;
+    attr.map_name[..5].copy_from_slice(b"ADMIT");
+    let fd = bpf(
+        BPF_MAP_CREATE,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<MapAttr>(),
+    )?;
+    // SAFETY: successful creation returns a fresh descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Delete slot zero of a typed writer outer map. Success includes the kernel's
+/// map-in-map RCU wait; ENOENT is an error, never a closure receipt.
+///
+/// # Safety
+/// `outer` must be the ARRAY_OF_MAPS returned by `writer_gate_outer`.
+pub unsafe fn writer_gate_delete(outer: RawFd) -> io::Result<()> {
+    let key = 0u32;
+    let mut attr: ElemAttr = zeroed();
+    attr.map_fd = outer as u32;
+    attr.key = std::ptr::addr_of!(key) as u64;
+    bpf(
+        3,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<ElemAttr>(),
+    )?;
+    Ok(())
+}
+
+/// Finite kernel map identities only. No program text, pointers or map values.
+pub fn prog_map_ids(fd: RawFd) -> io::Result<Vec<u32>> {
+    let mut ids = [0u32; 64];
+    let mut info = [0u64; 8];
+    // bpf_prog_info: nr_map_ids@52, map_ids@56. No optional trailing fields.
+    info[6] = 64u64 << 32;
+    info[7] = ids.as_mut_ptr() as u64;
+    let mut attr = InfoAttr {
+        bpf_fd: fd as u32,
+        info_len: 64,
+        info: info.as_mut_ptr() as u64,
+    };
+    bpf(
+        BPF_OBJ_GET_INFO_BY_FD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<InfoAttr>(),
+    )?;
+    let n = (info[6] >> 32) as usize;
+    if n > ids.len() || n == 0 {
+        return Err(io::Error::other("program map inventory unavailable"));
+    }
+    Ok(ids[..n].to_vec())
+}
+
 /// Update one map element (`GEN`/`TARGET` programming). `flags` is
 /// `BPF_ANY` (create-or-update) or `BPF_NOEXIST` (must-create).
 ///
@@ -439,6 +501,9 @@ pub fn prog_load_kprobe_quiet(
     if token.is_some() {
         attr.prog_flags |= BPF_F_TOKEN_FD;
     }
+    if attr.prog_flags & (1 << 4) != 0 {
+        return Err(io::Error::other("sleepable producer refused"));
+    }
     let fd = bpf(
         BPF_PROG_LOAD,
         std::ptr::addr_of_mut!(attr).cast(),
@@ -486,6 +551,9 @@ pub fn prog_load_kprobe(
     attr.prog_token_fd = token.unwrap_or(0);
     if token.is_some() {
         attr.prog_flags |= BPF_F_TOKEN_FD;
+    }
+    if attr.prog_flags & (1 << 4) != 0 {
+        return Err(io::Error::other("sleepable producer refused"));
     }
     let fd = bpf(
         BPF_PROG_LOAD,

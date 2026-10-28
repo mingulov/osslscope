@@ -2494,14 +2494,32 @@ fn load_prog(
 }
 
 pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
-    load_with_custody(prep, None)
+    load_with_custody(prep, None, None)
+}
+/// The only admission path for the two shared writer object types.
+pub(crate) fn load_gated(
+    prep: &Prepared,
+    gate: &crate::writer_gate::WriterGate,
+) -> anyhow::Result<Loaded> {
+    anyhow::ensure!(
+        prep.maps.iter().filter(|m| m.name == "ADMIT").count() == 1,
+        "missing shared writer map"
+    );
+    anyhow::ensure!(
+        prep.progs.iter().all(|p| matches!(
+            p.name.as_str(),
+            "count_entry" | "observation_entry" | "observation_return"
+        ) && p.map_fixups.iter().any(|f| f.map == "ADMIT")),
+        "ungated producer root"
+    );
+    load_with_custody(prep, None, Some(gate))
 }
 pub(crate) fn load_controlled(
     prep: &Prepared,
     links: &crate::capture_setup::SetupLinks,
     stage: crate::capture::BoundaryStage,
 ) -> anyhow::Result<Loaded> {
-    load_with_custody(prep, Some((links, stage)))
+    load_with_custody(prep, Some((links, stage)), None)
 }
 #[cfg(test)]
 thread_local! {static HOST_NATIVE_MAP:std::cell::RefCell<Option<OwnedFd>>=const {std::cell::RefCell::new(None)};}
@@ -2557,7 +2575,12 @@ fn load_with_custody(
         &crate::capture_setup::SetupLinks,
         crate::capture::BoundaryStage,
     )>,
+    gate: Option<&crate::writer_gate::WriterGate>,
 ) -> anyhow::Result<Loaded> {
+    anyhow::ensure!(
+        gate.is_some() || !prep.maps.iter().any(|m| m.name == "ADMIT"),
+        "shared writer map requires typed injection"
+    );
     crate::lifecycle_producer::note_acquisition()?;
     use anyhow::Context as _;
     let loaded = Loaded {
@@ -2576,7 +2599,11 @@ fn load_with_custody(
                 if let Some((links, stage)) = setup {
                     links.check_owned(stage)?;
                 }
-                let fd = create_native_map(m).with_context(|| format!("map_create {}", m.name))?;
+                let fd = if m.name == "ADMIT" {
+                    gate.context("shared gate missing")?.inject(m)?
+                } else {
+                    create_native_map(m).with_context(|| format!("map_create {}", m.name))?
+                };
                 loaded.maps.insert(m.name.clone(), fd);
             }
             for p in &prep.progs {
@@ -2584,6 +2611,9 @@ fn load_with_custody(
                     links.check_owned(stage)?;
                 }
                 let fd = load_prog(p, &loaded.maps, true, setup)?;
+                if let Some(gate) = gate {
+                    gate.attest(&fd)?;
+                }
                 loaded.progs.insert(p.name.clone(), fd);
             }
             Ok(())
@@ -2627,6 +2657,13 @@ pub struct FailedProg {
 /// all-rejected object must not fill the temp dir; every failure
 /// still carries its 2000-char summary in `error`).
 pub fn load_keep_good(prep: &Prepared) -> anyhow::Result<(Loaded, Vec<FailedProg>)> {
+    anyhow::ensure!(
+        !prep
+            .maps
+            .iter()
+            .any(|m| m.name == "ADMIT" || m.map_type == 12),
+        "shared writer gate requires typed all-root loading"
+    );
     crate::lifecycle_producer::note_acquisition()?;
     use anyhow::Context as _;
     let mut maps = HashMap::new();
@@ -6243,7 +6280,8 @@ mod fix1_event_tests {
 
 /// Focused Count adds only the public observer PID-namespace helper contract.
 /// The legacy seven-map Count owner/validators remain independent.
-pub const FOCUSED_COUNT_MAPS: [MapSpec; 9] = [
+pub const FOCUSED_COUNT_MAPS: [MapSpec; 10] = [
+    crate::writer_gate::SPEC,
     COUNT_MAPS[0],
     COUNT_MAPS[1],
     COUNT_MAPS[2],
@@ -6273,7 +6311,7 @@ pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
     validate_count_object(object)?;
     let prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
     anyhow::ensure!(
-        prepared.maps.len() == 9 && prepared.progs.len() == 1,
+        prepared.maps.len() == 10 && prepared.progs.len() == 1,
         "focused shape"
     );
     let root = &prepared.progs[0];

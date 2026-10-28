@@ -395,6 +395,7 @@ pub(crate) fn process_batch(
 /// Reusable bounded process observation. Fields close counter/provider links
 /// before releasing original owned custody, including error/drop paths.
 pub(crate) struct FocusedSession {
+    gate: Option<crate::writer_gate::WriterGate>,
     counter: Option<FocusedCounter>,
     session: Option<ProviderSession>,
     _foreign: Option<crate::provider_observation::objects::ProcessIncarnation>,
@@ -644,11 +645,26 @@ impl FocusedSession {
         .map_err(|_| TargetUnavailable)?;
         scanner.set_memory_pool(pool);
         let mut gaps = BTreeSet::new();
-        let mut session = if objects.observation.is_empty() {
+        let gate = if objects.observation.is_empty() && objects.count.is_empty() {
+            None
+        } else {
+            match crate::writer_gate::WriterGate::create(&reservation.pool()) {
+                Ok(gate) => Some(gate),
+                Err(_) => {
+                    gaps.insert(ObservationGap::BpfUnavailable);
+                    None
+                }
+            }
+        };
+        let mut session = if objects.observation.is_empty() || gate.is_none() {
             gaps.insert(ObservationGap::BpfUnavailable);
             None
         } else {
-            match ProviderSession::open_budgeted(budget.clone(), &objects.observation) {
+            match ProviderSession::open_gated(
+                budget.clone(),
+                &objects.observation,
+                gate.as_ref().unwrap().clone(),
+            ) {
                 Ok(s) => Some(s),
                 Err(gap) => {
                     gaps.insert(gap);
@@ -694,12 +710,12 @@ impl FocusedSession {
                 end.saturating_duration_since(now).as_nanos(),
             )?)
             .context("focused admission overflow")?;
-        let mut counter = if objects.count.is_empty() {
+        let mut counter = if objects.count.is_empty() || gate.is_none() {
             gaps.insert(ObservationGap::BpfUnavailable);
             None
         } else {
             match observer_namespace() {
-                Ok(namespace) => match FocusedCounter::open(
+                Ok(namespace) => match FocusedCounter::open_gated(
                     &objects.count,
                     pid,
                     namespace,
@@ -711,6 +727,7 @@ impl FocusedSession {
                         max_state_bytes: 24 << 20,
                         ..Default::default()
                     },
+                    gate.as_ref().unwrap().clone(),
                 ) {
                     Ok(c) => Some(c),
                     Err(_) => {
@@ -767,10 +784,14 @@ impl FocusedSession {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
             bail!("focused setup interrupted or expired");
         }
+        if let Some(gate) = &gate {
+            gate.open()?;
+        }
         if let Some(child) = &mut owned.1 {
             child.release_retaining_exit()?;
         }
         Ok(Self {
+            gate,
             counter,
             session,
             _foreign: foreign,
@@ -972,33 +993,31 @@ impl FocusedSession {
     pub(crate) fn stop_admission(&mut self, cancel: &AtomicBool) {
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         self.pending = None;
-        if let Some(counter) = &mut self.counter {
-            counter.retire();
-        }
-        if let Some(session) = &mut self.session {
-            match now_ns().and_then(|cut| {
-                session
-                    .set_api_window(self.start_ns, cut.min(self.deadline_ns))
-                    .map_err(|_| anyhow::anyhow!("API admission stop failed"))
-            }) {
-                Ok(()) => (),
-                Err(_) => {
-                    self.gaps.insert(ObservationGap::AttachFailed);
-                }
+        if let Some(gate) = &self.gate {
+            if gate.close().is_err() {
+                self.gaps.insert(ObservationGap::BpfUnavailable);
             }
         }
     }
     pub(crate) fn finish(mut self, deadline: Instant) -> anyhow::Result<FocusedResult> {
         self.pending = None;
-        let end_ns = now_ns()?.min(self.deadline_ns);
-        // Close admission/links first. Neither close nor equal map reads prove a
-        // terminal cut; keep a single bounded cumulative final read and its gaps.
-        if let Some(c) = &mut self.counter {
-            c.retire();
+        // One successful map-in-map delete closes metadata, API and physical
+        // writers together. Keep all binding owners until drain/snapshot finish.
+        if let Some(gate) = &self.gate {
+            if gate.close().is_err() {
+                self.gaps.insert(ObservationGap::BpfUnavailable);
+            }
+            if Instant::now() >= deadline {
+                self.gaps.insert(ObservationGap::DrainOverrun);
+            }
         }
+        let end_ns = now_ns()?.min(self.deadline_ns);
         let mut api_activity = Vec::new();
-        if let Some(s) = self.session.take() {
-            let batch = s.close_until(deadline);
+        if let Some(s) = self.session.as_mut() {
+            let batch = s.finalize_until(deadline);
+            if batch_invalidates_advertisements(&batch, self.pid) {
+                self.gaps.insert(ObservationGap::Invalidated);
+            }
             self.gaps.extend(batch.gaps);
             api_activity = batch
                 .api_activity

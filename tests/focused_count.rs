@@ -270,7 +270,7 @@ fn actual_focused_object_shape_privacy_and_namespace_guard() {
         .expect("set OSSLSCOPE_FOCUSED_COUNT_OBJECT to the freshly built object");
     let bytes = std::fs::read(path).expect("read focused BPF object");
     let prepared = osslscope::loader::prepare_focused_count(&bytes).unwrap();
-    assert_eq!(prepared.maps.len(), 9);
+    assert_eq!(prepared.maps.len(), 10);
     assert_eq!(prepared.progs.len(), 1);
     let helpers: Vec<u32> = prepared.progs[0]
         .insns
