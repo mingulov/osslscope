@@ -23,6 +23,7 @@ pub enum TableGap {
     Bounds,
     Malformed,
     Resource,
+    Deadline,
     Changed,
 }
 #[derive(Clone, Copy)]
@@ -279,7 +280,7 @@ impl Reader<'_> {
                     return Err(TableGap::Resource);
                 }
                 if let Some(b) = self.budget {
-                    b.read(valid as u64).map_err(|_| TableGap::Resource)?;
+                    b.read(valid as u64).map_err(budget_gap)?;
                 }
                 self.read.set(next);
                 self.file
@@ -608,6 +609,7 @@ impl Elf<'_> {
                         Err(TableGap::UnsupportedRelocation) if unresolved => {
                             RelocationTarget::UnresolvedFunction
                         }
+                        Err(TableGap::Deadline) => return Err(TableGap::Deadline),
                         Err(gap) => RelocationTarget::Rejected(gap),
                     };
                     m.push(&mut self.relocations, Relocation { slot, target })?;
@@ -883,7 +885,9 @@ impl Elf<'_> {
     fn algorithm_implementation(&self, address: u64) -> Result<Option<u64>, TableGap> {
         match self.pointer(address) {
             Ok(pointer) => Ok(Some(pointer)),
-            Err(gap @ (TableGap::Resource | TableGap::Io | TableGap::Changed)) => Err(gap),
+            Err(
+                gap @ (TableGap::Resource | TableGap::Deadline | TableGap::Io | TableGap::Changed),
+            ) => Err(gap),
             Err(_) => Ok(None),
         }
     }
@@ -996,6 +1000,13 @@ pub(crate) fn discover_tables_budgeted(
 ) -> Result<TableDiscovery, TableGap> {
     discover(file, limits, Some(budget))
 }
+fn budget_gap(gap: super::schema::ObservationGap) -> TableGap {
+    if gap == super::schema::ObservationGap::SnapshotLag {
+        TableGap::Deadline
+    } else {
+        TableGap::Resource
+    }
+}
 fn discover(
     file: &File,
     limits: TableLimits,
@@ -1010,10 +1021,12 @@ fn discover(
     }
     // Reserve the entire metadata ceiling before any parser allocation; live
     // callers share this cumulative charge with other retained-object work.
-    if let Some(b) = budget {
-        b.state(limits.max_metadata_bytes)
-            .map_err(|_| TableGap::Resource)?;
-    }
+    let reservation = budget
+        .map(|b| {
+            b.reserve_state(limits.max_metadata_bytes)
+                .map_err(budget_gap)
+        })
+        .transpose()?;
     let mut m = Memory {
         used: 0,
         limit: limits.max_metadata_bytes,
@@ -1199,7 +1212,7 @@ fn discover(
                         }
                         m.push(&mut result.tables, table)?;
                     }
-                    Err(TableGap::Resource) => return Err(TableGap::Resource),
+                    Err(gap @ (TableGap::Resource | TableGap::Deadline)) => return Err(gap),
                     Err(gap) => {
                         if !result.gaps.contains(&gap) {
                             m.push(&mut result.gaps, gap)?;
@@ -1293,7 +1306,9 @@ fn discover(
                                 }
                                 m.push(&mut result.algorithms, algorithm)?;
                             }
-                            Err(TableGap::Resource) => return Err(TableGap::Resource),
+                            Err(gap @ (TableGap::Resource | TableGap::Deadline)) => {
+                                return Err(gap);
+                            }
                             Err(gap) => {
                                 if !result.gaps.contains(&gap) {
                                     m.push(&mut result.gaps, gap)?;
@@ -1338,6 +1353,9 @@ fn discover(
     result.gaps.sort_unstable();
     if stamp(&before) != stamp(&file.metadata().map_err(|_| TableGap::Changed)?) {
         return Err(TableGap::Changed);
+    }
+    if let Some(reservation) = reservation {
+        reservation.retain();
     }
     Ok(result)
 }

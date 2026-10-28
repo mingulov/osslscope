@@ -30,6 +30,11 @@ const PARSER_STATE_BYTES: usize = MAX_HEADERS * std::mem::size_of::<Segment>()
     + std::mem::size_of::<ElfObject>()
     + 64;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static EXPIRE_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static EXPIRE_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, PartialEq, Eq)]
@@ -85,26 +90,47 @@ struct Object {
 }
 impl Object {
     fn parsed(&self, budget: &ObservationBudget) -> Result<&ElfObject, ObservationGap> {
+        if self.parsed.get().is_none() {
+            self.unchanged()?;
+            let mut fd = self
+                .file
+                .try_clone()
+                .map_err(|_| ObservationGap::BackingUnavailable)?;
+            let parsed = parse_object(&mut fd, self.expected.as_ref(), budget);
+            if matches!(parsed, Err(ObservationGap::SnapshotLag)) {
+                return Err(ObservationGap::SnapshotLag);
+            }
+            let _ = self.parsed.set(parsed);
+        }
         self.parsed
-            .get_or_init(|| {
-                if Stamp::of(
-                    &self
-                        .file
-                        .metadata()
-                        .map_err(|_| ObservationGap::ObjectChanged)?,
-                ) != self.stamp
-                {
-                    return Err(ObservationGap::ObjectChanged);
-                }
-                let mut fd = self
-                    .file
-                    .try_clone()
-                    .map_err(|_| ObservationGap::BackingUnavailable)?;
-                parse_object(&mut fd, self.expected.as_ref(), budget)
-            })
+            .get()
+            .expect("cached nontransient parse")
             .as_ref()
             .map_err(|gap| *gap)
     }
+    fn tables(&self, budget: &ObservationBudget) -> Result<&TableDiscovery, ObservationGap> {
+        if self.tables.get().is_none() {
+            let tables =
+                static_tables::discover_tables_budgeted(&self.file, TableLimits::default(), budget)
+                    .map_err(|g| match g {
+                        static_tables::TableGap::Deadline => ObservationGap::SnapshotLag,
+                        static_tables::TableGap::Resource => ObservationGap::ReadLimit,
+                        static_tables::TableGap::Changed => ObservationGap::ObjectChanged,
+                        static_tables::TableGap::Io => ObservationGap::BackingUnavailable,
+                        _ => ObservationGap::MalformedElf,
+                    });
+            if matches!(tables, Err(ObservationGap::SnapshotLag)) {
+                return Err(ObservationGap::SnapshotLag);
+            }
+            let _ = self.tables.set(tables);
+        }
+        self.tables
+            .get()
+            .expect("cached nontransient discovery")
+            .as_ref()
+            .map_err(|gap| *gap)
+    }
+
     fn unchanged(&self) -> Result<(), ObservationGap> {
         if Stamp::of(
             &self
@@ -362,6 +388,13 @@ pub struct ApiSite {
     pub site: VerifiedSite,
 }
 /// Procdir/pidfd and descriptors remain owned through all cloned sites.
+#[derive(Default)]
+struct StaticDiscovery {
+    mapping: usize,
+    locator: usize,
+    emitted: bool,
+    candidates: Vec<VerifiedStaticCandidate>,
+}
 pub struct VerifiedProcess {
     process: Rc<Process>,
     mappings: Vec<(Mapping, Rc<Object>)>,
@@ -369,8 +402,10 @@ pub struct VerifiedProcess {
     generation: u64,
     budget: ObservationBudget,
     gaps: RefCell<std::collections::BTreeSet<ObservationGap>>,
+    static_discovery: RefCell<StaticDiscovery>,
 }
 struct Process {
+    _admission: Option<super::schema::ProcessAdmission>,
     directory: File,
     pid: u32,
     pidfd: File,
@@ -502,30 +537,24 @@ impl VerifiedProcess {
         budget: &ObservationBudget,
     ) -> Result<Vec<VerifiedStaticCandidate>, ObservationGap> {
         self.revalidate()?;
-        let mut candidates = Vec::new();
-        let mut seen = std::collections::BTreeSet::new();
-        for (_, object) in &self.mappings {
-            if !seen.insert((object.stamp.native, object.stamp.inode)) {
+        let mut discovery = self.static_discovery.borrow_mut();
+        while discovery.mapping < self.mappings.len() {
+            let index = discovery.mapping;
+            let object = &self.mappings[index].1;
+            if self.mappings[..index]
+                .iter()
+                .any(|(_, prior)| Rc::ptr_eq(prior, object))
+            {
+                discovery.mapping += 1;
                 continue;
             }
             object.unchanged()?;
-            let tables = object.tables.get_or_init(|| {
-                static_tables::discover_tables_budgeted(
-                    &object.file,
-                    TableLimits::default(),
-                    budget,
-                )
-                .map_err(|g| match g {
-                    static_tables::TableGap::Resource => ObservationGap::ReadLimit,
-                    static_tables::TableGap::Changed => ObservationGap::ObjectChanged,
-                    static_tables::TableGap::Io => ObservationGap::BackingUnavailable,
-                    _ => ObservationGap::MalformedElf,
-                })
-            });
-            let tables = match tables {
+            let tables = match object.tables(budget) {
                 Ok(t) => t,
+                Err(ObservationGap::SnapshotLag) => return Err(ObservationGap::SnapshotLag),
                 Err(g) => {
-                    self.gaps.borrow_mut().insert(*g);
+                    self.gaps.borrow_mut().insert(g);
+                    discovery.mapping += 1;
                     continue;
                 }
             };
@@ -536,19 +565,24 @@ impl VerifiedProcess {
             }
             let parsed = match object.parsed(budget) {
                 Ok(p) => p,
+                Err(ObservationGap::SnapshotLag) => return Err(ObservationGap::SnapshotLag),
                 Err(g) => {
                     self.gaps.borrow_mut().insert(g);
+                    discovery.mapping += 1;
                     continue;
                 }
             };
-            for locator in tables.candidates() {
+            for locator in tables.candidates().skip(discovery.locator) {
                 if !self.mappings.iter().any(|(m, o)| {
                     Rc::ptr_eq(o, object) && mapping_contains_offset(m, locator.file_offset)
                 }) {
+                    discovery.locator += 1;
                     continue;
                 }
+                // Charge both retained progress and the one emitted batch. On
+                // expiry leave the cursor at the first uncharged candidate.
                 budget.state(std::mem::size_of::<VerifiedStaticCandidate>() * 2)?;
-                candidates.push(VerifiedStaticCandidate {
+                discovery.candidates.push(VerifiedStaticCandidate {
                     site: VerifiedSite {
                         custody: SiteCustody::Mapped {
                             process: self.process.clone(),
@@ -566,11 +600,26 @@ impl VerifiedProcess {
                     provenance: locator.provenance,
                     partial: locator.partial,
                 });
+                discovery.locator += 1;
+                #[cfg(test)]
+                EXPIRE_CANDIDATE.with(|flag| {
+                    if flag.replace(false) {
+                        budget.set_deadline(std::time::Instant::now());
+                    }
+                });
             }
             object.unchanged()?;
+            discovery.mapping += 1;
+            discovery.locator = 0;
         }
         self.revalidate()?;
-        Ok(candidates)
+        if discovery.emitted {
+            budget.state(
+                discovery.candidates.len() * std::mem::size_of::<VerifiedStaticCandidate>(),
+            )?;
+        }
+        discovery.emitted = true;
+        Ok(discovery.candidates.clone())
     }
     pub fn relocate(&self, address: TransientCodeAddress) -> Result<VerifiedSite, ObservationGap> {
         self.revalidate()?;
@@ -649,6 +698,7 @@ pub(crate) fn acquire_incarnation(
             .map_err(|_| ObservationGap::ProcessUnavailable)?,
     );
     let process = Rc::new(Process {
+        _admission: None,
         directory,
         pid: record.pid,
         pidfd,
@@ -664,7 +714,13 @@ pub fn acquire(
     record: &ProcessRecord,
     limits: &mut ObservationBudget,
 ) -> Result<VerifiedProcess, ObservationGap> {
-    limits.process()?;
+    let mut admission = limits.process()?;
+    #[cfg(test)]
+    EXPIRE_ACQUIRE.with(|flag| {
+        if flag.replace(false) {
+            limits.set_deadline(std::time::Instant::now());
+        }
+    });
     let process = acquire_incarnation(record)?.0;
     limits.state(MAX_MAPS)?;
     let maps = Rc::new(read_at(&process.directory, b"maps", MAX_MAPS)?);
@@ -720,6 +776,9 @@ pub fn acquire(
             existing.clone()
         } else {
             if let Err(gap) = limits.object() {
+                if gap == ObservationGap::SnapshotLag {
+                    return Err(gap);
+                }
                 gaps.insert(gap);
                 break;
             }
@@ -767,19 +826,27 @@ pub fn acquire(
             .is_some_and(|info| !info.exports.is_empty())
         {
             if let Err(gap) = object.parsed(limits) {
+                if gap == ObservationGap::SnapshotLag {
+                    return Err(gap);
+                }
                 gaps.insert(gap);
             }
         }
     }
-    let verified = VerifiedProcess {
+    let mut verified = VerifiedProcess {
         process,
         mappings,
         maps,
         generation: GENERATION.fetch_add(1, Ordering::Relaxed),
         budget: limits.clone(),
         gaps: RefCell::new(gaps),
+        static_discovery: RefCell::default(),
     };
     verified.revalidate()?;
+    admission.retain();
+    Rc::get_mut(&mut verified.process)
+        .expect("fresh process custody")
+        ._admission = Some(admission);
     Ok(verified)
 }
 fn association(file: &File, metadata: &Metadata, map: &Mapping) -> bool {
@@ -992,7 +1059,7 @@ fn parse_object(
     expected: Option<&ModuleInfo>,
     budget: &ObservationBudget,
 ) -> Result<ElfObject, ObservationGap> {
-    budget.state(PARSER_STATE_BYTES)?;
+    let reservation = budget.reserve_state(PARSER_STATE_BYTES)?;
     let before = file
         .metadata()
         .map_err(|_| ObservationGap::BackingUnavailable)?;
@@ -1043,6 +1110,7 @@ fn parse_object(
     {
         return Err(ObservationGap::ObjectChanged);
     }
+    reservation.retain();
     Ok(result)
 }
 fn bytes(
@@ -1382,6 +1450,39 @@ fn export_api_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<Observa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deadline_errors_do_not_poison_retained_object_parsers() {
+        let file = File::open("/bin/true").unwrap();
+        let object = Object {
+            stamp: Stamp::of(&file.metadata().unwrap()),
+            file,
+            expected: None,
+            parsed: OnceCell::new(),
+            tables: OnceCell::new(),
+        };
+        let budget = ObservationBudget::default();
+        budget.set_deadline(std::time::Instant::now());
+        assert!(matches!(
+            object.parsed(&budget),
+            Err(ObservationGap::SnapshotLag)
+        ));
+        assert!(matches!(
+            object.tables(&budget),
+            Err(ObservationGap::SnapshotLag)
+        ));
+        assert!(object.parsed.get().is_none() && object.tables.get().is_none());
+        budget.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        object.parsed(&budget).unwrap();
+        let table_result = object.tables(&budget).map(|_| ());
+        assert_ne!(table_result, Err(ObservationGap::SnapshotLag));
+        assert!(object.tables.get().is_some());
+        let reads = budget.elf_read_bytes();
+        object.parsed(&budget).unwrap();
+        assert_eq!(object.tables(&budget).map(|_| ()), table_result);
+        assert!(reads > 0);
+        assert_eq!(budget.elf_read_bytes(), reads);
+    }
 
     const CODE: &str = "1000-2000 r-xp 0000 08:01 10 /mapped/code\n";
 

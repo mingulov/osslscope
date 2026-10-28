@@ -325,7 +325,7 @@ fn process_batch(
         gaps.insert(ObservationGap::StateLimit);
         return Ok(BatchProgress::Applied(false));
     }
-    *state_bytes = admitted.unwrap();
+
     let mut candidates: Vec<_> = batch
         .static_candidates
         .iter()
@@ -353,11 +353,15 @@ fn process_batch(
     if installed >= deadline_ns {
         return Ok(BatchProgress::Applied(false));
     }
-    let valid = counter
-        .attach_candidates_controlled(candidates, installed, deadline, cancel)
-        .is_ok();
-    if !valid && Instant::now() >= deadline && !cancel.load(Ordering::Relaxed) {
+    let attached = counter.attach_candidates_controlled(candidates, installed, deadline, cancel);
+    if attached == Err(crate::focused_count::CountFailure::Deferred) {
+        // Only provisional controller/counter allocations were made. Native
+        // errors and cancellations are terminal for this batch, never replayed.
         return Ok(BatchProgress::Deferred);
+    }
+    let valid = attached.is_ok();
+    if valid {
+        *state_bytes = admitted.unwrap();
     }
     Ok(BatchProgress::Applied(
         valid && counter.active_site_count() > 0 && now_ns()? < deadline_ns,

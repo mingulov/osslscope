@@ -253,6 +253,7 @@ pub(crate) fn prepare_owned_startup(
                 }
             }
         }
+        drop(elf);
         drop(bytes);
         drop(scratch);
         check(deadline, cancel)?;

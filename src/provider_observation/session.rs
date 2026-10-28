@@ -170,12 +170,15 @@ struct Attachment {
     api: u32,
     advertisers: Vec<ObjectHash>,
 }
+#[cfg(test)]
+thread_local! { static EXPIRE_STATIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 struct Target {
     process: VerifiedProcess,
     starttime: u64,
     generation: u64,
     attachments: Vec<Attachment>,
     ranges: usize,
+    ready: bool,
 }
 pub struct ProviderSession {
     loaded: loader::Loaded,
@@ -467,7 +470,7 @@ impl ProviderSession {
             b.gap(ObservationGap::IntervalUnknown)
         }
         for record in records {
-            if self.targets.contains_key(&record.pid) {
+            if self.targets.get(&record.pid).is_some_and(|t| t.ready) {
                 continue;
             }
             match self.add_target(record, &mut b) {
@@ -483,24 +486,31 @@ impl ProviderSession {
         record: &inventory::ProcessRecord,
         b: &mut ObservationBatch,
     ) -> Result<(), ObservationGap> {
-        let Some(process) = acquire_observable(record, &mut self.budget)? else {
-            return Ok(());
+        let mut target = if let Some(target) = self.targets.remove(&record.pid) {
+            target
+        } else {
+            let Some(process) = acquire_observable(record, &mut self.budget)? else {
+                return Ok(());
+            };
+            let generation = self.next_generation;
+            self.next_generation = self
+                .next_generation
+                .checked_add(1)
+                .ok_or(ObservationGap::ProcessLimit)?;
+            Target {
+                process,
+                starttime: record.starttime,
+                generation,
+                attachments: Vec::new(),
+                ranges: 0,
+                ready: false,
+            }
         };
-        let ranges = order_ranges(process.executable_ranges()?)?;
-        let generation = self.next_generation;
-        self.next_generation = self
-            .next_generation
-            .checked_add(1)
-            .ok_or(ObservationGap::ProcessLimit)?;
-        let mut target = Target {
-            process,
-            starttime: record.starttime,
-            generation,
-            attachments: Vec::new(),
-            ranges: ranges.len(),
-        };
+        let generation = target.generation;
         let pid = record.pid;
         let result = (|| {
+            let ranges = order_ranges(target.process.executable_ranges()?)?;
+            target.ranges = ranges.len();
             for (index, (start, end)) in ranges.into_iter().enumerate() {
                 self.ranges
                     .insert(
@@ -548,6 +558,12 @@ impl ProviderSession {
                     }
                 }
             }
+            #[cfg(test)]
+            EXPIRE_STATIC.with(|flag| {
+                if flag.replace(false) {
+                    self.budget.set_deadline(Instant::now());
+                }
+            });
             b.static_candidates
                 .extend(target.process.static_candidates(&self.budget)?);
             for g in target.process.gaps() {
@@ -573,9 +589,12 @@ impl ProviderSession {
             target.process.revalidate()?;
             Ok(())
         })();
+        target.ready = result.is_ok();
         self.targets.insert(pid, target);
         if let Err(g) = result {
-            self.retire(pid, b);
+            if g != ObservationGap::SnapshotLag {
+                self.retire(pid, b);
+            }
             return Err(g);
         }
         b.gap(ObservationGap::FirstQueryUnknown);
@@ -1318,7 +1337,7 @@ mod tests {
         ));
         assert!(matches!(
             acquire_observable(&record, &mut budget),
-            Err(ObservationGap::ProcessLimit)
+            Err(ObservationGap::ProcessUnavailable)
         ));
     }
 
@@ -1680,5 +1699,135 @@ mod tests {
             "real object preparation: {}",
             result.err().unwrap()
         );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn discovery_tick_expiry_resumes_same_admitted_process() {
+        let argv = [
+            "/usr/bin/openssl",
+            "speed",
+            "-elapsed",
+            "-seconds",
+            "8",
+            "-evp",
+            "SHA512",
+            "-bytes",
+            "64",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        child.release_retaining_exit().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let records = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        use crate::provider_observation::objects::{EXPIRE_ACQUIRE, EXPIRE_CANDIDATE};
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        EXPIRE_ACQUIRE.with(|flag| flag.set(true));
+        let acquire = session.reconcile_records(&records);
+        assert!(acquire.gaps.contains(&ObservationGap::SnapshotLag));
+        assert!(session.targets.is_empty());
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        EXPIRE_STATIC.with(|flag| flag.set(true));
+        let first = session.reconcile_records(&records);
+        assert!(first.static_candidates.is_empty());
+        assert!(first.gaps.contains(&ObservationGap::SnapshotLag));
+        assert!(!first.gaps.contains(&ObservationGap::ProcessLimit));
+        assert!(!session.targets[&child.pid()].ready);
+        let cookies = session.next_cookie;
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        EXPIRE_CANDIDATE.with(|flag| flag.set(true));
+        let partial = session.reconcile_records(&records);
+        assert!(partial.gaps.contains(&ObservationGap::SnapshotLag));
+        assert!(partial.static_candidates.is_empty());
+        let read_prefix = session.budget.elf_read_bytes();
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        let second = session.reconcile_records(&records);
+        assert!(
+            !second.gaps.contains(&ObservationGap::ProcessLimit),
+            "deadline leaked the only admission"
+        );
+        assert!(
+            !second.static_candidates.is_empty(),
+            "deadline cached incomplete static discovery"
+        );
+        assert_eq!(session.next_cookie, cookies, "API links were replayed");
+        assert!(
+            session.budget.elf_read_bytes() >= read_prefix,
+            "real reads were refunded"
+        );
+        assert!(session.targets[&child.pid()].ready);
+        eprintln!(
+            "discovery resumed: candidates={}, API cookie high-water={}, charged reads={}",
+            second.static_candidates.len(),
+            cookies,
+            session.budget.elf_read_bytes()
+        );
+        assert!(session.link_count() > 0);
+        assert!(
+            session
+                .reconcile_records(&records)
+                .static_candidates
+                .is_empty(),
+            "completed target rediscovered"
+        );
+        use crate::capture::ClockPort;
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let now = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = crate::focused_count::FocusedCounter::open(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns: now,
+                    deadline_ns: now + 10_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        counter
+            .attach_candidates(
+                second
+                    .static_candidates
+                    .into_iter()
+                    .map(crate::focused_count::CountCandidate::Static)
+                    .collect(),
+                now,
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        let counts = counter.close(Instant::now() + Duration::from_secs(1));
+        let calls: u64 = counts
+            .sites
+            .iter()
+            .chain(&counts.fenced)
+            .map(|s| s.calls)
+            .sum();
+        assert!(
+            calls > 0,
+            "resumed static candidates did not retain native counts"
+        );
+        eprintln!("resumed discovery native calls={calls}");
+        session.close_until(Instant::now() + Duration::from_millis(100));
+        child.finish_observation().unwrap();
     }
 }

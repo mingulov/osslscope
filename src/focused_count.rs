@@ -29,6 +29,7 @@ pub enum CountFailure {
     Namespace,
     Identity,
     Attach,
+    Deferred,
     Read,
     Resource,
     Close,
@@ -166,6 +167,11 @@ pub fn evidence_device(native: u64) -> u64 {
 struct Attachment {
     link: OwnedFd,
     candidates: Vec<CountCandidate>,
+}
+#[cfg(test)]
+thread_local! {
+    static EXPIRE_AFTER_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static EXPIRE_BEFORE_NATIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 /// Owns maps, retained namespace, links and candidate custody. Links are closed
 /// before candidate custody is released, including during unwinding/Drop.
@@ -351,7 +357,9 @@ impl FocusedCounter {
     ) -> Result<(), CountFailure> {
         let result = self.attach_candidates_inner(candidates, installed_ns, control);
         if let Err(e) = result {
-            self.failure(e);
+            if e != CountFailure::Deferred {
+                self.failure(e);
+            }
             if matches!(e, CountFailure::Identity | CountFailure::Namespace) {
                 self.retire();
             }
@@ -364,16 +372,25 @@ impl FocusedCounter {
         installed_ns: u64,
         control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
     ) -> Result<(), CountFailure> {
-        let checkpoint = || {
-            if control.is_some_and(|(d, c)| {
-                Instant::now() >= d || c.load(std::sync::atomic::Ordering::Relaxed)
-            }) {
-                Err(CountFailure::Attach)
-            } else {
-                Ok(())
+        let hard_deadline = self.limits.window.deadline_ns;
+        let checkpoint = |native: bool| {
+            use crate::capture::ClockPort;
+            if control.is_some_and(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)) {
+                return Err(CountFailure::Attach);
             }
+            if crate::capture::LiveClock
+                .checked_monotonic_ns()
+                .ok_or(CountFailure::Read)?
+                >= hard_deadline
+            {
+                return Err(CountFailure::Attach);
+            }
+            if !native && control.is_some_and(|(d, _)| Instant::now() >= d) {
+                return Err(CountFailure::Deferred);
+            }
+            Ok(())
         };
-        checkpoint()?;
+        checkpoint(false)?;
         if candidates.is_empty() {
             return Ok(());
         }
@@ -399,21 +416,29 @@ impl FocusedCounter {
         // Each process/object identity is revalidated once per retained file;
         // no per-row procfs traversal or repeated ELF parsing is required.
         let mut files: BTreeMap<(u64, u64), Vec<CountCandidate>> = BTreeMap::new();
-        self.fold.charge(
-            candidates
-                .iter()
-                .try_fold(0usize, |total, c| {
-                    let advertisers = match c {
-                        CountCandidate::Static(_) => 0,
-                        CountCandidate::Learned(c) => c.advertiser_candidates().len(),
-                    };
-                    advertisers
-                        .checked_mul(1024)?
-                        .checked_add(512)?
-                        .checked_add(total)
-                })
-                .ok_or(CountFailure::Resource)?,
-        )?;
+        let input_charge = candidates
+            .iter()
+            .try_fold(0usize, |total, c| {
+                let advertisers = match c {
+                    CountCandidate::Static(_) => 0,
+                    CountCandidate::Learned(c) => c.advertiser_candidates().len(),
+                };
+                advertisers
+                    .checked_mul(1024)?
+                    .checked_add(512)?
+                    .checked_add(total)
+            })
+            .ok_or(CountFailure::Resource)?;
+        let scratch_charge = self
+            .fold
+            .rows
+            .len()
+            .checked_mul(1024)
+            .ok_or(CountFailure::Resource)?;
+        let planning_charge = input_charge
+            .checked_add(scratch_charge)
+            .ok_or(CountFailure::Resource)?;
+        self.fold.checked_charge(planning_charge)?;
         for candidate in candidates {
             files
                 .entry((candidate.site().native_device(), candidate.site().inode()))
@@ -421,7 +446,7 @@ impl FocusedCounter {
                 .push(candidate);
         }
         for file in files.values() {
-            checkpoint()?;
+            checkpoint(false)?;
             file[0]
                 .site()
                 .revalidate_object()
@@ -493,20 +518,14 @@ impl FocusedCounter {
         }
         // Plan on a copy: rows become visible only after every new link has
         // succeeded and both identity checks have passed.
-        self.fold.charge(
-            self.fold
-                .rows
-                .len()
-                .checked_mul(1024)
-                .ok_or(CountFailure::Resource)?,
-        )?;
-        let mut planned = self.fold.clone();
+        let mut planned = self.fold.clone_charged(planning_charge)?;
         if transition {
             planned.session = Some(mapping);
             for cookie in &promotions {
                 planned.rows.get_mut(cookie).expect("verified row").mapping = mapping;
             }
         }
+        let mut prepared = Vec::new();
         let mut additions = Vec::new();
         let mut metadata = Vec::new();
         let program = self
@@ -516,7 +535,7 @@ impl FocusedCounter {
             .ok_or(CountFailure::Object)?
             .as_raw_fd();
         for file in files.into_values() {
-            checkpoint()?;
+            checkpoint(false)?;
             let mut sites: BTreeMap<u64, Vec<&CountCandidate>> = BTreeMap::new();
             for c in &file {
                 sites.entry(c.site().file_offset()).or_default().push(c);
@@ -548,7 +567,7 @@ impl FocusedCounter {
             if offsets.is_empty() {
                 continue;
             }
-            if self.attachments.len() + additions.len() >= self.limits.max_links {
+            if self.attachments.len() + prepared.len() >= self.limits.max_links {
                 return Err(CountFailure::Resource);
             }
             planned.charge(256 + offsets.len() * 32)?;
@@ -557,13 +576,47 @@ impl FocusedCounter {
                 file[0].site().attachment_fd().as_raw_fd()
             ))
             .map_err(|_| CountFailure::Attach)?;
-            // Burn planned cookies before a fallible kernel attachment: even
-            // a rolled-back link may already have produced map entries.
-            self.fold.next_cookie = planned.next_cookie;
+            prepared.push((file, path, offsets, cookies));
+        }
+        // All rows, associations, capacities and file locators are preflighted.
+        // Once native effects begin, finish this bounded transaction despite a
+        // scheduling tick expiry. Cancellation, identity and the hard Count
+        // window remain checked before every subsequent native call.
+        #[cfg(test)]
+        EXPIRE_BEFORE_NATIVE.with(|flag| {
+            if flag.replace(false) {
+                let deadline = control.expect("controlled deadline test").0;
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now())
+                        + std::time::Duration::from_millis(1),
+                );
+            }
+        });
+        checkpoint(false)?;
+        for (index, (file, path, offsets, cookies)) in prepared.into_iter().enumerate() {
+            checkpoint(index > 0)?;
+            file[0]
+                .site()
+                .revalidate_object()
+                .map_err(|_| CountFailure::Identity)?;
+            checkpoint(index > 0)?;
+            // Cookies are never reused after a possibly observed native call.
+            self.fold.next_cookie =
+                cookies.last().copied().expect("nonempty native offsets") as u32 + 1;
             let link = ossl_bpf_sys::link_create_uprobe_multi(
                 program, &path, &offsets, &cookies, self.pid,
             )
             .map_err(|_| CountFailure::Attach)?;
+            #[cfg(test)]
+            EXPIRE_AFTER_LINK.with(|flag| {
+                if flag.replace(false) {
+                    let deadline = control.expect("controlled deadline test").0;
+                    std::thread::sleep(
+                        deadline.saturating_duration_since(Instant::now())
+                            + std::time::Duration::from_millis(1),
+                    );
+                }
+            });
             file[0]
                 .site()
                 .revalidate_object()
@@ -573,7 +626,9 @@ impl FocusedCounter {
                 candidates: file,
             });
         }
-        checkpoint()?;
+        if control.is_some_and(|(_, c)| c.load(std::sync::atomic::Ordering::Relaxed)) {
+            return Err(CountFailure::Attach);
+        }
         validate_namespace(&self.namespace, self.expected_namespace)?;
         for a in &additions {
             a.candidates[0]
@@ -1082,5 +1137,125 @@ mod startup_controls {
         );
         drop(counter);
         drop(child);
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh count object"]
+    fn tick_expiry_after_native_link_commits_once() {
+        use crate::capture::ClockPort;
+        let argv = ["/usr/bin/openssl", "dgst", "-sha512", "/dev/null"]
+            .map(str::to_owned)
+            .to_vec();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = AtomicBool::new(false);
+        let sites = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut crate::provider_observation::ObservationBudget::default(),
+            Instant::now() + Duration::from_secs(10),
+            &cancel,
+        )
+        .unwrap();
+        let bytes =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 15_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let candidates: Vec<_> = sites
+            .candidates
+            .into_iter()
+            .map(CountCandidate::Static)
+            .collect();
+        let initial = (counter.fold.next_cookie, counter.fold.state_bytes);
+        for _ in 0..2 {
+            EXPIRE_BEFORE_NATIVE.with(|flag| flag.set(true));
+            assert_eq!(
+                counter.attach_candidates_controlled(
+                    candidates.clone(),
+                    start,
+                    Instant::now() + Duration::from_secs(1),
+                    &cancel
+                ),
+                Err(CountFailure::Deferred)
+            );
+            assert_eq!(
+                (counter.fold.next_cookie, counter.fold.state_bytes),
+                initial,
+                "provisional pre-native state or cookies leaked"
+            );
+            assert_eq!(counter.active_link_count(), 0);
+            EXPIRE_BEFORE_NATIVE
+                .with(|flag| assert!(!flag.get(), "did not reach the planned boundary"));
+        }
+        EXPIRE_AFTER_LINK.with(|flag| flag.set(true));
+        counter
+            .attach_candidates_controlled(
+                candidates,
+                start,
+                Instant::now() + Duration::from_secs(1),
+                &cancel,
+            )
+            .expect("tick expiry must commit native effects once");
+        let cookies = counter.fold.next_cookie;
+        let state = counter.fold.state_bytes;
+        let links = counter.active_link_count();
+        assert!(cookies > 2000 && cookies <= 4097);
+        child.release_retaining_exit().unwrap();
+        let wait = Instant::now() + Duration::from_secs(5);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < wait, "ordinary digest did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let before_calls: u64 = counter
+            .sample(Instant::now() + Duration::from_secs(1))
+            .sites
+            .iter()
+            .map(|s| s.calls)
+            .sum();
+        counter
+            .attach_candidates_controlled(
+                Vec::new(),
+                start,
+                Instant::now() + Duration::from_secs(1),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(
+            (
+                counter.fold.next_cookie,
+                counter.fold.state_bytes,
+                counter.active_link_count()
+            ),
+            (cookies, state, links)
+        );
+        let sample = counter.close(Instant::now() + Duration::from_secs(1));
+        let calls: u64 = sample
+            .sites
+            .iter()
+            .chain(&sample.fenced)
+            .map(|s| s.calls)
+            .sum();
+        assert!(calls > 0);
+        assert_eq!(calls, before_calls, "next tick or close duplicated counts");
+        eprintln!(
+            "deadline transaction: cookies={}, state={}, links={}, calls={}",
+            cookies - 1,
+            state,
+            links,
+            calls
+        );
+        child.finish_observation().unwrap();
     }
 }

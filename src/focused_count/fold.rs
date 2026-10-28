@@ -30,7 +30,7 @@ pub struct CountFold {
     pub(super) generation: u32,
     pub(super) session: Option<u64>,
     pub(super) next_cookie: u32,
-    state_bytes: usize,
+    pub(super) state_bytes: usize,
     gaps: BTreeMap<&'static str, u64>,
 }
 impl CountFold {
@@ -48,14 +48,25 @@ impl CountFold {
         })
     }
     pub(super) fn charge(&mut self, n: usize) -> Result<(), CountFailure> {
-        self.state_bytes = self
+        let next = self.checked_charge(n)?;
+        self.state_bytes = next;
+        Ok(())
+    }
+    pub(super) fn checked_charge(&self, n: usize) -> Result<usize, CountFailure> {
+        let next = self
             .state_bytes
             .checked_add(n)
             .ok_or(CountFailure::Resource)?;
-        if self.state_bytes > self.limits.max_state_bytes {
+        if next > self.limits.max_state_bytes {
             return Err(CountFailure::Resource);
         }
-        Ok(())
+        Ok(next)
+    }
+    pub(super) fn clone_charged(&self, n: usize) -> Result<Self, CountFailure> {
+        let next = self.checked_charge(n)?;
+        let mut planned = self.clone();
+        planned.state_bytes = next;
+        Ok(planned)
     }
     pub(super) fn gap(&mut self, name: &'static str) {
         let v = self.gaps.entry(name).or_default();

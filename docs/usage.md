@@ -339,7 +339,11 @@ scripts, loader cache/hwcaps overrides, preloads and later `dlopen` can leave mi
 `focused.startup_partial` records that uncertainty; prearming does not establish
 complete startup coverage or turn a static candidate into a public ABI. Setup and
 polling deadlines are cooperative between file operations: an in-flight blocking
-filesystem syscall cannot be interrupted by the observation deadline.
+filesystem syscall cannot be interrupted by the observation deadline. A fully
+preflighted, bounded native attachment transaction may finish after its scheduling
+tick expires. Cancellation and identity checks still apply between native calls,
+and no new link is attached after the hard observation window ends. Unfinished
+discovery retains its progress for a later tick.
 
 A document covers one process incarnation and its threads. Cgroup/container
 inventory chooses a PID, not an implicit tracing group. Forks, children, process

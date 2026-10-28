@@ -89,6 +89,41 @@ struct Work {
     state: usize,
     reads: u64,
 }
+// A failed acquisition owns no retained state. Its provisional admissions can
+// be released; descriptor reads remain cumulative even when acquisition fails.
+pub(crate) struct ProcessAdmission {
+    work: Rc<RefCell<Work>>,
+    provisional: Option<(usize, usize)>,
+}
+impl ProcessAdmission {
+    pub(crate) fn retain(&mut self) {
+        self.provisional = None;
+    }
+}
+impl Drop for ProcessAdmission {
+    fn drop(&mut self) {
+        let mut work = self.work.borrow_mut();
+        work.processes -= 1;
+        if let Some((objects, state)) = self.provisional {
+            work.objects = objects;
+            work.state = state;
+        }
+    }
+}
+pub(crate) struct StateReservation {
+    work: Rc<RefCell<Work>>,
+    bytes: usize,
+}
+impl StateReservation {
+    pub(crate) fn retain(mut self) {
+        self.bytes = 0;
+    }
+}
+impl Drop for StateReservation {
+    fn drop(&mut self) {
+        self.work.borrow_mut().state -= self.bytes;
+    }
+}
 /// Clones share cumulative admission, including lazy relocation work.
 #[derive(Clone)]
 pub struct ObservationBudget {
@@ -141,14 +176,17 @@ impl ObservationBudget {
         work.reads = next;
         Ok(())
     }
-    pub(crate) fn process(&self) -> Result<(), ObservationGap> {
+    pub(crate) fn process(&self) -> Result<ProcessAdmission, ObservationGap> {
         self.checkpoint()?;
         let mut work = self.work.borrow_mut();
         if work.processes >= self.limits.max_processes {
             return Err(ObservationGap::ProcessLimit);
         }
         work.processes += 1;
-        Ok(())
+        Ok(ProcessAdmission {
+            work: self.work.clone(),
+            provisional: Some((work.objects, work.state)),
+        })
     }
     pub(crate) fn object(&self) -> Result<(), ObservationGap> {
         self.checkpoint()?;
@@ -158,6 +196,13 @@ impl ObservationBudget {
         }
         work.objects += 1;
         Ok(())
+    }
+    pub(crate) fn reserve_state(&self, bytes: usize) -> Result<StateReservation, ObservationGap> {
+        self.state(bytes)?;
+        Ok(StateReservation {
+            work: self.work.clone(),
+            bytes,
+        })
     }
     pub(crate) fn state(&self, bytes: usize) -> Result<(), ObservationGap> {
         self.checkpoint()?;
@@ -528,4 +573,37 @@ pub enum ObservationPayload {
     Invalidation {
         cause: InvalidationCause,
     },
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    #[test]
+    fn failed_provisional_acquisition_releases_ownership_but_not_reads() {
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_processes: 1,
+            max_objects: 1,
+            max_state_bytes: 64,
+            max_elf_read_bytes: 64,
+            ..Default::default()
+        });
+        let admission = budget.process().unwrap();
+        budget.object().unwrap();
+        budget.state(64).unwrap();
+        budget.read(32).unwrap();
+        assert!(matches!(
+            budget.process(),
+            Err(ObservationGap::ProcessLimit)
+        ));
+        drop(admission);
+        let mut admitted = budget.process().unwrap();
+        budget.object().unwrap();
+        budget.state(64).unwrap();
+        assert_eq!(budget.elf_read_bytes(), 32);
+        assert_eq!(budget.read(33), Err(ObservationGap::ReadLimit));
+        admitted.retain();
+        drop(admitted);
+        assert!(budget.process().is_ok());
+        assert_eq!(budget.state(1), Err(ObservationGap::StateLimit));
+    }
 }
