@@ -83,7 +83,7 @@ exit 0
 
 %files
 %defattr(-,root,root,-)
-/usr/bin/osslscope
+%caps(cap_bpf,cap_perfmon=ep) /usr/bin/osslscope
 %dir /usr/lib/osslscope
 /usr/lib/osslscope/osslscope-harvest
 /usr/lib/osslscope/osslscope-count
