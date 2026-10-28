@@ -17,6 +17,9 @@ use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "forwarder.rs"]
+mod forwarder;
+
 const MAX_MAPS: usize = 4_194_304;
 const MAX_OBJECT: u64 = 134_217_728;
 const MAX_HEADERS: usize = 4096;
@@ -72,6 +75,7 @@ struct Mapping {
     inode: u64,
 }
 struct Segment {
+    writable: bool,
     offset: u64,
     address: u64,
     size: u64,
@@ -1370,6 +1374,7 @@ fn parse_exports(
         }
         if word(p, 4, 4)? & 1 != 0 {
             segments.push(Segment {
+                writable: word(p, 4, 4)? & 2 != 0,
                 offset,
                 address,
                 size,
@@ -1451,6 +1456,38 @@ fn parse_exports(
                 }
             } else {
                 exports.push((api, offset));
+            }
+        }
+        if machine == 62 {
+            // Derivation is limited to the two unchanged public query ABIs.
+            // Resolve both against original export roles before replacing either.
+            let context = forwarder::Context {
+                file,
+                len,
+                budget,
+                segments: &segments,
+                symbols: &symbols,
+                names: &names,
+                sections: &sections,
+                header: &h,
+            };
+            let mut destinations = [None; 2];
+            for (index, api) in forwarder::APIS.into_iter().enumerate() {
+                if let Some((_, offset)) = exports.iter().find(|(found, _)| *found == api) {
+                    destinations[index] = context.resolve(api, *offset, &exports)?;
+                }
+            }
+            if destinations[0].is_some() && destinations[0] == destinations[1] {
+                // Query and unquery have different public signatures. A shared
+                // derived entry cannot inherit either role from these wrappers.
+                destinations.fill(None);
+            }
+            for (api, destination) in forwarder::APIS.into_iter().zip(destinations) {
+                if let Some(destination) = destination {
+                    if let Some((_, offset)) = exports.iter_mut().find(|(found, _)| *found == api) {
+                        *offset = destination;
+                    }
+                }
             }
         }
     }
@@ -1967,3 +2004,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "forwarder_tests.rs"]
+mod forwarder_tests;

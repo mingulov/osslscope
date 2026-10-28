@@ -15,6 +15,7 @@ attribution, startup or completeness gaps.
 - `install.md` - local prefix and package install, doctor-first verify, uninstall
 - `usage.md` - discovery, watch, provider observation, PID/run reports and policy
 - `what-it-proves.md` - claim chain, non-goals, who-should-NOT-adopt
+- `observation-contract.md` - public query forwarding, authority and attribution limits
 - `release-v0.4.0.md` - automatic observation candidate and artifact-specific limits
 - `release-v0.3.0.md` - discovery preview scope, qualification procedure and inventory cost
 - `release-v0.2.0.md` - source preview scope, native checks and limits

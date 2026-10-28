@@ -634,3 +634,44 @@ fn operational_exports_are_discovered_without_algorithm_selection() {
     }
     assert!(!names.contains(&"EVP_DecryptUpdate"));
 }
+
+#[cfg(target_arch = "x86_64")]
+#[path = "support/provider_forwarder.rs"]
+mod forwarder_fixture;
+
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn public_forwarder_inspection_preserves_finite_exports_and_object_identity() {
+    use forwarder_fixture::ForwarderFixture;
+    let fixture = ForwarderFixture::new(
+        ".byte 0xf3,0x0f,0x1e,0xfa,0xe9\n.long query_impl-.-4",
+        ".byte 0xeb\n.byte unquery_impl-.-1",
+    );
+    let mut file = fixture.file();
+    let expected = inventory::elf::inspect_file(&mut file, u64::MAX).unwrap();
+    let labels =
+        inspect_expected_exports(&mut file, &expected, &mut ObservationBudget::default()).unwrap();
+    assert_eq!(
+        labels,
+        vec![
+            ObservationApi::Inventoried(Api::OsslProviderQueryOperation),
+            ObservationApi::Inventoried(Api::EvpMdFetch),
+            ObservationApi::OsslProviderUnqueryOperation,
+        ]
+    );
+    let mut changed = fixture.image.clone();
+    changed[fixture.offsets["query_impl"] as usize] ^= 1;
+    // Change the same retained descriptor's backing, without inventing acquisition authority.
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&file)
+        ))
+        .unwrap();
+    writer.write_all(&changed).unwrap();
+    assert_eq!(
+        inspect_expected_exports(&mut file, &expected, &mut ObservationBudget::default()),
+        Err(ObservationGap::ObjectChanged)
+    );
+}
