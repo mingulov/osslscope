@@ -51,5 +51,7 @@ Already queued startup records can also be drained after the original owned
 process exits, bound to its retained pidfd, cookie, generation and unchanged
 file. This historical drain grants no new attachment or relocation authority;
 unavailable current process/namespace checks and prior losses remain explicit.
+A confirmed process, namespace or backing mismatch invalidates that retained
+source authority; later exit or unavailable identity reads cannot restore it.
 Neither startup nor historical metadata establishes execution-backed algorithm
 attribution or a COMPLETE window.

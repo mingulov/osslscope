@@ -286,6 +286,19 @@ fn terminal_originals(
     }
     Ok(found && terminal)
 }
+fn rejects_history(gap: ObservationGap) -> bool {
+    matches!(
+        gap,
+        ObservationGap::Invalidated
+            | ObservationGap::AmbiguousSite
+            | ObservationGap::ObjectChanged
+            | ObservationGap::NamespaceChanged
+            | ObservationGap::ProcessChanged
+    )
+}
+fn recorded_refusal(process: &VerifiedProcess) -> Option<ObservationGap> {
+    process.gaps().into_iter().find(|&gap| rejects_history(gap))
+}
 /// Shared retirement boundary for reconcile/acquisition failures and drain.
 /// The descriptor/map operation is supplied by the session; source ownership
 /// and pending assembler state have one production transition.
@@ -302,10 +315,15 @@ fn retire_source_owners(
     disarm: impl FnOnce(&[Attachment], Option<&Target>) -> Result<(), ObservationGap>,
 ) -> bool {
     let rows: &[Attachment] = startup.get(&pid).map_or(&[], Vec::as_slice);
-    let preserve = if matches!(
-        gap,
-        ObservationGap::Invalidated | ObservationGap::AmbiguousSite | ObservationGap::ObjectChanged
-    ) {
+    // A resolver can record an earlier confirmed failure before a subsequent
+    // call returns mere unavailability. Both forms retain refusal provenance.
+    let recorded = targets
+        .get(&pid)
+        .and_then(|target| recorded_refusal(&target.process));
+    if let Some(recorded) = recorded {
+        b.gap(recorded);
+    }
+    let preserve = if rejects_history(gap) || recorded.is_some() {
         false
     } else {
         match terminal_originals(rows, targets.get(&pid), record) {
@@ -895,6 +913,9 @@ impl ProviderSession {
         let generation = target.generation;
         let pid = record.pid;
         let result = (|| {
+            if let Some(gap) = recorded_refusal(&target.process) {
+                return Err(gap);
+            }
             let ranges = order_ranges(target.process.executable_ranges()?)?;
             target.ranges = ranges.len();
             for (index, (start, end)) in ranges.into_iter().enumerate() {
@@ -932,6 +953,9 @@ impl ProviderSession {
                     )?);
                     public_sites.push((id, resolved));
                 }
+            }
+            if let Some(gap) = recorded_refusal(&target.process) {
+                return Err(gap);
             }
             for (id, resolved) in public_sites {
                 let key = role_site(pid, record.starttime, &resolved.site);
@@ -1020,6 +1044,9 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::AttachFailed)?;
             // The second check fences setup changes after all links and membership.
             target.process.revalidate()?;
+            if let Some(gap) = recorded_refusal(&target.process) {
+                return Err(gap);
+            }
             if self.startup.get(&pid).is_some_and(Vec::is_empty) {
                 self.startup.remove(&pid);
             }
@@ -3147,6 +3174,150 @@ mod startup_api_controls {
                     fixture.child.finish_observation().unwrap();
                 }
             }
+        }
+    }
+    fn comparison_then_exit(comparison: ObservationGap) {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for adopted in [false, true] {
+            let mut fixture = reconcile_fixture(adopted);
+            let pid = fixture.child.pid();
+            // Obtain the failure from an actual readable identity comparison.
+            // The snapshot passed to retirement remains the prior matching one.
+            let confirmed = if comparison == ObservationGap::ProcessUnavailable {
+                None
+            } else {
+                let mut compared = fixture.record.clone();
+                match comparison {
+                    ObservationGap::NamespaceChanged => {
+                        compared.namespaces.mount.as_mut().unwrap().inode += 1
+                    }
+                    ObservationGap::ProcessChanged => compared.starttime += 1,
+                    _ => unreachable!(),
+                }
+                let gap = objects::acquire_incarnation(&compared)
+                    .err()
+                    .expect("readable comparison must fail");
+                assert_eq!(gap, comparison);
+                Some(gap)
+            };
+            fixture.child.release_retaining_exit().unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while fixture.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let unavailable = objects::acquire_incarnation(&fixture.record).err().unwrap();
+            // This second observation is absence, not evidence of a mismatch.
+            if confirmed.is_none() {
+                assert_eq!(unavailable, ObservationGap::ProcessUnavailable);
+            }
+            let gap = confirmed.unwrap_or(unavailable);
+            let r = c::Record {
+                pid,
+                tid: pid,
+                cookie: 81,
+                generation: 19,
+                api: c::PUBLIC_QUERY,
+                ..Default::default()
+            };
+            let mut aliases = super::super::assembly::Sequences::default();
+            let mut batch = ObservationBatch::default();
+            let preserve = retire_source_owners(
+                (&mut fixture.startup, &mut fixture.targets),
+                &mut aliases,
+                pid,
+                Some(&fixture.record),
+                gap,
+                &mut batch,
+                |_, _| Ok(()),
+            );
+            if confirmed.is_some() {
+                assert!(
+                    !preserve,
+                    "confirmed {comparison:?} was overwritten by later exit/unavailability; adopted={adopted}"
+                );
+                assert!(
+                    record_binding(&fixture.targets, &fixture.startup, &r)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+            } else {
+                assert!(
+                    preserve,
+                    "unavailable post-exit observation lost valid original queued ownership"
+                );
+                let binding = record_binding(&fixture.targets, &fixture.startup, &r)
+                    .unwrap()
+                    .unwrap();
+                assert!(binding.attachment.historical && binding.process.is_none());
+                assert!(binding.attachment.links.is_empty());
+                assert!(batch.gaps.contains(&ObservationGap::ProcessUnavailable));
+            }
+            fixture.child.finish_observation().unwrap();
+        }
+    }
+    #[test]
+    fn confirmed_namespace_mismatch_cannot_be_overridden_by_later_exit() {
+        comparison_then_exit(ObservationGap::NamespaceChanged);
+    }
+    #[test]
+    fn confirmed_process_mismatch_cannot_be_overridden_by_later_exit() {
+        comparison_then_exit(ObservationGap::ProcessChanged);
+    }
+    #[test]
+    fn unavailable_post_exit_observation_preserves_only_original_history() {
+        comparison_then_exit(ObservationGap::ProcessUnavailable);
+    }
+    #[test]
+    fn cached_confirmed_mismatch_survives_a_later_unavailable_return() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for namespace in [true, false] {
+            let mut fixture = reconcile_fixture(true);
+            let pid = fixture.child.pid();
+            let mut compared = fixture.record.clone();
+            if namespace {
+                compared.namespaces.mount.as_mut().unwrap().inode += 1;
+            } else {
+                compared.starttime += 1;
+            }
+            let confirmed = objects::acquire_incarnation(&compared).err().unwrap();
+            assert_eq!(
+                confirmed,
+                if namespace {
+                    ObservationGap::NamespaceChanged
+                } else {
+                    ObservationGap::ProcessChanged
+                }
+            );
+            objects::fixture_support::remember_compared_failure(
+                &fixture.targets[&pid].process,
+                &compared,
+            );
+            fixture.child.release_retaining_exit().unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while fixture.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            let later = fixture.targets[&pid].process.revalidate().unwrap_err();
+            assert_eq!(later, ObservationGap::ProcessUnavailable);
+            let mut aliases = super::super::assembly::Sequences::default();
+            let mut batch = ObservationBatch::default();
+            assert!(
+                !retire_source_owners(
+                    (&mut fixture.startup, &mut fixture.targets),
+                    &mut aliases,
+                    pid,
+                    None,
+                    later,
+                    &mut batch,
+                    |_, _| Ok(())
+                ),
+                "cached confirmed {confirmed:?} was lost behind later unavailability"
+            );
+            assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+            fixture.child.finish_observation().unwrap();
         }
     }
     #[test]

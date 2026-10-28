@@ -587,13 +587,13 @@ impl Process {
         if Stamp::of(
             &current
                 .metadata()
-                .map_err(|_| ObservationGap::ProcessChanged)?,
+                .map_err(|_| ObservationGap::ProcessUnavailable)?,
         ) != self.exe_stamp
             || Stamp::of(
                 &self
                     .executable
                     .metadata()
-                    .map_err(|_| ObservationGap::ProcessChanged)?,
+                    .map_err(|_| ObservationGap::ProcessUnavailable)?,
             ) != self.exe_stamp
         {
             return Err(ObservationGap::ProcessChanged);
@@ -856,6 +856,9 @@ impl ProcessIncarnation {
         if self.0.pid != record.pid || self.0.starttime != record.starttime {
             return Err(ObservationGap::ProcessChanged);
         }
+        if record.namespaces.pid.is_none() || record.namespaces.mount.is_none() {
+            return Err(ObservationGap::ProcessUnavailable);
+        }
         if self.0.namespaces != record.namespaces {
             return Err(ObservationGap::NamespaceChanged);
         }
@@ -876,10 +879,10 @@ pub(crate) fn acquire_incarnation(
     if starttime(&directory)? != record.starttime {
         return Err(ObservationGap::ProcessChanged);
     }
-    if namespaces(&directory)? != record.namespaces
-        || record.namespaces.pid.is_none()
-        || record.namespaces.mount.is_none()
-    {
+    if record.namespaces.pid.is_none() || record.namespaces.mount.is_none() {
+        return Err(ObservationGap::ProcessUnavailable);
+    }
+    if namespaces(&directory)? != record.namespaces {
         return Err(ObservationGap::NamespaceChanged);
     }
     // SAFETY: positive PID and zero flags; ownership transfers exactly once.
@@ -1167,12 +1170,14 @@ fn starttime(directory: &File) -> Result<u64, ObservationGap> {
         .ok_or(ObservationGap::ProcessUnavailable)?;
     number(field, 10).map_err(|_| ObservationGap::ProcessUnavailable)
 }
+// Observation failure is absence, not a compared identity change. Callers
+// produce NamespaceChanged only after a successful unequal comparison.
 fn namespaces(directory: &File) -> Result<NamespaceIds, ObservationGap> {
     let id = |name: &[u8]| {
-        let file = open_at(directory, name).map_err(|_| ObservationGap::NamespaceChanged)?;
+        let file = open_at(directory, name).map_err(|_| ObservationGap::ProcessUnavailable)?;
         let m = file
             .metadata()
-            .map_err(|_| ObservationGap::NamespaceChanged)?;
+            .map_err(|_| ObservationGap::ProcessUnavailable)?;
         Ok(Some(NamespaceId {
             device: m.dev(),
             inode: m.ino(),
@@ -2077,6 +2082,19 @@ mod forwarder_tests;
 #[cfg(test)]
 pub(super) mod fixture_support {
     use super::*;
+    pub fn remember_compared_failure(process: &VerifiedProcess, compared: &ProcessRecord) {
+        let gap = process
+            .retained_incarnation()
+            .validate_record(compared)
+            .unwrap_err();
+        assert!(matches!(
+            gap,
+            ObservationGap::NamespaceChanged | ObservationGap::ProcessChanged
+        ));
+        // Supply the earlier confirmed failure at the existing resolver-cache
+        // boundary; production resolve_api records revalidation errors here.
+        process.gaps.borrow_mut().insert(gap);
+    }
     pub fn mapped_process(
         record: &ProcessRecord,
         file: File,

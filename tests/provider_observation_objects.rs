@@ -186,10 +186,19 @@ fn pid_exec_namespace_change_retires() {
         Err(ObservationGap::ProcessChanged)
     ));
     let mut r = record();
-    r.namespaces.mount = None;
+    r.namespaces.mount.as_mut().unwrap().inode += 1;
     assert!(matches!(
         acquire(&r, &mut ObservationBudget::default()),
         Err(ObservationGap::NamespaceChanged)
+    ));
+}
+#[test]
+fn unavailable_namespace_observation_is_not_a_confirmed_change() {
+    let mut r = record();
+    r.namespaces.mount = None;
+    assert!(matches!(
+        acquire(&r, &mut ObservationBudget::default()),
+        Err(ObservationGap::ProcessUnavailable)
     ));
 }
 #[test]
