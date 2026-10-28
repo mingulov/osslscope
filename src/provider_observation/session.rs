@@ -32,6 +32,9 @@ pub struct ObservationBatch {
     pub learned_sites: Vec<VerifiedSiteCandidate>,
     pub static_candidates: Vec<VerifiedStaticCandidate>,
     pub api_activity: Vec<ProcessApiActivity>,
+    /// Internal count-epoch retirement for stronger inventory authority. This
+    /// is not a claim that the process or backing code changed identity.
+    pub refreshed_processes: Vec<u32>,
 }
 /// One cumulative final API ledger, scoped to an observed incarnation.
 #[derive(Clone)]
@@ -531,7 +534,28 @@ impl ProviderSession {
             b.gap(gap);
             b.gap(ObservationGap::IntervalUnknown)
         }
+        // A locator-only snapshot may have left useful partial custody while
+        // excluding a library. Reacquire on stronger inventory authority; do not
+        // promote the old locator or emit new sites in the retiring batch.
+        let refreshed: Vec<_> = self
+            .targets
+            .iter()
+            .filter_map(|(&pid, target)| {
+                records
+                    .iter()
+                    .find(|record| record.pid == pid)
+                    .filter(|record| target.process.inventory_authority_advanced(record))
+                    .map(|_| pid)
+            })
+            .collect();
+        for &pid in &refreshed {
+            self.retire(pid, &mut b);
+            b.refreshed_processes.push(pid);
+        }
         for record in records {
+            if refreshed.contains(&record.pid) {
+                continue;
+            }
             if self.targets.get(&record.pid).is_some_and(|t| t.ready) {
                 continue;
             }
@@ -2176,6 +2200,110 @@ mod tests {
             );
         }
     }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn verified_inventory_recovers_a_previously_refused_locator() {
+        use std::process::{Command, Stdio};
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Owned(
+            Command::new("/usr/bin/openssl")
+                .args([
+                    "speed", "-elapsed", "-seconds", "30", "-evp", "SHA512", "-bytes", "64",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let records = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.0.id()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let mut locators = records.clone();
+        let library = locators[0]
+            .modules
+            .iter_mut()
+            .find(|m| {
+                m.info
+                    .exports
+                    .iter()
+                    .any(|api| api.operational_id().is_some())
+            })
+            .unwrap();
+        assert_eq!(library.identity_status, inventory::IdentityStatus::Verified);
+        let library_hash: ObjectHash = library.info.sha256.clone().try_into().unwrap();
+        library.identity_status = inventory::IdentityStatus::LocatorCandidate;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        let first = session.reconcile_records(&locators);
+        assert!(first.gaps.contains(&ObservationGap::IdentityUnverified));
+        assert!(
+            !first
+                .static_candidates
+                .iter()
+                .any(|c| c.site().object_hash() == &library_hash)
+        );
+        drop(first);
+        let original = session.targets[&child.0.id()].process.generation();
+        // Stable locator-only snapshots must not promote or churn custody.
+        session.reconcile_records(&locators);
+        assert_eq!(
+            session.targets[&child.0.id()].process.generation(),
+            original
+        );
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        // A newly verified inventory row is only a reason for fresh acquisition.
+        let retirement = session.reconcile_records(&records);
+        assert_eq!(retirement.refreshed_processes, vec![child.0.id()]);
+        assert!(retirement.static_candidates.is_empty());
+        assert!(!retirement.gaps.contains(&ObservationGap::ProcessChanged));
+        let recovered = session.reconcile_records(&records);
+        assert!(
+            recovered
+                .static_candidates
+                .iter()
+                .any(|c| c.site().object_hash() == &library_hash),
+            "verified inventory never reacquired the refused library"
+        );
+        assert_ne!(
+            session.targets[&child.0.id()].process.generation(),
+            original
+        );
+        let generation = session.targets[&child.0.id()].process.generation();
+        let cookies = session.next_cookie;
+        let reads = session.budget.elf_read_bytes();
+        let again = session.reconcile_records(&records);
+        assert!(again.refreshed_processes.is_empty());
+        assert!(again.static_candidates.is_empty());
+        assert_eq!(
+            session.targets[&child.0.id()].process.generation(),
+            generation
+        );
+        assert_eq!(session.next_cookie, cookies);
+        assert_eq!(session.budget.elf_read_bytes(), reads);
+        std::thread::sleep(Duration::from_millis(100));
+        let final_batch = session.close_until(Instant::now() + Duration::from_secs(1));
+        assert!(final_batch.api_activity.iter().any(|a| a.row.entries > 0));
+    }
+
     #[test]
     #[ignore = "requires privileged BPF and fresh observation object"]
     fn discovery_tick_expiry_resumes_same_admitted_process() {

@@ -127,6 +127,9 @@ fn batch_invalidates_advertisements(batch: &ObservationBatch, pid: u32) -> bool 
 /// Target-memory observation loss does not invalidate retained executable code.
 /// Actual process, namespace and backing changes still retire every link.
 pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
+    if batch.refreshed_processes.contains(&pid) {
+        return true;
+    }
     batch.facts.iter().any(|f| {
         f.pid == pid
             && matches!(

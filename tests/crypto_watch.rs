@@ -565,24 +565,33 @@ fn installed_reused_pid_keeps_distinct_incarnations_and_never_redirects_old_link
     // ns_last_pid is changed only in this fresh PID namespace, after the owned
     // old workload is reaped. The observer itself is never recycled.
     let script = r#"
-import json, pathlib, subprocess, sys, time
+import json, pathlib, subprocess, sys, time, threading, queue
+ready=queue.Queue(); events=queue.Queue()
 args=['openssl','speed','-elapsed','-seconds','60','-evp','SHA512','-bytes','64']
 def workload(): return subprocess.Popen(args,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
 old=workload(); replacement=None; observer=None; rows=[]
 try:
-    observer=subprocess.Popen([sys.argv[1],'scan','--watch','--observe-crypto','--pid',str(old.pid),'--duration','35','--json'],stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,text=True)
+    observer=subprocess.Popen([sys.argv[1],'scan','--watch','--observe-crypto','--pid',str(old.pid),'--duration','35','--json'],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+    def read_ready():
+        for line in observer.stderr:
+            if 'focused callbacks attached' in line: ready.put(line)
+    threading.Thread(target=read_ready,daemon=True).start()
+    def read_rows():
+        for line in observer.stdout:
+            row=json.loads(line); rows.append(row); events.put(row)
+        events.put(None)
+    reader=threading.Thread(target=read_rows); reader.start()
     def admitted():
         while True:
-            line=observer.stdout.readline()
-            assert line, 'observer ended before admission'
-            row=json.loads(line); rows.append(row)
+            row=events.get(timeout=12)
+            assert row is not None, 'observer ended before admission'
             if row['kind']=='membership' and row['state']=='observing': return
-    admitted(); time.sleep(2)
+    admitted(); ready.get(timeout=12); time.sleep(2)
     pid=old.pid; old.terminate(); old.wait()
     pathlib.Path('/proc/sys/kernel/ns_last_pid').write_text(str(pid-1))
     replacement=workload(); assert replacement.pid==pid
-    admitted(); time.sleep(2); observer.terminate()
-    for line in observer.stdout: rows.append(json.loads(line))
+    admitted(); ready.get(timeout=12); time.sleep(2); observer.terminate()
+    reader.join(timeout=12); assert not reader.is_alive()
     assert observer.wait()==3
     assert replacement.poll() is None, 'foreign replacement was signalled'
     for row in rows: print(json.dumps(row,separators=(',',':')))

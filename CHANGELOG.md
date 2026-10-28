@@ -12,6 +12,8 @@
 - Add `crypto-watch-v1` sampled discovery and per-incarnation observation with
   four active slots and one shared 256 MiB accounted state budget. Temporary
   capacity pressure preserves retained discovery progress for later resumption.
+  A later verified inventory row also triggers fresh acquisition when an early
+  loader snapshot supplied only a refused locator candidate.
 - Root package version 0.4.0; helper crates retain their versions. Reports remain
   PARTIAL, attribution Unknown and algorithm policy inconclusive. See
   [candidate qualification and limits](docs/release-v0.4.0.md).

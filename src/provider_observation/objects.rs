@@ -487,6 +487,9 @@ pub struct VerifiedProcess {
     budget: ObservationBudget,
     gaps: RefCell<std::collections::BTreeSet<ObservationGap>>,
     static_discovery: RefCell<StaticDiscovery>,
+    // Inventory hints excluded from this acquisition. Stronger later metadata
+    // can request fresh custody, but cannot promote these old locators.
+    refused_inventory: Vec<(u64, u64)>,
 }
 struct Process {
     _admission: Option<super::schema::ProcessAdmission>,
@@ -559,6 +562,14 @@ impl VerifiedProcess {
     }
     pub fn gaps(&self) -> Vec<ObservationGap> {
         self.gaps.borrow().iter().copied().collect()
+    }
+    pub(crate) fn inventory_authority_advanced(&self, record: &ProcessRecord) -> bool {
+        record.modules.iter().any(|module| {
+            module.identity_status == IdentityStatus::Verified
+                && self
+                    .refused_inventory
+                    .contains(&(module.info.device, module.info.inode))
+        })
     }
     pub fn revalidate(&self) -> Result<(), ObservationGap> {
         self.process.validate()?;
@@ -821,6 +832,24 @@ pub fn acquire(
         }
     });
     let process = acquire_incarnation(record)?.0;
+    let refused_count = record
+        .modules
+        .iter()
+        .filter(|m| m.identity_status == IdentityStatus::LocatorCandidate)
+        .count();
+    limits.state(
+        refused_count
+            .checked_mul(std::mem::size_of::<(u64, u64)>())
+            .ok_or(ObservationGap::StateLimit)?,
+    )?;
+    let mut refused_inventory = Vec::with_capacity(refused_count);
+    refused_inventory.extend(
+        record
+            .modules
+            .iter()
+            .filter(|m| m.identity_status == IdentityStatus::LocatorCandidate)
+            .map(|m| (m.info.device, m.info.inode)),
+    );
     limits.state(MAX_MAPS)?;
     let maps = Rc::new(read_at(&process.directory, b"maps", MAX_MAPS)?);
     let mut mappings = Vec::new();
@@ -941,6 +970,7 @@ pub fn acquire(
         budget: limits.clone(),
         gaps: RefCell::new(gaps),
         static_discovery: RefCell::default(),
+        refused_inventory,
     };
     verified.revalidate()?;
     admission.retain();
