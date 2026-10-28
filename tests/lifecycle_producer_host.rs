@@ -9,7 +9,9 @@ extern crate self as osslscope;
 #[path = "../src/lib.rs"]
 mod app;
 pub use app::*;
-pub(crate) use app::{capture_setup, count_owner, policy_config};
+pub(crate) use app::{
+    capture_setup, count_owner, observation_memory, policy_config, startup_objects,
+};
 #[expect(
     dead_code,
     unused_imports,

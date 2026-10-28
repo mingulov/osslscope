@@ -564,3 +564,359 @@ fn legacy_closed_workload_fd_preserves_entrypoint_preflight() {
         );
     }
 }
+
+/// Privileged installed lane: unchanged short applications, with no readiness,
+/// query protocol, internal backend selection or explicit object paths.
+#[test]
+#[ignore = "requires an installed privileged focused CLI"]
+fn installed_short_digest_retains_prearmed_entries() {
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let dir = native_dir("short");
+    for algorithm in ["-sha512", "-sha3-256"] {
+        let output = dir.join(algorithm);
+        let expected = Command::new("/usr/bin/openssl")
+            .args(["dgst", algorithm, "/dev/null"])
+            .output()
+            .unwrap();
+        assert!(expected.status.success());
+        let out = Command::new(&binary)
+            .arg("report")
+            .arg("--workload-out")
+            .arg(&output)
+            .args([
+                "--duration",
+                "5",
+                "--format",
+                "json",
+                "run",
+                "--",
+                "/usr/bin/openssl",
+                "dgst",
+                algorithm,
+                "/dev/null",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let doc = parsed(&out);
+        assert_eq!(doc["disposition"]["outcome"], "exited");
+        assert_eq!(doc["disposition"]["code"], 0);
+        assert_eq!(std::fs::read(output).unwrap(), expected.stdout);
+        let calls: u64 = doc["sites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(
+                doc["fenced"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|g| g["sites"].as_array().unwrap()),
+            )
+            .map(|s| s["calls"].as_u64().unwrap())
+            .sum();
+        assert!(
+            calls > 0,
+            "ordinary short {algorithm} exited without retained physical entry evidence"
+        );
+        println!(
+            "{algorithm}: {calls} retained physical entries; child exit0; exact workload output preserved"
+        );
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires an installed privileged focused CLI"]
+fn installed_sustained_owned_digest_preserves_first_mapping_counts() {
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let out = Command::new(binary)
+        .args([
+            "report",
+            "--duration",
+            "10",
+            "--format",
+            "json",
+            "run",
+            "--",
+            "/usr/bin/openssl",
+            "speed",
+            "-elapsed",
+            "-seconds",
+            "4",
+            "-evp",
+            "SHA512",
+            "-bytes",
+            "64",
+        ])
+        .output()
+        .unwrap();
+    let doc = parsed(&out);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(doc["disposition"]["outcome"], "exited");
+    assert_eq!(doc["disposition"]["code"], 0);
+    let rows: Vec<_> = doc["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(
+            doc["fenced"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["sites"].as_array().unwrap()),
+        )
+        .collect();
+    let keys: std::collections::BTreeSet<_> = rows
+        .iter()
+        .map(|r| {
+            (
+                r["object"].as_str().unwrap(),
+                r["device"].as_u64().unwrap(),
+                r["inode"].as_u64().unwrap(),
+                r["offset"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        keys.len(),
+        rows.len(),
+        "first mapping must not duplicate a physical cookie"
+    );
+    let first = rows
+        .iter()
+        .filter(|r| r["calls"].as_u64().unwrap() > 0)
+        .map(|r| r["first_ns"].as_u64().unwrap())
+        .min()
+        .unwrap();
+    let last = rows
+        .iter()
+        .map(|r| r["last_ns"].as_u64().unwrap_or(0))
+        .max()
+        .unwrap();
+    assert!(
+        last - first > 2_000_000_000,
+        "entry evidence must continue across first rescan"
+    );
+    assert!(
+        !doc["completeness"]["counters"]
+            .to_string()
+            .contains("focused_resource")
+    );
+    println!(
+        "{} unique sites, entry span {}ns, child exit0",
+        rows.len(),
+        last - first
+    );
+}
+
+fn native_dir(label: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::DirBuilderExt;
+    let p = std::env::temp_dir().join(format!(
+        "osslscope-{label}-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::DirBuilder::new().mode(0o700).create(&p).unwrap();
+    p
+}
+#[test]
+#[ignore = "requires an installed privileged focused CLI and C compiler"]
+fn installed_origin_layout_and_late_module_remain_partial() {
+    use std::os::unix::fs::MetadataExt;
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let dir = native_dir("origin");
+    std::fs::create_dir(dir.join("lib")).unwrap();
+    let lib = dir.join("lib/libcrypto.so.3");
+    std::fs::copy("/usr/lib/x86_64-linux-gnu/libcrypto.so.3", &lib).unwrap();
+    let exe = dir.join("workload");
+    assert!(
+        Command::new("cc")
+            .args(["-O1", "-o"])
+            .arg(&exe)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/runtime/preview_workload.c"
+            ))
+            .args(["-Wl,-rpath,$ORIGIN/lib", "-lcrypto", "-lpthread"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let out = Command::new(&binary)
+        .args(["report", "--duration", "5", "--format", "json", "run", "--"])
+        .arg(exe)
+        .args(["sha", "37"])
+        .output()
+        .unwrap();
+    let doc = parsed(&out);
+    assert_eq!(doc["disposition"]["code"], 0);
+    let rows: Vec<_> = doc["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(
+            doc["fenced"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["sites"].as_array().unwrap()),
+        )
+        .collect();
+    let inode = std::fs::metadata(lib).unwrap().ino();
+    assert!(
+        rows.iter()
+            .any(|r| r["inode"].as_u64() == Some(inode) && r["calls"].as_u64().unwrap() > 0),
+        "actual alternate dependency must have retained entry evidence"
+    );
+    let late = Command::new(binary)
+        .args([
+            "report",
+            "--duration",
+            "5",
+            "--format",
+            "json",
+            "run",
+            "--",
+            "/usr/bin/openssl",
+            "dgst",
+            "-provider",
+            "legacy",
+            "-md4",
+            "/dev/null",
+        ])
+        .output()
+        .unwrap();
+    let late = parsed(&late);
+    assert_eq!(late["disposition"]["code"], 0);
+    assert_eq!(late["completeness"]["status"], "PARTIAL");
+    assert!(
+        late["completeness"]["counters"]
+            .to_string()
+            .contains("focused.interval_unknown")
+    );
+    for row in late["sites"].as_array().unwrap().iter().chain(
+        late["fenced"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["sites"].as_array().unwrap()),
+    ) {
+        assert_eq!(row["candidates_coverage"], "unknown");
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+#[ignore = "requires an installed privileged focused CLI"]
+fn installed_setup_cancellation_keeps_child_held_until_cleanup() {
+    use std::time::{Duration, Instant};
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let dir = native_dir("cancel");
+    let output = dir.join("workload.out");
+    let observer = Command::new(binary)
+        .arg("report")
+        .arg("--workload-out")
+        .arg(&output)
+        .args([
+            "--duration",
+            "5",
+            "--format",
+            "json",
+            "run",
+            "--",
+            "/usr/bin/openssl",
+            "dgst",
+            "-sha512",
+            "/dev/null",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let observer_pid = observer.id();
+    let until = Instant::now() + Duration::from_secs(5);
+    let pid = loop {
+        assert!(Instant::now() < until, "observer never acquired held child");
+        let children =
+            std::fs::read_to_string(format!("/proc/{observer_pid}/task/{observer_pid}/children"))
+                .unwrap_or_default();
+        if let Some(pid) = children
+            .split_whitespace()
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+        {
+            if std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|s| s.rsplit_once(')').unwrap().1.starts_with(" T"))
+            {
+                break pid;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(unsafe { libc::kill(observer_pid as i32, libc::SIGTERM) }, 0);
+    let out = observer.wait_with_output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        std::fs::read(&output).unwrap_or_default().is_empty(),
+        "cancelled held target executed"
+    );
+    assert!(
+        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+        "cancelled child not reaped"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+#[ignore = "requires an installed privileged focused CLI"]
+fn installed_warm_pid_keeps_candidates_across_discovery_deadline() {
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let mut workload = Command::new("/usr/bin/openssl")
+        .args([
+            "speed", "-elapsed", "-seconds", "8", "-evp", "SHA512", "-bytes", "64",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    let out = Command::new(binary)
+        .args([
+            "report",
+            "--pid",
+            &workload.id().to_string(),
+            "--duration",
+            "4",
+            "--format",
+            "json",
+        ])
+        .output()
+        .unwrap();
+    assert!(workload.wait().unwrap().success());
+    let doc = parsed(&out);
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(doc["disposition"]["outcome"], "foreign-observed");
+    let calls: u64 = doc["sites"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(
+            doc["fenced"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|g| g["sites"].as_array().unwrap()),
+        )
+        .map(|s| s["calls"].as_u64().unwrap())
+        .sum();
+    assert!(
+        calls > 0,
+        "available warm candidates were discarded at a discovery deadline"
+    );
+    println!("warm PID: {calls} entries; workload survived and exited0");
+}

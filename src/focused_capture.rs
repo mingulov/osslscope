@@ -20,7 +20,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     os::unix::fs::MetadataExt,
-    sync::{Arc, atomic::Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -76,6 +79,7 @@ pub struct FocusedResult {
     pub document: CaptureDocument,
     pub child_exit: Option<i32>,
     pub workload_discarded: bool,
+    pub(crate) _reservation: Option<crate::observation_memory::MemoryLease>,
 }
 
 /// No event-order proof is exposed within a batch. Invalidation therefore
@@ -287,21 +291,29 @@ pub(crate) fn observer_namespace() -> anyhow::Result<inventory::NamespaceId> {
     })
 }
 
+enum BatchProgress {
+    Applied(bool),
+    Deferred,
+}
 fn process_batch(
     session: &ProviderSession,
     counter: &mut FocusedCounter,
-    batch: ObservationBatch,
+    batch: &ObservationBatch,
     pid: u32,
-    deadline_ns: u64,
+    control: (u64, Instant, &AtomicBool),
     gaps: &mut BTreeSet<ObservationGap>,
     state_bytes: &mut usize,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<BatchProgress> {
     gaps.extend(batch.gaps.iter().copied());
-    if batch_requires_retirement(&batch, pid) {
+    if batch_requires_retirement(batch, pid) {
         counter.retire();
-        return Ok(false);
+        return Ok(BatchProgress::Applied(false));
     }
-    let discard_live = batch_invalidates_advertisements(&batch, pid);
+    let (deadline_ns, deadline, cancel) = control;
+    if Instant::now() >= deadline {
+        return Ok(BatchProgress::Deferred);
+    }
+    let discard_live = batch_invalidates_advertisements(batch, pid);
     let count = batch
         .static_candidates
         .len()
@@ -311,17 +323,18 @@ fn process_batch(
         .and_then(|n| state_bytes.checked_add(n));
     if admitted.is_none_or(|n| n > 8 << 20) {
         gaps.insert(ObservationGap::StateLimit);
-        return Ok(false);
+        return Ok(BatchProgress::Applied(false));
     }
     *state_bytes = admitted.unwrap();
     let mut candidates: Vec<_> = batch
         .static_candidates
-        .into_iter()
+        .iter()
         .filter(|c| c.pid() == pid)
+        .cloned()
         .map(CountCandidate::Static)
         .collect();
     if !discard_live {
-        for candidate in batch.learned_sites {
+        for candidate in batch.learned_sites.iter().cloned() {
             if candidate.pid() != pid {
                 continue;
             }
@@ -331,21 +344,579 @@ fn process_batch(
             if let Err(gap) = session.revalidate_candidate(&candidate) {
                 gaps.insert(gap);
                 counter.retire();
-                return Ok(false);
+                return Ok(BatchProgress::Applied(false));
             }
             candidates.push(CountCandidate::Learned(candidate));
         }
     }
     let installed = now_ns()?;
     if installed >= deadline_ns {
-        return Ok(false);
+        return Ok(BatchProgress::Applied(false));
     }
-    let valid = counter.attach_candidates(candidates, installed).is_ok();
-    Ok(valid && counter.active_site_count() > 0 && now_ns()? < deadline_ns)
+    let valid = counter
+        .attach_candidates_controlled(candidates, installed, deadline, cancel)
+        .is_ok();
+    if !valid && Instant::now() >= deadline && !cancel.load(Ordering::Relaxed) {
+        return Ok(BatchProgress::Deferred);
+    }
+    Ok(BatchProgress::Applied(
+        valid && counter.active_site_count() > 0 && now_ns()? < deadline_ns,
+    ))
 }
 
-/// Capture one selected process incarnation. Foreign PIDs acquire no custody;
-/// released children are detached on expiry, cancellation and error.
+/// Reusable bounded process observation. Fields close counter/provider links
+/// before releasing original owned custody, including error/drop paths.
+pub(crate) struct FocusedSession {
+    counter: Option<FocusedCounter>,
+    session: Option<ProviderSession>,
+    _foreign: Option<crate::provider_observation::objects::ProcessIncarnation>,
+    owned: Option<OwnedTarget>,
+    pid: u32,
+    starttime: u64,
+    namespaces: inventory::NamespaceIds,
+    scanner: ScopedScanner,
+    initial_metadata: Option<inventory::ProcessRecord>,
+    pending: Option<ObservationBatch>,
+    gaps: BTreeSet<ObservationGap>,
+    state_bytes: usize,
+    inventory_gaps: u64,
+    sample: CountSample,
+    next_snapshot: Instant,
+    ready: bool,
+    start_ns: u64,
+    deadline_ns: u64,
+    end: Instant,
+    wall_start: Option<u64>,
+    signal_cut: bool,
+    workload_discarded: bool,
+    _reservation: crate::observation_memory::MemoryLease,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SessionProgress {
+    Running,
+    Exited,
+    StopRequested,
+    Unverifiable,
+}
+impl FocusedSession {
+    /// Persistent host ceilings plus bounded scanner/pins/argv, source bytes,
+    /// and map payload/entry overhead. Temporary ELF bytes and parser metadata
+    /// are leased separately on the same pool before allocation.
+    pub(crate) fn reservation_bytes(objects: &FocusedObjects) -> anyhow::Result<usize> {
+        let cpus = aya::util::nr_cpus().map_err(|(_, e)| e)?;
+        if cpus == 0 || cpus > CountLimits::default().max_cpus {
+            bail!("focused CPU capacity exceeded");
+        }
+        if objects.observation.len() > 16 << 20 || objects.count.len() > 16 << 20 {
+            bail!("focused companion capacity exceeded");
+        }
+        let mut bytes = (104usize << 20) + objects.observation.len() + objects.count.len();
+        for spec in crate::loader::FOCUSED_COUNT_MAPS
+            .into_iter()
+            .chain(crate::provider_observation::session::specs())
+        {
+            let value = (spec.value_size as usize + 7) & !7;
+            let payload = if spec.map_type == 27 {
+                spec.max_entries as usize
+            } else {
+                let copies = if matches!(spec.map_type, 5 | 6) {
+                    cpus
+                } else {
+                    1
+                };
+                (spec.key_size as usize + value * copies + 128) * spec.max_entries as usize
+            };
+            bytes = bytes
+                .checked_add(payload + 65_536)
+                .context("focused map reservation overflow")?;
+        }
+        Ok(bytes)
+    }
+    /// No signal handlers are installed here. expected is a coordinator's
+    /// scanned incarnation and initial metadata, never attachment authority.
+    pub(crate) fn open(
+        config: FocusedConfig,
+        target: capture::Target,
+        objects: FocusedObjects,
+        setup_deadline: Instant,
+        cancel: &AtomicBool,
+        expected: Option<&inventory::ProcessRecord>,
+    ) -> anyhow::Result<Self> {
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let reservation = pool
+            .reserve(Self::reservation_bytes(&objects)?)
+            .context("focused memory admission refused")?;
+        Self::open_reserved(
+            config,
+            target,
+            objects,
+            setup_deadline,
+            cancel,
+            expected,
+            reservation,
+        )
+    }
+    pub(crate) fn open_reserved(
+        config: FocusedConfig,
+        target: capture::Target,
+        objects: FocusedObjects,
+        setup_deadline: Instant,
+        cancel: &AtomicBool,
+        expected: Option<&inventory::ProcessRecord>,
+        reservation: crate::observation_memory::MemoryLease,
+    ) -> anyhow::Result<Self> {
+        config.validate()?;
+        if reservation.bytes() < Self::reservation_bytes(&objects)? {
+            bail!("focused memory reservation too small");
+        }
+        let pool = reservation.pool();
+        let mut budget = crate::provider_observation::ObservationBudget::new(ObservationLimits {
+            max_processes: 1,
+            max_links: 512,
+            ..Default::default()
+        });
+        budget.memory = Some(pool.clone());
+        budget.set_deadline(setup_deadline);
+        if <[u8; 32]>::from(Sha256::digest(&objects.count)) != objects.count_sha256 {
+            bail!("focused count object identity mismatch");
+        }
+        let setup_deadline = setup_deadline.min(
+            Instant::now()
+                .checked_add(config.timeout)
+                .context("focused setup deadline overflow")?,
+        );
+        let workload_discarded = matches!(
+            &target,
+            capture::Target::Spawn {
+                workload: crate::target::WorkloadDest::Null,
+                ..
+            }
+        );
+        let startup_argv = match &target {
+            capture::Target::Spawn { argv, .. } => Some(argv.clone()),
+            _ => None,
+        };
+        let mut owned = match target {
+            capture::Target::Pid(pid) if pid > 0 && pid <= i32::MAX as u32 => (pid, None),
+            capture::Target::Pid(_) => return Err(TargetUnavailable.into()),
+            capture::Target::Spawn { argv, workload } => {
+                let child = OwnedTarget::spawn_stopped_with_control(
+                    &argv,
+                    workload,
+                    setup_deadline,
+                    cancel,
+                )?;
+                (child.pid(), Some(child))
+            }
+        };
+        let pid = owned.0;
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
+        }
+        // Readable target acquisition is independent of tracing availability.
+        // Acquire only proc/maps identity before release. Inspecting inherited
+        // observer mappings here can spend the setup budget on an unrelated ELF;
+        // actual object inventory/reconciliation starts after release below.
+        let (initial_record, initial_reads) = if let Some(expected) = expected {
+            if owned.1.is_some()
+                || expected.pid != pid
+                || expected.modules.len() > 256
+                || expected
+                    .modules
+                    .iter()
+                    .any(|m| m.info.sha256.len() != 64 || m.info.exports.len() > 16)
+            {
+                return Err(TargetUnavailable.into());
+            }
+            (expected.clone(), 0)
+        } else {
+            let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+                pids: vec![pid],
+                limits: inventory::Limits {
+                    max_pids: 1,
+                    max_objects_per_process: 0,
+                    max_objects: 256,
+                    max_read_bytes: 256 << 20,
+                    timeout: RESCAN.min(setup_deadline.saturating_duration_since(Instant::now())),
+                    ..Default::default()
+                },
+            });
+            (
+                snapshot
+                    .processes
+                    .into_iter()
+                    .find(|p| p.pid == pid)
+                    .ok_or(TargetUnavailable)?,
+                snapshot.totals.read_bytes,
+            )
+        };
+        let starttime = initial_record.starttime;
+        // Metadata is only a locator: fresh retained acquisition checks the exact
+        // scanned incarnation before any BPF attachment, including supplied snapshots.
+        let foreign = if owned.1.is_none() {
+            Some(
+                crate::provider_observation::objects::acquire_incarnation(&initial_record)
+                    .map_err(|_| TargetUnavailable)?,
+            )
+        } else {
+            None
+        };
+        let mut scanner = ScopedScanner::new(
+            Selection {
+                pids: vec![pid],
+                ..Default::default()
+            },
+            inventory::Limits {
+                max_pids: 1,
+                max_objects_per_process: 256,
+                max_objects: 256,
+                max_read_bytes: (256u64 << 20).saturating_sub(initial_reads),
+                timeout: RESCAN.min(setup_deadline.saturating_duration_since(Instant::now())),
+                ..Default::default()
+            },
+        )
+        .map_err(|_| TargetUnavailable)?;
+        scanner.set_memory_pool(pool);
+        let mut gaps = BTreeSet::new();
+        let session = if objects.observation.is_empty() {
+            gaps.insert(ObservationGap::BpfUnavailable);
+            None
+        } else {
+            match ProviderSession::open_budgeted(budget.clone(), &objects.observation) {
+                Ok(s) => Some(s),
+                Err(gap) => {
+                    gaps.insert(gap);
+                    None
+                }
+            }
+        };
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
+        }
+        let preexec = if let (Some(child), Some(argv)) = (&owned.1, &startup_argv) {
+            if objects.count.is_empty() {
+                None
+            } else {
+                match crate::startup_objects::prepare_owned_startup(
+                    child,
+                    argv,
+                    &mut budget,
+                    setup_deadline,
+                    cancel,
+                ) {
+                    Ok(sites) => Some(sites),
+                    Err(gap) => {
+                        gaps.insert(gap);
+                        None
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        let start_ns = now_ns()?;
+        let wall_start = unix_ns();
+        let deadline_ns = start_ns
+            .checked_add(u64::try_from(config.duration.as_nanos())?)
+            .context("focused admission overflow")?;
+        let end = Instant::now()
+            .checked_add(config.duration)
+            .context("focused duration overflow")?;
+        let mut counter = if objects.count.is_empty() {
+            gaps.insert(ObservationGap::BpfUnavailable);
+            None
+        } else {
+            match observer_namespace() {
+                Ok(namespace) => match FocusedCounter::open(
+                    &objects.count,
+                    pid,
+                    namespace,
+                    CountLimits {
+                        window: CountAdmissionWindow {
+                            start_ns,
+                            deadline_ns,
+                        },
+                        max_state_bytes: 24 << 20,
+                        ..Default::default()
+                    },
+                ) {
+                    Ok(c) => Some(c),
+                    Err(_) => {
+                        gaps.insert(ObservationGap::BpfUnavailable);
+                        None
+                    }
+                },
+                Err(_) => {
+                    gaps.insert(ObservationGap::NamespaceChanged);
+                    None
+                }
+            }
+        };
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
+        }
+        if let (Some(preexec), Some(counter)) = (preexec, &mut counter) {
+            gaps.extend(preexec.gaps);
+            if counter
+                .attach_candidates_controlled(
+                    preexec
+                        .candidates
+                        .into_iter()
+                        .map(CountCandidate::Static)
+                        .collect(),
+                    now_ns()?,
+                    setup_deadline,
+                    cancel,
+                )
+                .is_err()
+            {
+                gaps.insert(ObservationGap::AttachFailed);
+            }
+        }
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
+        }
+        if let Some(child) = &mut owned.1 {
+            child.release_retaining_exit()?;
+        }
+        Ok(Self {
+            counter,
+            session,
+            _foreign: foreign,
+            owned: owned.1,
+            pid,
+            starttime,
+            namespaces: initial_record.namespaces.clone(),
+            scanner,
+            initial_metadata: expected.map(|_| initial_record),
+            pending: None,
+            gaps,
+            state_bytes: 0,
+            inventory_gaps: 0,
+            sample: CountSample::default(),
+            next_snapshot: Instant::now()
+                + if startup_argv.is_some() {
+                    POLL
+                } else {
+                    Duration::ZERO
+                },
+            ready: false,
+            start_ns,
+            deadline_ns,
+            end,
+            wall_start,
+            signal_cut: false,
+            workload_discarded,
+            _reservation: reservation,
+        })
+    }
+    fn apply_batch(
+        &mut self,
+        batch: ObservationBatch,
+        deadline: Instant,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        self.gaps.extend(batch.gaps.iter().copied());
+        if let (Some(session), Some(counter)) = (&self.session, &mut self.counter) {
+            match process_batch(
+                session,
+                counter,
+                &batch,
+                self.pid,
+                (self.deadline_ns, deadline, cancel),
+                &mut self.gaps,
+                &mut self.state_bytes,
+            )? {
+                BatchProgress::Deferred => {
+                    // Candidate/file/custody storage is already charged to the
+                    // shared provider budget. Keep at most one batch; attach
+                    // revalidates every retained file/mapping on the next tick.
+                    self.pending = Some(batch);
+                }
+                BatchProgress::Applied(attached) => {
+                    if attached && !self.ready {
+                        eprintln!(
+                            "osslscope: focused callbacks attached (pid={}, sites={})",
+                            self.pid,
+                            counter.active_site_count()
+                        );
+                        self.ready = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    /// One bounded work pass, no sleeping. The caller owns cadence and signals.
+    pub(crate) fn poll(
+        &mut self,
+        now: Instant,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<SessionProgress> {
+        self.signal_cut |= cancel.load(Ordering::Relaxed);
+        if self.signal_cut || now >= self.end || Instant::now() >= self.end {
+            self.pending = None;
+            return Ok(SessionProgress::StopRequested);
+        }
+        // Peek before any maps read: an exited short command keeps its valid
+        // prearmed historical counts without a post-exit mapping prerequisite.
+        if let Some(child) = &self.owned {
+            if child.peek_exit()?.is_some() {
+                self.pending = None;
+                return Ok(SessionProgress::Exited);
+            }
+        }
+        let tick_end = (now + RESCAN).min(self.end);
+        if let Some(session) = &self.session {
+            session.set_deadline(tick_end);
+        }
+        if let Some(batch) = self.pending.take() {
+            self.apply_batch(batch, tick_end, cancel)?;
+            if self.pending.is_some() {
+                return Ok(SessionProgress::Running);
+            }
+        }
+        if now >= self.next_snapshot {
+            let records = if let Some(record) = self.initial_metadata.take() {
+                vec![record]
+            } else {
+                let snapshot = self
+                    .scanner
+                    .snapshot_for(tick_end.saturating_duration_since(Instant::now()));
+                if !snapshot.gaps.is_empty() {
+                    self.inventory_gaps = self.inventory_gaps.saturating_add(1);
+                }
+                snapshot.processes
+            };
+            if !records.iter().any(|p| {
+                p.pid == self.pid
+                    && p.starttime == self.starttime
+                    && p.namespaces == self.namespaces
+            }) {
+                self.gaps.insert(ObservationGap::ProcessChanged);
+                if let Some(c) = &mut self.counter {
+                    c.retire();
+                }
+                self.pending = None;
+                return Ok(SessionProgress::Unverifiable);
+            }
+            if cancel.load(Ordering::Relaxed) || Instant::now() >= tick_end {
+                self.signal_cut |= cancel.load(Ordering::Relaxed);
+                self.gaps.insert(ObservationGap::SnapshotLag);
+                return Ok(if self.signal_cut {
+                    SessionProgress::StopRequested
+                } else {
+                    SessionProgress::Running
+                });
+            }
+            if let Some(s) = &mut self.session {
+                let batch = s.reconcile_records(&records);
+                self.apply_batch(batch, tick_end, cancel)?;
+            }
+            self.next_snapshot = Instant::now() + RESCAN;
+            if self.pending.is_some() {
+                return Ok(SessionProgress::Running);
+            }
+        }
+        self.signal_cut |= cancel.load(Ordering::Relaxed);
+        if self.signal_cut {
+            self.pending = None;
+            return Ok(SessionProgress::StopRequested);
+        }
+        if Instant::now() >= tick_end {
+            self.gaps.insert(ObservationGap::SnapshotLag);
+            return Ok(SessionProgress::Running);
+        }
+        if let Some(s) = &mut self.session {
+            let batch = s.drain((Instant::now() + DRAIN).min(tick_end));
+            self.apply_batch(batch, tick_end, cancel)?;
+        }
+        self.signal_cut |= cancel.load(Ordering::Relaxed);
+        if self.signal_cut {
+            self.pending = None;
+            return Ok(SessionProgress::StopRequested);
+        }
+        if let Some(c) = &mut self.counter {
+            self.sample = c.sample((Instant::now() + DRAIN).min(tick_end));
+            if self.sample.namespace_failures > 0 {
+                c.retire();
+                self.gaps.insert(ObservationGap::NamespaceChanged);
+            }
+        }
+        Ok(SessionProgress::Running)
+    }
+    pub(crate) fn finish(mut self, deadline: Instant) -> anyhow::Result<FocusedResult> {
+        self.pending = None;
+        let end_ns = now_ns()?.min(self.deadline_ns);
+        // Close admission/links first. Neither close nor equal map reads prove a
+        // terminal cut; keep a single bounded cumulative final read and its gaps.
+        if let Some(c) = &mut self.counter {
+            c.retire();
+        }
+        if let Some(s) = self.session.take() {
+            self.gaps.extend(s.close_until(deadline).gaps);
+        }
+        if let Some(c) = self.counter.take() {
+            self.sample = c.close(deadline);
+        }
+        if self.owned.is_some() {
+            self.sample
+                .gaps
+                .push(loss("focused.startup_partial", CounterSource::Discovery, 1));
+        }
+        if self.inventory_gaps > 0 {
+            self.sample.gaps.push(loss(
+                "focused.inventory_partial",
+                CounterSource::Discovery,
+                self.inventory_gaps,
+            ));
+        }
+        let mut document = project(
+            self.pid,
+            CaptureWindow {
+                requested_start_ns: self.start_ns,
+                requested_end_ns: self.deadline_ns,
+                effective_start_ns: self.start_ns,
+                effective_end_ns: end_ns.max(self.start_ns),
+                signal_cut: self.signal_cut,
+                count_admission: Some(CountAdmissionWindow {
+                    start_ns: self.start_ns,
+                    deadline_ns: self.deadline_ns,
+                }),
+            },
+            std::mem::take(&mut self.sample),
+            &self.gaps.iter().copied().collect::<Vec<_>>(),
+        );
+        let disposition = match &mut self.owned {
+            Some(child) => child.finish_observation()?,
+            None => TargetDisposition::Detached { pid: self.pid },
+        };
+        let child_exit = match disposition {
+            TargetDisposition::Exited { code } => Some(code),
+            _ => None,
+        };
+        document.disposition = Some(match (self.owned.is_some(), disposition) {
+            (_, TargetDisposition::Exited { code }) => DispositionRecord::exited(code),
+            (true, TargetDisposition::Detached { pid }) => DispositionRecord::detached_running(pid),
+            (false, TargetDisposition::Detached { pid }) => {
+                DispositionRecord::foreign_observed(pid)
+            }
+        });
+        document.context = Some(CaptureContext {
+            kernel_release: String::new(),
+            wall_start_unix_ns: self.wall_start,
+            wall_end_unix_ns: unix_ns(),
+        });
+        Ok(FocusedResult {
+            document,
+            child_exit,
+            workload_discarded: self.workload_discarded,
+            _reservation: Some(self._reservation),
+        })
+    }
+}
+
+/// Synchronous one-process wrapper: exactly one signal owner, outside sessions.
 pub fn run(
     config: FocusedConfig,
     target: capture::Target,
@@ -353,271 +924,177 @@ pub fn run(
     setup_deadline: Instant,
 ) -> anyhow::Result<FocusedResult> {
     config.validate()?;
-    if <[u8; 32]>::from(Sha256::digest(&objects.count)) != objects.count_sha256 {
-        bail!("focused count object identity mismatch");
-    }
-    let setup_deadline = setup_deadline.min(
-        Instant::now()
-            .checked_add(config.timeout)
-            .context("focused setup deadline overflow")?,
-    );
-    let workload_discarded = matches!(
-        &target,
-        capture::Target::Spawn {
-            workload: crate::target::WorkloadDest::Null,
-            ..
-        }
-    );
     let signals = Signals::install().context("focused signal setup failed")?;
     let cancel = signals.cancel();
-    let mut owned = match target {
-        capture::Target::Pid(pid) if pid > 0 && pid <= i32::MAX as u32 => (pid, None),
-        capture::Target::Pid(_) => return Err(TargetUnavailable.into()),
-        capture::Target::Spawn { argv, workload } => {
-            let child =
-                OwnedTarget::spawn_stopped_with_control(&argv, workload, setup_deadline, cancel)?;
-            (child.pid(), Some(child))
-        }
-    };
-    let pid = owned.0;
-    if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
-        bail!("focused setup interrupted or expired");
-    }
-    // Readable target acquisition is independent of tracing availability.
-    // Acquire only proc/maps identity before release. Inspecting inherited
-    // observer mappings here can spend the setup budget on an unrelated ELF;
-    // actual object inventory/reconciliation starts after release below.
-    let initial = inventory::snapshot(&inventory::SnapshotOptions {
-        pids: vec![pid],
-        limits: inventory::Limits {
-            max_pids: 1,
-            max_objects_per_process: 0,
-            max_objects: 256,
-            max_read_bytes: 256 << 20,
-            timeout: RESCAN.min(setup_deadline.saturating_duration_since(Instant::now())),
-            ..Default::default()
-        },
-    });
-    let starttime = initial
-        .processes
-        .iter()
-        .find(|p| p.pid == pid)
-        .map(|p| p.starttime)
-        .ok_or(TargetUnavailable)?;
-    let mut scanner = ScopedScanner::new(
-        Selection {
-            pids: vec![pid],
-            ..Default::default()
-        },
-        inventory::Limits {
-            max_pids: 1,
-            max_objects_per_process: 256,
-            max_objects: 256,
-            max_read_bytes: (256u64 << 20).saturating_sub(initial.totals.read_bytes),
-            timeout: RESCAN.min(setup_deadline.saturating_duration_since(Instant::now())),
-            ..Default::default()
-        },
-    )
-    .map_err(|_| TargetUnavailable)?;
-    let mut gaps = BTreeSet::new();
-    let mut session = if objects.observation.is_empty() {
-        gaps.insert(ObservationGap::BpfUnavailable);
-        None
-    } else {
-        match ProviderSession::open(
-            ObservationLimits {
-                max_processes: 1,
-                max_links: 512,
-                ..Default::default()
-            },
-            &objects.observation,
-        ) {
-            Ok(s) => Some(s),
-            Err(gap) => {
-                gaps.insert(gap);
-                None
-            }
-        }
-    };
-    if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
-        bail!("focused setup interrupted or expired");
-    }
-    let start_ns = now_ns()?;
-    let wall_start = unix_ns();
-    let deadline_ns = start_ns
-        .checked_add(u64::try_from(config.duration.as_nanos())?)
-        .context("focused admission overflow")?;
-    let end = Instant::now()
-        .checked_add(config.duration)
-        .context("focused duration overflow")?;
-    let mut counter = if objects.count.is_empty() {
-        gaps.insert(ObservationGap::BpfUnavailable);
-        None
-    } else {
-        match observer_namespace() {
-            Ok(namespace) => match FocusedCounter::open(
-                &objects.count,
-                pid,
-                namespace,
-                CountLimits {
-                    window: CountAdmissionWindow {
-                        start_ns,
-                        deadline_ns,
-                    },
-                    max_state_bytes: 24 << 20,
-                    ..Default::default()
-                },
-            ) {
-                Ok(c) => Some(c),
-                Err(_) => {
-                    gaps.insert(ObservationGap::BpfUnavailable);
-                    None
-                }
-            },
-            Err(_) => {
-                gaps.insert(ObservationGap::NamespaceChanged);
-                None
-            }
-        }
-    };
-    if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
-        bail!("focused setup interrupted or expired");
-    }
-    if let Some(child) = &mut owned.1 {
-        child.release()?;
-    }
-    // The admission bound is the count program's actual start, including its
-    // unattached prefix; first-call/unknown-scope gaps describe that prefix.
-    let effective_start_ns = start_ns;
-    let mut next_snapshot = Instant::now();
-    let mut ready = false;
-    let mut inventory_gaps = 0u64;
-    let mut state_bytes = 0usize;
-    let mut sample = CountSample::default();
+    let mut session = FocusedSession::open(config, target, objects, setup_deadline, cancel, None)?;
     loop {
-        let poll_deadline = Instant::now() + POLL;
-        if cancel.load(Ordering::Relaxed) || Instant::now() >= end {
+        let now = Instant::now();
+        if session.poll(now, cancel)? != SessionProgress::Running {
             break;
         }
-        if let Some(child) = &mut owned.1 {
-            // Preserve waitability until count admission/links and observer
-            // resources close. finish_observation below consumes the exit.
-            if child.peek_exit()?.is_some() {
-                break;
-            }
-        }
-        if Instant::now() >= next_snapshot {
-            let snapshot = scanner.snapshot();
-            if !snapshot.gaps.is_empty() {
-                inventory_gaps = inventory_gaps.saturating_add(1);
-            }
-            if !snapshot
-                .processes
-                .iter()
-                .any(|p| p.pid == pid && p.starttime == starttime)
-            {
-                gaps.insert(ObservationGap::ProcessChanged);
-                if let Some(c) = &mut counter {
-                    c.retire();
-                }
-                break;
-            }
-            if let Some(s) = &mut session {
-                let batch = s.reconcile(&snapshot);
-                gaps.extend(batch.gaps.iter().copied());
-                if let Some(c) = &mut counter {
-                    let _ =
-                        process_batch(s, c, batch, pid, deadline_ns, &mut gaps, &mut state_bytes)?;
-                }
-            }
-            next_snapshot = Instant::now() + RESCAN;
-        }
-        if let Some(s) = &mut session {
-            let batch = s.drain(Instant::now() + DRAIN);
-            gaps.extend(batch.gaps.iter().copied());
-            if let Some(c) = &mut counter {
-                let attached =
-                    process_batch(s, c, batch, pid, deadline_ns, &mut gaps, &mut state_bytes)?;
-                if attached && !ready {
-                    eprintln!(
-                        "osslscope: focused callbacks attached (pid={pid}, sites={})",
-                        c.active_site_count()
-                    );
-                    ready = true;
-                }
-            }
-        }
-        if let Some(c) = &mut counter {
-            sample = c.sample(Instant::now() + DRAIN);
-            if sample.namespace_failures > 0 {
-                c.retire();
-                gaps.insert(ObservationGap::NamespaceChanged);
-            }
-        }
-        // Work consumes the cadence budget. A delayed iteration is not made
-        // timely by sleeping a fresh 100 ms after it.
-        let now = Instant::now();
-        if now > poll_deadline {
-            gaps.insert(ObservationGap::SnapshotLag);
-        }
-        std::thread::sleep(poll_deadline.min(end).saturating_duration_since(now));
+        std::thread::sleep(
+            (now + POLL)
+                .min(session.end)
+                .saturating_duration_since(Instant::now()),
+        );
     }
-    let end_ns = now_ns()?.min(deadline_ns);
-    // Close admission/links first. Neither close nor equal map reads prove a
-    // terminal cut; keep a single bounded cumulative final read and its gaps.
-    if let Some(c) = &mut counter {
-        c.retire();
+    session.finish(Instant::now() + config.grace)
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    fn objects() -> FocusedObjects {
+        FocusedObjects {
+            observation: Arc::from([]),
+            count: Arc::from([]),
+            count_sha256: Sha256::digest([]).into(),
+        }
     }
-    if let Some(s) = session {
-        gaps.extend(s.close().gaps);
+    fn record() -> inventory::ProcessRecord {
+        inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![std::process::id()],
+            limits: inventory::Limits {
+                max_objects_per_process: 0,
+                ..Default::default()
+            },
+        })
+        .processes
+        .remove(0)
     }
-    if let Some(c) = counter {
-        sample = c.close(Instant::now() + config.grace);
+    #[test]
+    fn session_reservation_precedes_open_and_shares_parser_headroom() {
+        let objects = objects();
+        let bytes = FocusedSession::reservation_bytes(&objects).unwrap();
+        println!("persistent session reservation {bytes} bytes on this CPU configuration");
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let one = pool.reserve(bytes).unwrap();
+        let two = pool.reserve(bytes).unwrap();
+        let stock = pool
+            .reserve(crate::inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
+            .unwrap();
+        assert!(
+            pool.reserve(crate::inventory::elf::parser_scratch_bytes(128 << 20).unwrap())
+                .is_none()
+        );
+        drop(stock);
+        drop(two);
+        drop(one);
+        let expected = record();
+        let too_small = pool.reserve(bytes - 1).unwrap();
+        assert!(
+            FocusedSession::open_reserved(
+                FocusedConfig::default(),
+                capture::Target::Pid(expected.pid),
+                objects,
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(false),
+                Some(&expected),
+                too_small
+            )
+            .is_err()
+        );
+        assert!(pool.reserve(256 << 20).is_some());
     }
-    if inventory_gaps > 0 {
-        sample.gaps.push(loss(
-            "focused.inventory_partial",
-            CounterSource::Discovery,
-            inventory_gaps,
-        ));
+    #[test]
+    fn supplied_incarnation_is_checked_before_open_and_foreign_survives() {
+        let expected = record();
+        let cancel = AtomicBool::new(false);
+        for namespace in [false, true] {
+            let mut stale = expected.clone();
+            if namespace {
+                stale.namespaces.pid.as_mut().unwrap().inode += 1;
+            } else {
+                stale.starttime += 1;
+            }
+            assert!(
+                FocusedSession::open(
+                    FocusedConfig::default(),
+                    capture::Target::Pid(expected.pid),
+                    objects(),
+                    Instant::now() + Duration::from_secs(2),
+                    &cancel,
+                    Some(&stale)
+                )
+                .is_err()
+            );
+        }
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Pid(expected.pid),
+            objects(),
+            Instant::now() + Duration::from_secs(2),
+            &cancel,
+            Some(&expected),
+        )
+        .unwrap();
+        session.pending = Some(ObservationBatch::default());
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::StopRequested
+        );
+        assert!(
+            session.pending.is_none(),
+            "cancellation must discard pending attachment work"
+        );
+        let result = session.finish(Instant::now()).unwrap();
+        assert!(result.document.window.signal_cut);
+        assert_eq!(unsafe { libc::kill(expected.pid as i32, 0) }, 0);
     }
-    let mut document = project(
-        pid,
-        CaptureWindow {
-            requested_start_ns: start_ns,
-            requested_end_ns: deadline_ns,
-            effective_start_ns,
-            effective_end_ns: end_ns.max(effective_start_ns),
-            signal_cut: cancel.load(Ordering::Relaxed),
-            count_admission: Some(CountAdmissionWindow {
-                start_ns,
-                deadline_ns,
-            }),
-        },
-        sample,
-        &gaps.into_iter().collect::<Vec<_>>(),
-    );
-    let disposition = match &mut owned.1 {
-        Some(child) => child.finish_observation()?,
-        None => TargetDisposition::Detached { pid },
-    };
-    let child_exit = match disposition {
-        TargetDisposition::Exited { code } => Some(code),
-        _ => None,
-    };
-    document.disposition = Some(match (owned.1.is_some(), disposition) {
-        (_, TargetDisposition::Exited { code }) => DispositionRecord::exited(code),
-        (true, TargetDisposition::Detached { pid }) => DispositionRecord::detached_running(pid),
-        (false, TargetDisposition::Detached { pid }) => DispositionRecord::foreign_observed(pid),
-    });
-    document.context = Some(CaptureContext {
-        kernel_release: String::new(),
-        wall_start_unix_ns: wall_start,
-        wall_end_unix_ns: unix_ns(),
-    });
-    Ok(FocusedResult {
-        document,
-        child_exit,
-        workload_discarded,
-    })
+    #[test]
+    fn disappeared_foreign_incarnation_is_unverifiable_not_owned_exit() {
+        let mut app = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let expected = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![app.id()],
+            limits: inventory::Limits {
+                max_objects_per_process: 0,
+                ..Default::default()
+            },
+        })
+        .processes
+        .remove(0);
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Pid(app.id()),
+            objects(),
+            Instant::now() + Duration::from_secs(2),
+            &cancel,
+            Some(&expected),
+        )
+        .unwrap();
+        app.kill().unwrap();
+        app.wait().unwrap(); // fixture owner, never the observing session
+        session.initial_metadata = None;
+        session.pending = Some(ObservationBatch::default());
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::Unverifiable
+        );
+        assert!(session.pending.is_none());
+        session.finish(Instant::now()).unwrap();
+    }
+    #[test]
+    fn cancelled_session_setup_never_resets_callers_signal() {
+        let cancel = AtomicBool::new(true);
+        assert!(
+            FocusedSession::open(
+                FocusedConfig::default(),
+                capture::Target::Spawn {
+                    argv: vec!["/bin/true".into()],
+                    workload: crate::target::WorkloadDest::Null
+                },
+                objects(),
+                Instant::now() + Duration::from_secs(2),
+                &cancel,
+                None
+            )
+            .is_err()
+        );
+        assert!(cancel.load(Ordering::Relaxed));
+    }
 }

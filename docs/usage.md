@@ -332,6 +332,15 @@ ownership, mode or ancestor protections, including under privileged invocation.
 Compatibility and hashes do not authenticate arbitrary BPF or establish its
 privacy; the operator must establish the safety of explicitly selected code.
 
+For `run --`, the observer holds its child while inspecting ELF executable,
+interpreter and dependency files and installing entry-only probes. Short commands
+can therefore retain physical counts after exit. Dependency prediction is bounded;
+scripts, loader cache/hwcaps overrides, preloads and later `dlopen` can leave misses.
+`focused.startup_partial` records that uncertainty; prearming does not establish
+complete startup coverage or turn a static candidate into a public ABI. Setup and
+polling deadlines are cooperative between file operations: an in-flight blocking
+filesystem syscall cannot be interrupted by the observation deadline.
+
 A document covers one process incarnation and its threads. Cgroup/container
 inventory chooses a PID, not an implicit tracing group. Forks, children, process
 replacement and later numeric PID reuse do not acquire execution coverage.

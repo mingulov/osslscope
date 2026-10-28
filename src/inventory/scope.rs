@@ -140,7 +140,10 @@ impl ScopedScanner {
         })
     }
 
-    pub(super) fn snapshot_for(&mut self, timeout: std::time::Duration) -> Snapshot {
+    pub(crate) fn set_memory_pool(&mut self, memory: crate::observation_memory::MemoryPool) {
+        self.scan_state.memory = Some(memory);
+    }
+    pub(crate) fn snapshot_for(&mut self, timeout: std::time::Duration) -> Snapshot {
         let original = self.limits.timeout;
         self.limits.timeout = original.min(timeout);
         let snapshot = self.snapshot();
@@ -273,7 +276,9 @@ impl ScopedScanner {
     fn failed(&mut self, reason: GapReason, clock: &CaptureClock, bytes: u64) -> Snapshot {
         // A wholly unavailable sampling pass observed no reusable objects.
         // Keep pinned selectors, but release obsolete sampled descriptors.
+        let memory = self.scan_state.memory.take();
         self.scan_state = procfs::ScanState::default();
+        self.scan_state.memory = memory;
         let mut result = procfs::snapshot_selected(
             &SnapshotOptions {
                 pids: vec![],

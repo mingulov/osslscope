@@ -2508,6 +2508,32 @@ impl OwnedTarget {
         }
     }
 
+    /// Separate from the one-shot legacy SetupOrigin handoff. The retained
+    /// original pidfd surrounds numeric-PID Count attachment and all links.
+    pub(crate) fn startup_group(&self) -> anyhow::Result<crate::pin::StartupGroupRetention> {
+        if self.state != CustodyState::Stopped {
+            anyhow::bail!("startup authority requires held child");
+        }
+        let setup = self
+            .setup
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("missing custody"))?;
+        if setup.state != SetupChildState::Held {
+            anyhow::bail!("startup authority requires original held custody");
+        }
+        let info = setup_waitid(
+            libc::P_PIDFD,
+            setup.pidfd.as_raw_fd() as u32,
+            libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED | libc::WNOHANG | libc::WNOWAIT,
+        )?;
+        if unsafe { info.si_pid() } != self.pid as i32
+            || !matches!(info.si_code, libc::CLD_STOPPED | libc::CLD_TRAPPED)
+        {
+            anyhow::bail!("startup authority requires retained stopped receipt");
+        }
+        Ok(setup.pidfd.retain_startup())
+    }
+
     pub(crate) fn original_group_handoff(
         &mut self,
         origin: crate::capture_setup::SetupOrigin,

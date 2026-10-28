@@ -65,6 +65,20 @@ pub(crate) struct OriginalGroupHandoff {
     file: Arc<OriginalGroupFile>,
     origin: SetupOrigin,
 }
+/// Shared original acquisition, minted only while OwnedTarget retains its stop.
+/// There is deliberately no fd, PID, or external-process constructor.
+pub(crate) struct StartupGroupRetention {
+    file: Arc<OriginalGroupFile>,
+}
+impl AsRawFd for StartupGroupRetention {
+    fn as_raw_fd(&self) -> i32 {
+        self.file
+            .fd
+            .as_ref()
+            .expect("retained original group")
+            .as_raw_fd()
+    }
+}
 impl OriginalGroupAcquisition {
     pub(crate) fn acquired_child(acquired: crate::target::AcquiredChildPidfd) -> Self {
         let (pid, fd) = acquired.into_parts();
@@ -76,6 +90,11 @@ impl OriginalGroupAcquisition {
                 close_probe: None,
             }),
             origin: None,
+        }
+    }
+    pub(crate) fn retain_startup(&self) -> StartupGroupRetention {
+        StartupGroupRetention {
+            file: self.file.clone(),
         }
     }
     pub(crate) fn handoff(&mut self, origin: SetupOrigin) -> anyhow::Result<OriginalGroupHandoff> {

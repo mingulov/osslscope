@@ -118,6 +118,146 @@ impl Object {
         Ok(())
     }
 }
+#[derive(Clone)]
+enum SiteCustody {
+    Mapped {
+        process: Rc<Process>,
+        maps: Rc<Vec<u8>>,
+    },
+    Startup(Rc<StartupProcess>),
+}
+impl SiteCustody {
+    fn pid(&self) -> u32 {
+        match self {
+            Self::Mapped { process, .. } => process.pid,
+            Self::Startup(p) => p.pid,
+        }
+    }
+    fn starttime(&self) -> u64 {
+        match self {
+            Self::Mapped { process, .. } => process.starttime,
+            Self::Startup(p) => p.starttime,
+        }
+    }
+    fn validate(&self) -> Result<(), ObservationGap> {
+        match self {
+            Self::Mapped { process, maps } => {
+                process.validate()?;
+                if !same_executable_mappings(
+                    maps,
+                    &read_at(&process.directory, b"maps", MAX_MAPS)?,
+                )? {
+                    return Err(ObservationGap::ProcessChanged);
+                }
+                Ok(())
+            }
+            Self::Startup(p) => p.validate(),
+        }
+    }
+}
+/// Sealed by the held OwnedTarget constructor. Exec is allowed, but PID and
+/// namespace changes are not. This authority can only mint entry-only sites.
+pub(crate) struct StartupProcess {
+    original: crate::pin::StartupGroupRetention,
+    directory: File,
+    pid: u32,
+    starttime: u64,
+    namespaces: NamespaceIds,
+    generation: u64,
+}
+impl StartupProcess {
+    pub(crate) fn held(child: &crate::target::OwnedTarget) -> Result<Rc<Self>, ObservationGap> {
+        let original = child
+            .startup_group()
+            .map_err(|_| ObservationGap::ProcessChanged)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(format!("/proc/{}", child.pid()))
+            .map_err(|_| ObservationGap::ProcessUnavailable)?;
+        let value = Rc::new(Self {
+            original,
+            pid: child.pid(),
+            starttime: starttime(&directory)?,
+            namespaces: namespaces(&directory)?,
+            directory,
+            generation: GENERATION.fetch_add(1, Ordering::Relaxed),
+        });
+        value.validate()?;
+        Ok(value)
+    }
+    fn validate(&self) -> Result<(), ObservationGap> {
+        let mut pfd = libc::pollfd {
+            fd: self.original.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut pfd, 1, 0) } != 0 {
+            return Err(ObservationGap::ProcessUnavailable);
+        }
+        if starttime(&self.directory)? != self.starttime {
+            return Err(ObservationGap::ProcessChanged);
+        }
+        if namespaces(&self.directory)? != self.namespaces {
+            return Err(ObservationGap::NamespaceChanged);
+        }
+        Ok(())
+    }
+}
+/// Retain and parse the exact file already opened by bounded dependency discovery.
+/// No public ABI site can be produced through this constructor.
+pub(crate) fn startup_candidates(
+    process: Rc<StartupProcess>,
+    file: File,
+    budget: &ObservationBudget,
+) -> Result<(Vec<VerifiedStaticCandidate>, bool), ObservationGap> {
+    process.validate()?;
+    budget.object()?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| ObservationGap::BackingUnavailable)?;
+    if !metadata.is_file() || metadata.len() > MAX_OBJECT {
+        return Err(ObservationGap::ReadLimit);
+    }
+    let object = Rc::new(Object {
+        file,
+        stamp: Stamp::of(&metadata),
+        expected: None,
+        parsed: OnceCell::new(),
+        tables: OnceCell::new(),
+    });
+    let parsed = object.parsed(budget)?;
+    let tables =
+        static_tables::discover_tables_budgeted(&object.file, TableLimits::default(), budget)
+            .map_err(|g| match g {
+                static_tables::TableGap::Resource => ObservationGap::ReadLimit,
+                static_tables::TableGap::Changed => ObservationGap::ObjectChanged,
+                _ => ObservationGap::MalformedElf,
+            })?;
+    let mut candidates = Vec::new();
+    for locator in tables.candidates() {
+        budget.state(std::mem::size_of::<VerifiedStaticCandidate>() * 2)?;
+        candidates.push(VerifiedStaticCandidate {
+            site: VerifiedSite {
+                custody: SiteCustody::Startup(process.clone()),
+                object: object.clone(),
+                offset: locator.file_offset,
+                generation: process.generation,
+                hash: parsed.hash.clone(),
+            },
+            algorithm: locator.algorithm,
+            operation_hint: None,
+            function_id: locator.function_id,
+            storage: locator.storage,
+            provenance: locator.provenance,
+            partial: locator.partial,
+        });
+    }
+    object.unchanged()?;
+    process.validate()?;
+    Ok((candidates, !tables.gaps().is_empty()))
+}
+
 /// Explicit privileged event operand, never a transport value.
 pub struct TransientCodeAddress(u64);
 impl TransientCodeAddress {
@@ -129,14 +269,31 @@ impl TransientCodeAddress {
 /// It cannot be serialized or formatted, and exposes no pathname.
 #[derive(Clone)]
 pub struct VerifiedSite {
-    process: Rc<Process>,
-    maps: Rc<Vec<u8>>,
+    custody: SiteCustody,
     object: Rc<Object>,
     offset: u64,
     generation: u64,
     hash: ObjectHash,
 }
 impl VerifiedSite {
+    pub(crate) fn is_startup(&self) -> bool {
+        matches!(self.custody, SiteCustody::Startup(_))
+    }
+    /// Narrow first-exec bookkeeping transition, never a constructor or ABI grant.
+    pub(crate) fn matches_startup(&self, startup: &Self) -> Result<bool, ObservationGap> {
+        let (SiteCustody::Mapped { process, .. }, SiteCustody::Startup(original)) =
+            (&self.custody, &startup.custody)
+        else {
+            return Ok(false);
+        };
+        // The counter validates both file representatives before this comparison.
+        Ok(process.pid == original.pid
+            && process.starttime == original.starttime
+            && process.namespaces == original.namespaces
+            && self.object.stamp == startup.object.stamp
+            && self.hash == startup.hash
+            && self.offset == startup.offset)
+    }
     pub fn attachment_fd(&self) -> BorrowedFd<'_> {
         self.object.file.as_fd()
     }
@@ -156,13 +313,7 @@ impl VerifiedSite {
         &self.hash
     }
     pub fn revalidate_object(&self) -> Result<(), ObservationGap> {
-        self.process.validate()?;
-        if !same_executable_mappings(
-            &self.maps,
-            &read_at(&self.process.directory, b"maps", MAX_MAPS)?,
-        )? {
-            return Err(ObservationGap::ProcessChanged);
-        }
+        self.custody.validate()?;
         self.object.unchanged()
     }
 }
@@ -182,10 +333,10 @@ impl VerifiedStaticCandidate {
         &self.site
     }
     pub fn pid(&self) -> u32 {
-        self.site.process.pid
+        self.site.custody.pid()
     }
     pub fn starttime(&self) -> u64 {
-        self.site.process.starttime
+        self.site.custody.starttime()
     }
     pub fn algorithm(&self) -> Option<DynamicAlgorithmId> {
         self.algorithm
@@ -329,8 +480,10 @@ impl VerifiedProcess {
                     sites.push(ApiSite {
                         api,
                         site: VerifiedSite {
-                            process: self.process.clone(),
-                            maps: self.maps.clone(),
+                            custody: SiteCustody::Mapped {
+                                process: self.process.clone(),
+                                maps: self.maps.clone(),
+                            },
                             object: object.clone(),
                             offset,
                             generation: self.generation,
@@ -397,8 +550,10 @@ impl VerifiedProcess {
                 budget.state(std::mem::size_of::<VerifiedStaticCandidate>() * 2)?;
                 candidates.push(VerifiedStaticCandidate {
                     site: VerifiedSite {
-                        process: self.process.clone(),
-                        maps: self.maps.clone(),
+                        custody: SiteCustody::Mapped {
+                            process: self.process.clone(),
+                            maps: self.maps.clone(),
+                        },
                         object: object.clone(),
                         offset: locator.file_offset,
                         generation: self.generation,
@@ -443,8 +598,10 @@ impl VerifiedProcess {
         }
         object.unchanged()?;
         Ok(VerifiedSite {
-            process: self.process.clone(),
-            maps: self.maps.clone(),
+            custody: SiteCustody::Mapped {
+                process: self.process.clone(),
+                maps: self.maps.clone(),
+            },
             object: object.clone(),
             offset,
             generation: self.generation,
@@ -456,11 +613,12 @@ fn mapping_contains_offset(map: &Mapping, offset: u64) -> bool {
     offset >= map.offset && offset - map.offset < map.end - map.start
 }
 
-pub fn acquire(
+/// Fresh process identity retention without requiring privileged map_files
+/// access. This value grants no site or target-memory authority.
+pub(crate) struct ProcessIncarnation(Rc<Process>);
+pub(crate) fn acquire_incarnation(
     record: &ProcessRecord,
-    limits: &mut ObservationBudget,
-) -> Result<VerifiedProcess, ObservationGap> {
-    limits.process()?;
+) -> Result<ProcessIncarnation, ObservationGap> {
     if record.pid == 0 || record.pid > i32::MAX as u32 {
         return Err(ObservationGap::ProcessUnavailable);
     }
@@ -500,6 +658,14 @@ pub fn acquire(
         namespaces: record.namespaces.clone(),
     });
     process.validate()?;
+    Ok(ProcessIncarnation(process))
+}
+pub fn acquire(
+    record: &ProcessRecord,
+    limits: &mut ObservationBudget,
+) -> Result<VerifiedProcess, ObservationGap> {
+    limits.process()?;
+    let process = acquire_incarnation(record)?.0;
     limits.state(MAX_MAPS)?;
     let maps = Rc::new(read_at(&process.directory, b"maps", MAX_MAPS)?);
     let mut mappings = Vec::new();
@@ -845,16 +1011,26 @@ fn parse_object(
             .checked_add(1)
             .ok_or(ObservationGap::ReadLimit)?,
     )?;
-    let info = inventory::elf::inspect_file(file, before.len()).map_err(|gap| match gap {
-        inventory::GapReason::Changed => ObservationGap::ObjectChanged,
-        inventory::GapReason::ReadLimit | inventory::GapReason::TooLarge => {
-            ObservationGap::ReadLimit
-        }
-        _ => ObservationGap::MalformedElf,
-    })?;
+    let info = inventory::elf::inspect_file_budgeted(file, before.len(), budget.memory.as_ref())
+        .map_err(|gap| match gap {
+            inventory::GapReason::Changed => ObservationGap::ObjectChanged,
+            inventory::GapReason::ReadLimit | inventory::GapReason::TooLarge => {
+                ObservationGap::ReadLimit
+            }
+            _ => ObservationGap::MalformedElf,
+        })?;
     if expected.is_some_and(|expected| *expected != info) {
         return Err(ObservationGap::ObjectChanged);
     }
+    // Export parsing follows inventory parsing; its symbol/string scratch is
+    // separate in time and never retained with the object metadata.
+    let _scratch = match &budget.memory {
+        Some(pool) => Some(
+            pool.reserve(MAX_STRINGS as usize + MAX_SYMBOLS as usize * 24 + (1 << 20))
+                .ok_or(ObservationGap::StateLimit)?,
+        ),
+        None => None,
+    };
     let result = parse_exports(
         file,
         before.len(),

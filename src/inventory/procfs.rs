@@ -215,10 +215,12 @@ struct Cached {
 /// Metadata and retained descriptors only; no mapped bytes or history.
 #[derive(Default)]
 pub(super) struct ScanState {
+    pub(super) memory: Option<crate::observation_memory::MemoryPool>,
     cache: BTreeMap<Fingerprint, Cached>,
     cursor: Option<u32>,
 }
 struct Work<'a> {
+    memory: Option<crate::observation_memory::MemoryPool>,
     options: &'a SnapshotOptions,
     include_other: bool,
     started: Instant,
@@ -300,7 +302,7 @@ impl Work<'_> {
         self.totals.objects_inspected += 1;
         // An object growing between our admission and the ELF inspector's
         // fstat must never read beyond the aggregate work already charged.
-        let result = elf::inspect_file(&mut file, metadata.len());
+        let result = elf::inspect_file_budgeted(&mut file, metadata.len(), self.memory.as_ref());
         self.deadline()?;
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
@@ -585,6 +587,7 @@ pub(super) fn snapshot_reused(
         cache.pop_first();
     }
     let mut work = Work {
+        memory: state.memory.clone(),
         include_other,
         options,
         started,
@@ -744,6 +747,7 @@ mod tests {
             },
         };
         let mut work = Work {
+            memory: None,
             options: &options,
             include_other: false,
             started: Instant::now(),
@@ -794,6 +798,7 @@ mod tests {
         let metadata = writer.metadata().unwrap();
         let options = SnapshotOptions::default();
         let mut work = Work {
+            memory: None,
             options: &options,
             include_other: false,
             started: Instant::now(),
@@ -811,6 +816,7 @@ mod tests {
             Err(GapReason::Changed)
         );
         let mut fresh = Work {
+            memory: None,
             options: &options,
             include_other: false,
             started: Instant::now(),

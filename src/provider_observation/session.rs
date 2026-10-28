@@ -210,7 +210,7 @@ fn map_data(loaded: &loader::Loaded, name: &str) -> Result<MapData, ObservationG
 fn map(loaded: &loader::Loaded, name: &str) -> Result<Map, ObservationGap> {
     Map::from_map_data(map_data(loaded, name)?).map_err(|_| ObservationGap::InvalidObject)
 }
-fn specs() -> Vec<loader::MapSpec> {
+pub(crate) fn specs() -> Vec<loader::MapSpec> {
     let shapes = [
         ("EVENTS", 27, 0, 0, 1 << 20),
         ("CONFIG", 1, 8, 24, 1024),
@@ -266,6 +266,13 @@ impl ProviderSession {
     }
 
     pub fn open(limits: ObservationLimits, object: &[u8]) -> Result<Self, ObservationGap> {
+        Self::open_budgeted(ObservationBudget::new(limits), object)
+    }
+    pub(crate) fn open_budgeted(
+        budget: ObservationBudget,
+        object: &[u8],
+    ) -> Result<Self, ObservationGap> {
+        let limits = &budget.limits;
         let max = ObservationLimits::default();
         if object.len() > 16 << 20 {
             return Err(ObservationGap::ReadLimit);
@@ -281,7 +288,6 @@ impl ProviderSession {
         {
             return Err(ObservationGap::StateLimit);
         }
-        let budget = ObservationBudget::new(limits);
         budget.state(
             object
                 .len()
@@ -429,7 +435,16 @@ impl ProviderSession {
             }
         }
     }
+    pub(crate) fn set_deadline(&self, deadline: Instant) {
+        self.budget.set_deadline(deadline);
+    }
     pub fn reconcile(&mut self, snapshot: &inventory::Snapshot) -> ObservationBatch {
+        self.reconcile_records(&snapshot.processes)
+    }
+    pub(crate) fn reconcile_records(
+        &mut self,
+        records: &[inventory::ProcessRecord],
+    ) -> ObservationBatch {
         let mut b = ObservationBatch::default();
         if self.closed {
             return b;
@@ -439,11 +454,7 @@ impl ProviderSession {
             .iter()
             .filter_map(|(&pid, t)| {
                 reconcile_retirement_gap(
-                    snapshot
-                        .processes
-                        .iter()
-                        .find(|p| p.pid == pid)
-                        .map(|p| p.starttime),
+                    records.iter().find(|p| p.pid == pid).map(|p| p.starttime),
                     t.starttime,
                     || t.process.revalidate(),
                 )
@@ -455,7 +466,7 @@ impl ProviderSession {
             b.gap(gap);
             b.gap(ObservationGap::IntervalUnknown)
         }
-        for record in &snapshot.processes {
+        for record in records {
             if self.targets.contains_key(&record.pid) {
                 continue;
             }
@@ -886,8 +897,11 @@ impl ProviderSession {
             }
         }
     }
-    pub fn close(mut self) -> ObservationBatch {
-        let mut b = self.drain(Instant::now() + Duration::from_millis(100));
+    pub fn close(self) -> ObservationBatch {
+        self.close_until(Instant::now() + Duration::from_millis(100))
+    }
+    pub(crate) fn close_until(mut self, deadline: Instant) -> ObservationBatch {
+        let mut b = self.drain(deadline);
         let pids: Vec<_> = self.targets.keys().copied().collect();
         for pid in pids {
             self.retire(pid, &mut b)

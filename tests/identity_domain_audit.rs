@@ -114,6 +114,16 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Startup dependency dedup compares native fstat dev_t/inode from
+        // opened regular candidate FDs only. It suppresses repeated parsing;
+        // it grants no mapped/site authority and never joins encoded evidence
+        // devices or maps text. Retained Object stamps remain in this domain.
+        (
+            "src/startup_objects.rs",
+            "raw",
+            "if !seen.insert((before.dev(), before.ino())) {",
+            1,
+        ),
         // Native retained observer namespace st_dev is used solely by the
         // public namespace helper, never joined to maps text device values.
         ("src/focused_count.rs", "raw", "device: meta.dev(),", 1),

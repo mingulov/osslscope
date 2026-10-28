@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 use crate::inventory;
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Metadata origin does not change a physical counter's attribution certainty.
@@ -94,6 +94,8 @@ struct Work {
 pub struct ObservationBudget {
     pub limits: ObservationLimits,
     work: Rc<RefCell<Work>>,
+    deadline: Rc<Cell<Option<std::time::Instant>>>,
+    pub(crate) memory: Option<crate::observation_memory::MemoryPool>,
 }
 impl Default for ObservationBudget {
     fn default() -> Self {
@@ -105,12 +107,29 @@ impl ObservationBudget {
         Self {
             limits,
             work: Rc::default(),
+            deadline: Rc::default(),
+            memory: None,
+        }
+    }
+    pub(crate) fn set_deadline(&self, deadline: std::time::Instant) {
+        self.deadline.set(Some(deadline));
+    }
+    fn checkpoint(&self) -> Result<(), ObservationGap> {
+        if self
+            .deadline
+            .get()
+            .is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            Err(ObservationGap::SnapshotLag)
+        } else {
+            Ok(())
         }
     }
     pub fn elf_read_bytes(&self) -> u64 {
         self.work.borrow().reads
     }
     pub(crate) fn read(&self, bytes: u64) -> Result<(), ObservationGap> {
+        self.checkpoint()?;
         let mut work = self.work.borrow_mut();
         let next = work
             .reads
@@ -123,6 +142,7 @@ impl ObservationBudget {
         Ok(())
     }
     pub(crate) fn process(&self) -> Result<(), ObservationGap> {
+        self.checkpoint()?;
         let mut work = self.work.borrow_mut();
         if work.processes >= self.limits.max_processes {
             return Err(ObservationGap::ProcessLimit);
@@ -131,6 +151,7 @@ impl ObservationBudget {
         Ok(())
     }
     pub(crate) fn object(&self) -> Result<(), ObservationGap> {
+        self.checkpoint()?;
         let mut work = self.work.borrow_mut();
         if work.objects >= self.limits.max_objects {
             return Err(ObservationGap::ObjectLimit);
@@ -139,6 +160,7 @@ impl ObservationBudget {
         Ok(())
     }
     pub(crate) fn state(&self, bytes: usize) -> Result<(), ObservationGap> {
+        self.checkpoint()?;
         let mut work = self.work.borrow_mut();
         let next = work
             .state

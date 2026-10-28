@@ -63,6 +63,9 @@ return value. Public query/getter observations remain a separate evidence source
 Zero counts do not establish non-use: coverage, unsupported linkage, attach
 latency and bounded discovery can leave gaps.
 
+Owned foreground commands prearm entry-only sites from retained executable and
+dependency files before release, preserving counts even after a short command exits.
+
 There is no universal first-call guarantee. Warm/built-in activation can remain
 unknown; startup, polling, invalidation and final drain leave explicit gaps.
 Calls before attachment or after retirement are uncovered. Unavailable backing,

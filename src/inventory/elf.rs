@@ -27,6 +27,13 @@ pub fn inspect_module(path: &Path, max_bytes: u64) -> Result<ModuleInfo, GapReas
 /// a path or changing the descriptor's cursor. Foreign ELF machines are
 /// descriptive inventory; tracing support is a separate decision.
 pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapReason> {
+    inspect_file_budgeted(file, max_bytes, None)
+}
+pub(crate) fn inspect_file_budgeted(
+    file: &mut File,
+    max_bytes: u64,
+    memory: Option<&crate::observation_memory::MemoryPool>,
+) -> Result<ModuleInfo, GapReason> {
     let before = file.metadata().map_err(|_| GapReason::Unavailable)?;
     if !before.is_file() {
         return Err(GapReason::NonRegular);
@@ -53,6 +60,13 @@ pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapRe
     if before.len() < 4 {
         return Err(GapReason::NotElf);
     }
+    let _scratch = match memory {
+        Some(pool) => Some(
+            pool.reserve(parser_scratch_bytes(before.len())?)
+                .ok_or(GapReason::ReadLimit)?,
+        ),
+        None => None,
+    };
     let bytes = read_bounded(file, before.len());
     verify_unchanged(file, &before)?;
     let bytes = bytes?;
@@ -145,6 +159,12 @@ pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapRe
 // limit (including 128 MiB objects). Goblin 0.10 eagerly allocates headers,
 // dynamic records, string indexes, dependency/path vectors and relocation
 // descriptors; symbols, relocation contents and version sections are borrowed.
+pub(crate) fn parser_scratch_bytes(file_bytes: u64) -> Result<usize, GapReason> {
+    usize::try_from(file_bytes)
+        .ok()
+        .and_then(|n| n.checked_add(MAX_METADATA_BYTES + 65_537))
+        .ok_or(GapReason::ReadLimit)
+}
 const MAX_HEADERS: usize = 4_096;
 const MAX_DYNAMIC_ENTRIES: usize = 16_384;
 const MAX_STRING_ROWS: usize = 65_536;
@@ -186,7 +206,7 @@ impl ParserBudget {
 /// Admit every eager allocation class before invoking Elf::parse. Repeated
 /// references count repeatedly: Goblin builds separate indexes even when
 /// section-name, ordinary symbol-name and dynamic string tables alias.
-fn admit_parser_metadata(bytes: &[u8]) -> Result<(), GapReason> {
+pub(crate) fn admit_parser_metadata(bytes: &[u8]) -> Result<(), GapReason> {
     let h = Elf::parse_header(bytes).map_err(|_| GapReason::MalformedElf)?;
     let container = match h.e_ident[header::EI_CLASS] {
         header::ELFCLASS64 => Container::Big,
