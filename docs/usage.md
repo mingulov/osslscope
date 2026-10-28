@@ -488,3 +488,27 @@ historical; see [v0.2 notes](release-v0.2.0.md), [catalogue](../profiles/README.
 and [historical overhead](overhead-matrix.md). Offline `alias-audit` remains
 available; its input does not become new runtime evidence. Manual offsets,
 reader/member objects, services and following are outside the normal workflow.
+
+### Candidate hints and public API activity
+
+Current automatic report/check output adds optional v2.4 candidate identities,
+site provenance and a separate public API activity ledger. Known vocabulary is
+only a display hint; custom opaque IDs remain visible. Positive entries from
+retired generations are retained. Candidate associations never multiply physical
+counts or establish definite algorithm/provider attribution.
+
+Available public digest, cipher, MAC, KDF, PKEY and RAND exports are observed
+using scalar entry/return aggregates. Operators still select only scope and
+duration. The observer does not read operational arguments, buffers or opaque
+contexts. Success means the documented integer return was observed; wrappers,
+setup and size queries are included. It does not mean a cryptographic result was
+produced. API activity is separate from callback totals and definite policy/CBOM
+assets. Missing attachments, pairing/depth/map losses, tails and unknown returns
+remain explicit. A fetched but unused method has no operational entries.
+
+For owned short commands, independently validated operational exports can be
+prearmed on retained executable/dependency files before release. This is a
+separate capability from entry-only static table shapes. Predicted loader files,
+late modules and available prefixes still leave gaps; a static lookalike never
+authorizes a target-memory decoder. See the [output contract](observed-crypto-v2.md)
+and [privacy read set](privacy/allowlist-v1.md).

@@ -212,7 +212,7 @@ fn package_historical_and_closed_metadata_controls() {
         schema_version: String,
     }
     let extracted: Known = serde_json::from_value(positive).unwrap();
-    assert_eq!(extracted.schema_version, "observed-crypto-v2.3");
+    assert_eq!(extracted.schema_version, "observed-crypto-v2.4");
 }
 #[test]
 fn package_real_render_roundtrip_and_offline_identity() {
@@ -260,7 +260,7 @@ fn package_real_render_roundtrip_and_offline_identity() {
     // Supplied historical identity is not a claim about today's producer.
     assert_eq!(
         osslscope::evidence::CAPTURE_SCHEMA_V2,
-        "observed-crypto-v2.3"
+        "observed-crypto-v2.4"
     );
 }
 

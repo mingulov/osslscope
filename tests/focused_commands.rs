@@ -920,3 +920,114 @@ fn installed_warm_pid_keeps_candidates_across_discovery_deadline() {
     );
     println!("warm PID: {calls} entries; workload survived and exited0");
 }
+
+#[test]
+#[ignore = "requires an installed privileged focused CLI"]
+fn installed_short_digest_has_scalar_api_and_candidate_hints() {
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let out = Command::new(binary)
+        .args([
+            "report",
+            "--duration",
+            "5",
+            "--format",
+            "json",
+            "run",
+            "--",
+            "/usr/bin/openssl",
+            "dgst",
+            "-sha512",
+            "/dev/null",
+        ])
+        .output()
+        .unwrap();
+    let doc = parsed(&out);
+    assert_eq!(doc["disposition"]["code"], 0);
+    let activity = doc["api_activity"].as_array().expect("scalar API ledger");
+    assert!(
+        activity
+            .iter()
+            .any(|row| row["api"] == 23 && row["observed_success"].as_u64().unwrap() > 0),
+        "{activity:?}"
+    );
+    assert!(
+        doc["algorithm_identities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| !row["known_algorithm"].is_null()),
+        "known candidate hints missing"
+    );
+    osslscope::schema::validate_v2(&doc).unwrap();
+    osslscope::schema::check_v2_semantics(&doc).unwrap();
+}
+
+#[test]
+#[ignore = "requires an installed privileged focused CLI and OpenSSL development headers"]
+fn installed_api_six_families_failures_size_queries_and_unused_fetch() {
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    let dir = native_dir("api-six");
+    let app = dir.join("api-activity");
+    assert!(
+        Command::new("cc")
+            .args(["-O0", "tests/fixtures/api_activity.c", "-lcrypto", "-o"])
+            .arg(&app)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new(&app).status().unwrap().success(),
+        "independent native control"
+    );
+    for unused in [false, true] {
+        let mut cmd = Command::new(&binary);
+        cmd.args(["report", "--duration", "5", "--format", "json", "run", "--"])
+            .arg(&app);
+        if unused {
+            cmd.arg("unused");
+        }
+        let out = cmd.output().unwrap();
+        let doc = parsed(&out);
+        assert_eq!(
+            doc["disposition"]["code"],
+            0,
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        osslscope::schema::validate_v2(&doc).unwrap();
+        osslscope::schema::check_v2_semantics(&doc).unwrap();
+        let rows = doc["api_activity"].as_array().expect("API activity");
+        let row = |api: u64| rows.iter().find(|r| r["api"] == api).expect("attached API");
+        if unused {
+            assert!(
+                rows.iter().all(|r| r["entries"] == 0),
+                "fetch is not operational use: {rows:?}"
+            );
+        } else {
+            for api in [22, 33, 37, 38, 46, 48] {
+                assert!(
+                    row(api)["observed_success"].as_u64().unwrap() > 0,
+                    "API {api}: {}",
+                    row(api)
+                );
+            }
+            for api in [31, 38, 47, 48] {
+                assert!(
+                    row(api)["observed_failure"].as_u64().unwrap() > 0,
+                    "API {api}: {}",
+                    row(api)
+                );
+            }
+            assert_eq!(
+                row(46)["entries"],
+                2,
+                "one size query plus one signature call"
+            );
+            assert_eq!(row(47)["verification_mismatch"], 1);
+        }
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("PRIVATE_API_PAYLOAD_CANARY"));
+        println!("unused={unused}: {}", doc["api_activity"]);
+    }
+    std::fs::remove_dir_all(dir).unwrap();
+}

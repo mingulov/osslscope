@@ -99,7 +99,8 @@ struct Row {
     offset: u64,
 }
 /// Storage evidence only: neither variant establishes an OpenSSL ABI role.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TableStorage {
     ReadOnly,
     Relro,
@@ -115,6 +116,8 @@ struct Algorithm {
     id: DynamicAlgorithmId,
     dispatch: usize,
     _aliases: Vec<u8>,
+    hint: Option<u16>,
+    quality: super::AliasQuality,
 }
 /// Private locators and aliases intentionally have no Debug or serialization.
 pub struct TableDiscovery {
@@ -126,7 +129,8 @@ pub struct TableDiscovery {
 }
 /// A shape is not an advertised ABI, even when its storage and function starts
 /// are corroborated. Embedded public records do not imply a surrounding array.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum StaticTableProvenance {
     DispatchTableShape,
     AlgorithmRecordShape,
@@ -136,6 +140,8 @@ pub(crate) struct StaticCandidate {
     pub file_offset: u64,
     pub function_id: u32,
     pub algorithm: Option<DynamicAlgorithmId>,
+    pub hint: Option<u16>,
+    pub quality: super::AliasQuality,
     pub storage: TableStorage,
     pub provenance: StaticTableProvenance,
     /// Other rows in this table have unresolved ordinary function linkage.
@@ -183,6 +189,8 @@ impl TableDiscovery {
                         file_offset: row.offset,
                         function_id: row.id,
                         algorithm: Some(algorithm.id),
+                        hint: algorithm.hint,
+                        quality: algorithm.quality,
                         storage: table.storage,
                         provenance: StaticTableProvenance::AlgorithmRecordShape,
                         partial: table.partial,
@@ -191,6 +199,8 @@ impl TableDiscovery {
                         file_offset: row.offset,
                         function_id: row.id,
                         algorithm: None,
+                        hint: None,
+                        quality: Default::default(),
                         storage: table.storage,
                         provenance: StaticTableProvenance::DispatchTableShape,
                         partial: table.partial,
@@ -1286,7 +1296,10 @@ fn discover(
                             id.update(object_hash);
                             id.update(at.to_le_bytes());
                             id.update(implementation.to_le_bytes());
+                            let (hint, quality) = static_alias_hint(&aliases);
                             Ok(Algorithm {
+                                hint,
+                                quality,
                                 id: DynamicAlgorithmId(id.finalize().into()),
                                 dispatch,
                                 _aliases: aliases,
@@ -1510,4 +1523,34 @@ mod tests {
             "listing and file have no overlapping aliases"
         );
     }
+}
+
+/// Optional finite vocabulary only. Unknown bytes never affect admission/ID.
+fn static_alias_hint(aliases: &[u8]) -> (Option<u16>, super::AliasQuality) {
+    let mut evidence = super::wire::contract::FiniteEvidence::new();
+    let mut count = 0;
+    for alias in aliases.split(|b| *b == b':').take(9) {
+        count += 1;
+        if count > 8 {
+            break;
+        }
+        if let Some((index, entry)) = crate::kinds::ALG_NAMES
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.name.as_bytes() == alias)
+        {
+            if let Some(canon) = crate::kinds::algorithm_semantic_id(entry.name) {
+                evidence.include(
+                    index as u16,
+                    u8::from(crate::kinds::is_weak_alg(entry.name)),
+                    canon,
+                );
+            }
+        }
+    }
+    let (id, weak, status) = evidence.finish(count > 8);
+    (
+        (id != u16::MAX).then_some(id),
+        super::AliasQuality::from_fold(status, weak),
+    )
 }

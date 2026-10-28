@@ -1,4 +1,4 @@
-osslscope report (observed-crypto-v2.3): pid=9 (staging) window=0..100ns effective=5..95ns
+osslscope report (observed-crypto-v2.4): pid=9 (staging) window=0..100ns effective=5..95ns
 duration: requested=100ns effective=90ns (monotonic; authoritative)
 kernel: 6.9.0-test
 wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
@@ -9,6 +9,7 @@ disposition: detached-running pid=9
 sites (2, 250 calls):
   site build:012345 file-offset=4096 gen=0: 200 calls, definite: AES-128-GCM (CIPHER) via default
   site build:fedcba file-offset=16384 gen=0: 50 calls, UNATTRIBUTED (candidate set incomplete)
+    candidate: provider=build:fedcba class=default op=DIGEST funcid=7 algs=[SHA-256]
 
 coverage:
   provider/default: expected=3 discovered=2 attached=1 (gap)

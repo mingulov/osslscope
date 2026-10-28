@@ -6,7 +6,7 @@ use aya_ebpf::{
     bindings::bpf_pidns_info,
     helpers,
     macros::{map, uprobe, uretprobe},
-    maps::{Array, HashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, PerCpuArray, PerCpuHashMap, RingBuf},
     programs::{ProbeContext, RetProbeContext},
     EbpfContext,
 };
@@ -31,6 +31,104 @@ static LOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
 static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 0);
 #[map]
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
+#[map]
+static API_WINDOW: Array<Range> = Array::with_max_entries(1, 0);
+#[map]
+static API_TOTALS: PerCpuHashMap<u64, ApiAggregate> = PerCpuHashMap::with_max_entries(1024, 0);
+#[map]
+static API_THREADS: HashMap<ApiThreadKey, Thread> = HashMap::with_max_entries(4096, 0);
+#[inline(always)]
+fn api_increment(pointer: *mut u64) {
+    // This non-preemptible program owns its CPU cell; no ring or raw operands.
+    unsafe {
+        *pointer = (*pointer).saturating_add(1);
+    }
+}
+#[inline(never)]
+#[no_mangle]
+pub fn operational_entry(cookie: u64, key: &ThreadKey) {
+    let Some(total) = API_TOTALS.get_ptr_mut(&cookie) else {
+        loss(LOSS_MAP);
+        return;
+    };
+    unsafe {
+        api_increment(core::ptr::addr_of_mut!((*total).entries));
+    }
+    let ak = ApiThreadKey {
+        thread: *key,
+        cookie,
+    };
+    let mut state = unsafe { API_THREADS.get(&ak).copied() }.unwrap_or_default();
+    if state.enter().is_none() {
+        unsafe {
+            api_increment(core::ptr::addr_of_mut!((*total).depth));
+        }
+    }
+    if API_THREADS.insert(ak, state, 0).is_err() {
+        unsafe {
+            api_increment(core::ptr::addr_of_mut!((*total).map));
+        }
+    }
+}
+#[inline(never)]
+#[no_mangle]
+pub fn operational_return(cookie: u64, key: &ThreadKey, api: u32, rv: u64) {
+    let Some(total) = API_TOTALS.get_ptr_mut(&cookie) else {
+        loss(LOSS_MAP);
+        return;
+    };
+    let ak = ApiThreadKey {
+        thread: *key,
+        cookie,
+    };
+    let Some(mut state) = (unsafe { API_THREADS.get(&ak).copied() }) else {
+        unsafe {
+            api_increment(core::ptr::addr_of_mut!((*total).unpaired));
+        }
+        return;
+    };
+    if state.skip_return() {
+        if API_THREADS.insert(ak, state, 0).is_err() {
+            unsafe {
+                api_increment(core::ptr::addr_of_mut!((*total).map));
+            }
+        }
+        return;
+    }
+    if state.depth == 0 {
+        unsafe {
+            api_increment(core::ptr::addr_of_mut!((*total).unpaired));
+        }
+        return;
+    }
+    state.depth -= 1;
+    let changed = if state.depth == 0 {
+        API_THREADS.remove(&ak)
+    } else {
+        API_THREADS.insert(ak, state, 0)
+    };
+    if changed.is_err() {
+        unsafe {
+            api_increment(core::ptr::addr_of_mut!((*total).map));
+        }
+        return;
+    }
+    unsafe {
+        match operational_outcome(api, rv) {
+            1 => api_increment(core::ptr::addr_of_mut!((*total).success)),
+            2 => api_increment(core::ptr::addr_of_mut!((*total).failure)),
+            3 => {
+                api_increment(core::ptr::addr_of_mut!((*total).failure));
+                api_increment(core::ptr::addr_of_mut!((*total).mismatch));
+            }
+            4 => {
+                api_increment(core::ptr::addr_of_mut!((*total).failure));
+                api_increment(core::ptr::addr_of_mut!((*total).unsupported));
+            }
+            _ => api_increment(core::ptr::addr_of_mut!((*total).unsupported_return)),
+        }
+    }
+}
 #[inline(always)]
 fn loss(n: u32) {
     if let Some(p) = LOSS.get_ptr_mut(n) {
@@ -51,6 +149,13 @@ fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
         return None;
     }
     let member = unsafe { *MEMBERS.get(&ids.tgid)? };
+    if operational_api(cfg.api) {
+        let window = API_WINDOW.get(0)?;
+        let now = unsafe { helpers::bpf_ktime_get_ns() };
+        if now < window.start || now >= window.end {
+            return None;
+        }
+    }
     if member.generation != cfg.generation {
         return None;
     }
@@ -119,6 +224,10 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     let Some((cfg, key)) = identity(cookie) else {
         return 0;
     };
+    if operational_api(cfg.api) {
+        operational_entry(cookie, &key);
+        return 0;
+    }
     let mut thread = unsafe { THREADS.get(&key).copied() }.unwrap_or_default();
     let old_depth = thread.depth;
     let Some(invocation) = thread.enter() else {
@@ -655,6 +764,12 @@ pub fn pop_return(cookie: u64, out_key: &mut ThreadKey, out_pending: &mut Pendin
 #[uretprobe]
 pub fn observation_return(ctx: RetProbeContext) -> u32 {
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    if let Some((cfg, key)) = identity(cookie) {
+        if operational_api(cfg.api) {
+            operational_return(cookie, &key, cfg.api, ctx.ret());
+            return 0;
+        }
+    }
     let mut key = ThreadKey::default();
     let mut p = Pending::default();
     if !pop_return(cookie, &mut key, &mut p) {

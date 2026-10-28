@@ -3,7 +3,7 @@
 //!
 //! [`check_version`] accepts historical v1.x documents; its schema is
 //! `schemas/observed-crypto-v1.json`. Live report/check producers emit
-//! `observed-crypto-v2.3`; [`check_version_v2`], [`validate_v2`] and
+//! `observed-crypto-v2.4`; [`check_version_v2`], [`validate_v2`] and
 //! [`check_v2_semantics`] own that contract. Minor additions are optional;
 //! field readers ignore unknown keys while validators stay strict.
 
@@ -590,6 +590,7 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_traversal_fingerprints(root)?;
     check_package_provenance(root)?;
     check_preview_count_provenance(root)?;
+    check_dynamic_sections(root)?;
     Ok(())
 }
 
@@ -2289,4 +2290,121 @@ fn package_frozen_v2_2_strict_reader_rejects_new_field() {
     assert!(error.message.contains("forbidden"));
     validate_v2(&v).unwrap();
     check_v2_semantics(&v).unwrap();
+}
+
+/// Optional v2.4 ledgers cannot create attribution or alter callback units.
+fn check_dynamic_sections(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    use crate::evidence::{AlgorithmIdentity, SiteProvenance};
+    use crate::provider_observation::MetadataOrigin;
+    use std::collections::BTreeSet;
+    fn section<T: serde::de::DeserializeOwned>(
+        root: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+    ) -> Result<Vec<T>, String> {
+        root.get(key)
+            .map(|value| {
+                serde_json::from_value(value.clone()).map_err(|_| format!("invalid {key}"))
+            })
+            .unwrap_or(Ok(Vec::new()))
+    }
+    let identities: Vec<AlgorithmIdentity> = section(root, "algorithm_identities")?;
+    let provenance: Vec<SiteProvenance> = section(root, "site_provenance")?;
+    let activity: Vec<crate::api_activity::ApiActivityRow> = section(root, "api_activity")?;
+    let mut ids = BTreeSet::new();
+    for identity in &identities {
+        let valid = identity.id.strip_prefix("algorithm-").is_some_and(|hex| {
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+        if !valid
+            || !ids.insert(identity.id.as_str())
+            || identity
+                .known_algorithm
+                .is_some_and(|id| id == u16::MAX || crate::kinds::alg_class_label(id).is_none())
+        {
+            return Err("invalid algorithm identity".into());
+        }
+    }
+    let mut sites: Vec<&serde_json::Value> = root["sites"]
+        .as_array()
+        .ok_or("invalid sites")?
+        .iter()
+        .collect();
+    for bucket in root["fenced"].as_array().ok_or("invalid fenced")? {
+        sites.extend(bucket["sites"].as_array().ok_or("invalid fenced sites")?);
+    }
+    let mut seen = BTreeSet::new();
+    for row in provenance {
+        if !seen.insert((row.site.clone(), row.count_generation)) {
+            return Err("duplicate provenance".into());
+        }
+        // Public physical rows flatten the backing identity (see site_json).
+        let matched = sites.iter().find(|site| {
+            site["object"].as_str() == Some(&row.site.object.0)
+                && site["device"].as_u64() == Some(row.site.device)
+                && site["inode"].as_u64() == Some(row.site.inode)
+                && site["offset"].as_u64() == Some(row.site.offset)
+                && site["generation"].as_u64() == Some(row.count_generation as u64)
+        });
+        if matched.is_none() {
+            return Err("unresolved provenance site/generation".into());
+        }
+        if matched.is_some_and(|site| site["candidates_coverage"] != "unknown") {
+            return Err("dynamic provenance cannot promote candidate coverage".into());
+        }
+        for a in row.associations {
+            if a.algorithm_id
+                .as_ref()
+                .is_some_and(|id| !ids.contains(id.as_str()))
+                || a.function_id == 0
+                || a.function_id > i32::MAX as u32
+                || a.operation
+                    .is_some_and(|op| op == 0 || op > i32::MAX as u32)
+                || a.observation_generation == 0
+            {
+                return Err("invalid candidate association".into());
+            }
+            match a.origin {
+                MetadataOrigin::StaticPublicTableCandidate
+                    if a.static_provenance.is_none()
+                        || a.storage.is_none()
+                        || !a.advertisers.is_empty() =>
+                {
+                    return Err("static shape cannot invent advertiser authority".into());
+                }
+                MetadataOrigin::ObservedPublicAbi
+                    if a.static_provenance.is_some()
+                        || a.storage.is_some()
+                        || a.algorithm_id.is_none()
+                        || a.operation.is_none() =>
+                {
+                    return Err("unsupported provenance promotion".into());
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut apis = BTreeSet::new();
+    for row in activity {
+        let paired = row
+            .observed_success
+            .checked_add(row.observed_failure)
+            .and_then(|v| v.checked_add(row.gaps.unsupported_return))
+            .ok_or("API count overflow")?;
+        let api = u32::from(row.api);
+        if !apis.insert(api)
+            || row.gaps.not_attached && (row.entries != 0 || paired != 0)
+            || paired > row.entries
+            || row.gaps.tail != row.entries - paired
+            || row.verification_mismatch > row.observed_failure
+            || row.unsupported > row.observed_failure
+            || row.verification_mismatch > 0 && !matches!(api, 40 | 45 | 47)
+            || row.unsupported > 0 && !(39..=43).contains(&api)
+        {
+            return Err("inconsistent API activity".into());
+        }
+    }
+    Ok(())
 }

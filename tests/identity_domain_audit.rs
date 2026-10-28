@@ -114,6 +114,14 @@ fn h5_t3_every_device_site_names_one_domain() {
         "stat", "maps", "raw", "agnostic", "fallback", "display", "local",
     ];
     let pinned: &[(&str, &str, &str, u32)] = &[
+        // Public provenance repeats the physical row's already-encoded device
+        // within the same document/count generation. No native/stat/maps join.
+        (
+            "src/schema.rs",
+            "local",
+            "&& site[\"device\"].as_u64() == Some(row.site.device)",
+            1,
+        ),
         // Startup dependency dedup compares native fstat dev_t/inode from
         // opened regular candidate FDs only. It suppresses repeated parsing;
         // it grants no mapped/site authority and never joins encoded evidence

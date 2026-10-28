@@ -389,11 +389,12 @@ fn association_handoff_keeps_fenced_identity_without_another_count() {
             origin: MetadataOrigin::StaticPublicTableCandidate,
             algorithm: None,
             known_algorithm: None,
+            alias_quality: Default::default(),
             operation: None,
             function_id: 70001,
             advertisers: Vec::new(),
-            static_provenance: None,
-            storage: None,
+            static_provenance: Some(osslscope::provider_observation::static_tables::StaticTableProvenance::DispatchTableShape),
+            storage: Some(osslscope::provider_observation::static_tables::TableStorage::ReadOnly),
             partial: true,
             observed_ns: 20,
             observation_generation: 9,
@@ -464,4 +465,36 @@ fn advertisement_invalidation_alone_preserves_physical_lifetime_but_identity_los
         assert_eq!(doc.total_calls(), 37);
         check_open(&doc);
     }
+}
+
+#[test]
+fn candidate_output_budget_refuses_metadata_without_losing_physical_counts() {
+    use osslscope::focused_count::{CandidateAssociation, MetadataOrigin, SiteAssociations};
+    let physical = site(37, &[]);
+    let association = CandidateAssociation {
+        origin: MetadataOrigin::StaticPublicTableCandidate, algorithm: None, known_algorithm: None, alias_quality: Default::default(), operation: None, function_id: 7, advertisers: Vec::new(),
+        static_provenance: Some(osslscope::provider_observation::static_tables::StaticTableProvenance::DispatchTableShape), storage: Some(osslscope::provider_observation::static_tables::TableStorage::ReadOnly), partial: true, observed_ns: 20, observation_generation: 9,
+    };
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            fenced: vec![physical.clone()],
+            associations: vec![SiteAssociations {
+                site: physical.site,
+                count_generation: 1,
+                associations: vec![association; 131072],
+            }],
+            ..Default::default()
+        },
+        &[],
+    );
+    assert_eq!(doc.total_calls(), 37);
+    assert!(doc.site_provenance.is_empty());
+    assert!(
+        doc.counters
+            .iter()
+            .any(|c| c.name == "focused.metadata_output_limit" && c.value == 1)
+    );
+    check_open(&doc);
 }

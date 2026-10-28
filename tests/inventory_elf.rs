@@ -506,3 +506,12 @@ fn files_shorter_than_elf_magic_are_rejected_without_a_read() {
         );
     }
 }
+
+#[test]
+fn operational_only_public_exports_are_inventory_sources() {
+    let f = Fixture::new();
+    let object = f.build("operational.so", "int EVP_DigestSign(void) { return 1; } int EVP_RAND_generate(void) { return 1; } int EVP_MAC_final;", &[]);
+    let metadata = inspect_module(&object, LIMIT).unwrap();
+    assert_eq!(metadata.kind, ObjectKind::OpenSslCompatible);
+    assert_eq!(metadata.exports.len(), 2);
+}

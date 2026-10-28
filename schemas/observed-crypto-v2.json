@@ -2,15 +2,315 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.3 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
   "properties": {
+    "algorithm_identities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "known_algorithm"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 74,
+            "maxLength": 74
+          },
+          "known_algorithm": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/u32"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "description": "Opaque per-process algorithm identities and optional finite presentation hints; no algorithm admission or executed asset claim."
+    },
+    "site_provenance": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "site",
+          "count_generation",
+          "associations"
+        ],
+        "properties": {
+          "site": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "object",
+              "device",
+              "inode",
+              "offset"
+            ],
+            "properties": {
+              "object": {
+                "type": "string"
+              },
+              "device": {
+                "$ref": "#/$defs/u64"
+              },
+              "inode": {
+                "$ref": "#/$defs/u64"
+              },
+              "offset": {
+                "$ref": "#/$defs/u64"
+              }
+            }
+          },
+          "count_generation": {
+            "$ref": "#/$defs/u32"
+          },
+          "associations": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "algorithm_id",
+                "origin",
+                "operation",
+                "function_id",
+                "advertisers",
+                "static_provenance",
+                "storage",
+                "partial",
+                "alias_quality",
+                "observed_ns",
+                "observation_generation"
+              ],
+              "properties": {
+                "algorithm_id": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "origin": {
+                  "enum": [
+                    "static_public_table_candidate",
+                    "observed_public_abi"
+                  ]
+                },
+                "operation": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/$defs/u32"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "function_id": {
+                  "$ref": "#/$defs/u32"
+                },
+                "advertisers": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "minLength": 64,
+                    "maxLength": 64
+                  }
+                },
+                "static_provenance": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "dispatch_table_shape",
+                        "algorithm_record_shape"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "storage": {
+                  "anyOf": [
+                    {
+                      "enum": [
+                        "read_only",
+                        "relro"
+                      ]
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "partial": {
+                  "type": "boolean"
+                },
+                "alias_quality": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "status",
+                    "weak"
+                  ],
+                  "properties": {
+                    "status": {
+                      "enum": [
+                        "complete",
+                        "unknown",
+                        "truncated",
+                        "alias_limit",
+                        "read_failed",
+                        "mixed",
+                        "unavailable"
+                      ]
+                    },
+                    "weak": {
+                      "type": "boolean"
+                    }
+                  }
+                },
+                "observed_ns": {
+                  "$ref": "#/$defs/u64"
+                },
+                "observation_generation": {
+                  "$ref": "#/$defs/u64"
+                }
+              }
+            }
+          }
+        }
+      },
+      "description": "Associations refer to exact current or fenced count generations, preserve their observation boundaries and do not allocate physical counts or promote Unknown coverage."
+    },
+    "api_activity": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "api",
+          "entries",
+          "observed_success",
+          "observed_failure",
+          "verification_mismatch",
+          "unsupported",
+          "gaps"
+        ],
+        "properties": {
+          "api": {
+            "enum": [
+              20,
+              21,
+              22,
+              23,
+              24,
+              25,
+              26,
+              27,
+              28,
+              29,
+              30,
+              31,
+              32,
+              33,
+              34,
+              35,
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              48
+            ]
+          },
+          "entries": {
+            "$ref": "#/$defs/u64"
+          },
+          "observed_success": {
+            "$ref": "#/$defs/u64"
+          },
+          "observed_failure": {
+            "$ref": "#/$defs/u64"
+          },
+          "verification_mismatch": {
+            "$ref": "#/$defs/u64"
+          },
+          "unsupported": {
+            "$ref": "#/$defs/u64"
+          },
+          "gaps": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "map",
+              "depth",
+              "unpaired",
+              "tail",
+              "unsupported_return",
+              "attachment",
+              "finality",
+              "not_attached",
+              "saturated"
+            ],
+            "properties": {
+              "map": {
+                "$ref": "#/$defs/u64"
+              },
+              "depth": {
+                "$ref": "#/$defs/u64"
+              },
+              "unpaired": {
+                "$ref": "#/$defs/u64"
+              },
+              "tail": {
+                "$ref": "#/$defs/u64"
+              },
+              "unsupported_return": {
+                "$ref": "#/$defs/u64"
+              },
+              "attachment": {
+                "type": "boolean"
+              },
+              "finality": {
+                "type": "boolean"
+              },
+              "not_attached": {
+                "type": "boolean"
+              },
+              "saturated": {
+                "type": "boolean"
+              }
+            }
+          }
+        }
+      },
+      "description": "Per-export operational entries and paired scalar returns, independent of callback totals, algorithm/provider attribution and definite policy/CBOM assets. Wrappers and size queries remain separate API calls."
+    },
     "package_build": { "$ref": "#/$defs/packageProvenance" },
     "count_object": { "$ref": "#/$defs/packageRoleProvenance", "description": "Count-only foreground preview: retained bytes/hash and operator-explicit or trusted-installed selection. No harvest/members bundle or build-input authentication is implied." },
     "schema_version": {
-      "description": "Producers emit exactly observed-crypto-v2.3; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
+      "description": "Producers emit exactly observed-crypto-v2.4; readers major-gate via check_version_v2 (accept v2.x, reject other majors).",
       "type": "string",
       "minLength": 1
     },

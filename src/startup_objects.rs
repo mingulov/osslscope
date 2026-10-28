@@ -26,6 +26,7 @@ const MAX_METADATA: u64 = 128 << 20;
 const MAX_NEEDED: usize = 256;
 pub(crate) struct PreExecSites {
     pub(crate) candidates: Vec<VerifiedStaticCandidate>,
+    pub(crate) apis: Vec<objects::StartupApiSite>,
     pub(crate) gaps: BTreeSet<ObservationGap>,
 }
 fn check(deadline: Instant, cancel: &AtomicBool) -> Result<(), ObservationGap> {
@@ -113,6 +114,7 @@ pub(crate) fn prepare_owned_startup(
     let mut seen = BTreeSet::new();
     let mut result = PreExecSites {
         candidates: Vec::new(),
+        apis: Vec::new(),
         gaps: BTreeSet::new(),
     };
     // Loader cache/hwcaps, preloads, scripts, dynamically selected modules and
@@ -258,7 +260,8 @@ pub(crate) fn prepare_owned_startup(
         drop(scratch);
         check(deadline, cancel)?;
         match objects::startup_candidates(custody.clone(), file, budget) {
-            Ok((candidates, partial)) => {
+            Ok((candidates, apis, partial)) => {
+                result.apis.extend(apis);
                 if partial {
                     result.gaps.insert(ObservationGap::DispatchPartial);
                 }

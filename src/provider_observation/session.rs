@@ -5,7 +5,9 @@ use super::{
     *,
 };
 use crate::{inventory, loader};
-use aya::maps::{Array, HashMap as BpfMap, Map, MapData, PerCpuArray, RingBuf};
+use aya::maps::{
+    Array, HashMap as BpfMap, Map, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf,
+};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
@@ -22,12 +24,21 @@ unsafe impl aya::Pod for c::Member {}
 unsafe impl aya::Pod for c::Namespace {}
 unsafe impl aya::Pod for c::Range {}
 unsafe impl aya::Pod for c::RangeKey {}
+unsafe impl aya::Pod for c::ApiAggregate {}
 #[derive(Default)]
 pub struct ObservationBatch {
     pub facts: Vec<ObservationFact>,
     pub gaps: Vec<ObservationGap>,
     pub learned_sites: Vec<VerifiedSiteCandidate>,
     pub static_candidates: Vec<VerifiedStaticCandidate>,
+    pub api_activity: Vec<ProcessApiActivity>,
+}
+/// One cumulative final API ledger, scoped to an observed incarnation.
+#[derive(Clone)]
+pub struct ProcessApiActivity {
+    pub pid: u32,
+    pub starttime: u64,
+    pub row: crate::api_activity::ApiActivityRow,
 }
 impl ObservationBatch {
     fn gap(&mut self, g: ObservationGap) {
@@ -187,6 +198,10 @@ pub struct ProviderSession {
     members: BpfMap<MapData, u32, c::Member>,
     ranges: BpfMap<MapData, c::RangeKey, c::Range>,
     loss: PerCpuArray<MapData, u64>,
+    api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate>,
+    api_window: Array<MapData, c::Range>,
+    api_owners: BTreeMap<u64, (u32, u64, u32)>,
+    startup: BTreeMap<u32, Vec<Attachment>>,
     targets: BTreeMap<u32, Target>,
     roles: Roles,
     aliases: super::assembly::Sequences,
@@ -223,6 +238,9 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
         ("THREADS", 1, 16, 16, 4096),
         ("PENDING", 1, 24, 56, 4096),
         ("LOSS", 6, 4, 8, 8),
+        ("API_TOTALS", 5, 8, 72, 1024),
+        ("API_THREADS", 1, 24, 16, 4096),
+        ("API_WINDOW", 2, 4, 16, 1),
         ("ALG_CLASS", 1, 8, 42, 1024),
         ("TRIP_CLASS", 1, 8, 22, 64),
     ];
@@ -300,7 +318,7 @@ impl ProviderSession {
         let mut prepared = prepare_object(object)?;
         // Retain hard bounds while honoring lower pending/process limits in actual maps.
         for m in &mut prepared.maps {
-            if matches!(m.name.as_str(), "PENDING" | "THREADS") {
+            if matches!(m.name.as_str(), "PENDING" | "THREADS" | "API_THREADS") {
                 m.max_entries = budget.limits.max_pending_calls.max(1) as u32;
             }
             if m.name == "MEMBERS" {
@@ -330,7 +348,24 @@ impl ProviderSession {
             .map_err(|_| ObservationGap::NamespaceChanged)?;
         ossl_bpf_sys::map_freeze(loaded.maps["NAMESPACE"].as_raw_fd())
             .map_err(|_| ObservationGap::NamespaceChanged)?;
+        let mut api_window = Array::try_from(map(&loaded, "API_WINDOW")?)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        api_window
+            .set(
+                0,
+                c::Range {
+                    start: 0,
+                    end: u64::MAX,
+                },
+                0,
+            )
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
         Ok(Self {
+            api_totals: PerCpuHashMap::try_from(map(&loaded, "API_TOTALS")?)
+                .map_err(|_| ObservationGap::InvalidObject)?,
+            api_window,
+            api_owners: BTreeMap::new(),
+            startup: BTreeMap::new(),
             events: RingBuf::try_from(map(&loaded, "EVENTS")?)
                 .map_err(|_| ObservationGap::BpfUnavailable)?,
             config: BpfMap::try_from(map(&loaded, "CONFIG")?)
@@ -359,7 +394,13 @@ impl ProviderSession {
         self.targets
             .values()
             .map(|t| t.attachments.iter().map(|a| a.links.len()).sum::<usize>())
-            .sum()
+            .sum::<usize>()
+            + self
+                .startup
+                .values()
+                .flatten()
+                .map(|a| a.links.len())
+                .sum::<usize>()
     }
     fn attach_pair(
         &mut self,
@@ -408,6 +449,26 @@ impl ProviderSession {
                 },
             )?;
             site.revalidate_object()?;
+            if c::operational_api(api) {
+                if self.api_owners.len() >= 1024 {
+                    return Err(ObservationGap::LinkLimit);
+                }
+                self.budget.state(256)?;
+                self.api_totals
+                    .insert(
+                        cookie,
+                        PerCpuValues::try_from(vec![
+                            c::ApiAggregate::default();
+                            aya::util::nr_cpus().map_err(|_| {
+                                ObservationGap::BpfUnavailable
+                            })?
+                        ])
+                        .map_err(|_| ObservationGap::BpfUnavailable)?,
+                        1,
+                    )
+                    .map_err(|_| ObservationGap::PendingLimit)?;
+                self.api_owners.insert(cookie, (pid, site.starttime(), api));
+            }
             Ok(Attachment {
                 links,
                 site,
@@ -425,6 +486,7 @@ impl ProviderSession {
         if self.members.remove(&pid).is_err() {
             b.gap(ObservationGap::Invalidated)
         }
+        self.retire_startup(pid);
         if let Some(target) = self.targets.remove(&pid) {
             for a in target.attachments {
                 let _ = self.config.remove(&a.cookie);
@@ -492,11 +554,32 @@ impl ProviderSession {
             let Some(process) = acquire_observable(record, &mut self.budget)? else {
                 return Ok(());
             };
-            let generation = self.next_generation;
-            self.next_generation = self
-                .next_generation
-                .checked_add(1)
-                .ok_or(ObservationGap::ProcessLimit)?;
+            // Only the first mapped adoption of the original held incarnation
+            // may retain its scalar epoch. Real retirement/remapping allocates a
+            // fresh generation and fresh cookies as before.
+            let generation = if let Some(startup) = self
+                .startup
+                .get(&record.pid)
+                .filter(|rows| !rows.is_empty())
+            {
+                for a in startup {
+                    a.site.revalidate_object()?;
+                    if a.site.starttime() != record.starttime {
+                        return Err(ObservationGap::ProcessChanged);
+                    }
+                }
+                self.members
+                    .get(&record.pid, 0)
+                    .map_err(|_| ObservationGap::MembershipUnknown)?
+                    .generation
+            } else {
+                let generation = self.next_generation;
+                self.next_generation = self
+                    .next_generation
+                    .checked_add(1)
+                    .ok_or(ObservationGap::ProcessLimit)?;
+                generation
+            };
             Target {
                 process,
                 starttime: record.starttime,
@@ -523,39 +606,83 @@ impl ProviderSession {
                     )
                     .map_err(|_| ObservationGap::AttachFailed)?;
             }
-            for id in 1..=16 {
+            // An adopted epoch is already active. Resolve every public role
+            // before any cold reader is armed, so an alias conflict cannot
+            // transiently grant a signature during this first transition.
+            let mut public_sites = Vec::new();
+            for id in (1..=16).chain(20..=48) {
                 for resolved in target.process.resolve_api(wire::api(id)?) {
-                    let key = role_site(pid, record.starttime, &resolved.site);
-                    if !self.roles.observe(key, id, &self.budget)? {
-                        disarm_site(&mut target, &resolved.site, &mut self.config)?;
-                        b.gap(ObservationGap::AmbiguousSite);
-                        continue;
-                    }
-                    if target
-                        .attachments
-                        .iter()
-                        .any(|a| same_site(&a.site, &resolved.site))
-                    {
-                        continue;
-                    }
-                    let advertisers = if id == c::PROVIDER_INIT {
-                        vec![resolved.site.object_hash().clone()]
-                    } else {
-                        Vec::new()
-                    };
-                    match self.attach_pair(
-                        pid,
+                    self.roles.observe(
+                        role_site(pid, record.starttime, &resolved.site),
                         id,
-                        resolved.site,
-                        advertisers,
-                        target.attachments.len() * 2,
-                    ) {
-                        Ok(a) => {
-                            arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
-                            target.attachments.push(a)
+                        &self.budget,
+                    )?;
+                    self.budget
+                        .state(2 * std::mem::size_of::<(u32, ApiSite)>())?;
+                    public_sites.push((id, resolved));
+                }
+            }
+            for (id, resolved) in public_sites {
+                let key = role_site(pid, record.starttime, &resolved.site);
+                if !self.roles.accepts(key, id) {
+                    disarm_site(&mut target, &resolved.site, &mut self.config)?;
+                    if let Some(rows) = self.startup.get_mut(&pid) {
+                        while let Some(index) =
+                            rows.iter().position(|a| same_site(&a.site, &resolved.site))
+                        {
+                            let a = rows.swap_remove(index);
+                            let _ = self.config.remove(&a.cookie);
+                            drop(a.links);
                         }
-                        Err(g) => b.gap(g),
                     }
+                    b.gap(ObservationGap::AmbiguousSite);
+                    continue;
+                }
+                if target
+                    .attachments
+                    .iter()
+                    .any(|a| same_site(&a.site, &resolved.site))
+                {
+                    continue;
+                }
+                if let Some(index) = self.startup.get(&pid).and_then(|rows| {
+                    rows.iter()
+                        .position(|a| a.api == id && same_site(&a.site, &resolved.site))
+                }) {
+                    let mut a = self.startup.get_mut(&pid).unwrap().swap_remove(index);
+                    let adopt = (|| {
+                        a.site.revalidate_object()?;
+                        resolved.site.revalidate_object()?;
+                        if a.site.object_hash() != resolved.site.object_hash() {
+                            return Err(ObservationGap::ObjectChanged);
+                        }
+                        a.site = resolved.site;
+                        arm_attachment(&mut self.config, &target.process, &a, pid, generation)
+                    })();
+                    if let Err(gap) = adopt {
+                        let _ = self.config.remove(&a.cookie);
+                        return Err(gap);
+                    }
+                    target.attachments.push(a);
+                    continue;
+                }
+                let advertisers = if id == c::PROVIDER_INIT {
+                    vec![resolved.site.object_hash().clone()]
+                } else {
+                    Vec::new()
+                };
+                match self.attach_pair(
+                    pid,
+                    id,
+                    resolved.site,
+                    advertisers,
+                    target.attachments.len() * 2,
+                ) {
+                    Ok(a) => {
+                        arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
+                        target.attachments.push(a)
+                    }
+                    Err(g) => b.gap(g),
                 }
             }
             #[cfg(test)]
@@ -585,6 +712,7 @@ impl ProviderSession {
                     0,
                 )
                 .map_err(|_| ObservationGap::AttachFailed)?;
+            self.retire_startup(pid);
             // The second check fences setup changes after all links and membership.
             target.process.revalidate()?;
             Ok(())
@@ -603,6 +731,19 @@ impl ProviderSession {
     }
     pub fn drain(&mut self, deadline: Instant) -> ObservationBatch {
         let mut b = ObservationBatch::default();
+        let invalid: Vec<_> = self
+            .startup
+            .iter()
+            .filter_map(|(&pid, rows)| {
+                rows.iter()
+                    .find_map(|a| a.site.revalidate_object().err())
+                    .map(|gap| (pid, gap))
+            })
+            .collect();
+        for (pid, gap) in invalid {
+            b.gap(gap);
+            self.retire(pid, &mut b);
+        }
         if self.last_drain.elapsed() > Duration::from_millis(200) {
             b.gap(ObservationGap::SnapshotLag)
         }
@@ -916,6 +1057,88 @@ impl ProviderSession {
             }
         }
     }
+    pub(crate) fn set_api_window(&mut self, start: u64, end: u64) -> Result<(), ObservationGap> {
+        self.api_window
+            .set(0, c::Range { start, end }, 0)
+            .map_err(|_| ObservationGap::BpfUnavailable)
+    }
+    fn retire_startup(&mut self, pid: u32) {
+        if let Some(attachments) = self.startup.remove(&pid) {
+            for a in attachments {
+                let _ = self.config.remove(&a.cookie);
+                drop(a.links);
+            }
+        }
+    }
+    /// Separate sealed operational export capability: no static candidate casts.
+    pub(crate) fn prearm_operational(
+        &mut self,
+        sites: Vec<super::objects::StartupApiSite>,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), ObservationGap> {
+        let mut resolved = Vec::new();
+        for site in sites {
+            let (api, site) = site.into_parts();
+            let id = u32::from(api);
+            let key = role_site(site.pid(), site.starttime(), &site);
+            self.roles.observe(key, id, &self.budget)?;
+            resolved.push((id, site));
+        }
+        let generation = self.next_generation;
+        self.next_generation = self
+            .next_generation
+            .checked_add(1)
+            .ok_or(ObservationGap::ProcessLimit)?;
+        for (api, site) in resolved {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(ObservationGap::SnapshotLag);
+            }
+            let pid = site.pid();
+            if !self
+                .roles
+                .accepts(role_site(pid, site.starttime(), &site), api)
+            {
+                continue;
+            }
+            if self
+                .startup
+                .get(&pid)
+                .is_some_and(|rows| rows.iter().any(|a| same_site(&a.site, &site)))
+            {
+                continue;
+            }
+            let a = self.attach_pair(pid, api, site, Vec::new(), 0)?;
+            a.site.revalidate_object()?;
+            self.config
+                .insert(
+                    a.cookie,
+                    c::Config {
+                        generation,
+                        object: 0,
+                        pid,
+                        api,
+                    },
+                    0,
+                )
+                .map_err(|_| ObservationGap::AttachFailed)?;
+            a.site.revalidate_object()?;
+            self.startup.entry(pid).or_default().push(a);
+            self.members
+                .insert(
+                    pid,
+                    c::Member {
+                        generation,
+                        epoch: 1,
+                        range_count: 0,
+                        reserved: 0,
+                    },
+                    0,
+                )
+                .map_err(|_| ObservationGap::AttachFailed)?;
+        }
+        Ok(())
+    }
     pub fn close(self) -> ObservationBatch {
         self.close_until(Instant::now() + Duration::from_millis(100))
     }
@@ -925,13 +1148,70 @@ impl ProviderSession {
         for pid in pids {
             self.retire(pid, &mut b)
         }
+        let pids: Vec<_> = self.startup.keys().copied().collect();
+        for pid in pids {
+            self.retire(pid, &mut b);
+        }
+        for (&cookie, &(pid, starttime, api)) in &self.api_owners {
+            match self
+                .api_totals
+                .get(&cookie, 0)
+                .map_err(|_| ObservationGap::InvalidWire)
+                .and_then(|values| {
+                    let mut total = c::ApiAggregate::default();
+                    for v in values.iter() {
+                        macro_rules! sum {
+                            ($field:ident) => {
+                                total.$field = total
+                                    .$field
+                                    .checked_add(v.$field)
+                                    .ok_or(ObservationGap::InvalidWire)?;
+                            };
+                        }
+                        sum!(entries);
+                        sum!(success);
+                        sum!(failure);
+                        sum!(mismatch);
+                        sum!(unsupported);
+                        sum!(unsupported_return);
+                        sum!(map);
+                        sum!(depth);
+                        sum!(unpaired);
+                    }
+                    wire::activity(api, total)
+                }) {
+                Ok(row) => b.api_activity.push(ProcessApiActivity {
+                    pid,
+                    starttime,
+                    row,
+                }),
+                Err(gap) => {
+                    b.gap(gap);
+                    if let Ok(api) = crate::api_activity::ApiId::try_from(api) {
+                        let mut row = crate::api_activity::ApiActivityRow::unavailable(api);
+                        row.gaps.not_attached = false;
+                        row.gaps.map = 1;
+                        b.api_activity.push(ProcessApiActivity {
+                            pid,
+                            starttime,
+                            row,
+                        });
+                    }
+                }
+            }
+        }
         self.closed = true;
         b
     }
 }
 impl Drop for ProviderSession {
     fn drop(&mut self) {
-        let pids: Vec<_> = self.targets.keys().copied().collect();
+        let pids: Vec<_> = self
+            .targets
+            .keys()
+            .chain(self.startup.keys())
+            .copied()
+            .collect();
         let mut b = ObservationBatch::default();
         for pid in pids {
             self.retire(pid, &mut b)
@@ -946,11 +1226,10 @@ fn acquire_observable(
     // dependencies and non-observable exports cannot authorize acquisition.
     // A later snapshot is evaluated afresh, so late module arrival can retry.
     if !record.modules.iter().any(|module| {
-        module
-            .info
-            .exports
-            .iter()
-            .any(|api| (1..=16).any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api))))
+        module.info.exports.iter().any(|api| {
+            api.operational_id().is_some()
+                || (1..=16).any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api)))
+        })
     }) {
         return Ok(None);
     }
@@ -1829,5 +2108,125 @@ mod tests {
         eprintln!("resumed discovery native calls={calls}");
         session.close_until(Instant::now() + Duration::from_millis(100));
         child.finish_observation().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod startup_api_controls {
+    use super::*;
+    #[test]
+    #[ignore = "requires fresh observation object and native tracing privileges"]
+    fn mapped_transition_reuses_prearmed_operational_cookies() {
+        let dir = std::env::temp_dir().join(format!("osslscope-api-adopt-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <stddef.h>
+static const char *ready, *go, *done;
+__attribute__((noinline)) int EVP_DigestUpdate(void *ctx,const void *data,size_t len) {
+ FILE *f=fopen(ready,"w"); if(!f) return 0; fclose(f);
+ for(int i=0;i<15000 && access(go,F_OK);i++) usleep(1000);
+ return access(go,F_OK)==0;
+}
+int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];done=argv[3];
+ if(EVP_DigestUpdate((void*)1,(void*)2,3)!=1) return 3;
+ FILE *f=fopen(done,"w");if(!f)return 4;fclose(f);return 0; }
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O0", "-rdynamic", "-o"])
+                .arg(&app)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let ready = dir.join("ready");
+        let go = dir.join("go");
+        let done = dir.join("done");
+        let argv = [&app, &ready, &go, &done]
+            .map(|p| p.to_string_lossy().into_owned())
+            .to_vec();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+        )
+        .unwrap();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        session
+            .prearm_operational(
+                startup.apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+            )
+            .unwrap();
+        let before: BTreeSet<_> = session.api_owners.keys().copied().collect();
+        assert_eq!(before.len(), 1);
+        child.release_retaining_exit().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        });
+        let batch = session.reconcile(&snapshot);
+        assert!(
+            session.targets.get(&child.pid()).is_some_and(|t| t.ready),
+            "{:?}",
+            batch.gaps
+        );
+        assert_eq!(
+            session.api_owners.keys().copied().collect::<BTreeSet<_>>(),
+            before,
+            "same-site API handoff minted duplicate physical probes"
+        );
+        assert!(session.startup.is_empty());
+        std::fs::write(&go, b"go").unwrap();
+        while !done.exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let final_batch = session.close();
+        let rows: Vec<_> = final_batch
+            .api_activity
+            .iter()
+            .filter(|a| u32::from(a.row.api) == 22)
+            .collect();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0].row;
+        assert_eq!(
+            (
+                row.entries,
+                row.observed_success,
+                row.observed_failure,
+                row.gaps.unpaired,
+                row.gaps.tail
+            ),
+            (1, 1, 0, 0, 0)
+        );
+        println!(
+            "mapped handoff: same cookie, one entry, one paired successful return, no tail/unpaired gap"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

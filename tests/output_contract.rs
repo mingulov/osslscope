@@ -834,7 +834,7 @@ fn schema_version_gate() {
     assert!(!check_version("observed-crypto-v2.9"));
     // Renders carry exactly the current producer version.
     for doc in [complete_doc(), violation_doc(), fatal_doc()] {
-        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.3");
+        assert_eq!(json_of(&doc)["schema_version"], "observed-crypto-v2.4");
     }
 }
 
@@ -1832,7 +1832,7 @@ fn cbom_carries_same_window() {
             meta["osslscope:window-effective-end-ns"],
             doc.window.effective_end_ns.to_string()
         );
-        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.3");
+        assert_eq!(meta["osslscope:schema-version"], "observed-crypto-v2.4");
     }
     // PARTIAL disclaimer names the gaps.
     let meta = cbom_metadata(&cbom_of(&partial_doc()));
@@ -2385,7 +2385,7 @@ fn selected_objects_rendered_and_old_reader_safe() {
     // Additive proof: a frozen pre-key wire reader (no
     // selected_objects field) parses the new bytes.
     let back: PreR12WireDocument = serde_json::from_value(v).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.3");
+    assert_eq!(back.schema_version, "observed-crypto-v2.4");
     assert_eq!(back.completeness.status, "COMPLETE");
 }
 
@@ -3008,7 +3008,7 @@ fn site_installed_at_renders_and_validates_v2() {
     doc.sites[0].installed_at = Some(5);
     assert_eq!(doc.sites[3].installed_at, None);
     let v = json_of(&doc);
-    assert_eq!(v["schema_version"], "observed-crypto-v2.3");
+    assert_eq!(v["schema_version"], "observed-crypto-v2.4");
     validate_v2(&v).expect("installed_at doc fails schema");
     check_v2_semantics(&v).expect("installed_at doc fails semantics");
     assert_eq!(v["sites"][0]["installed_at"], 5);
@@ -3922,7 +3922,7 @@ fn r12_old_reader_ignores_context() {
     );
     let back: PreR12WireDocument =
         serde_json::from_value(rendered).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.3");
+    assert_eq!(back.schema_version, "observed-crypto-v2.4");
     assert_eq!(back.completeness.status, "COMPLETE");
     assert_eq!(
         back.window.requested_start_ns,
@@ -4082,7 +4082,7 @@ fn r14_refusal_diagnostics_additive_old_reader_safe() {
     );
     let back: PreRefusalWireDocument =
         serde_json::from_value(rendered).expect("old reader parses new bytes");
-    assert_eq!(back.schema_version, "observed-crypto-v2.3");
+    assert_eq!(back.schema_version, "observed-crypto-v2.4");
     assert_eq!(back.sites.len(), doc.sites.len());
     assert_eq!(back.objects.len(), doc.objects.len());
     let calls: u64 = back.sites.iter().map(|s| s.calls).sum();
@@ -4166,8 +4166,8 @@ fn g1_current_producer_is_minor_2_2() {
     let v = json_of(&complete_doc());
     validate_v2(&v).unwrap();
     check_v2_semantics(&v).unwrap();
-    assert_eq!(v["schema_version"], "observed-crypto-v2.3");
-    assert!(render_human(&complete_doc()).contains("observed-crypto-v2.3"));
+    assert_eq!(v["schema_version"], "observed-crypto-v2.4");
+    assert!(render_human(&complete_doc()).contains("observed-crypto-v2.4"));
 }
 
 /// A TARGET read may precede seal and its ktime sample may follow seal.after.
@@ -4334,9 +4334,9 @@ fn g1_admission_extension_is_guarded() {
         assert!(check_v2_semantics(&v).is_err());
     }
     let human = render_human(&doc);
-    assert!(human.contains("observed-crypto-v2.3"));
+    assert!(human.contains("observed-crypto-v2.4"));
     let cbom: Value = serde_json::from_slice(&render_cbom(&doc).unwrap()).unwrap();
-    assert!(cbom.to_string().contains("observed-crypto-v2.3"));
+    assert!(cbom.to_string().contains("observed-crypto-v2.4"));
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -4833,4 +4833,137 @@ fn package_v2_2_count_admission_preserved() {
     check_v2_semantics(&after).unwrap();
     after.as_object_mut().unwrap().remove("package_build");
     assert_eq!(after, before);
+}
+
+#[test]
+fn v24_dynamic_hints_survive_unknown_fenced_sites_without_definite_assets() {
+    let mut input = input_base();
+    input.fenced = vec![FencedGeneration {
+        generation: 3,
+        sites: vec![site_at(
+            FP_A,
+            8,
+            100,
+            77,
+            3,
+            5,
+            vec![],
+            CandidateCoverage::Unknown,
+        )],
+    }];
+    let doc = finalize_honest(input);
+    let mut value = serde_json::to_value(&doc).unwrap();
+    value["algorithm_identities"] = json!([
+        {"id": format!("algorithm-{}", "a".repeat(64)), "known_algorithm": 9},
+        {"id": format!("algorithm-{}", "b".repeat(64)), "known_algorithm": null}
+    ]);
+    value["site_provenance"] = json!([{
+        "site": {"object": FP_A, "device": 8, "inode": 100, "offset": 77},
+        "count_generation": 3,
+        "associations": [
+            {"algorithm_id": format!("algorithm-{}", "a".repeat(64)), "origin": "static_public_table_candidate", "operation": null, "function_id": 9001, "advertisers": [], "static_provenance": "algorithm_record_shape", "storage": "relro", "partial": false, "alias_quality": {"status": "complete", "weak": false}, "observed_ns": 80, "observation_generation": 1},
+            {"algorithm_id": format!("algorithm-{}", "b".repeat(64)), "origin": "static_public_table_candidate", "operation": null, "function_id": 9001, "advertisers": [], "static_provenance": "algorithm_record_shape", "storage": "relro", "partial": false, "alias_quality": {"status": "unknown", "weak": false}, "observed_ns": 85, "observation_generation": 1}
+        ]
+    }]);
+    let doc: CaptureDocument = serde_json::from_value(value).unwrap();
+    let json = json_of(&doc);
+    assert_eq!(json["algorithm_identities"].as_array().unwrap().len(), 2);
+    assert_eq!(json["site_provenance"][0]["count_generation"], 3);
+    validate_v2(&json).unwrap();
+    check_v2_semantics(&json).unwrap();
+    let human = render_human(&doc);
+    assert!(human.contains("candidate hints"), "{human}");
+    assert!(human.contains("algorithm-bbbbbbbb"), "{human}");
+    assert!(human.contains("UNATTRIBUTED"), "{human}");
+    assert_eq!(doc.total_calls(), 5);
+    assert_eq!(cbom_of(&doc)["components"].as_array().unwrap().len(), 0);
+}
+
+#[test]
+fn v24_api_activity_is_separate_and_strict() {
+    let mut value = serde_json::to_value(finalize_honest(input_base())).unwrap();
+    value["api_activity"] = json!([{
+        "api": 20, "entries": 5, "observed_success": 3, "observed_failure": 1,
+        "verification_mismatch": 0, "unsupported": 0,
+        "gaps": {"map": 0, "depth": 0, "unpaired": 0, "tail": 1, "unsupported_return": 0, "attachment": true, "finality": true, "not_attached": false, "saturated": false}
+    }]);
+    let doc: CaptureDocument = serde_json::from_value(value).unwrap();
+    let json = json_of(&doc);
+    assert_eq!(json["api_activity"][0]["entries"], 5);
+    validate_v2(&json).unwrap();
+    check_v2_semantics(&json).unwrap();
+    assert_eq!(doc.total_calls(), 0);
+    assert!(render_human(&doc).contains("EVP_DigestInit_ex"));
+    assert_eq!(cbom_of(&doc)["components"].as_array().unwrap().len(), 0);
+    for (key, val) in [
+        ("raw_alias", json!("canary")),
+        ("handle", json!(123)),
+        ("provider", json!(FP_A)),
+    ] {
+        let mut bad = json.clone();
+        bad["api_activity"][0][key] = val;
+        assert!(validate_v2(&bad).is_err(), "accepted {key}");
+    }
+    let mut bad = json.clone();
+    bad["api_activity"][0]["observed_success"] = json!(6);
+    assert!(check_v2_semantics(&bad).is_err());
+    let mut bad = json;
+    bad["legacy_partition"]["non_legacy_exclusive_calls"] = json!(5);
+    assert!(check_v2_semantics(&bad).is_err());
+}
+
+#[test]
+fn legacy_v23_without_dynamic_sections_preserves_evidence_meaning() {
+    let mut doc = partial_doc();
+    doc.schema = "observed-crypto-v2.3".into();
+    let old = json_of(&doc);
+    validate_v2(&old).unwrap();
+    check_v2_semantics(&old).unwrap();
+    assert!(old.get("api_activity").is_none());
+    assert!(old.get("site_provenance").is_none());
+    let total = doc.total_calls();
+    let cbom = cbom_of(&doc);
+    doc.schema = "observed-crypto-v2.4".into();
+    assert_eq!(doc.total_calls(), total);
+    assert_eq!(cbom["components"], cbom_of(&doc)["components"]);
+}
+
+#[test]
+fn dynamic_metadata_rejects_invented_authority_and_raw_fields() {
+    let mut doc = partial_doc();
+    doc.algorithm_identities
+        .push(osslscope::evidence::AlgorithmIdentity {
+            id: format!("algorithm-{}", "a".repeat(64)),
+            known_algorithm: None,
+        });
+    let mut value = json_of(&doc);
+    value["site_provenance"] = json!([{
+        "site": {"object": FP_B, "device": 8, "inode": 200, "offset": 16384}, "count_generation": 0,
+        "associations": [{"algorithm_id": format!("algorithm-{}", "a".repeat(64)), "origin": "static_public_table_candidate", "operation": null, "function_id": 7, "advertisers": [], "static_provenance": "algorithm_record_shape", "storage": "relro", "partial": false, "alias_quality": {"status": "unknown", "weak": false}, "observed_ns": 80, "observation_generation": 1}]
+    }]);
+    validate_v2(&value).unwrap();
+    check_v2_semantics(&value).unwrap();
+    for field in ["raw_alias", "handle", "provider_name"] {
+        let mut bad = value.clone();
+        bad["site_provenance"][0]["associations"][0][field] = json!("PRIVATE_CANARY");
+        assert!(validate_v2(&bad).is_err());
+    }
+    let mut bad = value.clone();
+    bad["site_provenance"][0]["associations"][0]["advertisers"] = json!(["a".repeat(64)]);
+    assert!(check_v2_semantics(&bad).is_err());
+    let mut bad = value.clone();
+    bad["site_provenance"][0]["associations"][0]["origin"] = json!("observed_public_abi");
+    assert!(check_v2_semantics(&bad).is_err());
+    let mut bad = value.clone();
+    bad["site_provenance"][0]["count_generation"] = json!(999);
+    assert!(check_v2_semantics(&bad).is_err());
+    let mut bad = value.clone();
+    bad["sites"][1]["candidates_coverage"] = json!("complete");
+    assert!(
+        check_v2_semantics(&bad).is_err(),
+        "dynamic provenance cannot claim complete attribution"
+    );
+    let mut bad = value;
+    bad["algorithm_identities"][0]["id"] = json!("raw-custom-name");
+    assert!(check_v2_semantics(&bad).is_err());
 }

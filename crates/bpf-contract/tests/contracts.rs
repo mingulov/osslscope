@@ -822,3 +822,29 @@ mod layouts {
         );
     }
 }
+
+#[test]
+fn operational_scalar_contracts_do_not_guess_success_or_read_contexts() {
+    use provider_observation::operational_outcome;
+    // Fixed public scalar contracts; upper register bits do not change C int.
+    for api in 20..=48 {
+        assert_eq!(operational_outcome(api, 1), 1);
+        assert_eq!(
+            operational_outcome(api, 0),
+            if matches!(api, 40 | 45 | 47) { 3 } else { 2 }
+        );
+    }
+    for api in [39, 40, 41, 42, 43] {
+        assert_eq!(operational_outcome(api, (-2i64) as u64), 4);
+        assert_eq!(operational_outcome(api, (-1i64) as u64), 2);
+        assert_eq!(operational_outcome(api, 2), 0);
+    }
+    for api in [45, 47] {
+        assert_eq!(operational_outcome(api, 2), 2);
+    }
+    assert_eq!(operational_outcome(48, (-1i64) as u64), 2);
+    assert_eq!(operational_outcome(20, (-1i64) as u64), 0);
+    assert_eq!(operational_outcome(46, 2), 0);
+    assert_eq!(operational_outcome(49, 1), 0);
+    assert_eq!(operational_outcome(20, 0xffff_ffff_0000_0001), 1);
+}

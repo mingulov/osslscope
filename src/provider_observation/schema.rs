@@ -5,7 +5,8 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 /// Metadata origin does not change a physical counter's attribution certainty.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MetadataOrigin {
     StaticPublicTableCandidate,
     ObservedPublicAbi,
@@ -222,6 +223,7 @@ impl ObservationBudget {
 #[serde(rename_all = "snake_case")]
 pub enum ObservationApi {
     Inventoried(inventory::Api),
+    Operational(crate::api_activity::ApiId),
     OsslProviderUnqueryOperation,
     ProviderQueryCallback,
     ProviderTeardownCallback,
@@ -231,6 +233,7 @@ impl ObservationApi {
     pub fn export_name(self) -> Option<&'static str> {
         use inventory::Api::*;
         Some(match self {
+            Self::Operational(api) => api.export_name(),
             Self::ProviderQueryCallback
             | Self::ProviderTeardownCallback
             | Self::ProviderUnqueryCallback => return None,
@@ -252,11 +255,12 @@ impl ObservationApi {
                 EvpSignatureFetch => "EVP_SIGNATURE_fetch",
                 EvpKemFetch => "EVP_KEM_fetch",
                 OpenSslInitCrypto | OpenSslVersionMajor => return None,
+                _ => return api.operational_id().map(|id| id.export_name()),
             },
         })
     }
 }
-pub(crate) const APIS: [ObservationApi; 16] = [
+pub(crate) const APIS: [ObservationApi; 45] = [
     ObservationApi::Inventoried(inventory::Api::OsslProviderInit),
     ObservationApi::Inventoried(inventory::Api::OsslProviderLoad),
     ObservationApi::Inventoried(inventory::Api::OsslProviderTryLoad),
@@ -273,6 +277,35 @@ pub(crate) const APIS: [ObservationApi; 16] = [
     ObservationApi::Inventoried(inventory::Api::EvpSignatureFetch),
     ObservationApi::Inventoried(inventory::Api::EvpKemFetch),
     ObservationApi::OsslProviderUnqueryOperation,
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(20)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(21)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(22)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(23)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(24)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(25)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(26)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(27)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(28)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(29)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(30)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(31)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(32)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(33)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(34)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(35)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(36)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(37)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(38)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(39)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(40)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(41)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(42)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(43)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(44)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(45)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(46)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(47)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(48)),
 ];
 /// Content fingerprint validated on construction and deserialization.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

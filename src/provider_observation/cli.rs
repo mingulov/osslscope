@@ -361,6 +361,7 @@ impl<W: Write> Stream<'_, W> {
             mut gaps,
             learned_sites: _,
             static_candidates: _,
+            api_activity: _,
         } = batch;
         if let Some(snapshot) = snapshot {
             self.capabilities.inventory = match snapshot.capabilities.inventory {

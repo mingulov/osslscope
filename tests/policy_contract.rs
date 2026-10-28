@@ -2805,3 +2805,40 @@ fn engine_unrelated_provider_calls_pass_and_conserve() {
     assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
     assert_eq!(doc.total_calls(), 12);
 }
+
+#[test]
+fn dynamic_hints_and_successful_api_returns_do_not_satisfy_require_executed() {
+    let mut document = complete_doc(vec![site_at(
+        5,
+        3,
+        7,
+        vec![cand("unknown", "unknown", DIGEST, 7, &["SHA2-256"], false)],
+        CandidateCoverage::Unknown,
+    )]);
+    let before = evaluate_document(&[PolicyRule::require_executed("SHA2-256")], &document);
+    document
+        .algorithm_identities
+        .push(osslscope::evidence::AlgorithmIdentity {
+            id: format!("algorithm-{}", "a".repeat(64)),
+            known_algorithm: osslscope::kinds::algorithm_semantic_id("SHA2-256"),
+        });
+    document
+        .api_activity
+        .push(osslscope::api_activity::ApiActivityRow {
+            api: 23.try_into().unwrap(),
+            entries: 500,
+            observed_success: 500,
+            observed_failure: 0,
+            verification_mismatch: 0,
+            unsupported: 0,
+            gaps: osslscope::api_activity::ApiActivityGaps {
+                attachment: true,
+                finality: true,
+                ..Default::default()
+            },
+        });
+    let after = evaluate_document(&[PolicyRule::require_executed("SHA2-256")], &document);
+    assert_eq!(before, after);
+    assert_eq!(after.rules[0].verdict, RuleVerdict::Inconclusive);
+    assert_eq!(document.total_calls(), 7);
+}

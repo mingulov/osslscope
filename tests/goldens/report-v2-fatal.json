@@ -31,7 +31,7 @@
     "state": "unknown",
     "version": null
   },
-  "schema_version": "observed-crypto-v2.3",
+  "schema_version": "observed-crypto-v2.4",
   "sites": [],
   "target": {
     "argv_redacted": true,

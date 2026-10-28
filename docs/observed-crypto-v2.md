@@ -15,7 +15,7 @@ reject v2 documents and there is no dual live producer.
 
 ## Foreground preview
 
-The count-only foreground producer retains the same v2.3 report/check family.
+The count-only foreground producer retains the same v2.4 report/check family.
 It always records an unknown-denominator profile scope and stays PARTIAL.
 Candidate/provider labels describe compiled callback membership; entry counts
 prove neither provider activation nor crypto/message success.
@@ -31,7 +31,7 @@ qualification. Human and CBOM metadata carry the same Count identity/profile gap
 
 ## Reader contract
 
-Producers emit exactly `observed-crypto-v2.3`. Readers accept
+Producers emit exactly `observed-crypto-v2.4`. Readers accept
 `observed-crypto-v2` and `observed-crypto-v2.<digits>` and reject
 every other major (`src/schema.rs` `check_version_v2`, pinned by
 `compat_matrix_v2` and `output_contract::schema_version_gate`).
@@ -612,3 +612,43 @@ are not current live or package qualification.
 - Inspect `tests/scan_oracle.rs` controls for truncation, cache,
   settle and drain ordering behavior; source/fixture checks do not
   substitute for current live acceptance.
+
+## Optional dynamic evidence (v2.4)
+
+All older required fields keep their meanings. Three optional sections explain
+observations without changing attribution, completeness, policy or CBOM:
+
+- `algorithm_identities` contains observer-generated opaque IDs and optional
+  numeric hints from the frozen presentation vocabulary. Custom IDs remain
+  distinct. A hint does not admit an algorithm, identify a provider, or prove use.
+- `site_provenance` references the exact physical site and count generation,
+  including retained fenced generations. Each association records its origin,
+  numeric operation/function IDs, alias quality, observation generation and
+  first-observed timestamp. Static shapes have storage/provenance evidence and
+  no invented advertiser; public ABI observations may have advertiser candidates.
+  A late association never reallocates earlier calls. There is no second count
+  in this section.
+- `api_activity` contains per-export entries and paired observed-success/failure
+  integer returns. IDs 20–48 cover reviewed digest, cipher, MAC, KDF, PKEY and
+  RAND operations; IDs 1–19 in the observation ABI remain unchanged. The exact
+  operational registry is `src/api_activity.rs`. It includes generic cipher and
+  one-shot DigestSign/Verify APIs, independently of algorithm names.
+
+API entries are not unique cryptographic operations. Nested wrappers may produce
+several rows; a successful size query may produce no cryptographic output. No
+arguments, opaque contexts, buffers, runtime aliases or provider handles are
+read by the operational probes. Verification mismatch and documented unsupported
+returns are subsets of failure returns, never extra entries. Unknown return
+values remain `unsupported_return` gaps. `tail` is entries without a classified
+paired return, including depth/pending losses and in-flight calls. Other gap
+counters can overlap it and must not be summed as a call total. `not_attached`
+means no admitted operational attachment for that API; zero entries then cannot
+establish inactivity. `saturated` identifies a saturated scalar counter.
+Attachment and finality gaps disclose the available-prefix observation boundary.
+
+Human output prints qualified candidate hints beside positive current/fenced
+sites and a separate API summary. Callback totals, the legacy partition,
+`--require-executed` and definite CBOM assets use only their existing evidence
+rules. Unknown candidate coverage stays Unknown even when a familiar hint or a
+successful API return is shown. v2.3 documents without these sections preserve
+their prior interpretation.

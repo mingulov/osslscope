@@ -324,3 +324,48 @@ impl FiniteEvidence {
         )
     }
 }
+
+/// Public operational return class; no target arguments participate.
+pub const fn operational_outcome(api: u32, rv: u64) -> u32 {
+    if !operational_api(api) {
+        return 0;
+    }
+    let rv = rv as u32 as i32;
+    if rv == 1 {
+        return 1;
+    }
+    if rv == 0 {
+        return if matches!(api, 40 | 45 | 47) { 3 } else { 2 };
+    }
+    if matches!(api, 39..=43) && rv == -2 {
+        return 4;
+    }
+    if matches!(api, 39..=43 | 48) && rv < 0 || matches!(api, 45 | 47) {
+        return 2;
+    }
+    0
+}
+pub const fn operational_api(api: u32) -> bool {
+    api >= 20 && api <= 48
+}
+/// Cookie-bound scalars; no target handles or arguments. Counters are per CPU.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct ApiAggregate {
+    pub entries: u64,
+    pub success: u64,
+    pub failure: u64,
+    pub mismatch: u64,
+    pub unsupported: u64,
+    pub unsupported_return: u64,
+    pub map: u64,
+    pub depth: u64,
+    pub unpaired: u64,
+}
+/// Pair independently by export cookie; nested wrappers remain separate rows.
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub struct ApiThreadKey {
+    pub thread: ThreadKey,
+    pub cookie: u64,
+}

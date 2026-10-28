@@ -39,6 +39,9 @@ pub(crate) fn api(id: u32) -> Result<ObservationApi, ObservationGap> {
         17 => ObservationApi::ProviderQueryCallback,
         18 => ObservationApi::ProviderTeardownCallback,
         19 => ObservationApi::ProviderUnqueryCallback,
+        20..=48 => ObservationApi::Operational(
+            crate::api_activity::ApiId::try_from(id).map_err(|_| ObservationGap::InvalidWire)?,
+        ),
         _ => return Err(ObservationGap::InvalidWire),
     })
 }
@@ -291,4 +294,66 @@ pub(crate) fn algorithm_event(
             cacheability: cache(record.cacheability).unwrap_or(Cacheability::Unknown),
         },
     }
+}
+
+/// Exact scalar map ABI. No byte field can carry aliases, handles or context.
+pub fn decode_activity(
+    api: u32,
+    bytes: &[u8],
+) -> Result<crate::api_activity::ApiActivityRow, ObservationGap> {
+    if bytes.len() != std::mem::size_of::<c::ApiAggregate>() {
+        return Err(ObservationGap::InvalidWire);
+    }
+    let value = unsafe { bytes.as_ptr().cast::<c::ApiAggregate>().read_unaligned() };
+    activity(api, value)
+}
+pub(crate) fn activity(
+    api: u32,
+    v: c::ApiAggregate,
+) -> Result<crate::api_activity::ApiActivityRow, ObservationGap> {
+    use crate::api_activity::*;
+    let id = ApiId::try_from(api).map_err(|_| ObservationGap::InvalidWire)?;
+    let paired = v
+        .success
+        .checked_add(v.failure)
+        .and_then(|n| n.checked_add(v.unsupported_return))
+        .ok_or(ObservationGap::InvalidWire)?;
+    if paired > v.entries
+        || v.mismatch > v.failure
+        || v.unsupported > v.failure
+        || v.mismatch > 0 && !matches!(api, 40 | 45 | 47)
+        || v.unsupported > 0 && !(39..=43).contains(&api)
+    {
+        return Err(ObservationGap::InvalidWire);
+    }
+    Ok(ApiActivityRow {
+        api: id,
+        entries: v.entries,
+        observed_success: v.success,
+        observed_failure: v.failure,
+        verification_mismatch: v.mismatch,
+        unsupported: v.unsupported,
+        gaps: ApiActivityGaps {
+            map: v.map,
+            depth: v.depth,
+            unpaired: v.unpaired,
+            tail: v.entries - paired,
+            unsupported_return: v.unsupported_return,
+            saturated: [
+                v.entries,
+                v.success,
+                v.failure,
+                v.mismatch,
+                v.unsupported,
+                v.unsupported_return,
+                v.map,
+                v.depth,
+                v.unpaired,
+            ]
+            .contains(&u64::MAX),
+            not_attached: false,
+            attachment: true,
+            finality: true,
+        },
+    })
 }

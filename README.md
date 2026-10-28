@@ -65,6 +65,10 @@ latency and bounded discovery can leave gaps.
 
 Owned foreground commands prearm entry-only sites from retained executable and
 dependency files before release, preserving counts even after a short command exits.
+Independently verified public operational exports also provide scalar API activity
+for digest, cipher, MAC, KDF, PKEY and RAND. Candidate hints/custom IDs and API
+returns are displayed separately from callback totals; wrappers and size queries
+are included, and no algorithm/provider binding or crypto-success claim is inferred.
 
 There is no universal first-call guarantee. Warm/built-in activation can remain
 unknown; startup, polling, invalidation and final drain leave explicit gaps.

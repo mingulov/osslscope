@@ -346,7 +346,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
     // T14r4: report renders the finalized v2 capture document
     // (policy None => report shape), never the historical v1
     // projection. PRD §14.1: the live producer schema is
-    // observed-crypto-v2.3; v1 fixtures are history.
+    // observed-crypto-v2.4; v1 fixtures are history.
     let setup_deadline = std::time::Instant::now()
         .checked_add(args.cfg.harvest_timeout)
         .ok_or_else(|| {
@@ -1075,7 +1075,7 @@ pub(crate) fn consume_focused_result(
     }
 }
 
-/// Render the v2 JSON artifact (`observed-crypto-v2.3`) for one
+/// Render the v2 JSON artifact (`observed-crypto-v2.4`) for one
 /// finalized document: sorted keys, pretty-printed, trailing
 /// newline. Sites carry conserved per-site counts with candidate
 /// uncertainty; target/openssl/window/coverage/losses/disposition
@@ -1295,6 +1295,15 @@ fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     });
     // Report/check convention (v1-compatible): unevaluated policy
     // and unrecorded disposition omit their sections.
+    if !doc.algorithm_identities.is_empty() {
+        out["algorithm_identities"] = serde_json::json!(doc.algorithm_identities);
+    }
+    if !doc.site_provenance.is_empty() {
+        out["site_provenance"] = serde_json::json!(doc.site_provenance);
+    }
+    if !doc.api_activity.is_empty() {
+        out["api_activity"] = serde_json::json!(doc.api_activity);
+    }
     if let Some(admission) = doc.window.count_admission {
         out["window"]["count_admission"] = serde_json::json!({
             "start_ns": admission.start_ns,
@@ -1625,6 +1634,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
     }
     for site in &doc.sites {
         human_site(site, &mut s);
+        human_candidate_hints(doc, site, &mut s);
     }
     s.push('\n');
     if !doc.fenced.is_empty() {
@@ -1636,6 +1646,19 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                 bucket.sites.len(),
                 grouped(SiteExecution::sum_calls(&bucket.sites)),
             ));
+            if !doc.site_provenance.is_empty() {
+                for site in bucket.sites.iter().filter(|site| site.calls > 0) {
+                    human_site(site, &mut s);
+                    human_candidate_hints(doc, site, &mut s);
+                }
+            }
+        }
+        s.push('\n');
+    }
+    if !doc.api_activity.is_empty() {
+        s.push_str("public API activity (per exported entry; wrappers and size queries included; no algorithm/provider binding):\n");
+        for row in &doc.api_activity {
+            s.push_str(&format!("  {}: {} entries, {} observed-success returns, {} observed-failure returns; gaps: tail={} unpaired={} depth={} map={} unsupported-return={} attachment={} finality={} not-attached={} saturated={}\n", row.api.export_name(), row.entries, row.observed_success, row.observed_failure, row.gaps.tail, row.gaps.unpaired, row.gaps.depth, row.gaps.map, row.gaps.unsupported_return, row.gaps.attachment, row.gaps.finality, row.gaps.not_attached, row.gaps.saturated));
         }
         s.push('\n');
     }
@@ -1947,6 +1970,7 @@ fn human_site(site: &SiteExecution, s: &mut String) {
     }
     if site.candidates_coverage == CandidateCoverage::Unknown {
         s.push_str("UNATTRIBUTED (candidate set incomplete)\n");
+        human_candidates(site, s);
         return;
     }
     if let Some(asset) = definite_asset(site) {
@@ -2844,7 +2868,7 @@ mod tests {
         assert!(doc.policy.is_none());
         let bytes = render_json(&doc).unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["schema_version"], "observed-crypto-v2.3");
+        assert_eq!(v["schema_version"], "observed-crypto-v2.4");
         assert!(v.get("policy").is_none());
     }
 
@@ -3044,4 +3068,31 @@ fn normal_command_refuses_identity_v2_selection() {
         parse(&args).is_err(),
         "normal commands refuse legacy bundle selection"
     );
+}
+
+fn human_candidate_hints(doc: &CaptureDocument, site: &SiteExecution, out: &mut String) {
+    if site.calls == 0 {
+        return;
+    }
+    let Some(row) = doc
+        .site_provenance
+        .iter()
+        .find(|row| row.site == site.site && row.count_generation == site.generation)
+    else {
+        return;
+    };
+    out.push_str(
+        "    candidate hints (attribution open; associations do not allocate earlier entries):\n",
+    );
+    for a in &row.associations {
+        let id = a.algorithm_id.as_deref().unwrap_or("unidentified");
+        let hint = doc
+            .algorithm_identities
+            .iter()
+            .find(|known| known.id == id)
+            .and_then(|known| known.known_algorithm)
+            .and_then(crate::kinds::alg_class_label)
+            .unwrap_or("custom/unknown");
+        out.push_str(&format!("      {} hint={} origin={} operation={} function={} observed={}ns observation-gen={} advertisers={}\n", safe_display(id), hint, match a.origin { crate::provider_observation::MetadataOrigin::StaticPublicTableCandidate => "static table candidate", crate::provider_observation::MetadataOrigin::ObservedPublicAbi => "observed public ABI" }, a.operation.map_or("unknown".into(), |op| op.to_string()), a.function_id, a.observed_ns, a.observation_generation, a.advertisers.len()));
+    }
 }

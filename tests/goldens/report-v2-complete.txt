@@ -1,4 +1,4 @@
-osslscope report (observed-crypto-v2.3): pid=7 (demo) window=0..100ns effective=0..100ns
+osslscope report (observed-crypto-v2.4): pid=7 (demo) window=0..100ns effective=0..100ns
 duration: requested=100ns effective=100ns (monotonic; authoritative)
 kernel: 6.9.0-test
 wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)

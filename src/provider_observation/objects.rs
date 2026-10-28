@@ -182,7 +182,8 @@ impl SiteCustody {
     }
 }
 /// Sealed by the held OwnedTarget constructor. Exec is allowed, but PID and
-/// namespace changes are not. This authority can only mint entry-only sites.
+/// namespace changes are not. Static shapes mint entry-only sites; separately
+/// validated operational exports can mint scalar-only startup capabilities.
 pub(crate) struct StartupProcess {
     original: crate::pin::StartupGroupRetention,
     directory: File,
@@ -231,12 +232,12 @@ impl StartupProcess {
     }
 }
 /// Retain and parse the exact file already opened by bounded dependency discovery.
-/// No public ABI site can be produced through this constructor.
+/// Operational capabilities require an independently validated public export.
 pub(crate) fn startup_candidates(
     process: Rc<StartupProcess>,
     file: File,
     budget: &ObservationBudget,
-) -> Result<(Vec<VerifiedStaticCandidate>, bool), ObservationGap> {
+) -> Result<(Vec<VerifiedStaticCandidate>, Vec<StartupApiSite>, bool), ObservationGap> {
     process.validate()?;
     budget.object()?;
     let metadata = file
@@ -253,6 +254,31 @@ pub(crate) fn startup_candidates(
         tables: OnceCell::new(),
     });
     let parsed = object.parsed(budget)?;
+    let mut apis = Vec::new();
+    for &(api, offset) in &parsed.exports {
+        if let ObservationApi::Operational(api) = api {
+            // Consider all public roles, including legacy target-reading APIs,
+            // before minting even a scalar-only startup capability.
+            if parsed
+                .exports
+                .iter()
+                .any(|&(other, at)| at == offset && other != ObservationApi::Operational(api))
+            {
+                continue;
+            }
+            budget.state(256)?;
+            apis.push(StartupApiSite {
+                api,
+                site: VerifiedSite {
+                    custody: SiteCustody::Startup(process.clone()),
+                    object: object.clone(),
+                    offset,
+                    generation: process.generation,
+                    hash: parsed.hash.clone(),
+                },
+            });
+        }
+    }
     let tables =
         static_tables::discover_tables_budgeted(&object.file, TableLimits::default(), budget)
             .map_err(|g| match g {
@@ -272,6 +298,8 @@ pub(crate) fn startup_candidates(
                 hash: parsed.hash.clone(),
             },
             algorithm: locator.algorithm,
+            known_algorithm: locator.hint,
+            alias_quality: locator.quality,
             operation_hint: None,
             function_id: locator.function_id,
             storage: locator.storage,
@@ -281,7 +309,7 @@ pub(crate) fn startup_candidates(
     }
     object.unchanged()?;
     process.validate()?;
-    Ok((candidates, !tables.gaps().is_empty()))
+    Ok((candidates, apis, !tables.gaps().is_empty()))
 }
 
 /// Explicit privileged event operand, never a transport value.
@@ -302,6 +330,12 @@ pub struct VerifiedSite {
     hash: ObjectHash,
 }
 impl VerifiedSite {
+    pub(crate) fn pid(&self) -> u32 {
+        self.custody.pid()
+    }
+    pub(crate) fn starttime(&self) -> u64 {
+        self.custody.starttime()
+    }
     pub(crate) fn is_startup(&self) -> bool {
         matches!(self.custody, SiteCustody::Startup(_))
     }
@@ -348,6 +382,8 @@ impl VerifiedSite {
 pub struct VerifiedStaticCandidate {
     site: VerifiedSite,
     algorithm: Option<DynamicAlgorithmId>,
+    known_algorithm: Option<u16>,
+    alias_quality: super::AliasQuality,
     operation_hint: Option<u32>,
     function_id: u32,
     storage: TableStorage,
@@ -363,6 +399,12 @@ impl VerifiedStaticCandidate {
     }
     pub fn starttime(&self) -> u64 {
         self.site.custody.starttime()
+    }
+    pub fn known_algorithm(&self) -> Option<u16> {
+        self.known_algorithm
+    }
+    pub fn alias_quality(&self) -> super::AliasQuality {
+        self.alias_quality
     }
     pub fn algorithm(&self) -> Option<DynamicAlgorithmId> {
         self.algorithm
@@ -381,6 +423,16 @@ impl VerifiedStaticCandidate {
     }
     pub fn partial(&self) -> bool {
         self.partial
+    }
+}
+/// Only retained ELF public-export validation can construct this capability.
+pub(crate) struct StartupApiSite {
+    api: crate::api_activity::ApiId,
+    site: VerifiedSite,
+}
+impl StartupApiSite {
+    pub(crate) fn into_parts(self) -> (crate::api_activity::ApiId, VerifiedSite) {
+        (self.api, self.site)
     }
 }
 pub struct ApiSite {
@@ -594,6 +646,8 @@ impl VerifiedProcess {
                         hash: parsed.hash.clone(),
                     },
                     algorithm: locator.algorithm,
+                    known_algorithm: locator.hint,
+                    alias_quality: locator.quality,
                     operation_hint: None,
                     function_id: locator.function_id,
                     storage: locator.storage,

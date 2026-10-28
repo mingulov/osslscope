@@ -1081,3 +1081,167 @@ fn native_static_lookalike_getter_and_shared_site() {
     drop(session);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn operational_calls_cannot_enter_the_cold_fact_ring() {
+    for api in 20u32..=48 {
+        for kind in [1, 2, 3, 4, 5, 6] {
+            let mut bytes = record(kind);
+            bytes[12..16].copy_from_slice(&api.to_le_bytes());
+            assert!(wire::decode(&bytes).is_err());
+        }
+    }
+}
+
+#[test]
+fn scalar_aggregate_transport_is_exact_and_conserved() {
+    let mut bytes = vec![0; 72];
+    for (at, n) in [(0, 5u64), (8, 2), (16, 1), (24, 1), (40, 1), (64, 3)] {
+        bytes[at..at + 8].copy_from_slice(&n.to_ne_bytes());
+    }
+    let row = wire::decode_activity(40, &bytes).unwrap();
+    assert_eq!(
+        (
+            row.entries,
+            row.observed_success,
+            row.observed_failure,
+            row.gaps.tail,
+            row.gaps.unpaired
+        ),
+        (5, 2, 1, 1, 3)
+    );
+    assert!(
+        wire::decode_activity(20, &bytes).is_err(),
+        "digest cannot have mismatch returns"
+    );
+    assert!(wire::decode_activity(99, &bytes).is_err());
+    assert!(wire::decode_activity(40, &bytes[..71]).is_err());
+    bytes.extend_from_slice(b"secret-runtime-alias");
+    assert!(wire::decode_activity(40, &bytes).is_err());
+    bytes.truncate(72);
+    bytes[8..16].copy_from_slice(&6u64.to_ne_bytes());
+    assert!(wire::decode_activity(40, &bytes).is_err());
+}
+
+#[test]
+#[ignore = "requires fresh BPF object and native tracing privileges"]
+fn native_scalar_unpaired_depth_and_tail_have_no_hot_ring_records() {
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("osslscope-scalar-pair-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let source = dir.join("pair.c");
+    let app = dir.join("pair");
+    fs::write(&source, r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <stddef.h>
+#include <pthread.h>
+int EVP_DigestUpdate(void*, const void*, size_t);
+static void *worker(void *unused) { EVP_DigestUpdate((void*)1,(void*)2,0); return unused; }
+__attribute__((noinline)) int EVP_DigestUpdate(void *ctx, const void *data, size_t n) {
+ if (n == 97) return 2;
+ if (n == 96) return 0;
+ if (n == 99) { char byte; puts("inside"); fflush(stdout); if(read(0,&byte,1) != 1) return 0; }
+ else if (n == 98) { pthread_t thread; if(pthread_create(&thread,0,worker,0)) return 0; pthread_join(thread,0); }
+ else if (n) { volatile int result = EVP_DigestUpdate(ctx, data, n-1); if (result != 1) return 0; }
+ return 1;
+}
+int main(void) { if(EVP_DigestUpdate((void*)1,(void*)2,99) != 1) return 0;
+ if(EVP_DigestUpdate((void*)1,(void*)2,12) != 1) return 1;
+ if(EVP_DigestUpdate((void*)1,(void*)2,98) != 1) return 1;
+ if(EVP_DigestUpdate((void*)1,(void*)2,97) != 2 || EVP_DigestUpdate((void*)1,(void*)2,96) != 0) return 1;
+ return EVP_DigestUpdate((void*)1,(void*)2,99) == 1 ? 0 : 0; }
+"#).unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-O0", "-rdynamic", "-pthread", "-o"])
+            .arg(&app)
+            .arg(source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Owned(
+        Command::new(&app)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut out = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line, "inside\n");
+    let object =
+        fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").expect("fresh BPF object"))
+            .unwrap();
+    let mut session = po::ProviderSession::open(
+        po::ObservationLimits {
+            max_pending_calls: 1,
+            ..Default::default()
+        },
+        &object,
+    )
+    .unwrap();
+    let snapshot = osslscope::inventory::snapshot(&osslscope::inventory::SnapshotOptions {
+        pids: vec![child.0.id()],
+        ..Default::default()
+    });
+    let setup = session.reconcile(&snapshot);
+    assert!(
+        !setup.gaps.contains(&po::ObservationGap::AttachFailed),
+        "{:?}",
+        setup.gaps
+    );
+    child.0.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    line.clear();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line, "inside\n");
+    for _ in 0..3 {
+        let batch = session.drain(Instant::now() + Duration::from_millis(100));
+        assert!(
+            batch.facts.is_empty(),
+            "operational hot calls entered cold ring"
+        );
+        assert!(
+            batch.api_activity.is_empty(),
+            "interim snapshot must not be accumulated"
+        );
+    }
+    let batch = session.close();
+    let rows: Vec<_> = batch
+        .api_activity
+        .iter()
+        .filter(|a| u32::from(a.row.api) == 22)
+        .collect();
+    assert_eq!(rows.len(), 1, "{:?}", batch.gaps);
+    let row = &rows[0].row;
+    assert_eq!(
+        (
+            row.entries,
+            row.observed_success,
+            row.observed_failure,
+            row.gaps.depth,
+            row.gaps.unpaired,
+            row.gaps.tail
+        ),
+        (18, 9, 1, 5, 1, 7)
+    );
+    assert_eq!(row.gaps.map, 1);
+    assert_eq!(row.gaps.unsupported_return, 1);
+    println!("scalar pairing: {}", serde_json::to_string(row).unwrap());
+    drop(child);
+    fs::remove_dir_all(dir).unwrap();
+}

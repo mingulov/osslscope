@@ -132,7 +132,7 @@
     ],
     "verdict": "violation"
   },
-  "schema_version": "observed-crypto-v2.3",
+  "schema_version": "observed-crypto-v2.4",
   "sites": [
     {
       "calls": 500,

@@ -600,3 +600,37 @@ fn sectionless_shared_long_unknown_names_remain_valid() {
             .is_err()
     );
 }
+
+#[test]
+fn operational_exports_are_discovered_without_algorithm_selection() {
+    let f = Fixture::new();
+    let source = f.0.join("operational.c");
+    fs::write(&source, "int EVP_DigestUpdate(void){return 1;} int EVP_CipherUpdate(void){return 1;} int EVP_MAC_final(void){return 1;} int EVP_KDF_derive(void){return 1;} int EVP_DigestSign(void){return 1;} int EVP_RAND_generate(void){return 1;} int EVP_DecryptUpdate;").unwrap();
+    let path = f.0.join("operational.so");
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&path)
+            .arg(source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let exports = observation::inspect_exports(
+        &mut File::open(path).unwrap(),
+        &mut ObservationBudget::default(),
+    )
+    .unwrap();
+    let names: Vec<_> = exports.iter().filter_map(|api| api.export_name()).collect();
+    for name in [
+        "EVP_DigestUpdate",
+        "EVP_CipherUpdate",
+        "EVP_MAC_final",
+        "EVP_KDF_derive",
+        "EVP_DigestSign",
+        "EVP_RAND_generate",
+    ] {
+        assert!(names.contains(&name), "missing {name}: {names:?}");
+    }
+    assert!(!names.contains(&"EVP_DecryptUpdate"));
+}

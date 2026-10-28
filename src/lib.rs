@@ -45,3 +45,5 @@ pub mod focused_count;
 pub mod focused_capture;
 pub(crate) mod observation_memory;
 pub(crate) mod startup_objects;
+
+pub mod api_activity;

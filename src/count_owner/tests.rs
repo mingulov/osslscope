@@ -9944,7 +9944,7 @@ fn g1_target_read_before_seal_timestamp_after_seal_adapts_actual_terminal() {
     document.policy = Some(crate::check::policy_record(&verdict));
     let bytes = crate::report::render_json(&document).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(value["schema_version"], "observed-crypto-v2.3");
+    assert_eq!(value["schema_version"], "observed-crypto-v2.4");
     assert_eq!(value["sites"][0]["last_ns"], 1600);
     assert_eq!(value["window"]["effective_end_ns"], 1500);
     assert_eq!(value["window"]["count_admission"]["deadline_ns"], 2000);

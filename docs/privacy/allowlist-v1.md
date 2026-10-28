@@ -219,6 +219,9 @@ ATTEMPT
 BUCKET
 TRUNC_SEQ
 # provider_observation
+API_TOTALS
+API_THREADS
+API_WINDOW
 EVENTS
 CONFIG
 MEMBERS
@@ -540,3 +543,32 @@ canary sentinel in any emitted artifact, log, ring payload, or
 listed live map is a release blocker; sentinel inputs must surface
 only as `other`/unreadable classified evidence (the positive
 control that the read sites fired).
+
+
+The operational public EVP path branches before legacy argument capture. Its
+29 exact exported symbols (digest/cipher/MAC/KDF/PKEY/RAND) are a signature
+registry, independent of algorithm admission. Only task/namespace identity,
+observer cookies and documented C `int` return scalars participate. It performs
+no target argument, buffer, name or opaque-context reads and emits no hot-call
+ring messages. `API_TOTALS` holds 1024 cookie-bound 72-byte scalar aggregates;
+`API_THREADS` holds at most 4096 cookie/thread keys and bounded depth/overflow
+state (no arguments); `API_WINDOW` holds the admitted monotonic interval. Per-CPU
+counters are summed only in the final snapshot. Final snapshots are read once after disarming;
+unpaired/depth/map/tail/unsupported-return and attachment/finality gaps remain
+explicit. These entries never join callback totals, policy assets or CBOM.
+
+Only independently verified operational exports can authorize scalar prearming
+on retained files for the original held child. Static-table shapes cannot mint
+this capability. Legacy query/init/getter traversals still require mapped public
+ABI authority. Prearming preserves available-prefix evidence and cannot prove
+loader predictions, first-call or terminal coverage. Candidate output carries
+opaque algorithm IDs, finite optional hints and alias quality, count/observation
+generations and observed time boundaries; no raw aliases or provider handles.
+
+The focused session reservation includes all three operational map shapes,
+per-CPU cells and kernel entry/FD overhead. Retained API owners charge the
+existing observation host budget. Candidate projection occurs only after the
+provider session and counter have been destroyed; its conservative 64 MiB
+retained-and-rendered output ceiling (including JSON Value/key copies and output
+buffer growth) reuses the released observation-host allowance. Exceeding that
+ceiling emits `focused.metadata_output_limit` without changing physical counts.

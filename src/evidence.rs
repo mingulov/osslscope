@@ -20,7 +20,7 @@ use crate::scan::oracle::{Outcome, TrueT};
 use serde::{Deserialize, Serialize};
 
 /// Schema identity carried by every finalized capture document.
-pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.3";
+pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.4";
 
 /// Verified object fingerprint. A pathname may locate a file for display,
 /// but it never defines identity (R02).
@@ -792,6 +792,12 @@ impl LegacyCallPartition {
 /// from this one document for the same window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureDocument {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub algorithm_identities: Vec<AlgorithmIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub site_provenance: Vec<SiteProvenance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_activity: Vec<crate::api_activity::ApiActivityRow>,
     /// Internal bounded metadata handoff; public projection is separately versioned.
     #[serde(skip)]
     pub candidate_associations: Vec<crate::focused_count::SiteAssociations>,
@@ -1119,6 +1125,9 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
     };
     CaptureDocument {
         candidate_associations: Vec::new(),
+        algorithm_identities: Vec::new(),
+        site_provenance: Vec::new(),
+        api_activity: Vec::new(),
         schema: CAPTURE_SCHEMA_V2.to_string(),
         package_build: None,
         count_object: None,
@@ -1141,4 +1150,113 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         attach_diagnostics: Vec::new(),
         refusal_diagnostics: Vec::new(),
     }
+}
+
+/// Observer-generated identities and finite hints. No runtime alias spelling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AlgorithmIdentity {
+    pub id: String,
+    pub known_algorithm: Option<u16>,
+}
+/// Metadata is associated with an exact count generation, never a second count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SiteProvenance {
+    pub site: SiteKey,
+    pub count_generation: u32,
+    pub associations: Vec<CandidateProvenance>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CandidateProvenance {
+    pub algorithm_id: Option<String>,
+    pub origin: crate::provider_observation::MetadataOrigin,
+    pub operation: Option<u32>,
+    pub function_id: u32,
+    pub advertisers: Vec<crate::provider_observation::ObjectHash>,
+    pub static_provenance:
+        Option<crate::provider_observation::static_tables::StaticTableProvenance>,
+    pub storage: Option<crate::provider_observation::static_tables::TableStorage>,
+    pub partial: bool,
+    pub alias_quality: crate::provider_observation::AliasQuality,
+    pub observed_ns: u64,
+    pub observation_generation: u64,
+}
+impl CaptureDocument {
+    /// Project metadata without modifying frozen attribution or physical counts.
+    pub(crate) fn project_candidate_metadata(&mut self) {
+        let mut identities = std::collections::BTreeMap::new();
+        self.site_provenance = self
+            .candidate_associations
+            .iter()
+            .map(|row| SiteProvenance {
+                site: row.site.clone(),
+                count_generation: row.count_generation,
+                associations: row
+                    .associations
+                    .iter()
+                    .map(|a| {
+                        let algorithm_id = a.algorithm.map(|id| id.to_string());
+                        if let Some(id) = &algorithm_id {
+                            identities
+                                .entry(id.clone())
+                                .or_insert(a.known_algorithm.filter(|n| *n != u16::MAX));
+                        }
+                        CandidateProvenance {
+                            algorithm_id,
+                            origin: a.origin,
+                            operation: a.operation,
+                            function_id: a.function_id,
+                            advertisers: a.advertisers.clone(),
+                            static_provenance: a.static_provenance,
+                            storage: a.storage,
+                            partial: a.partial,
+                            alias_quality: a.alias_quality,
+                            observed_ns: a.observed_ns,
+                            observation_generation: a.observation_generation,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.algorithm_identities = identities
+            .into_iter()
+            .map(|(id, known_algorithm)| AlgorithmIdentity {
+                id,
+                known_algorithm,
+            })
+            .collect();
+    }
+}
+
+/// Projection runs after native session/counter destruction and reuses the
+/// released 64 MiB observation-host allowance. Account growth/temporary IDs,
+/// tree nodes, vector cells, advertiser strings, JSON Value/key copies and
+/// pretty-printed output growth before cloning output. The allowance includes
+/// both retained metadata and rendering; it is not just Rust struct sizes.
+pub(crate) fn candidate_projection_fits(rows: &[crate::focused_count::SiteAssociations]) -> bool {
+    let mut bytes = 0usize;
+    for row in rows {
+        let Some(next) = bytes.checked_add(2048 + row.site.object.0.len()) else {
+            return false;
+        };
+        bytes = next;
+        for association in &row.associations {
+            let Some(next) = association
+                .advertisers
+                .len()
+                .checked_mul(1024)
+                .and_then(|n| n.checked_add(4096))
+                .and_then(|n| bytes.checked_add(n))
+            else {
+                return false;
+            };
+            bytes = next;
+            if bytes > 64 << 20 {
+                return false;
+            }
+        }
+    }
+    bytes <= 64 << 20
 }

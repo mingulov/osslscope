@@ -233,6 +233,14 @@ pub fn project(
         sample.gaps.push(counter);
     }
     let associations = std::mem::take(&mut sample.associations);
+    let metadata_fits = candidate_projection_fits(&associations);
+    if !metadata_fits {
+        sample.gaps.push(loss(
+            "focused.metadata_output_limit",
+            CounterSource::Discovery,
+            1,
+        ));
+    }
     let mut document = crate::evidence::finalize(FinalizeInput {
         window,
         sites: sample.sites,
@@ -266,6 +274,9 @@ pub fn project(
         traversal: None,
     });
     document.candidate_associations = associations;
+    if metadata_fits {
+        document.project_candidate_metadata();
+    }
     document
 }
 fn now_ns() -> anyhow::Result<u64> {
@@ -528,7 +539,7 @@ impl FocusedSession {
                 || expected
                     .modules
                     .iter()
-                    .any(|m| m.info.sha256.len() != 64 || m.info.exports.len() > 16)
+                    .any(|m| m.info.sha256.len() != 64 || m.info.exports.len() > 46)
             {
                 return Err(TargetUnavailable.into());
             }
@@ -582,7 +593,7 @@ impl FocusedSession {
         .map_err(|_| TargetUnavailable)?;
         scanner.set_memory_pool(pool);
         let mut gaps = BTreeSet::new();
-        let session = if objects.observation.is_empty() {
+        let mut session = if objects.observation.is_empty() {
             gaps.insert(ObservationGap::BpfUnavailable);
             None
         } else {
@@ -597,7 +608,7 @@ impl FocusedSession {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
             bail!("focused setup interrupted or expired");
         }
-        let preexec = if let (Some(child), Some(argv)) = (&owned.1, &startup_argv) {
+        let mut preexec = if let (Some(child), Some(argv)) = (&owned.1, &startup_argv) {
             if objects.count.is_empty() {
                 None
             } else {
@@ -658,6 +669,25 @@ impl FocusedSession {
         };
         if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
             bail!("focused setup interrupted or expired");
+        }
+        if let Some(gap) = session
+            .as_mut()
+            .and_then(|s| s.set_api_window(start_ns, deadline_ns).err())
+        {
+            gaps.insert(gap);
+            // Never keep the unbounded standalone-session default on failure.
+            session = None;
+        }
+        if let Some(session) = &mut session {
+            if let Some(preexec) = &mut preexec {
+                if let Err(gap) = session.prearm_operational(
+                    std::mem::take(&mut preexec.apis),
+                    setup_deadline,
+                    cancel,
+                ) {
+                    gaps.insert(gap);
+                }
+            }
         }
         if let (Some(preexec), Some(counter)) = (preexec, &mut counter) {
             gaps.extend(preexec.gaps);
@@ -857,8 +887,16 @@ impl FocusedSession {
         if let Some(c) = &mut self.counter {
             c.retire();
         }
+        let mut api_activity = Vec::new();
         if let Some(s) = self.session.take() {
-            self.gaps.extend(s.close_until(deadline).gaps);
+            let batch = s.close_until(deadline);
+            self.gaps.extend(batch.gaps);
+            api_activity = batch
+                .api_activity
+                .into_iter()
+                .filter(|a| a.pid == self.pid && a.starttime == self.starttime)
+                .map(|a| a.row)
+                .collect();
         }
         if let Some(c) = self.counter.take() {
             self.sample = c.close(deadline);
@@ -891,6 +929,7 @@ impl FocusedSession {
             std::mem::take(&mut self.sample),
             &self.gaps.iter().copied().collect::<Vec<_>>(),
         );
+        document.api_activity = crate::api_activity::merge(api_activity)?;
         let disposition = match &mut self.owned {
             Some(child) => child.finish_observation()?,
             None => TargetDisposition::Detached { pid: self.pid },
