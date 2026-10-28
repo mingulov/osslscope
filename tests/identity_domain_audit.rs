@@ -128,6 +128,14 @@ fn h5_t3_every_device_site_names_one_domain() {
         // Companion snapshots and executable reopen checks compare native
         // fstat identities only; no maps or encoded device-domain join.
         ("src/provider_observation/artifact.rs", "raw", "m.dev(),", 1),
+        // Static table discovery compares before/after fstat stamps from the
+        // same retained FD: native dev_t only, with no maps/encoded-domain join.
+        (
+            "src/provider_observation/static_tables.rs",
+            "raw",
+            "m.dev(),",
+            1,
+        ),
         // Native st_dev of the observer PID namespace FD, consumed only by
         // bpf_get_ns_current_pid_tgid; never joined with maps text devices.
         (
