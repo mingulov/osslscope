@@ -609,6 +609,9 @@ impl ProviderSession {
             // An adopted epoch is already active. Resolve every public role
             // before any cold reader is armed, so an alias conflict cannot
             // transiently grant a signature during this first transition.
+            // Declare leases first so rows/buffer are dropped before their
+            // accounting on every early return as well as the normal path.
+            let mut staging = Vec::new();
             let mut public_sites = Vec::new();
             for id in (1..=16).chain(20..=48) {
                 for resolved in target.process.resolve_api(wire::api(id)?) {
@@ -617,8 +620,13 @@ impl ProviderSession {
                         id,
                         &self.budget,
                     )?;
-                    self.budget
-                        .state(2 * std::mem::size_of::<(u32, ApiSite)>())?;
+                    // This staging vector is temporary. Retrying a deferred
+                    // object must reuse existing role/link ownership, not burn
+                    // permanent state allowance for the same API staging rows.
+                    staging.push(self.budget.reserve_state(
+                        2 * (std::mem::size_of::<(u32, ApiSite)>()
+                            + std::mem::size_of::<super::schema::StateReservation>()),
+                    )?);
                     public_sites.push((id, resolved));
                 }
             }
@@ -685,6 +693,10 @@ impl ProviderSession {
                     Err(g) => b.gap(g),
                 }
             }
+            drop(staging);
+            if target.process.api_discovery_deferred() {
+                return Err(ObservationGap::SnapshotLag);
+            }
             #[cfg(test)]
             EXPIRE_STATIC.with(|flag| {
                 if flag.replace(false) {
@@ -693,9 +705,6 @@ impl ProviderSession {
             });
             b.static_candidates
                 .extend(target.process.static_candidates(&self.budget)?);
-            for g in target.process.gaps() {
-                b.gap(g)
-            }
             target.process.revalidate()?;
             if target.attachments.is_empty() && b.static_candidates.is_empty() {
                 return Err(ObservationGap::SymbolUnavailable);
@@ -718,6 +727,10 @@ impl ProviderSession {
             Ok(())
         })();
         target.ready = result.is_ok();
+        // Preserve the finite resource gap even when this pass is deferred.
+        for g in target.process.gaps() {
+            b.gap(g);
+        }
         self.targets.insert(pid, target);
         if let Err(g) = result {
             if g != ObservationGap::SnapshotLag {
@@ -1978,6 +1991,190 @@ mod tests {
             "real object preparation: {}",
             result.err().unwrap()
         );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation/count objects"]
+    fn pooled_discovery_recovers_same_target_without_recharging_or_duplicate_admission() {
+        use crate::capture::ClockPort;
+        use crate::focused_count::{CountCandidate, CountLimits, FocusedCounter};
+        use std::process::{Command, Stdio};
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        fn remaining_state(budget: &ObservationBudget) -> usize {
+            let (mut low, mut high) = (0, budget.limits.max_state_bytes);
+            while low < high {
+                let mid = low + (high - low).div_ceil(2);
+                if budget.reserve_state(mid).is_ok() {
+                    low = mid;
+                } else {
+                    high = mid - 1;
+                }
+            }
+            low
+        }
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        for (case, free, prearmed) in [
+            ("inventory", 16 << 20, false),
+            ("export", (23 << 20) - 1, false),
+            ("static_after_api", 16 << 20, true),
+        ] {
+            let child = Owned(
+                Command::new("/usr/bin/openssl")
+                    .args([
+                        "speed", "-elapsed", "-seconds", "30", "-evp", "SHA512", "-bytes", "64",
+                    ])
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            let pid = child.0.id();
+            let records = inventory::snapshot(&inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            assert_eq!(records.len(), 1);
+            let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+            let mut budget = ObservationBudget::new(ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            });
+            budget.memory = Some(pool.clone());
+            let mut session = ProviderSession::open_budgeted(budget, &object).unwrap();
+            session.set_deadline(Instant::now() + Duration::from_secs(10));
+            if prearmed {
+                EXPIRE_STATIC.with(|flag| flag.set(true));
+                let first = session.reconcile_records(&records);
+                assert!(first.gaps.contains(&ObservationGap::SnapshotLag));
+                assert!(session.link_count() > 0);
+                session.set_deadline(Instant::now() + Duration::from_secs(10));
+            }
+            let busy = pool.reserve((64 << 20) - free).unwrap();
+            let blocked = session.reconcile_records(&records);
+            assert!(
+                blocked
+                    .gaps
+                    .iter()
+                    .any(|g| matches!(g, ObservationGap::ReadLimit | ObservationGap::StateLimit)),
+                "{case}: missing capacity gap"
+            );
+            let target = session
+                .targets
+                .get(&pid)
+                .expect("temporary refusal must retain acquired process/object custody");
+            assert!(
+                !target.ready,
+                "{case}: shared refusal must not seal incomplete discovery"
+            );
+            let generation = target.process.generation();
+            let reads = session.budget.elf_read_bytes();
+            if !prearmed {
+                assert_eq!(reads, 0, "{case}: no-IO pool refusal charged reads");
+            }
+            let state = remaining_state(&session.budget);
+            let cookies = session.next_cookie;
+            let links = session.link_count();
+            for _ in 0..3 {
+                session.set_deadline(Instant::now() + Duration::from_secs(10));
+                let again = session.reconcile_records(&records);
+                assert!(again.static_candidates.is_empty());
+                assert!(!session.targets[&pid].ready);
+                assert_eq!(session.targets[&pid].process.generation(), generation);
+                assert_eq!(
+                    session.budget.elf_read_bytes(),
+                    reads,
+                    "{case}: completed/refused phases were repeated"
+                );
+                assert_eq!(
+                    remaining_state(&session.budget),
+                    state,
+                    "{case}: retry burned retained state"
+                );
+                assert_eq!(
+                    (session.next_cookie, session.link_count()),
+                    (cookies, links)
+                );
+            }
+            drop(busy);
+            session.set_deadline(Instant::now() + Duration::from_secs(10));
+            let recovered = session.reconcile_records(&records);
+            assert!(session.targets[&pid].ready);
+            assert!(
+                session.budget.elf_read_bytes() >= reads,
+                "{case}: actual work was refunded"
+            );
+            assert_eq!(session.targets[&pid].process.generation(), generation);
+            assert!(
+                !recovered.static_candidates.is_empty(),
+                "{case}: missing recovered physical candidates"
+            );
+            if prearmed {
+                assert_eq!(
+                    (session.next_cookie, session.link_count()),
+                    (cookies, links)
+                );
+            }
+            let now = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+            let mut counter = FocusedCounter::open(
+                &count_object,
+                pid,
+                crate::focused_capture::observer_namespace().unwrap(),
+                CountLimits {
+                    window: crate::evidence::CountAdmissionWindow {
+                        start_ns: now,
+                        deadline_ns: now + 10_000_000_000,
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let candidates: Vec<_> = recovered
+                .static_candidates
+                .into_iter()
+                .map(CountCandidate::Static)
+                .collect();
+            counter.attach_candidates(candidates.clone(), now).unwrap();
+            let physical = counter.active_site_count();
+            counter.attach_candidates(candidates, now).unwrap();
+            assert_eq!(
+                counter.active_site_count(),
+                physical,
+                "{case}: duplicate physical admission"
+            );
+            assert!(
+                session
+                    .reconcile_records(&records)
+                    .static_candidates
+                    .is_empty()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+            let count = counter.close(Instant::now() + Duration::from_secs(1));
+            let calls: u64 = count
+                .sites
+                .iter()
+                .chain(&count.fenced)
+                .map(|s| s.calls)
+                .sum();
+            let result = session.close_until(Instant::now() + Duration::from_secs(1));
+            let api: u64 = result.api_activity.iter().map(|a| a.row.entries).sum();
+            assert!(
+                calls > 0 && api > 0,
+                "{case}: recovery requires separate positive physical/API evidence"
+            );
+            println!(
+                "{case}: same retained generation {generation}, {physical} unique physical sites, {calls} physical entries, {api} API entries; blocked reads={reads}; no repeated read/state/cookie/link charges"
+            );
+        }
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation object"]

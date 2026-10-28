@@ -764,6 +764,57 @@ mod tests {
 mod observation_tests {
     use super::*;
     #[test]
+    fn pooled_scanner_recovers_same_mapped_file_after_competing_lease_releases() {
+        let mut child = std::process::Command::new("/usr/bin/openssl")
+            .args([
+                "speed", "-elapsed", "-seconds", "30", "-evp", "SHA512", "-bytes", "64",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+        let busy = pool.reserve(48 << 20).unwrap();
+        let mut scanner = ScopedScanner::new_budgeted(
+            Selection {
+                pids: vec![child.id()],
+                ..Default::default()
+            },
+            Limits {
+                max_pids: 1,
+                ..Default::default()
+            },
+            Some(pool),
+        )
+        .unwrap();
+        let blocked = scanner.observation_snapshot_for(std::time::Duration::from_secs(10));
+        assert!(
+            blocked
+                .snapshot
+                .gaps
+                .iter()
+                .any(|g| g.pid == Some(child.id()) && g.reason == GapReason::ReadLimit)
+        );
+        let original = blocked.snapshot.processes[0].clone();
+        drop(blocked);
+        drop(busy);
+        let recovered = scanner.observation_snapshot_for(std::time::Duration::from_secs(10));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let current = &recovered.snapshot.processes[0];
+        assert_eq!(
+            (original.pid, original.starttime, original.namespaces),
+            (current.pid, current.starttime, current.namespaces.clone())
+        );
+        assert!(
+            current.modules.iter().any(|m| m.info.kind
+                == super::super::ObjectKind::OpenSslCompatible
+                && !m.info.exports.is_empty()),
+            "temporary scratch refusal was cached against the unchanged mapped file"
+        );
+    }
+    #[test]
     fn pooled_selector_cannot_parse_without_scratch_and_full_snapshot_keeps_other_modules() {
         let path = std::fs::canonicalize("/usr/bin/openssl").unwrap();
         let selection = Selection {

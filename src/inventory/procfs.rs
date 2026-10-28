@@ -341,16 +341,27 @@ impl Work<'_> {
         if charge > self.remaining() {
             return Err(GapReason::ReadLimit);
         }
-        self.totals.read_bytes += charge;
-        self.totals.objects_inspected += 1;
-        // An object growing between our admission and the ELF inspector's
-        // fstat must never read beyond the aggregate work already charged.
         let lease = self
             .memory
             .as_ref()
             .map(|pool| pool.reserve(2048).ok_or(GapReason::ReadLimit))
             .transpose()?;
-        let result = elf::inspect_file_budgeted(&mut file, metadata.len(), self.memory.as_ref());
+        // Shared capacity is transient, not a property of this fingerprint.
+        // Refuse before charging IO or memoizing a parser result. Keep this
+        // lease through parsing; only structural parser errors reach the cache.
+        let _scratch = self
+            .memory
+            .as_ref()
+            .map(|pool| {
+                pool.reserve(elf::parser_scratch_bytes(metadata.len())?)
+                    .ok_or(GapReason::ReadLimit)
+            })
+            .transpose()?;
+        self.totals.read_bytes += charge;
+        self.totals.objects_inspected += 1;
+        // The external lease covers this parser; metadata.len() still bounds
+        // growth between admission and its independent descriptor checks.
+        let result = elf::inspect_file(&mut file, metadata.len());
         self.deadline()?;
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
@@ -848,6 +859,42 @@ mod tests {
         let parsed = parse_line(b"0000000a-000000bc r--p 0 00:01 42 /secret name").unwrap();
         assert_eq!(parsed.map_name(), "a-bc");
         assert_eq!(parsed.inode, 42);
+    }
+
+    #[test]
+    fn pooled_refusal_does_not_count_unperformed_inspections() {
+        let options = SnapshotOptions::default();
+        let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+        let metadata = std::fs::metadata("/bin/true").unwrap();
+        let free = elf::parser_scratch_bytes(metadata.len()).unwrap() + 2048 - 1;
+        let busy = pool.reserve((64 << 20) - free).unwrap();
+        let mut work = Work {
+            records_memory: Vec::new(),
+            memory: Some(pool),
+            options: &options,
+            include_other: false,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                work.inspect(File::open("/bin/true").unwrap(), &metadata),
+                Err(GapReason::ReadLimit)
+            );
+            assert_eq!(work.totals.read_bytes, 0);
+            assert_eq!(work.totals.objects_inspected, 0);
+            assert!(work.cache.is_empty());
+        }
+        drop(busy);
+        work.inspect(File::open("/bin/true").unwrap(), &metadata)
+            .unwrap();
+        assert_eq!(work.totals.read_bytes, metadata.len() + 1);
+        assert_eq!(work.totals.objects_inspected, 1);
+        work.inspect(File::open("/bin/true").unwrap(), &metadata)
+            .unwrap();
+        assert_eq!(work.totals.read_bytes, metadata.len() + 1);
     }
 
     // Catches reading or reusing cached bytes after stale metadata admission.

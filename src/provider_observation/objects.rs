@@ -8,7 +8,7 @@ use super::static_tables::{
 use crate::inventory::{
     self, IdentityStatus, ModuleInfo, NamespaceId, NamespaceIds, ProcessRecord,
 };
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::CString;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::Read as _;
@@ -81,7 +81,27 @@ struct ElfObject {
     segments: Vec<Segment>,
     exports: Vec<(ObservationApi, u64)>,
 }
+// Internal retry classification: shared capacity is not part of a retained
+// file fingerprint. Public diagnostics keep their existing finite gap labels.
+#[derive(Debug)]
+enum ParseError {
+    Gap(ObservationGap),
+    SharedCapacity(ObservationGap),
+}
+impl From<ObservationGap> for ParseError {
+    fn from(gap: ObservationGap) -> Self {
+        Self::Gap(gap)
+    }
+}
+impl ParseError {
+    fn gap(self) -> ObservationGap {
+        match self {
+            Self::Gap(gap) | Self::SharedCapacity(gap) => gap,
+        }
+    }
+}
 struct Object {
+    parse_deferred: Cell<bool>,
     file: File,
     stamp: Stamp,
     expected: Option<ModuleInfo>,
@@ -91,15 +111,26 @@ struct Object {
 impl Object {
     fn parsed(&self, budget: &ObservationBudget) -> Result<&ElfObject, ObservationGap> {
         if self.parsed.get().is_none() {
+            // This marker describes this attempt only. An authority/deadline
+            // failure must not inherit an earlier shared-capacity refusal.
+            self.parse_deferred.set(false);
             self.unchanged()?;
             let mut fd = self
                 .file
                 .try_clone()
                 .map_err(|_| ObservationGap::BackingUnavailable)?;
-            let parsed = parse_object(&mut fd, self.expected.as_ref(), budget);
-            if matches!(parsed, Err(ObservationGap::SnapshotLag)) {
-                return Err(ObservationGap::SnapshotLag);
-            }
+            let parsed = match parse_object(&mut fd, self.expected.as_ref(), budget) {
+                Err(ParseError::SharedCapacity(gap)) => {
+                    self.parse_deferred.set(true);
+                    return Err(gap);
+                }
+                Err(ParseError::Gap(ObservationGap::SnapshotLag)) => {
+                    return Err(ObservationGap::SnapshotLag);
+                }
+                Err(ParseError::Gap(gap)) => Err(gap),
+                Ok(parsed) => Ok(parsed),
+            };
+            self.parse_deferred.set(false);
             let _ = self.parsed.set(parsed);
         }
         self.parsed
@@ -247,6 +278,7 @@ pub(crate) fn startup_candidates(
         return Err(ObservationGap::ReadLimit);
     }
     let object = Rc::new(Object {
+        parse_deferred: Cell::new(false),
         file,
         stamp: Stamp::of(&metadata),
         expected: None,
@@ -506,6 +538,15 @@ impl VerifiedProcess {
             .map(|(m, _)| (m.start, m.end))
             .collect())
     }
+    pub(crate) fn api_discovery_deferred(&self) -> bool {
+        self.mappings.iter().any(|(_, object)| {
+            object.parse_deferred.get()
+                && object
+                    .expected
+                    .as_ref()
+                    .is_some_and(|info| !info.exports.is_empty())
+        })
+    }
     pub fn retained_objects(&self) -> usize {
         let mut identities = std::collections::BTreeSet::new();
         for (_, object) in &self.mappings {
@@ -618,6 +659,10 @@ impl VerifiedProcess {
             let parsed = match object.parsed(budget) {
                 Ok(p) => p,
                 Err(ObservationGap::SnapshotLag) => return Err(ObservationGap::SnapshotLag),
+                Err(g) if object.parse_deferred.get() => {
+                    self.gaps.borrow_mut().insert(g);
+                    return Err(ObservationGap::SnapshotLag);
+                }
                 Err(g) => {
                     self.gaps.borrow_mut().insert(g);
                     discovery.mapping += 1;
@@ -857,6 +902,7 @@ pub fn acquire(
                 continue;
             }
             let object = Rc::new(Object {
+                parse_deferred: Cell::new(false),
                 file,
                 stamp,
                 expected,
@@ -1091,7 +1137,8 @@ pub fn inspect_exports(
     file: &mut File,
     budget: &mut ObservationBudget,
 ) -> Result<Vec<ObservationApi>, ObservationGap> {
-    Ok(parse_object(file, None, budget)?
+    Ok(parse_object(file, None, budget)
+        .map_err(ParseError::gap)?
         .exports
         .into_iter()
         .map(|(api, _)| api)
@@ -1102,7 +1149,8 @@ pub fn inspect_expected_exports(
     expected: &ModuleInfo,
     budget: &mut ObservationBudget,
 ) -> Result<Vec<ObservationApi>, ObservationGap> {
-    Ok(parse_object(file, Some(expected), budget)?
+    Ok(parse_object(file, Some(expected), budget)
+        .map_err(ParseError::gap)?
         .exports
         .into_iter()
         .map(|(api, _)| api)
@@ -1112,46 +1160,60 @@ fn parse_object(
     file: &mut File,
     expected: Option<&ModuleInfo>,
     budget: &ObservationBudget,
-) -> Result<ElfObject, ObservationGap> {
+) -> Result<ElfObject, ParseError> {
     let reservation = budget.reserve_state(PARSER_STATE_BYTES)?;
     let before = file
         .metadata()
         .map_err(|_| ObservationGap::BackingUnavailable)?;
     if !before.is_file() || before.len() > MAX_OBJECT {
-        return Err(ObservationGap::ReadLimit);
+        return Err(ObservationGap::ReadLimit.into());
     }
     if expected.is_some_and(|e| {
         e.device != before.dev() || e.inode != before.ino() || e.size_bytes != before.len()
     }) {
-        return Err(ObservationGap::ObjectChanged);
+        return Err(ObservationGap::ObjectChanged.into());
     }
-    // inspect_file reads at most size+1, with D1's independent parser admission.
+    // Reserve both non-overlapping phase needs before committing any IO work.
+    // Export headroom can refuse even when inventory scratch fits; acquiring it
+    // now prevents re-reading completed inventory on every blocked retry.
+    let inventory_bytes = inventory::elf::parser_scratch_bytes(before.len())
+        .map_err(|_| ObservationGap::ReadLimit)?;
+    let export_bytes = MAX_STRINGS as usize + MAX_SYMBOLS as usize * 24 + (1 << 20);
+    let _inventory = budget
+        .memory
+        .as_ref()
+        .map(|pool| {
+            pool.reserve(inventory_bytes)
+                .ok_or(ParseError::SharedCapacity(ObservationGap::ReadLimit))
+        })
+        .transpose()?;
+    let _export_headroom = budget
+        .memory
+        .as_ref()
+        .map(|pool| {
+            pool.reserve(export_bytes.saturating_sub(inventory_bytes))
+                .ok_or(ParseError::SharedCapacity(ObservationGap::StateLimit))
+        })
+        .transpose()?;
+    // inspect_file reads at most size+1; its externally held lease above covers
+    // parser scratch while its independent structural and descriptor checks run.
     budget.read(
         before
             .len()
             .checked_add(1)
             .ok_or(ObservationGap::ReadLimit)?,
     )?;
-    let info = inventory::elf::inspect_file_budgeted(file, before.len(), budget.memory.as_ref())
-        .map_err(|gap| match gap {
-            inventory::GapReason::Changed => ObservationGap::ObjectChanged,
-            inventory::GapReason::ReadLimit | inventory::GapReason::TooLarge => {
-                ObservationGap::ReadLimit
-            }
-            _ => ObservationGap::MalformedElf,
-        })?;
+    let info = inventory::elf::inspect_file(file, before.len()).map_err(|gap| match gap {
+        inventory::GapReason::Changed => ObservationGap::ObjectChanged,
+        inventory::GapReason::ReadLimit | inventory::GapReason::TooLarge => {
+            ObservationGap::ReadLimit
+        }
+        _ => ObservationGap::MalformedElf,
+    })?;
     if expected.is_some_and(|expected| *expected != info) {
-        return Err(ObservationGap::ObjectChanged);
+        return Err(ObservationGap::ObjectChanged.into());
     }
-    // Export parsing follows inventory parsing; its symbol/string scratch is
-    // separate in time and never retained with the object metadata.
-    let _scratch = match &budget.memory {
-        Some(pool) => Some(
-            pool.reserve(MAX_STRINGS as usize + MAX_SYMBOLS as usize * 24 + (1 << 20))
-                .ok_or(ObservationGap::StateLimit)?,
-        ),
-        None => None,
-    };
+    // The same maximum phase lease now covers export symbol/string scratch.
     let result = parse_exports(
         file,
         before.len(),
@@ -1162,7 +1224,7 @@ fn parse_object(
     )?;
     if Stamp::of(&before) != Stamp::of(&file.metadata().map_err(|_| ObservationGap::ObjectChanged)?)
     {
-        return Err(ObservationGap::ObjectChanged);
+        return Err(ObservationGap::ObjectChanged.into());
     }
     reservation.retain();
     Ok(result)
@@ -1506,9 +1568,169 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pooled_inventory_refusal_has_no_read_charge_and_retained_object_recovers() {
+        pooled_parse_refusal(false);
+    }
+    #[test]
+    fn pooled_export_refusal_has_no_read_charge_and_retained_object_recovers() {
+        pooled_parse_refusal(true);
+    }
+    fn pooled_parse_refusal(export_checkpoint: bool) {
+        let inventory =
+            inventory::elf::parser_scratch_bytes(std::fs::metadata("/bin/true").unwrap().len())
+                .unwrap();
+        let export = MAX_STRINGS as usize + MAX_SYMBOLS as usize * 24 + (1 << 20);
+        assert!(
+            inventory < export,
+            "small file isolates the export-headroom checkpoint"
+        );
+        for free in [if export_checkpoint {
+            export - 1
+        } else {
+            inventory - 1
+        }] {
+            let file = File::open("/bin/true").unwrap();
+            let object = Object {
+                parse_deferred: Cell::new(false),
+                stamp: Stamp::of(&file.metadata().unwrap()),
+                file,
+                expected: None,
+                parsed: OnceCell::new(),
+                tables: OnceCell::new(),
+            };
+            let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+            let busy = pool.reserve((64 << 20) - free).unwrap();
+            let mut budget = ObservationBudget::default();
+            budget.memory = Some(pool);
+            for _ in 0..3 {
+                assert!(object.parsed(&budget).is_err());
+                assert_eq!(
+                    budget.elf_read_bytes(),
+                    0,
+                    "shared capacity refused before IO must not consume cumulative read work; free={free}"
+                );
+                assert!(
+                    object.parsed.get().is_none(),
+                    "temporary refusal is not a stable parse result"
+                );
+            }
+            drop(busy);
+            object
+                .parsed(&budget)
+                .expect("same retained descriptor must recover");
+            let performed = budget.elf_read_bytes();
+            assert!(performed > 0);
+            object.parsed(&budget).unwrap();
+            assert_eq!(
+                budget.elf_read_bytes(),
+                performed,
+                "completed IO remains charged but is not repeated"
+            );
+        }
+    }
+    #[test]
+    fn pooled_marker_cannot_mask_later_file_or_deadline_failure() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-parser-failure-transition-{}",
+            std::process::id()
+        ));
+        for changed in [true, false] {
+            std::fs::copy("/bin/true", &path).unwrap();
+            let file = File::open(&path).unwrap();
+            let object = Object {
+                parse_deferred: Cell::new(false),
+                stamp: Stamp::of(&file.metadata().unwrap()),
+                file,
+                expected: None,
+                parsed: OnceCell::new(),
+                tables: OnceCell::new(),
+            };
+            let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+            let busy = pool.reserve(48 << 20).unwrap();
+            let mut budget = ObservationBudget::default();
+            budget.memory = Some(pool);
+            assert_eq!(
+                object.parsed(&budget).err(),
+                Some(ObservationGap::ReadLimit)
+            );
+            assert!(object.parse_deferred.get());
+            drop(busy);
+            let expected = if changed {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(b"changed")
+                    .unwrap();
+                ObservationGap::ObjectChanged
+            } else {
+                budget.set_deadline(std::time::Instant::now());
+                ObservationGap::SnapshotLag
+            };
+            assert_eq!(object.parsed(&budget).err(), Some(expected));
+            assert!(
+                !object.parse_deferred.get(),
+                "new failure is not a shared-capacity refusal"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn pooled_retry_does_not_reclassify_malformed_or_per_session_read_limits() {
+        let path =
+            std::env::temp_dir().join(format!("osslscope-stable-parser-{}", std::process::id()));
+        std::fs::write(&path, b"not ELF; stable malformed input").unwrap();
+        for (file, max_reads, expected_gap, performed) in [
+            (
+                File::open(&path).unwrap(),
+                1 << 20,
+                ObservationGap::MalformedElf,
+                true,
+            ),
+            (
+                File::open("/bin/true").unwrap(),
+                0,
+                ObservationGap::ReadLimit,
+                false,
+            ),
+        ] {
+            let object = Object {
+                parse_deferred: Cell::new(false),
+                stamp: Stamp::of(&file.metadata().unwrap()),
+                file,
+                expected: None,
+                parsed: OnceCell::new(),
+                tables: OnceCell::new(),
+            };
+            let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+            let mut budget = ObservationBudget::new(super::super::ObservationLimits {
+                max_elf_read_bytes: max_reads,
+                ..Default::default()
+            });
+            budget.memory = Some(pool.clone());
+            assert_eq!(object.parsed(&budget).err(), Some(expected_gap));
+            assert!(object.parsed.get().is_some());
+            assert!(!object.parse_deferred.get());
+            let reads = budget.elf_read_bytes();
+            assert_eq!(
+                reads > 0,
+                performed,
+                "performed work remains cumulative even when parsing failed"
+            );
+            let busy = pool.reserve(64 << 20).unwrap();
+            assert_eq!(object.parsed(&budget).err(), Some(expected_gap));
+            drop(busy);
+            assert_eq!(object.parsed(&budget).err(), Some(expected_gap));
+            assert_eq!(budget.elf_read_bytes(), reads);
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn deadline_errors_do_not_poison_retained_object_parsers() {
         let file = File::open("/bin/true").unwrap();
         let object = Object {
+            parse_deferred: Cell::new(false),
             stamp: Stamp::of(&file.metadata().unwrap()),
             file,
             expected: None,
