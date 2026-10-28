@@ -5,6 +5,49 @@ use super::{
 };
 use std::fs::File;
 
+// Test-only work observations inject expiry after an independently selected row.
+// They do not implement cancellation; production must still check its budget.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) enum ScanKind {
+    Source = 0,
+    Conflict = 1,
+    Segment = 2,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+pub(super) struct ScanProbe {
+    pub rows: [usize; 3],
+    pub expire_at: Option<(ScanKind, usize)>,
+    pub expired: bool,
+    pub after_expiry: usize,
+}
+#[cfg(test)]
+thread_local! {
+    pub(super) static SCAN_PROBE: std::cell::Cell<ScanProbe> = const { std::cell::Cell::new(ScanProbe {
+        rows: [0; 3], expire_at: None, expired: false, after_expiry: 0,
+    }) };
+}
+#[cfg(test)]
+fn observe_scan(budget: &ObservationBudget, kind: ScanKind) {
+    SCAN_PROBE.with(|probe| {
+        let mut value = probe.get();
+        if value.expired {
+            value.after_expiry += 1;
+        }
+        value.rows[kind as usize] += 1;
+        if !value.expired
+            && value.expire_at.is_some_and(|(at, row)| {
+                at as usize == kind as usize && row == value.rows[kind as usize]
+            })
+        {
+            budget.set_deadline(std::time::Instant::now());
+            value.expired = true;
+        }
+        probe.set(value);
+    });
+}
+
 pub(super) const APIS: [ObservationApi; 2] = [
     ObservationApi::Inventoried(crate::inventory::Api::OsslProviderQueryOperation),
     ObservationApi::OsslProviderUnqueryOperation,
@@ -21,20 +64,43 @@ pub(super) struct Context<'a> {
     pub header: &'a [u8],
 }
 impl Context<'_> {
-    fn executable(&self, address: u64, size: u64) -> Option<(&Segment, u64)> {
-        let end = address.checked_add(size)?;
-        let mut matches = self
-            .segments
-            .iter()
-            .filter(|s| address >= s.address && end <= s.address.checked_add(s.size).unwrap_or(0));
-        let segment = matches.next()?;
-        if matches.next().is_some() || segment.writable {
-            return None;
+    fn checkpoint(&self, row: usize) -> Result<(), ObservationGap> {
+        if row % 256 == 0 {
+            self.budget.checkpoint()?;
         }
-        let offset = segment
-            .offset
-            .checked_add(address.checked_sub(segment.address)?)?;
-        (offset.checked_add(size)? <= self.len).then_some((segment, offset))
+        Ok(())
+    }
+
+    fn executable(
+        &self,
+        address: u64,
+        size: u64,
+    ) -> Result<Option<(&Segment, u64)>, ObservationGap> {
+        let Some(end) = address.checked_add(size) else {
+            return Ok(None);
+        };
+        let mut found = None;
+        for (index, segment) in self.segments.iter().enumerate() {
+            #[cfg(test)]
+            observe_scan(self.budget, ScanKind::Segment);
+            self.checkpoint(index)?;
+            if address >= segment.address
+                && end <= segment.address.checked_add(segment.size).unwrap_or(0)
+                && found.replace(segment).is_some()
+            {
+                return Ok(None);
+            }
+        }
+        let Some(segment) = found.filter(|segment| !segment.writable) else {
+            return Ok(None);
+        };
+        let Some(offset) = segment.offset.checked_add(address - segment.address) else {
+            return Ok(None);
+        };
+        Ok(
+            (offset.checked_add(size).is_some_and(|end| end <= self.len))
+                .then_some((segment, offset)),
+        )
     }
 
     pub(super) fn resolve(
@@ -50,7 +116,10 @@ impl Context<'_> {
             return Ok(None);
         }
         let mut source = None;
-        for symbol in self.symbols.chunks_exact(24) {
+        for (index, symbol) in self.symbols.chunks_exact(24).enumerate() {
+            #[cfg(test)]
+            observe_scan(self.budget, ScanKind::Source);
+            self.checkpoint(index)?;
             if symbol[4] & 15 != 2 || word(symbol, 6, 2)? == 0 {
                 continue;
             }
@@ -61,7 +130,7 @@ impl Context<'_> {
             let address = word(symbol, 8, 8)?;
             let size = word(symbol, 16, 8)?;
             if self
-                .executable(address, size.max(1))
+                .executable(address, size.max(1))?
                 .map(|(_, offset)| offset)
                 != Some(entry)
             {
@@ -93,7 +162,7 @@ impl Context<'_> {
         if (address..address + size).contains(&target) {
             return Ok(None);
         }
-        let Some((segment, offset)) = self.executable(target, 1) else {
+        let Some((segment, offset)) = self.executable(target, 1)? else {
             return Ok(None);
         };
         if exports
@@ -104,19 +173,28 @@ impl Context<'_> {
         }
         // Exact entries of ordinary dynamic functions are permitted. Interior
         // entries and IFUNC resolvers cannot inherit this public signature.
-        for symbol in self.symbols.chunks_exact(24) {
+        for (index, symbol) in self.symbols.chunks_exact(24).enumerate() {
+            #[cfg(test)]
+            observe_scan(self.budget, ScanKind::Conflict);
+            self.checkpoint(index)?;
             if word(symbol, 6, 2)? == 0 || !matches!(symbol[4] & 15, 2 | 10) {
                 continue;
             }
             let start = word(symbol, 8, 8)?;
-            let size = word(symbol, 16, 8)?.max(1);
-            if self.executable(start, 1).is_none() {
+            if target < start {
                 continue;
             }
-            let Some(end) = start.checked_add(size) else {
-                return Ok(None);
-            };
-            if target >= start && target < end && (target != start || symbol[4] & 15 == 10) {
+            let size = word(symbol, 16, 8)?.max(1);
+            let end = start.checked_add(size);
+            // Discard unrelated intervals and allowed ordinary exact entries
+            // before any segment lookup. Overflowing potential conflicts still
+            // refuse forwarding when their start has executable backing.
+            if end.is_some_and(|end| target >= end)
+                || end.is_some() && target == start && symbol[4] & 15 == 2
+            {
+                continue;
+            }
+            if self.executable(start, 1)?.is_some() {
                 return Ok(None);
             }
         }
@@ -150,7 +228,8 @@ impl Context<'_> {
         };
         let names_offset = word(names, 24, 8)?;
         let names_size = word(names, 32, 8)?;
-        for section in self.sections.chunks_exact(64) {
+        for (index, section) in self.sections.chunks_exact(64).enumerate() {
+            self.checkpoint(index)?;
             let start = word(section, 16, 8)?;
             let Some(end) = start.checked_add(word(section, 32, 8)?) else {
                 return Ok(true);

@@ -270,3 +270,175 @@ fn overlapping_executable_destination_ranges_do_not_authorize_forwarding() {
     }
     assert_eq!(offset(&parsed(&f), QUERY), Some(f.offsets[QUERY]));
 }
+
+// Literal sectionless ELF: shared unknown FUNC names reuse one valid unrelated
+// executable address. Disjoint PT_LOAD virtual ranges reuse the same file byte.
+fn adversarial_forwarder() -> (ForwarderFixture, u64) {
+    const BASE: u64 = 0x400000;
+    const SYMBOLS: usize = 8192;
+    const EXTRA_SEGMENTS: usize = 1024;
+    let names = b"\0OSSL_PROVIDER_query_operation\0unrelated\0";
+    let dynamic = 64 + (EXTRA_SEGMENTS + 2) * 56;
+    let hash = dynamic + 96;
+    let strings = hash + 8 + (1 + SYMBOLS) * 4;
+    let symbols = (strings + names.len() + 7) & !7;
+    let code = symbols + SYMBOLS * 24;
+    let mut image = vec![0; code + 16];
+    image[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    let put = |image: &mut [u8], at: usize, value: u64, size: usize| {
+        image[at..at + size].copy_from_slice(&value.to_le_bytes()[..size]);
+    };
+    for (at, value, size) in [
+        (16, 3, 2),
+        (18, 62, 2),
+        (20, 1, 4),
+        (32, 64, 8),
+        (52, 64, 2),
+        (54, 56, 2),
+        (56, (EXTRA_SEGMENTS + 2) as u64, 2),
+    ] {
+        put(&mut image, at, value, size);
+    }
+    let len = image.len() as u64;
+    for (at, value, size) in [
+        (64, 1, 4),
+        (68, 5, 4),
+        (80, BASE, 8),
+        (96, len, 8),
+        (104, len, 8),
+        (112, 1, 8),
+        (120, 2, 4),
+        (124, 4, 4),
+        (128, dynamic as u64, 8),
+        (136, BASE + dynamic as u64, 8),
+        (152, 96, 8),
+        (160, 96, 8),
+    ] {
+        put(&mut image, at, value, size);
+    }
+    for index in 0..EXTRA_SEGMENTS {
+        let at = 64 + (index + 2) * 56;
+        for (relative, value, size) in [
+            (0, 1, 4),
+            (4, 5, 4),
+            (8, (code + 8) as u64, 8),
+            (16, 0x1000000 + index as u64 * 4096, 8),
+            (32, 1, 8),
+            (40, 1, 8),
+            (48, 1, 8),
+        ] {
+            put(&mut image, at + relative, value, size);
+        }
+    }
+    for (index, (tag, value)) in [
+        (4, BASE + hash as u64),
+        (5, BASE + strings as u64),
+        (6, BASE + symbols as u64),
+        (10, names.len() as u64),
+        (11, 24),
+        (0, 0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        put(&mut image, dynamic + index * 16, tag, 8);
+        put(&mut image, dynamic + index * 16 + 8, value, 8);
+    }
+    put(&mut image, hash, 1, 4);
+    put(&mut image, hash + 4, SYMBOLS as u64, 4);
+    put(&mut image, hash + 8, 1, 4);
+    image[strings..strings + names.len()].copy_from_slice(names);
+    for index in 1..SYMBOLS {
+        let at = symbols + index * 24;
+        let (name, address, size) = if index == 1 {
+            (1, BASE + code as u64, 5)
+        } else {
+            (31, 0x1000000, 1)
+        };
+        put(&mut image, at, name, 4);
+        image[at + 4] = 0x12;
+        put(&mut image, at + 6, 1, 2);
+        put(&mut image, at + 8, address, 8);
+        put(&mut image, at + 16, size, 8);
+    }
+    image[code..code + 5].copy_from_slice(&[0xe9, 3, 0, 0, 0]);
+    image[code + 8] = 0xc3;
+    let mut fixture = ForwarderFixture::new(NEAR, SHORT_BACK);
+    fixture.image = image;
+    (fixture, (code + 8) as u64)
+}
+
+#[test]
+fn unrelated_dynamic_symbols_do_not_multiply_executable_segment_work() {
+    use super::forwarder::{SCAN_PROBE, ScanProbe};
+    let (fixture, target) = adversarial_forwarder();
+    SCAN_PROBE.with(|probe| probe.set(ScanProbe::default()));
+    let parsed = parse_object(&mut fixture.file(), None, &ObservationBudget::default()).unwrap();
+    let work = SCAN_PROBE.with(|probe| probe.replace(ScanProbe::default()));
+    assert_eq!(offset(&parsed, QUERY), Some(target));
+    eprintln!(
+        "adversarial conflict rows={}, segment predicates={}",
+        work.rows[1], work.rows[2]
+    );
+    assert!(
+        work.rows[1] >= 8192,
+        "all conflict candidates were considered"
+    );
+    // Only query-source and target validation need a segment walk. This literal
+    // bound allows ample headroom without deriving expectations from the helper.
+    assert!(
+        work.rows[2] < 4096,
+        "unrelated symbols multiplied segment scans: {}",
+        work.rows[2]
+    );
+}
+
+#[test]
+fn forwarding_deadlines_stop_in_memory_work_without_caching_partial_parse() {
+    use super::forwarder::{SCAN_PROBE, ScanKind, ScanProbe};
+    let (fixture, target) = adversarial_forwarder();
+    for expire_at in [
+        (ScanKind::Source, 300),
+        (ScanKind::Conflict, 300),
+        (ScanKind::Segment, 300),
+    ] {
+        let file = fixture.file();
+        let object = Object {
+            stamp: Stamp::of(&file.metadata().unwrap()),
+            file,
+            parse_deferred: Cell::new(false),
+            expected: None,
+            parsed: OnceCell::new(),
+            tables: OnceCell::new(),
+        };
+        let budget = ObservationBudget::default();
+        SCAN_PROBE.with(|probe| {
+            probe.set(ScanProbe {
+                expire_at: Some(expire_at),
+                ..Default::default()
+            })
+        });
+        assert_eq!(
+            object.parsed(&budget).err(),
+            Some(ObservationGap::SnapshotLag)
+        );
+        let work = SCAN_PROBE.with(|probe| probe.replace(ScanProbe::default()));
+        assert!(work.expired);
+        eprintln!(
+            "deadline phase={}, additional work rows={}",
+            expire_at.0 as usize, work.after_expiry
+        );
+        assert!(
+            work.after_expiry < 512,
+            "deadline observed only after {} additional in-memory rows",
+            work.after_expiry
+        );
+        assert!(
+            object.parsed.get().is_none(),
+            "partial parse cached across SnapshotLag"
+        );
+        budget.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        assert_eq!(offset(object.parsed(&budget).unwrap(), QUERY), Some(target));
+        SCAN_PROBE.with(|probe| probe.set(ScanProbe::default()));
+    }
+}

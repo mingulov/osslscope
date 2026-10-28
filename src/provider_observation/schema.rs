@@ -150,7 +150,7 @@ impl ObservationBudget {
     pub(crate) fn set_deadline(&self, deadline: std::time::Instant) {
         self.deadline.set(Some(deadline));
     }
-    fn checkpoint(&self) -> Result<(), ObservationGap> {
+    pub(crate) fn checkpoint(&self) -> Result<(), ObservationGap> {
         if self
             .deadline
             .get()
