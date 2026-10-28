@@ -2085,6 +2085,19 @@ mod forwarder_tests;
 #[cfg(test)]
 pub(super) mod fixture_support {
     use super::*;
+    pub fn lose_mapped_process_directory(process: &mut VerifiedProcess) {
+        let old = &process.process;
+        process.process = Rc::new(Process {
+            _admission: None,
+            directory: File::open("/dev/null").unwrap(),
+            pid: old.pid,
+            pidfd: old.pidfd.try_clone().unwrap(),
+            executable: old.executable.try_clone().unwrap(),
+            exe_stamp: old.exe_stamp.clone(),
+            starttime: old.starttime,
+            namespaces: old.namespaces.clone(),
+        });
+    }
     pub fn remember_compared_failure(process: &VerifiedProcess, compared: &ProcessRecord) {
         let gap = process
             .retained_incarnation()

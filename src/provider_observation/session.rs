@@ -242,6 +242,7 @@ pub struct ProviderSession {
     gate: crate::writer_gate::WriterGate,
     final_drain: bool,
     final_refusals: BTreeMap<u32, ObservationGap>,
+    final_terminal: BTreeSet<u32>,
     loaded: loader::Loaded,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
@@ -409,6 +410,7 @@ fn final_source_refusals(
     startup: &BTreeMap<u32, Vec<Attachment>>,
     b: &mut ObservationBatch,
     deadline: Instant,
+    terminal_pids: &mut BTreeSet<u32>,
 ) -> BTreeMap<u32, ObservationGap> {
     let mut refusals = BTreeMap::new();
     // Retain every immutable owner. A terminal original may authorize
@@ -426,6 +428,8 @@ fn final_source_refusals(
                 && terminal_originals(rows, Some(target), None) == Ok(true);
             if !terminal {
                 refusals.insert(pid, gap);
+            } else {
+                terminal_pids.insert(pid);
             }
             b.gap(gap);
         }
@@ -494,6 +498,35 @@ fn record_binding<'a>(
         return Err(ObservationGap::InvalidWire);
     }
     Ok(None)
+}
+fn final_record_binding<'a>(
+    targets: &'a BTreeMap<u32, Target>,
+    startup: &'a BTreeMap<u32, Vec<Attachment>>,
+    refusals: &BTreeMap<u32, ObservationGap>,
+    terminal_pids: &BTreeSet<u32>,
+    r: &c::Record,
+) -> Result<Option<RecordBinding<'a>>, ObservationGap> {
+    if let Some(&gap) = refusals.get(&r.pid) {
+        return Err(gap);
+    }
+    let Some(mut binding) = record_binding(targets, startup, r)? else {
+        return Ok(None);
+    };
+    if terminal_pids.contains(&r.pid) {
+        // Retention is not authority. Each queued cookie must carry its own
+        // independently validated original; a sibling's original cannot help.
+        let a = binding.attachment;
+        let original = a
+            .original
+            .as_ref()
+            .or_else(|| a.site.is_startup().then_some(&a.site))
+            .ok_or(ObservationGap::ProcessUnavailable)?;
+        if !original.revalidate_queued_record(None)? {
+            return Err(ObservationGap::ProcessUnavailable);
+        }
+        binding.process = None;
+    }
+    Ok(Some(binding))
 }
 fn map_data(loaded: &loader::Loaded, name: &str) -> Result<MapData, ObservationGap> {
     MapData::from_fd(
@@ -672,6 +705,7 @@ impl ProviderSession {
             gate,
             final_drain: false,
             final_refusals: BTreeMap::new(),
+            final_terminal: BTreeSet::new(),
             api_totals: PerCpuHashMap::try_from(map(&loaded, "API_TOTALS")?)
                 .map_err(|_| ObservationGap::InvalidObject)?,
             api_window,
@@ -1192,6 +1226,7 @@ impl ProviderSession {
                 &self.startup,
                 &mut b,
                 deadline,
+                &mut self.final_terminal,
             ));
         }
         let mut terminal = Vec::new();
@@ -1301,11 +1336,18 @@ impl ProviderSession {
     }
     fn consume(&mut self, event: wire::Transport, b: &mut ObservationBatch) {
         let r = event.record();
-        if let Some(&gap) = self.final_refusals.get(&r.pid) {
-            b.gap(gap);
-            return;
-        }
-        let binding = match record_binding(&self.targets, &self.startup, &r) {
+        let binding = if self.final_drain {
+            final_record_binding(
+                &self.targets,
+                &self.startup,
+                &self.final_refusals,
+                &self.final_terminal,
+                &r,
+            )
+        } else {
+            record_binding(&self.targets, &self.startup, &r)
+        };
+        let binding = match binding {
             Ok(Some(binding)) => binding,
             Ok(None) => return,
             Err(gap) => {
@@ -3086,6 +3128,104 @@ mod startup_api_controls {
         }
     }
     #[test]
+    fn final_cut_mixed_sources_require_each_attachments_own_terminal_authority() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for case in ["live", "terminal", "permanent", "nonterminal-unavailable"] {
+            let mut fixture = reconcile_fixture(true);
+            let pid = fixture.child.pid();
+            let target = fixture.targets.get_mut(&pid).unwrap();
+            let site = target
+                .process
+                .resolve_api(wire::api(c::PUBLIC_UNQUERY).unwrap())
+                .remove(0)
+                .site;
+            assert!(!site.is_startup());
+            let (link, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_nonblocking(true).unwrap();
+            target.attachments.push(Attachment {
+                object: object_id(&site),
+                site,
+                cookie: 82,
+                api: c::PUBLIC_UNQUERY,
+                links: vec![link.into()],
+                generation: 19,
+                advertisers: Vec::new(),
+                original: None,
+                historical: false,
+            });
+            if case == "permanent" {
+                target
+                    .process
+                    .remember_refusal(ObservationGap::ObjectChanged);
+            }
+            if case == "nonterminal-unavailable" {
+                objects::fixture_support::lose_mapped_process_directory(&mut target.process);
+                assert_eq!(
+                    target.process.revalidate(),
+                    Err(ObservationGap::ProcessUnavailable)
+                );
+            }
+            if matches!(case, "terminal" | "permanent") {
+                fixture.child.finish_observation().unwrap();
+            }
+            let mut terminal = BTreeSet::new();
+            let refused = final_source_refusals(
+                &fixture.targets,
+                &fixture.startup,
+                &mut ObservationBatch::default(),
+                Instant::now() + Duration::from_secs(2),
+                &mut terminal,
+            );
+            let record = |cookie, api| c::Record {
+                pid,
+                cookie,
+                api,
+                generation: 19,
+                ..Default::default()
+            };
+            let original = final_record_binding(
+                &fixture.targets,
+                &fixture.startup,
+                &refused,
+                &terminal,
+                &record(81, c::PUBLIC_QUERY),
+            );
+            let mapped = final_record_binding(
+                &fixture.targets,
+                &fixture.startup,
+                &refused,
+                &terminal,
+                &record(82, c::PUBLIC_UNQUERY),
+            );
+            if case == "live" {
+                assert!(original.unwrap().unwrap().process.is_some());
+                assert!(mapped.unwrap().unwrap().process.is_some());
+            } else if case == "terminal" {
+                assert!(
+                    mapped.is_err(),
+                    "terminal PID fallback admitted a mapped-only cookie"
+                );
+                assert!(
+                    original.unwrap().unwrap().process.is_none(),
+                    "terminal original retained live relocation authority"
+                );
+            } else {
+                assert!(original.is_err());
+                assert!(mapped.is_err());
+            }
+            use std::io::Read;
+            assert_eq!(fixture.targets[&pid].attachments.len(), 2);
+            assert_eq!(
+                fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert_eq!(
+                peer.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+    #[test]
     fn final_cut_validation_retains_terminal_owners_and_permanent_refusals() {
         let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
         for poisoned in [false, true] {
@@ -3103,6 +3243,7 @@ mod startup_api_controls {
                 &fixture.startup,
                 &mut batch,
                 Instant::now() + Duration::from_secs(2),
+                &mut BTreeSet::new(),
             );
             assert_eq!(
                 refused.get(&pid).copied(),
