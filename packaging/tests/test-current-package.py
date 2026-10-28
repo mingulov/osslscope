@@ -116,6 +116,47 @@ class CurrentPackage(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
         self.assertFalse(prefix.exists())
 
+    def test_source_bearing_partial_manifests_compose_explicit_v1_installs(self):
+        # These are the actual producer modes: --bpf-only emits five BPF
+        # records, --host-only emits the CLI. Explicit selections complete
+        # diagnostic installs without promoting them to a normal v2 set.
+        installer = str(SCRIPT.parents[1]/'scripts/install-dev.sh')
+        for mode, entries, options, expected_count, explicit_names in [
+            ('bpf', self.arts[1:], ['--binary', self.arts[0]['path']], 6, {'osslscope'}),
+            ('host', self.arts[:1], ['--harvest', self.arts[1]['path'], '--count', self.arts[2]['path']], 3, {'osslscope-harvest','osslscope-count'}),
+        ]:
+            with self.subTest(mode=mode):
+                manifest = self.root/(mode+'.json')
+                manifest.write_text(json.dumps(dict(self.manifest, mode=mode, artifacts=entries)))
+                prefix = self.root/('installed-'+mode)
+                result = subprocess.run(['sh', installer, '--manifest', str(manifest), '--prefix', str(prefix), *options], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+                receipt = json.loads((prefix/'share/osslscope/install-manifest.json').read_bytes())
+                self.assertEqual(receipt['schema'], 'osslscope-install-manifest-v1')
+                self.assertEqual(len(receipt['artifacts']), expected_count)
+                self.assertIsNone(receipt['product_ref'])
+                for entry in receipt['artifacts']:
+                    name = entry.get('bin','osslscope')
+                    self.assertEqual(entry['selection'], 'explicit-override' if name in explicit_names else 'manifest-verified')
+                    self.assertEqual(entry['product_ref'], None if name in explicit_names else 'a'*40)
+                    self.assertEqual(hashlib.sha256(Path(entry['dest']).read_bytes()).hexdigest(), entry['sha256'])
+                # The same partial input cannot become a normal current install.
+                normal = self.root/('normal-'+mode)
+                denied = subprocess.run(['sh', installer, '--manifest', str(manifest), '--prefix', str(normal)], capture_output=True, text=True)
+                self.assertNotEqual(denied.returncode, 0)
+                self.assertFalse(normal.exists())
+                # Implicitly selected records still need source and byte proof
+                # even when explicit inputs complete a diagnostic v1 install.
+                original = manifest.read_bytes()
+                for field, value in [('product_ref', 'c'*40), ('sha256', '0'*64)]:
+                    changed = json.loads(original)
+                    changed['artifacts'][0][field] = value
+                    manifest.write_text(json.dumps(changed))
+                    refused = self.root/('bad-'+mode+'-'+field)
+                    result = subprocess.run(['sh', installer, '--manifest', str(manifest), '--prefix', str(refused), *options], capture_output=True, text=True)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(refused.exists())
+
     def test_restored_aya_notices_require_exact_registry_and_vcs_source(self):
         # Lockfile identity is independently read; source VCS identity is fixed
         # by the published crate archive, not selected by the caller.

@@ -180,7 +180,7 @@ fi
 
 MANIFEST_PATHS=""
 if [ -n "$MANIFEST_SNAP" ]; then
-    MANIFEST_PATHS="$(python3 - "$MANIFEST_SNAP" "$MANIFEST" <<'EOF'
+    MANIFEST_PATHS="$(python3 - "$MANIFEST_SNAP" "$MANIFEST" "$BIN_OVERRIDE" "$HARVEST_OVERRIDE" "$COUNT_OVERRIDE" "$MEMBERS_OVERRIDE" <<'EOF'
 import json, sys
 try:
     m = json.load(open(sys.argv[1]))
@@ -188,13 +188,14 @@ except (OSError, ValueError) as e:
     sys.exit("error: cannot parse build manifest %s: %s" % (sys.argv[2], e))
 if m.get("schema") != "osslscope-dev-build-manifest-v1":
     sys.exit("error: unsupported build manifest schema %r in %s (want osslscope-dev-build-manifest-v1; rebuild with scripts/build-dev.sh)" % (m.get("schema"), sys.argv[2]))
-# Current source-bearing builds may not silently select a historical subset
-# or normalize a mixed/duplicated artifact list into a current receipt.
+# Normal current installs require a complete matched source-bearing build.
+# Explicit composition may use a partial build, but its override selection
+# keeps the resulting receipt v1; it cannot become a current normal install.
 if m.get("product_tree"):
     expected = {("host-binary", None)} | {("bpf-object", "osslscope-" + name) for name in
         ("harvest", "count", "members", "provider-observation", "focused-count")}
     entries = m.get("artifacts", [])
-    if len(entries) != 6 or {(a.get("role"), a.get("bin")) for a in entries} != expected:
+    if not any(sys.argv[3:]) and (len(entries) != 6 or {(a.get("role"), a.get("bin")) for a in entries} != expected):
         sys.exit("error: current manifest requires exactly CLI and five BPF roles")
     if any(a.get("product_ref") != m.get("product_ref") or a.get("product_tree") != m.get("product_tree") for a in entries):
         sys.exit("error: mixed source identity in current build manifest")

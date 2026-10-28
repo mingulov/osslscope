@@ -26,6 +26,9 @@ source reference and every hash, including the running CLI. Missing, historical,
 partial, mixed or mutated receipts/objects refuse normal loading; an unreceipted
 sibling cannot bypass a prefix receipt. Dirty, partial and explicit-override
 installs retain historical v1 receipts for their explicit development routes.
+For example, a `--bpf-only` build can be composed with installer `--binary`,
+or a `--host-only` build with installer `--harvest`/`--count`; explicit artifacts
+remain operator-trusted and the composed v1 receipt cannot enable normal tracing.
 Commit reviewed source and rebuild the full tree for normal installed tracing.
 
 Manifest files are staged and checked against recorded hashes/lengths before
