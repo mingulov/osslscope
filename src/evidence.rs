@@ -792,6 +792,9 @@ impl LegacyCallPartition {
 /// from this one document for the same window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CaptureDocument {
+    /// Internal bounded metadata handoff; public projection is separately versioned.
+    #[serde(skip)]
+    pub candidate_associations: Vec<crate::focused_count::SiteAssociations>,
     pub schema: String,
     /// Observer package identity derived only from admitted retained inputs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1115,6 +1118,7 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         None => Completeness::Partial { reasons },
     };
     CaptureDocument {
+        candidate_associations: Vec::new(),
         schema: CAPTURE_SCHEMA_V2.to_string(),
         package_build: None,
         count_object: None,

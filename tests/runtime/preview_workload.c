@@ -172,7 +172,8 @@ int main(int argc, char **argv) {
         puts("OK quiet");
         return 0;
     }
-    int sha = !strcmp(mode, "sha") || !strcmp(mode, "sha-fail") || !strcmp(mode, "both")
+    int warm = !strcmp(mode, "warm-sha");
+    int sha = warm || !strcmp(mode, "sha") || !strcmp(mode, "sha-fail") || !strcmp(mode, "both")
         || !strcmp(mode, "worker") || !strcmp(mode, "forked") || !strcmp(mode, "mixed-fork");
     int aes = !strcmp(mode, "aes") || !strcmp(mode, "both")
         || !strcmp(mode, "worker") || !strcmp(mode, "forked") || !strcmp(mode, "mixed-fork");
@@ -188,7 +189,13 @@ int main(int argc, char **argv) {
             return 0;
         }
     }
+    if (warm) {
+        if (!crypto_work(1, 1, 0, 0)) return 1;
+        puts("READY warm-sha"); fflush(stdout);
+        if (getchar() != 'G') return 2;
+    }
     int ok = crypto_work(n, sha, aes, !strcmp(mode, "worker"));
+    if (warm) { puts("DONE warm-sha"); fflush(stdout); if (getchar() != 'E') return 2; }
     if (foreign > 0 && !wait_success(foreign)) ok = 0;
     if (!ok) { fputs("workload validation failed\n", stderr); return 1; }
     printf("OK sha=%lu aes=%lu foreign=%d\n", sha ? n : 0, aes ? n : 0, foreign > 0);

@@ -4,14 +4,14 @@
 use crate::{
     capture::{self, ClockPort, LiveClock},
     evidence::*,
-    focused_count::{CountLimits, CountSample, FocusedCounter},
+    focused_count::{CountCandidate, CountLimits, CountSample, FocusedCounter},
     inventory::{
         self,
         scope::{ScopedScanner, Selection},
     },
     provider_observation::{
         AliasStatus, Cacheability, ObservationBatch, ObservationGap, ObservationLimits,
-        ObservationPayload, ProviderSession, VerifiedSiteCandidate, cli::Signals,
+        ObservationPayload, ProviderSession, cli::Signals,
     },
     target::{OwnedTarget, TargetDisposition},
 };
@@ -78,9 +78,9 @@ pub struct FocusedResult {
     pub workload_discarded: bool,
 }
 
-/// No event-order proof is exposed within a batch. Retirement therefore also
-/// forbids admitting that batch's candidates; only a later return can rearm.
-pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
+/// No event-order proof is exposed within a batch. Invalidation therefore
+/// discards new live metadata; static code lifetime is checked independently.
+fn batch_invalidates_advertisements(batch: &ObservationBatch, pid: u32) -> bool {
     batch.facts.iter().any(|f| {
         f.pid == pid
             && matches!(
@@ -116,6 +116,32 @@ pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
                 | ObservationGap::BpfUnavailable
                 | ObservationGap::FactLimit
                 | ObservationGap::StateLimit
+        )
+    })
+}
+/// Target-memory observation loss does not invalidate retained executable code.
+/// Actual process, namespace and backing changes still retire every link.
+pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
+    batch.facts.iter().any(|f| {
+        f.pid == pid
+            && matches!(
+                f.payload,
+                ObservationPayload::Invalidation {
+                    cause: crate::provider_observation::InvalidationCause::IdentityChanged
+                }
+            )
+    }) || batch.gaps.iter().any(|g| {
+        matches!(
+            g,
+            ObservationGap::ProcessUnavailable
+                | ObservationGap::ProcessChanged
+                | ObservationGap::NamespaceChanged
+                | ObservationGap::BackingUnavailable
+                | ObservationGap::IdentityUnverified
+                | ObservationGap::ObjectChanged
+                | ObservationGap::MalformedMaps
+                | ObservationGap::MembershipUnknown
+                | ObservationGap::BpfUnavailable
         )
     })
 }
@@ -202,7 +228,8 @@ pub fn project(
         counter.units = CounterUnits::Calls;
         sample.gaps.push(counter);
     }
-    crate::evidence::finalize(FinalizeInput {
+    let associations = std::mem::take(&mut sample.associations);
+    let mut document = crate::evidence::finalize(FinalizeInput {
         window,
         sites: sample.sites,
         fenced: fenced
@@ -233,7 +260,9 @@ pub fn project(
         legacy_partition: partition,
         engine_observations: Vec::new(),
         traversal: None,
-    })
+    });
+    document.candidate_associations = associations;
+    document
 }
 fn now_ns() -> anyhow::Result<u64> {
     LiveClock
@@ -258,8 +287,6 @@ pub(crate) fn observer_namespace() -> anyhow::Result<inventory::NamespaceId> {
     })
 }
 
-// This grouping owns only the current bounded batch, never a shadow link table.
-type Group = (u64, u64, u64, u64, u64, u64, String);
 fn process_batch(
     session: &ProviderSession,
     counter: &mut FocusedCounter,
@@ -274,71 +301,46 @@ fn process_batch(
         counter.retire();
         return Ok(false);
     }
-    // Reserve 8 MiB of the combined 32 MiB host allowance for controller
-    // grouping/clones/projection. Charge cumulatively before allocation.
-    let charge = batch.learned_sites.iter().try_fold(0usize, |n, c| {
-        c.advertiser_candidates()
-            .len()
-            .checked_mul(1024)?
-            .checked_add(2048)?
-            .checked_add(n)
-    });
-    let admitted = charge.and_then(|n| state_bytes.checked_add(n));
+    let discard_live = batch_invalidates_advertisements(&batch, pid);
+    let count = batch
+        .static_candidates
+        .len()
+        .checked_add(batch.learned_sites.len());
+    let admitted = count
+        .and_then(|n| n.checked_mul(256))
+        .and_then(|n| state_bytes.checked_add(n));
     if admitted.is_none_or(|n| n > 8 << 20) {
         gaps.insert(ObservationGap::StateLimit);
-        counter.retire();
         return Ok(false);
     }
     *state_bytes = admitted.unwrap();
-    let mut groups: BTreeMap<Group, Vec<VerifiedSiteCandidate>> = BTreeMap::new();
-    for candidate in batch.learned_sites {
-        if candidate.pid() != pid {
-            continue;
-        }
-        if candidate.alias_quality().status != AliasStatus::Complete {
-            gaps.insert(ObservationGap::AmbiguousSite);
-            if candidate.alias_quality().status == AliasStatus::ReadFailed {
-                gaps.insert(ObservationGap::DispatchPartial);
+    let mut candidates: Vec<_> = batch
+        .static_candidates
+        .into_iter()
+        .filter(|c| c.pid() == pid)
+        .map(CountCandidate::Static)
+        .collect();
+    if !discard_live {
+        for candidate in batch.learned_sites {
+            if candidate.pid() != pid {
+                continue;
             }
-        }
-        let site = candidate.site();
-        groups
-            .entry((
-                candidate.starttime(),
-                candidate.generation(),
-                site.generation(),
-                site.native_device(),
-                site.inode(),
-                site.file_offset(),
-                site.object_hash().clone().into(),
-            ))
-            .or_default()
-            .push(candidate);
-    }
-    let mut valid = true;
-    for candidates in groups.into_values() {
-        for candidate in &candidates {
-            if let Err(gap) = session.revalidate_candidate(candidate) {
+            if candidate.alias_quality().status != AliasStatus::Complete {
+                gaps.insert(ObservationGap::AmbiguousSite);
+            }
+            if let Err(gap) = session.revalidate_candidate(&candidate) {
                 gaps.insert(gap);
                 counter.retire();
                 return Ok(false);
             }
-        }
-        let installed = now_ns()?;
-        if installed >= deadline_ns {
-            return Ok(false);
-        }
-        if counter.attach_group(candidates.clone(), installed).is_err() {
-            valid = false;
-        }
-        for candidate in &candidates {
-            if let Err(gap) = session.revalidate_candidate(candidate) {
-                gaps.insert(gap);
-                counter.retire();
-                return Ok(false);
-            }
+            candidates.push(CountCandidate::Learned(candidate));
         }
     }
+    let installed = now_ns()?;
+    if installed >= deadline_ns {
+        return Ok(false);
+    }
+    let valid = counter.attach_candidates(candidates, installed).is_ok();
     Ok(valid && counter.active_site_count() > 0 && now_ns()? < deadline_ns)
 }
 

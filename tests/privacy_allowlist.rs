@@ -16,12 +16,14 @@ fn manifest_dir() -> PathBuf {
 /// hide behind a same-named map in the other object (H1's harvest
 /// `GEN` hid behind count's `GEN` — union count stayed 17 by
 /// coincidence).
-fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>) {
+fn inventory_from_doc() -> [BTreeSet<String>; 5] {
     let text = fs::read_to_string(manifest_dir().join("docs/privacy/allowlist-v1.md")).unwrap();
     let mut in_block = false;
     let mut harvest = BTreeSet::new();
     let mut count = BTreeSet::new();
     let mut members = BTreeSet::new();
+    let mut observation = BTreeSet::new();
+    let mut focused = BTreeSet::new();
     let mut section: Option<&mut BTreeSet<String>> = None;
     for line in text.lines() {
         let t = line.trim();
@@ -46,6 +48,8 @@ fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>
                 "harvest" => &mut harvest,
                 "count" => &mut count,
                 "members" => &mut members,
+                "provider_observation" => &mut observation,
+                "focused_count" => &mut focused,
                 other => panic!("unknown inventory section: {other:?}"),
             });
             continue;
@@ -62,7 +66,7 @@ fn inventory_from_doc() -> (BTreeSet<String>, BTreeSet<String>, BTreeSet<String>
     assert!(!harvest.is_empty(), "harvest inventory missing/empty");
     assert!(!count.is_empty(), "count inventory missing/empty");
     assert!(!members.is_empty(), "members inventory missing/empty");
-    (harvest, count, members)
+    [harvest, count, members, observation, focused]
 }
 
 fn maps_from_source(path: &Path) -> BTreeSet<String> {
@@ -99,7 +103,21 @@ fn maps_from_source(path: &Path) -> BTreeSet<String> {
 
 #[test]
 fn map_inventory_matches_sources() {
-    let (doc_harvest, doc_count, doc_members) = inventory_from_doc();
+    let [
+        doc_harvest,
+        doc_count,
+        doc_members,
+        doc_observation,
+        doc_focused,
+    ] = inventory_from_doc();
+    assert_eq!(
+        doc_observation,
+        maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/provider_observation.rs"))
+    );
+    assert_eq!(
+        doc_focused,
+        maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/focused_count.rs"))
+    );
     let src_harvest = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/harvest.rs"));
     let src_count = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/count.rs"));
     let src_members = maps_from_source(&manifest_dir().join("crates/ebpf/src/bin/members.rs"));
@@ -232,6 +250,22 @@ fn probe_read_allowlist_is_complete() {
     assert!(
         !count.contains("bpf_probe_read_user"),
         "count program must read no target memory"
+    );
+    let focused =
+        fs::read_to_string(manifest_dir().join("crates/ebpf/src/bin/focused_count.rs")).unwrap();
+    assert!(
+        !focused.contains("bpf_probe_read_user"),
+        "static candidates must remain entry-only"
+    );
+    let observation =
+        fs::read_to_string(manifest_dir().join("crates/ebpf/src/bin/provider_observation.rs"))
+            .unwrap();
+    assert_eq!(observation.match_indices("bpf_probe_read_user").count(), 10);
+    assert_eq!(
+        observation
+            .match_indices("bpf_probe_read_user_str_bytes")
+            .count(),
+        2
     );
     let total = harvest.match_indices("bpf_probe_read_user").count();
     let str_reads = harvest

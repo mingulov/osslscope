@@ -66,7 +66,8 @@ fn finite_registry_ids_reject_unregistered_values() {
         po::AlgorithmId::try_from(u16::MAX).unwrap().label(),
         "other"
     );
-    assert!(po::FunctionIdentity::new(po::Operation::Digest, 99999).is_err());
+    assert!(po::FunctionIdentity::new(po::Operation::Digest, 99999).is_ok());
+    assert!(po::FunctionIdentity::new(po::Operation::Digest, u32::MAX).is_err());
     assert!(po::FunctionIdentity::new(po::Operation::Digest, 1).is_ok());
 }
 #[test]
@@ -355,13 +356,21 @@ fn native_provider_observation() {
             volatile = false
         }
         if command == 'Q' {
-            // The third Q follows acknowledged unquery and must restart at the
-            // known first entry. The second Q must independently reach Other.
+            // Every single returned table must now contain both algorithms;
+            // no second application query is needed to reach the next slot.
             assert_eq!(
-                query_phase_complete(&b, volatile, counters[2] == 2),
+                query_phase_complete(&b, volatile, false),
                 Ok(()),
                 "query phase {}: gaps={:?}",
                 counters[2],
+                b.gaps
+            );
+        }
+        if command == 'Q' {
+            assert_eq!(
+                query_phase_complete(&b, volatile, true),
+                Ok(()),
+                "same-return unknown row: {:?}",
                 b.gaps
             );
         }
@@ -579,13 +588,10 @@ fn recursion_overflow_is_gap() {
     assert!(t.skip_return());
 }
 #[test]
-fn unquery_restarts_sampling_without_census_claim() {
-    use wire::contract::*;
-    assert_eq!(sample_index(1, 511), Some(511));
-    assert_eq!(sample_index(1, 512), None);
-    assert_eq!(sample_index(2, 511), Some(0));
-    assert_eq!(sample_index(0, 511), Some(0));
-    assert_eq!(sample_index(1, 0), Some(0));
+fn future_public_operations_preserve_numeric_identity() {
+    assert_eq!(wire::contract::known_operation(50001), 50001);
+    assert_eq!(wire::contract::known_operation(50002), 50002);
+    assert_eq!(wire::contract::known_operation(u32::MAX), 0);
 }
 #[test]
 fn unknown_and_alias_bytes_discarded() {
@@ -650,4 +656,428 @@ fn invalid_object_is_refused_before_bpf_load() {
         po::ProviderSession::open(po::ObservationLimits::default(), b"not ELF"),
         Err(po::ObservationGap::InvalidObject)
     ));
+}
+
+#[test]
+fn public_abi_future_numeric_ids_remain_distinct_countable_inputs() {
+    for (operation, function) in [(50001u32, 70001u32), (50002, 70001), (50001, 70002)] {
+        let mut r = record(6);
+        for (at, value) in [
+            (12, 17),
+            (60, operation),
+            (64, 65535),
+            (68, function),
+            (72, 1),
+        ] {
+            r[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        r[80..88].copy_from_slice(&4096u64.to_le_bytes());
+        assert!(
+            wire::decode(&r).is_ok(),
+            "future public ABI operation/function is not a registry admission gate"
+        );
+    }
+}
+#[test]
+fn public_dispatch_getter_return_is_a_correlated_dispatch_source() {
+    let mut r = record(3);
+    for (at, value) in [(12, 16u32), (56, 1), (68, 1027)] {
+        r[at..at + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    r[80..88].copy_from_slice(&4096u64.to_le_bytes());
+    assert!(wire::decode(&r).is_ok());
+    r[56..60].copy_from_slice(&0u32.to_le_bytes());
+    assert!(
+        wire::decode(&r).is_err(),
+        "unsuccessful getter cannot authorize code relocation"
+    );
+}
+
+#[test]
+#[ignore = "requires explicitly supplied fresh observation/count objects and native BPF privileges"]
+fn native_static_lookalike_getter_and_shared_site() {
+    use osslscope::{
+        capture::{ClockPort, LiveClock},
+        focused_count::{CountCandidate, CountLimits, FocusedCounter, MetadataOrigin},
+        inventory::{
+            self,
+            scope::{ScopedScanner, Selection},
+        },
+    };
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Write},
+        os::unix::fs::MetadataExt,
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("osslscope-v2-count-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let provider = dir.join("fixture.so");
+    let app = dir.join("fixture");
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-O1", "-Wl,-Bsymbolic", "-o"])
+            .arg(&provider)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/provider_observation_provider.c"
+            ))
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("cc")
+            .args(["-O1", "-o"])
+            .arg(&app)
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/provider_observation.c"
+            ))
+            .args(["-lcrypto", "-ldl"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let bytes = fs::read(&provider).unwrap();
+    let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+    let offset = |name: &str| {
+        let symbol = elf
+            .dynsyms
+            .iter()
+            .find(|s| elf.dynstrtab.get_at(s.st_name) == Some(name))
+            .unwrap();
+        let segment = elf
+            .program_headers
+            .iter()
+            .find(|p| {
+                p.p_type == 1
+                    && symbol.st_value >= p.p_vaddr
+                    && symbol.st_value < p.p_vaddr + p.p_filesz
+            })
+            .unwrap();
+        segment.p_offset + symbol.st_value - segment.p_vaddr
+    };
+    let shared = offset("fixture_count_entry");
+    let lookalike = offset("fixture_lookalike");
+    let mut child = Owned(
+        Command::new(&app)
+            .arg(&provider)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut output = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    output.read_line(&mut line).unwrap();
+    assert_eq!(line, "ready\n");
+    let mut send = |child: &mut Owned, command: &str| -> Vec<String> {
+        writeln!(child.0.stdin.as_mut().unwrap(), "{command}").unwrap();
+        child.0.stdin.as_mut().unwrap().flush().unwrap();
+        let mut lines = Vec::new();
+        loop {
+            let mut line = String::new();
+            assert!(output.read_line(&mut line).unwrap() > 0);
+            let ack = line.starts_with("ack ");
+            lines.push(line);
+            if ack {
+                break;
+            }
+        }
+        assert_eq!(lines.last().unwrap().split_whitespace().nth(2), Some("1"));
+        lines
+    };
+    // Initialize/query before the observer: only the later public getter can
+    // corroborate the callback ABI. Static discovery must work without it.
+    send(&mut child, "I");
+    send(&mut child, "P");
+    send(&mut child, "Q");
+    let mut scanner = ScopedScanner::new(
+        Selection {
+            pids: vec![child.0.id()],
+            ..Default::default()
+        },
+        inventory::Limits::default(),
+    )
+    .unwrap();
+    let snapshot = scanner.snapshot();
+    let mut budget = po::ObservationBudget::default();
+    let process = po::acquire(&snapshot.processes[0], &mut budget).unwrap();
+    let first = process.static_candidates(&budget).unwrap();
+    let read_bytes = budget.elf_read_bytes();
+    let second = process.static_candidates(&budget).unwrap();
+    assert_eq!(first.len(), second.len());
+    assert_eq!(
+        budget.elf_read_bytes(),
+        read_bytes,
+        "cached retained files were reparsed"
+    );
+    assert!(read_bytes > 0 && read_bytes <= 268435456);
+    println!(
+        "retained-file static discovery: {} associations, {} shared-budget read bytes; second scan adds zero reads",
+        first.len(),
+        read_bytes
+    );
+    drop((first, second, process));
+    let object = fs::read(
+        std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").expect("fresh observation object"),
+    )
+    .unwrap();
+    let count =
+        fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").expect("fresh count object"))
+            .unwrap();
+    let mut session = po::ProviderSession::open(po::ObservationLimits::default(), &object).unwrap();
+    let setup = session.reconcile(&scanner.snapshot());
+    let metadata = fs::metadata(&provider).unwrap();
+    let candidates: Vec<_> = setup
+        .static_candidates
+        .into_iter()
+        .filter(|c| {
+            c.site().inode() == metadata.ino() && c.site().native_device() == metadata.dev()
+        })
+        .collect();
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.site().file_offset() == lookalike && c.function_id() == 1027)
+    );
+    assert!(
+        candidates
+            .iter()
+            .any(|c| c.site().file_offset() == shared && c.function_id() == 70001)
+    );
+    let ns = fs::metadata("/proc/self/ns/pid").unwrap();
+    let namespace = inventory::NamespaceId {
+        device: ns.dev(),
+        inode: ns.ino(),
+    };
+    let now = || LiveClock.checked_monotonic_ns().unwrap();
+    let limits = CountLimits {
+        max_links: 1,
+        window: osslscope::evidence::CountAdmissionWindow {
+            start_ns: now(),
+            deadline_ns: now() + 30_000_000_000,
+        },
+        ..Default::default()
+    };
+    let mut negative = FocusedCounter::open(&count, child.0.id(), namespace, limits).unwrap();
+    negative
+        .attach_candidates(
+            candidates
+                .iter()
+                .filter(|c| c.site().file_offset() == lookalike || c.site().file_offset() == shared)
+                .cloned()
+                .map(CountCandidate::Static)
+                .collect(),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        (negative.active_site_count(), negative.active_link_count()),
+        (2, 1)
+    );
+    send(&mut child, "L7");
+    let b = session.drain(Instant::now() + Duration::from_millis(100));
+    assert!(
+        b.facts.is_empty(),
+        "static lookalike emitted an advertisement"
+    );
+    assert!(
+        b.learned_sites.is_empty(),
+        "static lookalike installed a query reader"
+    );
+    assert!(!b.gaps.contains(&po::ObservationGap::TargetReadFailed));
+    let n = negative.close(Instant::now() + Duration::from_secs(1));
+    assert_eq!(n.fenced.iter().map(|s| s.calls).sum::<u64>(), 7);
+    let mut counter = FocusedCounter::open(&count, child.0.id(), namespace, limits).unwrap();
+    counter
+        .attach_candidates(
+            candidates
+                .into_iter()
+                .filter(|c| c.site().file_offset() == shared)
+                .map(CountCandidate::Static)
+                .collect(),
+            now(),
+        )
+        .unwrap();
+    assert_eq!(
+        (counter.active_site_count(), counter.active_link_count()),
+        (1, 1)
+    );
+    send(&mut child, "G");
+    let getter = session.drain(Instant::now() + Duration::from_millis(100));
+    assert!(getter.facts.iter().any(|f| f.api
+        == po::ObservationApi::Inventoried(inventory::Api::OsslProviderGet0Dispatch)
+        && matches!(
+            f.payload,
+            po::ObservationPayload::InitResult {
+                outcome: po::ApiOutcome::Success
+            }
+        )));
+    let mut algorithms = std::collections::BTreeSet::new();
+    for (command, operation) in [("Q", 1), ("Y", 2), ("J", 50001)] {
+        send(&mut child, command);
+        let b = session.drain(Instant::now() + Duration::from_millis(100));
+        assert!(
+            !b.gaps.iter().any(|g| matches!(
+                g,
+                po::ObservationGap::InvalidWire
+                    | po::ObservationGap::TargetReadFailed
+                    | po::ObservationGap::QueueLoss
+            )),
+            "{:?}",
+            b.gaps
+        );
+        let learned: Vec<_> = b
+            .learned_sites
+            .into_iter()
+            .filter(|c| c.site().inode() == metadata.ino() && c.site().file_offset() == shared)
+            .collect();
+        assert!(
+            learned
+                .iter()
+                .any(|c| c.numeric_operation() == operation && c.function().id() == 70001)
+        );
+        assert!(learned.iter().any(|c| c.algorithm().label() == "other"));
+        assert!(learned.iter().any(|c| c.algorithm().label() != "other"));
+        let unknown_ids: std::collections::BTreeSet<_> = learned
+            .iter()
+            .filter(|c| c.algorithm().label() == "other")
+            .map(|c| c.dynamic_algorithm())
+            .collect();
+        // Two unknown rows in each of the public wrapper and correlated
+        // callback observations must remain four distinct observation IDs.
+        assert_eq!(
+            unknown_ids.len(),
+            4,
+            "unknown rows collapsed within one returned table"
+        );
+        for c in &learned {
+            algorithms.insert(c.dynamic_algorithm());
+        }
+        counter
+            .attach_candidates(
+                learned.into_iter().map(CountCandidate::Learned).collect(),
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            (counter.active_site_count(), counter.active_link_count()),
+            (1, 1)
+        );
+        assert_eq!(
+            counter
+                .sample(Instant::now() + Duration::from_secs(1))
+                .sites[0]
+                .calls,
+            0,
+            "advertisement is not execution"
+        );
+    }
+    assert!(
+        algorithms.len() == 18,
+        "unknown observations must not collapse into Other"
+    );
+    let lines = send(&mut child, "C37");
+    assert!(lines.iter().any(|s| s.trim() == "calls C 37 37"));
+    let sample = counter.sample(Instant::now() + Duration::from_secs(1));
+    assert_eq!(sample.sites.len(), 1);
+    assert_eq!(sample.sites[0].calls, 37);
+    assert_eq!(sample.admitted, 37);
+    assert!(
+        sample.sites[0].candidates.is_empty(),
+        "late metadata relabeled earlier attribution"
+    );
+    assert_eq!(
+        sample.sites[0].candidates_coverage,
+        osslscope::evidence::CandidateCoverage::Unknown
+    );
+    assert_eq!(sample.associations.len(), 1);
+    for origin in [
+        MetadataOrigin::StaticPublicTableCandidate,
+        MetadataOrigin::ObservedPublicAbi,
+    ] {
+        assert!(
+            sample.associations[0]
+                .associations
+                .iter()
+                .any(|a| a.origin == origin)
+        );
+    }
+    assert!(
+        sample.associations[0]
+            .associations
+            .iter()
+            .filter(|a| a.origin == MetadataOrigin::StaticPublicTableCandidate)
+            .all(|a| a.advertisers.is_empty())
+    );
+    // Volatile advertisement invalidates its lease, not the file-backed entry
+    // counter; no volatile callback pointer enters learned attachment inputs.
+    send(&mut child, "V");
+    send(&mut child, "Q");
+    let volatile = session.drain(Instant::now() + Duration::from_millis(100));
+    assert!(volatile.learned_sites.is_empty());
+    assert!(!osslscope::focused_capture::batch_requires_retirement(
+        &volatile,
+        child.0.id()
+    ));
+    send(&mut child, "M");
+    send(&mut child, "Q");
+    let unreadable = session.drain(Instant::now() + Duration::from_secs(2));
+    assert!(
+        unreadable
+            .gaps
+            .contains(&po::ObservationGap::TargetReadFailed)
+    );
+    assert!(!osslscope::focused_capture::batch_requires_retirement(
+        &unreadable,
+        child.0.id()
+    ));
+    send(&mut child, "T");
+    send(&mut child, "Q");
+    let truncated = session.drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        truncated
+            .gaps
+            .contains(&po::ObservationGap::DispatchPartial),
+        "bounded table overflow was not explicit: {:?}",
+        truncated.gaps
+    );
+    for _ in 0..3 {
+        send(&mut child, "Q");
+    }
+    let overflow = session.drain(Instant::now() + Duration::from_secs(5));
+    assert!(
+        overflow.gaps.contains(&po::ObservationGap::QueueLoss),
+        "full ring not disclosed: {:?}",
+        overflow.gaps
+    );
+    assert!(!osslscope::focused_capture::batch_requires_retirement(
+        &overflow,
+        child.0.id()
+    ));
+    let sample = counter.close(Instant::now() + Duration::from_secs(1));
+    assert_eq!(sample.fenced.iter().map(|s| s.calls).sum::<u64>(), 37);
+    assert_eq!(
+        sample.associations[0].count_generation,
+        sample.fenced[0].generation
+    );
+    println!(
+        "native static lookalike=7, shared static+live N=37, advertise-only=0, physical sites=1, links=1, algorithms={}",
+        algorithms.len()
+    );
+    writeln!(child.0.stdin.as_mut().unwrap(), "E").unwrap();
+    drop(child.0.stdin.take());
+    assert!(child.0.wait().unwrap().success());
+    drop(session);
+    fs::remove_dir_all(dir).unwrap();
 }

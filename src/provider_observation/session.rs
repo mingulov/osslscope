@@ -27,6 +27,7 @@ pub struct ObservationBatch {
     pub facts: Vec<ObservationFact>,
     pub gaps: Vec<ObservationGap>,
     pub learned_sites: Vec<VerifiedSiteCandidate>,
+    pub static_candidates: Vec<VerifiedStaticCandidate>,
 }
 impl ObservationBatch {
     fn gap(&mut self, g: ObservationGap) {
@@ -44,6 +45,9 @@ pub struct VerifiedSiteCandidate {
     generation: u64,
     advertisers: Vec<ObjectHash>,
     operation: Operation,
+    numeric_operation: u32,
+    dynamic_algorithm: super::static_tables::DynamicAlgorithmId,
+    observed_ns: u64,
     algorithm: AlgorithmId,
     alias_quality: AliasQuality,
     function: FunctionIdentity,
@@ -66,6 +70,15 @@ impl VerifiedSiteCandidate {
     }
     pub fn operation(&self) -> Operation {
         self.operation
+    }
+    pub fn numeric_operation(&self) -> u32 {
+        self.numeric_operation
+    }
+    pub fn dynamic_algorithm(&self) -> super::static_tables::DynamicAlgorithmId {
+        self.dynamic_algorithm
+    }
+    pub fn observed_ns(&self) -> u64 {
+        self.observed_ns
     }
     pub fn algorithm(&self) -> AlgorithmId {
         self.algorithm
@@ -115,8 +128,8 @@ fn role_site(pid: u32, starttime: u64, site: &VerifiedSite) -> RoleSite {
     ]
 }
 fn validate_candidate_member(member: &c::Member, generation: u64) -> Result<(), ObservationGap> {
-    // Epoch is the producer's cursor-continuation lease. Disabled cursors do
-    // not invalidate the process/code binding of a later current return.
+    // Epoch is the advertisement lease. Its invalidation does not invalidate
+    // the verified process/code binding of a later current return.
     if member.generation != generation || !matches!(member.epoch, 0 | 1) {
         Err(ObservationGap::MembershipUnknown)
     } else {
@@ -206,11 +219,9 @@ fn specs() -> Vec<loader::MapSpec> {
         ("RANGES", 1, 8, 16, 8192),
         ("THREADS", 1, 16, 16, 4096),
         ("PENDING", 1, 24, 56, 4096),
-        ("CURSORS", 1, 48, 4, 4096),
         ("LOSS", 6, 4, 8, 8),
         ("ALG_CLASS", 1, 8, 42, 1024),
         ("TRIP_CLASS", 1, 8, 22, 64),
-        ("FUNCTIONS", 1, 8, 4, 1024),
     ];
     shapes
         .into_iter()
@@ -280,7 +291,7 @@ impl ProviderSession {
         let mut prepared = prepare_object(object)?;
         // Retain hard bounds while honoring lower pending/process limits in actual maps.
         for m in &mut prepared.maps {
-            if matches!(m.name.as_str(), "PENDING" | "THREADS" | "CURSORS") {
+            if matches!(m.name.as_str(), "PENDING" | "THREADS") {
                 m.max_entries = budget.limits.max_pending_calls.max(1) as u32;
             }
             if m.name == "MEMBERS" {
@@ -293,19 +304,6 @@ impl ProviderSession {
             crate::discovery::ClassifierRole::Harvest,
         )
         .map_err(|_| ObservationGap::ClassifierFailed)?;
-        let mut functions = BpfMap::<_, u64, u32>::try_from(map(&loaded, "FUNCTIONS")?)
-            .map_err(|_| ObservationGap::InvalidObject)?;
-        for f in crate::kinds::FUNCS {
-            if let Some(op) =
-                f.op.and_then(|name| crate::kinds::OPS.iter().find(|op| op.name == name))
-            {
-                functions
-                    .insert(((op.id as u64) << 32) | f.id as u64, f.id, 0)
-                    .map_err(|_| ObservationGap::ClassifierFailed)?;
-            }
-        }
-        ossl_bpf_sys::map_freeze(loaded.maps["FUNCTIONS"].as_raw_fd())
-            .map_err(|_| ObservationGap::ClassifierFailed)?;
         let ns = std::fs::File::open("/proc/self/ns/pid")
             .and_then(|f| f.metadata())
             .map_err(|_| ObservationGap::NamespaceChanged)?;
@@ -413,6 +411,7 @@ impl ProviderSession {
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) {
         self.aliases.retire(pid);
         b.learned_sites.retain(|site| site.pid != pid);
+        b.static_candidates.retain(|site| site.pid() != pid);
         // Disarm before dropping links. Never walk kernel-private opaque joins.
         if self.members.remove(&pid).is_err() {
             b.gap(ObservationGap::Invalidated)
@@ -503,7 +502,7 @@ impl ProviderSession {
                     )
                     .map_err(|_| ObservationGap::AttachFailed)?;
             }
-            for id in 1..=15 {
+            for id in 1..=16 {
                 for resolved in target.process.resolve_api(wire::api(id)?) {
                     let key = role_site(pid, record.starttime, &resolved.site);
                     if !self.roles.observe(key, id, &self.budget)? {
@@ -538,11 +537,13 @@ impl ProviderSession {
                     }
                 }
             }
+            b.static_candidates
+                .extend(target.process.static_candidates(&self.budget)?);
             for g in target.process.gaps() {
                 b.gap(g)
             }
             target.process.revalidate()?;
-            if target.attachments.is_empty() {
+            if target.attachments.is_empty() && b.static_candidates.is_empty() {
                 return Err(ObservationGap::SymbolUnavailable);
             }
             self.members
@@ -732,6 +733,20 @@ impl ProviderSession {
                             generation: r.generation,
                             advertisers,
                             operation: Operation::from_id(r.operation).unwrap_or(Operation::Other),
+                            numeric_operation: r.operation,
+                            dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                                &hash,
+                                [
+                                    r.pid as u64,
+                                    starttime,
+                                    r.generation,
+                                    r.cookie,
+                                    r.invocation,
+                                    r.operation as u64,
+                                    r.algorithm_index as u64,
+                                ],
+                            ),
+                            observed_ns: r.monotonic_ns,
                             algorithm: *algorithm,
                             alias_quality: *alias_quality,
                             function: *function,
@@ -750,9 +765,6 @@ impl ProviderSession {
         } = &mut payload
         {
             *advertiser_candidates = advertisers;
-        }
-        if matches!(payload, ObservationPayload::Invalidation { .. }) {
-            b.gap(ObservationGap::Invalidated)
         }
         if self.emitted >= self.budget.limits.max_facts {
             b.gap(ObservationGap::FactLimit);
@@ -914,7 +926,7 @@ fn acquire_observable(
             .info
             .exports
             .iter()
-            .any(|api| (1..=15).any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api))))
+            .any(|api| (1..=16).any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api))))
     }) {
         return Ok(None);
     }
@@ -929,6 +941,13 @@ pub(crate) fn assemble_payload(
 ) -> Option<ObservationPayload> {
     let r = event.record();
     Some(match event {
+        wire::Transport::Begin(r) => {
+            if let Err(g) = aliases.begin(&r, budget) {
+                invalidate_algorithms(b);
+                b.gap(g);
+            }
+            return None;
+        }
         wire::Transport::Alias(r) => {
             if let Err(g) = aliases.alias(&r) {
                 invalidate_algorithms(b);
@@ -955,11 +974,7 @@ pub(crate) fn assemble_payload(
             wire::algorithm_event(r, algorithm, alias_quality).into_payload()
         }
         wire::Transport::Event(event) => {
-            if r.kind == c::QUERY {
-                if let Err(g) = aliases.begin(&r, budget) {
-                    b.gap(g);
-                }
-            } else if r.kind == c::INVALIDATION {
+            if r.kind == c::INVALIDATION {
                 aliases.retire(r.pid);
             }
             let mut payload = event.into_payload();
@@ -1140,7 +1155,7 @@ fn object_id(site: &VerifiedSite) -> u64 {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn candidate_membership_accepts_current_return_after_cursor_disable() {
+    fn candidate_membership_accepts_current_return_after_lease_invalidation() {
         for epoch in [0, 1] {
             let member = c::Member {
                 generation: 7,
@@ -1224,7 +1239,6 @@ mod tests {
                 exports: vec![
                     inventory::Api::OpenSslInitCrypto,
                     inventory::Api::OpenSslVersionMajor,
-                    inventory::Api::OsslProviderGet0Dispatch,
                 ],
                 depends_on_libcrypto: true,
                 depends_on_libssl: false,
@@ -1238,7 +1252,7 @@ mod tests {
         record.modules[0]
             .info
             .exports
-            .push(inventory::Api::OsslProviderLoad);
+            .push(inventory::Api::OsslProviderGet0Dispatch);
         assert!(matches!(
             acquire_observable(&record, &mut budget),
             Err(ObservationGap::ProcessUnavailable)

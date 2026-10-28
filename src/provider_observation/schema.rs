@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::rc::Rc;
 
+/// Metadata origin does not change a physical counter's attribution certainty.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MetadataOrigin {
+    StaticPublicTableCandidate,
+    ObservedPublicAbi,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservationGap {
@@ -402,11 +408,7 @@ pub struct FunctionIdentity {
 }
 impl FunctionIdentity {
     pub fn new(operation: Operation, id: u32) -> Result<Self, &'static str> {
-        if id == 0
-            || crate::kinds::FUNCS
-                .iter()
-                .any(|f| f.id == id && f.op == operation.registry_name() && f.op.is_some())
-        {
+        if id <= i32::MAX as u32 {
             Ok(Self { operation, id })
         } else {
             Err("invalid_function_id")

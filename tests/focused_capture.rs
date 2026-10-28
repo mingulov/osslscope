@@ -161,28 +161,22 @@ fn invalidation() -> ObservationFact {
     .unwrap()
 }
 #[test]
-fn invalidation_discards_same_batch_advertisements_before_admission() {
+fn unquery_preserves_backed_physical_count_lifetime() {
     let batch = ObservationBatch {
         facts: vec![invalidation()],
         ..Default::default()
     };
-    assert!(batch_requires_retirement(&batch, 42));
+    assert!(!batch_requires_retirement(&batch, 42));
     assert!(!batch_requires_retirement(&batch, 43));
 }
 #[test]
 fn unscoped_loss_and_identity_churn_require_later_advertisements() {
     for gap in [
-        ObservationGap::QueueLoss,
         ObservationGap::NamespaceChanged,
         ObservationGap::ProcessChanged,
         ObservationGap::MembershipUnknown,
         ObservationGap::ObjectChanged,
-        ObservationGap::InvalidWire,
-        ObservationGap::TargetReadFailed,
-        ObservationGap::Invalidated,
         ObservationGap::BpfUnavailable,
-        ObservationGap::FactLimit,
-        ObservationGap::StateLimit,
     ] {
         let batch = ObservationBatch {
             gaps: vec![gap],
@@ -197,6 +191,11 @@ fn unscoped_loss_and_identity_churn_require_later_advertisements() {
 #[test]
 fn ordinary_coverage_and_finite_alias_gaps_do_not_retire_sites() {
     for gap in [
+        ObservationGap::QueueLoss,
+        ObservationGap::InvalidWire,
+        ObservationGap::TargetReadFailed,
+        ObservationGap::FactLimit,
+        ObservationGap::StateLimit,
         ObservationGap::FirstQueryUnknown,
         ObservationGap::IntervalUnknown,
         ObservationGap::SamplingPartial,
@@ -352,11 +351,11 @@ fn zero_hit_row_does_not_skip_a_later_invalid_execution_row() {
 }
 
 #[test]
-fn query_cacheability_retires_selected_pid_without_an_invalidation_fact() {
+fn query_cacheability_does_not_retire_verified_code_lifetime() {
     for (cacheability, retire) in [
         (Cacheability::Cacheable, false),
-        (Cacheability::Volatile, true),
-        (Cacheability::Unknown, true),
+        (Cacheability::Volatile, false),
+        (Cacheability::Unknown, false),
     ] {
         let mut fact = invalidation();
         fact.payload = ObservationPayload::QueryResult {
@@ -376,5 +375,93 @@ fn query_cacheability_retires_selected_pid_without_an_invalidation_fact() {
             !batch_requires_retirement(&batch, 43),
             "unrelated PID {cacheability:?}"
         );
+    }
+}
+
+#[test]
+fn association_handoff_keeps_fenced_identity_without_another_count() {
+    use osslscope::focused_count::{CandidateAssociation, MetadataOrigin, SiteAssociations};
+    let physical = site(37, &[]);
+    let association = SiteAssociations {
+        site: physical.site.clone(),
+        count_generation: 1,
+        associations: vec![CandidateAssociation {
+            origin: MetadataOrigin::StaticPublicTableCandidate,
+            algorithm: None,
+            known_algorithm: None,
+            operation: None,
+            function_id: 70001,
+            advertisers: Vec::new(),
+            static_provenance: None,
+            storage: None,
+            partial: true,
+            observed_ns: 20,
+            observation_generation: 9,
+        }],
+    };
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            fenced: vec![physical],
+            associations: vec![association.clone()],
+            ..Default::default()
+        },
+        &[],
+    );
+    assert_eq!(doc.total_calls(), 37);
+    assert_eq!(doc.candidate_associations, vec![association]);
+    assert_eq!(
+        doc.fenced[0].generation,
+        doc.candidate_associations[0].count_generation
+    );
+    assert!(
+        !serde_json::to_value(&doc)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("candidate_associations")
+    );
+    check_open(&doc);
+}
+
+#[test]
+fn advertisement_invalidation_alone_preserves_physical_lifetime_but_identity_loss_retires() {
+    for advertisement in [
+        ObservationGap::RegistrationRace,
+        ObservationGap::Invalidated,
+    ] {
+        let mut batch = ObservationBatch {
+            gaps: vec![advertisement],
+            ..Default::default()
+        };
+        assert!(
+            !batch_requires_retirement(&batch, 42),
+            "{advertisement:?} is not code custody loss"
+        );
+        for identity in [
+            ObservationGap::ProcessChanged,
+            ObservationGap::NamespaceChanged,
+            ObservationGap::ObjectChanged,
+            ObservationGap::MembershipUnknown,
+        ] {
+            batch.gaps.push(identity);
+            assert!(
+                batch_requires_retirement(&batch, 42),
+                "{advertisement:?} must not mask {identity:?}"
+            );
+            batch.gaps.pop();
+        }
+        let doc = project(
+            42,
+            window(),
+            CountSample {
+                sites: vec![site(37, &[])],
+                ..Default::default()
+            },
+            &[advertisement],
+        );
+        assert_eq!(doc.total_calls(), 37);
+        check_open(&doc);
     }
 }

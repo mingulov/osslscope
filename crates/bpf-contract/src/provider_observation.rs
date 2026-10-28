@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Finite observation ABI. No opaque target handle is a transport field.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const EVENT_SIZE: usize = 96;
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_PENDING: u32 = 4096;
@@ -18,6 +18,9 @@ pub const GAP: u32 = 8;
 pub const ALIAS: u32 = 9;
 /// Internal terminator: function=segment count, status=0/2/3/4, algorithm=OTHER.
 pub const ALIAS_END: u32 = 10;
+/// Explicit per-algorithm boundary within one synchronous returned table.
+pub const ALGORITHM_BEGIN: u32 = 11;
+pub const MAX_ALGORITHMS: u32 = 512;
 pub const LOAD: u32 = 1;
 pub const TRY_LOAD: u32 = 2;
 pub const LOAD_EX: u32 = 3;
@@ -27,6 +30,7 @@ pub const ADD_BUILTIN: u32 = 6;
 pub const PROVIDER_INIT: u32 = 7;
 pub const PUBLIC_QUERY: u32 = 8;
 pub const PUBLIC_UNQUERY: u32 = 9;
+pub const GET_DISPATCH: u32 = 16;
 pub const QUERY_CALLBACK: u32 = 17;
 pub const TEARDOWN: u32 = 18;
 pub const UNQUERY_CALLBACK: u32 = 19;
@@ -60,7 +64,8 @@ pub struct Record {
     pub status: u32,
     /// Only INIT and cacheable IMPLEMENTATION may contain a verified-range code operand.
     pub code: u64,
-    pub reserved: [u32; 2],
+    pub algorithm_index: u32,
+    pub reserved: u32,
 }
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -130,21 +135,10 @@ pub struct Pending {
     pub name: u32,
     pub suppressed: u32,
 }
-/// Kernel-only: not a wire record, and the host never enumerates this map.
-#[derive(Clone, Copy, Default)]
-#[repr(C)]
-pub struct CursorKey {
-    pub generation: u64,
-    pub epoch: u64,
-    pub cookie: u64,
-    pub context: u64,
-    pub table: u64,
-    pub pid: u32,
-    pub operation: u32,
-}
+/// Positive future public operation IDs are preserved, independently of registry.
 pub const fn known_operation(op: u32) -> u32 {
     match op {
-        1..=5 | 10..=14 | 20..=22 => op,
+        0..=0x7fff_ffff => op,
         _ => 0,
     }
 }
@@ -163,14 +157,6 @@ pub fn suppress_wrapper(parent: &Pending, child: &Pending) -> bool {
         && parent.api != child.api
         && parent.object == child.object
         && parent.arg0 == child.arg0
-}
-/// Sample policy is shared with the consumer tests; no table pointer participates.
-pub const fn sample_index(cacheability: u32, stored: u32) -> Option<u32> {
-    let index = if cacheability == 1 { stored } else { 0 };
-    match index {
-        0..=511 => Some(index),
-        _ => None,
-    }
 }
 impl Thread {
     pub fn enter(&mut self) -> Option<u64> {

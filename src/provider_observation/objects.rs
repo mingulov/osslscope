@@ -2,6 +2,9 @@
 //! No target-memory reads or pathname-based attachment. All locators and
 //! addresses are private transient inputs and deliberately lack Debug/serde.
 use super::schema::{APIS, ObjectHash, ObservationApi, ObservationBudget, ObservationGap};
+use super::static_tables::{
+    self, DynamicAlgorithmId, StaticTableProvenance, TableDiscovery, TableLimits, TableStorage,
+};
 use crate::inventory::{
     self, IdentityStatus, ModuleInfo, NamespaceId, NamespaceIds, ProcessRecord,
 };
@@ -78,6 +81,7 @@ struct Object {
     stamp: Stamp,
     expected: Option<ModuleInfo>,
     parsed: OnceCell<Result<ElfObject, ObservationGap>>,
+    tables: OnceCell<Result<TableDiscovery, ObservationGap>>,
 }
 impl Object {
     fn parsed(&self, budget: &ObservationBudget) -> Result<&ElfObject, ObservationGap> {
@@ -126,6 +130,7 @@ impl TransientCodeAddress {
 #[derive(Clone)]
 pub struct VerifiedSite {
     process: Rc<Process>,
+    maps: Rc<Vec<u8>>,
     object: Rc<Object>,
     offset: u64,
     generation: u64,
@@ -152,7 +157,53 @@ impl VerifiedSite {
     }
     pub fn revalidate_object(&self) -> Result<(), ObservationGap> {
         self.process.validate()?;
+        if !same_executable_mappings(
+            &self.maps,
+            &read_at(&self.process.directory, b"maps", MAX_MAPS)?,
+        )? {
+            return Err(ObservationGap::ProcessChanged);
+        }
         self.object.unchanged()
+    }
+}
+/// A file-derived shape grants entry-count authority only, never a callable ABI.
+#[derive(Clone)]
+pub struct VerifiedStaticCandidate {
+    site: VerifiedSite,
+    algorithm: Option<DynamicAlgorithmId>,
+    operation_hint: Option<u32>,
+    function_id: u32,
+    storage: TableStorage,
+    provenance: StaticTableProvenance,
+    partial: bool,
+}
+impl VerifiedStaticCandidate {
+    pub fn site(&self) -> &VerifiedSite {
+        &self.site
+    }
+    pub fn pid(&self) -> u32 {
+        self.site.process.pid
+    }
+    pub fn starttime(&self) -> u64 {
+        self.site.process.starttime
+    }
+    pub fn algorithm(&self) -> Option<DynamicAlgorithmId> {
+        self.algorithm
+    }
+    pub fn operation_hint(&self) -> Option<u32> {
+        self.operation_hint
+    }
+    pub fn function_id(&self) -> u32 {
+        self.function_id
+    }
+    pub fn storage(&self) -> TableStorage {
+        self.storage
+    }
+    pub fn provenance(&self) -> StaticTableProvenance {
+        self.provenance
+    }
+    pub fn partial(&self) -> bool {
+        self.partial
     }
 }
 pub struct ApiSite {
@@ -163,13 +214,14 @@ pub struct ApiSite {
 pub struct VerifiedProcess {
     process: Rc<Process>,
     mappings: Vec<(Mapping, Rc<Object>)>,
-    maps: Vec<u8>,
+    maps: Rc<Vec<u8>>,
     generation: u64,
     budget: ObservationBudget,
     gaps: RefCell<std::collections::BTreeSet<ObservationGap>>,
 }
 struct Process {
     directory: File,
+    pid: u32,
     pidfd: File,
     executable: File,
     exe_stamp: Stamp,
@@ -278,6 +330,7 @@ impl VerifiedProcess {
                         api,
                         site: VerifiedSite {
                             process: self.process.clone(),
+                            maps: self.maps.clone(),
                             object: object.clone(),
                             offset,
                             generation: self.generation,
@@ -288,6 +341,81 @@ impl VerifiedProcess {
             }
         }
         sites
+    }
+    /// Discover once per retained file, then bind every locator to the verified
+    /// executable mapping. Parsing never supplies process or attachment authority.
+    pub fn static_candidates(
+        &self,
+        budget: &ObservationBudget,
+    ) -> Result<Vec<VerifiedStaticCandidate>, ObservationGap> {
+        self.revalidate()?;
+        let mut candidates = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, object) in &self.mappings {
+            if !seen.insert((object.stamp.native, object.stamp.inode)) {
+                continue;
+            }
+            object.unchanged()?;
+            let tables = object.tables.get_or_init(|| {
+                static_tables::discover_tables_budgeted(
+                    &object.file,
+                    TableLimits::default(),
+                    budget,
+                )
+                .map_err(|g| match g {
+                    static_tables::TableGap::Resource => ObservationGap::ReadLimit,
+                    static_tables::TableGap::Changed => ObservationGap::ObjectChanged,
+                    static_tables::TableGap::Io => ObservationGap::BackingUnavailable,
+                    _ => ObservationGap::MalformedElf,
+                })
+            });
+            let tables = match tables {
+                Ok(t) => t,
+                Err(g) => {
+                    self.gaps.borrow_mut().insert(*g);
+                    continue;
+                }
+            };
+            if !tables.gaps().is_empty() {
+                self.gaps
+                    .borrow_mut()
+                    .insert(ObservationGap::DispatchPartial);
+            }
+            let parsed = match object.parsed(budget) {
+                Ok(p) => p,
+                Err(g) => {
+                    self.gaps.borrow_mut().insert(g);
+                    continue;
+                }
+            };
+            for locator in tables.candidates() {
+                if !self.mappings.iter().any(|(m, o)| {
+                    Rc::ptr_eq(o, object) && mapping_contains_offset(m, locator.file_offset)
+                }) {
+                    continue;
+                }
+                budget.state(std::mem::size_of::<VerifiedStaticCandidate>() * 2)?;
+                candidates.push(VerifiedStaticCandidate {
+                    site: VerifiedSite {
+                        process: self.process.clone(),
+                        maps: self.maps.clone(),
+                        object: object.clone(),
+                        offset: locator.file_offset,
+                        generation: self.generation,
+                        hash: parsed.hash.clone(),
+                    },
+                    algorithm: locator.algorithm,
+                    operation_hint: None,
+                    function_id: locator.function_id,
+                    storage: locator.storage,
+                    provenance: locator.provenance,
+                    partial: locator.partial,
+                });
+            }
+            object.unchanged()?;
+        }
+        self.revalidate()?;
+        Ok(candidates)
     }
     pub fn relocate(&self, address: TransientCodeAddress) -> Result<VerifiedSite, ObservationGap> {
         self.revalidate()?;
@@ -316,6 +444,7 @@ impl VerifiedProcess {
         object.unchanged()?;
         Ok(VerifiedSite {
             process: self.process.clone(),
+            maps: self.maps.clone(),
             object: object.clone(),
             offset,
             generation: self.generation,
@@ -363,6 +492,7 @@ pub fn acquire(
     );
     let process = Rc::new(Process {
         directory,
+        pid: record.pid,
         pidfd,
         executable,
         exe_stamp,
@@ -371,7 +501,7 @@ pub fn acquire(
     });
     process.validate()?;
     limits.state(MAX_MAPS)?;
-    let maps = read_at(&process.directory, b"maps", MAX_MAPS)?;
+    let maps = Rc::new(read_at(&process.directory, b"maps", MAX_MAPS)?);
     let mut mappings = Vec::new();
     let mut objects: Vec<Rc<Object>> = Vec::new();
     let mut refused = None;
@@ -452,6 +582,7 @@ pub fn acquire(
                 stamp,
                 expected,
                 parsed: OnceCell::new(),
+                tables: OnceCell::new(),
             });
             objects.push(object.clone());
             object

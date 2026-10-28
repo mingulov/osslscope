@@ -2,10 +2,17 @@
 //! Bounded retained-site counter. Samples are cumulative available-prefix
 //! evidence, including fenced generations; they never assert terminal finality.
 use crate::{
-    evidence::*, inventory::NamespaceId, loader, provider_observation::VerifiedSiteCandidate,
+    evidence::*,
+    inventory::NamespaceId,
+    loader,
+    provider_observation::{
+        VerifiedSite, VerifiedSiteCandidate, VerifiedStaticCandidate,
+        static_tables::{DynamicAlgorithmId, StaticTableProvenance, TableStorage},
+    },
 };
 use osslscope_ebpf_common::{CountValue, split_key};
 use std::{
+    collections::BTreeMap,
     ffi::CString,
     fs::File,
     os::{
@@ -69,9 +76,57 @@ impl CountLimits {
         Ok(())
     }
 }
+pub use crate::provider_observation::MetadataOrigin;
+#[derive(Clone)]
+pub enum CountCandidate {
+    Static(VerifiedStaticCandidate),
+    Learned(VerifiedSiteCandidate),
+}
+impl CountCandidate {
+    pub fn site(&self) -> &VerifiedSite {
+        match self {
+            Self::Static(c) => c.site(),
+            Self::Learned(c) => c.site(),
+        }
+    }
+    pub fn pid(&self) -> u32 {
+        match self {
+            Self::Static(c) => c.pid(),
+            Self::Learned(c) => c.pid(),
+        }
+    }
+    pub fn starttime(&self) -> u64 {
+        match self {
+            Self::Static(c) => c.starttime(),
+            Self::Learned(c) => c.starttime(),
+        }
+    }
+}
+/// Safe association metadata, independent from the frozen legacy attribution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateAssociation {
+    pub origin: MetadataOrigin,
+    pub algorithm: Option<DynamicAlgorithmId>,
+    pub known_algorithm: Option<u16>,
+    pub operation: Option<u32>,
+    pub function_id: u32,
+    pub advertisers: Vec<crate::provider_observation::ObjectHash>,
+    pub static_provenance: Option<StaticTableProvenance>,
+    pub storage: Option<TableStorage>,
+    pub partial: bool,
+    pub observed_ns: u64,
+    pub observation_generation: u64,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SiteAssociations {
+    pub site: SiteKey,
+    pub count_generation: u32,
+    pub associations: Vec<CandidateAssociation>,
+}
 #[derive(Clone, Default)]
 pub struct CountSample {
     pub sites: Vec<SiteExecution>,
+    pub associations: Vec<SiteAssociations>,
     pub fenced: Vec<SiteExecution>,
     pub gaps: Vec<GapCounter>,
     pub admitted: u64,
@@ -110,7 +165,7 @@ pub fn evidence_device(native: u64) -> u64 {
 }
 struct Attachment {
     link: OwnedFd,
-    candidates: Vec<VerifiedSiteCandidate>,
+    candidates: Vec<CountCandidate>,
 }
 /// Owns maps, retained namespace, links and candidate custody. Links are closed
 /// before candidate custody is released, including during unwinding/Drop.
@@ -126,6 +181,7 @@ pub struct FocusedCounter {
     attachments: Vec<Attachment>,
     retired: bool,
     totals: [u64; 3],
+    associations: BTreeMap<u32, SiteAssociations>,
 }
 impl FocusedCounter {
     pub fn open(
@@ -172,6 +228,7 @@ impl FocusedCounter {
             attachments: Vec::new(),
             retired: false,
             totals: [0; 3],
+            associations: BTreeMap::new(),
         };
         let NamespaceId { device, inode } = namespace;
         let mut config = [0u8; 16];
@@ -211,6 +268,9 @@ impl FocusedCounter {
     }
     /// Scalar readiness derived from owned physical links, not advertisements.
     pub fn active_site_count(&self) -> usize {
+        self.fold.rows.values().filter(|r| r.active).count()
+    }
+    pub fn active_link_count(&self) -> usize {
         self.attachments.len()
     }
     pub fn retire(&mut self) {
@@ -233,79 +293,109 @@ impl FocusedCounter {
     ) -> Result<(), CountFailure> {
         self.attach_group(vec![candidate], installed_ns)
     }
-    /// Attach one same-physical-site batch with its metadata frozen before the
-    /// first link. Mixed physical sites/epochs are refused before attachment.
+    /// Compatibility wrapper; learned metadata shares the same physical ledger.
     pub fn attach_group(
         &mut self,
         candidates: Vec<VerifiedSiteCandidate>,
         installed_ns: u64,
     ) -> Result<(), CountFailure> {
-        let result = self.attach_group_inner(candidates, installed_ns);
+        let first = candidates.first().ok_or(CountFailure::Identity)?;
+        if candidates.iter().any(|c| {
+            site_key(c.site()) != site_key(first.site())
+                || c.site().generation() != first.site().generation()
+                || c.starttime() != first.starttime()
+                || c.pid() != first.pid()
+        }) {
+            return Err(CountFailure::Identity);
+        }
+        self.attach_candidates(
+            candidates
+                .into_iter()
+                .map(CountCandidate::Learned)
+                .collect(),
+            installed_ns,
+        )
+    }
+    /// Group physical cookies by retained backing descriptor. Static candidates
+    /// enter only the Count program, which has no argument or return reads.
+    pub fn attach_candidates(
+        &mut self,
+        candidates: Vec<CountCandidate>,
+        installed_ns: u64,
+    ) -> Result<(), CountFailure> {
+        let result = self.attach_candidates_inner(candidates, installed_ns);
         if let Err(e) = result {
             self.failure(e);
-            if self.retired && !self.attachments.is_empty() {
+            if matches!(e, CountFailure::Identity | CountFailure::Namespace) {
                 self.retire();
             }
         }
         result
     }
-    fn attach_group_inner(
+    fn attach_candidates_inner(
         &mut self,
-        candidates: Vec<VerifiedSiteCandidate>,
+        candidates: Vec<CountCandidate>,
         installed_ns: u64,
     ) -> Result<(), CountFailure> {
-        let first = candidates.first().ok_or(CountFailure::Identity)?;
-        if first.pid() != self.pid
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let first = &candidates[0];
+        if installed_ns == 0
+            || first.pid() != self.pid
             || self.starttime.is_some_and(|s| s != first.starttime())
-            || installed_ns == 0
         {
             return Err(CountFailure::Identity);
         }
+        let starttime = first.starttime();
+        let mapping = first.site().generation();
+        if candidates.iter().any(|c| {
+            c.pid() != self.pid || c.starttime() != starttime || c.site().generation() != mapping
+        }) {
+            return Err(CountFailure::Identity);
+        }
         validate_namespace(&self.namespace, self.expected_namespace)?;
-        for candidate in &candidates {
-            if candidate.pid() != first.pid()
-                || candidate.starttime() != first.starttime()
-                || candidate.generation() != first.generation()
-                || candidate.site().generation() != first.site().generation()
-                || candidate.site().native_device() != first.site().native_device()
-                || candidate.site().inode() != first.site().inode()
-                || candidate.site().file_offset() != first.site().file_offset()
-                || candidate.site().object_hash() != first.site().object_hash()
-            {
-                return Err(CountFailure::Identity);
-            }
-            candidate
+        // Each process/object identity is revalidated once per retained file;
+        // no per-row procfs traversal or repeated ELF parsing is required.
+        let mut files: BTreeMap<(u64, u64), Vec<CountCandidate>> = BTreeMap::new();
+        self.fold.charge(
+            candidates
+                .iter()
+                .try_fold(0usize, |total, c| {
+                    let advertisers = match c {
+                        CountCandidate::Static(_) => 0,
+                        CountCandidate::Learned(c) => c.advertiser_candidates().len(),
+                    };
+                    advertisers
+                        .checked_mul(1024)?
+                        .checked_add(512)?
+                        .checked_add(total)
+                })
+                .ok_or(CountFailure::Resource)?,
+        )?;
+        for candidate in candidates {
+            files
+                .entry((candidate.site().native_device(), candidate.site().inode()))
+                .or_default()
+                .push(candidate);
+        }
+        for file in files.values() {
+            file[0]
                 .site()
                 .revalidate_object()
                 .map_err(|_| CountFailure::Identity)?;
-        }
-        // Charge retention/conversion before constructing owned metadata.
-        let state = candidates
-            .iter()
-            .try_fold(1024usize, |n, c| {
-                c.advertiser_candidates()
-                    .len()
-                    .checked_mul(1024)
-                    .and_then(|v| v.checked_add(1024))
-                    .and_then(|v| n.checked_add(v))
-            })
-            .ok_or(CountFailure::Resource)?;
-        self.fold.charge(state)?;
-        let mut site_binding = binding(first, installed_ns);
-        for candidate in candidates.iter().skip(1) {
-            site_binding
-                .candidates
-                .extend(binding(candidate, installed_ns).candidates);
+            if file
+                .iter()
+                .any(|c| c.site().object_hash() != file[0].site().object_hash())
+            {
+                return Err(CountFailure::Identity);
+            }
         }
         if self
             .fold
-            .session
-            .is_some_and(|s| s != site_binding.session_generation)
-            || self.fold.rows.values().any(|r| {
-                r.active
-                    && r.row.site == site_binding.site
-                    && r.mapping != site_binding.mapping_generation
-            })
+            .rows
+            .values()
+            .any(|r| r.active && r.mapping != mapping)
         {
             self.retire();
         }
@@ -314,47 +404,109 @@ impl FocusedCounter {
         }
         if self.retired {
             self.write("GEN", 0, &self.fold.generation.to_ne_bytes())?;
-            validate_namespace(&self.namespace, self.expected_namespace)?;
         }
+        // Plan on a copy: rows become visible only after every new link has
+        // succeeded and both identity checks have passed.
+        self.fold.charge(
+            self.fold
+                .rows
+                .len()
+                .checked_mul(1024)
+                .ok_or(CountFailure::Resource)?,
+        )?;
+        let mut planned = self.fold.clone();
+        let mut additions = Vec::new();
+        let mut metadata = Vec::new();
         let program = self
             .loaded
             .progs
             .get("count_entry")
             .ok_or(CountFailure::Object)?
             .as_raw_fd();
-        let path = CString::new(format!(
-            "/proc/self/fd/{}",
-            first.site().attachment_fd().as_raw_fd()
-        ))
-        .map_err(|_| CountFailure::Attach)?;
-        let mut link = None;
-        self.fold.attach(site_binding, |cookie, _| {
-            let fd = ossl_bpf_sys::link_create_uprobe_multi(
-                program,
-                &path,
-                &[first.site().file_offset()],
-                &[cookie as u64],
-                self.pid,
+        for file in files.into_values() {
+            let mut sites: BTreeMap<u64, Vec<&CountCandidate>> = BTreeMap::new();
+            for c in &file {
+                sites.entry(c.site().file_offset()).or_default().push(c);
+            }
+            let mut offsets = Vec::new();
+            let mut cookies = Vec::new();
+            for (offset, group) in sites {
+                let mut binding = count_binding(group[0], installed_ns);
+                for c in group.iter().skip(1) {
+                    binding
+                        .candidates
+                        .extend(count_binding(c, installed_ns).candidates);
+                }
+                let key = binding.site.clone();
+                let (cookie, generation) = planned.attach(binding, |cookie, _| {
+                    offsets.push(offset);
+                    cookies.push(cookie as u64);
+                    Ok(())
+                })?;
+                for c in group {
+                    metadata.push((
+                        cookie,
+                        generation,
+                        key.clone(),
+                        association(c, installed_ns),
+                    ));
+                }
+            }
+            if offsets.is_empty() {
+                continue;
+            }
+            if self.attachments.len() + additions.len() >= self.limits.max_links {
+                return Err(CountFailure::Resource);
+            }
+            planned.charge(256 + offsets.len() * 32)?;
+            let path = CString::new(format!(
+                "/proc/self/fd/{}",
+                file[0].site().attachment_fd().as_raw_fd()
+            ))
+            .map_err(|_| CountFailure::Attach)?;
+            // Burn planned cookies before a fallible kernel attachment: even
+            // a rolled-back link may already have produced map entries.
+            self.fold.next_cookie = planned.next_cookie;
+            let link = ossl_bpf_sys::link_create_uprobe_multi(
+                program, &path, &offsets, &cookies, self.pid,
             )
             .map_err(|_| CountFailure::Attach)?;
-            if candidates
-                .iter()
-                .any(|c| c.site().revalidate_object().is_err())
-            {
-                drop(fd);
-                return Err(CountFailure::Identity);
-            }
-            if validate_namespace(&self.namespace, self.expected_namespace).is_err() {
-                drop(fd);
-                return Err(CountFailure::Namespace);
-            }
-            link = Some(fd);
-            Ok(())
-        })?;
-        self.starttime = Some(first.starttime());
-        if let Some(link) = link {
-            self.attachments.push(Attachment { link, candidates });
+            file[0]
+                .site()
+                .revalidate_object()
+                .map_err(|_| CountFailure::Identity)?;
+            additions.push(Attachment {
+                link,
+                candidates: file,
+            });
         }
+        validate_namespace(&self.namespace, self.expected_namespace)?;
+        for a in &additions {
+            a.candidates[0]
+                .site()
+                .revalidate_object()
+                .map_err(|_| CountFailure::Identity)?;
+        }
+        self.fold = planned;
+        self.attachments.extend(additions);
+        for (cookie, count_generation, site, association) in metadata {
+            let row = self
+                .associations
+                .entry(cookie)
+                .or_insert_with(|| SiteAssociations {
+                    site,
+                    count_generation,
+                    associations: Vec::new(),
+                });
+            if !row
+                .associations
+                .iter()
+                .any(|a| same_association(a, &association))
+            {
+                row.associations.push(association);
+            }
+        }
+        self.starttime = Some(starttime);
         if self.retired {
             self.write("TARGET", 0, &(self.pid as u64).to_ne_bytes())?;
             self.retired = false;
@@ -366,6 +518,7 @@ impl FocusedCounter {
             self.failure(e);
         }
         let mut sample = self.fold.sample();
+        sample.associations = self.associations.values().cloned().collect();
         [sample.admitted, sample.dropfail, sample.namespace_failures] = self.totals;
         if sample.dropfail > 0 {
             sample.gaps.push(gap("focused_dropfail", sample.dropfail));
@@ -505,7 +658,7 @@ fn binding(candidate: &VerifiedSiteCandidate, installed_ns: u64) -> SiteBinding 
             CandidateIdentity::new(
                 ObjectId(advertiser.clone().into()),
                 "unknown".into(),
-                operation_id(candidate.operation()),
+                candidate.numeric_operation(),
                 candidate.function().id(),
                 vec![candidate.algorithm().label().into()],
                 candidate.alias_quality().weak,
@@ -525,8 +678,63 @@ fn binding(candidate: &VerifiedSiteCandidate, installed_ns: u64) -> SiteBinding 
         installed_ns,
     }
 }
-fn operation_id(operation: crate::provider_observation::Operation) -> u32 {
-    (0..=22)
-        .find(|id| crate::provider_observation::Operation::from_id(*id) == Some(operation))
-        .unwrap_or(0)
+
+fn site_key(site: &VerifiedSite) -> SiteKey {
+    SiteKey {
+        object: ObjectId(site.object_hash().clone().into()),
+        device: evidence_device(site.native_device()),
+        inode: site.inode(),
+        offset: site.file_offset(),
+    }
+}
+fn count_binding(candidate: &CountCandidate, installed_ns: u64) -> SiteBinding {
+    let mut b = match candidate {
+        CountCandidate::Learned(c) => binding(c, installed_ns),
+        CountCandidate::Static(c) => SiteBinding {
+            site: site_key(c.site()),
+            session_generation: c.site().generation(),
+            mapping_generation: c.site().generation(),
+            candidates: Vec::new(),
+            installed_ns,
+        },
+    };
+    // Advertisement generations cannot multiply physical entries. Only the
+    // verified process/mapping incarnation owns this attachment lifetime.
+    b.session_generation = candidate.site().generation();
+    b
+}
+fn association(candidate: &CountCandidate, observed_ns: u64) -> CandidateAssociation {
+    match candidate {
+        CountCandidate::Static(c) => CandidateAssociation {
+            origin: MetadataOrigin::StaticPublicTableCandidate,
+            algorithm: c.algorithm(),
+            known_algorithm: None,
+            operation: c.operation_hint(),
+            function_id: c.function_id(),
+            advertisers: Vec::new(),
+            static_provenance: Some(c.provenance()),
+            storage: Some(c.storage()),
+            partial: c.partial(),
+            observed_ns,
+            observation_generation: c.site().generation(),
+        },
+        CountCandidate::Learned(c) => CandidateAssociation {
+            origin: MetadataOrigin::ObservedPublicAbi,
+            algorithm: Some(c.dynamic_algorithm()),
+            known_algorithm: Some(c.algorithm().into()),
+            operation: Some(c.numeric_operation()),
+            function_id: c.function().id(),
+            advertisers: c.advertiser_candidates().to_vec(),
+            static_provenance: None,
+            storage: None,
+            partial: c.alias_quality().status != crate::provider_observation::AliasStatus::Complete,
+            observed_ns: c.observed_ns(),
+            observation_generation: c.generation(),
+        },
+    }
+}
+fn same_association(a: &CandidateAssociation, b: &CandidateAssociation) -> bool {
+    let mut b = b.clone();
+    b.observed_ns = a.observed_ns;
+    *a == b
 }

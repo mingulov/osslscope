@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 type Thread = (u32, u32, u64);
 struct Sequence {
-    identity: [u64; 5],
+    identity: [u64; 6],
     evidence: c::FiniteEvidence,
     next: u32,
     valid: bool,
@@ -17,13 +17,14 @@ pub(crate) struct Sequences(BTreeMap<Thread, Sequence>);
 fn thread(r: &c::Record) -> Thread {
     (r.pid, r.tid, r.generation)
 }
-fn identity(r: &c::Record) -> [u64; 5] {
+fn identity(r: &c::Record) -> [u64; 6] {
     [
         r.cookie,
         r.invocation,
         r.api as u64,
         r.operation as u64,
         r.cacheability as u64,
+        r.algorithm_index as u64,
     ]
 }
 pub(crate) fn other() -> AlgorithmId {
@@ -175,6 +176,23 @@ mod tests {
         wire::decode_transport(bytes)
     }
     #[test]
+    fn adjacent_algorithms_in_one_return_have_separate_alias_boundaries() {
+        let q = query();
+        let mut s = Sequences::default();
+        let b = ObservationBudget::default();
+        s.begin(&q, &b).unwrap();
+        s.alias(&known(q, 0)).unwrap();
+        s.end(&end(q, 1, 0)).unwrap();
+        let mut next = q;
+        next.algorithm_index = 1;
+        s.begin(&next, &b)
+            .expect("a different bounded algorithm ordinal starts its own sequence");
+        assert!(
+            s.implementation(&next).is_err(),
+            "previous algorithm cannot label the next one"
+        );
+    }
+    #[test]
     fn complete_sequence_labels_only_matching_implementation() {
         let q = query();
         let mut s = Sequences::default();
@@ -304,7 +322,7 @@ mod tests {
                 2 => r.outcome ^= 1,
                 3 => r.status = 8,
                 4 => r.code = 4096,
-                5 => r.reserved[0] = 1,
+                5 => r.reserved = 1,
                 _ => r.api = c::LOAD,
             }
             assert!(decode(r).is_err(), "field {field}");

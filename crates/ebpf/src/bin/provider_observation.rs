@@ -26,15 +26,11 @@ static THREADS: HashMap<ThreadKey, Thread> = HashMap::with_max_entries(4096, 0);
 #[map]
 static PENDING: HashMap<PendingKey, Pending> = HashMap::with_max_entries(4096, 0);
 #[map]
-static CURSORS: HashMap<CursorKey, u32> = HashMap::with_max_entries(4096, 0);
-#[map]
 static LOSS: PerCpuArray<u64> = PerCpuArray::with_max_entries(8, 0);
 #[map]
 static ALG_CLASS: HashMap<u64, AlgClassValue> = HashMap::with_max_entries(1024, 0);
 #[map]
 static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 0);
-#[map]
-static FUNCTIONS: HashMap<u64, u32> = HashMap::with_max_entries(1024, 0);
 #[inline(always)]
 fn loss(n: u32) {
     if let Some(p) = LOSS.get_ptr_mut(n) {
@@ -185,6 +181,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         && !matches!(
             p.api,
             PROVIDER_INIT
+                | GET_DISPATCH
                 | PUBLIC_QUERY
                 | QUERY_CALLBACK
                 | PUBLIC_UNQUERY
@@ -205,7 +202,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
 #[inline(never)]
 #[no_mangle]
 pub fn invalidate(p: &Pending, key: &ThreadKey, status: u32) {
-    // Kernel-only epoch invalidation: no host enumeration of cursor/opaque keys.
+    // Invalidate advertisement leases, independently of retained code lifetimes.
     if let Some(member) = MEMBERS.get_ptr_mut(&key.pid) {
         unsafe { (*member).epoch = 0 }
     }
@@ -231,6 +228,22 @@ pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64) {
             return;
         }
     };
+    walk_provider_dispatch(table, &mut r);
+}
+#[inline(never)]
+#[no_mangle]
+pub fn getter_return(p: &Pending, key: &ThreadKey, table: u64) {
+    let mut r = Record::default();
+    base(p, key, INIT, &mut r);
+    r.outcome = if table == 0 { 2 } else { 1 };
+    emit(&r);
+    if table != 0 {
+        walk_provider_dispatch(table, &mut r);
+    }
+}
+#[inline(never)]
+#[no_mangle]
+pub fn walk_provider_dispatch(table: u64, r: &mut Record) {
     let mut query = false;
     for i in 0..16u64 {
         let Some(base) = table.checked_add(i * 16) else {
@@ -258,13 +271,13 @@ pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64) {
                     return;
                 }
             };
-            if !code_ok(key.pid, address) {
+            if !code_ok(r.pid, address) {
                 loss(LOSS_RANGE);
                 continue;
             }
             r.function = fid;
             r.code = address;
-            emit(&r);
+            emit(r);
             if fid == 1027 {
                 query = true
             }
@@ -330,8 +343,9 @@ pub extern "C" fn alias_byte(index: u64, context: u64) -> u64 {
     }
     0
 }
-#[inline(always)]
-fn classify(pointer: u64, r: &mut Record) {
+#[inline(never)]
+#[no_mangle]
+pub fn classify(pointer: u64, r: &mut Record) {
     r.algorithm = OTHER;
     r.function = 0;
     r.outcome = 0;
@@ -394,55 +408,119 @@ fn classify(pointer: u64, r: &mut Record) {
     r.function = 0;
     r.status = 0;
 }
+#[repr(C)]
+struct DispatchScan {
+    record: *mut Record,
+    table: u64,
+    stopped: u32,
+    reserved: u32,
+}
 #[inline(never)]
 #[no_mangle]
 pub fn walk_dispatch(imp: u64, r: &mut Record) {
-    for index in 0..128u64 {
-        let Some(base) = imp.checked_add(index * 16) else {
+    let mut scan = DispatchScan {
+        record: r,
+        table: imp,
+        stopped: 0,
+        reserved: 0,
+    };
+    let result = unsafe {
+        helpers::bpf_loop(
+            128,
+            dispatch_slot as *mut core::ffi::c_void,
+            (&mut scan as *mut DispatchScan).cast(),
+            0,
+        )
+    };
+    if result < 0 {
+        loss(LOSS_READ);
+    } else if scan.stopped == 0 {
+        loss(LOSS_TRUNC);
+    }
+}
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn dispatch_slot(index: u64, context: u64) -> u64 {
+    let scan = unsafe { &mut *(context as *mut DispatchScan) };
+    if index >= 128 {
+        return 1;
+    }
+    let Some(base) = scan.table.checked_add(index * 16) else {
+        loss(LOSS_READ);
+        scan.stopped = 1;
+        return 1;
+    };
+    let id = match unsafe { helpers::bpf_probe_read_user(base as *const u32) } {
+        Ok(v) => v,
+        Err(_) => {
             loss(LOSS_READ);
-            return;
-        };
-        let id = match unsafe { helpers::bpf_probe_read_user(base as *const u32) } {
+            scan.stopped = 1;
+            return 1;
+        }
+    };
+    if id == 0 {
+        scan.stopped = 1;
+        return 1;
+    }
+    if id > i32::MAX as u32 {
+        loss(LOSS_TRUNC);
+        scan.stopped = 1;
+        return 1;
+    }
+    let r = unsafe { &mut *scan.record };
+    r.function = id;
+    r.code = 0;
+    // Volatile returned tables supply synchronous advertisement metadata only.
+    if r.cacheability == 1 {
+        let address = match unsafe { helpers::bpf_probe_read_user((base + 8) as *const u64) } {
             Ok(v) => v,
             Err(_) => {
                 loss(LOSS_READ);
-                return;
+                scan.stopped = 1;
+                return 1;
             }
         };
-        if id == 0 {
-            return;
+        if code_ok(r.pid, address) {
+            r.code = address
+        } else {
+            loss(LOSS_RANGE)
         }
-        // Unknown function IDs are finite OTHER and cannot authorize a site.
-        let function = unsafe {
-            FUNCTIONS
-                .get(&(((r.operation as u64) << 32) | id as u64))
-                .copied()
-        }
-        .unwrap_or(0);
-        r.function = function;
-        r.code = 0;
-        if function != 0 && r.cacheability == 1 {
-            let address = match unsafe { helpers::bpf_probe_read_user((base + 8) as *const u64) } {
-                Ok(v) => v,
-                Err(_) => {
-                    loss(LOSS_READ);
-                    return;
-                }
-            };
-            if code_ok(r.pid, address) {
-                r.code = address
-            } else {
-                loss(LOSS_RANGE)
-            }
-        }
-        r.kind = IMPLEMENTATION;
-        emit(r);
     }
-    loss(LOSS_TRUNC);
+    r.kind = IMPLEMENTATION;
+    emit(r);
+    0
 }
 #[inline(never)]
 #[no_mangle]
 pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
+    let cacheability = query_result(p, key, table);
+    if table == 0 {
+        return;
+    }
+    let mut scan = AlgorithmScan {
+        pending: p,
+        thread: key,
+        table,
+        cacheability,
+        stopped: 0,
+    };
+    let result = unsafe {
+        helpers::bpf_loop(
+            MAX_ALGORITHMS,
+            algorithm_slot as *mut core::ffi::c_void,
+            (&mut scan as *mut AlgorithmScan).cast(),
+            0,
+        )
+    };
+    if result < 0 {
+        loss(LOSS_READ);
+    } else if scan.stopped == 0 {
+        loss(LOSS_TRUNC);
+    }
+}
+#[inline(never)]
+#[no_mangle]
+pub fn query_result(p: &Pending, key: &ThreadKey, table: u64) -> u32 {
     let mut r = Record::default();
     base(p, key, QUERY, &mut r);
     r.operation = p.operation;
@@ -457,73 +535,75 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
     };
     emit(&r);
     if r.cacheability != 1 {
-        // Once lifetime is uncertain, never revive a cursor in this mapping
-        // generation. This idempotent invalidation cannot lose racing updates.
         if let Some(member) = MEMBERS.get_ptr_mut(&key.pid) {
             unsafe { (*member).epoch = 0 }
         }
     }
-    if table == 0 {
-        return;
+    r.cacheability
+}
+/// Synchronous own-stack context, never persisted or emitted. No returned table
+/// address survives this uretprobe, including no-store and failed-read paths.
+#[repr(C)]
+struct AlgorithmScan {
+    pending: *const Pending,
+    thread: *const ThreadKey,
+    table: u64,
+    cacheability: u32,
+    stopped: u32,
+}
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
+    let scan = unsafe { &mut *(context as *mut AlgorithmScan) };
+    if index >= MAX_ALGORITHMS as u64 {
+        return 1;
     }
-    let epoch = match unsafe { MEMBERS.get(&key.pid) } {
-        Some(v) => v.epoch,
-        None => return,
-    };
-    if epoch == u64::MAX {
-        loss(LOSS_MAP);
-        return;
-    }
-    let cursor = CursorKey {
-        generation: key.generation,
-        epoch,
-        cookie: p.cookie,
-        context: p.arg0,
-        table,
-        pid: key.pid,
-        operation: p.operation,
-    };
-    let index = if r.cacheability == 1 && epoch != 0 {
-        unsafe { CURSORS.get(&cursor).copied() }.unwrap_or(0)
-    } else {
-        0
-    };
-    let Some(index) = sample_index(r.cacheability, index) else {
-        loss(LOSS_TRUNC);
-        return;
-    };
-    let Some(slot) = table.checked_add(index as u64 * 32) else {
+    let Some(slot) = scan.table.checked_add(index * 32) else {
         loss(LOSS_READ);
-        return;
+        scan.stopped = 1;
+        return 1;
     };
     let names = match unsafe { helpers::bpf_probe_read_user(slot as *const u64) } {
         Ok(v) => v,
         Err(_) => {
             loss(LOSS_READ);
-            return;
+            scan.stopped = 1;
+            return 1;
         }
     };
     if names == 0 {
-        return;
+        scan.stopped = 1;
+        return 1;
     }
     let imp = match unsafe { helpers::bpf_probe_read_user((slot + 16) as *const u64) } {
         Ok(v) => v,
         Err(_) => {
             loss(LOSS_READ);
-            return;
+            scan.stopped = 1;
+            return 1;
         }
     };
-    classify(names, &mut r);
+    let mut record = Record::default();
+    let p = unsafe { &*scan.pending };
+    base(p, unsafe { &*scan.thread }, ALGORITHM_BEGIN, &mut record);
+    record.operation = p.operation;
+    record.cacheability = scan.cacheability;
+    let r = &mut record;
+    r.kind = ALGORITHM_BEGIN;
+    r.algorithm_index = index as u32;
+    r.outcome = 1;
+    r.algorithm = 0;
+    r.function = 0;
+    r.status = 0;
+    r.code = 0;
+    emit(r);
+    classify(names, r);
     if imp != 0 {
-        walk_dispatch(imp, &mut r)
+        walk_dispatch(imp, r)
     } else {
         loss(LOSS_TRUNC)
     }
-    if r.cacheability == 1 && epoch != 0 {
-        if CURSORS.insert(cursor, index + 1, 0).is_err() {
-            loss(LOSS_MAP)
-        }
-    }
+    0
 }
 // Keep pairing temporaries out of the frame that classifies a query return.
 #[inline(never)]
@@ -583,6 +663,8 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
     let rv: u64 = ctx.ret();
     if p.api == PROVIDER_INIT {
         init_return(&p, &key, rv)
+    } else if p.api == GET_DISPATCH {
+        getter_return(&p, &key, rv)
     } else if query_api(p.api) {
         query_return(&p, &key, rv)
     } else if !matches!(p.api, PUBLIC_UNQUERY | TEARDOWN | UNQUERY_CALLBACK) {

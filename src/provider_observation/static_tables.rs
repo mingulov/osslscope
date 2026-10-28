@@ -50,6 +50,19 @@ impl Default for TableLimits {
 /// Opaque, object-bound identity. Names and addresses never enter formatting.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DynamicAlgorithmId([u8; 32]);
+impl DynamicAlgorithmId {
+    /// Observer-generated identity of one public algorithm observation. Only
+    /// observer IDs, object fingerprint and bounded ordinal enter this digest.
+    pub(crate) fn observed(object: &super::ObjectHash, identity: [u64; 7]) -> Self {
+        let mut hash = Sha256::new();
+        hash.update(b"osslscope-public-algorithm-v1");
+        hash.update(String::from(object.clone()).as_bytes());
+        for value in identity {
+            hash.update(value.to_le_bytes());
+        }
+        Self(hash.finalize().into())
+    }
+}
 impl std::fmt::Display for DynamicAlgorithmId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("algorithm-")?;
@@ -102,7 +115,6 @@ pub enum StaticTableProvenance {
     AlgorithmRecordShape,
 }
 /// An entry-count-only site; its shape supplies no callable signature.
-#[allow(dead_code)] // Consumed by the process-bound static discovery integration.
 pub(crate) struct StaticCandidate {
     pub file_offset: u64,
     pub function_id: u32,
@@ -144,7 +156,6 @@ impl TableDiscovery {
     pub fn gaps(&self) -> &[TableGap] {
         &self.gaps
     }
-    #[allow(dead_code)]
     pub(crate) fn candidates(&self) -> impl Iterator<Item = StaticCandidate> + '_ {
         self.tables.iter().flat_map(move |table| {
             let algorithms = &self.algorithms[table.algorithms.clone()];

@@ -8,7 +8,7 @@ pub mod objects;
 pub mod schema;
 pub mod static_tables;
 pub use objects::{
-    ApiSite, TransientCodeAddress, VerifiedProcess, VerifiedSite, acquire,
+    ApiSite, TransientCodeAddress, VerifiedProcess, VerifiedSite, VerifiedStaticCandidate, acquire,
     inspect_expected_exports, inspect_exports,
 };
 pub use schema::*;

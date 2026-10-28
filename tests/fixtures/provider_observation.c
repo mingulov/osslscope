@@ -69,6 +69,22 @@ int main(int argc, char **argv) {
             }
             success = table != NULL; queries += success; break;
         }
+        case 'G': success = p && OSSL_PROVIDER_get0_dispatch(p) != NULL; break;
+        case 'Y':
+        case 'J': {
+            int no_store = 99;
+            success = p && OSSL_PROVIDER_query_operation(p, command == 'Y' ? OSSL_OP_CIPHER : 50001, &no_store) != NULL;
+            queries += success;
+            break;
+        }
+        case 'L': {
+            uintptr_t (*lookalike)(uintptr_t, uintptr_t, uintptr_t) = dlsym(module, "fixture_lookalike");
+            unsigned long calls;
+            if (!lookalike || !read_calls(&calls)) return 7;
+            success = 1;
+            for (unsigned long i = 0; i < calls; ++i) if (lookalike(1, 2, 3) != 6) success = 0;
+            break;
+        }
         case 'P': count_mode(1); success=1; break;
         case 'D': count_mode(0); success=1; break;
         case 'R': printf("counter %" PRIu64 "\n", count_read()); success=1; break;
@@ -87,6 +103,8 @@ int main(int argc, char **argv) {
             break;
         }
         case 'U': if (p && table) {OSSL_PROVIDER_unquery_operation(p, OSSL_OP_DIGEST, table);table=NULL;success=1;} break;
+        case 'M': mode(3); success=1; break;
+        case 'T': mode(4); success=1; break;
         case 'V': mode(1); success=1; break;
         case 'S': mode(0); success=1; break;
         case 'X': if(p){success=OSSL_PROVIDER_unload(p);unloads+=success;p=NULL;}break;

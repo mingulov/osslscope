@@ -280,7 +280,9 @@ fn dependency_evidence_is_consumer_only() {
     let f = Fixture::new();
     for (name, crypto, ssl) in [
         ("libcrypto.so.3", true, false),
+        ("libcrypto.so.4", true, false),
         ("libssl.so.3", false, true),
+        ("libssl.so.4", false, true),
         ("libcrypto.so.PRIVATE_CANARY", false, false),
     ] {
         let dependency = f.build(

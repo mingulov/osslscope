@@ -373,3 +373,19 @@ fn actual_object_refuses_dimension_root_helper_and_namespace_drift() {
         Err(CountFailure::Namespace)
     ));
 }
+
+#[test]
+fn physical_cookie_capacity_is_independent_of_link_fd_capacity() {
+    let mut fold = CountFold::new(CountLimits {
+        max_links: 1,
+        ..CountLimits::default()
+    })
+    .unwrap();
+    for offset in 0..600 {
+        let mut b = binding(1, 90, "unknown");
+        b.site.offset = offset;
+        fold.attach(b, |_, _| Ok(()))
+            .expect("one batched link can own many physical cookies");
+    }
+    assert_eq!(fold.sample().sites.len(), 600);
+}

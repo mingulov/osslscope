@@ -100,12 +100,18 @@ pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapRe
                 | "libcrypto.so.1.0.2"
                 | "libcrypto.so.1.1"
                 | "libcrypto.so.3"
+                | "libcrypto.so.4"
         )
     });
     let depends_on_libssl = elf.libraries.iter().any(|name| {
         matches!(
             *name,
-            "libssl.so" | "libssl.so.1.0.0" | "libssl.so.1.0.2" | "libssl.so.1.1" | "libssl.so.3"
+            "libssl.so"
+                | "libssl.so.1.0.0"
+                | "libssl.so.1.0.2"
+                | "libssl.so.1.1"
+                | "libssl.so.3"
+                | "libssl.so.4"
         )
     });
     let kind = if exports.contains(&Api::OsslProviderInit) {

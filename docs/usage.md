@@ -304,7 +304,7 @@ osslscope scan --pid 1234 --observe-providers --watch --duration 30 --json
 osslscope inspect --pid 1234 --observe-providers --json
 ```
 
-This opt-in observes public provider lifecycle/query interfaces using the fixed
+This opt-in observes public provider lifecycle/query/getter interfaces using the fixed
 observation companion. It does not count callback execution. Public interfaces
 are incomplete advertisements; warm and built-in activation may stay unknown.
 Unsupported observations retain passive inventory and explicit gaps. Supplied
@@ -368,9 +368,14 @@ refuses CBOM delivery and preserves the primary artifact.
 
 Advertisement alone produces no callback count. Learned sites require verified
 mapped backing, current incarnation/namespace and candidate revalidation.
-Repeated advertisements share a physical attachment. Unquery, volatile query,
-module/process change or invalidated custody retires old sites; calls before
-later reattachment remain uncovered. The stderr readiness line proves verified
+Static public-table shapes in retained ELF files also admit entry-only probes,
+without application queries or build enrollment. They grant no argument/return
+reads or advertised ABI authority. Static and learned associations share one
+physical cookie; offsets in one file can share a link FD. Future positive
+operation/function IDs and unknown algorithm identities remain eligible.
+Unquery, volatile-query and ring/read losses downgrade live metadata while
+retained file-backed entry counts continue. Actual process, namespace, mapping
+or backing changes retire links; calls before reattachment remain uncovered. The stderr readiness line proves verified
 attachment at that point, not semantic attribution or complete coverage.
 
 Physical counts are conserved across current/fenced rows; a shared implementation
@@ -406,13 +411,13 @@ Explicit legacy diagnostics (`--libcrypto`) accept only `--require-executed`
 and `--deny-algorithm`; provider, ENGINE and weak predicates are refused.
 
 The provider observation session admits one process, 256 objects, 512 observer
-links, 4096 pending calls, depth 8, 4096 learned candidates and 16384 facts,
+links, 4096 pending calls, depth 8, 4096 learned physical sites and 16384 facts,
 with a 1 MiB ring, 64 MiB cumulative host-state charges and its own 256 MiB
 cumulative ELF-read budget. The separate passive inventory scanner receives
 a per-snapshot read allowance of 256 MiB minus the initial inventory read
 charges. That allowance renews for each snapshot; repeated snapshots can
 exceed 256 MiB of total read work across the command. Counting adds at most
-512 active links, 4096 lifetime cookies, 8192 map keys, 256 possible CPUs and
+512 active link FDs (independent of physical site count), 4096 lifetime cookies, 8192 map keys, 256 possible CPUs and
 32 MiB host-state charges; the combined link bound is 1024. Charges precede
 allocation/attachment; cookie meanings are never recycled. Fixed maps bound kernel storage separately; host-state charges
 are not a total kernel memory claim. Resource/deadline failures remain gaps.

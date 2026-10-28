@@ -54,12 +54,14 @@ Candidates and their coverage remain **Unknown**; learned advertisements do
 not establish a definite algorithm/provider count or definite CBOM asset.
 Normal reports remain **PARTIAL** and algorithm checks remain inconclusive.
 
-Ordinary default-provider activity can produce no callback counts: its internal
-initialization/query path can bypass the exported hooks currently observed.
-This can affect a sustained workload, as well as short commands that finish
-before probes attach. Discovery remains useful, but a zero callback result does
-not establish non-use. The [next-version plan](ROADMAP.md#v040-automatic-observation)
-prioritizes automatic observation of these ordinary applications.
+Report/check also discover entry-only candidates from public-table shapes in
+verified mapped ELF files. This allows warm ordinary default-provider activity
+to produce physical entry evidence without an application query or build
+profile. These candidates are hints, not proof of an advertised OpenSSL ABI or
+of crypto use. A called lookalike is counted without reading its arguments or
+return value. Public query/getter observations remain a separate evidence source.
+Zero counts do not establish non-use: coverage, unsupported linkage, attach
+latency and bounded discovery can leave gaps.
 
 There is no universal first-call guarantee. Warm/built-in activation can remain
 unknown; startup, polling, invalidation and final drain leave explicit gaps.

@@ -14,6 +14,7 @@ pub struct SiteBinding {
     pub candidates: Vec<CandidateIdentity>,
     pub installed_ns: u64,
 }
+#[derive(Clone)]
 pub(super) struct Row {
     pub(super) row: SiteExecution,
     pub(super) mapping: u64,
@@ -21,13 +22,14 @@ pub(super) struct Row {
 }
 /// Bounded pure host folding and attachment admission. The install closure is
 /// called once per new physical site; a refusal never publishes a successful row.
+#[derive(Clone)]
 pub struct CountFold {
     limits: CountLimits,
     pub(super) rows: BTreeMap<u32, Row>,
     foreign: BTreeMap<(u32, u32), u64>,
     pub(super) generation: u32,
     pub(super) session: Option<u64>,
-    next_cookie: u32,
+    pub(super) next_cookie: u32,
     state_bytes: usize,
     gaps: BTreeMap<&'static str, u64>,
 }
@@ -134,9 +136,7 @@ impl CountFold {
             }
             return Ok((cookie, generation));
         }
-        if self.rows.values().filter(|r| r.active).count() >= self.limits.max_links
-            || self.next_cookie as usize > self.limits.max_cookies
-        {
+        if self.next_cookie as usize > self.limits.max_cookies {
             return Err(CountFailure::Resource);
         }
         let cookie = self.next_cookie;

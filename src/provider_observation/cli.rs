@@ -360,6 +360,7 @@ impl<W: Write> Stream<'_, W> {
             facts,
             mut gaps,
             learned_sites: _,
+            static_candidates: _,
         } = batch;
         if let Some(snapshot) = snapshot {
             self.capabilities.inventory = match snapshot.capabilities.inventory {
@@ -735,6 +736,10 @@ mod tests {
                 )
             };
             assemble(q).unwrap();
+            assemble(c::Record {
+                kind: c::ALGORITHM_BEGIN,
+                ..q
+            });
             for (index, label) in labels.iter().enumerate() {
                 let id = crate::kinds::ALG_NAMES
                     .iter()

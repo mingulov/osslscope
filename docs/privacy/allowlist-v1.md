@@ -218,6 +218,27 @@ CTRL
 ATTEMPT
 BUCKET
 TRUNC_SEQ
+# provider_observation
+EVENTS
+CONFIG
+MEMBERS
+NAMESPACE
+RANGES
+THREADS
+PENDING
+LOSS
+ALG_CLASS
+TRIP_CLASS
+# focused_count
+NS_CONFIG
+NSFAIL
+COUNTS
+GEN
+TARGET
+WINDOW
+DROPFAIL
+ADMITTED
+LATC
 ```
 
 All maps hold numeric keys/values/counters/cursors except `EVENTS`,
@@ -449,7 +470,66 @@ deferred for v1. There is no int-arg/value capture in v1; any future
 value capture needs per-key-set approval, exact key/shape gates, and
 its own canary lanes.
 
-## 7. Change rule
+## 7. Automatic public-table observation
+
+`provider_observation.rs` attaches only verified exported public load/fetch,
+provider-init, query/unquery and `OSSL_PROVIDER_get0_dispatch` interfaces, plus
+callbacks obtained from successful public init/getter dispatch observations.
+Static ELF table shapes never authorize these argument/return-reading probes.
+The getter returns provider dispatch metadata, not an algorithm array.
+
+The producer has ten target-read source sites, two of which are bounded string
+reads. These extend the separately enumerated legacy harvest/members read set:
+
+| site | read | bound and lifetime | failure |
+|---|---|---|---|
+| `provider_name` | load/registration name | 32-byte stack scratch, finite taxonomy only | unreadable/overlong class |
+| `init_return` | public output dispatch pointer | one u64 after successful init | read loss; no traversal |
+| `walk_provider_dispatch` | function ID and function pointer | 16 dispatch rows; only public query/unquery/teardown signatures may authorize paired probes | read/range/truncation loss |
+| `query_result` | public no-store pointee | one u32 during return | unknown lifetime plus read loss |
+| `algorithm_slot` | names and implementation pointers | at most 512 public 32-byte records within this return | stop plus read/truncation loss |
+| `classify` | alias string | 128-byte stack scratch, at most 8 classified segments | explicit unreadable/overlong/truncated status |
+| `dispatch_slot` | function ID and function pointer | at most 128 public 16-byte dispatch rows per algorithm; pointers read only for cacheable observations | read/range/truncation loss |
+
+Algorithm and dispatch scans use synchronous bounded kernel callbacks. Each
+algorithm has local scratch and a bounded ordinal. No table, alias pointer or
+cursor survives the returned-table observation. Volatile tables may produce
+advertisement metadata within that observation; they produce no asynchronous
+callback attachment operands. Cold/unreadable pages remain read gaps; no page
+faulting target-memory reader is used by this path. Missing ring records and
+traversal bounds remain explicit losses, never termination/completeness proof.
+
+The 96-byte private observation record is ABI version 3: version/kind/size/API,
+PID/TID, observer cookie/generation/invocation, monotonic timestamp, finite
+outcome/cacheability/status/classifier values, numeric operation/function IDs,
+bounded algorithm ordinal, and one zero reserved word. Only successful
+init/getter dispatch records and cacheable implementation records may carry a
+validated executable code operand. The host immediately relocates that operand
+through retained descriptors; it is never emitted in public output. No runtime
+strings, table pointers, provider handles, contexts, key material or application
+payload are transport fields. Future positive operation/function IDs remain
+numeric identities rather than registry admission decisions.
+
+`PENDING` holds bounded per-thread call pairing and required argument operands
+only until return; `THREADS` holds bounded nesting/invocation state. Neither is
+enumerated to public output. `CONFIG`, `MEMBERS`, `NAMESPACE`, and `RANGES` hold
+observer-owned attachment, process/namespace and executable-range admission
+state. There is no persisted returned-table cursor map. The classifier maps
+contain only observer registry bytes, never runtime names.
+
+`focused_count.rs` reads no target arguments, return values or memory. Static
+candidates come solely from bounded retained-file ELF parsing and verified
+process/mapping/backing identity. Multiple candidates and public advertisements
+at one physical site share one cookie; multiple offsets in one retained file
+share a link FD. Static hints have no invented advertiser. Safe opaque algorithm
+IDs, numeric IDs, provenance and first-observed boundaries remain separate from
+the physical counter and do not increase attribution certainty retroactively.
+Query/ring/read losses downgrade live metadata; actual process, namespace or
+backing-identity changes retire links. Final rows and their associations survive
+retirement with their original count generation.
+
+## 8. Change rule
+
 
 A new probe read, map, emitted field, classifier, debug print of
 target-derived data, or userspace target-memory read requires an

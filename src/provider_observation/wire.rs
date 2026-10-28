@@ -35,6 +35,7 @@ pub(crate) fn api(id: u32) -> Result<ObservationApi, ObservationGap> {
         13 => ObservationApi::Inventoried(EvpKdfFetch),
         14 => ObservationApi::Inventoried(EvpSignatureFetch),
         15 => ObservationApi::Inventoried(EvpKemFetch),
+        16 => ObservationApi::Inventoried(OsslProviderGet0Dispatch),
         17 => ObservationApi::ProviderQueryCallback,
         18 => ObservationApi::ProviderTeardownCallback,
         19 => ObservationApi::ProviderUnqueryCallback,
@@ -83,7 +84,14 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
     let bad = ObservationGap::InvalidWire;
     if r.version != c::VERSION
         || r.size != c::EVENT_SIZE as u32
-        || r.reserved != [0; 2]
+        || r.reserved != 0
+        || r.algorithm_index >= c::MAX_ALGORITHMS
+        || r.algorithm_index != 0
+            && !matches!(
+                r.kind,
+                c::IMPLEMENTATION | c::ALIAS | c::ALIAS_END | c::ALGORITHM_BEGIN
+            )
+        || r.operation > i32::MAX as u32
         || r.cookie == 0
         || r.generation == 0
         || r.pid == 0
@@ -93,7 +101,7 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
         return Err(bad);
     }
     api(r.api)?;
-    let op = Operation::from_id(r.operation).ok_or(bad)?;
+    let op = Operation::from_id(r.operation).unwrap_or(Operation::Other);
     outcome(r.outcome)?;
     cache(r.cacheability)?;
     if r.code != 0
@@ -108,7 +116,7 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
     let compatible = match r.kind {
         c::ATTEMPT | c::RESULT => matches!(r.api,1..=6|10..=15),
         c::INIT => {
-            r.api == c::PROVIDER_INIT && r.function != 1
+            matches!(r.api, c::PROVIDER_INIT | c::GET_DISPATCH) && r.function != 1
                 || r.api == c::ADD_BUILTIN && r.function == 1
         }
         c::QUERY | c::IMPLEMENTATION => c::query_api(r.api),
@@ -207,30 +215,41 @@ pub(crate) enum Transport {
     Event(ProviderEvent),
     Alias(c::Record),
     End(c::Record),
+    Begin(c::Record),
 }
 impl Transport {
     pub(crate) fn record(&self) -> c::Record {
         match self {
             Self::Event(e) => e.record,
-            Self::Alias(r) | Self::End(r) => *r,
+            Self::Alias(r) | Self::End(r) | Self::Begin(r) => *r,
         }
     }
 }
 pub(crate) fn decode_transport(bytes: &[u8]) -> Result<Transport, ObservationGap> {
     let r = read_record(bytes)?;
-    if !matches!(r.kind, c::ALIAS | c::ALIAS_END) {
+    if !matches!(r.kind, c::ALIAS | c::ALIAS_END | c::ALGORITHM_BEGIN) {
         return decode_record(r).map(Transport::Event);
     }
     // Reuse the complete envelope/query validation, retaining code and reserved
     // slots so internal records cannot smuggle relocation operands or extensions.
     let mut envelope = r;
     envelope.kind = c::QUERY;
+    envelope.algorithm_index = 0;
     envelope.algorithm = 0;
     envelope.function = 0;
     envelope.outcome = 0;
     envelope.status = 0;
     decode_record(envelope)?;
     let bad = ObservationGap::InvalidWire;
+    if r.algorithm_index >= c::MAX_ALGORITHMS {
+        return Err(bad);
+    }
+    if r.kind == c::ALGORITHM_BEGIN {
+        if r.outcome != 1 || r.algorithm != 0 || r.function != 0 || r.status != 0 {
+            return Err(bad);
+        }
+        return Ok(Transport::Begin(r));
+    }
     if r.kind == c::ALIAS {
         if r.status >= 8 || r.outcome > 1 || r.algorithm > c::OTHER || r.function > c::OTHER {
             return Err(bad);
