@@ -1,125 +1,107 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Roadmap
 
-v0.3.0 is a released discovery preview with focused execution.
-Discovery is the normal starting point; the v0.2.0 fixed-profile foreground
-route remains a legacy diagnostic with its original qualification boundary.
+osslscope starts with automatic OpenSSL discovery, then observes selected
+workloads through public interfaces and validated callback sites. Available
+algorithms and library builds determine what can be observed; there is no
+algorithm or exact-build admission list on the normal path.
 
-## v0.4.0: automatic observation
+v0.3.0 is published. The v0.4.0 automatic-observation candidate is implemented
+and reviewed, with its finite installed qualification described in
+[the candidate notes](docs/release-v0.4.0.md). It remains unreleased.
+The milestones below are planned capabilities, not claims about the current app.
 
-Planned next milestone: make ordinary OpenSSL workloads produce useful activity
-without an enrolled build, manual offsets, application changes or a provider-
-query driver. SHA/AES examples are regression cases, not an algorithm whitelist.
+## v0.5.0: useful execution answers and practical installation
 
-- Discover public provider dispatch/algorithm table candidates from each exact
-  mapped ELF, with bounded relocation, function-start and backing validation.
-  Use public table pointers to find built-in query entrypoints even when their
-  symbols are hidden. Static-only sites use entry-only counting; a shape match
-  does not authorize target-data traversal or prove runtime advertisement.
-  No private EVP/provider layout or stored build offsets.
-- Cover all discoverable operation families and algorithms, including unfamiliar
-  providers/names. Runtime table identities and physical sites determine what
-  can be observed; name registries improve labels rather than admission.
-- Combine static table candidates, naturally observed public query returns,
-  exported API activity and callback counts. Preserve their different evidence
-  levels and shared-site ambiguity; static candidates do not prove activation.
-- Automatically prearm verified dependency candidates for owned runs and handle
-  warm processes/late objects. Source now includes `scan --watch --observe-crypto`
-  for PID/cgroup/module or visible-host scopes, separate per-incarnation v2.4
-  documents, retained passive inventory and explicit membership/resource gaps.
-  No universal first-call or lossless following promise.
-- Show readable candidate hints even when coverage is Unknown. Preserve strict
-  policy/CBOM semantics; API calls do not become provider execution proof.
-- Qualify the real installed command path on independent stock builds, ordinary
-  workloads across multiple crypto families and available supported kernels;
-  measure actual tracing cost separately from passive inventory.
+The intended workflow is: install a complete package, discover a real process
+or container, select its scope, and obtain an understandable execution report
+that can support a useful policy decision or CBOM.
 
-This milestone remains unreleased. Public-table recovery needs production false-positive,
-relocation and safe-attachment controls; experiments are not release acceptance.
-Feature completion and truthful runtime checks decide readiness, not a fixed
-date or a fallback to a small enrolled-algorithm release.
+- Add positive algorithm/provider attribution where naturally observed public
+  relationships establish it. Keep unresolved shared implementations and warm
+  state explicit; never promote API activity or static table hints into proof.
+- Integrate that evidence into existing policy files and CBOM output. Support
+  safe object-bound selectors for unfamiliar algorithms, with clear limits on
+  comparisons across different builds.
+- Extend operational API observations, including KEM and key generation.
+  Algorithm admission remains dynamic; finite test examples do not limit use.
+- Improve tracing cost from measured causes and preserve useful identity and
+  provenance within bounded reports. Publish actual workload impact and limits.
+- Support active observation of ordinary overlay-backed Docker and kind
+  workloads on declared capable hosts, with verified mapped-file identity,
+  namespace scope and sibling exclusion.
+- Deliver matched CLI and BPF objects in binary bundles, DEB and RPM packages;
+  qualify installation, upgrades, removal, privileges and mixed-object rejection.
+- Provide a short first-use journey, actionable diagnostics, real consumer
+  integration and regular installed live regression checks.
 
-## v0.3.0: discover first, then observe
+Attribution, mapped-file authority and complete-window feasibility are early
+engineering gates. A failed gate changes the implementation or schedule; safe
+refusal alone does not complete the intended active workflow.
 
-- **D1 — snapshot and passive-file workflows implemented and checked.** `scan` inventories
-  visible processes or selected PIDs; `inspect` inventories one PID or supplied
-  ELF files. The same bounded parser recognizes finite OpenSSL interfaces from
-  file bytes without profiles, manual offsets, code loading or BPF. Access,
-  identity and resource gaps remain visible. Mapping candidates are distinct
-  from verified backing. Activation/interfaces are unknown and execution is
-  not observed.
-- **D2 — workflows implemented and checked:** sampled watch,
-  intersecting PID/cgroup/module selectors, namespace provenance and bounded
-  metadata reuse. Host-side container workflows use independently resolved
-  PIDs/cgroups. Watch is sampled inventory, with explicit visibility loss and
-  candidate backing; it does not establish process exit, provider unload or
-  lossless following. Native scope exclusion, churn, container and integration
-  checks cover these workflows within their stated observation limits.
-- **D3 — source implemented:** public provider lifecycle/init/query observation,
-  verified backing custody and candidate retirement. Warm/built-in activation,
-  query races and unknown advertisements remain explicit limits.
-- **D4 — source implemented; release qualification is separate:** learned physical
-  callback counting, ordinary PID/run report/check, functional doctor and fixed
-  installed companions. Candidate attribution stays Unknown, reports PARTIAL,
-  and algorithm policy inconclusive. The independent callback fixture is a
-  stimulus oracle, not installed observation acceptance.
+## v0.6.0: continuous operation and deeper investigation
 
-Source implementation and local fixtures do not establish platform/provider
-or release qualification. Discovery metadata alone produces neither an executed
-CBOM nor a policy verdict. Apply the finite fixture/stock-build, lifecycle,
-namespace, resource, privacy and two-kernel checks to one unchanged installed
-CLI/companion pair; see the [release procedure](docs/release-v0.3.0.md).
-The [published record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
-reports the completed finite release checks; it does not close the ordinary
-default-provider or attribution gaps. The
-[bounded inventory cost sample](docs/release-v0.3.0.md#measured-inventory-cost)
-is separate from tracing and broad performance qualification. Source completion
-alone does not authorize a release.
+- Follow selected process lifecycles and fork/exec transitions with explicit
+  identity, loss and fair resource admission.
+- Add continuous service operation with bounded windows, policy reload,
+  restart/recovery, retention and backpressure.
+- Export finalized observations to Prometheus and OpenTelemetry with bounded
+  labels and explicit uncertainty; provide compact operator summaries.
+- Add opt-in callback-duration histograms, bounded metadata-only traces and
+  reviewed scalar status/error observations. Timing is separate from the
+  overhead introduced by tracing.
+- Improve startup, coverage and close guarantees for declared ordinary
+  workloads; preserve unknowns where passive observation cannot establish them.
+- Support useful before/after migration comparison and qualify operational
+  performance, privacy and package lifecycle together.
 
-## v0.2.0: a usable foreground preview
+## v0.7.0: complete the known feature set
 
-This milestone concentrates on running one unchanged application and
-answering a useful question: which enrolled OpenSSL implementation callbacks
-actually executed?
+- Broaden the tested OpenSSL 3/4, kernel, libc and provider matrix, including
+  default, legacy, FIPS and third-party providers.
+- Add ARM64 and separate OpenSSL 1.1.1 inventory/public EVP/ENGINE observation.
+  OpenSSL 1.1.1 has no provider interface; its results retain that distinction.
+- Qualify genuine RHEL with enforcing SELinux and Secure Boot controls, and
+  node-local Docker/containerd/Kubernetes deployment on supported hosts.
+- Provide an explicitly invoked isolated helper for exploring supplied provider
+  modules. Its observations describe its own execution, not another application.
+- Add passive executable inspection beyond environment prediction, with clear
+  static/dynamic dependency, plugin-loading and multiple-library limitations.
+- Add a documented correlation workflow with p11scope while preserving each
+  tool's evidence and clock/coverage limits.
+- Complete package channels, consumer compatibility, remaining correctness and
+  privacy work, and real operator/practitioner acceptance before feature freeze.
 
-Implemented and exercised on the exact enrolled profile:
+Known selected features belong in this milestone. An unfinished requirement
+keeps feature completion open rather than silently moving to a later version.
 
-- Build from source, install into a local prefix and check the environment with
-  `doctor`.
-- Observe one owned process and its threads with `report` and `check`.
-- Start with SHA-256 and AES-GCM observations in one exact stock OpenSSL 3
-  library on one qualified Linux x86-64 profile.
-- Produce human/JSON reports and CBOM assets for definite observations; check
-  observed algorithm use with command-line rules or a policy file.
-- Keep shared-site counts, ambiguity and incomplete coverage explicit.
+## Toward 1.0: stabilization
 
-Capture uses a limited reviewed callback catalogue and the count program.
-Ordinary results remain PARTIAL: absence does not prove non-use. Callback
-entries do not prove cryptographic success, runtime provider activation or
-complete application coverage. Unsupported modes and unmatched enrolled OpenSSL libraries will
-be rejected. The CLI enforces these restrictions before target/BPF acquisition.
+After v0.7, focus on correctness, security, performance, usability, documentation
+and deployment fixes. Qualify the integrated packages across the supported
+matrix, continuous-operation soak, useful consumer imports and real operator
+journeys. Stable CLI/schema behavior and reproducible release artifacts matter
+as much as feature count. Release dates follow demonstrated readiness.
 
-The initial distribution is source plus a documented local build/install
-workflow. Native installed checks cover positive counts, foreign/forked group
-exclusion, policy/output behavior and normal cleanup, with
-[measured overhead and limits](docs/overhead-matrix.md). The pre-exec observer
-crash limitation remains explicit. See [release notes](docs/release-v0.2.0.md).
-Full binary-package and cross-platform qualification is later work.
+## Reuse and boundaries
 
-## Beyond this delivery
+Review implemented mechanisms in p11scope, including its development branches,
+for mapped-file identity, lifetime handling, bounded counters/output, diagnostics,
+comparison and distribution. Adapt each mechanism to OpenSSL's different public
+interfaces and privacy rules; upstream source or tests do not qualify osslscope.
 
-Broader OpenSSL, kernel, libc and container support will be qualified
-incrementally. Additional capabilities remain later work:
+The initial platform remains Linux x86-64 with capable kernels. ARM64 and the
+explicit legacy OpenSSL path are planned above. Windows/macOS, older kernel
+backends, cgroup v1, remote cluster inventory and universal detection of hidden
+static/JIT crypto are outside the selected 1.0 scope.
 
-- Daemon operation and Prometheus/OpenTelemetry export.
-- Latency histograms and metadata-only per-call tracing.
-- Advanced artifact identity/build provenance and DEB/RPM lifecycle support.
-- Stronger completeness/first-call guarantees and broader performance,
-  platform/provider and consumer qualification.
+No keys, passwords, plaintext, application payloads, private OpenSSL layouts,
+application injection or interposition. Discovery, advertisement, API activity,
+physical entries and attributable execution remain distinct. Missing visibility
+never proves non-use, and provider identity never proves FIPS certification or
+hardware protection.
 
-These later tracks do not replace qualification of each newly shipped workflow.
-ARM64 and OpenSSL before 3.0 remain later evaluation. Platform and performance
-claims will follow actual results, with their limits documented.
-
-The permanent boundaries remain: no keys, passwords, plaintext or application
-payload capture; no TLS interception, application changes or interposition.
+Historical release behavior remains documented in the
+[v0.3.0 release](https://github.com/mingulov/osslscope/releases/tag/v0.3.0) and
+[v0.2.0 notes](docs/release-v0.2.0.md). The old fixed-profile route is a legacy
+diagnostic with its original qualification boundary.
