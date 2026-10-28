@@ -14,6 +14,9 @@ limits](docs/release-v0.4.0.md). The [v0.3.0 release
 record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0) retains its
 historical artifact-specific scope; this candidate has not been published.
 
+Tracing hot loops can be costly: the finite stock SHA-256 sample measured a
+4.67× baseline/observed throughput ratio. See [measured cost and limits](docs/release-v0.4.0.md#measured-cost-and-practical-limits).
+
 ## Discover, select, observe
 
 Build the host CLI with `cargo build --locked --bin osslscope` for passive

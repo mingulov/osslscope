@@ -35,10 +35,89 @@ ARM64, pre-3.0, RHEL and Secure Boot remain outside this candidate's evidence.
 
 Installed runtime receipts must bind the CLI and all five BPF object hashes.
 Source checks and fresh-object preparation do not substitute for those receipts.
-Finite performance measurements separate passive scanner CPU/RSS, observer
-process CPU and workload throughput. No general 100k calls/s, 4 microsecond or
-2x overhead guarantee is claimed. Artifact-specific results will be recorded
-here after the candidate's installed workflows are exercised.
+The following finite results bind the ordinary release build from source
+`acd7cf84f0ab6d137148755f9bc214b03d382f18`. Later identity-audit test and release
+prose changes leave these runtime bytes unchanged. This is a source-prefix
+installation qualification, not binary-package or publication acceptance.
+
+## Measured cost and practical limits
+
+**Tracing reduced this SHA-256 hot loop's throughput by about 4.67×**: the
+median baseline/observed ratio was 4.673, range 4.649–4.691. Five paired runs
+followed one warmup pair and alternated order, using the identical stock command
+`openssl speed -elapsed -seconds 6 -bytes 16384 -evp sha256`. Median throughput
+was 2.500 GB/s alone and 0.535 GB/s under ordinary `report run`. Both the workload
+exit and positive physical/API evidence were checked independently.
+
+This sample uses host kernel 7.0.0-38-generic, stock OpenSSL 3.5.5, warm caches,
+two-CPU affinity and the host's powersave governor. It is not a general overhead
+bound; tight loops can be expensive. No 100k calls/s, 4 microsecond or 2× overhead
+guarantee is claimed.
+
+| Separate measurement | Observed finite result |
+| --- | --- |
+| One-PID passive scan, five runs | 10.63–10.84 ms scanner interval; 10,968–11,352 KiB peak RSS; seven objects and 12,006,788 charged read bytes per invocation |
+| Four-second passive watch | 0.01 s user CPU, system CPU below the timer's 0.01 s display resolution; 10,972 KiB peak RSS; subsequent cached samples charged 10,280 bytes each |
+| Observer process under tracing | Per-run mean CPU 21.5–24.2% of one CPU, including setup; one-second samples 0–99%; sampled RSS at most 30,324 KiB |
+
+The observer CPU samples select only the observer PID. They do not measure total
+kernel/probe CPU, workload CPU or per-call latency. Sampled RSS excludes kernel
+map memory and is not the global accounted-state budget. Scanner CPU readings
+below timer resolution are not zero-cost claims.
+
+All six observed hot-loop runs also hit the explicit
+`focused.metadata_output_limit`: optional `algorithm_identities` and
+`site_provenance` sections were omitted while core physical counts and API rows
+remained available. Large candidate sets can therefore lose optional metadata
+at the output cap even when useful activity counts survive. The cap was not
+raised for qualification.
+
+## Performed qualification
+
+| Actual input | Performed cells |
+| --- | --- |
+| Host Linux x86-64, kernel 7.0.0-38-generic, stock OpenSSL 3.5.5 | Short/warm CLI, six-family public-API client, default and legacy provider, unmodified curl TLS, installed scope/cancellation/privacy/resource controls |
+| Same host, independent Debian OpenSSL 3.5.7 library/module build | Matching-library public-API client; short digest and warm external-provider activity with the stock 3-linked CLI selecting those ABI-compatible libraries |
+| Same host, official stable OpenSSL 4.0.3 | Its own 4-linked CLI/client and matching libraries; static tables, public query/dispatch facts, six-family API activity, default/legacy, short/warm observations |
+| Cached kernel 6.12.114-0612114-generic | Unchanged observer artifacts; seven installed focused controls plus both stock 3 public-API clients on verified guest-local tmpfs backing |
+
+All six-family clients exited successfully. SHA3/BLAKE2 digest values matched
+independent hashlib oracles; legacy MD4 matched a fixed known value. Unused
+fetches had zero operational API entries on all three builds, while initialization
+could still produce physical candidate entries. ChaCha20 and Camellia round trips
+preserved public test bytes. Curl completed a certificate-verified local TLS
+request with HTTP 200 and exit 0; its fixture server was outside the selected
+process. Native controls include lookalikes, shared and unused callbacks, renamed/
+replaced/unlinked/late objects, denied access, actual PID reuse and global caps.
+Reports remain PARTIAL and checked algorithm policy remains inconclusive.
+
+The guest's original overlayfs root backing was refused at mapped-file
+association. Warm/sustained controls passed with byte-identical executable and
+loaded dependencies on verified tmpfs. These results do not qualify overlayfs
+or 9p backing. The table is the performed set, not a complete cross-product of
+applications, algorithms, libraries and kernels. OpenSSL 4.0.3 is one pinned
+compatibility lane; broader OpenSSL 4 qualification remains open.
+
+Source checks pass with 2,055 tests and 136 explicit ignores. Fifteen fresh-object
+preparation controls, thirteen installed host-command controls and seven direct
+native source/producer controls pass; source tests and capability skips are not
+runtime passes. Known shared-test-helper warnings and the pinned BPF-linker's
+LLVM fallback warning remain disclosed. Whole-change independent review remains
+part of candidate acceptance; no release has been published.
+
+## Runtime identity
+
+The CLI reports version 0.4.0. The ordinary pinned release build and protected
+installation produced these SHA-256 values; guest copies were checked unchanged:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `osslscope` | `3aeb8138fbb3c94c6bb1d815a5dce497a3b9921e5ce85cb004626c0207968514` |
+| `osslscope-harvest` | `fa4f1ee35f5bce8a0e86232e25c15fcab372f98af3d137995caf3f0f2b7ffca2` |
+| `osslscope-count` | `a6ddb29c44cc9845875cdd8f48558e856e30170101323fe187db91f52a76ea75` |
+| `osslscope-members` | `abda2a14b3a32a416cc3e4ce3678cc3bb498854f0cdb806d1518a2e46f628800` |
+| `osslscope-provider-observation` | `8d1faa01b05ed778cb57ab2805c0ee9290e7d6cd3761380ba9c317ba6a208115` |
+| `osslscope-focused-count` | `35b6c2f499a5ad61134cf6ba946f7fb8e4a40ae8bf7980711038f7e48f750add` |
 
 See [usage](usage.md) for cancellation, exit codes, privacy and the distinct
 native-device/report-device identity encodings in crypto-watch records.
