@@ -212,9 +212,13 @@ struct Attachment {
     generation: u64,
     object: u64,
     original: Option<VerifiedSite>,
+    historical: bool,
 }
 impl Attachment {
     fn adopt_site(&mut self, mapped: VerifiedSite) -> Result<(), ObservationGap> {
+        if self.historical {
+            return Err(ObservationGap::Invalidated);
+        }
         self.site.revalidate_object()?;
         mapped.revalidate_object()?;
         if !mapped.matches_retained(&self.site)? {
@@ -260,6 +264,100 @@ pub struct ProviderSession {
     last_drain: Instant,
     closed: bool,
 }
+fn terminal_originals(
+    startup: &[Attachment],
+    target: Option<&Target>,
+    record: Option<&inventory::ProcessRecord>,
+) -> Result<bool, ObservationGap> {
+    let mut found = false;
+    let mut terminal = true;
+    for a in startup
+        .iter()
+        .chain(target.into_iter().flat_map(|t| &t.attachments))
+    {
+        if let Some(original) = a
+            .original
+            .as_ref()
+            .or_else(|| a.site.is_startup().then_some(&a.site))
+        {
+            found = true;
+            terminal &= original.revalidate_queued_record(record)?;
+        }
+    }
+    Ok(found && terminal)
+}
+/// Shared retirement boundary for reconcile/acquisition failures and drain.
+/// The descriptor/map operation is supplied by the session; source ownership
+/// and pending assembler state have one production transition.
+fn retire_source_owners(
+    (startup, targets): (
+        &mut BTreeMap<u32, Vec<Attachment>>,
+        &mut BTreeMap<u32, Target>,
+    ),
+    aliases: &mut super::assembly::Sequences,
+    pid: u32,
+    record: Option<&inventory::ProcessRecord>,
+    gap: ObservationGap,
+    b: &mut ObservationBatch,
+    disarm: impl FnOnce(&[Attachment], Option<&Target>) -> Result<(), ObservationGap>,
+) -> bool {
+    let rows: &[Attachment] = startup.get(&pid).map_or(&[], Vec::as_slice);
+    let preserve = if matches!(
+        gap,
+        ObservationGap::Invalidated | ObservationGap::AmbiguousSite | ObservationGap::ObjectChanged
+    ) {
+        false
+    } else {
+        match terminal_originals(rows, targets.get(&pid), record) {
+            Ok(terminal) => terminal,
+            Err(gap) => {
+                b.gap(gap);
+                false
+            }
+        }
+    };
+    if let Err(gap) = disarm(rows, targets.get(&pid)) {
+        b.gap(gap);
+    }
+    b.learned_sites.retain(|site| site.pid != pid);
+    b.static_candidates.retain(|site| site.pid() != pid);
+    if preserve {
+        if let Some(target) = targets.remove(&pid) {
+            for mut a in target.attachments {
+                // Close links while both mapped and original file owners are
+                // alive. Only original source identity survives the transition.
+                a.links.clear();
+                if let Some(original) = a.original.take() {
+                    a.site = original;
+                }
+                if a.site.is_startup() {
+                    startup.entry(pid).or_default().push(a);
+                }
+            }
+        }
+        for a in startup.get_mut(&pid).into_iter().flatten() {
+            a.links.clear();
+            a.historical = true;
+        }
+        b.gap(ObservationGap::ProcessUnavailable);
+        b.gap(ObservationGap::IntervalUnknown);
+        b.gap(ObservationGap::FirstQueryUnknown);
+        b.gap(ObservationGap::SamplingPartial);
+    } else {
+        aliases.retire(pid);
+        if let Some(rows) = startup.remove(&pid) {
+            for a in rows {
+                drop(a.links);
+            }
+        }
+        if let Some(target) = targets.remove(&pid) {
+            for a in target.attachments {
+                drop(a.links);
+            }
+        }
+    }
+    preserve
+}
 struct RecordBinding<'a> {
     attachment: &'a Attachment,
     starttime: u64,
@@ -279,7 +377,7 @@ fn record_binding<'a>(
             return Ok(Some(RecordBinding {
                 attachment,
                 starttime: target.starttime,
-                process: Some(&target.process),
+                process: (!attachment.historical).then_some(&target.process),
             }));
         }
     }
@@ -571,6 +669,7 @@ impl ProviderSession {
                 object: object_id(&site),
                 generation,
                 original: None,
+                historical: false,
                 links,
                 site,
                 cookie,
@@ -580,27 +679,52 @@ impl ProviderSession {
         })()
     }
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) {
+        self.retire_for_gap(pid, None, ObservationGap::Invalidated, b);
+    }
+    fn retire_for_gap(
+        &mut self,
+        pid: u32,
+        record: Option<&inventory::ProcessRecord>,
+        gap: ObservationGap,
+        b: &mut ObservationBatch,
+    ) -> bool {
         self.refreshing.remove(&pid);
-        self.aliases.retire(pid);
-        b.learned_sites.retain(|site| site.pid != pid);
-        b.static_candidates.retain(|site| site.pid() != pid);
-        // Disarm before dropping links. Never walk kernel-private opaque joins.
-        if self.members.remove(&pid).is_err() {
-            b.gap(ObservationGap::Invalidated)
-        }
-        self.retire_startup(pid);
-        if let Some(target) = self.targets.remove(&pid) {
-            for a in target.attachments {
-                let _ = self.config.remove(&a.cookie);
-                drop(a.links);
-            }
-            for index in 0..target.ranges {
-                let _ = self.ranges.remove(&c::RangeKey {
-                    pid,
-                    index: index as u32,
-                });
-            }
-        }
+        retire_source_owners(
+            (&mut self.startup, &mut self.targets),
+            &mut self.aliases,
+            pid,
+            record,
+            gap,
+            b,
+            |startup, target| {
+                if target.is_none() && !startup.is_empty() && startup.iter().all(|a| a.historical) {
+                    return Ok(());
+                }
+                let mut failed = self.members.remove(&pid).is_err();
+                for a in startup
+                    .iter()
+                    .chain(target.into_iter().flat_map(|t| &t.attachments))
+                {
+                    failed |= self.config.remove(&a.cookie).is_err();
+                }
+                if let Some(target) = target {
+                    for index in 0..target.ranges {
+                        failed |= self
+                            .ranges
+                            .remove(&c::RangeKey {
+                                pid,
+                                index: index as u32,
+                            })
+                            .is_err();
+                    }
+                }
+                if failed {
+                    Err(ObservationGap::Invalidated)
+                } else {
+                    Ok(())
+                }
+            },
+        )
     }
     pub(crate) fn set_deadline(&self, deadline: Instant) {
         self.budget.set_deadline(deadline);
@@ -629,7 +753,7 @@ impl ProviderSession {
             })
             .collect();
         for (pid, gap) in invalid_refresh {
-            self.retire(pid, &mut b);
+            self.retire_for_gap(pid, records.iter().find(|r| r.pid == pid), gap, &mut b);
             b.gap(gap);
         }
         let retire: Vec<_> = self
@@ -645,7 +769,7 @@ impl ProviderSession {
             })
             .collect();
         for (pid, gap) in retire {
-            self.retire(pid, &mut b);
+            self.retire_for_gap(pid, records.iter().find(|r| r.pid == pid), gap, &mut b);
             b.gap(gap);
             b.gap(ObservationGap::IntervalUnknown)
         }
@@ -664,6 +788,23 @@ impl ProviderSession {
             })
             .collect();
         for &pid in &refreshed {
+            let record = records.iter().find(|r| r.pid == pid);
+            match terminal_originals(
+                self.startup.get(&pid).map_or(&[], Vec::as_slice),
+                self.targets.get(&pid),
+                record,
+            ) {
+                Ok(true) => {
+                    self.retire_for_gap(pid, record, ObservationGap::ProcessUnavailable, &mut b);
+                    continue;
+                }
+                Err(gap) => {
+                    self.retire(pid, &mut b);
+                    b.gap(gap);
+                    continue;
+                }
+                Ok(false) => (),
+            }
             let retained = self.targets[&pid].process.retained_incarnation();
             self.retire(pid, &mut b);
             self.refreshing.insert(pid, retained);
@@ -680,7 +821,7 @@ impl ProviderSession {
                 Ok(()) => {}
                 Err(g) => {
                     if identity_failure(g) {
-                        self.retire(record.pid, &mut b);
+                        self.retire_for_gap(record.pid, Some(record), g, &mut b);
                     }
                     b.gap(g);
                 }
@@ -694,6 +835,16 @@ impl ProviderSession {
         record: &inventory::ProcessRecord,
         b: &mut ObservationBatch,
     ) -> Result<(), ObservationGap> {
+        if let Some(rows) = self
+            .startup
+            .get(&record.pid)
+            .filter(|rows| rows.iter().any(|a| a.historical))
+        {
+            if terminal_originals(rows, None, Some(record))? {
+                return Ok(());
+            }
+            return Err(ObservationGap::Invalidated);
+        }
         let mut target = if let Some(target) = self.targets.remove(&record.pid) {
             target
         } else {
@@ -867,9 +1018,11 @@ impl ProviderSession {
             self.members
                 .insert(pid, mapped_member(previous, generation, target.ranges)?, 0)
                 .map_err(|_| ObservationGap::AttachFailed)?;
-            self.retire_startup(pid);
             // The second check fences setup changes after all links and membership.
             target.process.revalidate()?;
+            if self.startup.get(&pid).is_some_and(Vec::is_empty) {
+                self.startup.remove(&pid);
+            }
             Ok(())
         })();
         target.ready = result.is_ok();
@@ -880,7 +1033,7 @@ impl ProviderSession {
         self.targets.insert(pid, target);
         if let Err(g) = result {
             if g != ObservationGap::SnapshotLag {
-                self.retire(pid, b);
+                self.retire_for_gap(pid, Some(record), g, b);
             }
             return Err(g);
         }
@@ -900,33 +1053,7 @@ impl ProviderSession {
             .filter_map(|(&pid, t)| t.process.revalidate().err().map(|g| (pid, g)))
             .collect();
         for (pid, gap) in retired {
-            // Only retained original startup authorities may survive an exit as
-            // historical event owners. Drop every mapped authority and range;
-            // no historical code address is relocated or attached.
-            if gap == ObservationGap::ProcessUnavailable {
-                if let Some(target) = self.targets.remove(&pid) {
-                    for mut a in target.attachments {
-                        if let Some(original) = a.original.take() {
-                            a.site = original;
-                            self.startup.entry(pid).or_default().push(a);
-                        } else {
-                            let _ = self.config.remove(&a.cookie);
-                            drop(a.links);
-                        }
-                    }
-                    for index in 0..target.ranges {
-                        let _ = self.ranges.remove(&c::RangeKey {
-                            pid,
-                            index: index as u32,
-                        });
-                    }
-                }
-                if self.startup.get(&pid).is_none_or(|rows| rows.is_empty()) {
-                    self.retire(pid, &mut b);
-                }
-            } else {
-                self.retire(pid, &mut b);
-            }
+            self.retire_for_gap(pid, None, gap, &mut b);
             b.gap(gap);
         }
         if !self.startup.is_empty() {
@@ -949,23 +1076,13 @@ impl ProviderSession {
         for (pid, result) in validation {
             match result {
                 Err(gap) => {
-                    self.retire(pid, &mut b);
+                    self.retire_for_gap(pid, None, gap, &mut b);
                     b.gap(gap);
                 }
                 Ok(true) => {
-                    // Disarm now, retain link/file/cookie owners through the
-                    // bounded ring drain, then release links before files.
-                    if self.members.remove(&pid).is_err() {
-                        b.gap(ObservationGap::Invalidated);
+                    if self.retire_for_gap(pid, None, ObservationGap::ProcessUnavailable, &mut b) {
+                        terminal.push(pid);
                     }
-                    for a in &self.startup[&pid] {
-                        if self.config.remove(&a.cookie).is_err() {
-                            b.gap(ObservationGap::Invalidated);
-                        }
-                    }
-                    terminal.push(pid);
-                    b.gap(ObservationGap::ProcessUnavailable);
-                    b.gap(ObservationGap::IntervalUnknown);
                 }
                 Ok(false) => (),
             }
@@ -1062,7 +1179,7 @@ impl ProviderSession {
                 Err(g) => {
                     b.gap(g);
                     if identity_failure(g) {
-                        self.retire(r.pid, b)
+                        self.retire_for_gap(r.pid, None, g, b);
                     }
                     return;
                 }
@@ -1240,7 +1357,7 @@ impl ProviderSession {
         }
         if let Err(g) = target.process.revalidate() {
             b.gap(g);
-            self.retire(pid, b);
+            self.retire_for_gap(pid, None, g, b);
             return;
         }
         let generation = target.generation;
@@ -1257,7 +1374,7 @@ impl ProviderSession {
                 );
                 if let Err(g) = result {
                     b.gap(g);
-                    self.retire(pid, b);
+                    self.retire_for_gap(pid, None, g, b);
                     return;
                 }
                 self.targets.get_mut(&pid).unwrap().attachments.push(a);
@@ -1265,7 +1382,7 @@ impl ProviderSession {
             Err(g) => {
                 b.gap(g);
                 if identity_failure(g) {
-                    self.retire(pid, b)
+                    self.retire_for_gap(pid, None, g, b);
                 }
             }
         }
@@ -1329,6 +1446,13 @@ impl ProviderSession {
                 return Err(ObservationGap::SnapshotLag);
             }
             let pid = site.pid();
+            if self
+                .startup
+                .get(&pid)
+                .is_some_and(|rows| rows.iter().any(|a| a.historical))
+            {
+                return Err(ObservationGap::Invalidated);
+            }
             if !self
                 .roles
                 .accepts(role_site(pid, site.starttime(), &site), api)
@@ -2653,6 +2777,378 @@ mod startup_fixture;
 #[cfg(all(test, target_arch = "x86_64"))]
 mod startup_api_controls {
     use super::*;
+    // A held child inherits all concurrent parent fixture maps. Keep their
+    // lifetimes separate so another test cannot unlink an inherited code file.
+    static MAPPED_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    struct FixtureMapping(*mut libc::c_void, usize);
+    impl Drop for FixtureMapping {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(self.0, self.1);
+            }
+        }
+    }
+    struct ReconcileFixture {
+        child: crate::target::OwnedTarget,
+        startup: BTreeMap<u32, Vec<Attachment>>,
+        targets: BTreeMap<u32, Target>,
+        record: inventory::ProcessRecord,
+        link_peer: std::os::unix::net::UnixStream,
+        _mapping: FixtureMapping,
+        _file: startup_fixture::ForwarderFixture,
+        budget: ObservationBudget,
+    }
+    fn reconcile_fixture(adopted: bool) -> ReconcileFixture {
+        let f = startup_fixture::ForwarderFixture::new(
+            ".byte 0xe9\n.long query_impl-.-4",
+            ".byte 0xeb\n.byte unquery_impl-.-1",
+        );
+        let file = f.file();
+        let len = file.metadata().unwrap().len() as usize;
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let mapping = FixtureMapping(address, len);
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .unwrap();
+        let budget = ObservationBudget::default();
+        let mapped_file = file.try_clone().unwrap();
+        let (_, sites, _) = objects::startup_candidates(
+            objects::StartupProcess::held(&child).unwrap(),
+            file,
+            &budget,
+        )
+        .unwrap();
+        let (_, site) = sites
+            .into_iter()
+            .map(|s| s.into_parts())
+            .find(|(api, _)| *api == wire::api(c::PUBLIC_QUERY).unwrap())
+            .unwrap();
+        let mut attachment = Attachment {
+            object: object_id(&site),
+            site,
+            links: Vec::new(),
+            cookie: 81,
+            api: c::PUBLIC_QUERY,
+            generation: 19,
+            advertisers: Vec::new(),
+            original: None,
+            historical: false,
+        };
+        let (link, link_peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        link_peer.set_nonblocking(true).unwrap();
+        attachment.links.push(link.into());
+        let record = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let mut targets = BTreeMap::new();
+        let mut startup = BTreeMap::new();
+        if adopted {
+            let process = objects::fixture_support::mapped_process(&record, mapped_file, &budget);
+            let mapped = process
+                .resolve_api(wire::api(c::PUBLIC_QUERY).unwrap())
+                .into_iter()
+                .find(|s| s.site.object_hash() == attachment.site.object_hash())
+                .unwrap()
+                .site;
+            attachment.adopt_site(mapped).unwrap();
+            targets.insert(
+                child.pid(),
+                Target {
+                    process,
+                    starttime: record.starttime,
+                    generation: 19,
+                    attachments: vec![attachment],
+                    ranges: 1,
+                    ready: true,
+                },
+            );
+        } else {
+            startup.insert(child.pid(), vec![attachment]);
+        }
+        ReconcileFixture {
+            child,
+            startup,
+            targets,
+            record,
+            link_peer,
+            _mapping: mapping,
+            _file: f,
+            budget,
+        }
+    }
+    #[test]
+    fn terminal_reconcile_before_drain_preserves_startup_and_adopted_query_owners() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for stage in ["startup", "adopted", "partial"] {
+            let adopted = stage != "startup";
+            let mut fixture = reconcile_fixture(adopted);
+            let pid = fixture.child.pid();
+            if stage == "partial" {
+                // First construction has moved the physical owner into Target,
+                // but adoption's initial validation can fail before replacement.
+                let attachment = &mut fixture.targets.get_mut(&pid).unwrap().attachments[0];
+                attachment.site = attachment.original.take().unwrap();
+            }
+            let mut r = c::Record {
+                version: c::VERSION,
+                size: 96,
+                kind: c::ALGORITHM_BEGIN,
+                pid,
+                tid: pid,
+                cookie: 81,
+                generation: 19,
+                invocation: 7,
+                api: c::PUBLIC_QUERY,
+                operation: 1,
+                outcome: 1,
+                cacheability: 1,
+                ..Default::default()
+            };
+            let decode = |r: &c::Record| {
+                wire::decode_transport(unsafe {
+                    std::slice::from_raw_parts((r as *const c::Record).cast(), 96)
+                })
+                .unwrap()
+            };
+            let identity = record_binding(&fixture.targets, &fixture.startup, &r)
+                .unwrap()
+                .unwrap();
+            let hash = identity.attachment.site.object_hash().clone();
+            let object = identity.attachment.object;
+            let file_fd = identity
+                .attachment
+                .original
+                .as_ref()
+                .unwrap_or(&identity.attachment.site)
+                .attachment_fd()
+                .as_raw_fd();
+            let link_fd = identity.attachment.links[0].as_raw_fd();
+            let mut aliases = super::super::assembly::Sequences::default();
+            let mut batch = ObservationBatch::default();
+            assert!(
+                assemble_payload(decode(&r), &mut aliases, &fixture.budget, &mut batch).is_none()
+            );
+            fixture.child.release_retaining_exit().unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            while fixture.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until);
+                std::thread::yield_now();
+            }
+            // The same first-acquisition / mapped-revalidation failure decisions
+            // used by reconcile, before the subsequent queued transport drain.
+            let gap = if adopted {
+                reconcile_retirement_gap(
+                    Some(fixture.record.starttime),
+                    fixture.record.starttime,
+                    || fixture.targets[&pid].process.revalidate(),
+                )
+                .unwrap()
+            } else {
+                objects::acquire_incarnation(&fixture.record)
+                    .err()
+                    .expect("terminal first acquisition fails")
+            };
+            assert!(
+                identity_failure(gap),
+                "host stimulus must reach reconcile's actual retirement branch"
+            );
+            let mut membership = true;
+            let mut code_ranges = usize::from(adopted);
+            let kept = retire_source_owners(
+                (&mut fixture.startup, &mut fixture.targets),
+                &mut aliases,
+                pid,
+                Some(&fixture.record),
+                gap,
+                &mut batch,
+                |_, _| {
+                    assert!(unsafe { libc::fcntl(file_fd, libc::F_GETFD) } >= 0);
+                    assert!(unsafe { libc::fcntl(link_fd, libc::F_GETFD) } >= 0);
+                    membership = false;
+                    code_ranges = 0;
+                    Ok(())
+                },
+            );
+            assert!(
+                kept,
+                "reconcile erased validated terminal original owner; adopted={adopted}"
+            );
+            assert!(!membership && code_ranges == 0);
+            assert!(
+                fixture.targets.is_empty(),
+                "terminal reconcile retained mapped relocation authority"
+            );
+            assert!(
+                fixture
+                    .startup
+                    .get(&pid)
+                    .is_some_and(|rows| !rows.is_empty()),
+                "retirement dropped terminal owner at {stage} stage"
+            );
+            assert!(
+                aliases.incomplete(),
+                "retirement orphaned a pending alias boundary"
+            );
+            use std::io::Read;
+            assert_eq!(
+                fixture.link_peer.read(&mut [0]).unwrap(),
+                0,
+                "terminal history retained an armed link"
+            );
+            assert!(unsafe { libc::fcntl(file_fd, libc::F_GETFD) } >= 0);
+            let binding = record_binding(&fixture.targets, &fixture.startup, &r)
+                .unwrap()
+                .unwrap();
+            assert!(binding.process.is_none());
+            assert!(binding.attachment.historical);
+            assert!(
+                binding.attachment.site.revalidate_object().is_err(),
+                "historical source cannot authorize a new attachment"
+            );
+            assert_eq!(
+                (
+                    binding.attachment.cookie,
+                    binding.attachment.generation,
+                    binding.attachment.object
+                ),
+                (81, 19, object)
+            );
+            assert_eq!(binding.starttime, fixture.record.starttime);
+            assert_eq!(binding.attachment.site.object_hash(), &hash);
+            let mut query = r;
+            query.invocation = 8;
+            query.kind = c::QUERY;
+            let mut begin = query;
+            begin.kind = c::ALGORITHM_BEGIN;
+            r.kind = c::ALIAS;
+            r.algorithm = c::OTHER;
+            r.function = c::OTHER;
+            r.outcome = 0;
+            let mut end = r;
+            end.kind = c::ALIAS_END;
+            end.function = 1;
+            let mut alias8 = r;
+            alias8.invocation = 8;
+            let mut end8 = end;
+            end8.invocation = 8;
+            let mut query_results = 0;
+            let mut advertisements = 0;
+            for queued in [r, end, query, begin, alias8, end8] {
+                let binding = record_binding(&fixture.targets, &fixture.startup, &queued)
+                    .unwrap()
+                    .unwrap();
+                assert!(binding.process.is_none());
+                assert_eq!(binding.attachment.site.object_hash(), &hash);
+                if let Some(payload) =
+                    assemble_payload(decode(&queued), &mut aliases, &fixture.budget, &mut batch)
+                {
+                    match payload {
+                        ObservationPayload::QueryResult { .. } => query_results += 1,
+                        ObservationPayload::Algorithm { .. } => advertisements += 1,
+                        _ => (),
+                    }
+                }
+            }
+            assert_eq!((query_results, advertisements), (1, 2));
+            assert!(!aliases.incomplete());
+            assert!(batch.learned_sites.is_empty());
+            assert!(batch.gaps.contains(&ObservationGap::ProcessUnavailable));
+            assert!(batch.gaps.contains(&ObservationGap::IntervalUnknown));
+            fixture.child.finish_observation().unwrap();
+        }
+    }
+    #[test]
+    fn terminal_reconcile_refuses_readable_mismatches_conflicts_and_live_failure() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        for adopted in [false, true] {
+            for case in ["live", "starttime", "namespace", "object", "role"] {
+                let mut fixture = reconcile_fixture(adopted);
+                let pid = fixture.child.pid();
+                let r = c::Record {
+                    pid,
+                    tid: pid,
+                    cookie: 81,
+                    generation: 19,
+                    api: c::PUBLIC_QUERY,
+                    ..Default::default()
+                };
+                if case != "live" {
+                    fixture.child.release_retaining_exit().unwrap();
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while fixture.child.peek_exit().unwrap().is_none() {
+                        assert!(Instant::now() < until);
+                        std::thread::yield_now();
+                    }
+                }
+                match case {
+                    "starttime" => fixture.record.starttime += 1,
+                    "namespace" => fixture.record.namespaces.pid.as_mut().unwrap().inode += 1,
+                    "object" => {
+                        use std::os::unix::fs::PermissionsExt;
+                        let binding = record_binding(&fixture.targets, &fixture.startup, &r)
+                            .unwrap()
+                            .unwrap();
+                        let file = format!(
+                            "/proc/self/fd/{}",
+                            binding.attachment.site.attachment_fd().as_raw_fd()
+                        );
+                        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                    }
+                    _ => (),
+                }
+                let mut aliases = super::super::assembly::Sequences::default();
+                let mut batch = ObservationBatch::default();
+                let gap = if case == "role" {
+                    ObservationGap::AmbiguousSite
+                } else {
+                    ObservationGap::BackingUnavailable
+                };
+                assert!(
+                    !retire_source_owners(
+                        (&mut fixture.startup, &mut fixture.targets),
+                        &mut aliases,
+                        pid,
+                        Some(&fixture.record),
+                        gap,
+                        &mut batch,
+                        |_, _| Ok(())
+                    ),
+                    "generic failure became historical authority: case={case}, adopted={adopted}"
+                );
+                assert!(
+                    record_binding(&fixture.targets, &fixture.startup, &r)
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(fixture.startup.is_empty() && fixture.targets.is_empty());
+                match case {
+                    "starttime" => assert!(batch.gaps.contains(&ObservationGap::ProcessChanged)),
+                    "namespace" => assert!(batch.gaps.contains(&ObservationGap::NamespaceChanged)),
+                    "object" => assert!(batch.gaps.contains(&ObservationGap::ObjectChanged)),
+                    _ => (),
+                }
+                if case != "live" {
+                    fixture.child.finish_observation().unwrap();
+                }
+            }
+        }
+    }
     #[test]
     fn startup_mapped_membership_never_renews_an_invalidated_advertisement_lease() {
         let previous = c::Member {
@@ -2696,6 +3192,7 @@ mod startup_api_controls {
             generation: 19,
             advertisers: Vec::new(),
             original: None,
+            historical: false,
         };
         (f, attachment)
     }
@@ -2789,8 +3286,14 @@ mod startup_api_controls {
     fn first_natural_stock_queries_survive_without_a_mapped_snapshot() {
         let object =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let executable = std::env::var_os("OSSLSCOPE_TEST_OPENSSL")
+            .map(|path| {
+                path.into_string()
+                    .expect("OSSLSCOPE_TEST_OPENSSL must be a UTF-8 executable path")
+            })
+            .unwrap_or_else(|| "/usr/bin/openssl".into());
         for algorithm in ["-sha512", "-sha3-256"] {
-            let argv = ["/usr/bin/openssl", "dgst", algorithm, "/dev/null"]
+            let argv = [executable.as_str(), "dgst", algorithm, "/dev/null"]
                 .map(str::to_owned)
                 .to_vec();
             let mut child =
@@ -2837,9 +3340,19 @@ mod startup_api_controls {
                 std::thread::yield_now();
             }
             assert_eq!(child.peek_exit().unwrap(), Some(0));
+            // Actual controller ordering includes reconcile before drain even
+            // when the natural process exits during discovery.
+            let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+                pids: vec![child.pid()],
+                ..Default::default()
+            });
+            let reconciliation = session.reconcile(&snapshot);
             // One bounded drain after ordinary exit; no readiness/query/getter
             // protocol, sleeps, target pacing or repeated library contexts.
-            let batch = session.close_until(Instant::now() + Duration::from_secs(2));
+            let mut batch = session.close_until(Instant::now() + Duration::from_secs(2));
+            for gap in reconciliation.gaps {
+                batch.gap(gap);
+            }
             let facts: Vec<_> = batch
                 .facts
                 .iter()
@@ -2887,6 +3400,7 @@ mod startup_api_controls {
     }
     #[test]
     fn startup_pending_aliases_and_cookie_survive_first_mapped_authority() {
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
         use std::os::fd::AsRawFd;
         let f = startup_fixture::ForwarderFixture::new(
             ".byte 0xe9\n.long query_impl-.-4",
@@ -2946,6 +3460,7 @@ mod startup_api_controls {
             api: c::PUBLIC_QUERY,
             advertisers: Vec::new(),
             original: None,
+            historical: false,
         };
         let records = inventory::snapshot(&inventory::SnapshotOptions {
             pids: vec![child.pid()],

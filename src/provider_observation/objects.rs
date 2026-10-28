@@ -418,6 +418,28 @@ impl VerifiedSite {
     pub fn object_hash(&self) -> &ObjectHash {
         &self.hash
     }
+    pub(crate) fn revalidate_queued_record(
+        &self,
+        record: Option<&ProcessRecord>,
+    ) -> Result<bool, ObservationGap> {
+        let SiteCustody::Startup(original) = &self.custody else {
+            return Err(ObservationGap::Invalidated);
+        };
+        if let Some(record) = record {
+            if record.pid != original.pid || record.starttime != original.starttime {
+                return Err(ObservationGap::ProcessChanged);
+            }
+            // Missing post-exit observations are uncertainty. A readable supplied
+            // identity mismatch still defeats retained historical authority.
+            if record.namespaces.pid.is_some() && record.namespaces.pid != original.namespaces.pid
+                || record.namespaces.mount.is_some()
+                    && record.namespaces.mount != original.namespaces.mount
+            {
+                return Err(ObservationGap::NamespaceChanged);
+            }
+        }
+        self.revalidate_queued()
+    }
     /// Existing queued records only. A terminal original pidfd cannot authorize
     /// new links, reads or mapped relocation. Missing post-exit proc metadata is
     /// uncertainty, never a successful current namespace validation.
