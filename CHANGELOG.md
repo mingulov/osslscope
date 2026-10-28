@@ -13,7 +13,11 @@
   four active slots and one shared 256 MiB accounted state budget. Temporary
   capacity pressure preserves retained discovery progress for later resumption.
   A later verified inventory row also triggers fresh acquisition when an early
-  loader snapshot supplied only a refused locator candidate.
+  loader snapshot supplied only a refused locator candidate. Independently
+  revalidated unchanged Count custody retains its physical cookies across this
+  metadata upgrade; actual backing/namespace/process loss still retires links.
+- Render bounded human crypto-watch summaries by default, with distinct
+  physical/API totals and explicit uncertainty; `--json` retains NDJSON.
 - Root package version 0.4.0; helper crates retain their versions. Reports remain
   PARTIAL, attribution Unknown and algorithm policy inconclusive. See
   [candidate qualification and limits](docs/release-v0.4.0.md).

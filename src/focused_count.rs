@@ -191,6 +191,7 @@ pub struct FocusedCounter {
     associations: BTreeMap<u32, SiteAssociations>,
     startup_only: std::collections::BTreeSet<u32>,
     mapped_generation: Option<u64>,
+    authority_refresh_pending: bool,
     mapped_guards: Vec<crate::provider_observation::VerifiedSite>,
 }
 impl FocusedCounter {
@@ -241,6 +242,7 @@ impl FocusedCounter {
             associations: BTreeMap::new(),
             startup_only: Default::default(),
             mapped_generation: None,
+            authority_refresh_pending: false,
             mapped_guards: Vec::new(),
         };
         let NamespaceId { device, inode } = namespace;
@@ -286,6 +288,34 @@ impl FocusedCounter {
     pub fn active_link_count(&self) -> usize {
         self.attachments.len()
     }
+    /// Recheck independently retained Count custody, without obtaining any
+    /// attachment authority from inventory metadata or the refresh marker.
+    pub(crate) fn retain_authority(&mut self, refresh: bool) -> Result<(), CountFailure> {
+        let result = (|| {
+            validate_namespace(&self.namespace, self.expected_namespace)?;
+            for attachment in &self.attachments {
+                attachment.candidates[0]
+                    .site()
+                    .revalidate_object()
+                    .map_err(|_| CountFailure::Identity)?;
+            }
+            // Startup FDs alone permit the initial exec; mapped guards preserve
+            // the stronger mapping constraint once a file has been adopted.
+            for guard in &self.mapped_guards {
+                guard
+                    .revalidate_object()
+                    .map_err(|_| CountFailure::Identity)?;
+            }
+            Ok(())
+        })();
+        if let Err(failure) = result {
+            self.failure(failure);
+            self.retire();
+        } else if refresh && !self.retired {
+            self.authority_refresh_pending = true;
+        }
+        result
+    }
     pub fn retire(&mut self) {
         if self.retired && self.attachments.is_empty() {
             return;
@@ -297,6 +327,7 @@ impl FocusedCounter {
         self.mapped_guards.clear();
         self.startup_only.clear();
         self.mapped_generation = None;
+        self.authority_refresh_pending = false;
         if let Err(e) = self.fold.fence() {
             self.failure(e);
         }
@@ -462,9 +493,14 @@ impl FocusedCounter {
         // The first mapped epoch may arrive in several static/live batches.
         // Later epochs still fence normally; never let a partial first batch
         // make CountFold fence an unmatched startup cookie behind live links.
+        let refresh = !startup && self.authority_refresh_pending;
+        if refresh {
+            self.retain_authority(false)?;
+        }
         let transition = !startup
-            && self.mapped_generation.is_none_or(|g| g == mapping)
-            && !self.startup_only.is_empty();
+            && (refresh
+                || (self.mapped_generation.is_none_or(|g| g == mapping)
+                    && !self.startup_only.is_empty()));
         let mut promotions = Vec::new();
         let mut guards = Vec::new();
         if transition {
@@ -478,7 +514,7 @@ impl FocusedCounter {
                 .fold
                 .rows
                 .iter()
-                .filter(|(cookie, r)| self.startup_only.contains(cookie) && r.active)
+                .filter(|(cookie, r)| (refresh || self.startup_only.contains(cookie)) && r.active)
                 .map(|(&cookie, r)| (&r.row.site, cookie))
                 .collect();
             for file in files.values() {
@@ -496,7 +532,7 @@ impl FocusedCounter {
                         }
                         if !c
                             .site()
-                            .matches_startup(previous)
+                            .matches_retained(previous)
                             .map_err(|_| CountFailure::Identity)?
                         {
                             return Err(CountFailure::Identity);
@@ -522,6 +558,13 @@ impl FocusedCounter {
         let mut planned = self.fold.clone_charged(planning_charge)?;
         if transition {
             planned.session = Some(mapping);
+            if refresh {
+                // All retained custody was independently revalidated. This is
+                // provider bookkeeping only, not a code-mapping replacement.
+                for row in planned.rows.values_mut().filter(|row| row.active) {
+                    row.mapping = mapping;
+                }
+            }
             for cookie in &promotions {
                 planned.rows.get_mut(cookie).expect("verified row").mapping = mapping;
             }
@@ -643,7 +686,21 @@ impl FocusedCounter {
                 .map_err(|_| CountFailure::Identity)?;
         }
         self.fold = planned;
-        self.mapped_guards.extend(guards);
+        // Keep one latest mapped guard per retained file; all prior guards
+        // were checked above before any authority-only replacement.
+        for guard in guards {
+            if let Some(previous) = self.mapped_guards.iter_mut().find(|previous| {
+                previous.native_device() == guard.native_device()
+                    && previous.inode() == guard.inode()
+            }) {
+                *previous = guard;
+            } else {
+                self.mapped_guards.push(guard);
+            }
+        }
+        if refresh {
+            self.authority_refresh_pending = false;
+        }
         if startup {
             self.startup_only.extend(
                 self.fold
@@ -919,6 +976,342 @@ mod startup_controls {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation/count objects"]
+    fn owned_authority_refresh_preserves_stock_population_and_known_calls() {
+        use crate::capture::ClockPort;
+        use crate::provider_observation::{
+            ObservationBatch, ObservationBudget, ObservationGap, ObservationLimits, ProviderSession,
+        };
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::fd::FromRawFd,
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-owned-refresh-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let provider = dir.join("fixture.so");
+        let app = dir.join("fixture");
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-O1", "-Wl,-Bsymbolic", "-o"])
+                .arg(&provider)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_observation_provider.c"
+                ))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_observation.c"
+                ))
+                .arg(format!("-L{}", dir.display()))
+                .arg(format!("-Wl,-rpath,{}", dir.display()))
+                .args(["-Wl,--no-as-needed", "-l:fixture.so", "-lcrypto", "-ldl"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let bytes = fs::read(&provider).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let symbol = elf
+            .dynsyms
+            .iter()
+            .find(|s| elf.dynstrtab.get_at(s.st_name) == Some("fixture_count_entry"))
+            .unwrap();
+        let segment = elf
+            .program_headers
+            .iter()
+            .find(|p| {
+                p.p_type == 1
+                    && symbol.st_value >= p.p_vaddr
+                    && symbol.st_value < p.p_vaddr + p.p_filesz
+            })
+            .unwrap();
+        let offset = segment.p_offset + symbol.st_value - segment.p_vaddr;
+        let object: String = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let argv = vec![
+            app.to_str().unwrap().into(),
+            provider.to_str().unwrap().into(),
+            input.to_str().unwrap().into(),
+        ];
+        struct Child(crate::target::OwnedTarget);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // This test alone owns this finite fixture, including panic paths.
+                if self.0.state() != crate::target::CustodyState::Reaped {
+                    unsafe {
+                        libc::kill(self.0.pid() as i32, libc::SIGKILL);
+                    }
+                    let _ = self.0.finish_observation();
+                }
+            }
+        }
+        let mut child = Child(
+            crate::target::OwnedTarget::spawn_stopped(
+                &argv,
+                crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            )
+            .unwrap(),
+        );
+        let cancel = AtomicBool::new(false);
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child.0,
+            &argv,
+            &mut ObservationBudget::default(),
+            Instant::now() + Duration::from_secs(20),
+            &cancel,
+        )
+        .unwrap();
+        let bytes = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            child.0.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        counter
+            .attach_candidates(
+                startup
+                    .candidates
+                    .into_iter()
+                    .map(CountCandidate::Static)
+                    .collect(),
+                start,
+            )
+            .unwrap();
+        let population = counter.active_site_count();
+        let cookies = counter.fold.next_cookie;
+        let links = counter.active_link_count();
+        assert!(
+            population > 2048 && population <= 4096,
+            "real stock population={population}"
+        );
+        child.0.release_retaining_exit().unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let mut command = |text: &str| -> String {
+            writeln!(commands, "{text}").unwrap();
+            commands.flush().unwrap();
+            let mut response = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(output.read_line(&mut line).unwrap() > 0);
+                let ack = line.starts_with("ack ");
+                response.push_str(&line);
+                if ack {
+                    assert!(
+                        line.starts_with(&format!("ack {} 1 ", &text[..1])),
+                        "{response}"
+                    );
+                    break;
+                }
+            }
+            response
+        };
+        command("I");
+        command("P");
+        command("Q");
+        assert!(command("C37").contains("calls C 37 37"));
+        let known = |sample: &CountSample| {
+            sample
+                .sites
+                .iter()
+                .chain(&sample.fenced)
+                .filter(|s| s.site.object.0 == object && s.site.offset == offset)
+                .map(|s| s.calls)
+                .sum::<u64>()
+        };
+        println!(
+            "prearm population={population} cookies={} links={links}",
+            cookies - 1
+        );
+        assert_eq!(
+            known(&counter.sample(Instant::now() + Duration::from_secs(2))),
+            37
+        );
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![child.0.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let mut partial = records.clone();
+        let library = partial[0]
+            .modules
+            .iter_mut()
+            .find(|m| m.info.kind == crate::inventory::ObjectKind::OpenSslCompatible)
+            .unwrap();
+        assert_eq!(
+            library.identity_status,
+            crate::inventory::IdentityStatus::Verified
+        );
+        library.identity_status = crate::inventory::IdentityStatus::LocatorCandidate;
+        let observation =
+            fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_processes: 1,
+            ..Default::default()
+        });
+        let mut session = ProviderSession::open_budgeted(budget.clone(), &observation).unwrap();
+        let mut gaps = std::collections::BTreeSet::new();
+        let mut state = 0;
+        let apply = |session: &ProviderSession,
+                     counter: &mut FocusedCounter,
+                     batch: &ObservationBatch,
+                     gaps: &mut _,
+                     state: &mut _| {
+            crate::focused_capture::process_batch(
+                session,
+                counter,
+                batch,
+                child.0.pid(),
+                (
+                    start + 60_000_000_000,
+                    Instant::now() + Duration::from_secs(10),
+                    &cancel,
+                ),
+                gaps,
+                state,
+            )
+            .unwrap();
+        };
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        let first = session.reconcile_records(&partial);
+        assert!(first.gaps.contains(&ObservationGap::IdentityUnverified));
+        apply(&session, &mut counter, &first, &mut gaps, &mut state);
+        assert_eq!(
+            counter.active_site_count(),
+            population,
+            "locator uncertainty retired independently valid prearmed sites"
+        );
+        assert_eq!(counter.fold.next_cookie, cookies);
+        session.set_deadline(Instant::now() + Duration::from_secs(10));
+        let refresh = session.reconcile_records(&records);
+        assert_eq!(refresh.refreshed_processes, vec![child.0.pid()]);
+        assert!(refresh.static_candidates.is_empty());
+        apply(&session, &mut counter, &refresh, &mut gaps, &mut state);
+        let recovered = session.reconcile_records(&records);
+        assert!(
+            !recovered.static_candidates.is_empty(),
+            "reacquisition gaps: {:?}",
+            recovered.gaps
+        );
+        apply(&session, &mut counter, &recovered, &mut gaps, &mut state);
+        assert_eq!(counter.active_site_count(), population);
+        assert_eq!(
+            counter.fold.next_cookie, cookies,
+            "authority refresh replayed cookies"
+        );
+        assert_eq!(
+            counter.active_link_count(),
+            links,
+            "authority refresh duplicated links"
+        );
+        assert_eq!(counter.fold.generation, 1);
+        assert!(command("C11").contains("calls C 11 48"));
+        assert_eq!(
+            known(&counter.sample(Instant::now() + Duration::from_secs(2))),
+            48
+        );
+        let reads_after = budget.elf_read_bytes();
+        let state_after = (
+            counter.fold.next_cookie,
+            counter.fold.state_bytes,
+            counter.active_link_count(),
+        );
+        for _ in 0..3 {
+            let stable = session.reconcile_records(&records);
+            assert!(stable.static_candidates.is_empty() && stable.refreshed_processes.is_empty());
+            apply(&session, &mut counter, &stable, &mut gaps, &mut state);
+            assert_eq!(budget.elf_read_bytes(), reads_after);
+            assert_eq!(
+                (
+                    counter.fold.next_cookie,
+                    counter.fold.state_bytes,
+                    counter.active_link_count()
+                ),
+                state_after
+            );
+        }
+        // A real retained-file stamp change must defeat the refresh marker.
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&provider, fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(counter.retain_authority(true), Err(CountFailure::Identity));
+        assert_eq!(counter.active_site_count(), 0);
+        assert_eq!(counter.active_link_count(), 0);
+        let final_sample = counter.close(Instant::now() + Duration::from_secs(2));
+        assert_eq!(
+            known(&final_sample),
+            48,
+            "fenced historical+current conservation"
+        );
+        assert!(final_sample.sites.is_empty());
+        session.close_until(Instant::now() + Duration::from_secs(1));
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        let end = Instant::now() + Duration::from_secs(2);
+        while child.0.peek_exit().unwrap().is_none() && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(child.0.peek_exit().unwrap(), Some(0));
+        child.0.finish_observation().unwrap();
+        println!(
+            "owned prearm={population} physical sites cookies={} links={links}; partial mapped/verified refresh/stable; independent 37+11=48 physical entries, final fenced=48; cap=4096",
+            cookies - 1
+        );
+        println!(
+            "stable Count state={} bytes, provider ELF reads={reads_after}; real backing stamp change retired all links without changing conserved48",
+            state_after.1
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
     #[test]
     #[ignore = "requires privileged BPF and freshly built focused count object"]
     fn first_mapped_epoch_in_partial_batches_preserves_native_cookies() {

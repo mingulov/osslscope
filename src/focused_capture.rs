@@ -127,9 +127,6 @@ fn batch_invalidates_advertisements(batch: &ObservationBatch, pid: u32) -> bool 
 /// Target-memory observation loss does not invalidate retained executable code.
 /// Actual process, namespace and backing changes still retire every link.
 pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
-    if batch.refreshed_processes.contains(&pid) {
-        return true;
-    }
     batch.facts.iter().any(|f| {
         f.pid == pid
             && matches!(
@@ -145,7 +142,6 @@ pub fn batch_requires_retirement(batch: &ObservationBatch, pid: u32) -> bool {
                 | ObservationGap::ProcessChanged
                 | ObservationGap::NamespaceChanged
                 | ObservationGap::BackingUnavailable
-                | ObservationGap::IdentityUnverified
                 | ObservationGap::ObjectChanged
                 | ObservationGap::MalformedMaps
                 | ObservationGap::MembershipUnknown
@@ -306,11 +302,11 @@ pub(crate) fn observer_namespace() -> anyhow::Result<inventory::NamespaceId> {
     })
 }
 
-enum BatchProgress {
+pub(crate) enum BatchProgress {
     Applied(bool),
     Deferred,
 }
-fn process_batch(
+pub(crate) fn process_batch(
     session: &ProviderSession,
     counter: &mut FocusedCounter,
     batch: &ObservationBatch,
@@ -323,6 +319,19 @@ fn process_batch(
     if batch_requires_retirement(batch, pid) {
         counter.retire();
         return Ok(BatchProgress::Applied(false));
+    }
+    if batch.refreshed_processes.contains(&pid)
+        || batch.gaps.contains(&ObservationGap::IdentityUnverified)
+    {
+        // Inventory metadata is not the independent authority of existing
+        // Count links. Validate that custody now; never let the hint alone
+        // retain a changed process, namespace, mapping or backing file.
+        if counter
+            .retain_authority(batch.refreshed_processes.contains(&pid))
+            .is_err()
+        {
+            return Ok(BatchProgress::Applied(false));
+        }
     }
     let (deadline_ns, deadline, cancel) = control;
     if Instant::now() >= deadline {

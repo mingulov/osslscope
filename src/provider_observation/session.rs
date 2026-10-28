@@ -32,8 +32,9 @@ pub struct ObservationBatch {
     pub learned_sites: Vec<VerifiedSiteCandidate>,
     pub static_candidates: Vec<VerifiedStaticCandidate>,
     pub api_activity: Vec<ProcessApiActivity>,
-    /// Internal count-epoch retirement for stronger inventory authority. This
-    /// is not a claim that the process or backing code changed identity.
+    /// Internal provider reacquisition marker for stronger inventory authority.
+    /// Count may bridge only after independently revalidating retained custody;
+    /// this is not a claim that process or backing code changed identity.
     pub refreshed_processes: Vec<u32>,
 }
 /// One cumulative final API ledger, scoped to an observed incarnation.
@@ -206,6 +207,9 @@ pub struct ProviderSession {
     api_owners: BTreeMap<u64, (u32, u64, u32)>,
     startup: BTreeMap<u32, Vec<Attachment>>,
     targets: BTreeMap<u32, Target>,
+    // Replaces (never adds to) an admitted target during metadata-only refresh.
+    // The shared process lease still bounds this map and any Count site owners.
+    refreshing: BTreeMap<u32, objects::ProcessIncarnation>,
     roles: Roles,
     aliases: super::assembly::Sequences,
     budget: ObservationBudget,
@@ -381,6 +385,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             targets: BTreeMap::new(),
+            refreshing: BTreeMap::new(),
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
             budget,
@@ -482,6 +487,7 @@ impl ProviderSession {
         })()
     }
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) {
+        self.refreshing.remove(&pid);
         self.aliases.retire(pid);
         b.learned_sites.retain(|site| site.pid != pid);
         b.static_candidates.retain(|site| site.pid() != pid);
@@ -517,6 +523,22 @@ impl ProviderSession {
         if self.closed {
             return b;
         }
+        let invalid_refresh: Vec<_> = self
+            .refreshing
+            .iter()
+            .filter_map(|(&pid, retained)| {
+                let validation = records
+                    .iter()
+                    .find(|record| record.pid == pid)
+                    .ok_or(ObservationGap::MembershipUnknown)
+                    .and_then(|record| retained.validate_record(record));
+                validation.err().map(|gap| (pid, gap))
+            })
+            .collect();
+        for (pid, gap) in invalid_refresh {
+            self.retire(pid, &mut b);
+            b.gap(gap);
+        }
         let retire: Vec<_> = self
             .targets
             .iter()
@@ -549,7 +571,9 @@ impl ProviderSession {
             })
             .collect();
         for &pid in &refreshed {
+            let retained = self.targets[&pid].process.retained_incarnation();
             self.retire(pid, &mut b);
+            self.refreshing.insert(pid, retained);
             b.refreshed_processes.push(pid);
         }
         for record in records {
@@ -575,9 +599,15 @@ impl ProviderSession {
         let mut target = if let Some(target) = self.targets.remove(&record.pid) {
             target
         } else {
-            let Some(process) = acquire_observable(record, &mut self.budget)? else {
-                return Ok(());
+            let process = if let Some(retained) = self.refreshing.get(&record.pid) {
+                objects::acquire_with_incarnation(record, &mut self.budget, Some(retained))?
+            } else {
+                let Some(process) = acquire_observable(record, &mut self.budget)? else {
+                    return Ok(());
+                };
+                process
             };
+            self.refreshing.remove(&record.pid);
             // Only the first mapped adoption of the original held incarnation
             // may retain its scalar epoch. Real retirement/remapping allocates a
             // fresh generation and fresh cookies as before.
@@ -1237,6 +1267,7 @@ impl ProviderSession {
                 }
             }
         }
+        self.refreshing.clear();
         self.closed = true;
         b
     }

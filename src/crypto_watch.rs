@@ -117,9 +117,16 @@ enum Record<'a> {
 struct Output<'a, W> {
     writer: &'a mut W,
     sequence: u64,
+    json: bool,
 }
 impl<W: Write> Output<'_, W> {
     fn emit(&mut self, record: Record<'_>) -> io::Result<()> {
+        if !self.json {
+            self.human(&record)?;
+            self.writer.flush()?;
+            self.sequence += 1;
+            return Ok(());
+        }
         serde_json::to_writer(
             &mut *self.writer,
             &Envelope {
@@ -133,6 +140,144 @@ impl<W: Write> Output<'_, W> {
         self.writer.flush()?;
         self.sequence += 1;
         Ok(())
+    }
+    /// Fixed-size summaries per record. Never dump a document, raw path, symbol
+    /// or target string; large object/gap populations get explicit omitted counts.
+    fn human(&mut self, record: &Record<'_>) -> io::Result<()> {
+        const ROWS: usize = 8;
+        let w = &mut self.writer;
+        match record {
+            Record::Start {
+                max_active,
+                max_state_bytes,
+                poll_interval,
+                duration,
+                ..
+            } => writeln!(
+                w,
+                "Crypto watch: membership=sampled coverage=unknown max_active={max_active} accounted_limit_bytes={max_state_bytes} interval_s={} duration_s={}",
+                poll_interval.as_secs_f64(),
+                duration.as_secs_f64()
+            ),
+            Record::Discovery { process: p } => {
+                writeln!(
+                    w,
+                    "Process {} start={} objects={} execution=not_observed coverage=unknown (passive inventory)",
+                    p.pid,
+                    p.starttime,
+                    p.modules.len()
+                )?;
+                for m in p.modules.iter().take(ROWS) {
+                    writeln!(
+                        w,
+                        "  Object sha256={} kind={:?} identity={:?} interfaces={}",
+                        m.info.sha256.get(..12).unwrap_or("unknown"),
+                        m.info.kind,
+                        m.identity_status,
+                        m.info.exports.len()
+                    )?;
+                }
+                if p.modules.len() > ROWS {
+                    writeln!(w, "  Objects omitted={}", p.modules.len() - ROWS)?;
+                }
+                Ok(())
+            }
+            Record::TracingGap { reason } => {
+                writeln!(w, "Tracing unavailable: {reason}; coverage=unknown")
+            }
+            Record::Membership {
+                incarnation: i,
+                segment,
+                state,
+                reason,
+            } => writeln!(
+                w,
+                "Membership pid={} start={} segment={segment} state={state} reason={reason}; sampled",
+                i.pid, i.starttime
+            ),
+            Record::Limit {
+                incarnation: i,
+                reason,
+            } => writeln!(
+                w,
+                "Limit pid={} start={}: {reason}; activity=unknown",
+                i.pid, i.starttime
+            ),
+            Record::Gap { gap } => writeln!(
+                w,
+                "Discovery gap pid={:?}: {:?}; coverage=unknown",
+                gap.pid, gap.reason
+            ),
+            Record::SessionGap {
+                incarnation: i,
+                reason,
+            } => writeln!(
+                w,
+                "Process {} start={} unavailable: {reason}; coverage=unknown",
+                i.pid, i.starttime
+            ),
+            Record::ProcessObservation {
+                incarnation: i,
+                segment,
+                retirement,
+                document: d,
+            } => {
+                let rows = |name: &str| d[name].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                let physical = rows("sites")
+                    .iter()
+                    .chain(rows("fenced").iter().flat_map(|epoch| {
+                        epoch["sites"].as_array().map(Vec::as_slice).unwrap_or(&[])
+                    }))
+                    .try_fold(0u64, |n, r| n.checked_add(r["calls"].as_u64()?));
+                let api = d["api_activity"].as_array().and_then(|rows| {
+                    rows.iter()
+                        .try_fold(0u64, |n, r| n.checked_add(r["entries"].as_u64()?))
+                });
+                let total =
+                    |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
+                writeln!(
+                    w,
+                    "Process {} start={} segment={segment} retirement={retirement} objects={} physical_entries={} api_entries={} coverage=partial attribution=unknown",
+                    i.pid,
+                    i.starttime,
+                    rows("objects").len(),
+                    total(physical),
+                    total(api)
+                )?;
+                let counters = d["completeness"]["counters"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                // Counter names are observer-owned finite vocabulary; limit text
+                // width even if a future producer extends that vocabulary.
+                for c in counters.iter().take(ROWS) {
+                    let name = c["name"].as_str().unwrap_or("unknown");
+                    let label: String = name
+                        .chars()
+                        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_'))
+                        .take(80)
+                        .collect();
+                    writeln!(
+                        w,
+                        "  Gap {label} value={}",
+                        c["value"].as_u64().unwrap_or(0)
+                    )?;
+                }
+                if counters.len() > ROWS {
+                    writeln!(w, "  Gaps omitted={}", counters.len() - ROWS)?;
+                }
+                Ok(())
+            }
+            Record::End {
+                reason,
+                segments,
+                peak_accounted_bytes,
+                coverage,
+            } => writeln!(
+                w,
+                "Crypto watch end: reason={reason} segments={segments} peak_accounted_bytes={peak_accounted_bytes} coverage={coverage}; unsampled membership and unobserved activity remain unknown"
+            ),
+        }
     }
     fn finish(&mut self, active: Active, reason: &'static str) -> io::Result<()> {
         let Active {
@@ -197,11 +342,13 @@ fn observe(
     objects: FocusedObjects,
     pool: &MemoryPool,
     output: &mut impl Write,
+    json: bool,
     cancel: &AtomicBool,
 ) -> io::Result<u8> {
     let mut out = Output {
         writer: output,
         sequence: 0,
+        json,
     };
     let mut scanner = match ScopedScanner::new_budgeted(
         config.selection.clone(),
@@ -495,16 +642,12 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(s) => s,
         Err(_) => return ExitCode::from(1),
     };
-    if !options.json {
-        crate::report::err_line(
-            "Crypto watch: per-incarnation JSON stream; membership is sampled and coverage remains partial.",
-        );
-    }
     match observe(
         &config,
         objects,
         &pool,
         &mut io::stdout().lock(),
+        options.json,
         _signals.cancel(),
     ) {
         Ok(code) => ExitCode::from(code),
@@ -526,6 +669,41 @@ mod tests {
             count: Arc::from([]),
             count_sha256: Sha256::digest([]).into(),
         }
+    }
+    #[test]
+    fn human_summary_conserves_fenced_counts_and_bounds_gaps() {
+        let identity = Incarnation {
+            pid: 42,
+            starttime: 123,
+            namespaces: inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        };
+        let document = serde_json::json!({
+            "sites": [{"calls": 2}], "fenced": [{"sites": [{"calls": 3}]}],
+            "api_activity": [{"entries": 7}], "objects": [{}, {}],
+            "completeness": {"counters": (0..12).map(|_| serde_json::json!({"name": "focused.test", "value": 1})).collect::<Vec<_>>()}
+        });
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+        };
+        out.emit(Record::ProcessObservation {
+            incarnation: &identity,
+            segment: 4,
+            retirement: "duration",
+            document: &document,
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("physical_entries=5 api_entries=7"));
+        assert!(text.contains("start=123 segment=4") && text.contains("objects=2"));
+        assert_eq!(text.lines().count(), 10);
+        assert!(text.contains("Gaps omitted=4"));
+        assert!(text.contains("coverage=partial attribution=unknown"));
     }
     #[test]
     fn two_normal_reservations_include_coordinator_scanner_and_stock_parser() {
@@ -613,6 +791,7 @@ mod tests {
             objects,
             &pool,
             &mut output,
+            true,
             &AtomicBool::new(false),
         );
         for child in &mut children {

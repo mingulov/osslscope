@@ -371,20 +371,27 @@ impl VerifiedSite {
     pub(crate) fn is_startup(&self) -> bool {
         matches!(self.custody, SiteCustody::Startup(_))
     }
-    /// Narrow first-exec bookkeeping transition, never a constructor or ABI grant.
-    pub(crate) fn matches_startup(&self, startup: &Self) -> Result<bool, ObservationGap> {
-        let (SiteCustody::Mapped { process, .. }, SiteCustody::Startup(original)) =
-            (&self.custody, &startup.custody)
-        else {
+    /// Bookkeeping bridge between independently retained authorities. Both
+    /// representatives must be revalidated by the counter before comparison;
+    /// this cannot construct a site or grant a public ABI capability.
+    pub(crate) fn matches_retained(&self, previous: &Self) -> Result<bool, ObservationGap> {
+        let SiteCustody::Mapped { process, .. } = &self.custody else {
             return Ok(false);
         };
-        // The counter validates both file representatives before this comparison.
-        Ok(process.pid == original.pid
-            && process.starttime == original.starttime
-            && process.namespaces == original.namespaces
-            && self.object.stamp == startup.object.stamp
-            && self.hash == startup.hash
-            && self.offset == startup.offset)
+        let (pid, starttime, namespaces) = match &previous.custody {
+            SiteCustody::Mapped { process, .. } => {
+                (process.pid, process.starttime, &process.namespaces)
+            }
+            SiteCustody::Startup(original) => {
+                (original.pid, original.starttime, &original.namespaces)
+            }
+        };
+        Ok(process.pid == pid
+            && process.starttime == starttime
+            && &process.namespaces == namespaces
+            && self.object.stamp == previous.object.stamp
+            && self.hash == previous.hash
+            && self.offset == previous.offset)
     }
     pub fn attachment_fd(&self) -> BorrowedFd<'_> {
         self.object.file.as_fd()
@@ -562,6 +569,9 @@ impl VerifiedProcess {
     }
     pub fn gaps(&self) -> Vec<ObservationGap> {
         self.gaps.borrow().iter().copied().collect()
+    }
+    pub(crate) fn retained_incarnation(&self) -> ProcessIncarnation {
+        ProcessIncarnation(self.process.clone())
     }
     pub(crate) fn inventory_authority_advanced(&self, record: &ProcessRecord) -> bool {
         record.modules.iter().any(|module| {
@@ -775,6 +785,17 @@ fn mapping_contains_offset(map: &Mapping, offset: u64) -> bool {
 /// Fresh process identity retention without requiring privileged map_files
 /// access. This value grants no site or target-memory authority.
 pub(crate) struct ProcessIncarnation(Rc<Process>);
+impl ProcessIncarnation {
+    pub(crate) fn validate_record(&self, record: &ProcessRecord) -> Result<(), ObservationGap> {
+        if self.0.pid != record.pid || self.0.starttime != record.starttime {
+            return Err(ObservationGap::ProcessChanged);
+        }
+        if self.0.namespaces != record.namespaces {
+            return Err(ObservationGap::NamespaceChanged);
+        }
+        self.0.validate()
+    }
+}
 pub(crate) fn acquire_incarnation(
     record: &ProcessRecord,
 ) -> Result<ProcessIncarnation, ObservationGap> {
@@ -824,14 +845,33 @@ pub fn acquire(
     record: &ProcessRecord,
     limits: &mut ObservationBudget,
 ) -> Result<VerifiedProcess, ObservationGap> {
-    let mut admission = limits.process()?;
+    acquire_with_incarnation(record, limits, None)
+}
+/// Share only one exact incarnation's admission. Maps, native files, parser
+/// state and all reads are freshly acquired and charged; old Count owners keep
+/// their own allocations/custody alive without any budget refund.
+pub(crate) fn acquire_with_incarnation(
+    record: &ProcessRecord,
+    limits: &mut ObservationBudget,
+    retained: Option<&ProcessIncarnation>,
+) -> Result<VerifiedProcess, ObservationGap> {
+    let mut admission = if retained.is_none() {
+        Some(limits.process()?)
+    } else {
+        None
+    };
     #[cfg(test)]
     EXPIRE_ACQUIRE.with(|flag| {
         if flag.replace(false) {
             limits.set_deadline(std::time::Instant::now());
         }
     });
-    let process = acquire_incarnation(record)?.0;
+    let process = if let Some(retained) = retained {
+        retained.validate_record(record)?;
+        retained.0.clone()
+    } else {
+        acquire_incarnation(record)?.0
+    };
     let refused_count = record
         .modules
         .iter()
@@ -973,10 +1013,12 @@ pub fn acquire(
         refused_inventory,
     };
     verified.revalidate()?;
-    admission.retain();
-    Rc::get_mut(&mut verified.process)
-        .expect("fresh process custody")
-        ._admission = Some(admission);
+    if let Some(mut admission) = admission.take() {
+        admission.retain();
+        Rc::get_mut(&mut verified.process)
+            .expect("fresh process custody")
+            ._admission = Some(admission);
+    }
     Ok(verified)
 }
 fn association(file: &File, metadata: &Metadata, map: &Mapping) -> bool {

@@ -24,7 +24,9 @@ static int read_calls(unsigned long *calls) {
     return !errno && *calls <= 1000000 && *end == '\n' && end[1] == '\0';
 }
 int main(int argc, char **argv) {
-    if (argc != 2) return 2;
+    if (argc != 2 && argc != 3) return 2;
+    /* Optional finite-test command FIFO for held owned-startup controls. */
+    if (argc == 3 && !freopen(argv[2], "r", stdin)) return 2;
     void *module = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
     if (!module) return 3;
     OSSL_provider_init_fn *init = (OSSL_provider_init_fn *)dlsym(module, "OSSL_provider_init");

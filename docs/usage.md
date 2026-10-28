@@ -9,7 +9,7 @@ behavior; see [release scope](release-v0.4.0.md).
 ## Automatic crypto watch
 
 ```sh
-osslscope scan --watch --observe-crypto --duration 30 --json
+osslscope scan --watch --observe-crypto --duration 30
 osslscope scan --watch --observe-crypto --pid 1234 --pid 5678 --json
 osslscope scan --watch --observe-crypto --cgroup /sys/fs/cgroup/example.service --json
 osslscope scan --watch --observe-crypto --module /usr/lib/x86_64-linux-gnu/libcrypto.so.3 --json
@@ -36,8 +36,14 @@ for later loads. “No candidate interfaces in this sample” is not proof of no
 OpenSSL or crypto use; visibility/read/limit failures remain explicit uncertainty.
 Library names, versions and algorithms do not select the tracing backend.
 
-Output is NDJSON with `schema_version: "crypto-watch-v1"` and increasing
-`sequence`. Without `--json`, a short explanation also goes to stderr. Records:
+Default output is a compact human summary per process incarnation: passive
+objects, sampled membership, limits, unavailable tracing and partial activity.
+Physical entries and API entries are separate units; unknown attribution stays
+explicit. Each summary shows at most eight object or gap rows and reports how
+many were omitted. Passive `not_observed` does not override later activity.
+
+With `--json`, output is NDJSON with `schema_version: "crypto-watch-v1"` and
+increasing `sequence`. Records:
 
 - `start`: duration, interval and resource bounds.
 - `discovery`: the existing sanitized passive `ProcessRecord`, including file

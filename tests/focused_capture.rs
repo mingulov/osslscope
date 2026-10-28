@@ -189,6 +189,28 @@ fn unscoped_loss_and_identity_churn_require_later_advertisements() {
     }
 }
 #[test]
+fn inventory_upgrade_does_not_mask_actual_identity_loss() {
+    let mut batch = ObservationBatch {
+        refreshed_processes: vec![42],
+        gaps: vec![ObservationGap::IdentityUnverified],
+        ..Default::default()
+    };
+    // This classification is followed by independent retained-custody
+    // validation in process_batch; it is never attachment authority.
+    assert!(!batch_requires_retirement(&batch, 42));
+    for loss in [
+        ObservationGap::ProcessChanged,
+        ObservationGap::NamespaceChanged,
+        ObservationGap::ObjectChanged,
+        ObservationGap::BackingUnavailable,
+        ObservationGap::MembershipUnknown,
+    ] {
+        batch.gaps.push(loss);
+        assert!(batch_requires_retirement(&batch, 42), "{loss:?}");
+        batch.gaps.pop();
+    }
+}
+#[test]
 fn ordinary_coverage_and_finite_alias_gaps_do_not_retire_sites() {
     for gap in [
         ObservationGap::QueueLoss,

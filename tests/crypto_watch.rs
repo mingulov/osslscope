@@ -20,6 +20,99 @@ fn records(output: &Output) -> Vec<serde_json::Value> {
         .collect()
 }
 #[test]
+fn default_human_watch_preserves_passive_unavailable_facts() {
+    let dir = std::env::temp_dir().join(format!("osslscope-watch-human-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let binary = dir.join("osslscope");
+    std::fs::copy(env!("CARGO_BIN_EXE_osslscope"), &binary).unwrap();
+    let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+    let output = Command::new(&binary)
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    assert!(matches!(output.status.code(), Some(3 | 4)));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("Crypto watch"),
+        "default output is not a human summary: {text}"
+    );
+    assert!(text.contains("Tracing unavailable: companions_unavailable"));
+    assert!(text.contains(&format!("Process {} start=", child.id())));
+    assert!(text.contains("objects=") && text.contains("coverage=unknown"));
+    assert!(text.contains("membership=sampled") && text.contains("execution=not_observed"));
+    assert!(text.len() < 16_384);
+    assert!(
+        text.lines()
+            .all(|line| serde_json::from_str::<serde_json::Value>(line).is_err())
+    );
+}
+
+#[test]
+#[ignore = "requires a privileged installed CLI and stock OpenSSL"]
+fn installed_default_human_watch_reports_positive_separate_activity() {
+    let mut child = Command::new("openssl")
+        .args([
+            "speed", "-elapsed", "-seconds", "20", "-evp", "SHA512", "-bytes", "64",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let output =
+        Command::new(std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI"))
+            .args([
+                "scan",
+                "--watch",
+                "--observe-crypto",
+                "--pid",
+                &child.id().to_string(),
+                "--duration",
+                "5",
+            ])
+            .output()
+            .unwrap();
+    let alive = child.try_wait().unwrap().is_none();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(alive);
+    assert!(matches!(output.status.code(), Some(3 | 4)));
+    let text = String::from_utf8(output.stdout).unwrap();
+    let activity = text
+        .lines()
+        .find(|line| line.contains("physical_entries="))
+        .expect("human activity");
+    for field in ["physical_entries=", "api_entries="] {
+        let value = activity
+            .split(field)
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(value > 0, "{field}: {text}");
+    }
+    assert!(activity.contains(&format!("Process {} start=", child.id())));
+    assert!(activity.contains("coverage=partial") && activity.contains("attribution=unknown"));
+    assert!(text.contains("Membership") && text.contains("retired"));
+    assert!(text.len() < 32_768);
+    assert!(!text.contains("schema_version"));
+    println!("{text}");
+}
+
+#[test]
 fn crypto_watch_rejects_incompatible_grammar_before_scope_access() {
     for args in [
         vec!["scan", "--observe-crypto", "--cgroup", "/PRIVATE_CANARY"],
