@@ -36,6 +36,8 @@ pub(crate) fn host_main() {
         "host-protected-original",
         "host-filter",
         "host-history",
+        "host-writer-gate-history",
+        "host-writer-gate-starting",
         "host-deadline",
         "host-target-close",
         "host-invalid-help",
@@ -247,6 +249,22 @@ fn host_case(case: &str) {
     }
     if case == "host-starting-gates" {
         host_starting_gates();
+        return;
+    }
+    if case == "host-writer-gate-starting" {
+        REGISTRY.lock().unwrap().history = History::Starting;
+        crate::writer_gate::host_acquisition_history(true);
+        return;
+    }
+    if case == "host-writer-gate-history" {
+        crate::writer_gate::host_acquisition_history(false);
+        match unsafe { LifecycleRuntime::bootstrap_early(t0 + Duration::from_secs(2), None) } {
+            Err(_) => (),
+            Ok(runtime) => {
+                runtime.shutdown(Instant::now() + Duration::from_secs(2));
+                panic!("writer-gate acquisition did not close bootstrap history");
+            }
+        }
         return;
     }
     if case == "host-history" {

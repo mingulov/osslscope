@@ -84,6 +84,51 @@ struct Inner {
     injections: RefCell<Vec<MemoryLease>>,
     pool: MemoryPool,
 }
+#[cfg(test)]
+thread_local! { static HOST_GATE_CREATES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+fn create_maps() -> io::Result<(OwnedFd, OwnedFd, u32)> {
+    #[cfg(test)]
+    if HOST_GATE_CREATES.with(|count| count.get().is_some()) {
+        let acquire = || -> io::Result<OwnedFd> {
+            let fd = std::fs::File::open("/dev/null")?.into();
+            HOST_GATE_CREATES.with(|count| count.set(Some(count.get().unwrap() + 1)));
+            Ok(fd)
+        };
+        return Ok((acquire()?, acquire()?, 1));
+    }
+    let token = ossl_bpf_sys::map_create(2, 4, 8, 1, None, "admit_token")?;
+    ossl_bpf_sys::map_freeze(token.as_raw_fd())?;
+    let outer = ossl_bpf_sys::writer_gate_outer(&token)?;
+    let map = loader::BorrowedMap::new(outer.as_fd())?;
+    map.shape(&[12], 4, 4).map_err(io::Error::other)?;
+    if map.info.max_entries != 1 || map.info.flags != 0 {
+        return Err(io::Error::other("writer gate shape"));
+    }
+    let id = map.info.id;
+    Ok((outer, token, id))
+}
+#[cfg(test)]
+pub(crate) fn host_acquisition_history(blocked: bool) {
+    HOST_GATE_CREATES.with(|count| count.set(Some(0)));
+    let pool = MemoryPool::new(RESERVATION_BYTES);
+    let result = WriterGate::create(&pool);
+    let creates = HOST_GATE_CREATES.with(|count| count.replace(None)).unwrap();
+    if blocked {
+        assert!(
+            result.is_err(),
+            "Starting must refuse typed writer-gate acquisition"
+        );
+        assert_eq!(creates, 0, "Starting reached a native create seam");
+    } else {
+        let gate = result.expect("harmless owned-FD creation seam");
+        assert_eq!(creates, 2);
+        let fds = [gate.0.outer.as_raw_fd(), gate.0.token.as_raw_fd()];
+        drop(gate);
+        for fd in fds {
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        }
+    }
+}
 #[derive(Clone)]
 pub(crate) struct WriterGate(Rc<Inner>);
 impl WriterGate {
@@ -91,15 +136,8 @@ impl WriterGate {
         let reservation = pool
             .reserve(RESERVATION_BYTES)
             .ok_or_else(|| io::Error::other("writer gate reservation refused"))?;
-        let token = ossl_bpf_sys::map_create(2, 4, 8, 1, None, "admit_token")?;
-        ossl_bpf_sys::map_freeze(token.as_raw_fd())?;
-        let outer = ossl_bpf_sys::writer_gate_outer(&token)?;
-        let map = loader::BorrowedMap::new(outer.as_fd())?;
-        map.shape(&[12], 4, 4).map_err(io::Error::other)?;
-        if map.info.max_entries != 1 || map.info.flags != 0 {
-            return Err(io::Error::other("writer gate shape"));
-        }
-        let id = map.info.id;
+        crate::lifecycle_producer::note_acquisition().map_err(io::Error::other)?;
+        let (outer, token, id) = create_maps()?;
         Ok(Self(Rc::new(Inner {
             outer,
             token,
