@@ -558,3 +558,105 @@ fn null_names_are_not_confused_with_bytes_at_elf_virtual_zero() {
     assert_eq!(d.algorithm_count(), 1);
     assert!(d.gaps().contains(&TableGap::Malformed));
 }
+
+#[test]
+fn explicit_record_recovers_a_valid_table_after_an_invalid_predecessor() {
+    for prefix in ["-DPREFIX_ROW=0", "-DPREFIX_ROW=12"] {
+        let f = Fixture::new(&[prefix, "-DONE_ENTRY"]);
+        let d = f.discover();
+        assert_eq!(d.algorithm_count(), 2);
+        assert_eq!(d.dispatch_table_count(), 1);
+        assert_eq!(d.function_ids().collect::<Vec<_>>(), vec![70001]);
+        if prefix == "-DPREFIX_ROW=12" {
+            assert!(d.gaps().contains(&TableGap::MissingFunctionStart));
+        }
+    }
+}
+
+#[test]
+fn invalid_directly_referenced_table_does_not_admit_its_anonymous_tail() {
+    let f = Fixture::new(&["-DPREFIX_ROW=12", "-DONE_ENTRY", "-DPOINT_AT_PREFIX"]);
+    let d = f.discover();
+    assert_eq!(d.algorithm_count(), 0);
+    assert_eq!(d.candidate_count(), 0);
+    assert!(d.gaps().contains(&TableGap::MissingFunctionStart));
+}
+
+// Minimal real ELF64 shared objects for independent program-header controls.
+// Only the data load is meaningful; PT_NULL contents are intentionally unused.
+fn header_elf(count: usize) -> Vec<u8> {
+    let data = (64 + count * 56 + 4095) & !4095;
+    let mut bytes = vec![0; data + 16384];
+    bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+    bytes[16..18].copy_from_slice(&3u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&(count as u16).to_le_bytes());
+    bytes[64..68].copy_from_slice(&1u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&4u32.to_le_bytes());
+    bytes[72..80].copy_from_slice(&(data as u64).to_le_bytes());
+    bytes[80..88].copy_from_slice(&0x100000u64.to_le_bytes());
+    bytes[96..104].copy_from_slice(&16384u64.to_le_bytes());
+    bytes[104..112].copy_from_slice(&16384u64.to_le_bytes());
+    bytes[112..120].copy_from_slice(&4096u64.to_le_bytes());
+    bytes
+}
+fn raw_fixture(bytes: &[u8]) -> Fixture {
+    let dir = std::env::temp_dir().join(format!(
+        "osslscope-static-raw-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    fs::create_dir(&dir).unwrap();
+    let path = dir.join("fixture.so");
+    fs::write(&path, bytes).unwrap();
+    Fixture { dir, path }
+}
+
+#[test]
+fn irrelevant_program_headers_do_not_enter_lookup_state() {
+    let one = raw_fixture(&header_elf(1));
+    let many = raw_fixture(&header_elf(4097));
+    let a = one.discover();
+    let b = many.discover();
+    assert_eq!(a.candidate_count(), 0);
+    assert_eq!(b.candidate_count(), 0);
+    assert_eq!(
+        a.metadata_bytes(),
+        b.metadata_bytes(),
+        "PT_NULL headers must not enlarge the lookup index"
+    );
+}
+
+#[test]
+fn overlapping_executable_loads_fail_even_without_candidate_lookups() {
+    let mut bytes = header_elf(2);
+    bytes[68..72].copy_from_slice(&5u32.to_le_bytes());
+    let first = bytes[64..120].to_vec();
+    bytes[120..176].copy_from_slice(&first);
+    let f = raw_fixture(&bytes);
+    assert!(matches!(
+        discover_tables(&File::open(&f.path).unwrap(), TableLimits::default()),
+        Err(TableGap::Malformed)
+    ));
+}
+
+#[test]
+fn aliased_file_ranges_cannot_multiply_the_scan_byte_budget() {
+    let mut bytes = header_elf(2);
+    let first = bytes[64..120].to_vec();
+    bytes[120..176].copy_from_slice(&first);
+    bytes[136..144].copy_from_slice(&0x200000u64.to_le_bytes());
+    let limits = TableLimits {
+        max_object_bytes: bytes.len() as u64,
+        ..TableLimits::default()
+    };
+    let f = raw_fixture(&bytes);
+    assert!(matches!(
+        discover_tables(&File::open(&f.path).unwrap(), limits),
+        Err(TableGap::Resource)
+    ));
+}

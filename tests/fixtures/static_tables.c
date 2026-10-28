@@ -40,26 +40,34 @@ __asm__(".type imported_function,@function");
 #define SECOND_FUNCTION implementation
 #endif
 __attribute__((visibility("protected"))) const struct dispatch test_dispatch[] = {
+#ifdef PREFIX_ROW
+    { PREFIX_ROW, (void (*)(void))((char *)implementation + 1) },
+#endif
     { 70001, implementation },
 #ifndef ONE_ENTRY
     { 70002, SECOND_FUNCTION },
 #endif
     { 0, 0 }
 };
+#if defined(PREFIX_ROW) && !defined(POINT_AT_PREFIX)
+#define IMPLEMENTATION_TABLE (test_dispatch + 1)
+#else
+#define IMPLEMENTATION_TABLE test_dispatch
+#endif
 #ifdef OPAQUE_RECORDS
 /* Public prefixes can be embedded in unrelated opaque containers. Their
  * suffix bytes are deliberately not a production layout contract. */
 struct enclosing { struct algorithm public_record; uintptr_t opaque[3]; };
 const struct enclosing test_algorithms[] = {
-    { { NAMES, "provider=custom", test_dispatch, "description" }, { 17, 29, 41 } },
-    { { "Different-Family:another-alias", 0, test_dispatch, 0 }, { 53, 67, 79 } }
+    { { NAMES, "provider=custom", IMPLEMENTATION_TABLE, "description" }, { 17, 29, 41 } },
+    { { "Different-Family:another-alias", 0, IMPLEMENTATION_TABLE, 0 }, { 53, 67, 79 } }
 };
 #else
 const struct algorithm test_algorithms[] = {
-    { NAMES, "provider=custom", test_dispatch, DESCRIPTION },
-    { "Different-Family:another-alias", 0, test_dispatch, 0 },
+    { NAMES, "provider=custom", IMPLEMENTATION_TABLE, DESCRIPTION },
+    { "Different-Family:another-alias", 0, IMPLEMENTATION_TABLE, 0 },
 #ifdef EXTRA_SHARED
-    { "Third-Family", 0, test_dispatch, 0 },
+    { "Third-Family", 0, IMPLEMENTATION_TABLE, 0 },
 #endif
     { 0, 0, 0, 0 }
 };

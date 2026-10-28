@@ -30,6 +30,8 @@ pub enum TableGap {
 /// Each validated dispatch or standalone public-record shape consumes a table
 /// slot; alias/function association expansion also consumes the entry ceiling.
 pub struct TableLimits {
+    /// Caps file length and cumulative non-executable load bytes scanned per
+    /// pass, including separate virtual loads backed by the same file bytes.
     pub max_object_bytes: u64,
     pub max_tables: usize,
     pub max_entries: usize,
@@ -289,7 +291,12 @@ struct Relocation {
 }
 struct Elf<'a> {
     reader: Reader<'a>,
+    // Sorted, disjoint file-backed loads only. Irrelevant headers never enter
+    // address/storage lookup state.
     segments: Vec<Segment>,
+    relro: Vec<Segment>,
+    dynamic_header: Option<Segment>,
+    unwind_header: Option<Segment>,
     relocations: Vec<Relocation>,
     starts: Vec<u64>,
     ifuncs: Vec<u64>,
@@ -321,22 +328,31 @@ fn d(b: &[u8], i: usize) -> u32 {
 fn h(b: &[u8], i: usize) -> u16 {
     u16::from_le_bytes(b[i..i + 2].try_into().unwrap())
 }
+fn index_ranges(ranges: &mut [Segment]) -> Result<(), TableGap> {
+    ranges.sort_unstable_by_key(|range| range.address);
+    for pair in ranges.windows(2) {
+        if add(pair[0].address, pair[0].size)? > pair[1].address {
+            return Err(TableGap::Malformed);
+        }
+    }
+    Ok(())
+}
+fn range_at(ranges: &[Segment], address: u64, size: u64) -> Result<&Segment, TableGap> {
+    let end = add(address, size)?;
+    let index = ranges
+        .partition_point(|range| range.address <= address)
+        .checked_sub(1)
+        .ok_or(TableGap::Bounds)?;
+    let range = &ranges[index];
+    if end > add(range.address, range.size)? {
+        return Err(TableGap::Bounds);
+    }
+    Ok(range)
+}
 impl Elf<'_> {
     fn offset(&self, address: u64, size: u64) -> Result<u64, TableGap> {
-        let end = add(address, size)?;
-        let mut result = None;
-        for s in &self.segments {
-            if s.kind == 1
-                && address >= s.address
-                && end <= add(s.address, s.size)?
-                && result
-                    .replace(add(s.offset, address - s.address)?)
-                    .is_some()
-            {
-                return Err(TableGap::Malformed);
-            }
-        }
-        result.ok_or(TableGap::Bounds)
+        let range = range_at(&self.segments, address, size)?;
+        add(range.offset, address - range.address)
     }
     fn word(&self, address: u64) -> Result<u64, TableGap> {
         self.reader.u64(self.offset(address, 8)?)
@@ -358,9 +374,7 @@ impl Elf<'_> {
     }
     fn code(&self, address: u64) -> Result<u64, TableGap> {
         let offset = self.offset(address, 1)?;
-        if !self.segments.iter().any(|s| {
-            s.kind == 1 && s.flags & 1 != 0 && address >= s.address && address - s.address < s.size
-        }) {
+        if range_at(&self.segments, address, 1)?.flags & 1 == 0 {
             return Err(TableGap::Bounds);
         }
         if self.ifuncs.binary_search(&address).is_ok() {
@@ -455,11 +469,10 @@ impl Elf<'_> {
         Err(TableGap::UnsupportedElf)
     }
     fn dynamic(&mut self, m: &mut Memory) -> Result<(), TableGap> {
-        let mut dynamic = self.segments.iter().filter(|s| s.kind == 2);
-        let Some(s) = dynamic.next().copied() else {
+        let Some(s) = self.dynamic_header else {
             return Ok(());
         };
-        if dynamic.next().is_some() || s.size % 16 != 0 {
+        if s.size % 16 != 0 {
             return Err(TableGap::Malformed);
         }
         let mut terminated = false;
@@ -542,13 +555,7 @@ impl Elf<'_> {
                                         if !self.symbol_section(value, section)? {
                                             return Err(TableGap::Malformed);
                                         }
-                                        self.offset(value, 1)?;
-                                        if !self.segments.iter().any(|segment| {
-                                            segment.kind == 1
-                                                && segment.flags & 1 != 0
-                                                && value >= segment.address
-                                                && value - segment.address < segment.size
-                                        }) {
+                                        if range_at(&self.segments, value, 1)?.flags & 1 == 0 {
                                             return Err(TableGap::Bounds);
                                         }
                                     }
@@ -667,34 +674,31 @@ impl Elf<'_> {
         }
     }
     fn unwind(&mut self, m: &mut Memory) -> Result<(), TableGap> {
-        for index in 0..self.segments.len() {
-            let s = self.segments[index];
-            if s.kind != 0x6474e550 {
-                continue;
+        let Some(s) = self.unwind_header else {
+            return Ok(());
+        };
+        let b = self.reader.bytes::<4>(s.offset)?;
+        if b[0] != 1 {
+            return Err(TableGap::UnsupportedElf);
+        }
+        let mut cursor = add(s.address, 4)?;
+        let end = add(s.address, s.size)?;
+        let eh = self.encoded(&mut cursor, end, b[1], s.address)?;
+        self.offset(eh, 4)?;
+        let count = self.encoded(&mut cursor, end, b[2], s.address)?;
+        let mut previous = None;
+        for _ in 0..count {
+            let start = self.encoded(&mut cursor, end, b[3], s.address)?;
+            let fde = self.encoded(&mut cursor, end, b[3], s.address)?;
+            self.offset(fde, 8)?;
+            if self.fde_start(fde)? != start {
+                return Err(TableGap::Malformed);
             }
-            let b = self.reader.bytes::<4>(s.offset)?;
-            if b[0] != 1 {
-                return Err(TableGap::UnsupportedElf);
+            if previous.is_some_and(|p| p >= start) {
+                return Err(TableGap::Malformed);
             }
-            let mut cursor = add(s.address, 4)?;
-            let end = add(s.address, s.size)?;
-            let eh = self.encoded(&mut cursor, end, b[1], s.address)?;
-            self.offset(eh, 4)?;
-            let count = self.encoded(&mut cursor, end, b[2], s.address)?;
-            let mut previous = None;
-            for _ in 0..count {
-                let start = self.encoded(&mut cursor, end, b[3], s.address)?;
-                let fde = self.encoded(&mut cursor, end, b[3], s.address)?;
-                self.offset(fde, 8)?;
-                if self.fde_start(fde)? != start {
-                    return Err(TableGap::Malformed);
-                }
-                if previous.is_some_and(|p| p >= start) {
-                    return Err(TableGap::Malformed);
-                }
-                previous = Some(start);
-                m.push(&mut self.starts, start)?;
-            }
+            previous = Some(start);
+            m.push(&mut self.starts, start)?;
         }
         Ok(())
     }
@@ -807,28 +811,19 @@ impl Elf<'_> {
         let mut cursor = add(fde, 8)?;
         let start = self.encoded(&mut cursor, end, encoding, 0)?;
         let size = self.encoded(&mut cursor, end, encoding & 15, 0)?;
-        self.offset(start, size.max(1))?;
-        if !self.segments.iter().any(|s| {
-            s.kind == 1
-                && s.flags & 1 != 0
-                && start >= s.address
-                && add(start, size.max(1)).is_ok_and(|end| end <= s.address + s.size)
-        }) {
+        if range_at(&self.segments, start, size.max(1))?.flags & 1 == 0 {
             return Err(TableGap::Bounds);
         }
         Ok(start)
     }
     fn storage(&self, address: u64, size: u64) -> Option<TableStorage> {
-        let end = address.checked_add(size)?;
-        if self.segments.iter().any(|s| {
-            s.kind == 1 && s.flags & 3 == 0 && address >= s.address && end <= s.address + s.size
-        }) {
+        let load = range_at(&self.segments, address, size).ok()?;
+        if load.flags & 3 == 0 {
             return Some(TableStorage::ReadOnly);
         }
-        self.segments
-            .iter()
-            .any(|s| s.kind == 0x6474e552 && address >= s.address && end <= s.address + s.size)
-            .then_some(TableStorage::Relro)
+        range_at(&self.relro, address, size)
+            .ok()
+            .map(|_| TableStorage::Relro)
     }
     fn function_id(&self, address: u64) -> Result<u32, TableGap> {
         // OSSL_DISPATCH has an int32 ID, then unspecified alignment padding.
@@ -1031,6 +1026,9 @@ fn discover(
     let mut elf = Elf {
         reader,
         segments: Vec::new(),
+        relro: Vec::new(),
+        dynamic_header: None,
+        unwind_header: None,
         relocations: Vec::new(),
         starts: Vec::new(),
         ifuncs: Vec::new(),
@@ -1039,8 +1037,12 @@ fn discover(
         section_offset: 0,
         section_count: 0,
     };
+    let mut scan_bytes = 0u64;
     for i in 0..phnum {
         let b = elf.reader.bytes::<56>(add(phoff, i * 56)?)?;
+        if !matches!(d(&b, 0), 1 | 2 | 0x6474e550 | 0x6474e552) {
+            continue;
+        }
         let s = Segment {
             kind: d(&b, 0),
             flags: d(&b, 4),
@@ -1052,8 +1054,34 @@ fn discover(
             return Err(TableGap::Bounds);
         }
         add(s.address, w(&b, 40))?;
-        m.push(&mut elf.segments, s)?;
+        match s.kind {
+            1 if s.size > 0 => {
+                if s.flags & 1 == 0 {
+                    // Distinct virtual loads may alias the same file bytes.
+                    // Bound both scans by admitted bytes, not file length alone.
+                    scan_bytes = scan_bytes.checked_add(s.size).ok_or(TableGap::Resource)?;
+                    if scan_bytes > limits.max_object_bytes {
+                        return Err(TableGap::Resource);
+                    }
+                }
+                m.push(&mut elf.segments, s)?;
+            }
+            2 => {
+                if elf.dynamic_header.replace(s).is_some() {
+                    return Err(TableGap::Malformed);
+                }
+            }
+            0x6474e550 => {
+                if elf.unwind_header.replace(s).is_some() {
+                    return Err(TableGap::Malformed);
+                }
+            }
+            0x6474e552 if s.size > 0 => m.push(&mut elf.relro, s)?,
+            _ => {}
+        }
     }
+    index_ranges(&mut elf.segments)?;
+    index_ranges(&mut elf.relro)?;
     // Section metadata is optional, but malformed present headers fail closed.
     let shoff = w(&header, 40);
     if shoff != 0 {
@@ -1128,6 +1156,9 @@ fn discover(
         while add(at, 16)? <= end {
             if elf.storage(at, 16).is_some()
                 && elf.structural_row(at)?
+                // Defer anonymous interior-looking rows. A public record's
+                // explicit start is validated independently below, even if
+                // the apparent predecessor was rejected.
                 && !(at >= s.address + 16 && elf.structural_row(at - 16)?)
             {
                 match elf.dispatch(at, &mut m, &mut entries, limits) {
@@ -1153,6 +1184,12 @@ fn discover(
         }
     }
     result.tables.sort_unstable_by_key(|table| table.address);
+    // Stable table indices plus a small sorted address index permit independent
+    // public-record starts without repeatedly searching every discovered table.
+    let mut table_index = Vec::new();
+    for (index, table) in result.tables.iter().enumerate() {
+        m.push(&mut table_index, (table.address, index))?;
+    }
     for s in &elf.segments {
         if s.kind != 1 || s.flags & 1 != 0 {
             continue;
@@ -1162,12 +1199,15 @@ fn discover(
         while add(at, 32)? <= end {
             if let Some(implementation) = elf.algorithm_implementation(add(at, 16)?)? {
                 if elf.storage(at, 32).is_some() {
-                    if let Ok(dispatch) = result
-                        .tables
-                        .binary_search_by_key(&implementation, |table| table.address)
-                    {
-                        // Inspect exactly the public record, never adjacent opaque
-                        // container fields or any assumed private container stride.
+                    let lookup =
+                        table_index.binary_search_by_key(&implementation, |&(address, _)| address);
+                    let possible = lookup.is_ok()
+                        || elf.storage(implementation, 16).is_some()
+                            && elf.structural_row(implementation)?;
+                    if possible {
+                        // Validate exactly the public record before accepting a
+                        // previously deferred start. No private container fields
+                        // or arbitrary anonymous tails establish this reference.
                         let record = (|| -> Result<Algorithm, TableGap> {
                             let aliases = elf.string(elf.pointer(at)?, &mut m, false)?;
                             for slot in [add(at, 8)?, add(at, 24)?] {
@@ -1176,6 +1216,31 @@ fn discover(
                                     let _ = elf.string(pointer, &mut m, true)?;
                                 }
                             }
+                            let dispatch = match lookup {
+                                Ok(index) => table_index[index].1,
+                                Err(position) => {
+                                    let table =
+                                        elf.dispatch(implementation, &mut m, &mut entries, limits)?;
+                                    if result
+                                        .tables
+                                        .len()
+                                        .checked_add(result.algorithms.len())
+                                        .is_none_or(|count| count >= limits.max_tables)
+                                    {
+                                        return Err(TableGap::Resource);
+                                    }
+                                    if table.partial
+                                        && !result.gaps.contains(&TableGap::UnsupportedRelocation)
+                                    {
+                                        m.push(&mut result.gaps, TableGap::UnsupportedRelocation)?;
+                                    }
+                                    let index = result.tables.len();
+                                    m.push(&mut result.tables, table)?;
+                                    m.push(&mut table_index, (implementation, index))?;
+                                    table_index[position..].rotate_right(1);
+                                    index
+                                }
+                            };
                             let mut id = Sha256::new();
                             id.update(b"osslscope-static-algorithm-v1\0");
                             id.update(object_hash);
@@ -1339,6 +1404,9 @@ mod tests {
                 address: 0,
                 size: len,
             }],
+            relro: Vec::new(),
+            dynamic_header: None,
+            unwind_header: None,
             relocations: Vec::new(),
             starts: Vec::new(),
             ifuncs: Vec::new(),
