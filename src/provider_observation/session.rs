@@ -4068,6 +4068,16 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(1));
         }
+        // The done marker precedes exit. Terminal history requires the owned
+        // pidfd to be ready before close: an unavailable but nonterminal source
+        // must still be refused (covered by the live-failure host controls).
+        // The query was held across adoption above; this wait only establishes
+        // custody for its already queued return and advertisements.
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until);
+            std::thread::yield_now();
+        }
+        assert_eq!(child.peek_exit().unwrap(), Some(0));
         let final_batch = session.close();
         let rows: Vec<_> = final_batch
             .api_activity
@@ -4099,7 +4109,11 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
                     ..
                 }
             )),
-            "pending startup query return was orphaned"
+            "pending startup query return was orphaned: reconcile_gaps={:?}, final_gaps={:?}, fact_count={}, query_fact_count={}",
+            batch.gaps,
+            final_batch.gaps,
+            final_batch.facts.len(),
+            facts.len()
         );
         assert!(
             facts
@@ -4110,10 +4124,6 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
         assert!(facts.iter().all(|f| f.starttime == metadata_identity.3
             && f.generation == metadata_identity.1
             && f.object_sha256 == metadata_identity.4));
-        while child.peek_exit().unwrap().is_none() {
-            assert!(Instant::now() < until);
-            std::thread::yield_now();
-        }
         child.finish_observation().unwrap();
         println!(
             "mapped handoff: same operational/metadata cookies and generation; one paired scalar success; pending natural fixture query/advertisement retained; no tail/unpaired gap"
