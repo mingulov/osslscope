@@ -90,6 +90,14 @@ fn directory(path: &Path, privileged: bool) -> Result<File, ObservationGap> {
     Ok(file)
 }
 fn read_at(parent: &File, privileged: bool, name: &str) -> Result<Vec<u8>, ObservationGap> {
+    read_at_limit(parent, privileged, name, MAX_BYTES)
+}
+fn read_at_limit(
+    parent: &File,
+    privileged: bool,
+    name: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>, ObservationGap> {
     let mut file = open_at(parent, std::ffi::OsStr::new(name), false)?;
     let before = file
         .metadata()
@@ -97,7 +105,7 @@ fn read_at(parent: &File, privileged: bool, name: &str) -> Result<Vec<u8>, Obser
     if !before.is_file()
         || !trusted(&before, privileged)
         || before.len() == 0
-        || before.len() > MAX_BYTES
+        || before.len() > max_bytes
     {
         return Err(ObservationGap::BpfUnavailable);
     }
@@ -186,18 +194,80 @@ fn load_role_for(
     {
         return Err(ObservationGap::BpfUnavailable);
     }
-    if let Ok(bytes) = read_at(&parent, privileged, role.name()) {
-        return Ok(bytes);
-    }
     if parent_path.file_name() != Some(std::ffi::OsStr::new("bin")) {
-        return Err(ObservationGap::BpfUnavailable);
+        // Explicit development layout. Installed prefixes always use the
+        // protected current receipt below, even if a sibling object exists.
+        return read_at(&parent, privileged, role.name());
     }
     let prefix = parent_path.parent().ok_or(ObservationGap::BpfUnavailable)?;
-    read_at(
-        &directory(&prefix.join("lib/osslscope"), privileged)?,
-        privileged,
-        role.name(),
-    )
+    let receipts = directory(&prefix.join("share/osslscope"), privileged)?;
+    let receipt_bytes = read_at_limit(&receipts, privileged, "install-manifest.json", 1 << 20)?;
+    let receipt = crate::package::installed::InstalledReceipt::parse(&receipt_bytes, prefix)
+        .ok_or(ObservationGap::BpfUnavailable)?;
+    let (host_bytes, host_digest) = executable_digest(&reopened)?;
+    if !receipt.matches("osslscope", host_bytes, &host_digest) {
+        return Err(ObservationGap::BpfUnavailable);
+    }
+    let objects = directory(&prefix.join("lib/osslscope"), privileged)?;
+    let mut selected = None;
+    for name in crate::package::installed::CURRENT_NAMES.into_iter().skip(1) {
+        let bytes = read_at(&objects, privileged, name)?;
+        if !receipt.matches(name, bytes.len() as u64, &digest(&bytes)) {
+            return Err(ObservationGap::BpfUnavailable);
+        }
+        if name == role.name() {
+            selected = Some(bytes);
+        }
+    }
+    selected.ok_or(ObservationGap::BpfUnavailable)
+}
+fn digest(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+fn executable_digest(file: &File) -> Result<(u64, String), ObservationGap> {
+    use sha2::Digest as _;
+    use std::os::unix::fs::FileExt as _;
+    let before = file
+        .metadata()
+        .map_err(|_| ObservationGap::BpfUnavailable)?;
+    // Debug development binaries can exceed the BPF object bound. Stream a
+    // separate host bound; no allocation proportional to the executable.
+    if before.len() == 0 || before.len() > 256 << 20 {
+        return Err(ObservationGap::BpfUnavailable);
+    }
+    let mut hash = sha2::Sha256::new();
+    let mut offset = 0;
+    let mut buffer = [0; 65536];
+    loop {
+        let count = file
+            .read_at(&mut buffer, offset)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        if count == 0 {
+            break;
+        }
+        offset += count as u64;
+        if offset > before.len() {
+            return Err(ObservationGap::BpfUnavailable);
+        }
+        hash.update(&buffer[..count]);
+    }
+    let after = file
+        .metadata()
+        .map_err(|_| ObservationGap::BpfUnavailable)?;
+    if offset != before.len() || identity(&before) != identity(&after) {
+        return Err(ObservationGap::BpfUnavailable);
+    }
+    Ok((
+        offset,
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    ))
 }
 
 #[cfg(test)]
@@ -232,6 +302,134 @@ mod tests {
     impl Drop for Fixture {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+    fn install_fixture() -> Fixture {
+        let f = Fixture::new();
+        fs::create_dir(f.0.join("bin")).unwrap();
+        fs::create_dir_all(f.0.join("lib/osslscope")).unwrap();
+        fs::create_dir_all(f.0.join("share/osslscope")).unwrap();
+        fs::rename(f.0.join("osslscope"), f.0.join("bin/osslscope")).unwrap();
+        let mut arts = Vec::new();
+        for name in [
+            "osslscope",
+            "osslscope-harvest",
+            "osslscope-count",
+            "osslscope-members",
+            NAME,
+            "osslscope-focused-count",
+        ] {
+            let dest = if name == "osslscope" {
+                f.0.join("bin/osslscope")
+            } else {
+                f.0.join("lib/osslscope").join(name)
+            };
+            if name != "osslscope" {
+                fs::write(&dest, name.as_bytes()).unwrap();
+            }
+            let bytes = fs::read(&dest).unwrap();
+            use sha2::Digest as _;
+            let hash = sha2::Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            let mut entry = serde_json::json!({"role": if name == "osslscope" { "host-binary" } else { "bpf-object" }, "dest": dest, "bytes": bytes.len(), "sha256": hash, "product_ref": "a".repeat(40)});
+            if name != "osslscope" {
+                entry["bin"] = name.into();
+            }
+            arts.push(entry);
+        }
+        fs::write(f.0.join("share/osslscope/install-manifest.json"), serde_json::to_vec(&serde_json::json!({"schema": "osslscope-install-manifest-v2", "prefix": f.0, "product_ref": "a".repeat(40), "product_dirty": false, "artifacts": arts})).unwrap()).unwrap();
+        f
+    }
+    fn installed_load(f: &Fixture, role: Companion) -> Result<Vec<u8>, ObservationGap> {
+        load_role_for(
+            &File::open(f.0.join("bin/osslscope")).unwrap(),
+            &f.0.join("bin/osslscope"),
+            false,
+            role,
+        )
+    }
+    #[test]
+    fn installed_five_roles_bind_both_companions_and_running_host() {
+        let f = install_fixture();
+        for role in [Companion::Observation, Companion::FocusedCount] {
+            assert_eq!(installed_load(&f, role).unwrap(), role.name().as_bytes());
+        }
+        fs::write(f.0.join("bin/osslscope"), b"different host").unwrap();
+        assert!(installed_load(&f, Companion::Observation).is_err());
+    }
+    #[test]
+    fn installed_set_rejects_each_missing_mutated_or_symlinked_role() {
+        for name in [
+            "osslscope-harvest",
+            "osslscope-count",
+            "osslscope-members",
+            NAME,
+            "osslscope-focused-count",
+        ] {
+            for mutation in 0..3 {
+                let f = install_fixture();
+                let path = f.0.join("lib/osslscope").join(name);
+                if mutation == 0 {
+                    fs::remove_file(&path).unwrap();
+                }
+                if mutation == 1 {
+                    fs::write(&path, b"mutated bytes").unwrap();
+                }
+                if mutation == 2 {
+                    fs::remove_file(&path).unwrap();
+                    symlink("../elsewhere", &path).unwrap();
+                }
+                for role in [Companion::Observation, Companion::FocusedCount] {
+                    assert!(
+                        installed_load(&f, role).is_err(),
+                        "{name} mutation {mutation}"
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn installed_set_rejects_missing_legacy_mixed_duplicate_receipts_and_sibling_bypass() {
+        for mutation in 0..7 {
+            let f = install_fixture();
+            let path = f.0.join("share/osslscope/install-manifest.json");
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            match mutation {
+                0 => {
+                    fs::remove_file(&path).unwrap();
+                }
+                1 => {
+                    receipt["schema"] = "osslscope-install-manifest-v1".into();
+                }
+                2 => {
+                    receipt["artifacts"].as_array_mut().unwrap().truncate(4);
+                }
+                3 => {
+                    receipt["artifacts"][4]["product_ref"] = "b".repeat(40).into();
+                }
+                4 => {
+                    let dupe = receipt["artifacts"][3].clone();
+                    receipt["artifacts"][4] = dupe;
+                }
+                5 => {
+                    receipt["artifacts"][4]["dest"] =
+                        "/elsewhere/osslscope-provider-observation".into();
+                }
+                _ => {
+                    receipt["artifacts"][0]["sha256"] = "0".repeat(64).into();
+                }
+            }
+            if mutation != 0 {
+                fs::write(&path, serde_json::to_vec(&receipt).unwrap()).unwrap();
+            }
+            fs::write(f.0.join("bin").join(NAME), b"unreceipted sibling").unwrap();
+            assert!(
+                installed_load(&f, Companion::Observation).is_err(),
+                "mutation {mutation}"
+            );
         }
     }
     #[test]
@@ -315,15 +513,11 @@ mod tests {
     }
     #[test]
     fn installed_layout_and_symlinked_ancestor_are_handled_without_cwd_lookup() {
-        let f = Fixture::new();
-        fs::create_dir(f.0.join("bin")).unwrap();
-        fs::create_dir_all(f.0.join("lib/osslscope")).unwrap();
-        fs::rename(f.0.join("osslscope"), f.0.join("bin/osslscope")).unwrap();
-        fs::write(f.0.join("lib/osslscope").join(NAME), b"installed").unwrap();
+        let f = install_fixture();
         let exe = File::open(f.0.join("bin/osslscope")).unwrap();
         assert_eq!(
             load_for(&exe, &f.0.join("bin/osslscope"), false).unwrap(),
-            b"installed"
+            NAME.as_bytes()
         );
         symlink("bin", f.0.join("linked")).unwrap();
         assert!(load_for(&exe, &f.0.join("linked/osslscope"), false).is_err());

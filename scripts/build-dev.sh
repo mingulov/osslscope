@@ -133,6 +133,7 @@ fi
 # Revision is best-effort: a fresh source archive (not a git checkout) must
 # still build; the manifest then records a null ref instead of failing.
 PRODUCT_REF=""
+PRODUCT_TREE=""
 PRODUCT_REF_SHORT="unknown"
 PRODUCT_DIRTY="unknown"
 # A source archive may sit inside another repository. Only this exact tree's
@@ -140,6 +141,7 @@ PRODUCT_DIRTY="unknown"
 PRODUCT_GIT_ROOT="$(git -C "$REPO" rev-parse --show-toplevel 2>/dev/null || true)"
 if [ "$PRODUCT_GIT_ROOT" = "$REPO" ] && git -C "$REPO" rev-parse HEAD >/dev/null 2>&1; then
     PRODUCT_REF="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+    PRODUCT_TREE="$(git -C "$REPO" rev-parse 'HEAD^{tree}')"
     PRODUCT_REF_SHORT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     PRODUCT_DIRTY="false"
     if [ -n "$(git -C "$REPO" status --porcelain 2>/dev/null)" ]; then PRODUCT_DIRTY="true"; fi
@@ -398,8 +400,16 @@ $_p"
     fi
 fi
 
+# A build crossing source revisions or tracked/untracked edits cannot claim
+# clean source provenance, even when it began in a clean checkout.
+if [ -n "$PRODUCT_REF" ]; then
+    if [ "$(git -C "$REPO" rev-parse HEAD)" != "$PRODUCT_REF" ] || [ -n "$(git -C "$REPO" status --porcelain)" ]; then
+        PRODUCT_DIRTY="true"
+    fi
+fi
+
 # --- manifest: versions + artifact identity ---
-export REPO MANIFEST PRODUCT_REF PRODUCT_REF_SHORT PRODUCT_DIRTY BUILT_AT \
+export REPO MANIFEST PRODUCT_REF PRODUCT_TREE PRODUCT_REF_SHORT PRODUCT_DIRTY BUILT_AT \
     HOST_CARGO_VER HOST_RUSTC_VER BPF_CARGO_VER BPF_RUSTC_VER BPF_LINKER_VER \
     HOST_TOOLCHAIN BPF_TOOLCHAIN BPF_TARGET BPF_BINS JOBS NET OFFLINE_USED \
     MODE PROFILE HOST_CMD BPF_CMD DIAGNOSTICS HOST_BIN BPF_BIN_PATHS \
@@ -430,7 +440,8 @@ def ident(path):
         pass
     return {"path": path, "sha256": h.hexdigest(),
             "bytes": os.path.getsize(path), "file": ftype,
-            "build_id": build_id}
+            "build_id": build_id, "product_ref": os.environ.get("PRODUCT_REF") or None,
+            "product_tree": os.environ.get("PRODUCT_TREE") or None}
 
 e = os.environ
 artifacts = []
@@ -451,6 +462,7 @@ if e.get("CHECK_ONLY") != "1":
 manifest = {
     "schema": "osslscope-dev-build-manifest-v1",
     "product_ref": e.get("PRODUCT_REF") or None,
+    "product_tree": e.get("PRODUCT_TREE") or None,
     "product_ref_short": (e.get("PRODUCT_REF_SHORT") if e.get("PRODUCT_REF") else None),
     "product_dirty": {"true": True, "false": False}.get(e.get("PRODUCT_DIRTY")),
     "built_at_utc": e.get("BUILT_AT"),

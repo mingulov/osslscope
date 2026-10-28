@@ -3,7 +3,7 @@
 
 | Actual text | Applicable source components |
 | --- | --- |
-| [Root LICENSE](../LICENSE), GPL-3.0 | `osslscope` 0.2.0; internal `ossl-bpf-sys`, `ossl-discover`, `osslscope-ebpf-common`, `osslscope-manifest` 0.1.0; all GPL-3.0-or-later |
+| [Root LICENSE](../LICENSE), GPL-3.0 | `osslscope` 0.4.0; internal `ossl-bpf-sys`, `ossl-discover`, `osslscope-ebpf-common`, `osslscope-manifest` 0.1.0; all GPL-3.0-or-later |
 | [GPL-2.0-only.txt](GPL-2.0-only.txt) | `osslscope-ebpf` 0.0.0 under GPL-2.0-only; the selected GPL-2.0 option of `osslscope-bpf-contract` 0.0.0, whose expression remains GPL-2.0-or-later |
 
 The first-party declarations are indexed in [NOTICE.md](../NOTICE.md).
@@ -18,3 +18,11 @@ set for a binary or vendored release. Such a distribution needs its actual
 applicable texts, notices, corresponding source and source-availability wording
 reviewed for the inventory it conveys. No rights or aggregate release-license
 conclusion follows from this index alone.
+
+
+The restored Aya upstream [MIT](../packaging/notices/aya-LICENSE-MIT.txt) and
+[Apache-2.0](../packaging/notices/aya-LICENSE-APACHE.txt) texts remain third-party
+license documents. Their [provenance index](../packaging/notices/restored.json)
+records exact registry/VCS identities and the selected MIT option. These files
+are conveyed as notice inputs; they do not embed third-party Rust source into
+the product source archive or complete a binary distribution rights review.

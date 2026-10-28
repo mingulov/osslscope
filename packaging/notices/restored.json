@@ -1,0 +1,93 @@
+{
+  "packages": [
+    {
+      "crate_sha256": "609b414caa508f04d2dbbc9481ad6869f43ab9ab1dc9abd237fca27c0818f663",
+      "declared_license": "MIT OR Apache-2.0",
+      "name": "aya-build",
+      "selected_license": "MIT",
+      "texts": [
+        {
+          "bytes": 1062,
+          "file": "aya-LICENSE-MIT.txt",
+          "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-MIT"
+        },
+        {
+          "bytes": 10852,
+          "file": "aya-LICENSE-APACHE.txt",
+          "sha256": "937e2efb1ad10b57b31b14d860c2356d012dd33b6ead2e0fc6be2f24d4066326",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-APACHE"
+        }
+      ],
+      "vcs_revision": "302985c72850cd9a8f1d791a11d247a4fbe1c5b1",
+      "version": "0.2.0"
+    },
+    {
+      "crate_sha256": "eace5970943931fea46a8cbdca208a8f6a9e0413d85a5a6c4e168f0b909570bc",
+      "declared_license": "MIT OR Apache-2.0",
+      "name": "aya-ebpf",
+      "selected_license": "MIT",
+      "texts": [
+        {
+          "bytes": 1062,
+          "file": "aya-LICENSE-MIT.txt",
+          "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/773ca715385b97eb0c26a581b53246c0c4306959/LICENSE-MIT"
+        },
+        {
+          "bytes": 10852,
+          "file": "aya-LICENSE-APACHE.txt",
+          "sha256": "937e2efb1ad10b57b31b14d860c2356d012dd33b6ead2e0fc6be2f24d4066326",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/773ca715385b97eb0c26a581b53246c0c4306959/LICENSE-APACHE"
+        }
+      ],
+      "vcs_revision": "773ca715385b97eb0c26a581b53246c0c4306959",
+      "version": "0.2.1"
+    },
+    {
+      "crate_sha256": "cf1f19286ebbda6673099b68d049034838f08e4939cef66c998a8d3e62825d76",
+      "declared_license": "MIT OR Apache-2.0",
+      "name": "aya-ebpf-bindings",
+      "selected_license": "MIT",
+      "texts": [
+        {
+          "bytes": 1062,
+          "file": "aya-LICENSE-MIT.txt",
+          "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-MIT"
+        },
+        {
+          "bytes": 10852,
+          "file": "aya-LICENSE-APACHE.txt",
+          "sha256": "937e2efb1ad10b57b31b14d860c2356d012dd33b6ead2e0fc6be2f24d4066326",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-APACHE"
+        }
+      ],
+      "vcs_revision": "302985c72850cd9a8f1d791a11d247a4fbe1c5b1",
+      "version": "0.2.0"
+    },
+    {
+      "crate_sha256": "23e3a7f86e914df106dd00f9d757bc93f7d5c93380c51eead23d8d2ccd15a87a",
+      "declared_license": "MIT OR Apache-2.0",
+      "name": "aya-ebpf-macros",
+      "selected_license": "MIT",
+      "texts": [
+        {
+          "bytes": 1062,
+          "file": "aya-LICENSE-MIT.txt",
+          "sha256": "71f5b27660dcd9b566402a9fb724b04453d6da50a46c5e165c32147b2405a5cb",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-MIT"
+        },
+        {
+          "bytes": 10852,
+          "file": "aya-LICENSE-APACHE.txt",
+          "sha256": "937e2efb1ad10b57b31b14d860c2356d012dd33b6ead2e0fc6be2f24d4066326",
+          "upstream_url": "https://raw.githubusercontent.com/aya-rs/aya/302985c72850cd9a8f1d791a11d247a4fbe1c5b1/LICENSE-APACHE"
+        }
+      ],
+      "vcs_revision": "302985c72850cd9a8f1d791a11d247a4fbe1c5b1",
+      "version": "0.2.0"
+    }
+  ],
+  "schema": "osslscope-restored-notices-v1"
+}

@@ -1,109 +1,109 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Packaging (deb + rpm)
+# Matched development packages
 
-> Development status: packages built from this branch are
-> development snapshots, not final distributables. Current builders
-> omit BPF objects; operators build matching roles for development
-> (see [build](../docs/build.md)). Matched redistributable host+BPF
-> packages remain forthcoming, subject to licensing, provenance and
-> exact-package qualification. This note grants no distribution rights.
+The current builder constructs a prefix tarball, DEB and RPM containing the CLI
+and all five BPF roles from one clean pinned build. These are development
+candidates. Construction and extraction do not establish installed platform,
+reproducibility, source/license closure or release qualification.
 
-File-caps default install: both packages ship the `osslscope` binary
-plus `docs/install.md`, and a post-install hook grants
-`CAP_BPF`+`CAP_PERFMON` file capabilities so the tool runs
-unprivileged. The current builders include no BPF objects
-(harvest/count/members) or `tests/goldens/` fixtures. Development
-objects use the pinned nightly and explicit role flags, or a trusted
-local-prefix install with matching receipt for automatic traversal;
-goldens are test-only. See [install](../docs/install.md).
-
-Package contents:
-
-- `/usr/bin/osslscope`
-- `/usr/share/doc/osslscope/install.md`
-
-The version is read from `Cargo.toml` `[package] version` at build
-time, never hardcoded.
-
-## Capability lifecycle across upgrade
-
-Ordinary-user file capabilities must survive install, reinstall,
-upgrade, and removal (removal takes the caps with the binary).
-
-- deb: `postinst configure` applies caps; `prerm` only matches
-  `remove|deconfigure`, so the `upgrade` call leaves caps alone.
-- rpm: `%post` applies caps; `%preun` is erase-only (`$1 == 0`) so
-  upgrades skip cleanup; `%posttrans` re-applies caps idempotently
-  at the end of every install/upgrade transaction. The `%posttrans`
-  step is the migration path: upgrading *from* an older development
-  package carrying the unreleased 1.0.0 label
-  still runs that package's old unguarded `%preun` *after* the new
-  `%post`, which would strip the new binary's caps — guarding only
-  the new `%preun` cannot prevent the old script from running.
-
-Every scriptlet warns with a labeled-sudo fallback and exits 0 when
-`setcap` is missing or denied; a missing tool never fails the
-transaction. `doctor` repeats the remediation.
-
-## deb
-
-Prerequisites: a cargo-built release binary, `dpkg-deb`.
+Build from a reviewed clean product checkout:
 
 ```sh
-cargo build --locked --release
-./packaging/build-deb.sh            # or: ./packaging/build-deb.sh /path/to/osslscope
-# -> osslscope_<ver>-1_amd64.deb
-sudo dpkg -i osslscope_<ver>-1_amd64.deb
-# NB: dpkg alone does not resolve Depends; if libcap2-bin is missing:
-sudo apt-get install -f
+./scripts/build-dev.sh --release --offline
+python3 packaging/build-package.py --output dist/current
+# dist/current: prefix tarball, DEB, RPM, product source tar, package-manifest.json
 ```
 
-The control file is `packaging/deb/DEBIAN/control.in`
-(`@VERSION@`/`@REVISION@` substituted at build; `DEB_REVISION`
-overrides the revision for upgrade-path testing, default 1);
-`postinst` applies `setcap cap_bpf,cap_perfmon+ep` with a
-labeled-sudo fallback note on failure; `prerm` clears caps
-best-effort on removal only.
+The output directory must be new; existing output is refused. The builder never
+installs software, changes privileges, acquires dependencies or starts workloads.
+It requires Python 3.11+, the pinned Cargo toolchains and cached locked dependency
+metadata. DEB construction additionally needs `dpkg-deb`; RPM needs `rpmbuild`.
+No Cargo compilation or network access occurs inside packaging.
 
-## rpm
+A full clean `build-dev.sh --release` manifest must record the current source
+revision/tree, pinned toolchains/linker, CLI and exact five-role membership,
+per-artifact source identity, nonzero bytes, hashes and compatible ELF headers.
+Missing, duplicate, stale or mixed roles refuse construction. Old manifests
+without source-tree identity, host-only builds and bare CLI paths cannot create
+current packages. This is a trusted local recipe/manifest contract, not a signed
+attestation against a malicious builder.
 
-Prerequisites: a cargo-built release binary, `rpmbuild`.
+Select formats and the final tar installation prefix explicitly:
 
 ```sh
-cargo build --locked --release
-./packaging/build-rpm.sh            # or: ./packaging/build-rpm.sh /path/to/osslscope
-# -> ~/rpmbuild/RPMS/x86_64/osslscope-<ver>-1.<dist>.x86_64.rpm
-sudo dnf install ./osslscope-<ver>-1.*.x86_64.rpm   # pulls libcap via Requires
+python3 packaging/build-package.py --formats tar --prefix /opt/osslscope --output dist/prefix
+./packaging/build-deb.sh --output dist/deb
+RPM_RELEASE=2 ./packaging/build-rpm.sh --output dist/rpm
 ```
 
-The spec is `packaging/rpm/osslscope.spec`. It takes the version as
-an rpmbuild define (`--define "pkg_version <ver>"`, supplied by
-`build-rpm.sh` from `Cargo.toml`) and installs a prebuilt binary —
-no cargo/network inside the rpm build. `%post`/`%preun`/`%posttrans`
-mirror the deb hooks with the upgrade semantics above.
-`RPM_RELEASE` overrides the release for upgrade-path testing
-(default 1): build the old tree with `RPM_RELEASE=1` and the new
-tree with `RPM_RELEASE=2` at the same version.
+`--revision N`, `DEB_REVISION` and `RPM_RELEASE` select a positive numeric package
+revision for lifecycle controls. DEB/RPM require `/usr`. Tar receipt paths bind
+the selected prefix: extract into that exact protected prefix; relocation
+requires rebuilding the package receipt. Do not extract over an existing
+installation. Version comes from `Cargo.toml`; the builder does not bump it.
 
-## Tests
+The shared prefix tree contains:
 
-Host-runnable, no root (also run by the `packaging` CI job):
+- `bin/osslscope` (0755).
+- `lib/osslscope/osslscope-{harvest,count,members,provider-observation,focused-count}` (0644).
+- `share/osslscope/install-manifest.json` (0644).
+- `share/doc/osslscope/`: installation/licensing documentation, project license
+  texts, actual locked host/BPF dependency graphs and copied dependency notices,
+  plus source-availability metadata binding the accompanying product source tar.
+
+DEB/RPM install this tree below `/usr`, owned by root with protected directories.
+The current receipt binds the CLI and all five role hashes and source reference.
+Normal installed companion resolution refuses a missing, historical, mixed or
+mutated set before object loading. Under privileged invocation it also verifies
+root-owned, non-writable ancestry/files. Ownership remains the trust root;
+root-authorized replacement of both receipt and artifacts is outside this check.
+Explicit object overrides retain their documented operator-trust behavior.
+Historical embedded bundle contract parsing and executors remain separate.
+
+## Source and notices
+
+`osslscope-<version>-source.tar` is the exact tracked product revision, including
+both lockfiles and recipes. `dependency-notices.json` inventories both actual
+locked resolved Cargo graphs, with crate source URLs/checksums, declared license
+expressions, dependency edges and copied applicable notice texts. These resolved
+graphs include build/test/target dependencies and are broader than the final
+linked code. Four BPF Aya crates omit license files from their registry tarballs;
+[the restoration index](notices/restored.json) pins each archive checksum and
+published VCS revision to both upstream license texts. The MIT distribution
+option is recorded explicitly, retaining the upstream dual-license declaration.
+Package construction validates these pins without network access.
+
+Product source plus upstream source links is not a complete offline corresponding
+source bundle. Final compiler/sysroot/native-runtime inventory, complete source
+availability and rights review remain release gates. Metadata passing and
+restored notices grant no new rights. Preserve the source tar and package manifest
+alongside the development packages. No upload/tag/publish occurs during builds.
+
+## Capability lifecycle
+
+DEB `postinst configure` applies `cap_bpf,cap_perfmon+ep`; `prerm` removes caps
+only for `remove|deconfigure`, preserving upgrade behavior. RPM `%post` applies
+caps, `%preun` clears only for erase (`$1 == 0`), and `%posttrans` restores caps
+after the old package's scriptlets. This retains migration handling for older
+unguarded `%preun` scripts. Missing/denied `setcap` produces a labeled-sudo
+remediation and leaves the transaction successful; `doctor` reports the limit.
+RPM's build must not strip or mutate receipt-bound prebuilt bytes.
+
+On an authorized qualification host, install the selected package with `dpkg -i`
+or `dnf install`, then run ordinary-user `osslscope doctor`, `scan`, `report` and
+`check` against independent workload truth. Privilege, upgrade/reinstall,
+remove/purge, old-scriptlet migration, interruption, disk exhaustion and rollback
+controls remain required. The historical `tests/guest-lifecycle.sh` builds the
+old CLI-only archive recipe and is not the current five-role acceptance runner.
+
+Host controls (no root):
 
 ```sh
-./packaging/tests/test-scriptlets.sh   # scriptlet argument matrix with stub setcap
-./scripts/tests/test-install-dev.sh    # local prefix layout + diagnostics
+python3 packaging/tests/test-current-package.py
+./packaging/tests/test-scriptlets.sh
+./scripts/tests/test-install-dev.sh
 ```
 
-Privileged lifecycle witness (prepared, NOT-RUN without an approved
-guest — dry-run by default):
-
-```sh
-./packaging/tests/guest-lifecycle.sh --pkg rpm --old-ref <old-development-ref> --new-ref <rev>
-./packaging/tests/guest-lifecycle.sh --pkg rpm --old-ref <old-development-ref> --new-ref <rev> --execute
-```
-
-`--execute` builds both packages from clean refs, then asserts
-`getcap` keeps `cap_bpf+cap_perfmon` across install, upgrade,
-reinstall, and that removal cleans up. It runs only on the approved
-guest. Scriptlet fixtures and local installs do not qualify a final
-matched redistributable package.
+Synthetic ELF staging and scriptlet fixtures do not qualify installed runtime
+behavior. Repeated construction from one build is also not a clean double-build
+reproducibility result.

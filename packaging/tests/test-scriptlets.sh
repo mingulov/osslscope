@@ -99,13 +99,14 @@ else
     bad "build-rpm.sh threads RPM_RELEASE into pkg_release define"
 fi
 
-# The result glob must pin the built release: a shared RPMS dir holding an
-# older release would otherwise make a first-match `-*` glob return the
-# stale rpm and turn an upgrade witness into a no-op.
-if grep -q 'osslscope-"\$ver"-"\$release"\.' "$REPO/packaging/build-rpm.sh"; then
-    ok "build-rpm.sh result glob pins the built release"
+# Current construction uses a fresh output tree rather than a shared RPMS
+# glob. Refusing an occupied tree prevents stale output selection/overwrite.
+if python3 "$REPO/packaging/build-package.py" --formats rpm --output "$T" >"$T/refuse.out" 2>&1; then
+    bad "current builder refuses occupied output"
+elif grep -q 'output already exists' "$T/refuse.out"; then
+    ok "current builder refuses occupied output"
 else
-    bad "build-rpm.sh result glob pins the built release"
+    bad "current builder diagnoses occupied output ($(cat "$T/refuse.out"))"
 fi
 
 # Simulate the control.in substitution build-deb.sh performs.

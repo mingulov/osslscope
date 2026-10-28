@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
+"""Offline staging contract; synthetic ELFs do not qualify installed tracing."""
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import struct
+import subprocess
+import tempfile
+import unittest
+
+SCRIPT = Path(__file__).resolve().parents[1] / 'build-package.py'
+
+
+class CurrentPackage(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.assertTrue(SCRIPT.is_file(), 'current five-role package builder is missing')
+        spec = importlib.util.spec_from_file_location('package_builder', SCRIPT)
+        self.builder = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.builder)
+        self.roles = ('harvest', 'count', 'members', 'provider-observation', 'focused-count')
+        self.arts = []
+        for name in ('osslscope', *('osslscope-' + r for r in self.roles)):
+            host = name == 'osslscope'
+            data = struct.pack('<16sHHIQQQIHHHHHH', b'\x7fELF\x02\x01\x01' + bytes(9), 3 if host else 1, 62 if host else 247, 1, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0) + name.encode()
+            path = self.root / name
+            path.write_bytes(data)
+            path.chmod(0o755 if host else 0o644)
+            entry = {'role': 'host-binary' if host else 'bpf-object', 'path': str(path), 'bytes': len(data), 'sha256': hashlib.sha256(data).hexdigest(), 'product_ref': 'a'*40, 'product_tree': 'b'*40}
+            if not host:
+                entry['bin'] = name
+            self.arts.append(entry)
+        self.manifest = {'schema': 'osslscope-dev-build-manifest-v1', 'product_ref': 'a'*40, 'product_tree': 'b'*40, 'product_dirty': False, 'host_toolchain': '1.88.0', 'bpf_toolchain': 'nightly-2026-05-20', 'bpf_linker': 'bpf-linker 0.10.4', 'bpf_target': 'bpfel-unknown-none', 'host_profile': 'release', 'mode': 'both', 'artifacts': self.arts}
+
+    def test_current_manifest_requires_exactly_all_five_nonempty_roles(self):
+        selected = self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)
+        self.assertEqual(set(selected), {'osslscope', *('osslscope-'+r for r in self.roles)})
+        self.manifest['artifacts'] = self.arts[:4]
+        with self.assertRaisesRegex(ValueError, 'six|five|role'):
+            self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)
+
+    def test_rejects_each_stale_mixed_duplicate_empty_or_wrong_elf_role(self):
+        for i in range(6):
+            for mutation in ('hash', 'source', 'missing', 'duplicate', 'empty', 'elf', 'symlink'):
+                with self.subTest(i=i, mutation=mutation):
+                    entries = json.loads(json.dumps(self.arts))
+                    manifest = dict(self.manifest, artifacts=entries)
+                    path = Path(entries[i]['path'])
+                    original = path.read_bytes()
+                    if mutation == 'hash': entries[i]['sha256'] = '0'*64
+                    elif mutation == 'source': entries[i]['product_ref'] = 'c'*40
+                    elif mutation == 'missing': entries.pop(i)
+                    elif mutation == 'duplicate': entries[i] = entries[(i+1)%6]
+                    elif mutation == 'empty': path.write_bytes(b'')
+                    elif mutation == 'elf':
+                        path.write_bytes(b'not elf')
+                        entries[i].update(bytes=7, sha256=hashlib.sha256(b'not elf').hexdigest())
+                    else:
+                        path.rename(path.with_suffix('.saved'))
+                        path.symlink_to(path.with_suffix('.saved'))
+                    try:
+                        with self.assertRaises(ValueError):
+                            self.builder.select_artifacts(manifest, 'a'*40, 'b'*40)
+                    finally:
+                        if path.is_symlink(): path.unlink()
+                        path.write_bytes(original)
+
+    def test_rejects_unproven_source_debug_and_wrong_recipe(self):
+        for key, value in [('schema', 'old'), ('product_dirty', True), ('product_ref', 'c'*40), ('product_tree', 'c'*40), ('host_profile', 'dev'), ('mode', 'host'), ('bpf_toolchain', 'nightly'), ('host_toolchain', 'stable'), ('bpf_linker', 'bpf-linker 0.10.5')]:
+            with self.subTest(key=key):
+                with self.assertRaises(ValueError):
+                    self.builder.select_artifacts(dict(self.manifest, **{key:value}), 'a'*40, 'b'*40)
+
+    def test_staging_is_deterministic_receipt_binds_host_and_five_roles(self):
+        artifacts = self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)
+        receipts = []
+        for name in ('one', 'two'):
+            dest = self.root / name
+            self.builder.stage_artifacts(dest, '/usr', self.manifest, artifacts)
+            receipt = (dest / 'share/osslscope/install-manifest.json').read_bytes()
+            receipts.append(receipt)
+            parsed = json.loads(receipt)
+            self.assertEqual(parsed['schema'], 'osslscope-install-manifest-v2')
+            self.assertEqual(len(parsed['artifacts']), 6)
+            for entry in parsed['artifacts']:
+                relative = Path(entry['dest']).relative_to('/usr')
+                data = (dest/relative).read_bytes()
+                self.assertEqual(entry['sha256'], hashlib.sha256(data).hexdigest())
+                self.assertGreater(len(data), 64)
+                self.assertEqual((dest/relative).stat().st_mode & 0o777, 0o755 if entry['role']=='host-binary' else 0o644)
+        self.assertEqual(*receipts)
+        with self.assertRaises(FileExistsError):
+            self.builder.stage_artifacts(self.root/'one', '/usr', self.manifest, artifacts)
+
+    def test_full_prefix_install_emits_current_runtime_receipt(self):
+        manifest = self.root/'build.json'
+        manifest.write_text(json.dumps(self.manifest))
+        prefix = self.root/'installed'
+        result = subprocess.run(['sh', str(SCRIPT.parents[1]/'scripts/install-dev.sh'), '--manifest', str(manifest), '--prefix', str(prefix)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+        receipt = json.loads((prefix/'share/osslscope/install-manifest.json').read_bytes())
+        self.assertEqual(receipt['schema'], 'osslscope-install-manifest-v2')
+        self.assertEqual(len(receipt['artifacts']), 6)
+        self.assertEqual(set(receipt), {'schema','prefix','product_ref','product_dirty','artifacts'})
+
+    def test_prefix_install_rejects_mixed_current_source_before_writing(self):
+        self.manifest['artifacts'][4]['product_ref'] = 'c'*40
+        manifest = self.root/'build.json'
+        manifest.write_text(json.dumps(self.manifest))
+        prefix = self.root/'installed'
+        result = subprocess.run(['sh', str(SCRIPT.parents[1]/'scripts/install-dev.sh'), '--manifest', str(manifest), '--prefix', str(prefix)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+        self.assertFalse(prefix.exists())
+
+    def test_restored_aya_notices_require_exact_registry_and_vcs_source(self):
+        # Lockfile identity is independently read; source VCS identity is fixed
+        # by the published crate archive, not selected by the caller.
+        import tomllib
+        lock = tomllib.loads((SCRIPT.parents[1]/'crates/ebpf/Cargo.lock').read_text())
+        checksum = next(p['checksum'] for p in lock['package'] if p['name']=='aya-ebpf' and p['version']=='0.2.1')
+        self.assertTrue(hasattr(self.builder, 'restored_notices'), 'exact-source license notice restoration is missing')
+        notice = self.builder.restored_notices('aya-ebpf', '0.2.1', checksum, '773ca715385b97eb0c26a581b53246c0c4306959')
+        self.assertEqual(notice['selected_license'], 'MIT')
+        self.assertEqual(len(notice['texts']), 2)
+        self.assertTrue(any(b'Copyright (c) 2021 Alessandro Decina' in n['data'] for n in notice['texts']))
+        for version, digest, vcs in [('0.2.2', checksum, '773ca715385b97eb0c26a581b53246c0c4306959'), ('0.2.1', '0'*64, '773ca715385b97eb0c26a581b53246c0c4306959'), ('0.2.1', checksum, '0'*40)]:
+            with self.assertRaises(ValueError):
+                self.builder.restored_notices('aya-ebpf', version, digest, vcs)
+
+    def test_rejects_artifact_changed_after_selection_before_receipt_publication(self):
+        artifacts = self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)
+        Path(self.arts[4]['path']).write_bytes(b'changed')
+        with self.assertRaises(ValueError):
+            self.builder.stage_artifacts(self.root/'stage', '/usr', self.manifest, artifacts)
+        self.assertFalse((self.root/'stage/share/osslscope/install-manifest.json').exists())
+
+
+if __name__ == '__main__':
+    unittest.main()

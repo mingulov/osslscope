@@ -121,6 +121,8 @@ case "$_NORM" in
     /|/usr) echo "error: refusing system prefix '$PREFIX' (canonical path '$_NORM'): /usr is system package territory (use deb/rpm there); pick a local prefix such as \$HOME/.local" >&2; exit 2 ;;
 esac
 
+PREFIX="$_NORM"
+
 # POSIX parameter expansion instead of dirname(1): this runs before the
 # prerequisite checks, so it cannot depend on any external tool.
 _d="${0%/*}"; [ "$_d" = "$0" ] && _d="."
@@ -186,6 +188,16 @@ except (OSError, ValueError) as e:
     sys.exit("error: cannot parse build manifest %s: %s" % (sys.argv[2], e))
 if m.get("schema") != "osslscope-dev-build-manifest-v1":
     sys.exit("error: unsupported build manifest schema %r in %s (want osslscope-dev-build-manifest-v1; rebuild with scripts/build-dev.sh)" % (m.get("schema"), sys.argv[2]))
+# Current source-bearing builds may not silently select a historical subset
+# or normalize a mixed/duplicated artifact list into a current receipt.
+if m.get("product_tree"):
+    expected = {("host-binary", None)} | {("bpf-object", "osslscope-" + name) for name in
+        ("harvest", "count", "members", "provider-observation", "focused-count")}
+    entries = m.get("artifacts", [])
+    if len(entries) != 6 or {(a.get("role"), a.get("bin")) for a in entries} != expected:
+        sys.exit("error: current manifest requires exactly CLI and five BPF roles")
+    if any(a.get("product_ref") != m.get("product_ref") or a.get("product_tree") != m.get("product_tree") for a in entries):
+        sys.exit("error: mixed source identity in current build manifest")
 arts = {a.get("role"): a for a in m.get("artifacts", [])}
 bpf = [a for a in m.get("artifacts", []) if a.get("role") == "bpf-object"]
 host = arts.get("host-binary", {})
@@ -600,7 +612,7 @@ verify_staged
 export PREFIX MANIFEST PRODUCT_REF PRODUCT_DIRTY SETCAP_STATE REPO RECEIPT_TMP
 export HOST_BIN HARVEST_OBJ COUNT_OBJ MEMBERS_OBJ
 python3 - "$INST_MANIFEST" <<'EOF' || exit 1
-import hashlib, json, os, subprocess, sys, datetime
+import hashlib, json, os, re, subprocess, sys, datetime
 
 def ident(path):
     h = hashlib.sha256()
@@ -677,6 +689,20 @@ manifest = {
     "setcap": e.get("SETCAP_STATE"),
     "artifacts": arts,
 }
+# The current normal route uses this closed, versioned shape. Historical
+# partial/override/dirty development installs remain explicit v1 receipts.
+current_source = {}
+if e.get("MANIFEST_SNAP"):
+    with open(e["MANIFEST_SNAP"]) as source_file:
+        current_source = json.load(source_file)
+if (len(arts) == 6 and all_verified and manifest["product_dirty"] is False
+        and re.fullmatch(r"[0-9a-f]{40}", current_source.get("product_tree") or "")
+        and re.fullmatch(r"[0-9a-f]{40}", e.get("PRODUCT_REF", ""))):
+    manifest = {"schema": "osslscope-install-manifest-v2", "prefix": pfx,
+                "product_ref": e["PRODUCT_REF"], "product_dirty": False,
+                "artifacts": [{key: a[key] for key in
+                    ("role", "bin", "dest", "bytes", "sha256", "product_ref") if key in a}
+                    for a in arts]}
 tmp = e.get("RECEIPT_TMP") or None
 if not tmp:
     sys.exit("error: cannot write install receipt %s: no temporary path" % sys.argv[1])

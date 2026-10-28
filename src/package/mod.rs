@@ -4,6 +4,7 @@ pub mod commands;
 pub mod dev;
 pub mod embedded;
 pub mod error;
+pub(crate) mod installed;
 pub mod inventory;
 pub mod records;
 pub mod resolve;

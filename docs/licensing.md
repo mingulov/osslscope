@@ -3,7 +3,7 @@
 
 The host application, host-only `osslscope-ebpf-common`, documentation, and
 build scripts carry GPL-3.0-or-later terms; the root [LICENSE](../LICENSE)
-contains that license. The three BPF program sources in `crates/ebpf` carry
+contains that license. The five shipped BPF program sources in `crates/ebpf` carry
 GPL-2.0-only terms; [GPL-2.0-only.txt](../LICENSES/GPL-2.0-only.txt)
 contains that text. The independent `crates/bpf-contract` component carries
 GPL-2.0-or-later package and file expressions. It is used under its GPL-2.0
@@ -45,4 +45,12 @@ The [source component notices](../NOTICE.md) and
 lockfiles pin external versions, registry locations and checksums, not an
 aggregate license determination. Later distribution of compiled binaries,
 vendored dependencies or copied tool sources needs a notice/source review for
-those actual contents. Advanced binary/package distribution remains deferred.
+those actual contents. The current matched development package builder inventories both locked
+resolved dependency graphs, copies registry license/notice texts, and supplies
+an exact product source archive plus upstream source links. Its
+[restoration index](../packaging/notices/restored.json) preserves missing Aya
+registry notices from each published crate's exact upstream VCS revision,
+including both upstream texts and the selected MIT option. This is an initial
+construction inventory, not final compiler/sysroot/native-runtime source closure
+or a completed conveyance-rights review. Public binary distribution remains a
+separate release action after those gates.

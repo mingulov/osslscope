@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Source component notices
 
-The root `osslscope` package declares version 0.2.0.
+The root `osslscope` package declares version 0.4.0.
 `ossl-bpf-sys`, `ossl-discover`, `osslscope-ebpf-common` and
 `osslscope-manifest` remain internal version 0.1.0. All declare
 GPL-3.0-or-later. Their license text is in [LICENSE](LICENSE).
@@ -26,3 +26,15 @@ inventory. Declared SPDX expressions and hashes do not establish authorship
 or conveyance rights.
 See [the source license index](LICENSES/README.md) and
 [licensing details](docs/licensing.md).
+
+
+The packaging notice-restoration inputs preserve Aya's upstream MIT and
+Apache-2.0 license texts and copyright attribution in
+[`packaging/notices/`](packaging/notices/). The
+[provenance index](packaging/notices/restored.json) binds these texts to the
+published registry archives and exact upstream source revisions. They are
+third-party license texts, not relicensed project source. The selected MIT
+option for the affected BPF dependencies retains their upstream dual-license
+expression. Current development packages additionally carry an actual resolved
+host/BPF dependency notice inventory; its scope and remaining source/rights
+gates are described in [packaging](packaging/README.md).

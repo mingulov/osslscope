@@ -10,7 +10,7 @@ Version:        %{pkg_version}
 # (build old=1, new=2 from different refs; see packaging/README.md).
 Release:        %{?pkg_release}%{!?pkg_release:1}%{?dist}
 Summary:        Non-interposing OpenSSL observer on eBPF uprobes
-License:        GPL-3.0-or-later
+License:        GPL-3.0-or-later AND GPL-2.0-only
 Packager:       Denis Mingulov <denis@mingulov.com>
 Source0:        %{name}-%{pkg_version}.tar.gz
 Requires:       libcap
@@ -29,9 +29,10 @@ the tool runs unprivileged.
 # Binary is prebuilt by cargo (see packaging/README.md); nothing to compile.
 
 %install
-mkdir -p %{buildroot}/usr/bin %{buildroot}/usr/share/doc/%{name}
-install -m0755 osslscope %{buildroot}/usr/bin/osslscope
-install -m0644 install.md %{buildroot}/usr/share/doc/%{name}/install.md
+# Same reviewed prefix tree as tar/DEB. Do not strip or rewrite bytes: the
+# protected receipt binds the CLI and every BPF companion byte for byte.
+mkdir -p "%{buildroot}/usr"
+cp -a bin lib share "%{buildroot}/usr/"
 
 %post
 if command -v setcap >/dev/null 2>&1; then
@@ -81,9 +82,17 @@ fi
 exit 0
 
 %files
+%defattr(-,root,root,-)
 /usr/bin/osslscope
-%dir /usr/share/doc/%{name}
-/usr/share/doc/%{name}/install.md
+%dir /usr/lib/osslscope
+/usr/lib/osslscope/osslscope-harvest
+/usr/lib/osslscope/osslscope-count
+/usr/lib/osslscope/osslscope-members
+/usr/lib/osslscope/osslscope-provider-observation
+/usr/lib/osslscope/osslscope-focused-count
+%dir /usr/share/osslscope
+/usr/share/osslscope/install-manifest.json
+/usr/share/doc/%{name}/
 
 %changelog
 * Sat Sep 19 2026 Denis Mingulov <denis@mingulov.com> - 1.0.0-1

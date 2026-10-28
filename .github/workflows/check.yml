@@ -75,6 +75,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+      - run: python3 packaging/tests/test-current-package.py
       - run: ./packaging/tests/test-scriptlets.sh
       - run: ./packaging/tests/test-lifecycle-assert.sh
       - run: ./scripts/tests/test-install-dev.sh

@@ -194,3 +194,14 @@ to the application. This is a startup metadata control; it does not establish
 definite algorithm/provider execution, complete coverage or full compatibility.
 Installed application workflows and the broader family/provider controls remain
 separate release gates.
+
+
+## Matched package construction
+
+A clean full pinned release build can feed the current five-role
+[package builder](../packaging/README.md). It requires all six artifact identities
+and refuses mixed/stale source and bytes. It constructs the same protected prefix
+tree for tar/DEB/RPM without reviving historical source-graph executors.
+Corresponding product source, both resolved dependency graphs, license notices
+and upstream source links accompany the development output. Final source/rights,
+clean double-build and installed lifecycle qualification remain separate gates.

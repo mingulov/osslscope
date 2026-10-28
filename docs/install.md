@@ -15,10 +15,18 @@ BPF loading, provider behavior or a platform.
 The manifest installs `bin/osslscope`, five development BPF objects under
 `lib/osslscope/`, and `share/osslscope/install-manifest.json`. Normal tracing
 selects `osslscope-provider-observation` and `osslscope-focused-count`
-automatically relative to the actual executable: fixed sibling names or
-`PREFIX/lib/osslscope` when the executable is in `PREFIX/bin`. It does not search
+automatically relative to the actual executable: `PREFIX/lib/osslscope` when the executable is in `PREFIX/bin`.
+A non-bin development executable can use fixed sibling names. It does not search
 CWD, environment paths or unrelated build trees. A host-only build supports
 passive inventory but does not supply tracing companions.
+
+A full clean source-bearing manifest installs a current v2 receipt. Automatic
+installed tracing checks its exact CLI plus five-role membership, consistent
+source reference and every hash, including the running CLI. Missing, historical,
+partial, mixed or mutated receipts/objects refuse normal loading; an unreceipted
+sibling cannot bypass a prefix receipt. Dirty, partial and explicit-override
+installs retain historical v1 receipts for their explicit development routes.
+Commit reviewed source and rebuild the full tree for normal installed tracing.
 
 Manifest files are staged and checked against recorded hashes/lengths before
 publication. The receipt publishes atomically; destination replacement can
@@ -83,6 +91,21 @@ Use a real host-visible PID found with scan/inspect:
 Report remains PARTIAL (3); Unknown-only algorithm evidence is inconclusive
 (11). Workload success alone does not prove observation. See [usage](usage.md)
 for limits, failure precedence, output delivery and cleanup.
+
+## Matched development packages
+
+From a clean reviewed product checkout:
+
+```sh
+./scripts/build-dev.sh --release --offline
+python3 packaging/build-package.py --output dist/current
+```
+
+This constructs a prefix tarball, DEB, RPM, exact product source archive and
+package manifest. All formats include the CLI, five roles and protected current
+receipt plus source/notices links. See [packaging](../packaging/README.md) for
+format selection, prefix binding, prerequisites and installed acceptance gates.
+Construction/extraction does not establish platform support or release readiness.
 
 ## Historical and deferred distribution
 
