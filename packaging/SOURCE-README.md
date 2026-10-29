@@ -17,7 +17,14 @@ original notices and this recipe. Graph membership includes build, test and
 other-target dependencies; inclusion does not prove code survived linking.
 Project dependencies are derived anew from each checkout's lockfiles and Cargo
 metadata. The reviewed Rust runtime pins are in `packaging/runtime-sources.json`.
-Missing, altered or stale source inputs refuse package construction.
+The normal build captures the complete installed nightly library source identity
+before and after compilation and binds it to its BPF artifact hashes. Packaging
+compares that recorded identity to the accompanying official component, including
+all relative names, lengths and hashes. Missing, altered, extra or stale source
+inputs and old manifests without this evidence refuse current package
+construction. Restoring installed sources before packaging does not replace the
+recorded earlier build input. This remains the trusted local recipe boundary;
+it is not an attestation against a malicious builder.
 
 Verify the bundle's SHA256 against the accompanying package manifest or installed
 source-availability metadata before extracting it into a new directory. From

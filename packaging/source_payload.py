@@ -11,6 +11,7 @@ import io
 import json
 import os
 import posixpath
+import re
 from pathlib import Path, PurePosixPath
 import shutil
 import stat
@@ -36,11 +37,11 @@ def safe_path(name):
     return path
 
 
-def checked_bytes(path, checksum=None, size=None):
+def checked_bytes(path, checksum=None, size=None, allow_empty=False):
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(fd, 'rb') as stream:
         before = os.fstat(stream.fileno())
-        if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 128 << 20:
+        if not stat.S_ISREG(before.st_mode) or not (0 if allow_empty else 1) <= before.st_size <= 128 << 20:
             raise ValueError('source input must be a bounded nonempty regular file: '+path.name)
         data = stream.read((128 << 20)+1)
         after = os.fstat(stream.fileno())
@@ -49,6 +50,70 @@ def checked_bytes(path, checksum=None, size=None):
     if len(data) != before.st_size or (size is not None and len(data) != size) or (checksum is not None and sha(data) != checksum):
         raise ValueError('missing, stale or mutated source input: '+path.name)
     return data
+
+
+def library_identity(files):
+    """Canonical identity of every relative file in the build-std library tree."""
+    rows = []
+    for name,data in sorted(files.items()):
+        safe_path(name)
+        rows.append({'path':name,'bytes':len(data),'sha256':sha(data)})
+    return _library_rows_identity(rows)
+
+
+def _library_rows_identity(rows):
+    rows = sorted(rows,key=lambda row:row['path'])
+    total = sum(row['bytes'] for row in rows)
+    if not 0 < len(rows) <= 20000 or total > 256 << 20:
+        raise ValueError('runtime library source inventory exceeds bounds or is empty')
+    return {'schema':'osslscope-rust-library-v1','files':len(rows),'bytes':total,'sha256':sha(canonical(rows))}
+
+
+def capture_library(root):
+    if not root.is_dir() or root.is_symlink():
+        raise ValueError('runtime library source directory is missing or aliased')
+    def paths():
+        found = sorted(root.rglob('*'))
+        if any(path.is_symlink() or not (path.is_dir() or path.is_file()) for path in found):
+            raise ValueError('runtime library source contains aliases or special files')
+        return [path for path in found if path.is_file()]
+    before = paths()
+    if len(before) > 20000:
+        raise ValueError('runtime library source inventory exceeds bounds')
+    rows, total = [], 0
+    for path in before:
+        data = checked_bytes(path,allow_empty=True)
+        total += len(data)
+        if total > 256 << 20:
+            raise ValueError('runtime library source inventory exceeds bounds')
+        rows.append({'path':path.relative_to(root).as_posix(),'bytes':len(data),'sha256':sha(data)})
+    if paths() != before:
+        raise ValueError('runtime library source file set changed during capture')
+    return _library_rows_identity(rows)
+
+
+def bpf_artifact_digest(artifacts):
+    rows = [{key:entry[key] for key in ('bin','bytes','sha256')}
+            for entry in artifacts if entry['role']=='bpf-object']
+    return sha(canonical(sorted(rows,key=lambda entry:entry['bin'])))
+
+
+def validate_runtime_binding(binding, artifacts):
+    if (not isinstance(binding,dict)
+            or binding.get('schema') != 'osslscope-bpf-runtime-source-v1'
+            or binding.get('toolchain') != 'nightly-2026-05-20'
+            or binding.get('capture') != 'before-and-after-build'):
+        raise ValueError('build-time runtime source evidence required')
+    library = binding.get('library')
+    if (not isinstance(library,dict)
+            or library.get('schema') != 'osslscope-rust-library-v1'
+            or type(library.get('files')) is not int or not 0 < library['files'] <= 20000
+            or type(library.get('bytes')) is not int or not 0 <= library['bytes'] <= 256 << 20
+            or not isinstance(library.get('sha256'),str)
+            or not re.fullmatch('[0-9a-f]{64}',library['sha256'])):
+        raise ValueError('invalid build-time runtime source inventory')
+    if binding.get('artifacts_sha256') != bpf_artifact_digest(artifacts):
+        raise ValueError('runtime source evidence belongs to different BPF artifacts')
 
 
 def archive_files(data, modes=None, source_links=False):
@@ -88,7 +153,7 @@ def archive_files(data, modes=None, source_links=False):
     return result
 
 
-def stage_payload(root, archives, destination, source, revision, tree, artifacts, notices, notice_texts):
+def stage_payload(root, archives, destination, source, revision, tree, artifacts, notices, notice_texts, runtime_source=None):
     """Inputs are the live locked graphs and reviewed runtime pins, never a frozen graph."""
     pins = json.loads((root/'packaging/runtime-sources.json').read_bytes())
     if pins['schema'] != 'osslscope-runtime-sources-v1':
@@ -156,6 +221,9 @@ def stage_payload(root, archives, destination, source, revision, tree, artifacts
             if relative in ('LICENSE-MIT','LICENSE-APACHE','COPYRIGHT') or relative == 'rust-src/lib/rustlib/src/rust/library/compiler-builtins/LICENSE.txt':
                 put('runtime-notices/'+component['toolchain']+'/'+Path(name).name, text, 'runtime-notice')
         if component['toolchain']=='nightly-2026-05-20':
+            expected = library_identity({path[len(library):]:text for path,text in files.items() if path.startswith(library)})
+            if not isinstance(runtime_source,dict) or runtime_source.get('library') != expected:
+                raise ValueError('build runtime source differs from accompanying library source component')
             manifest_path = library+'compiler-builtins/compiler-builtins/Cargo.toml'
             if manifest_path in files:
                 terms = tomllib.loads(files[manifest_path].decode())['package']['license']
@@ -214,7 +282,7 @@ def stage_payload(root, archives, destination, source, revision, tree, artifacts
         put('runtime-notices/'+notice['file'],data,'runtime-notice',**{k:notice[k] for k in ('url','origin') if k in notice})
     public_artifacts = [{key:entry[key] for key in ('role','bin','bytes','sha256') if key in entry} for entry in artifacts]
     manifest = {'schema':'osslscope-accompanying-source-v1','product_ref':revision,'product_tree':tree,
-                'artifacts':public_artifacts,'files':sorted(records,key=lambda r:r['path']),
+                'artifacts':public_artifacts,'files':sorted(records,key=lambda r:r['path']),'bpf_runtime_source':runtime_source,
                 'runtime_scope':'pinned Rust library source components and bounded host std crate superset; ordinary compiler/linker/system runtimes remain prerequisites',
                 'compiler_builtins_terms':BUILTINS_TERMS,
                 'qualification':'source payload construction; no offline-build, reproducibility, installed-runtime or final rights qualification inferred'}
@@ -301,9 +369,14 @@ def prepare(bundle, output):
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--output',type=Path,required=True,help='fresh source directory')
+    action = parser.add_mutually_exclusive_group(required=True)
+    action.add_argument('--output',type=Path,help='fresh source directory')
+    action.add_argument('--library-root',type=Path,help='capture the installed build-std library source identity')
     args = parser.parse_args()
     try:
-        prepare(Path(__file__).resolve().parent,args.output)
+        if args.library_root is not None:
+            print(canonical(capture_library(args.library_root)).decode(),end='')
+        else:
+            prepare(Path(__file__).resolve().parent,args.output)
     except (OSError,ValueError,KeyError,TypeError,tarfile.TarError) as error:
         parser.exit(1,'source preparation refused: '+str(error)+'\n')

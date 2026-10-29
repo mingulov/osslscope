@@ -53,10 +53,23 @@ class SourcePayload(unittest.TestCase):
             name = 'rust-src-'+toolchain
             content = {name+'/git-commit-hash':revision.encode(), name+'/rust-src/lib/rustlib/src/rust/library/Cargo.lock': b'version = 4\npackage = []\n', name+'/LICENSE-MIT': b'original Rust permission'}
             if toolchain=='nightly-2026-05-20':
+                content[name+'/rust-src/lib/rustlib/src/rust/library/core/lib.rs']=b'original core source'
+                content[name+'/rust-src/lib/rustlib/src/rust/library/core.rs']=b'rootcore'
                 prefix=name+'/rust-src/lib/rustlib/src/rust/library/vendor/stdlib-only-2.0.0/'
                 content[prefix+'Cargo.toml']=b'[package]\nname="stdlib-only"\nversion="2.0.0"\n'
                 content[prefix+'LICENSE']=b'original std resolver notice'
                 content[prefix+'.cargo-checksum.json']=json.dumps({'package':'f'*64,'files':{}}).encode()
+            if toolchain=='nightly-2026-05-20':
+                prefix=name+'/rust-src/lib/rustlib/src/rust/library/'
+                library_files={path[len(prefix):]:data for path,data in content.items() if path.startswith(prefix)}
+                self.library_source=self.root/'installed-library'
+                for path,data in library_files.items():
+                    dest=self.library_source/path;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
+                rows=[{'path':path,'bytes':len(data),'sha256':digest(data)} for path,data in sorted(library_files.items())]
+                encoded=(json.dumps(rows,sort_keys=True,separators=(',',':'))+'\n').encode()
+                self.runtime_source={'schema':'osslscope-bpf-runtime-source-v1','toolchain':toolchain,'capture':'before-and-after-build',
+                                     'library':{'schema':'osslscope-rust-library-v1','files':len(rows),'bytes':sum(row['bytes'] for row in rows),'sha256':digest(encoded)},
+                                     'artifacts_sha256':digest(b'[]\n')}
             data = archive(self.inputs/(name+'.tar.xz'), content)
             pins['components'].append({'toolchain':toolchain,'archive':name+'.tar.xz','root':name,'rust_revision':revision,'bytes':len(data),'sha256':digest(data),'url':'https://static.rust-lang.org/dist/'+name+'.tar.xz'})
         (product/'packaging/runtime-sources.json').write_text(json.dumps(pins))
@@ -66,7 +79,7 @@ class SourcePayload(unittest.TestCase):
         product, source, notices = self.fixture()
         payload = self.root/'payload'
         manifest = self.module.stage_payload(product, self.inputs, payload, source, 'c'*40, 'd'*40,
-                                             [{'role':'host-binary','bytes':123,'sha256':'e'*64}], notices, {})
+                                             [{'role':'host-binary','bytes':123,'sha256':'e'*64}], notices, {},self.runtime_source)
         return payload, manifest
 
     def test_payload_binds_unique_current_graph_sources_and_prepares_vendor(self):
@@ -88,6 +101,31 @@ class SourcePayload(unittest.TestCase):
         with self.assertRaises(FileExistsError):
             self.module.prepare(payload, output)
 
+    def test_snapshot_binds_relative_names_lengths_and_all_source_bytes(self):
+        self.fixture()
+        self.assertTrue(hasattr(self.module,'capture_library'),'build-time runtime source snapshot is missing')
+        snapshot=self.module.capture_library(self.library_source)
+        self.assertEqual(snapshot,self.runtime_source['library'])
+        for mutation in ('changed','missing','extra'):
+            core=self.library_source/'core/lib.rs'; original=core.read_bytes()
+            if mutation=='changed': core.write_bytes(b'modified core source')
+            if mutation=='missing': core.unlink()
+            extra=self.library_source/'extra.rs'
+            if mutation=='extra': extra.write_bytes(b'extra source')
+            changed=self.module.capture_library(self.library_source)
+            self.assertNotEqual(changed,snapshot)
+            core.write_bytes(original);extra.unlink(missing_ok=True)
+
+    def test_restored_installed_source_cannot_replace_the_earlier_build_snapshot(self):
+        product,source,notices=self.fixture()
+        self.assertTrue(hasattr(self.module,'capture_library'),'build-time runtime source snapshot is missing')
+        core=self.library_source/'core/lib.rs';original=core.read_bytes();core.write_bytes(b'changed before build')
+        altered=self.module.capture_library(self.library_source)
+        core.write_bytes(original)  # restored before packaging; same compiler pin
+        recorded=dict(self.runtime_source,library=altered)
+        with self.assertRaisesRegex(ValueError,'runtime source|library source'):
+            self.module.stage_payload(product,self.inputs,self.root/'restored-payload',source,'c'*40,'d'*40,[],notices,{},recorded)
+
     def test_preparation_includes_component_vendor_for_build_std_resolution(self):
         payload, manifest=self.build()
         output=self.root/'sysroot-vendor'
@@ -107,7 +145,7 @@ class SourcePayload(unittest.TestCase):
                 if mutation=='changed': crate.write_bytes(b'wrong bytes')
                 if mutation=='symlink': crate.symlink_to(source)
                 with self.assertRaises((ValueError, OSError)):
-                    self.module.stage_payload(product,self.inputs,self.root/('payload-'+mutation),source,'c'*40,'d'*40,[],notices,{})
+                    self.module.stage_payload(product,self.inputs,self.root/('payload-'+mutation),source,'c'*40,'d'*40,[],notices,{},self.runtime_source)
                 if crate.is_symlink(): crate.unlink()
                 crate.write_bytes(original)
 
@@ -117,7 +155,7 @@ class SourcePayload(unittest.TestCase):
         package['notices']=[{'path':'dependency-notices/sample-1.0.0/LICENSE'}]
         with self.assertRaises(ValueError):
             self.module.stage_payload(product,self.inputs,self.root/'payload',source,'c'*40,'d'*40,[],notices,
-                                      {'sample-1.0.0/LICENSE':b'wrong copyright'})
+                                      {'sample-1.0.0/LICENSE':b'wrong copyright'},self.runtime_source)
 
     def test_stale_runtime_revision_or_host_std_checksum_refuses_payload(self):
         product, source, notices = self.fixture()
@@ -129,7 +167,7 @@ class SourcePayload(unittest.TestCase):
             else: pins['host_std_crates'] = [{'name':'sample','version':'1.0.0','sha256':'f'*64}]
             pins_path.write_text(json.dumps(pins))
             with self.assertRaises(ValueError):
-                self.module.stage_payload(product,self.inputs,self.root/mutation,source,'c'*40,'d'*40,[],notices,{})
+                self.module.stage_payload(product,self.inputs,self.root/mutation,source,'c'*40,'d'*40,[],notices,{},self.runtime_source)
 
     def test_preparation_rejects_mutation_missing_and_unlisted_payloads_before_output(self):
         payload, manifest = self.build()

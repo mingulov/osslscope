@@ -25,8 +25,8 @@ A full clean `build-dev.sh --release` manifest must record the current source
 revision/tree, pinned toolchains/linker, CLI and exact five-role membership,
 per-artifact source identity, nonzero bytes, hashes and compatible ELF headers.
 Missing, duplicate, stale or mixed roles refuse construction. Old manifests
-without source-tree identity, host-only builds and bare CLI paths cannot create
-current packages. This is a trusted local recipe/manifest contract, not a signed
+without source-tree identity or build-time runtime-source binding, host-only
+builds and bare CLI paths cannot create current packages. This is a trusted local recipe/manifest contract, not a signed
 attestation against a malicious builder.
 
 Select formats and the final tar installation prefix explicitly:
@@ -82,8 +82,16 @@ both **current** locked resolved graphs and the reviewed runtime inputs in
 and the bounded host standard-library crate superset. Filenames are the official
 archive basenames. Every byte is checked against the live lock checksums or
 reviewed runtime hashes; missing, changed or stale inputs refuse construction.
-Rust component revisions must also match the installed pinned compilers. There
-is no download fallback, frozen product dependency list or compiler archive.
+Rust component revisions must also match the installed pinned compilers. The
+normal build records a canonical relative-file/length/hash identity for every
+installed nightly library source file before and after compilation. It refuses
+source changes during the build and binds the stable identity to the exact five
+BPF artifact hashes. Packaging requires that receipt and compares the recorded
+source identity to the supplied official component, including missing/extra
+files. Restoring installed sources after a modified-source build cannot change
+its recorded identity. Old manifests require rebuilding. This remains a trusted
+local recipe/manifest contract, rather than malicious-builder attestation.
+There is no download fallback, frozen project dependency list or compiler archive.
 
 `osslscope-<version>-accompanying-source.tar.gz` contains the exact product
 archive, original source payloads, dependency graphs, license/notice texts and a
@@ -133,6 +141,7 @@ Host controls (no root):
 ```sh
 python3 packaging/tests/test-current-package.py
 python3 packaging/tests/test-source-payload.py
+python3 scripts/tests/test-runtime-source-binding.py
 ./packaging/tests/test-scriptlets.sh
 ./scripts/tests/test-install-dev.sh
 ```

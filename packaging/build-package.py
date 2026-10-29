@@ -18,6 +18,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -25,6 +26,8 @@ import tomllib
 NAMES = ('osslscope', 'osslscope-harvest', 'osslscope-count', 'osslscope-members',
          'osslscope-provider-observation', 'osslscope-focused-count')
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from source_payload import validate_runtime_binding
 
 
 def canonical(value):
@@ -107,6 +110,7 @@ def select_artifacts(manifest, revision, tree):
         selected[name] = entry
     if set(selected) != set(NAMES):
         raise ValueError('five BPF roles and CLI required')
+    validate_runtime_binding(manifest.get('bpf_runtime_source'), list(selected.values()))
     return selected
 
 
@@ -317,7 +321,7 @@ def main():
             run(['git','-C',str(ROOT),'archive','--format=tar',f'--output={source}',revision])
             payload = work/'accompanying-source'
             payload_manifest = stage_payload(ROOT, args.source_archives, payload, source, revision, tree,
-                                             [artifacts[name] for name in NAMES], notices, notice_texts)
+                                             [artifacts[name] for name in NAMES], notices, notice_texts, manifest['bpf_runtime_source'])
             accompanying = result/f'osslscope-{version}-accompanying-source.tar.gz'
             archive_tree(payload, accompanying, epoch)
             accompanying_info = {'archive':accompanying.name,'bytes':accompanying.stat().st_size,

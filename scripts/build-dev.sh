@@ -103,7 +103,7 @@ need_cmd() {
 need_cmd cargo "install the Rust toolchain via rustup (pinned: $HOST_TOOLCHAIN + $BPF_TOOLCHAIN), then re-run"
 need_cmd rustc "install the Rust toolchain via rustup, then re-run"
 need_cmd rustup "install rustup and the pinned toolchains, then re-run"
-need_cmd python3 "install python3 (used only to write the JSON manifest), then re-run"
+need_cmd python3 "install python3 (used for source inventory and JSON manifests), then re-run"
 need_cmd sha256sum "install coreutils, then re-run"
 
 HOST_CARGO_VER="$(cargo +"$HOST_TOOLCHAIN" --version 2>/dev/null)" \
@@ -128,6 +128,22 @@ if [ "$MODE" != "host" ]; then
     command -v bpf-linker >/dev/null 2>&1 \
         || fail_prereq "bpf-linker not found on PATH" "install bpf-linker 0.10.4 manually (e.g. cargo install --locked bpf-linker --version 0.10.4)"
     BPF_LINKER_VER="$(bpf-linker --version 2>/dev/null || echo bpf-linker-unknown)"
+fi
+
+# Cargo build-std reads the separately installed source tree, not compiler
+# implementation bytes. Capture all library files before compilation; the
+# matching post-build snapshot is required before an artifact receipt is written.
+BPF_LIBRARY_IDENTITY=""
+BPF_LIBRARY_ROOT=""
+if [ "$MODE" != "host" ]; then
+    [ -z "${__CARGO_TESTS_ONLY_SRC_ROOT-}" ] || fail_prereq \
+        "runtime source override is unsupported by this pinned recipe" \
+        "unset __CARGO_TESTS_ONLY_SRC_ROOT; use the pinned installed rust-src"
+    BPF_SYSROOT="$(rustc +"$BPF_TOOLCHAIN" --print sysroot)" \
+        || fail_prereq "cannot resolve BPF compiler sysroot" "check the pinned nightly compiler"
+    BPF_LIBRARY_ROOT="$BPF_SYSROOT/lib/rustlib/src/rust/library"
+    BPF_LIBRARY_IDENTITY="$(python3 "$REPO/packaging/source_payload.py" --library-root "$BPF_LIBRARY_ROOT")" \
+        || fail_prereq "runtime library source capture failed" "restore the exact pinned nightly rust-src component"
 fi
 
 # Revision is best-effort: a fresh source archive (not a git checkout) must
@@ -400,6 +416,16 @@ $_p"
     fi
 fi
 
+if [ "$MODE" != "host" ] && [ "$CHECK_ONLY" -eq 0 ]; then
+    _after_sysroot="$(rustc +"$BPF_TOOLCHAIN" --print sysroot)" || exit 1
+    _after_source="$(python3 "$REPO/packaging/source_payload.py" --library-root "$_after_sysroot/lib/rustlib/src/rust/library")" \
+        || { echo "error: runtime library source capture failed after build" >&2; exit 1; }
+    if [ "$_after_source" != "$BPF_LIBRARY_IDENTITY" ]; then
+        echo "error: runtime library source changed during build; no new manifest written" >&2
+        exit 1
+    fi
+fi
+
 # A build crossing source revisions or tracked/untracked edits cannot claim
 # clean source provenance, even when it began in a clean checkout.
 if [ -n "$PRODUCT_REF" ]; then
@@ -413,7 +439,7 @@ export REPO MANIFEST PRODUCT_REF PRODUCT_TREE PRODUCT_REF_SHORT PRODUCT_DIRTY BU
     HOST_CARGO_VER HOST_RUSTC_VER BPF_CARGO_VER BPF_RUSTC_VER BPF_LINKER_VER \
     HOST_TOOLCHAIN BPF_TOOLCHAIN BPF_TARGET BPF_BINS JOBS NET OFFLINE_USED \
     MODE PROFILE HOST_CMD BPF_CMD DIAGNOSTICS HOST_BIN BPF_BIN_PATHS \
-    HOST_TD BPF_TD CHECK_ONLY CARGO_TARGET_DIR CARGO_LOG SCRATCH
+    HOST_TD BPF_TD CHECK_ONLY CARGO_TARGET_DIR CARGO_LOG SCRATCH BPF_LIBRARY_IDENTITY
 python3 - <<'EOF'
 import hashlib, json, os, subprocess
 
@@ -459,6 +485,17 @@ if e.get("CHECK_ONLY") != "1":
             a["bin"] = os.path.basename(p)
             artifacts.append(a)
 
+runtime_source = None
+if e.get("MODE") != "host" and e.get("CHECK_ONLY") != "1":
+    import sys
+    sys.path.insert(0, os.path.join(e["REPO"], "packaging"))
+    from source_payload import bpf_artifact_digest
+    runtime_source = {"schema": "osslscope-bpf-runtime-source-v1",
+                      "toolchain": e["BPF_TOOLCHAIN"],
+                      "capture": "before-and-after-build",
+                      "library": json.loads(e["BPF_LIBRARY_IDENTITY"]),
+                      "artifacts_sha256": bpf_artifact_digest(artifacts)}
+
 manifest = {
     "schema": "osslscope-dev-build-manifest-v1",
     "product_ref": e.get("PRODUCT_REF") or None,
@@ -479,6 +516,7 @@ manifest = {
     "bpf_cargo": e.get("BPF_CARGO_VER") or None,
     "bpf_rustc": e.get("BPF_RUSTC_VER") or None,
     "bpf_linker": e.get("BPF_LINKER_VER") or None,
+    "bpf_runtime_source": runtime_source,
     "bpf_target": e.get("BPF_TARGET"),
     "jobs": int(e.get("JOBS", "2")),
     "net_mode": e.get("NET"),
