@@ -67,7 +67,7 @@ class SourcePayload(unittest.TestCase):
                     dest=self.library_source/path;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(data)
                 rows=[{'path':path,'bytes':len(data),'sha256':digest(data)} for path,data in sorted(library_files.items())]
                 encoded=(json.dumps(rows,sort_keys=True,separators=(',',':'))+'\n').encode()
-                self.runtime_source={'schema':'osslscope-bpf-runtime-source-v1','toolchain':toolchain,'capture':'before-and-after-build',
+                self.runtime_source={'schema':'osslscope-bpf-runtime-source-v2','compiler_selection':'resolved-pinned-rustc','toolchain':toolchain,'capture':'before-and-after-build',
                                      'library':{'schema':'osslscope-rust-library-v1','files':len(rows),'bytes':sum(row['bytes'] for row in rows),'sha256':digest(encoded)},
                                      'artifacts_sha256':digest(b'[]\n')}
             data = archive(self.inputs/(name+'.tar.xz'), content)

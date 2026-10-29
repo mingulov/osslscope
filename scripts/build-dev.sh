@@ -99,6 +99,25 @@ need_cmd() {
     command -v "$1" >/dev/null 2>&1 || fail_prereq "command '$1' not found on PATH" "$2"
 }
 
+# Resolve the pinned executable once and use it both for direct source/version
+# queries and every Cargo operation. Preserve ordinary Cargo cache wrappers;
+# compiler selection itself is owned by this pinned build recipe.
+resolve_pinned_rustc() {
+    _resolved_rustc="$(rustup which --toolchain "$1" rustc)" || return 1
+    case "$_resolved_rustc" in /*) ;; *) return 1 ;; esac
+    [ -f "$_resolved_rustc" ] && [ -x "$_resolved_rustc" ] || return 1
+    printf '%s\n' "$_resolved_rustc"
+}
+run_pinned_cargo() {
+    _cargo_pin="$1"; shift
+    case "$_cargo_pin" in
+        "$HOST_TOOLCHAIN") _cargo_rustc="$HOST_RUSTC_PATH" ;;
+        "$BPF_TOOLCHAIN") _cargo_rustc="$BPF_RUSTC_PATH" ;;
+        *) echo "error: unsupported pinned Cargo toolchain" >&2; return 2 ;;
+    esac
+    RUSTC="$_cargo_rustc" CARGO_BUILD_RUSTC="$_cargo_rustc" cargo +"$_cargo_pin" "$@"
+}
+
 # --- prerequisite checks (diagnose, never install) ---
 need_cmd cargo "install the Rust toolchain via rustup (pinned: $HOST_TOOLCHAIN + $BPF_TOOLCHAIN), then re-run"
 need_cmd rustc "install the Rust toolchain via rustup, then re-run"
@@ -106,9 +125,11 @@ need_cmd rustup "install rustup and the pinned toolchains, then re-run"
 need_cmd python3 "install python3 (used for source inventory and JSON manifests), then re-run"
 need_cmd sha256sum "install coreutils, then re-run"
 
-HOST_CARGO_VER="$(cargo +"$HOST_TOOLCHAIN" --version 2>/dev/null)" \
+HOST_RUSTC_PATH="$(resolve_pinned_rustc "$HOST_TOOLCHAIN")" \
+    || fail_prereq "cannot resolve pinned host rustc" "install the pinned $HOST_TOOLCHAIN toolchain"
+HOST_CARGO_VER="$(run_pinned_cargo "$HOST_TOOLCHAIN" --version 2>/dev/null)" \
     || fail_prereq "cargo +$HOST_TOOLCHAIN unavailable" "rustup toolchain install $HOST_TOOLCHAIN --profile minimal"
-HOST_RUSTC_VER="$(rustc +"$HOST_TOOLCHAIN" --version 2>/dev/null)" \
+HOST_RUSTC_VER="$("$HOST_RUSTC_PATH" --version 2>/dev/null)" \
     || fail_prereq "rustc +$HOST_TOOLCHAIN unavailable" "rustup toolchain install $HOST_TOOLCHAIN --profile minimal"
 case "$HOST_RUSTC_VER" in
     "rustc 1.88.0 "*) ;;
@@ -118,10 +139,13 @@ esac
 BPF_CARGO_VER=""
 BPF_RUSTC_VER=""
 BPF_LINKER_VER=""
+BPF_RUSTC_PATH=""
 if [ "$MODE" != "host" ]; then
-    BPF_CARGO_VER="$(cargo +"$BPF_TOOLCHAIN" --version 2>/dev/null)" \
+    BPF_RUSTC_PATH="$(resolve_pinned_rustc "$BPF_TOOLCHAIN")" \
+        || fail_prereq "cannot resolve pinned BPF rustc" "install the pinned $BPF_TOOLCHAIN toolchain"
+    BPF_CARGO_VER="$(run_pinned_cargo "$BPF_TOOLCHAIN" --version 2>/dev/null)" \
         || fail_prereq "cargo +$BPF_TOOLCHAIN unavailable" "rustup toolchain install $BPF_TOOLCHAIN --component rust-src"
-    BPF_RUSTC_VER="$(rustc +"$BPF_TOOLCHAIN" --version 2>/dev/null)" \
+    BPF_RUSTC_VER="$("$BPF_RUSTC_PATH" --version 2>/dev/null)" \
         || fail_prereq "rustc +$BPF_TOOLCHAIN unavailable" "rustup toolchain install $BPF_TOOLCHAIN --component rust-src"
     rustup component list --toolchain "$BPF_TOOLCHAIN" --installed 2>/dev/null | grep -q '^rust-src' \
         || fail_prereq "rust-src missing on $BPF_TOOLCHAIN (bpfel needs -Z build-std=core)" "rustup component add --toolchain $BPF_TOOLCHAIN rust-src"
@@ -139,7 +163,7 @@ if [ "$MODE" != "host" ]; then
     [ -z "${__CARGO_TESTS_ONLY_SRC_ROOT-}" ] || fail_prereq \
         "runtime source override is unsupported by this pinned recipe" \
         "unset __CARGO_TESTS_ONLY_SRC_ROOT; use the pinned installed rust-src"
-    BPF_SYSROOT="$(rustc +"$BPF_TOOLCHAIN" --print sysroot)" \
+    BPF_SYSROOT="$("$BPF_RUSTC_PATH" --print sysroot)" \
         || fail_prereq "cannot resolve BPF compiler sysroot" "check the pinned nightly compiler"
     BPF_LIBRARY_ROOT="$BPF_SYSROOT/lib/rustlib/src/rust/library"
     BPF_LIBRARY_IDENTITY="$(python3 "$REPO/packaging/source_payload.py" --library-root "$BPF_LIBRARY_ROOT")" \
@@ -171,7 +195,7 @@ BPF_TD=""
 if [ "$MODE" != "bpf" ]; then
     # From REPO, like the build itself: repo-local config or a relative
     # CARGO_TARGET_DIR must resolve identically for both.
-    HOST_TD="$(cd "$REPO" && cargo +"$HOST_TOOLCHAIN" metadata \
+    HOST_TD="$(cd "$REPO" && run_pinned_cargo "$HOST_TOOLCHAIN" metadata \
         --format-version 1 --no-deps \
         --manifest-path "$REPO/Cargo.toml" 2>/dev/null | python3 -c \
         'import json,sys; print(json.load(sys.stdin)["target_directory"])')" \
@@ -180,7 +204,7 @@ if [ "$MODE" != "bpf" ]; then
     [ -n "$HOST_TD" ] || fail_prereq "empty host target dir" "report this script bug with the manifest"
 fi
 if [ "$MODE" != "host" ]; then
-    BPF_TD="$(cd "$REPO/crates/ebpf" && cargo +"$BPF_TOOLCHAIN" metadata \
+    BPF_TD="$(cd "$REPO/crates/ebpf" && run_pinned_cargo "$BPF_TOOLCHAIN" metadata \
         --format-version 1 --no-deps --manifest-path "$REPO/crates/ebpf/Cargo.toml" 2>/dev/null | python3 -c \
         'import json,sys; print(json.load(sys.stdin)["target_directory"])')" \
         || fail_prereq "cannot resolve BPF target dir (cargo metadata failed)" \
@@ -232,18 +256,18 @@ run_cargo_locked() {
     _rc=0
     if [ "$NET" = "online" ]; then
         OFFLINE_USED="false"
-        cargo +"$_tc" "$@" --locked >"$_ato" 2>"$_att" || _rc=$?
+        run_pinned_cargo "$_tc" "$@" --locked >"$_ato" 2>"$_att" || _rc=$?
         _log_attempt "$_att" "$_ato"
         return $_rc
     fi
     if [ "$NET" = "offline" ]; then
         OFFLINE_USED="true"
-        cargo +"$_tc" "$@" --locked --offline >"$_ato" 2>"$_att" || _rc=$?
+        run_pinned_cargo "$_tc" "$@" --locked --offline >"$_ato" 2>"$_att" || _rc=$?
         _log_attempt "$_att" "$_ato"
         return $_rc
     fi
     # auto: try cached first; on a cache miss retry once online (locked set only)
-    if cargo +"$_tc" "$@" --locked --offline >"$_ato" 2>"$_att"; then
+    if run_pinned_cargo "$_tc" "$@" --locked --offline >"$_ato" 2>"$_att"; then
         OFFLINE_USED="true"
         _log_attempt "$_att" "$_ato"
         return 0
@@ -254,7 +278,7 @@ run_cargo_locked() {
         cat "$_ato" >"$CARGO_STDOUT"
         rm -f "$_att" "$_ato"
         OFFLINE_USED="false"
-        cargo +"$_tc" "$@" --locked >"$_ato" 2>"$_att" || _rc=$?
+        run_pinned_cargo "$_tc" "$@" --locked >"$_ato" 2>"$_att" || _rc=$?
         _log_attempt "$_att" "$_ato"
         return $_rc
     fi
@@ -417,7 +441,7 @@ $_p"
 fi
 
 if [ "$MODE" != "host" ] && [ "$CHECK_ONLY" -eq 0 ]; then
-    _after_sysroot="$(rustc +"$BPF_TOOLCHAIN" --print sysroot)" || exit 1
+    _after_sysroot="$("$BPF_RUSTC_PATH" --print sysroot)" || exit 1
     _after_source="$(python3 "$REPO/packaging/source_payload.py" --library-root "$_after_sysroot/lib/rustlib/src/rust/library")" \
         || { echo "error: runtime library source capture failed after build" >&2; exit 1; }
     if [ "$_after_source" != "$BPF_LIBRARY_IDENTITY" ]; then
@@ -439,7 +463,7 @@ export REPO MANIFEST PRODUCT_REF PRODUCT_TREE PRODUCT_REF_SHORT PRODUCT_DIRTY BU
     HOST_CARGO_VER HOST_RUSTC_VER BPF_CARGO_VER BPF_RUSTC_VER BPF_LINKER_VER \
     HOST_TOOLCHAIN BPF_TOOLCHAIN BPF_TARGET BPF_BINS JOBS NET OFFLINE_USED \
     MODE PROFILE HOST_CMD BPF_CMD DIAGNOSTICS HOST_BIN BPF_BIN_PATHS \
-    HOST_TD BPF_TD CHECK_ONLY CARGO_TARGET_DIR CARGO_LOG SCRATCH BPF_LIBRARY_IDENTITY
+    HOST_TD BPF_TD CHECK_ONLY CARGO_TARGET_DIR CARGO_LOG SCRATCH BPF_LIBRARY_IDENTITY HOST_RUSTC_PATH BPF_RUSTC_PATH
 python3 - <<'EOF'
 import hashlib, json, os, subprocess
 
@@ -490,7 +514,8 @@ if e.get("MODE") != "host" and e.get("CHECK_ONLY") != "1":
     import sys
     sys.path.insert(0, os.path.join(e["REPO"], "packaging"))
     from source_payload import bpf_artifact_digest
-    runtime_source = {"schema": "osslscope-bpf-runtime-source-v1",
+    runtime_source = {"schema": "osslscope-bpf-runtime-source-v2",
+                      "compiler_selection": "resolved-pinned-rustc",
                       "toolchain": e["BPF_TOOLCHAIN"],
                       "capture": "before-and-after-build",
                       "library": json.loads(e["BPF_LIBRARY_IDENTITY"]),
@@ -506,6 +531,7 @@ manifest = {
     "host_toolchain": e.get("HOST_TOOLCHAIN"),
     "host_cargo": e.get("HOST_CARGO_VER"),
     "host_rustc": e.get("HOST_RUSTC_VER"),
+    "host_rustc_path": e.get("HOST_RUSTC_PATH"),
     "host_profile": e.get("PROFILE"),
     "host_target_dir": e.get("HOST_TD") or None,
     "bpf_target_dir": e.get("BPF_TD") or None,
@@ -515,6 +541,7 @@ manifest = {
     "bpf_toolchain": e.get("BPF_TOOLCHAIN") or None,
     "bpf_cargo": e.get("BPF_CARGO_VER") or None,
     "bpf_rustc": e.get("BPF_RUSTC_VER") or None,
+    "bpf_rustc_path": e.get("BPF_RUSTC_PATH") or None,
     "bpf_linker": e.get("BPF_LINKER_VER") or None,
     "bpf_runtime_source": runtime_source,
     "bpf_target": e.get("BPF_TARGET"),

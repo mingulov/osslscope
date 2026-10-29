@@ -83,8 +83,13 @@ and the bounded host standard-library crate superset. Filenames are the official
 archive basenames. Every byte is checked against the live lock checksums or
 reviewed runtime hashes; missing, changed or stale inputs refuse construction.
 Rust component revisions must also match the installed pinned compilers. The
-normal build records a canonical relative-file/length/hash identity for every
-installed nightly library source file before and after compilation. It refuses
+pinned recipe resolves the host and BPF compiler executables through rustup and
+uses those same executables for source/version queries and every Cargo metadata
+or build invocation. It overrides `RUSTC`, `CARGO_BUILD_RUSTC` and `build.rustc`
+selection for those operations, retaining compatible Cargo cache wrappers.
+The v2 runtime-source receipt records this normalized compiler selection; older
+receipts require rebuilding. The normal build records a canonical
+relative-file/length/hash identity for every installed nightly library source file before and after compilation. It refuses
 source changes during the build and binds the stable identity to the exact five
 BPF artifact hashes. Packaging requires that receipt and compares the recorded
 source identity to the supplied official component, including missing/extra

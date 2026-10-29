@@ -17,8 +17,13 @@ original notices and this recipe. Graph membership includes build, test and
 other-target dependencies; inclusion does not prove code survived linking.
 Project dependencies are derived anew from each checkout's lockfiles and Cargo
 metadata. The reviewed Rust runtime pins are in `packaging/runtime-sources.json`.
-The normal build captures the complete installed nightly library source identity
-before and after compilation and binds it to its BPF artifact hashes. Packaging
+The pinned recipe resolves each compiler through rustup, then uses that exact
+executable for direct source/version queries and all corresponding Cargo
+metadata/build calls. Ordinary compiler selectors (`RUSTC`, `CARGO_BUILD_RUSTC`,
+`build.rustc`) are normalized to that pin, retaining compatible Cargo cache
+wrappers. Runtime-source receipt v2 records this selection; older receipts
+require rebuilding. The normal build captures the complete installed nightly
+library source identity before and after compilation and binds it to its BPF artifact hashes. Packaging
 compares that recorded identity to the accompanying official component, including
 all relative names, lengths and hashes. Missing, altered, extra or stale source
 inputs and old manifests without this evidence refuse current package

@@ -100,7 +100,8 @@ def bpf_artifact_digest(artifacts):
 
 def validate_runtime_binding(binding, artifacts):
     if (not isinstance(binding,dict)
-            or binding.get('schema') != 'osslscope-bpf-runtime-source-v1'
+            or binding.get('schema') != 'osslscope-bpf-runtime-source-v2'
+            or binding.get('compiler_selection') != 'resolved-pinned-rustc'
             or binding.get('toolchain') != 'nightly-2026-05-20'
             or binding.get('capture') != 'before-and-after-build'):
         raise ValueError('build-time runtime source evidence required')

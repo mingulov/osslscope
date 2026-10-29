@@ -151,6 +151,13 @@ def run(argv, **kwargs):
     return subprocess.check_output(argv, **kwargs)
 
 
+def pinned_rustc(toolchain):
+    compiler = run(['rustup','which','--toolchain',toolchain,'rustc']).decode().strip()
+    if not Path(compiler).is_absolute() or not Path(compiler).is_file():
+        raise ValueError('cannot resolve pinned metadata compiler')
+    return compiler
+
+
 def source_identity():
     if run(['git', '-C', str(ROOT), 'rev-parse', '--show-toplevel']).decode().strip() != str(ROOT):
         raise ValueError('source must be the product repository')
@@ -187,7 +194,8 @@ def dependency_notices():
     """
     graphs, texts = [], {}
     for label, manifest, toolchain in [('host', ROOT/'Cargo.toml', '1.88.0'), ('bpf', ROOT/'crates/ebpf/Cargo.toml', 'nightly-2026-05-20')]:
-        metadata = json.loads(run(['cargo', '+'+toolchain, 'metadata', '--locked', '--offline', '--format-version', '1', '--manifest-path', str(manifest)], cwd=manifest.parent))
+        compiler = pinned_rustc(toolchain)
+        metadata = json.loads(run(['cargo', '+'+toolchain, 'metadata', '--locked', '--offline', '--format-version', '1', '--manifest-path', str(manifest)], cwd=manifest.parent, env=dict(os.environ,RUSTC=compiler,CARGO_BUILD_RUSTC=compiler)))
         lock = tomllib.loads((manifest.parent/'Cargo.lock').read_text())
         checksums = {(p['name'], p['version']): p.get('checksum') for p in lock['package']}
         identifiers = {p['id']: p['name']+'@'+p['version'] for p in metadata['packages']}
@@ -310,7 +318,7 @@ def main():
         from source_payload import stage_payload
         runtime_pins = json.loads((ROOT/'packaging/runtime-sources.json').read_bytes(), object_pairs_hook=no_duplicates)
         for component in runtime_pins['components']:
-            compiler_version = run(['rustc', '+'+component['toolchain'], '-vV']).decode()
+            compiler_version = run([pinned_rustc(component['toolchain']), '-vV']).decode()
             if 'commit-hash: '+component['rust_revision']+'\n' not in compiler_version:
                 raise ValueError('runtime compiler revision needs source review')
         with tempfile.TemporaryDirectory(prefix='.osslscope-package-', dir=args.output.parent) as tmp:
