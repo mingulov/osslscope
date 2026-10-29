@@ -16,6 +16,7 @@ pub(super) struct SourceLayout {
     fields: [u32; 6],
     vma_bytes: u32,
     registration_function: u32,
+    allocation: [u32; 2],
 }
 impl SourceLayout {
     pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
@@ -108,11 +109,29 @@ impl SourceLayout {
         view.integer(word(proto.data, 20)?, 8, true, false)?;
         view.pointer(word(proto.data, 28)?, consumer)?;
         view.pointer(proto.size, uprobe)?;
+        // Capacity metadata only: never resolve or read this internal type's
+        // members. The iterator's 8B opaque handle is not its allocation size.
+        let allocation_type = view.ty(view.named(4, b"bpf_iter_task_vma_kern_data")?)?;
+        ensure!(
+            allocation_type.size >= 8 && allocation_type.size % 8 == 0,
+            "iterator allocation extent"
+        );
+        let with_node = allocation_type
+            .size
+            .checked_add(8)
+            .ok_or_else(|| anyhow::anyhow!("iterator allocation overflow"))?;
+        // Reviewed bpf_mem_alloc non-percpu LLIST_NODE_SZ and finite classes.
+        // This validates a class only, not concurrent/cache/deferred capacity.
+        let class = [16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096]
+            .into_iter()
+            .find(|class| *class >= with_node)
+            .ok_or_else(|| anyhow::anyhow!("iterator allocation class unavailable"))?;
         Ok(Self {
             functions,
             fields,
             vma_bytes: view.ty(vma)?.size,
             registration_function,
+            allocation: [allocation_type.size, class],
         })
     }
     pub(super) fn kfunc_ids(&self) -> [u32; 3] {
@@ -126,6 +145,9 @@ impl SourceLayout {
     }
     pub(super) fn registration_id(&self) -> u32 {
         self.registration_function
+    }
+    pub(super) fn allocation(&self) -> [u32; 2] {
+        self.allocation
     }
 }
 fn word(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -453,6 +475,7 @@ mod tests {
             &[0, inode_ptr, 0, loff, 0, loff, 0, consumer_ptr],
         ); // 25
         f.ty("uprobe_register", 12, 1, registration, &[]); // 26
+        f.ty("bpf_iter_task_vma_kern_data", 4, 0, 320, &[]); // 27
         f
     }
     #[test]
@@ -462,6 +485,7 @@ mod tests {
         assert_eq!(got.field_offsets(), [0, 8, 16, 24, 32, 8]);
         assert_eq!(got.vma_size(), 64);
         assert_eq!(got.registration_id(), 26);
+        assert_eq!(got.allocation(), [320, 512]);
         // vmlinux BTF producers may mark registered kfunc definitions STATIC.
         let mut static_definition = fixture();
         static_definition.mutate(15, 4, 12 << 24);
@@ -511,8 +535,9 @@ mod tests {
             );
         }
         let mut f = fixture();
-        let alias = f.ty("bad_alias", 8, 0, 27, &[]);
-        assert_eq!(alias, 27);
+        let next_id = f.count + 1;
+        let alias = f.ty("bad_alias", 8, 0, next_id, &[]);
+        assert_eq!(alias, next_id);
         f.mutate(12, 16, alias);
         assert!(SourceLayout::parse(&f.finish()).is_err());
     }
@@ -546,6 +571,23 @@ mod tests {
         }
     }
     #[test]
+    fn iterator_allocation_metadata_refuses_unaccountable_sizes() {
+        for size in [0, 1, 4089, 4096, u32::MAX] {
+            let mut f = fixture();
+            f.mutate(27, 8, size);
+            assert!(
+                SourceLayout::parse(&f.finish()).is_err(),
+                "allocation size {size}"
+            );
+        }
+        let mut f = fixture();
+        f.mutate(27, 8, 4088);
+        assert_eq!(
+            SourceLayout::parse(&f.finish()).unwrap().allocation(),
+            [4088, 4096]
+        );
+    }
+    #[test]
     fn source_kernel_budget_precedes_file_acquisition() {
         let budget = crate::provider_observation::ObservationBudget::new(
             crate::provider_observation::ObservationLimits {
@@ -565,6 +607,8 @@ mod tests {
         let layout = super::super::SourceKernel::read(&budget).unwrap();
         assert!(layout._configuration[..3].iter().all(|id| *id > 0));
         assert!(layout._configuration[10] > 0);
+        assert!(layout._configuration[11] >= 8);
+        assert!(layout._configuration[12] >= layout._configuration[11] + 8);
         assert!(
             layout._configuration[3..8]
                 .iter()
