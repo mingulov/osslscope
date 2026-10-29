@@ -161,6 +161,19 @@ impl WriterGate {
         Ok(start.elapsed())
     }
     #[cfg(test)]
+    pub(crate) fn map_memlock(&self) -> [u64; 2] {
+        [&self.0.token, &self.0.outer].map(|fd| {
+            let info =
+                std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
+            info.lines()
+                .find_map(|line| {
+                    line.strip_prefix("memlock:")
+                        .and_then(|v| v.trim().parse().ok())
+                })
+                .unwrap()
+        })
+    }
+    #[cfg(test)]
     pub(crate) fn fail_next_delete(&self) {
         self.0.fail_delete.set(true);
     }

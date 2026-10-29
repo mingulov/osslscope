@@ -502,22 +502,16 @@ fn native_gate_cost_against_historical_rust_count_and_resource_release() {
             flags: 0,
         };
         let fd = gate.inject(&spec).unwrap();
-        let info =
-            std::fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd())).unwrap();
-        memlock.push(
-            info.lines()
-                .find_map(|line| {
-                    line.strip_prefix("memlock:")
-                        .and_then(|v| v.trim().parse::<u64>().ok())
-                })
-                .unwrap(),
-        );
+        let second = gate.inject(&spec).unwrap();
+        assert_eq!(fd_count(), descriptors_before + 4);
+        memlock.push(gate.map_memlock());
         open.push(gate.open().unwrap().as_nanos());
         let start = Instant::now();
         gate.close().unwrap();
         close.push(start.elapsed().as_nanos());
         let raw = fd.as_raw_fd();
         drop(fd);
+        drop(second);
         drop(gate);
         assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
     }
@@ -626,8 +620,93 @@ fn native_gate_cost_against_historical_rust_count_and_resource_release() {
     }
     assert_eq!(fd_count(), descriptors_before);
     eprintln!(
-        "gate_setup_ns={setup:?} gate_open_ns={open:?} gate_delete_ns={close:?} outer_memlock={memlock:?} accounted_gate_peak={} descriptors_before={descriptors_before} descriptors_after={} count_batches_20000={samples:?}",
+        "gate_setup_ns={setup:?} gate_open_ns={open:?} gate_delete_ns={close:?} inner_outer_memlock={memlock:?} accounted_gate_peak={} descriptors_before={descriptors_before} descriptors_after={} count_batches_20000={samples:?}",
         gate_peak,
         fd_count()
     );
+}
+
+#[test]
+#[ignore = "requires privileged BPF, two CPUs and fresh production objects"]
+fn native_active_workers_span_delete_and_preserve_independent_bounds() {
+    CALLS.store(0, Ordering::SeqCst);
+    let p = Producers::new();
+    let control = Producers::new();
+    let cpus = available_cpus();
+    assert!(cpus.len() >= 2);
+    let stop = Arc::new(AtomicBool::new(false));
+    let start = Arc::new(Barrier::new(3));
+    struct StopOnDrop(Arc<AtomicBool>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    std::thread::scope(|scope| {
+        // Drop on either success or assertion unwind before scope joins workers.
+        let _stop = StopOnDrop(stop.clone());
+        for &cpu in &cpus[..2] {
+            let stop = stop.clone();
+            let start = start.clone();
+            scope.spawn(move || {
+                pin(cpu);
+                start.wait();
+                while !stop.load(Ordering::SeqCst) {
+                    assert_eq!(osslscope_native_cut_callback(0), 1);
+                }
+            });
+        }
+        start.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while CALLS.load(Ordering::SeqCst) < 5000 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let before = CALLS.load(Ordering::SeqCst);
+        // No deliberate BPF-handler suspension: workers remain active across
+        // the actual syscall. Its reviewed RCU semantics establish the cut.
+        p.gate.close().unwrap();
+        let after = CALLS.load(Ordering::SeqCst);
+        let snapshot = p.snapshot();
+        let physical = p.count();
+        let api = p.api();
+        assert!(physical >= before && physical <= after + 2);
+        assert!(
+            api[0].abs_diff(physical) <= 2,
+            "at most one entry probe sequence per worker can straddle the cut"
+        );
+        assert!(api[0] >= api[1] && api[0] - api[1] <= 2);
+        assert_eq!(
+            p.cells(false, "ADMITTED", &0u32.to_ne_bytes())
+                .iter()
+                .sum::<u64>(),
+            physical
+        );
+        assert!(
+            p.cells(false, "DROPFAIL", &0u32.to_ne_bytes())
+                .iter()
+                .all(|&n| n == 0)
+        );
+        while CALLS.load(Ordering::SeqCst) < after + 1000 {
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            p.snapshot(),
+            snapshot,
+            "active post-cut callbacks changed safe writer outputs"
+        );
+        eprintln!(
+            "active_cut independent_before={before} independent_after={after} physical={physical} api_entries={} api_returns={} post_cut_calls_at_least=1000 cpus=2",
+            api[0], api[1]
+        );
+    });
+    let independent = CALLS.load(Ordering::SeqCst);
+    control.gate.close().unwrap();
+    assert_eq!(control.count(), independent);
+    assert_eq!(
+        control.api(),
+        [independent, independent, 0, 0, 0, 0, 0, 0, 0]
+    );
+    eprintln!("active_cut independent_final={independent} open_control_exact=true");
 }
