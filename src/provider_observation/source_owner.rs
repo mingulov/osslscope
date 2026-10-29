@@ -215,8 +215,10 @@ pub(super) fn initialize_controls(
 /// workloads, host and floor kernels only.
 pub(crate) enum SourceAcquisitionLease {
     Disabled,
-    /// Constructed only by the owned native qualification tests; production
-    /// builds never enable acquisition.
+    /// Only the owned native qualification tests can construct this variant:
+    /// `NativeSourceParams` has private fields and its sole constructor is
+    /// `#[cfg(test)]`, so a non-test build cannot name a value to wrap here.
+    /// Production matches on the lease but can only ever observe `Disabled`.
     #[allow(dead_code)]
     Enabled(NativeSourceParams),
 }
@@ -224,10 +226,39 @@ pub(crate) enum SourceAcquisitionLease {
 /// Owned inputs for one acquiring session. The target file doubles as the
 /// anchor object: anchor and registration rows join on its single inode, so
 /// no copy or second path may be substituted after admission.
+///
+/// Fields are private and the sole constructor is test-only, which makes
+/// `SourceAcquisitionLease::Enabled` unconstructible outside `#[cfg(test)]`
+/// by construction rather than by convention. Production code reads claimed
+/// inputs through the accessors below (claim-vs-truth verification) but can
+/// never mint the claims themselves.
 pub(crate) struct NativeSourceParams {
-    pub target: std::path::PathBuf,
-    pub link_offset: u64,
-    pub child_pid: u32,
+    target: std::path::PathBuf,
+    link_offset: u64,
+    child_pid: u32,
+}
+
+impl NativeSourceParams {
+    /// Test-only claim constructor for the owned native qualification.
+    /// Unavailable in non-test builds, which is what keeps `Enabled`
+    /// out of production paths.
+    #[cfg(test)]
+    pub(crate) fn for_test(target: std::path::PathBuf, link_offset: u64, child_pid: u32) -> Self {
+        Self {
+            target,
+            link_offset,
+            child_pid,
+        }
+    }
+    pub(crate) fn target(&self) -> &std::path::Path {
+        &self.target
+    }
+    pub(crate) fn link_offset(&self) -> u64 {
+        self.link_offset
+    }
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
 }
 
 /// Structural receipts for the pre-open enablement step.
@@ -1481,6 +1512,18 @@ impl SourceOwner {
 mod tests {
     use super::super::ObservationLimits;
     use super::*;
+    #[test]
+    fn native_claims_round_trip_through_the_test_only_constructor() {
+        // The sole `NativeSourceParams` constructor is `#[cfg(test)]`, so
+        // non-test builds cannot mint the claims that `Enabled` wraps; the
+        // clean non-test `cargo check` on this commit is the proof. The
+        // accessors below are the production claim-vs-truth read path.
+        let params =
+            NativeSourceParams::for_test(std::path::PathBuf::from("/owned/fixture"), 0x11b4, 4242);
+        assert_eq!(params.target(), std::path::Path::new("/owned/fixture"));
+        assert_eq!(params.link_offset(), 0x11b4);
+        assert_eq!(params.child_pid(), 4242);
+    }
     #[test]
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));

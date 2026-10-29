@@ -1820,7 +1820,7 @@ impl ProviderSession {
             .next()
             .ok_or(ObservationGap::Invalidated)?;
         let (tgid, attachments) = (*tgid, attachments.len());
-        if attachments != 1 || params.child_pid != tgid {
+        if attachments != 1 || params.child_pid() != tgid {
             return Err(ObservationGap::Invalidated);
         }
         let attachment = &self.startup[&tgid][0];
@@ -1834,10 +1834,11 @@ impl ProviderSession {
         if !(1..=4096).contains(&cookie) {
             return Err(ObservationGap::Invalidated);
         }
-        if params.link_offset != attachment.site.file_offset() {
+        if params.link_offset() != attachment.site.file_offset() {
             return Err(ObservationGap::Invalidated);
         }
-        let claimed = std::fs::metadata(&params.target).map_err(|_| ObservationGap::Invalidated)?;
+        let claimed =
+            std::fs::metadata(params.target()).map_err(|_| ObservationGap::Invalidated)?;
         if !claimed.is_file()
             || claimed.dev() != attachment.site.native_device()
             || claimed.ino() != attachment.site.inode()
@@ -3504,11 +3505,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             )
             .unwrap();
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
-            super::source_owner::NativeSourceParams {
-                target: app.clone(),
-                link_offset: session.startup[&child.pid()][0].site.file_offset(),
-                child_pid: child.pid(),
-            },
+            super::source_owner::NativeSourceParams::for_test(
+                app.clone(),
+                session.startup[&child.pid()][0].site.file_offset(),
+                child.pid(),
+            ),
         );
         session
             .prepare_typed_startup(
@@ -3628,11 +3629,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let admitted_offset = admitted.site.file_offset();
         eprintln!("admitted site: cookie={cookie} offset={admitted_offset:#x}");
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
-            super::source_owner::NativeSourceParams {
-                target: app.clone(),
-                link_offset: admitted_offset,
-                child_pid: child.pid(),
-            },
+            super::source_owner::NativeSourceParams::for_test(
+                app.clone(),
+                admitted_offset,
+                child.pid(),
+            ),
         );
         session
             .prepare_typed_startup(
@@ -3823,11 +3824,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let admitted_offset = session.startup[&child.pid()][0].site.file_offset();
         assert_ne!(admitted_offset, 0);
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
-            super::source_owner::NativeSourceParams {
-                target: app.clone(),
-                link_offset: admitted_offset,
-                child_pid: child.pid(),
-            },
+            super::source_owner::NativeSourceParams::for_test(
+                app.clone(),
+                admitted_offset,
+                child.pid(),
+            ),
         );
         session
             .prepare_typed_startup(
@@ -3878,11 +3879,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 }
             };
             let bad = super::source_owner::SourceAcquisitionLease::Enabled(
-                super::source_owner::NativeSourceParams {
+                super::source_owner::NativeSourceParams::for_test(
                     target,
                     link_offset,
-                    child_pid: setup.child.pid(),
-                },
+                    setup.child.pid(),
+                ),
             );
             let fds_pre_acquire = source_native_fd_targets();
             let result = setup.session.acquire_source_after_open(
@@ -3950,11 +3951,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let mut setup = source_refusal_setup("disarm");
         let pid = setup.child.pid();
         let marker = setup.dir.join("marker");
-        let params = super::source_owner::NativeSourceParams {
-            target: setup.app.clone(),
-            link_offset: setup.admitted_offset,
-            child_pid: pid,
-        };
+        let params = super::source_owner::NativeSourceParams::for_test(
+            setup.app.clone(),
+            setup.admitted_offset,
+            pid,
+        );
         let admitted = setup.session.admitted_source_site(&params).unwrap();
         let entry_prog =
             std::os::fd::AsRawFd::as_raw_fd(&setup.session.loaded.progs["observation_entry"]);
@@ -4115,11 +4116,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let mut setup = source_refusal_setup("close-cut");
         let pid = setup.child.pid();
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
-            super::source_owner::NativeSourceParams {
-                target: setup.app.clone(),
-                link_offset: setup.admitted_offset,
-                child_pid: pid,
-            },
+            super::source_owner::NativeSourceParams::for_test(
+                setup.app.clone(),
+                setup.admitted_offset,
+                pid,
+            ),
         );
         let receipts = setup
             .session
@@ -4216,11 +4217,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let mut setup = source_refusal_setup("close-retire");
         let pid = setup.child.pid();
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
-            super::source_owner::NativeSourceParams {
-                target: setup.app.clone(),
-                link_offset: setup.admitted_offset,
-                child_pid: pid,
-            },
+            super::source_owner::NativeSourceParams::for_test(
+                setup.app.clone(),
+                setup.admitted_offset,
+                pid,
+            ),
         );
         let receipts = setup
             .session
@@ -4315,11 +4316,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let mut setup = source_refusal_setup("close-live");
         let pid = setup.child.pid();
         let marker = setup.dir.join("marker");
-        let params = super::source_owner::NativeSourceParams {
-            target: setup.app.clone(),
-            link_offset: setup.admitted_offset,
-            child_pid: pid,
-        };
+        let params = super::source_owner::NativeSourceParams::for_test(
+            setup.app.clone(),
+            setup.admitted_offset,
+            pid,
+        );
         let admitted = setup.session.admitted_source_site(&params).unwrap();
         let entry_prog =
             std::os::fd::AsRawFd::as_raw_fd(&setup.session.loaded.progs["observation_entry"]);
