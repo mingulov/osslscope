@@ -685,6 +685,140 @@ fn raw_tracepoint_open_with(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Exact non-sleepable observer registration roots. The caller must derive the
+/// attach BTF ID from the finite running-kernel signature validator and retain
+/// the actual program/link/shared admission owner before exposing any source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceTracingRoot {
+    Enter,
+    Exit,
+}
+impl SourceTracingRoot {
+    pub const fn attach_type(self) -> u32 {
+        match self {
+            Self::Enter => 24,
+            Self::Exit => 25,
+        }
+    }
+    pub const fn program_name(self) -> &'static str {
+        match self {
+            Self::Enter => "source_reg_in",
+            Self::Exit => "source_reg_out",
+        }
+    }
+    pub const fn section(self) -> &'static str {
+        match self {
+            Self::Enter => "fentry/uprobe_register",
+            Self::Exit => "fexit/uprobe_register",
+        }
+    }
+}
+
+/// No program BTF, sleepable flag, token, alternate attach target or consumer
+/// metadata is accepted by this finite source-registration loader.
+pub fn prog_load_source_registration(
+    insns: &[u8],
+    root: SourceTracingRoot,
+    attach_btf_id: u32,
+    log: Option<&mut [u8]>,
+) -> io::Result<OwnedFd> {
+    prog_load_source_with(insns, root, attach_btf_id, log, |attr| {
+        bpf(
+            BPF_PROG_LOAD,
+            std::ptr::from_mut(attr).cast(),
+            size_of::<ProgAttr>(),
+        )
+    })
+}
+fn prog_load_source_with(
+    insns: &[u8],
+    root: SourceTracingRoot,
+    attach_btf_id: u32,
+    log: Option<&mut [u8]>,
+    call: impl FnOnce(&mut ProgAttr) -> io::Result<i32>,
+) -> io::Result<OwnedFd> {
+    if attach_btf_id == 0 || insns.is_empty() || insns.len() % 8 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source load shape",
+        ));
+    }
+    let mut attr: ProgAttr = zeroed();
+    attr.prog_type = 26; // BPF_PROG_TYPE_TRACING, not KPROBE or sleepable tracing.
+    attr.expected_attach_type = root.attach_type();
+    attr.attach_btf_id = attach_btf_id;
+    attr.insn_cnt = u32::try_from(insns.len() / 8)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source instruction count"))?;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    let name = root.program_name().as_bytes();
+    attr.prog_name[..name.len()].copy_from_slice(name);
+    if let Some(log) = log {
+        attr.log_level = 1;
+        attr.log_size = u32::try_from(log.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "source log size"))?;
+        attr.log_buf = log.as_mut_ptr() as u64;
+    }
+    let fd = call(&mut attr)?;
+    // SAFETY: successful BPF_PROG_LOAD returns a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+/// Attach only to the target frozen at load; all retargeting/cookie fields zero.
+pub fn link_create_source_registration(
+    prog_fd: RawFd,
+    root: SourceTracingRoot,
+) -> io::Result<OwnedFd> {
+    source_link_with(prog_fd, root, |cmd, attr| {
+        bpf(cmd, attr.as_mut_ptr().cast(), attr.len())
+    })
+}
+fn source_link_with(
+    prog_fd: RawFd,
+    root: SourceTracingRoot,
+    call: impl FnOnce(u32, &mut [u8; 32]) -> io::Result<i32>,
+) -> io::Result<OwnedFd> {
+    if prog_fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source program descriptor",
+        ));
+    }
+    // LINK_CREATE fixed prefix: prog_fd@0,target_fd@4,type@8,flags@12,
+    // target_btf_id@16,padding@20,tracing.cookie@24. No alternate target.
+    let mut attr = [0; 32];
+    attr[..4].copy_from_slice(&(prog_fd as u32).to_ne_bytes());
+    attr[8..12].copy_from_slice(&root.attach_type().to_ne_bytes());
+    let fd = call(BPF_LINK_CREATE, &mut attr)?;
+    // SAFETY: successful link creation returns a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Observer-only provisional trigger body. It cannot count, read, call helpers
+/// or mutate any map, independently of admission state or target activity.
+/// Caller must attach only to its nonzero observer PID and retain/clean its FD.
+pub fn prog_load_source_noop() -> io::Result<OwnedFd> {
+    source_noop_with(|attr| {
+        bpf(
+            BPF_PROG_LOAD,
+            std::ptr::from_mut(attr).cast(),
+            size_of::<ProgAttr>(),
+        )
+    })
+}
+fn source_noop_with(call: impl FnOnce(&mut ProgAttr) -> io::Result<i32>) -> io::Result<OwnedFd> {
+    const CODE: [u8; 16] = [0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0];
+    let mut attr: ProgAttr = zeroed();
+    attr.prog_type = BPF_PROG_TYPE_KPROBE;
+    attr.expected_attach_type = BPF_TRACE_UPROBE_MULTI;
+    attr.insn_cnt = 2;
+    attr.insns = CODE.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    attr.prog_name[..11].copy_from_slice(b"source_noop");
+    let fd = call(&mut attr)?;
+    // SAFETY: successful BPF_PROG_LOAD returns a fresh owned descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// One uprobe_multi link: `offsets[i]` fires with `cookies[i]`.
 pub fn link_create_uprobe_multi(
     prog_fd: RawFd,
@@ -809,6 +943,71 @@ mod tests {
     use std::sync::Mutex;
 
     static G1_FD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn source_load_and_link_freeze_registration_target_and_zero_btf() {
+        for root in [SourceTracingRoot::Enter, SourceTracingRoot::Exit] {
+            let code = [0x95, 0, 0, 0, 0, 0, 0, 0];
+            let error = prog_load_source_with(&code, root, 123, None, |attr| {
+                assert_eq!(attr.prog_type, 26);
+                assert_eq!(attr.expected_attach_type, root.attach_type());
+                assert_eq!(attr.attach_btf_id, 123);
+                assert_eq!(attr.prog_flags, 0);
+                assert_eq!(attr.prog_btf_fd, 0);
+                assert_eq!(attr.attach_prog_fd, 0);
+                assert_eq!(attr.prog_token_fd, 0);
+                assert_eq!(attr.func_info, 0);
+                assert_eq!(attr.func_info_cnt, 0);
+                assert_eq!(attr.line_info, 0);
+                assert_eq!(attr.line_info_cnt, 0);
+                assert_eq!(attr.insns, code.as_ptr() as u64);
+                assert_eq!(attr.insn_cnt, 1);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            assert!(
+                prog_load_source_with(&code, root, 0, None, |_| panic!(
+                    "missing target reached load"
+                ))
+                .is_err()
+            );
+            let error = source_link_with(313, root, |cmd, attr| {
+                assert_eq!(cmd, BPF_LINK_CREATE);
+                assert_eq!(u32::from_ne_bytes(attr[..4].try_into().unwrap()), 313);
+                assert_eq!(
+                    u32::from_ne_bytes(attr[8..12].try_into().unwrap()),
+                    root.attach_type()
+                );
+                assert_eq!(&attr[4..8], &[0; 4]);
+                assert!(attr[12..].iter().all(|byte| *byte == 0));
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+    }
+    #[test]
+    fn source_noop_is_literal_nonwriting_two_instruction_program() {
+        let error = source_noop_with(|attr| {
+            assert_eq!(attr.prog_type, BPF_PROG_TYPE_KPROBE);
+            assert_eq!(attr.expected_attach_type, BPF_TRACE_UPROBE_MULTI);
+            assert_eq!(attr.insn_cnt, 2);
+            assert_eq!(attr.prog_flags, 0);
+            assert_eq!(attr.prog_btf_fd, 0);
+            assert_eq!(attr.attach_btf_id, 0);
+            assert_eq!(attr.func_info, 0);
+            // The native call borrows the immutable built-in bytes for its duration.
+            let code = unsafe { std::slice::from_raw_parts(attr.insns as *const u8, 16) };
+            assert_eq!(
+                code,
+                &[0xb7, 0, 0, 0, 0, 0, 0, 0, 0x95, 0, 0, 0, 0, 0, 0, 0]
+            );
+            Err(io::Error::from_raw_os_error(libc::EPERM))
+        })
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+    }
 
     #[test]
     fn lifecycle_load_has_exact_non_sleepable_raw_attributes() {
