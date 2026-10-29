@@ -499,6 +499,51 @@ fn assert_application_loop_witness(role: &str, owner: &str, raw: &[u8]) {
     }
 }
 
+// The pinned Rust v0 names below are direct functions under a crate root:
+// _R + Nv + C + s<base-62-number> + exact length-prefixed crate/function.
+// Only that crate disambiguator is incidental across equivalent builds. Keep
+// all other spelling, the complete body hash, and the CFG cycle count exact.
+// Grammar: https://doc.rust-lang.org/rustc/symbol-mangling/v0.html
+fn reviewed_cycle_identity(role: &str, name: &str) -> String {
+    if let Some((disambiguator, suffix)) = name
+        .strip_prefix("_RNvCs")
+        .and_then(|rest| rest.split_once('_'))
+    {
+        let reviewed = matches!(
+            (role, suffix),
+            ("harvest", "17osslscope_harvest12classify_alg")
+                | ("harvest", "17osslscope_harvest13walk_dispatch")
+                | ("members", "17osslscope_members12classify_alg")
+                | ("members", "17osslscope_members13walk_dispatch")
+        );
+        if reviewed && disambiguator.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return format!("_RNvCs_{suffix}");
+        }
+    }
+    name.to_string()
+}
+
+#[test]
+fn reviewed_cycle_identity_only_elides_crate_disambiguator() {
+    let canonical = "_RNvCs_17osslscope_harvest12classify_alg";
+    for disambiguator in ["eODenyNQ03x", "evktOyTz8Qs", "0aZ", ""] {
+        let name = format!("_RNvCs{disambiguator}_17osslscope_harvest12classify_alg");
+        assert_eq!(reviewed_cycle_identity("harvest", &name), canonical);
+        assert_eq!(reviewed_cycle_identity("members", &name), name);
+    }
+    for name in [
+        "_RNvCsbad!_17osslscope_harvest12classify_alg",
+        "_RNvCsabc_17osslscope_harvest12classify_alg.extra",
+        "_RNvCsabc_17osslscope_harvest12classify_bad",
+        "_RNvCsabc_17osslscope_foreign12classify_alg",
+        "_RNvCabc_17osslscope_harvest12classify_alg",
+        "_RNvCsabc_17osslscope_harvest11classify_alg",
+    ] {
+        assert_eq!(reviewed_cycle_identity("harvest", name), name);
+        assert_ne!(reviewed_cycle_identity("harvest", name), canonical);
+    }
+}
+
 fn assert_reviewed_cycles(role: &str, actual: &[(String, usize, String)]) {
     // Hash the complete bytes of every cyclic function. CFG discovery runs
     // over every emitted function first, including uncalled compiler builtins.
@@ -530,12 +575,12 @@ fn assert_reviewed_cycles(role: &str, actual: &[(String, usize, String)]) {
         )),
         "harvest" => expected.extend([
             (
-                "_RNvCseODenyNQ03x_17osslscope_harvest12classify_alg",
+                "_RNvCs_17osslscope_harvest12classify_alg",
                 1,
                 "dd69c5df43b3a064da2d37f57f2a36cc3a91d53f3e1dc1ab7db91b51ac6e4aab",
             ),
             (
-                "_RNvCseODenyNQ03x_17osslscope_harvest13walk_dispatch",
+                "_RNvCs_17osslscope_harvest13walk_dispatch",
                 1,
                 "a9b65f762e91574eaeb13fe765afe93fd006270b3b0d5c8923a6ab5faf672083",
             ),
@@ -562,12 +607,12 @@ fn assert_reviewed_cycles(role: &str, actual: &[(String, usize, String)]) {
         ]),
         "members" => expected.extend([
             (
-                "_RNvCsaubhtxa9GzF_17osslscope_members12classify_alg",
+                "_RNvCs_17osslscope_members12classify_alg",
                 1,
                 "dd69c5df43b3a064da2d37f57f2a36cc3a91d53f3e1dc1ab7db91b51ac6e4aab",
             ),
             (
-                "_RNvCsaubhtxa9GzF_17osslscope_members13walk_dispatch",
+                "_RNvCs_17osslscope_members13walk_dispatch",
                 1,
                 "3498fee53f799b03cd71a75c665f76524a941e6a78f57a86f93a72c5df6428f0",
             ),
@@ -579,6 +624,11 @@ fn assert_reviewed_cycles(role: &str, actual: &[(String, usize, String)]) {
         .into_iter()
         .map(|(name, count, hash)| (name.to_string(), count, hash.to_string()))
         .collect();
+    let mut actual: Vec<_> = actual
+        .iter()
+        .map(|(name, count, hash)| (reviewed_cycle_identity(role, name), *count, hash.clone()))
+        .collect();
+    actual.sort();
     assert_eq!(actual, expected, "{role}: reviewed cyclic function bodies");
 }
 
@@ -1722,13 +1772,20 @@ fn negative_controls(bytes: &[u8], prepared: &loader::Prepared) {
         "member_001 original branch displacement"
     );
     bad_scratch[branch_at + 2..branch_at + 4].copy_from_slice(&4i16.to_le_bytes());
+    // The clone has exactly the reviewed two-byte displacement patch. Bind
+    // its entire function body, not incidental ELF symbol-table metadata.
+    assert_eq!(&bad_scratch[..branch_at + 2], &bytes[..branch_at + 2]);
+    assert_eq!(&bad_scratch[branch_at + 4..], &bytes[branch_at + 4..]);
+    let body_start = elf.section_headers[branch_owner.st_shndx].sh_offset as usize
+        + branch_owner.st_value as usize;
+    let body_end = body_start + branch_owner.st_size as usize;
     assert_eq!(
-        Sha256::digest(&bad_scratch)
+        Sha256::digest(&bad_scratch[body_start..body_end])
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>(),
-        "162a95a7c7a421e966353614fd33c0b1948453d81d1a289258c3aba81054e0e8",
-        "reviewed scratch-bypass mutant bytes"
+        "be4c47456c1be3660349fc80fc459c37de441e1215748f083b80f77b04a771ef",
+        "reviewed complete scratch-bypass mutant function bytes"
     );
     let altered = loader::prepare(&bad_scratch, &MEMBER_MAPS, &MEMBER_PROGS)
         .expect("scratch-bypass mutant remains a prepared BPF object");
