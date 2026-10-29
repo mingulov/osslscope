@@ -248,6 +248,21 @@ impl CountFold {
         }
         Ok(())
     }
+    /// A closed final enumeration must include every previously observed key.
+    /// Counts are never deleted in this producer, including fenced generations.
+    /// A missing row cannot be filled from a live cached prefix.
+    pub(super) fn validate_final_keys(
+        &self,
+        keys: &std::collections::BTreeSet<(u32, u32)>,
+    ) -> Result<(), CountFailure> {
+        if self.rows.iter().any(|(&cookie, row)| {
+            row.row.calls > 0 && !keys.contains(&(cookie, row.row.generation))
+        }) || self.foreign.keys().any(|key| !keys.contains(key))
+        {
+            return Err(CountFailure::Read);
+        }
+        Ok(())
+    }
     pub fn sample(&self) -> CountSample {
         let mut s = CountSample::default();
         for r in self.rows.values() {
@@ -271,6 +286,44 @@ impl CountFold {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_enumeration_cannot_reuse_cached_known_or_foreign_counts() {
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let binding = SiteBinding {
+            site: SiteKey {
+                object: ObjectId("a".repeat(64)),
+                device: 1,
+                inode: 2,
+                offset: 3,
+            },
+            session_generation: 1,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, generation) = fold.attach(binding, |_, _| Ok(())).unwrap();
+        let value = CountValue {
+            count: 7,
+            first_ns: 2,
+            last_ns: 3,
+        };
+        fold.observe(cookie, generation, &[value]).unwrap();
+        assert_eq!(
+            fold.validate_final_keys(&Default::default()),
+            Err(CountFailure::Read)
+        );
+        let mut keys = std::collections::BTreeSet::from([(cookie, generation)]);
+        assert!(fold.validate_final_keys(&keys).is_ok());
+        fold.fence().unwrap();
+        assert!(
+            fold.validate_final_keys(&keys).is_ok(),
+            "fenced physical rows remain once"
+        );
+        fold.observe(999, 99, &[value]).unwrap();
+        assert_eq!(fold.validate_final_keys(&keys), Err(CountFailure::Read));
+        keys.insert((999, 99));
+        assert!(fold.validate_final_keys(&keys).is_ok());
+    }
     #[test]
     fn count_generation_exhaustion_is_permanent() {
         let mut fold = CountFold::new(CountLimits::default()).unwrap();

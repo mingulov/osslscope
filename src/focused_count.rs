@@ -197,6 +197,19 @@ pub struct FocusedCounter {
     authority_refresh_pending: bool,
     mapped_guards: Vec<crate::provider_observation::VerifiedSite>,
 }
+/// One-shot stable physical acquisition. It keeps the actual counter/maps and
+/// successful shared-gate owner alive; a copied sample is never this capability.
+struct ClosedPhysicalSnapshot {
+    owner: FocusedCounter,
+    closed_gate: crate::writer_gate::OwnedClosedGate,
+    sample: CountSample,
+}
+impl ClosedPhysicalSnapshot {
+    fn into_sample(self) -> CountSample {
+        debug_assert!(self.closed_gate.matches(&self.owner.gate));
+        self.sample
+    }
+}
 impl FocusedCounter {
     pub fn open(
         bytes: &[u8],
@@ -243,6 +256,14 @@ impl FocusedCounter {
         if cpus == 0 || cpus > limits.max_cpus {
             return Err(CountFailure::Resource);
         }
+        // Final enumeration retains a bounded set of every observed physical
+        // identity alongside the live fold. Charge its full capacity up front.
+        fold.charge(
+            limits
+                .max_keys
+                .checked_mul(64)
+                .ok_or(CountFailure::Resource)?,
+        )?;
         fold.charge(
             cpus.checked_mul(48)
                 .and_then(|n| n.checked_add(limits.max_keys * 192))
@@ -776,9 +797,12 @@ impl FocusedCounter {
         Ok(())
     }
     pub fn sample(&mut self, deadline: Instant) -> CountSample {
-        if let Err(e) = self.read_snapshot(deadline) {
+        if let Err(e) = self.read_snapshot(deadline, false) {
             self.failure(e);
         }
+        self.current_sample()
+    }
+    fn current_sample(&self) -> CountSample {
         let mut sample = self.fold.sample();
         sample.associations = self.associations.values().cloned().collect();
         [sample.admitted, sample.dropfail, sample.namespace_failures] = self.totals;
@@ -810,7 +834,7 @@ impl FocusedCounter {
         }
         sample
     }
-    fn read_snapshot(&mut self, deadline: Instant) -> Result<(), CountFailure> {
+    fn read_snapshot(&mut self, deadline: Instant, strict: bool) -> Result<(), CountFailure> {
         let check = || {
             if Instant::now() >= deadline {
                 Err(CountFailure::Read)
@@ -824,6 +848,7 @@ impl FocusedCounter {
             .keys(self.limits.max_keys as u32)
             .map_err(|_| CountFailure::Read)?;
         let mut bytes = vec![0u8; self.cpus * 24];
+        let mut final_keys = std::collections::BTreeSet::new();
         for key in keys {
             check()?;
             map.lookup(&key, &mut bytes)
@@ -839,7 +864,13 @@ impl FocusedCounter {
             let (cookie, generation) = split_key(u64::from_ne_bytes(
                 key.try_into().map_err(|_| CountFailure::Read)?,
             ));
+            if strict && !final_keys.insert((cookie, generation)) {
+                return Err(CountFailure::Read);
+            }
             self.fold.observe(cookie, generation, &values)?;
+        }
+        if strict {
+            self.fold.validate_final_keys(&final_keys)?;
         }
         for (i, name) in ["ADMITTED", "DROPFAIL", "NSFAIL"].iter().enumerate() {
             check()?;
@@ -860,13 +891,60 @@ impl FocusedCounter {
         }
         check()
     }
+    /// Consuming acquisition prevents replay and retains real kernel/source
+    /// owners until the final snapshot has been projected. This is physical
+    /// evidence only; it does not certify an attribution dictionary or partition.
+    fn read_closed(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(crate::writer_gate::OwnedClosedGate, CountSample), CountFailure> {
+        (|| {
+            self.gate.close().map_err(|_| CountFailure::Close)?;
+            let closed_gate = self.gate.owned_closed().map_err(|_| CountFailure::Close)?;
+            if !closed_gate.matches(&self.gate) {
+                return Err(CountFailure::Identity);
+            }
+            self.read_snapshot(deadline, true)?;
+            let sample = self.current_sample();
+            if sample.gaps.iter().any(|gap| {
+                matches!(
+                    gap.name.as_str(),
+                    "focused_saturated" | "focused_ledger_mismatch" | "focused_cut_unavailable"
+                )
+            }) {
+                return Err(CountFailure::Read);
+            }
+            let receipt = closed_gate.receipt();
+            if sample
+                .sites
+                .iter()
+                .chain(&sample.fenced)
+                .any(|row| row.last_ns > receipt.close_after_ns)
+            {
+                return Err(CountFailure::Read);
+            }
+            Ok((closed_gate, sample))
+        })()
+    }
     pub fn close(mut self, deadline: Instant) -> CountSample {
-        if self.gate.close().is_err() {
-            self.failure(CountFailure::Close);
+        match self.read_closed(deadline) {
+            Ok((closed_gate, sample)) => ClosedPhysicalSnapshot {
+                owner: self,
+                closed_gate,
+                sample,
+            }
+            .into_sample(),
+            Err(error) => {
+                // Preserve the useful observed physical prefix, explicitly
+                // unavailable as a final snapshot. Never reread or certify it.
+                self.failure(error);
+                let mut sample = self.current_sample();
+                sample
+                    .gaps
+                    .push(gap("focused_final_snapshot_unavailable", 1));
+                sample
+            }
         }
-        // Retain links and code guards through the final read; Drop closes links
-        // before releasing those owners. Live retire/fence is a separate policy.
-        self.sample(deadline)
     }
 }
 impl Drop for FocusedCounter {

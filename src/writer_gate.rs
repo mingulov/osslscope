@@ -27,6 +27,8 @@ pub(crate) const SPEC: loader::MapSpec = loader::MapSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClosedReceipt {
     pub(crate) map_id: u32,
+    pub(crate) close_before_ns: u64,
+    pub(crate) close_after_ns: u64,
 }
 #[derive(Clone, Copy, Debug)]
 enum GateState {
@@ -65,14 +67,59 @@ impl GateState {
             *self = Self::Unavailable;
             return Err(io::Error::other("no successful writer cut"));
         }
+        *self = Self::Unavailable;
+        let close_before_ns = monotonic_ns()?;
         *self = Self::Closing;
         if let Err(error) = call() {
             *self = Self::Unavailable;
             return Err(error);
         }
-        let receipt = ClosedReceipt { map_id };
+        *self = Self::Unavailable;
+        let close_after_ns = monotonic_ns()?;
+        if close_after_ns < close_before_ns {
+            return Err(io::Error::other("writer cut clock regression"));
+        }
+        let receipt = ClosedReceipt {
+            map_id,
+            close_before_ns,
+            close_after_ns,
+        };
         *self = Self::Closed(receipt);
         Ok(receipt)
+    }
+}
+fn monotonic_ns() -> io::Result<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: valid writable timespec and the process-independent monotonic clock.
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    u64::try_from(time.tv_sec)
+        .ok()
+        .and_then(|s| s.checked_mul(1_000_000_000))
+        .and_then(|s| {
+            u64::try_from(time.tv_nsec)
+                .ok()
+                .and_then(|n| s.checked_add(n))
+        })
+        .filter(|&n| n != 0)
+        .ok_or_else(|| io::Error::other("writer cut clock range"))
+}
+/// Non-Clone capability retaining the actual shared map/FD owner. Numeric map
+/// IDs and copied diagnostic receipts cannot construct this capability.
+pub(crate) struct OwnedClosedGate {
+    gate: WriterGate,
+    receipt: ClosedReceipt,
+}
+impl OwnedClosedGate {
+    pub(crate) fn matches(&self, gate: &WriterGate) -> bool {
+        Rc::ptr_eq(&self.gate.0, &gate.0) && self.gate.receipt() == Some(self.receipt)
+    }
+    pub(crate) fn receipt(&self) -> ClosedReceipt {
+        self.receipt
     }
 }
 struct Inner {
@@ -172,6 +219,15 @@ impl WriterGate {
             }
             // SAFETY: private immutable outer owner comes only from the typed constructor.
             unsafe { ossl_bpf_sys::writer_gate_delete(self.0.outer.as_raw_fd()) }
+        })
+    }
+    pub(crate) fn owned_closed(&self) -> io::Result<OwnedClosedGate> {
+        let receipt = self
+            .receipt()
+            .ok_or_else(|| io::Error::other("shared writer owner not closed"))?;
+        Ok(OwnedClosedGate {
+            gate: self.clone(),
+            receipt,
         })
     }
     pub(crate) fn receipt(&self) -> Option<ClosedReceipt> {
@@ -295,6 +351,32 @@ mod tests {
         );
     }
     #[test]
+    fn closed_capability_rejects_another_owner_with_the_same_numeric_map_id() {
+        HOST_GATE_CREATES.with(|count| count.set(Some(0)));
+        let pool = MemoryPool::new(2 * RESERVATION_BYTES);
+        let first = WriterGate::create(&pool).unwrap();
+        let second = WriterGate::create(&pool).unwrap();
+        HOST_GATE_CREATES.with(|count| count.set(None));
+        assert_eq!(first.0.id, second.0.id);
+        *first.0.state.borrow_mut() = GateState::Open;
+        *second.0.state.borrow_mut() = GateState::Open;
+        first
+            .0
+            .state
+            .borrow_mut()
+            .close_with(first.0.id, || Ok(()))
+            .unwrap();
+        second
+            .0
+            .state
+            .borrow_mut()
+            .close_with(second.0.id, || Ok(()))
+            .unwrap();
+        let closed = first.owned_closed().unwrap();
+        assert!(closed.matches(&first));
+        assert!(!closed.matches(&second));
+    }
+    #[test]
     fn failed_delete_never_certifies_or_rearms() {
         let mut state = GateState::Open;
         assert!(
@@ -319,6 +401,8 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
         assert_eq!(first.map_id, 17);
+        assert!(first.close_before_ns > 0);
+        assert!(first.close_after_ns >= first.close_before_ns);
         assert!(state.open_with(|| panic!("must not rearm")).is_err());
     }
     #[test]
