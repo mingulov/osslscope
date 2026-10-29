@@ -115,11 +115,13 @@ unsafe fn inspect(
 /// Actual retained file/anchor custody must outlive the returned equality token.
 /// A non-inlined single body keeps one set of finite patch sites for all callers.
 #[inline(never)]
+#[no_mangle]
 pub unsafe fn current_source_at(
     address: u64,
     policy: Policy,
     page_shift: u32,
-) -> Option<SourceLocation> {
+    output: &mut SourceLocation,
+) -> bool {
     let task: unsafe extern "C" fn() -> *mut c_void = core::mem::transmute(158usize);
     // Raw CALL src=0 markers; loader changes src to BPF_PSEUDO_KFUNC_CALL (2)
     // and imm to the exact validated running-vmlinux FUNC ID, with off=0.
@@ -155,9 +157,10 @@ pub unsafe fn current_source_at(
     let inode = core::ptr::read_volatile(&saved_inode);
     let file_offset = core::ptr::read_volatile(&saved_offset);
     if present == 0 {
-        None
+        false
     } else {
-        Some(SourceLocation { inode, file_offset })
+        *output = SourceLocation { inode, file_offset };
+        true
     }
 }
 

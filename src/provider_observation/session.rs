@@ -221,11 +221,43 @@ fn retain_typed_startup(
 }
 /// Pure object ABI admission, shared with ordinary command preflight.
 pub(crate) fn prepare_object(object: &[u8]) -> Result<loader::Prepared, ObservationGap> {
-    let programs = [
+    let programs: Vec<_> = [
         loader::ProgSpec::uprobe("observation_entry"),
         loader::ProgSpec::uretprobe("observation_return"),
-    ];
-    loader::prepare(object, &specs(), &programs).map_err(|_| ObservationGap::InvalidObject)
+    ]
+    .into_iter()
+    .chain(loader::SOURCE_REGISTRATION_PROGS)
+    .chain(loader::LIFECYCLE_PROGS)
+    .collect();
+    let maps: Vec<_> = specs()
+        .into_iter()
+        .chain(super::source_owner::MAPS)
+        .collect();
+    loader::prepare(object, &maps, &programs).map_err(|_| ObservationGap::InvalidObject)
+}
+/// Preserve the sole mandatory legacy load while retaining the fully checked
+/// source roots as unloaded input. Optional maps are acquired only after legacy
+/// startup custody; no tracing root can reach the generic uprobe load adapter.
+fn split_source_preparation(prepared: loader::Prepared) -> (loader::Prepared, loader::Prepared) {
+    let (legacy, source) = prepared
+        .progs
+        .into_iter()
+        .partition(|p| matches!(p.name.as_str(), "observation_entry" | "observation_return"));
+    let (source_maps, legacy_maps) = prepared.maps.into_iter().partition(|m| {
+        super::source_owner::MAPS
+            .iter()
+            .any(|spec| spec.name == m.name)
+    });
+    (
+        loader::Prepared {
+            progs: legacy,
+            maps: legacy_maps,
+        },
+        loader::Prepared {
+            progs: source,
+            maps: source_maps,
+        },
+    )
 }
 struct Attachment {
     links: Vec<OwnedFd>,
@@ -271,6 +303,9 @@ pub struct ProviderSession {
     // A validated kernel layout is only a prerequisite. No source authority is
     // published without the separately owned anchor and actual registrations.
     _source_kernel: Result<loader::SourceKernel, ObservationGap>,
+    // Unloaded roots retain symbolic map fixups and validated finite kernel
+    // patches until exact source ownership and the native adapter exist.
+    _source_prepared: loader::Prepared,
     source_owner: Option<super::source_owner::SourceOwner>,
     // Prearmed source preparation is noncertifying until actual source links,
     // post-adoption readiness and target-domain guards are established.
@@ -706,7 +741,7 @@ impl ProviderSession {
                 .checked_mul(4)
                 .ok_or(ObservationGap::StateLimit)?,
         )?;
-        let mut prepared = prepare_object(object)?;
+        let (mut prepared, mut source_prepared) = split_source_preparation(prepare_object(object)?);
         // Retain hard bounds while honoring lower pending/process limits in actual maps.
         for m in &mut prepared.maps {
             if matches!(m.name.as_str(), "PENDING" | "THREADS" | "API_THREADS") {
@@ -718,7 +753,10 @@ impl ProviderSession {
         }
         let possible_cpus = aya::util::nr_cpus().map_err(|_| ObservationGap::StateLimit)?;
         reserve_map_capacity(&budget, &prepared.maps, possible_cpus)?;
-        let source_kernel = loader::SourceKernel::read(&budget);
+        let source_kernel = loader::SourceKernel::read(&budget).and_then(|kernel| {
+            kernel.patch(&mut source_prepared)?;
+            Ok(kernel)
+        });
         budget.checkpoint()?;
         let loaded =
             loader::load_gated(&prepared, &gate).map_err(|_| ObservationGap::BpfUnavailable)?;
@@ -779,6 +817,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             _source_kernel: source_kernel,
+            _source_prepared: source_prepared,
             source_owner: None,
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
@@ -2721,7 +2760,7 @@ mod tests {
                 flags: m.flags,
             })
             .collect();
-        // Independent fixed total for the actual fifteen ordinary provider maps
+        // Independent fixed total for the actual sixteen ordinary provider maps
         // on sixteen possible CPUs, excluding the separately owned ADMIT gate.
         let required = 7_166_360;
         let budget = ObservationBudget::new(ObservationLimits {
@@ -2761,17 +2800,34 @@ mod tests {
         let path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")
             .expect("required test-only object path OSSL_PROVIDER_OBSERVATION_TEST_BPF");
         let object = std::fs::read(path).expect("required test-only object must be readable");
-        let result = loader::prepare(
-            &object,
-            &specs(),
-            &[
-                loader::ProgSpec::uprobe("observation_entry"),
-                loader::ProgSpec::uretprobe("observation_return"),
-            ],
-        );
-        let prepared = result.expect("real object preparation");
-        assert_eq!(prepared.maps.len(), 16);
+        let prepared = prepare_object(&object).expect("real object preparation");
+        assert_eq!(prepared.maps.len(), 23);
+        assert_eq!(prepared.progs.len(), 6);
         for root in &prepared.progs {
+            assert!(root.map_fixups.iter().any(|site| site.map == "ADMIT"));
+        }
+        let (prepared, source) = split_source_preparation(prepared);
+        assert_eq!((prepared.maps.len(), prepared.progs.len()), (16, 2));
+        assert_eq!((source.maps.len(), source.progs.len()), (7, 4));
+        let all_maps: std::collections::BTreeSet<_> = prepared
+            .maps
+            .iter()
+            .chain(&source.maps)
+            .map(|m| m.name.as_str())
+            .collect();
+        for root in &source.progs {
+            assert!(
+                root.map_fixups
+                    .iter()
+                    .all(|site| all_maps.contains(site.map.as_str()))
+            );
+            assert!(!root.subprogs.iter().any(|p| p.is_callback));
+        }
+        for root in prepared
+            .progs
+            .iter()
+            .filter(|p| matches!(p.name.as_str(), "observation_entry" | "observation_return"))
+        {
             assert!(root.map_fixups.iter().any(|site| site.map == "ATTR_STATE"));
             if root.name == "observation_entry" {
                 assert!(

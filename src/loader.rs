@@ -23,6 +23,13 @@ impl SourceKernel {
     pub(crate) fn iterator_class(&self) -> u32 {
         self._configuration[12]
     }
+    pub(crate) fn patch(
+        &self,
+        prepared: &mut Prepared,
+    ) -> Result<(), crate::provider_observation::ObservationGap> {
+        patch_source_configuration(&self._configuration, &mut prepared.progs)
+            .map_err(|_| crate::provider_observation::ObservationGap::InvalidObject)
+    }
     pub(crate) fn read(
         budget: &crate::provider_observation::ObservationBudget,
     ) -> Result<Self, crate::provider_observation::ObservationGap> {
@@ -66,6 +73,105 @@ impl SourceKernel {
         })
     }
 }
+/// Finite patch set owned by one global callback-free helper. Validate every
+/// site before changing any bytes; an incidental constant or another root cannot
+/// acquire a kernel-read identity. Values come only from SourceLayout admission.
+fn patch_source_configuration(
+    configuration: &[u32; 13],
+    programs: &mut [PreparedProg],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        configuration[..3]
+            .iter()
+            .all(|id| *id != 0 && *id <= i32::MAX as u32),
+        "source kfunc ID range"
+    );
+    anyhow::ensure!(
+        configuration[3..9]
+            .iter()
+            .all(|offset| *offset <= i32::MAX as u32),
+        "source offset range"
+    );
+    anyhow::ensure!(
+        configuration[3..8].iter().all(|offset| offset
+            .checked_add(8)
+            .is_some_and(|end| end <= configuration[9])),
+        "source VMA extent"
+    );
+    // f_inode's separate containing-file extent was checked by SourceLayout's
+    // semantic member parser; do not substitute the VMA size for that type.
+    let mut sites = [None; 9];
+    let mut helpers = 0;
+    for (root_index, program) in programs.iter().enumerate() {
+        let mut helper_range = None;
+        for (index, subprogram) in program.subprogs.iter().enumerate() {
+            if subprogram.name != "current_source_at" {
+                continue;
+            }
+            anyhow::ensure!(
+                program.name == "source_reg_out"
+                    && program.section == "fexit/uprobe_register"
+                    && !program.is_return
+                    && !subprogram.is_callback,
+                "source helper owner"
+            );
+            helpers += 1;
+            let start = subprogram.insn_off as usize * 8;
+            let end = program
+                .subprogs
+                .get(index + 1)
+                .map_or(program.insns.len(), |next| next.insn_off as usize * 8);
+            anyhow::ensure!(
+                start < end && end <= program.insns.len(),
+                "source helper extent"
+            );
+            helper_range = Some(start..end);
+        }
+        for (index, instruction) in program.insns.chunks_exact(8).enumerate() {
+            let immediate = u32::from_le_bytes(instruction[4..8].try_into().unwrap());
+            let site = match immediate {
+                0x7f001..=0x7f003 => (immediate - 0x7f001) as usize,
+                0x6f001..=0x6f006 => 3 + (immediate - 0x6f001) as usize,
+                0x7f000..=0x7ffff | 0x6f000..=0x6ffff => {
+                    anyhow::bail!("unknown source patch identity")
+                }
+                _ => continue,
+            };
+            let offset = index * 8;
+            anyhow::ensure!(
+                helper_range.as_ref().is_some_and(|r| r.contains(&offset)),
+                "source patch outside helper"
+            );
+            anyhow::ensure!(sites[site].is_none(), "duplicate source patch identity");
+            if site < 3 {
+                anyhow::ensure!(
+                    instruction[..4] == [0x85, 0, 0, 0],
+                    "source kfunc patch shape"
+                );
+            } else {
+                anyhow::ensure!(
+                    instruction[0] == 0xb7 && instruction[1] <= 10 && instruction[2..4] == [0, 0],
+                    "source field patch shape"
+                );
+            }
+            sites[site] = Some((root_index, offset));
+        }
+    }
+    anyhow::ensure!(
+        helpers == 1 && sites.iter().all(Option::is_some),
+        "missing source helper patch"
+    );
+    for (identity, site) in sites.into_iter().enumerate() {
+        let (root, offset) = site.unwrap();
+        let instruction = &mut programs[root].insns[offset..offset + 8];
+        if identity < 3 {
+            instruction[1] = 0x20;
+        }
+        instruction[4..8].copy_from_slice(&configuration[identity].to_le_bytes());
+    }
+    Ok(())
+}
+
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 
@@ -156,6 +262,27 @@ impl ProgSpec {
             section: "uretprobe",
         }
     }
+}
+
+/// Exact observer-only tracing roots. Preparation does not authorize loading;
+/// the generic uprobe loader deliberately rejects these program kinds.
+pub(crate) const SOURCE_REGISTRATION_PROGS: [ProgSpec; 2] = [
+    ProgSpec {
+        name: "source_reg_in",
+        section: "fentry/uprobe_register",
+    },
+    ProgSpec {
+        name: "source_reg_out",
+        section: "fexit/uprobe_register",
+    },
+];
+fn selected_source_registration(name: &str, section: &str) -> bool {
+    [
+        ossl_bpf_sys::SourceTracingRoot::Enter,
+        ossl_bpf_sys::SourceTracingRoot::Exit,
+    ]
+    .into_iter()
+    .any(|root| root.program_name() == name && root.section() == section)
 }
 
 /// Exact synchronous lifecycle writer roots; their programs read no ctx fields.
@@ -1836,6 +1963,13 @@ fn prepare_sections(
         if n == ".BTF" || n == ".BTF.ext" {
             anyhow::bail!("frozen shape forbids {n} (BTF-disabled objects only)");
         }
+        if (n.starts_with("fentry") || n.starts_with("fexit"))
+            && !progs
+                .iter()
+                .any(|p| p.section == n && selected_source_registration(p.name, n))
+        {
+            anyhow::bail!("unselected source registration section");
+        }
         if n.starts_with("raw_tracepoint")
             && !(raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == n))
             && !progs
@@ -1919,6 +2053,11 @@ fn prepare_sections(
         if n == "uprobe"
             || n == "uretprobe"
             || (raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == n))
+            || progs.iter().any(|p| {
+                p.section == n
+                    && (selected_lifecycle(p.name, n).is_some()
+                        || selected_source_registration(p.name, n))
+            })
         {
             let mut v = Vec::new();
             for f in syms.iter().filter(|f| f.is_func && f.shndx == i) {
@@ -2006,6 +2145,7 @@ fn prepare_sections(
             "uretprobe" => true,
             s if raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == s) => false,
             s if selected_lifecycle(p.name, s).is_some() => false,
+            s if selected_source_registration(p.name, s) => false,
             s => anyhow::bail!("prog {}: bad section {s}", p.name),
         };
         let sec = sec_bytes(&elf, obj, p.section)?;
@@ -3760,6 +3900,68 @@ mod tests {
             Ok(0) => true,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => false,
             result => panic!("sentinel read {result:?}"),
+        }
+    }
+    #[test]
+    #[ignore = "requires rebuilt OSSL_PROVIDER_OBSERVATION_TEST_BPF; preparation only"]
+    fn source_iterator_real_object_patches_only_exact_owned_sites() {
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let prepare = || crate::provider_observation::session::prepare_object(&object).unwrap();
+        let configuration = [101, 102, 103, 0, 8, 120, 32, 128, 40, 184, 104, 184, 192];
+        let mut prepared = prepare();
+        patch_source_configuration(&configuration, &mut prepared.progs).unwrap();
+        let original = prepare();
+        let mut changed = 0;
+        for (old, new) in original.progs.iter().zip(&prepared.progs) {
+            assert_eq!(old.insns.len(), new.insns.len());
+            for (a, b) in old.insns.chunks_exact(8).zip(new.insns.chunks_exact(8)) {
+                if a == b {
+                    continue;
+                }
+                changed += 1;
+                let marker = u32::from_le_bytes(a[4..8].try_into().unwrap());
+                if (0x7f001..=0x7f003).contains(&marker) {
+                    assert_eq!(&b[..4], &[0x85, 0x20, 0, 0]);
+                    assert_eq!(
+                        u32::from_le_bytes(b[4..8].try_into().unwrap()),
+                        configuration[(marker - 0x7f001) as usize]
+                    );
+                } else {
+                    assert!((0x6f001..=0x6f006).contains(&marker));
+                    assert_eq!(&a[..4], &b[..4]);
+                    assert_eq!(
+                        u32::from_le_bytes(b[4..8].try_into().unwrap()),
+                        configuration[3 + (marker - 0x6f001) as usize]
+                    );
+                }
+            }
+        }
+        assert_eq!(changed, 9);
+        assert!(patch_source_configuration(&configuration, &mut prepared.progs).is_err());
+        // Corrupt an actual field opcode, duplicate a field identity, and move
+        // the helper to the wrong root. None may produce a partial patched body.
+        for mutation in 0..3 {
+            let mut mutant = prepare();
+            let root = mutant
+                .progs
+                .iter_mut()
+                .find(|p| p.name == "source_reg_out")
+                .unwrap();
+            let at = root
+                .insns
+                .chunks_exact(8)
+                .position(|i| i[4..8] == 0x6f001u32.to_le_bytes())
+                .unwrap()
+                * 8;
+            match mutation {
+                0 => root.insns[at] = 0x07,
+                1 => root.insns[at + 4..at + 8].copy_from_slice(&0x6f002u32.to_le_bytes()),
+                _ => root.name = "source_reg_in".into(),
+            }
+            let before: Vec<_> = mutant.progs.iter().map(|p| p.insns.clone()).collect();
+            assert!(patch_source_configuration(&configuration, &mut mutant.progs).is_err());
+            assert!(mutant.progs.iter().zip(before).all(|(p, b)| p.insns == b));
         }
     }
     #[test]

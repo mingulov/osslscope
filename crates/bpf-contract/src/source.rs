@@ -44,6 +44,100 @@ pub struct SourceRequest {
     pub image_epoch: u64,
     pub registration_id: u64,
 }
+impl SourceRequest {
+    #[inline(always)]
+    pub fn valid_input(&self) -> bool {
+        if self.nonce < HOST_ID_FIRST
+            || self.anchor_id < HOST_ID_FIRST
+            || self.nonce == self.anchor_id
+            || self.nonce == self.registration_id
+            || self.object_id == 0
+            || self.source_epoch == 0
+            || self.process_incarnation == 0
+            || self.image_epoch == 0
+            || self.reserved != 0
+        {
+            return false;
+        }
+        match self.phase {
+            PHASE_ANCHOR => {
+                self.site_cookie == 0
+                    && self.registration_id == 0
+                    && self.file_offset == 0
+                    && self.required_mask == 0
+                    && self.observer_anchor_address != 0
+            }
+            PHASE_ENTRY | PHASE_RETURN | PHASE_READY => {
+                self.site_cookie != 0
+                    && self.site_cookie <= 4096
+                    && self.registration_id >= HOST_ID_FIRST
+                    && self.registration_id != self.anchor_id
+                    && self.observer_anchor_address == 0
+                    && self.file_offset <= i64::MAX as u64
+                    && (self.required_mask == 3
+                        || self.required_mask == 1 && self.phase != PHASE_RETURN)
+            }
+            _ => false,
+        }
+    }
+    /// Exact immutable input association; counters/verdict/sequence are separate
+    /// kernel outputs checked at their respective entry/exit/receipt boundaries.
+    #[inline(always)]
+    pub fn same_input(&self, other: &Self) -> bool {
+        self.nonce == other.nonce
+            && self.anchor_id == other.anchor_id
+            && self.object_id == other.object_id
+            && self.source_epoch == other.source_epoch
+            && self.site_cookie == other.site_cookie
+            && self.file_offset == other.file_offset
+            && self.observer_anchor_address == other.observer_anchor_address
+            && self.phase == other.phase
+            && self.required_mask == other.required_mask
+            && self.reserved == other.reserved
+            && self.process_incarnation == other.process_incarnation
+            && self.image_epoch == other.image_epoch
+            && self.registration_id == other.registration_id
+    }
+}
+
+pub const DOMAIN_LIVE: u64 = 1;
+pub const DOMAIN_ARMED: u64 = 2;
+pub const DOMAIN_ACTIVE: u64 = 3;
+pub const DOMAIN_RETIRED: u64 = 4;
+pub const DOMAIN_POISON: u64 = 5;
+pub const DOMAIN_TRANSITION: u64 = 6;
+
+/// Keyed by the exact existing MEMBERS/NAMESPACE normalized TGID coordinate.
+/// Initial host configuration requires original held custody for ARMED. After
+/// writers start, current_image/state/loss_epoch are accessed atomically; neither
+/// numeric TGID reuse nor a later exec may retarget or revive this retained row.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SourceDomain {
+    pub process_incarnation: u64,
+    pub original_image: u64,
+    pub planned_image: u64,
+    pub current_image: u64,
+    pub state: u64,
+    pub loss_epoch: u64,
+    pub reserved: [u64; 2],
+}
+
+/// Kernel-private matching entry. Never host-read or exported: entry_inode is
+/// populated only from the approved registration operand in phases2/3. Anchor
+/// snapshot work happens at matched exit and leaves this operand slot zero.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SourcePair {
+    pub request: SourceRequest,
+    pub entry_inode: u64,
+    pub state: u64,
+}
+#[inline(always)]
+pub const fn registration_succeeded(return_pointer: u64) -> bool {
+    return_pointer != 0 && return_pointer < u64::MAX - 4094
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SourceGuard {
@@ -112,6 +206,8 @@ pub const fn pending_release_value(current: u64) -> Option<u64> {
 
 const _: () = {
     assert!(core::mem::size_of::<SourceRequest>() == 112);
+    assert!(core::mem::size_of::<SourcePair>() == 128);
+    assert!(core::mem::size_of::<SourceDomain>() == 64);
     assert!(core::mem::size_of::<SourceObserver>() == 48);
     assert!(core::mem::size_of::<SourceGuard>() == 16);
     assert!(core::mem::size_of::<SourceControl>() == 64);
@@ -122,6 +218,78 @@ const _: () = {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+    #[test]
+    fn source_domain_has_exact_planned_transition_fields() {
+        assert_eq!(size_of::<SourceDomain>(), 64);
+        assert_eq!(align_of::<SourceDomain>(), 8);
+        assert_eq!(offset_of!(SourceDomain, process_incarnation), 0);
+        assert_eq!(offset_of!(SourceDomain, original_image), 8);
+        assert_eq!(offset_of!(SourceDomain, planned_image), 16);
+        assert_eq!(offset_of!(SourceDomain, current_image), 24);
+        assert_eq!(offset_of!(SourceDomain, state), 32);
+        assert_eq!(offset_of!(SourceDomain, loss_epoch), 40);
+        assert_eq!(offset_of!(SourceDomain, reserved), 48);
+    }
+    #[test]
+    fn source_requests_reject_phase_confusion_and_match_the_full_domain() {
+        let mut request = SourceRequest {
+            nonce: HOST_ID_FIRST + 1,
+            anchor_id: HOST_ID_FIRST + 2,
+            object_id: 3,
+            source_epoch: 4,
+            observer_anchor_address: 0x1000,
+            phase: PHASE_ANCHOR,
+            process_incarnation: 5,
+            image_epoch: 6,
+            ..SourceRequest::default()
+        };
+        assert!(request.valid_input());
+        let mut replay = request;
+        replay.nonce = replay.anchor_id;
+        assert!(!replay.valid_input());
+        request.phase = PHASE_ENTRY;
+        assert!(!request.valid_input());
+        request.observer_anchor_address = 0;
+        request.site_cookie = 1;
+        request.registration_id = HOST_ID_FIRST + 3;
+        request.required_mask = 3;
+        assert!(request.valid_input());
+        for field in [0, 1, 2, 3] {
+            let mut other = request;
+            match field {
+                0 => other.nonce += 1,
+                1 => other.process_incarnation += 1,
+                2 => other.image_epoch += 1,
+                _ => other.registration_id += 1,
+            }
+            assert!(!request.same_input(&other));
+        }
+        let mut output = request;
+        output.entry_count = 1;
+        output.exit_count = 1;
+        output.verdict = 1;
+        output.publication_sequence = 42;
+        assert!(request.same_input(&output));
+        request.phase = PHASE_RETURN;
+        request.required_mask = 1;
+        assert!(!request.valid_input());
+        request.required_mask = 3;
+        request.file_offset = 1 << 63;
+        assert!(!request.valid_input());
+    }
+    #[test]
+    fn source_pair_keeps_request_and_inode_in_the_reviewed_slots() {
+        assert_eq!(size_of::<SourcePair>(), 128);
+        assert_eq!(align_of::<SourcePair>(), 8);
+        assert_eq!(offset_of!(SourcePair, request), 0);
+        assert_eq!(offset_of!(SourcePair, entry_inode), 112);
+        assert_eq!(offset_of!(SourcePair, state), 120);
+        assert!(!registration_succeeded(0));
+        assert!(!registration_succeeded(u64::MAX));
+        assert!(!registration_succeeded(u64::MAX - 4094));
+        assert!(registration_succeeded(u64::MAX - 4095));
+        assert!(registration_succeeded(1));
+    }
     #[test]
     fn joint_pending_bounds_preserve_reserved_pair_and_caller_limit() {
         assert_eq!(pending_claim_value(2, 3), Some(3));

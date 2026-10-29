@@ -6,8 +6,14 @@
 // actual 64-bit BPF atomic instructions, checked in the object receipt.
 #![feature(core_intrinsics)]
 #![allow(internal_features)]
+#[path = "../source_registration.rs"]
+mod source_registration;
 #[path = "../source_state.rs"]
 mod source_state;
+// Code policy is retained unchanged for the subsequent copied callback join.
+#[allow(dead_code)]
+#[path = "../source_vma.rs"]
+mod source_vma;
 #[path = "../writer_gate.rs"]
 mod writer_gate;
 use aya_ebpf::{

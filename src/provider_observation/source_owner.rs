@@ -18,17 +18,19 @@ use std::{
     time::Instant,
 };
 
-// Existing namespace/map owner plus two independently retained shared-map FDs.
-const HOST_OWNER_BYTES: usize = 4096 + 2 * crate::writer_gate::INJECTION_BYTES;
+// Existing namespace/map owner, two shared-map FDs and pairing/domain-map owners.
+const HOST_OWNER_BYTES: usize = 4096 + 4 * crate::writer_gate::INJECTION_BYTES;
 pub(super) const CONTROL_MAPS: [loader::MapSpec; 2] = [
     spec("ATTR_STATE", 2, 4, 64, 1),
     spec("SOURCE_CONFIG", 2, 4, 8, 1),
 ];
 // Private REL is available to BPF injection only, never a host readback surface.
-const MAPS: [loader::MapSpec; 5] = [
+pub(super) const MAPS: [loader::MapSpec; 7] = [
     spec("REL", 1, 48, 256, 8192),
     spec("SOURCE_GUARD", 1, 8, 16, 8192),
     spec("SOURCE_REQUEST", 1, 8, 112, 4096),
+    spec("SOURCE_PAIR", 2, 4, 128, 1),
+    spec("SOURCE_DOMAIN", 1, 4, 64, 64),
     spec("SOURCE_OBSERVER", 2, 4, 48, 1),
     spec("ITER_SLOT", 6, 4, 8, 1),
 ];
@@ -318,8 +320,8 @@ mod tests {
     #[test]
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
-        assert_eq!(map_reservation(16), Some(6_128_056));
-        assert_eq!(source_reservation(512, 16), Some(12_579_256));
+        assert_eq!(map_reservation(16), Some(6_271_932));
+        assert_eq!(source_reservation(512, 16), Some(12_731_324));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());
