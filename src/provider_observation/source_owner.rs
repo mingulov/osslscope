@@ -14,6 +14,8 @@ use crate::{loader, observation_memory::MemoryLease, writer_gate::WriterGate};
 #[allow(dead_code)]
 #[path = "../../crates/bpf-contract/src/source.rs"]
 pub(super) mod contract;
+#[cfg(test)]
+use contract::SourcePair;
 use contract::{SourceConfig, SourceControl, SourceDomain, SourceObserver, SourceRequest};
 use sha2::{Digest as _, Sha256};
 use std::{
@@ -576,6 +578,19 @@ impl SourceOwner {
         self.try_read_request(key)?
             .ok_or(ObservationGap::Invalidated)
     }
+    /// Disarm a completed synchronous request: delete its SOURCE_REQUEST row
+    /// after the terminal receipt validated. An absent row is the normal
+    /// unarmed state — unrelated registrations stay quiet — while a retained
+    /// completed row would refuse the next hook pair on this thread and
+    /// terminally poison SOURCE_PAIR. Success path only: incomplete/error
+    /// rows keep their terminal refusal and are never disarmed.
+    fn disarm_request(&self, key: u64) -> Result<(), ObservationGap> {
+        let map = self.map("SOURCE_REQUEST")?;
+        map.shape(&[1], 8, 112)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        map.delete(&key.to_ne_bytes())
+            .map_err(|_| ObservationGap::BpfUnavailable)
+    }
     /// Enable source mode 1 exactly once, before the gate opens. The control
     /// row must still be the exact PREPARED bytes (no writer fires before
     /// ADMIT opens); any drift refuses instead of read-modify-write racing a
@@ -695,6 +710,58 @@ impl SourceOwner {
     }
     pub(super) fn adopted_link_count(&self) -> usize {
         self._adopted.len()
+    }
+    /// Test-only unrelated-registration control: performs a real native
+    /// uprobe registration on the observer thread with no armed request and
+    /// returns its link (the caller drops it). Against a disarmed row the
+    /// hooks stay quiet; against a stale completed row they would refuse and
+    /// terminally poison SOURCE_PAIR. The cookie is outside every armed
+    /// site-cookie range, so this registration is unrelated by construction.
+    #[cfg(test)]
+    pub(super) fn fire_unrelated_registration(&self) -> Result<OwnedFd, ObservationGap> {
+        let program = self._roots.noop_program_fd()?;
+        let (pid, _, _) = Self::current_host_key()?;
+        let exe = std::env::current_exe().map_err(|_| ObservationGap::BackingUnavailable)?;
+        let path = std::ffi::CString::new(exe.as_os_str().as_encoded_bytes())
+            .map_err(|_| ObservationGap::Invalidated)?;
+        ossl_bpf_sys::link_create_uprobe_multi(program, &path, &[0], &[0x0BAD_F00D], pid)
+            .map_err(|_| ObservationGap::BpfUnavailable)
+    }
+    /// Test-only disarm readback: true when no SOURCE_REQUEST row exists for
+    /// the key (the normal unarmed state after a completed request disarms).
+    #[cfg(test)]
+    pub(super) fn request_absent_test(&self, key: u64) -> Result<bool, ObservationGap> {
+        Ok(self.try_read_request(key)?.is_none())
+    }
+    /// Test-only SOURCE_PAIR state readback (0 idle, 1 active, 2 terminal).
+    #[cfg(test)]
+    pub(super) fn pair_state_test(&self) -> Result<u64, ObservationGap> {
+        debug_assert_eq!(size_of::<SourcePair>(), 128);
+        let map = self.map("SOURCE_PAIR")?;
+        map.shape(&[2], 4, 128)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        let mut pair = SourcePair::default();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut((&mut pair as *mut SourcePair).cast::<u8>(), 128)
+        };
+        map.lookup(&0u32.to_ne_bytes(), bytes)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        Ok(pair.state)
+    }
+    /// Test-only SOURCE_OBSERVER state readback (2 observed).
+    #[cfg(test)]
+    pub(super) fn observer_state_test(&self) -> Result<u64, ObservationGap> {
+        debug_assert_eq!(size_of::<SourceObserver>(), 48);
+        let map = self.map("SOURCE_OBSERVER")?;
+        map.shape(&[2], 4, 48)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        let mut observer = SourceObserver::default();
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut((&mut observer as *mut SourceObserver).cast::<u8>(), 48)
+        };
+        map.lookup(&0u32.to_ne_bytes(), bytes)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        Ok(observer.state)
     }
     /// Post-hoc pre-open enablement receipts. Test-called only.
     #[allow(dead_code)]
@@ -924,7 +991,6 @@ impl SourceOwner {
         let (pid, _, _) = Self::current_host_key()?;
         self.invoke_provisional_trigger(pid)?;
         let row = self.read_request(scope.host_key)?;
-        drop(self._roots.take_provisional());
         if !request.same_input(&row) {
             self._last_error = Some(format!(
                 "anchor same-input: armed nonce {nonce:#x} anchor {anchor:#x} vs row nonce {:#x} anchor {:#x} phase {}",
@@ -943,6 +1009,11 @@ impl SourceOwner {
         }
         let receipt =
             AnchorReceipt::observed(anchor, nonce, row.entry_count, row.exit_count, row.verdict)?;
+        // Contract order: consume the terminal receipt, disarm the request,
+        // then release the provisional link. Failures above keep both the
+        // terminal row and provisional custody for final disposal.
+        self.disarm_request(scope.host_key)?;
+        drop(self._roots.take_provisional());
         let guard_fd = self.guard_fd()?;
         self._ledger
             .create_anchor_guarded(guard_fd, anchor, &receipt)?;
@@ -1065,6 +1136,7 @@ impl SourceOwner {
             row.verdict,
             true,
         )?;
+        self.disarm_request(scope.host_key)?;
         self._ledger
             .create_adoption_guarded(guard_fd, registration, &receipt)?;
         // RETURN kind: arms only with the adoption guard in PREPARING.
@@ -1108,6 +1180,7 @@ impl SourceOwner {
             row.verdict,
             true,
         )?;
+        self.disarm_request(scope.host_key)?;
         let adopted = AdoptedLinks::adopted(registration, anchor.anchor_id, anchor.epoch, 2)?;
         self._ledger.live_adoption(registration, &adopted)?;
         self._ledger.converge_guard_live(guard_fd, registration)?;
@@ -1158,7 +1231,6 @@ impl SourceOwner {
         let (pid, _, _) = Self::current_host_key()?;
         self.invoke_provisional_trigger(pid)?;
         let row = self.read_request(scope.host_key)?;
-        drop(self._roots.take_provisional());
         if !request.same_input(&row) {
             self._last_error = Some(format!(
                 "ready same-input: armed nonce {nonce:#x} vs row nonce {:#x} phase {}",
@@ -1188,6 +1260,10 @@ impl SourceOwner {
             row.verdict,
             row.publication_sequence,
         )?;
+        // Contract order: consume the terminal receipt, disarm the request,
+        // then release the provisional link.
+        self.disarm_request(scope.host_key)?;
+        drop(self._roots.take_provisional());
         self._order.note_ready(&self._ledger, nonce, &receipt)?;
         if !self._order.child_may_release() {
             return Err(ObservationGap::Invalidated);

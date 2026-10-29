@@ -3927,6 +3927,170 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         }
     }
     #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_disarm_keeps_unrelated_registrations_quiet_and_pairable() {
+        // P2-I2: every completed synchronous request disarms (its row is
+        // deleted). An unrelated native registration between source
+        // transactions and after READY stays quiet (PAIR never leaves 0,
+        // observer stays live), and every later legitimate request still
+        // pairs (each subsequent phase succeeds). Against a stale
+        // completed row the first control would refuse and terminally
+        // poison PAIR, failing the phase that follows it.
+        let baseline = source_native_fd_targets();
+        let mut setup = source_refusal_setup("disarm");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let params = super::source_owner::NativeSourceParams {
+            target: setup.app.clone(),
+            link_offset: setup.admitted_offset,
+            child_pid: pid,
+        };
+        let admitted = setup.session.admitted_source_site(&params).unwrap();
+        let entry_prog =
+            std::os::fd::AsRawFd::as_raw_fd(&setup.session.loaded.progs["observation_entry"]);
+        let return_prog =
+            std::os::fd::AsRawFd::as_raw_fd(&setup.session.loaded.progs["observation_return"]);
+        let (planned, anchor_hash) = {
+            let session = &mut setup.session;
+            let owner = session.source_owner.as_mut().expect("source owner");
+            let budget = &session.budget;
+            owner.note_gate_open_observed().unwrap();
+            let domain = owner.arm_domain(pid).unwrap();
+            let host_key = owner.enroll_observer().unwrap();
+            let scope = super::source_owner::RequestScope {
+                site_cookie: admitted.site_cookie,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+                link_offset: admitted.link_offset,
+                target_pid: admitted.tgid,
+                target: admitted.target,
+                expected_artifact: admitted.expected_artifact,
+            };
+            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
+                panic!(
+                    "anchor failed: {gap:?} owner: {:?}",
+                    owner.take_last_error()
+                )
+            });
+            assert!(
+                owner.request_absent_test(host_key).unwrap(),
+                "anchor must disarm its completed request"
+            );
+            assert_eq!(owner.pair_state_test().unwrap(), 0);
+            // Control A: unrelated registration between anchor and entry/return.
+            drop(owner.fire_unrelated_registration().unwrap());
+            assert_eq!(
+                owner.pair_state_test().unwrap(),
+                0,
+                "control A must stay quiet"
+            );
+            assert!(owner.request_absent_test(host_key).unwrap());
+            let registration = owner
+                .register_entry_return(&scope, entry_prog, return_prog, &anchor)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "entry/return failed after quiet control: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
+            assert!(
+                owner.request_absent_test(host_key).unwrap(),
+                "entry/return must disarm their completed requests"
+            );
+            // Control B: unrelated registration between adoption and READY.
+            drop(owner.fire_unrelated_registration().unwrap());
+            assert_eq!(
+                owner.pair_state_test().unwrap(),
+                0,
+                "control B must stay quiet"
+            );
+            let ready = owner
+                .publish_ready(&scope, &anchor, &registration)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "ready failed after quiet control: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
+            assert_ne!(ready, 0);
+            assert!(owner.acquisition_ready());
+            assert!(
+                owner.request_absent_test(host_key).unwrap(),
+                "ready must disarm its completed request"
+            );
+            // Control C: unrelated registration after READY.
+            drop(owner.fire_unrelated_registration().unwrap());
+            assert_eq!(
+                owner.pair_state_test().unwrap(),
+                0,
+                "control C must stay quiet"
+            );
+            assert_eq!(
+                owner.observer_state_test().unwrap(),
+                2,
+                "observer stays live through quiet controls"
+            );
+            assert_ne!(anchor.anchor_id, 0);
+            assert_ne!(registration.registration_id, 0);
+            assert_eq!(owner.adopted_link_count(), 2);
+            eprintln!("disarm controls quiet: pair=0 observer=2 adopted=2 ready_seq={ready}");
+            (domain.planned, anchor.hash)
+        };
+        // Independent anchor oracle: hash the target file directly.
+        let expected = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(std::fs::read(&setup.app).unwrap())
+        };
+        assert_eq!(anchor_hash, expected.as_slice());
+        // Release only after READY, then the independent workload oracle.
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            setup.child.poll_exit().unwrap(),
+            Some(0),
+            "workload must exit 0"
+        );
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(params);
+        let state = setup
+            .session
+            .note_source_exec(&lease, pid, planned)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (2, 0, 1)
+        );
+        assert!(
+            !close.order_refused,
+            "READY order must stay published at close"
+        );
+        assert!(close.first_error.is_none());
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]
     fn pooled_discovery_recovers_same_target_without_recharging_or_duplicate_admission() {
         use crate::capture::ClockPort;
