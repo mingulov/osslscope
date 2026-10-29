@@ -180,7 +180,7 @@ thread_local! {
 /// before candidate custody is released, including during unwinding/Drop.
 pub struct FocusedCounter {
     gate: crate::writer_gate::WriterGate,
-    loaded: loader::Loaded,
+    loaded: loader::GatedLoaded,
     namespace: File,
     expected_namespace: NamespaceId,
     pid: u32,

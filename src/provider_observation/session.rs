@@ -243,7 +243,7 @@ pub struct ProviderSession {
     final_drain: bool,
     final_refusals: BTreeMap<u32, ObservationGap>,
     final_terminal: BTreeSet<u32>,
-    loaded: loader::Loaded,
+    loaded: loader::GatedLoaded,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
     members: BpfMap<MapData, u32, c::Member>,

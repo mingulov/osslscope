@@ -187,6 +187,7 @@ fn fixup_prep(insns: Vec<u8>, off: usize) -> Prepared {
         }],
         progs: vec![PreparedProg {
             name: "dprobefix".to_string(),
+            section: "uprobe".into(),
             is_return: false,
             insns,
             map_fixups: vec![MapFixup {

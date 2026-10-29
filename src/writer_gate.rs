@@ -122,6 +122,15 @@ impl OwnedClosedGate {
         self.receipt
     }
 }
+/// Each global raw link retains the same gate owner and its accounted capacity.
+/// No caller can construct this owner from a numeric map/program identity.
+pub(crate) struct LifecycleWriter {
+    _link: OwnedFd,
+    _gate: WriterGate,
+    _reservation: MemoryLease,
+}
+const LIFECYCLE_RESERVATION_BYTES: usize = 32 << 10;
+
 struct Inner {
     #[cfg(test)]
     fail_delete: std::cell::Cell<bool>,
@@ -198,6 +207,34 @@ impl WriterGate {
             injections: RefCell::new(Vec::new()),
             pool: pool.clone(),
         })))
+    }
+    pub(crate) fn preparing(&self) -> bool {
+        matches!(*self.0.state.borrow(), GateState::Setup)
+    }
+    pub(crate) fn attach_lifecycle(
+        &self,
+        program: &OwnedFd,
+        root: ossl_bpf_sys::LifecycleTracepoint,
+    ) -> io::Result<LifecycleWriter> {
+        if !self.preparing() {
+            return Err(io::Error::other("lifecycle writers require unopened gate"));
+        }
+        let reservation = self
+            .0
+            .pool
+            .reserve(LIFECYCLE_RESERVATION_BYTES)
+            .ok_or_else(|| io::Error::other("lifecycle writer reservation refused"))?;
+        self.attest(program)?;
+        if ossl_bpf_sys::prog_type(program.as_raw_fd())? != 17 {
+            return Err(io::Error::other("lifecycle program type mismatch"));
+        }
+        crate::lifecycle_producer::note_acquisition().map_err(io::Error::other)?;
+        let link = ossl_bpf_sys::raw_tracepoint_open(program.as_raw_fd(), root)?;
+        Ok(LifecycleWriter {
+            _link: link,
+            _gate: self.clone(),
+            _reservation: reservation,
+        })
     }
     pub(crate) fn open(&self) -> io::Result<Duration> {
         let start = Instant::now();
@@ -350,6 +387,29 @@ mod tests {
             pool.peak()
         );
     }
+    #[test]
+    fn lifecycle_attachment_refuses_budget_and_open_gate_before_syscalls() {
+        HOST_GATE_CREATES.with(|count| count.set(Some(0)));
+        let pool = MemoryPool::new(RESERVATION_BYTES);
+        let gate = WriterGate::create(&pool).unwrap();
+        HOST_GATE_CREATES.with(|count| count.set(None));
+        let program: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        assert!(gate.preparing());
+        let error = gate
+            .attach_lifecycle(&program, ossl_bpf_sys::LifecycleTracepoint::Exit)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "lifecycle writer reservation refused");
+        assert_eq!(pool.peak(), RESERVATION_BYTES);
+        *gate.0.state.borrow_mut() = GateState::Open;
+        let error = gate
+            .attach_lifecycle(&program, ossl_bpf_sys::LifecycleTracepoint::Exec)
+            .err()
+            .unwrap();
+        assert_eq!(error.to_string(), "lifecycle writers require unopened gate");
+        assert_eq!(pool.peak(), RESERVATION_BYTES);
+    }
+
     #[test]
     fn closed_capability_rejects_another_owner_with_the_same_numeric_map_id() {
         HOST_GATE_CREATES.with(|count| count.set(Some(0)));

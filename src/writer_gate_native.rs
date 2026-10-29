@@ -31,8 +31,8 @@ extern "C" fn osslscope_native_cut_callback(block: u32) -> i32 {
 }
 struct Producers {
     gate: WriterGate,
-    count: loader::Loaded,
-    provider: loader::Loaded,
+    count: loader::GatedLoaded,
+    provider: loader::GatedLoaded,
     links: Vec<OwnedFd>,
     cpus: usize,
 }
@@ -571,9 +571,17 @@ fn native_gate_cost_against_historical_rust_count_and_resource_release() {
             [true, false]
         } {
             let gate = gated.then(|| WriterGate::create(&pool).unwrap());
-            let loaded = match &gate {
-                Some(g) => loader::load_gated(&current, g).unwrap(),
-                None => loader::load(&baseline).unwrap(),
+            let gated_owner;
+            let baseline_owner;
+            let loaded: &loader::Loaded = match &gate {
+                Some(g) => {
+                    gated_owner = loader::load_gated(&current, g).unwrap();
+                    &gated_owner
+                }
+                None => {
+                    baseline_owner = loader::load(&baseline).unwrap();
+                    &baseline_owner
+                }
             };
             let write = |name: &str, key: u32, bytes: &[u8]| {
                 loader::BorrowedMap::new(loaded.maps[name].as_fd())

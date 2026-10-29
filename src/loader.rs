@@ -69,6 +69,42 @@ impl ProgSpec {
     }
 }
 
+/// Exact synchronous lifecycle writer roots; their programs read no ctx fields.
+pub const LIFECYCLE_PROGS: [ProgSpec; 2] = [
+    ProgSpec {
+        name: "attr_exit",
+        section: "raw_tracepoint/sched_process_exit",
+    },
+    ProgSpec {
+        name: "attr_exec",
+        section: "raw_tracepoint/sched_process_exec",
+    },
+];
+fn selected_lifecycle(name: &str, section: &str) -> Option<ossl_bpf_sys::LifecycleTracepoint> {
+    [
+        ossl_bpf_sys::LifecycleTracepoint::Exit,
+        ossl_bpf_sys::LifecycleTracepoint::Exec,
+    ]
+    .into_iter()
+    .find(|r| r.program_name() == name && r.section() == section)
+}
+fn lifecycle_root(p: &PreparedProg) -> anyhow::Result<Option<ossl_bpf_sys::LifecycleTracepoint>> {
+    if matches!(p.section.as_str(), "uprobe" | "uretprobe") {
+        anyhow::ensure!(
+            p.is_return == (p.section == "uretprobe"),
+            "program return kind mismatch"
+        );
+        return Ok(None);
+    }
+    let root = selected_lifecycle(&p.name, &p.section)
+        .ok_or_else(|| anyhow::anyhow!("unreviewed raw program kind"))?;
+    anyhow::ensure!(
+        !p.is_return && !p.subprogs.iter().any(|s| s.is_callback),
+        "raw lifecycle forbids return mode and callback BTF"
+    );
+    Ok(Some(root))
+}
+
 /// Adopted v4 shared declarations. Admission only; no load/attach authority.
 pub const IDENTITY_MAPS: [MapSpec; 6] = [
     MapSpec {
@@ -1138,6 +1174,8 @@ pub struct MapFixup {
 /// relocs applied) + map fixups for `load()`.
 pub struct PreparedProg {
     pub name: String,
+    /// Preserved for exact load-type selection; raw identity declarations are admission-only.
+    pub section: String,
     pub is_return: bool,
     pub insns: Vec<u8>,
     pub map_fixups: Vec<MapFixup>,
@@ -1168,6 +1206,19 @@ pub struct MapSpecLite {
 pub struct Loaded {
     pub progs: HashMap<String, OwnedFd>,
     pub maps: HashMap<String, OwnedFd>,
+}
+
+/// Local gated pipeline owner. Legacy cross-thread loading remains Send;
+/// synchronous global links retain the actual local shared gate separately.
+pub(crate) struct GatedLoaded {
+    lifecycle: Vec<crate::writer_gate::LifecycleWriter>,
+    loaded: Loaded,
+}
+impl std::ops::Deref for GatedLoaded {
+    type Target = Loaded;
+    fn deref(&self) -> &Loaded {
+        &self.loaded
+    }
 }
 
 struct Sym {
@@ -1686,8 +1737,11 @@ fn prepare_sections(
         }
         if n.starts_with("raw_tracepoint")
             && !(raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == n))
+            && !progs
+                .iter()
+                .any(|p| p.section == n && selected_lifecycle(p.name, p.section).is_some())
         {
-            anyhow::bail!("raw sections are exclusive to the four identity programs");
+            anyhow::bail!("unselected raw tracepoint section");
         }
     }
     // License: .license governs when present (must be GPL-compatible),
@@ -1850,6 +1904,7 @@ fn prepare_sections(
             "uprobe" => false,
             "uretprobe" => true,
             s if raw_identity && IDENTITY_PROGS.iter().any(|p| p.section == s) => false,
+            s if selected_lifecycle(p.name, s).is_some() => false,
             s => anyhow::bail!("prog {}: bad section {s}", p.name),
         };
         let sec = sec_bytes(&elf, obj, p.section)?;
@@ -2118,6 +2173,7 @@ fn prepare_sections(
         }
         out.push(PreparedProg {
             name: p.name.to_string(),
+            section: p.section.to_string(),
             is_return,
             insns,
             map_fixups: fixups,
@@ -2367,6 +2423,7 @@ fn load_prog(
     )>,
 ) -> anyhow::Result<OwnedFd> {
     use anyhow::Context as _;
+    let raw_root = lifecycle_root(p)?;
     let mut insns = p.insns.clone();
     for f in &p.map_fixups {
         // Full 16-byte range first (checked: `Prepared` fields
@@ -2435,27 +2492,31 @@ fn load_prog(
     if let Some((links, stage)) = setup {
         links.check_owned(stage)?;
     }
-    let fd = match ossl_bpf_sys::prog_load_kprobe_quiet(
-        &insns,
-        license,
-        None,
-        &p.name,
-        prog_btf(&btf_fd),
-    ) {
+    let quiet = match raw_root {
+        Some(root) => ossl_bpf_sys::prog_load_lifecycle(&insns, root, None),
+        None => {
+            ossl_bpf_sys::prog_load_kprobe_quiet(&insns, license, None, &p.name, prog_btf(&btf_fd))
+        }
+    };
+    let fd = match quiet {
         Ok(fd) => fd,
         Err(_) => {
             if let Some((links, stage)) = setup {
                 links.check_owned(stage)?;
             }
             let mut log = vec![0u8; 4 << 20];
-            match ossl_bpf_sys::prog_load_kprobe(
-                &insns,
-                license,
-                None,
-                &mut log,
-                &p.name,
-                prog_btf(&btf_fd),
-            ) {
+            let logged = match raw_root {
+                Some(root) => ossl_bpf_sys::prog_load_lifecycle(&insns, root, Some(&mut log)),
+                None => ossl_bpf_sys::prog_load_kprobe(
+                    &insns,
+                    license,
+                    None,
+                    &mut log,
+                    &p.name,
+                    prog_btf(&btf_fd),
+                ),
+            };
+            match logged {
                 Ok(fd) => fd,
                 Err(e) => {
                     let full = trim_nul(&log);
@@ -2500,19 +2561,46 @@ pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
 pub(crate) fn load_gated(
     prep: &Prepared,
     gate: &crate::writer_gate::WriterGate,
-) -> anyhow::Result<Loaded> {
+) -> anyhow::Result<GatedLoaded> {
     anyhow::ensure!(
         prep.maps.iter().filter(|m| m.name == "ADMIT").count() == 1,
         "missing shared writer map"
     );
     anyhow::ensure!(
-        prep.progs.iter().all(|p| matches!(
+        prep.progs.iter().all(|p| ((matches!(
             p.name.as_str(),
             "count_entry" | "observation_entry" | "observation_return"
-        ) && p.map_fixups.iter().any(|f| f.map == "ADMIT")),
+        ) && matches!(p.section.as_str(), "uprobe" | "uretprobe"))
+            || selected_lifecycle(&p.name, &p.section).is_some())
+            && p.map_fixups.iter().any(|f| f.map == "ADMIT")),
         "ungated producer root"
     );
-    load_with_custody(prep, None, Some(gate))
+    for root in [
+        ossl_bpf_sys::LifecycleTracepoint::Exit,
+        ossl_bpf_sys::LifecycleTracepoint::Exec,
+    ] {
+        anyhow::ensure!(
+            prep.progs
+                .iter()
+                .filter(|p| p.name == root.program_name())
+                .count()
+                <= 1,
+            "duplicate lifecycle root"
+        );
+    }
+    let loaded = load_with_custody(prep, None, Some(gate))?;
+    let mut owned = GatedLoaded {
+        lifecycle: Vec::new(),
+        loaded,
+    };
+    for p in &prep.progs {
+        if let Some(root) = lifecycle_root(p)? {
+            let writer = gate.attach_lifecycle(&owned.loaded.progs[&p.name], root)?;
+            // Link reservation already covers this at-most-two-element owner vector.
+            owned.lifecycle.push(writer);
+        }
+    }
+    Ok(owned)
 }
 pub(crate) fn load_controlled(
     prep: &Prepared,
@@ -2581,6 +2669,15 @@ fn load_with_custody(
         gate.is_some() || !prep.maps.iter().any(|m| m.name == "ADMIT"),
         "shared writer map requires typed injection"
     );
+    for p in &prep.progs {
+        if lifecycle_root(p)?.is_some() {
+            anyhow::ensure!(gate.is_some(), "lifecycle root requires shared gate");
+            anyhow::ensure!(
+                gate.is_some_and(|g| g.preparing()),
+                "lifecycle root requires unopened gate"
+            );
+        }
+    }
     crate::lifecycle_producer::note_acquisition()?;
     use anyhow::Context as _;
     let loaded = Loaded {
@@ -2666,6 +2763,12 @@ pub fn load_keep_good(prep: &Prepared) -> anyhow::Result<(Loaded, Vec<FailedProg
     );
     crate::lifecycle_producer::note_acquisition()?;
     use anyhow::Context as _;
+    for p in &prep.progs {
+        anyhow::ensure!(
+            lifecycle_root(p)?.is_none(),
+            "lifecycle root requires shared gate"
+        );
+    }
     let mut maps = HashMap::new();
     for m in &prep.maps {
         let fd = ossl_bpf_sys::map_create(
@@ -4875,6 +4978,46 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_loader_refuses_unreviewed_kind_and_ungated_acquisition() {
+        let mut p = PreparedProg {
+            name: "attr_exit".into(),
+            section: "raw_tracepoint/sched_process_exit".into(),
+            is_return: false,
+            insns: vec![0x95, 0, 0, 0, 0, 0, 0, 0],
+            map_fixups: Vec::new(),
+            subprogs: Vec::new(),
+        };
+        assert_eq!(
+            lifecycle_root(&p).unwrap(),
+            Some(ossl_bpf_sys::LifecycleTracepoint::Exit)
+        );
+        p.name = "identity_exit".into();
+        assert!(lifecycle_root(&p).is_err());
+        p.name = "attr_exit".into();
+        p.is_return = true;
+        assert!(lifecycle_root(&p).is_err());
+        p.is_return = false;
+        p.subprogs.push(SubprogInfo {
+            name: "callback".into(),
+            insn_off: 1,
+            is_callback: true,
+        });
+        assert!(lifecycle_root(&p).is_err());
+        p.subprogs.clear();
+        let error = load(&Prepared {
+            progs: vec![p],
+            maps: Vec::new(),
+        })
+        .err()
+        .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("lifecycle root requires shared gate")
+        );
+    }
+
+    #[test]
     fn load_rejects_huge_fixup_off_caps_free() {
         // `Prepared` fields are public: a hand-built fixup at
         // `MAX-7` (aligned) must ERR, not panic on `off + 8`
@@ -4884,6 +5027,7 @@ mod tests {
             maps: Vec::new(),
             progs: vec![PreparedProg {
                 name: "p".to_string(),
+                section: "uprobe".into(),
                 is_return: false,
                 insns: vec![0u8; 32],
                 map_fixups: vec![MapFixup {

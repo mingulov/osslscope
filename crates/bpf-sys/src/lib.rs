@@ -274,6 +274,25 @@ pub unsafe fn writer_gate_delete(outer: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+/// Stable bpf_prog_info prefix: actual program type and ID only.
+pub fn prog_type(fd: RawFd) -> io::Result<u32> {
+    let mut info = [0u32; 2];
+    let mut attr = InfoAttr {
+        bpf_fd: fd as u32,
+        info_len: 8,
+        info: info.as_mut_ptr() as u64,
+    };
+    bpf(
+        BPF_OBJ_GET_INFO_BY_FD,
+        std::ptr::addr_of_mut!(attr).cast(),
+        size_of::<InfoAttr>(),
+    )?;
+    if attr.info_len < 8 || info[1] == 0 {
+        return Err(io::Error::other("program type unavailable"));
+    }
+    Ok(info[0])
+}
+
 /// Finite kernel map identities only. No program text, pointers or map values.
 pub fn prog_map_ids(fd: RawFd) -> io::Result<Vec<u32>> {
     let mut ids = [0u32; 64];
@@ -564,6 +583,108 @@ pub fn prog_load_kprobe(
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// Reviewed synchronous roots. No arbitrary event name, BTF attachment,
+/// sleepable flag, token, target PID, cookie, or tracepoint context read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LifecycleTracepoint {
+    Exit,
+    Exec,
+}
+impl LifecycleTracepoint {
+    pub const fn tracepoint_name(self) -> &'static CStr {
+        match self {
+            Self::Exit => c"sched_process_exit",
+            Self::Exec => c"sched_process_exec",
+        }
+    }
+    pub const fn program_name(self) -> &'static str {
+        match self {
+            Self::Exit => "attr_exit",
+            Self::Exec => "attr_exec",
+        }
+    }
+    pub const fn section(self) -> &'static str {
+        match self {
+            Self::Exit => "raw_tracepoint/sched_process_exit",
+            Self::Exec => "raw_tracepoint/sched_process_exec",
+        }
+    }
+}
+
+/// Load only the reviewed non-sleepable raw lifecycle type. Optional logging
+/// changes diagnostics only; the complete remaining load attributes stay zero.
+pub fn prog_load_lifecycle(
+    insns: &[u8],
+    root: LifecycleTracepoint,
+    log: Option<&mut [u8]>,
+) -> io::Result<OwnedFd> {
+    prog_load_lifecycle_with(insns, root, log, |attr| {
+        bpf(
+            BPF_PROG_LOAD,
+            std::ptr::from_mut(attr).cast(),
+            size_of::<ProgAttr>(),
+        )
+    })
+}
+fn prog_load_lifecycle_with(
+    insns: &[u8],
+    root: LifecycleTracepoint,
+    log: Option<&mut [u8]>,
+    call: impl FnOnce(&mut ProgAttr) -> io::Result<i32>,
+) -> io::Result<OwnedFd> {
+    if insns.is_empty() || insns.len() % 8 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw instruction stride",
+        ));
+    }
+    let mut attr: ProgAttr = zeroed();
+    attr.prog_type = 17; // BPF_PROG_TYPE_RAW_TRACEPOINT; not writable-raw/TRACING.
+    attr.insn_cnt = u32::try_from(insns.len() / 8)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "raw instruction count"))?;
+    attr.insns = insns.as_ptr() as u64;
+    attr.license = c"GPL".as_ptr() as u64;
+    let name = root.program_name().as_bytes();
+    attr.prog_name[..name.len()].copy_from_slice(name);
+    if let Some(log) = log {
+        attr.log_level = 1;
+        attr.log_size = u32::try_from(log.len())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "raw log size"))?;
+        attr.log_buf = log.as_mut_ptr() as u64;
+    }
+    let fd = call(&mut attr)?;
+    // SAFETY: successful BPF_PROG_LOAD returns a fresh descriptor.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// Attach a global lifecycle program and retain the returned descriptor for the
+/// entire writer lifetime. Caller must retain/attest its actual shared gate.
+pub fn raw_tracepoint_open(prog_fd: RawFd, root: LifecycleTracepoint) -> io::Result<OwnedFd> {
+    raw_tracepoint_open_with(prog_fd, root, |cmd, attr| {
+        bpf(cmd, attr.as_mut_ptr().cast(), attr.len())
+    })
+}
+fn raw_tracepoint_open_with(
+    prog_fd: RawFd,
+    root: LifecycleTracepoint,
+    call: impl FnOnce(u32, &mut [u8; 16]) -> io::Result<i32>,
+) -> io::Result<OwnedFd> {
+    if prog_fd < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw program descriptor",
+        ));
+    }
+    // Exact legacy UAPI prefix: name@0, prog_fd@8; all trailing bytes zero.
+    // Do not send the later raw-tracepoint cookie field to older kernels.
+    let mut attr = [0u8; 16];
+    attr[..8].copy_from_slice(&(root.tracepoint_name().as_ptr() as u64).to_ne_bytes());
+    attr[8..12].copy_from_slice(&(prog_fd as u32).to_ne_bytes());
+    let fd = call(17, &mut attr)?; // BPF_RAW_TRACEPOINT_OPEN.
+    // SAFETY: successful open returns a fresh, unique global attachment FD.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
 /// One uprobe_multi link: `offsets[i]` fires with `cookies[i]`.
 pub fn link_create_uprobe_multi(
     prog_fd: RawFd,
@@ -688,6 +809,62 @@ mod tests {
     use std::sync::Mutex;
 
     static G1_FD_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn lifecycle_load_has_exact_non_sleepable_raw_attributes() {
+        for root in [LifecycleTracepoint::Exit, LifecycleTracepoint::Exec] {
+            let code = [0x95, 0, 0, 0, 0, 0, 0, 0];
+            let error = prog_load_lifecycle_with(&code, root, None, |attr| {
+                assert_eq!(attr.prog_type, 17);
+                assert_eq!(attr.expected_attach_type, 0);
+                assert_eq!(attr.prog_flags, 0);
+                assert_eq!(attr.prog_btf_fd, 0);
+                assert_eq!(attr.attach_btf_id, 0);
+                assert_eq!(attr.attach_prog_fd, 0);
+                assert_eq!(attr.prog_token_fd, 0);
+                assert_eq!(attr.func_info, 0);
+                assert_eq!(attr.func_info_cnt, 0);
+                assert_eq!(attr.insn_cnt, 1);
+                assert_eq!(attr.insns, code.as_ptr() as u64);
+                assert_eq!(attr.log_level, 0);
+                assert_eq!(attr.log_size, 0);
+                assert_eq!(attr.log_buf, 0);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        }
+        for code in [&[][..], &[0; 7][..]] {
+            assert!(
+                prog_load_lifecycle_with(code, LifecycleTracepoint::Exit, None, |_| panic!(
+                    "invalid input reached syscall"
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_open_uses_constant_name_and_zero_trailing_fields() {
+        for (root, name) in [
+            (LifecycleTracepoint::Exit, c"sched_process_exit"),
+            (LifecycleTracepoint::Exec, c"sched_process_exec"),
+        ] {
+            assert_eq!(root.tracepoint_name(), name);
+            let error = raw_tracepoint_open_with(123, root, |cmd, attr| {
+                assert_eq!(cmd, 17);
+                assert_eq!(
+                    u64::from_ne_bytes(attr[..8].try_into().unwrap()),
+                    name.as_ptr() as u64
+                );
+                assert_eq!(u32::from_ne_bytes(attr[8..12].try_into().unwrap()), 123);
+                assert_eq!(&attr[12..], &[0; 4]);
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+    }
 
     #[test]
     fn map_freeze_uses_four_byte_fd_attribute_and_preserves_error() {
