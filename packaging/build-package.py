@@ -3,8 +3,8 @@
 """Construct matched five-role development packages from a clean pinned build.
 
 No compilation, installation, acquisition or privilege changes. Output must be
-fresh. Source and dependency notices accompany each set; publication and final
-source/license/platform qualification are separate release gates.
+fresh. Source payloads and dependency/runtime notices accompany each set.
+Publication and final source/license/platform qualification are separate gates.
 """
 import argparse
 import gzip
@@ -18,6 +18,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import tomllib
@@ -25,6 +26,8 @@ import tomllib
 NAMES = ('osslscope', 'osslscope-harvest', 'osslscope-count', 'osslscope-members',
          'osslscope-provider-observation', 'osslscope-focused-count')
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(Path(__file__).resolve().parent))
+from source_payload import validate_runtime_binding
 
 
 def canonical(value):
@@ -107,6 +110,7 @@ def select_artifacts(manifest, revision, tree):
         selected[name] = entry
     if set(selected) != set(NAMES):
         raise ValueError('five BPF roles and CLI required')
+    validate_runtime_binding(manifest.get('bpf_runtime_source'), list(selected.values()))
     return selected
 
 
@@ -147,6 +151,13 @@ def run(argv, **kwargs):
     return subprocess.check_output(argv, **kwargs)
 
 
+def pinned_rustc(toolchain):
+    compiler = run(['rustup','which','--toolchain',toolchain,'rustc']).decode().strip()
+    if not Path(compiler).is_absolute() or not Path(compiler).is_file():
+        raise ValueError('cannot resolve pinned metadata compiler')
+    return compiler
+
+
 def source_identity():
     if run(['git', '-C', str(ROOT), 'rev-parse', '--show-toplevel']).decode().strip() != str(ROOT):
         raise ValueError('source must be the product repository')
@@ -183,7 +194,8 @@ def dependency_notices():
     """
     graphs, texts = [], {}
     for label, manifest, toolchain in [('host', ROOT/'Cargo.toml', '1.88.0'), ('bpf', ROOT/'crates/ebpf/Cargo.toml', 'nightly-2026-05-20')]:
-        metadata = json.loads(run(['cargo', '+'+toolchain, 'metadata', '--locked', '--offline', '--format-version', '1', '--manifest-path', str(manifest)], cwd=manifest.parent))
+        compiler = pinned_rustc(toolchain)
+        metadata = json.loads(run(['cargo', '+'+toolchain, '--config', 'unstable.host-config=false', '--config', 'unstable.target-applies-to-host=false', 'metadata', '--locked', '--offline', '--format-version', '1', '--manifest-path', str(manifest)], cwd=manifest.parent, env=dict(os.environ,RUSTC=compiler,CARGO_BUILD_RUSTC=compiler,CARGO_ENCODED_RUSTFLAGS='',RUSTFLAGS='',CARGO_UNSTABLE_HOST_CONFIG='false',CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST='false')))
         lock = tomllib.loads((manifest.parent/'Cargo.lock').read_text())
         checksums = {(p['name'], p['version']): p.get('checksum') for p in lock['package']}
         identifiers = {p['id']: p['name']+'@'+p['version'] for p in metadata['packages']}
@@ -276,6 +288,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--manifest', type=Path, default=ROOT/'target/dev-build-manifest.json')
     parser.add_argument('--output', type=Path, required=True, help='fresh directory; never overwritten')
+    parser.add_argument('--source-archives', type=Path, required=True, help='directory of original locked .crate and pinned rust-src archives; no downloads')
     parser.add_argument('--formats', default='tar,deb,rpm')
     parser.add_argument('--prefix', default='/usr', help='receipt binds this final absolute prefix; DEB/RPM require /usr')
     parser.add_argument('--revision', default='1', help='DEB revision/RPM release for lifecycle controls')
@@ -302,12 +315,26 @@ def main():
             raise ValueError('unsupported package version')
         epoch = int(run(['git','-C',str(ROOT),'show','-s','--format=%ct',revision]))
         notices, notice_texts = dependency_notices()
+        from source_payload import stage_payload
+        runtime_pins = json.loads((ROOT/'packaging/runtime-sources.json').read_bytes(), object_pairs_hook=no_duplicates)
+        for component in runtime_pins['components']:
+            compiler_version = run([pinned_rustc(component['toolchain']), '-vV']).decode()
+            if 'commit-hash: '+component['rust_revision']+'\n' not in compiler_version:
+                raise ValueError('runtime compiler revision needs source review')
         with tempfile.TemporaryDirectory(prefix='.osslscope-package-', dir=args.output.parent) as tmp:
             work = Path(tmp)
             result = work/'result'
             result.mkdir()
             source = result/f'osslscope-{version}-source.tar'
             run(['git','-C',str(ROOT),'archive','--format=tar',f'--output={source}',revision])
+            payload = work/'accompanying-source'
+            payload_manifest = stage_payload(ROOT, args.source_archives, payload, source, revision, tree,
+                                             [artifacts[name] for name in NAMES], notices, notice_texts, manifest['bpf_runtime_source'])
+            accompanying = result/f'osslscope-{version}-accompanying-source.tar.gz'
+            archive_tree(payload, accompanying, epoch)
+            accompanying_info = {'archive':accompanying.name,'bytes':accompanying.stat().st_size,
+                                 'sha256':sha(accompanying.read_bytes()),
+                                 'manifest_sha256':sha(canonical(payload_manifest))}
             stage = work/'prefix'
             receipt = stage_artifacts(stage, args.prefix, manifest, artifacts)
             docs = stage/'share/doc/osslscope'
@@ -315,6 +342,9 @@ def main():
             for name in ('docs/install.md', 'docs/licensing.md', 'NOTICE.md', 'LICENSE', 'LICENSES/GPL-2.0-only.txt'):
                 shutil.copyfile(ROOT/name, docs/Path(name).name)
             (docs/'dependency-notices.json').write_bytes(canonical(notices))
+            shutil.copytree(payload/'runtime-notices', docs/'runtime-notices')
+            (docs/'accompanying-source-manifest.json').write_bytes(canonical(payload_manifest))
+            shutil.copyfile(ROOT/'packaging/SOURCE-README.md', docs/'SOURCE-README.md')
             for name, data in notice_texts.items():
                 path = docs/'dependency-notices'/name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -322,7 +352,8 @@ def main():
             source_info = {'schema':'osslscope-source-availability-v1', 'product_ref': revision, 'product_tree': tree,
                            'archive':source.name, 'sha256':sha(source.read_bytes()),
                            'dependency_sources':'dependency-notices.json',
-                           'qualification':'development construction; final source/rights and installed platform qualification pending'}
+                           'accompanying_source':accompanying_info,
+                           'qualification':'development construction with accompanying source payload; final rights, reproducibility and installed platform qualification pending'}
             (docs/'source-availability.json').write_bytes(canonical(source_info))
             # Normalize all package content independent of caller umask.
             for path in stage.rglob('*'):
@@ -353,7 +384,7 @@ def main():
                 raise
         print(args.output)
         return 0
-    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, KeyError, TypeError, subprocess.CalledProcessError, tarfile.TarError) as error:
         parser.exit(1, f'package construction refused: {error}\n')
 
 
