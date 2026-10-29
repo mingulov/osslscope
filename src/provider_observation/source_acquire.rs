@@ -476,6 +476,11 @@ impl GuardLedger {
             .get(&id)
             .is_some_and(|g| g.life == GuardLife::Live)
     }
+    /// The anchor a registration was minted under. The acquisition order uses
+    /// this to prove an adoption belongs to its stored anchor.
+    pub(super) fn registration_anchor(&self, id: u64) -> Option<u64> {
+        self.registrations.get(&id).map(|guard| guard.anchor_id)
+    }
 }
 
 /// Proof that the host holds the original pre-exec child for one TGID, so
@@ -610,9 +615,15 @@ impl DomainIndex {
 
 /// After-open acquisition order. Legacy resources are fully reserved before
 /// the gate opens; after the open the observer enrolls, sources anchor, the
-/// sole required target links are adopted, and post-adoption READY publishes
+/// required target links are adopted, and post-adoption READY publishes
 /// before the held child is released. Every step is one-way; any failure
 /// refuses the acquisition without disturbing legacy facts.
+///
+/// The order retains the selected anchor and every required capability: READY
+/// must bind the STORED registration whose links were adopted, never a
+/// caller-supplied expectation. Multiple required capabilities are listed
+/// individually — never a singleton that silently serializes them — and the
+/// child releases only once READY has published for every listed capability.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum AcquisitionStage {
     LegacyReserved,
@@ -623,8 +634,17 @@ pub(super) enum AcquisitionStage {
     ReadyPublished,
     Refused,
 }
+/// One explicitly required capability: its adopted registration plus whether
+/// post-adoption READY has published for exactly that registration.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RequiredCapability {
+    registration: u64,
+    ready: bool,
+}
 pub(super) struct AcquisitionOrder {
     stage: AcquisitionStage,
+    anchor: Option<u64>,
+    capabilities: Vec<RequiredCapability>,
 }
 // Phase-2 native lease: transitions run only from the future after-open
 // acquisition path, after source/artifact review plus explicit lease.
@@ -633,6 +653,8 @@ impl AcquisitionOrder {
     pub(super) fn new() -> Self {
         Self {
             stage: AcquisitionStage::LegacyReserved,
+            anchor: None,
+            capabilities: Vec::new(),
         }
     }
     pub(super) fn note_gate_open(&mut self) -> Result<(), ObservationGap> {
@@ -659,6 +681,8 @@ impl AcquisitionOrder {
         self.stage = AcquisitionStage::ObserverEnrolled;
         Ok(())
     }
+    /// Select the LIVE anchor for this acquisition and retain it. Every
+    /// later adoption must belong to this stored anchor.
     pub(super) fn note_anchored(
         &mut self,
         ledger: &GuardLedger,
@@ -667,42 +691,85 @@ impl AcquisitionOrder {
         if self.stage != AcquisitionStage::ObserverEnrolled || !ledger.anchor_live(anchor_id) {
             return Err(ObservationGap::Invalidated);
         }
+        self.anchor = Some(anchor_id);
         self.stage = AcquisitionStage::SourceAnchored;
         Ok(())
     }
+    /// Adopt one LIVE registration into the stored capability set. The
+    /// adoption must belong to the STORED anchor (ledger relationship, not
+    /// caller assertion) and must not already be listed. Repeat for each
+    /// required capability; the stage stays LinksAdopted until every listed
+    /// capability is READY.
     pub(super) fn note_links_adopted(
         &mut self,
         ledger: &GuardLedger,
         registration_id: u64,
     ) -> Result<(), ObservationGap> {
-        if self.stage != AcquisitionStage::SourceAnchored || !ledger.adoption_live(registration_id)
+        let Some(anchor) = self.anchor else {
+            return Err(ObservationGap::Invalidated);
+        };
+        if (self.stage != AcquisitionStage::SourceAnchored
+            && self.stage != AcquisitionStage::LinksAdopted)
+            || !ledger.adoption_live(registration_id)
+            || ledger.registration_anchor(registration_id) != Some(anchor)
+            || self
+                .capabilities
+                .iter()
+                .any(|cap| cap.registration == registration_id)
+            || self.capabilities.len() >= MAX_REGISTRATION_GUARDS
         {
             return Err(ObservationGap::Invalidated);
         }
+        self.capabilities.push(RequiredCapability {
+            registration: registration_id,
+            ready: false,
+        });
         self.stage = AcquisitionStage::LinksAdopted;
         Ok(())
     }
     /// READY publishes only after adoption, consuming the exact phase-4
-    /// receipt: matching nonce and registration, one completed hook pair, a
-    /// success verdict, and a nonzero publication sequence older than every
-    /// consuming callback entry.
+    /// receipt: matching armed nonce, one completed hook pair, a success
+    /// verdict, and a nonzero publication sequence older than every
+    /// consuming callback entry. The receipt MUST name a STORED adopted
+    /// registration — there is no caller-supplied registration expectation
+    /// to substitute — and that adoption must still be LIVE under the
+    /// stored anchor. The order publishes only once every listed capability
+    /// is READY. (The armed phase-4 nonce still arrives from the caller that
+    /// armed it; the order never arms nonces, so identity alone is stored.)
     pub(super) fn note_ready(
         &mut self,
+        ledger: &GuardLedger,
         expected_nonce: u64,
-        expected_registration: u64,
         receipt: &ReadyReceipt,
     ) -> Result<(), ObservationGap> {
+        let Some(anchor) = self.anchor else {
+            return Err(ObservationGap::Invalidated);
+        };
         if self.stage != AcquisitionStage::LinksAdopted
             || receipt.nonce != expected_nonce
-            || receipt.registration_id != expected_registration
             || receipt.entry_count != 1
             || receipt.exit_count != 1
             || receipt.verdict != VERDICT_SUCCESS
             || receipt.sequence == 0
+            || !ledger.adoption_live(receipt.registration_id)
+            || ledger.registration_anchor(receipt.registration_id) != Some(anchor)
         {
             return Err(ObservationGap::Invalidated);
         }
-        self.stage = AcquisitionStage::ReadyPublished;
+        let Some(cap) = self
+            .capabilities
+            .iter_mut()
+            .find(|cap| cap.registration == receipt.registration_id)
+        else {
+            return Err(ObservationGap::Invalidated);
+        };
+        if cap.ready {
+            return Err(ObservationGap::Invalidated);
+        }
+        cap.ready = true;
+        if self.capabilities.iter().all(|cap| cap.ready) {
+            self.stage = AcquisitionStage::ReadyPublished;
+        }
         Ok(())
     }
     /// Refuse the acquisition from any non-terminal stage. READY is terminal:
@@ -1689,6 +1756,65 @@ mod tests {
         assert!(ledger.adoption_live(registration));
         (ids, ledger, anchor, registration)
     }
+    fn live_anchor_in(ids: &mut HostIds, ledger: &mut GuardLedger, epoch: u64) -> u64 {
+        let nonce = ids.fresh().unwrap();
+        let anchor = ledger.mint_anchor(ids, epoch, nonce).unwrap();
+        ledger
+            .create_anchor(anchor, &anchor_receipt(anchor, nonce))
+            .unwrap();
+        ledger.live_anchor(anchor).unwrap();
+        anchor
+    }
+    fn live_registration(
+        ids: &mut HostIds,
+        ledger: &mut GuardLedger,
+        anchor: u64,
+        epoch: u64,
+    ) -> u64 {
+        let nonce = ids.fresh().unwrap();
+        let registration = ledger.mint_registration(ids, anchor, epoch, nonce).unwrap();
+        ledger
+            .create_adoption(registration, &entry_receipt(registration, nonce))
+            .unwrap();
+        ledger
+            .live_adoption(
+                registration,
+                &AdoptedLinks {
+                    registration_id: registration,
+                    anchor_id: anchor,
+                    epoch,
+                    links: 1,
+                },
+            )
+            .unwrap();
+        registration
+    }
+    fn enrolled_order(ids: &mut HostIds, ledger: &GuardLedger, anchor: u64) -> AcquisitionOrder {
+        let mut order = AcquisitionOrder::new();
+        order.note_gate_open().unwrap();
+        let nonce = ids.fresh().unwrap();
+        order
+            .note_enrolled(
+                nonce,
+                &EnrollmentReceipt {
+                    nonce,
+                    host_pid_tgid: 1,
+                },
+            )
+            .unwrap();
+        order.note_anchored(ledger, anchor).unwrap();
+        order
+    }
+    fn ready_receipt(nonce: u64, registration: u64, sequence: u64) -> ReadyReceipt {
+        ReadyReceipt {
+            nonce,
+            registration_id: registration,
+            entry_count: 1,
+            exit_count: 1,
+            verdict: VERDICT_SUCCESS,
+            sequence,
+        }
+    }
     #[test]
     fn acquisition_order_runs_legacy_to_ready_before_child_release() {
         let (mut ids, ledger, anchor, registration) = adopted_ledger();
@@ -1725,13 +1851,13 @@ mod tests {
             sequence: 0,
             ..ready_fields(&ready)
         };
-        assert!(order.note_ready(ready_nonce, registration, &bad).is_err());
+        assert!(order.note_ready(&ledger, ready_nonce, &bad).is_err());
         bad = ReadyReceipt {
             nonce: ready_nonce + 1,
             ..ready_fields(&ready)
         };
-        assert!(order.note_ready(ready_nonce, registration, &bad).is_err());
-        order.note_ready(ready_nonce, registration, &ready).unwrap();
+        assert!(order.note_ready(&ledger, ready_nonce, &bad).is_err());
+        order.note_ready(&ledger, ready_nonce, &ready).unwrap();
         assert!(order.child_may_release());
     }
     fn ready_fields(receipt: &ReadyReceipt) -> ReadyReceipt {
@@ -1771,7 +1897,7 @@ mod tests {
             verdict: VERDICT_SUCCESS,
             sequence: 1,
         };
-        assert!(order.note_ready(nonce, registration, &early).is_err());
+        assert!(order.note_ready(&ledger, nonce, &early).is_err());
         order.note_gate_open().unwrap();
         assert!(order.note_gate_open().is_err());
         // Enrollment binds the exact armed nonce and nonzero host coords.
@@ -1826,13 +1952,13 @@ mod tests {
             verdict: VERDICT_SUCCESS,
             sequence: 2,
         };
-        order.note_ready(ready_nonce, registration, &ready).unwrap();
+        order.note_ready(&ledger, ready_nonce, &ready).unwrap();
         // READY never regresses; refusal after READY refuses.
         let later = ReadyReceipt {
             sequence: 3,
             ..ready_fields(&ready)
         };
-        assert!(order.note_ready(ready_nonce, registration, &later).is_err());
+        assert!(order.note_ready(&ledger, ready_nonce, &later).is_err());
         assert!(order.refuse().is_err());
         assert!(order.child_may_release());
         // Refusal from a middle stage is terminal and blocks release.
@@ -1842,6 +1968,70 @@ mod tests {
         assert!(order.refuse().is_ok());
         assert!(order.note_gate_open().is_err());
         assert!(!order.child_may_release());
+    }
+    #[test]
+    fn acquisition_order_binds_stored_anchor_and_registrations() {
+        // Two anchors: A and B LIVE on anchor 1, C LIVE on anchor 2.
+        let (mut ids, mut ledger, anchor1, epoch1) = live_anchor();
+        let epoch2 = epoch1 + 100;
+        let anchor2 = live_anchor_in(&mut ids, &mut ledger, epoch2);
+        let reg_a = live_registration(&mut ids, &mut ledger, anchor1, epoch1);
+        let reg_b = live_registration(&mut ids, &mut ledger, anchor1, epoch1);
+        let reg_c = live_registration(&mut ids, &mut ledger, anchor2, epoch2);
+        // Substitution: adopt A, then a genuine READY-for-B refuses while
+        // READY-for-A advances to ReadyPublished with child release.
+        let mut order = enrolled_order(&mut ids, &ledger, anchor1);
+        // Anchor mismatch: C is LIVE but belongs to anchor 2, not the stored
+        // anchor 1.
+        assert!(order.note_links_adopted(&ledger, reg_c).is_err());
+        order.note_links_adopted(&ledger, reg_a).unwrap();
+        // Duplicate adoption refuses.
+        assert!(order.note_links_adopted(&ledger, reg_a).is_err());
+        let nonce_b = ids.fresh().unwrap();
+        assert!(
+            order
+                .note_ready(&ledger, nonce_b, &ready_receipt(nonce_b, reg_b, 9))
+                .is_err()
+        );
+        assert!(!order.child_may_release());
+        // Unknown registrations refuse as well.
+        let nonce_x = ids.fresh().unwrap();
+        assert!(
+            order
+                .note_ready(
+                    &ledger,
+                    nonce_x,
+                    &ready_receipt(nonce_x, reg_a + 999_999, 10)
+                )
+                .is_err()
+        );
+        let nonce_a = ids.fresh().unwrap();
+        order
+            .note_ready(&ledger, nonce_a, &ready_receipt(nonce_a, reg_a, 11))
+            .unwrap();
+        assert!(order.child_may_release());
+        // Multiple required capabilities are explicit: adopting A and B needs
+        // READY for BOTH before publication; partial READY never releases.
+        let mut order = enrolled_order(&mut ids, &ledger, anchor1);
+        order.note_links_adopted(&ledger, reg_a).unwrap();
+        order.note_links_adopted(&ledger, reg_b).unwrap();
+        assert!(!order.child_may_release());
+        let nonce_a = ids.fresh().unwrap();
+        order
+            .note_ready(&ledger, nonce_a, &ready_receipt(nonce_a, reg_a, 12))
+            .unwrap();
+        assert!(!order.child_may_release());
+        // Duplicate READY-for-A refuses.
+        assert!(
+            order
+                .note_ready(&ledger, nonce_a, &ready_receipt(nonce_a, reg_a, 13))
+                .is_err()
+        );
+        let nonce_b = ids.fresh().unwrap();
+        order
+            .note_ready(&ledger, nonce_b, &ready_receipt(nonce_b, reg_b, 14))
+            .unwrap();
+        assert!(order.child_may_release());
     }
     fn valid_source_prepared() -> loader::Prepared {
         let progs = [
