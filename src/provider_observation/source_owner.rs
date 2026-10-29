@@ -288,6 +288,7 @@ pub(crate) struct SourceCloseReceipts {
     pub guards_abandoned: usize,
     pub domains_retired: usize,
     pub order_refused: bool,
+    pub cut_confirmed: bool,
     pub first_error: Option<ObservationGap>,
 }
 
@@ -320,6 +321,8 @@ pub(super) struct SourceOwner {
     _registration_ids: Vec<u64>,
     _domain_tgids: Vec<u32>,
     _mode: Option<(u64, u64)>,
+    #[cfg(test)]
+    _fail_next_retire: std::cell::Cell<bool>,
     _last_error: Option<String>,
     _maps: BTreeMap<&'static str, OwnedFd>,
     _namespace: File,
@@ -462,6 +465,8 @@ impl SourceOwner {
             _registration_ids: Vec::new(),
             _domain_tgids: Vec::new(),
             _mode: None,
+            #[cfg(test)]
+            _fail_next_retire: std::cell::Cell::new(false),
             _last_error: None,
             _maps: maps,
             _namespace: namespace,
@@ -710,6 +715,45 @@ impl SourceOwner {
     }
     pub(super) fn adopted_link_count(&self) -> usize {
         self._adopted.len()
+    }
+    /// Test-only close-failure injection: the next guard retirement in
+    /// `close_source` fails with `BpfUnavailable`, exercising the
+    /// retain-custody path with real maps and live writers.
+    #[cfg(test)]
+    pub(super) fn fail_next_guard_retire(&self) {
+        self._fail_next_retire.set(true);
+    }
+    /// Test-only anchor-custody readback.
+    #[cfg(test)]
+    pub(super) fn anchor_retained_test(&self) -> bool {
+        self._anchor.is_some()
+    }
+    /// Test-only host guard-life readback.
+    #[cfg(test)]
+    pub(super) fn guard_life_test(&self, id: u64) -> Option<GuardLife> {
+        self._ledger.guard_life(id)
+    }
+    /// Test-only kernel SOURCE_DOMAIN state readback.
+    #[cfg(test)]
+    pub(super) fn domain_state_test(&self, tgid: u32) -> Result<u64, ObservationGap> {
+        let map = self.map("SOURCE_DOMAIN")?;
+        map.shape(&[1], 4, 64)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        let mut row = SourceDomain {
+            process_incarnation: 0,
+            original_image: 0,
+            planned_image: 0,
+            current_image: 0,
+            state: 0,
+            loss_epoch: 0,
+            reserved: [0, 0],
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut((&mut row as *mut SourceDomain).cast::<u8>(), 64)
+        };
+        map.lookup(&tgid.to_ne_bytes(), bytes)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        Ok(row.state)
     }
     /// Test-only unrelated-registration control: performs a real native
     /// uprobe registration on the observer thread with no armed request and
@@ -1320,11 +1364,48 @@ impl SourceOwner {
         }
         Ok(state)
     }
-    /// Explicit test-driven close: retire every created guard row in the map
-    /// before releasing anything, abandon minted-never-created IDs, retire
-    /// armed kernel domain rows, refuse a non-READY order, then release all
-    /// program/link/mapping owners. Best-effort per item with the first error
-    /// retained in the receipts; production close lands with 5B activation.
+    /// Retire one armed kernel domain row now that writers are quiesced,
+    /// then retire its host mirror. Runs only after the common cut: the host
+    /// never read-modify-writes live kernel domain state.
+    fn retire_domain_row(&mut self, tgid: u32) -> Result<(), ObservationGap> {
+        let map = self.map("SOURCE_DOMAIN")?;
+        map.shape(&[1], 4, 64)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        let mut row = SourceDomain {
+            process_incarnation: 0,
+            original_image: 0,
+            planned_image: 0,
+            current_image: 0,
+            state: 0,
+            loss_epoch: 0,
+            reserved: [0, 0],
+        };
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut((&mut row as *mut SourceDomain).cast::<u8>(), 64)
+        };
+        map.lookup(&tgid.to_ne_bytes(), bytes)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        if row.state == contract::DOMAIN_ARMED
+            || row.state == contract::DOMAIN_ACTIVE
+            || row.state == contract::DOMAIN_TRANSITION
+        {
+            row.state = contract::DOMAIN_RETIRED;
+            let bytes = unsafe {
+                std::slice::from_raw_parts((&row as *const SourceDomain).cast::<u8>(), 64)
+            };
+            map.update(&tgid.to_ne_bytes(), bytes)
+                .map_err(|_| ObservationGap::BpfUnavailable)?;
+        }
+        self._domains.retire(tgid)
+    }
+    /// Explicit test-driven close, integrated with the retained gate's
+    /// successful common cut: the cut receipt must exist before anything is
+    /// touched, guards retire before any release, domain rows update only
+    /// after writer quiescence, and a non-READY order refuses last. Fail-fast:
+    /// the first error stops the close with all custody retained (roots,
+    /// adopted links, anchor, unprocessed domain TGIDs, order state), so a
+    /// failed close is retryable and never releases writers' backing.
+    /// Production close lands with 5B activation.
     #[allow(dead_code)]
     pub(super) fn close_source(&mut self) -> SourceCloseReceipts {
         let mut receipts = SourceCloseReceipts {
@@ -1332,17 +1413,22 @@ impl SourceOwner {
             guards_abandoned: 0,
             domains_retired: 0,
             order_refused: false,
+            cut_confirmed: false,
             first_error: None,
         };
-        let note = |receipts: &mut SourceCloseReceipts, error: ObservationGap| {
-            if receipts.first_error.is_none() {
-                receipts.first_error = Some(error);
-            }
-        };
+        // The retained shared gate must show the successful common-cut
+        // receipt. Anything else (open, preparing, failed cut) refuses
+        // WITHOUT touching guards, domains, order or custody: writers may
+        // still be live, and a live acquisition must not be disturbed.
+        if self._gate.receipt().is_none() {
+            receipts.first_error = Some(ObservationGap::Invalidated);
+            return receipts;
+        }
+        receipts.cut_confirmed = true;
         let guard_fd = match self.guard_fd() {
             Ok(fd) => Some(fd),
             Err(error) => {
-                note(&mut receipts, error);
+                receipts.first_error = Some(error);
                 None
             }
         };
@@ -1352,6 +1438,11 @@ impl SourceOwner {
         for id in ids {
             match self._ledger.guard_life(id) {
                 Some(GuardLife::Preparing | GuardLife::Live) => {
+                    #[cfg(test)]
+                    if self._fail_next_retire.take() {
+                        receipts.first_error = Some(ObservationGap::BpfUnavailable);
+                        return receipts;
+                    }
                     let from = if self._ledger.guard_life(id) == Some(GuardLife::Preparing) {
                         GuardLife::Preparing
                     } else {
@@ -1369,69 +1460,54 @@ impl SourceOwner {
                                     receipts.guards_retired += 1;
                                     let _ = self._ledger.retire(id);
                                 }
-                                Err(error) => note(&mut receipts, error),
+                                Err(error) => {
+                                    receipts.first_error = Some(error);
+                                    return receipts;
+                                }
                             }
                         }
-                        None => note(&mut receipts, ObservationGap::BpfUnavailable),
+                        None => {
+                            receipts.first_error = Some(ObservationGap::BpfUnavailable);
+                            return receipts;
+                        }
                     }
                 }
                 Some(GuardLife::Minted) => match self._ledger.abandon(id) {
                     Ok(()) => receipts.guards_abandoned += 1,
-                    Err(error) => note(&mut receipts, error),
+                    Err(error) => {
+                        receipts.first_error = Some(error);
+                        return receipts;
+                    }
                 },
                 Some(GuardLife::Retired | GuardLife::Conflict) => {
                     let _ = self._ledger.retire(id);
                 }
-                None => note(&mut receipts, ObservationGap::Invalidated),
+                None => {
+                    receipts.first_error = Some(ObservationGap::Invalidated);
+                    return receipts;
+                }
             }
         }
-        for tgid in std::mem::take(&mut self._domain_tgids) {
-            match self.map("SOURCE_DOMAIN") {
-                Ok(map) => {
-                    let mut row = SourceDomain {
-                        process_incarnation: 0,
-                        original_image: 0,
-                        planned_image: 0,
-                        current_image: 0,
-                        state: 0,
-                        loss_epoch: 0,
-                        reserved: [0, 0],
-                    };
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts_mut(
-                            (&mut row as *mut SourceDomain).cast::<u8>(),
-                            64,
-                        )
-                    };
-                    match map.lookup(&tgid.to_ne_bytes(), bytes) {
-                        Ok(()) => {
-                            if row.state == contract::DOMAIN_ARMED
-                                || row.state == contract::DOMAIN_ACTIVE
-                                || row.state == contract::DOMAIN_TRANSITION
-                            {
-                                row.state = contract::DOMAIN_RETIRED;
-                                let bytes = unsafe {
-                                    std::slice::from_raw_parts(
-                                        (&row as *const SourceDomain).cast::<u8>(),
-                                        64,
-                                    )
-                                };
-                                if map.update(&tgid.to_ne_bytes(), bytes).is_err() {
-                                    note(&mut receipts, ObservationGap::BpfUnavailable);
-                                }
-                            }
-                            match self._domains.retire(tgid) {
-                                Ok(()) => receipts.domains_retired += 1,
-                                Err(error) => note(&mut receipts, error),
-                            }
-                        }
-                        Err(_) => note(&mut receipts, ObservationGap::BpfUnavailable),
-                    }
+        let mut pending = std::mem::take(&mut self._domain_tgids);
+        // Drain from the front so a failure can restore the unprocessed
+        // remainder (including the failed TGID) for a later retry.
+        pending.reverse();
+        while let Some(tgid) = pending.pop() {
+            match self.retire_domain_row(tgid) {
+                Ok(()) => receipts.domains_retired += 1,
+                Err(error) => {
+                    pending.push(tgid);
+                    pending.reverse();
+                    self._domain_tgids = pending;
+                    receipts.first_error = Some(error);
+                    return receipts;
                 }
-                Err(error) => note(&mut receipts, error),
             }
         }
         receipts.order_refused = self._order.refuse().is_ok();
+        // Success only: release in contract order (programs/links, then
+        // adopted links, then the anchor mapping). Any failure above
+        // returned with all custody retained.
         self._roots.release_loaded();
         self._adopted.clear();
         self._anchor = None;

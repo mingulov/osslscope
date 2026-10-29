@@ -3525,7 +3525,12 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         assert_eq!((roots.programs, roots.links, roots.lifecycle), (4, 2, 2));
         assert_eq!((roots.mode_before, roots.mode_after), (0, 1));
+        // Teardown integrates with the common cut: open then cut the idle
+        // gate (no writers admitted) before closing sources.
+        gate.open().unwrap();
+        gate.close().unwrap();
         let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
         assert_eq!(
             (
                 close.guards_retired,
@@ -3738,7 +3743,10 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             queries > 0,
             "the admitted query must fire through the derived links"
         );
+        // finalize_until above already performed the common cut; the close
+        // confirms it before retiring anything.
         let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
         assert_eq!(
             (
                 close.guards_retired,
@@ -3902,7 +3910,9 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 0,
                 "{case}: refusal must precede any link adoption"
             );
+            setup.gate.close().unwrap();
             let close = setup.session.close_source_explicit().expect("source close");
+            assert!(close.cut_confirmed, "{case}: close must confirm the cut");
             assert_eq!(
                 (
                     close.guards_retired,
@@ -4066,7 +4076,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             .note_source_exec(&lease, pid, planned)
             .unwrap();
         assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        // Final consumers (exec mirror above) run before the cut; the cut
+        // runs before the close.
+        setup.gate.close().unwrap();
         let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
         assert_eq!(
             (
                 close.guards_retired,
@@ -4080,6 +4094,368 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "READY order must stay published at close"
         );
         assert!(close.first_error.is_none());
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    /// P2-I3 failed-cut control: the gate cut fails, so the source close
+    /// refuses without touching guards, domains, order or custody; writers
+    /// stay safe (an unrelated registration stays quiet against the
+    /// disarmed row). Teardown then releases everything.
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_close_failed_cut_retains_custody_and_stays_safe() {
+        let baseline = source_native_fd_targets();
+        let mut setup = source_refusal_setup("close-cut");
+        let pid = setup.child.pid();
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams {
+                target: setup.app.clone(),
+                link_offset: setup.admitted_offset,
+                child_pid: pid,
+            },
+        );
+        let receipts = setup
+            .session
+            .acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "acquire failed: {gap:?} owner: {:?}",
+                    setup.session.source_error()
+                )
+            });
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        let planned = receipts.domain.planned;
+        let state = setup
+            .session
+            .note_source_exec(&lease, pid, planned)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        // Fail the common cut, then attempt the close.
+        setup.gate.fail_next_delete();
+        assert!(setup.gate.close().is_err(), "cut must fail");
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(!close.cut_confirmed, "close must not confirm a failed cut");
+        assert_eq!(close.first_error, Some(ObservationGap::Invalidated));
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (0, 0, 0)
+        );
+        assert!(
+            !close.order_refused,
+            "failed close must not disturb the READY order"
+        );
+        // Custody retained: adopted links, anchor, loaded roots, LIVE
+        // guards, and the kernel domain row untouched (still ACTIVE: the
+        // host performed no racing read-modify-write of live state).
+        let owner = setup.session.source_owner.as_ref().expect("source owner");
+        assert_eq!(owner.adopted_link_count(), 2);
+        assert!(owner.anchor_retained_test());
+        let roots = setup
+            .session
+            .roots_enabled_receipts()
+            .expect("roots receipts");
+        assert_eq!((roots.programs, roots.links, roots.lifecycle), (4, 2, 2));
+        assert_eq!(
+            owner.guard_life_test(receipts.anchor.anchor_id),
+            Some(super::source_acquire::GuardLife::Live)
+        );
+        assert_eq!(
+            owner.guard_life_test(receipts.registration.registration_id),
+            Some(super::source_acquire::GuardLife::Live)
+        );
+        assert_eq!(
+            owner.domain_state_test(pid).unwrap(),
+            super::source_owner::contract::DOMAIN_ACTIVE
+        );
+        assert!(owner.acquisition_ready());
+        // Writers safe: the failed close left kernel state coherent, so an
+        // unrelated registration on the observer thread stays quiet.
+        drop(owner.fire_unrelated_registration().unwrap());
+        assert_eq!(owner.pair_state_test().unwrap(), 0);
+        assert_eq!(owner.observer_state_test().unwrap(), 2);
+        eprintln!("failed-cut close refused with full custody retained");
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    /// P2-I3 failed-retirement control: the first guard retirement fails
+    /// (injected), so the close stops with custody retained and the kernel
+    /// domain row untouched (no host racing update: the domain loop never
+    /// runs). Writers stay safe; teardown releases everything.
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_close_failed_retirement_retains_custody_and_stays_safe() {
+        let baseline = source_native_fd_targets();
+        let mut setup = source_refusal_setup("close-retire");
+        let pid = setup.child.pid();
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams {
+                target: setup.app.clone(),
+                link_offset: setup.admitted_offset,
+                child_pid: pid,
+            },
+        );
+        let receipts = setup
+            .session
+            .acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "acquire failed: {gap:?} owner: {:?}",
+                    setup.session.source_error()
+                )
+            });
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        let planned = receipts.domain.planned;
+        let state = setup
+            .session
+            .note_source_exec(&lease, pid, planned)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        setup.gate.close().unwrap();
+        setup
+            .session
+            .source_owner
+            .as_ref()
+            .expect("source owner")
+            .fail_next_guard_retire();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "the cut itself succeeded");
+        assert_eq!(close.first_error, Some(ObservationGap::BpfUnavailable));
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (0, 0, 0)
+        );
+        assert!(
+            !close.order_refused,
+            "failed close must not disturb the READY order"
+        );
+        let owner = setup.session.source_owner.as_ref().expect("source owner");
+        assert_eq!(owner.adopted_link_count(), 2);
+        assert!(owner.anchor_retained_test());
+        let roots = setup
+            .session
+            .roots_enabled_receipts()
+            .expect("roots receipts");
+        assert_eq!((roots.programs, roots.links, roots.lifecycle), (4, 2, 2));
+        assert_eq!(
+            owner.guard_life_test(receipts.anchor.anchor_id),
+            Some(super::source_acquire::GuardLife::Live)
+        );
+        assert_eq!(
+            owner.guard_life_test(receipts.registration.registration_id),
+            Some(super::source_acquire::GuardLife::Live)
+        );
+        assert_eq!(
+            owner.domain_state_test(pid).unwrap(),
+            super::source_owner::contract::DOMAIN_ACTIVE
+        );
+        assert!(owner.acquisition_ready());
+        drop(owner.fire_unrelated_registration().unwrap());
+        assert_eq!(owner.pair_state_test().unwrap(), 0);
+        eprintln!("failed-retirement close refused with full custody retained");
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    /// P2-I3 concurrent-close control: a close attempted while the gate is
+    /// still open (acquisition mid-flight) refuses without disturbing the
+    /// live acquisition — which then completes normally — proving the
+    /// refused close touched neither custody nor kernel state.
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_close_while_live_refuses_and_acquisition_completes() {
+        let baseline = source_native_fd_targets();
+        let mut setup = source_refusal_setup("close-live");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let params = super::source_owner::NativeSourceParams {
+            target: setup.app.clone(),
+            link_offset: setup.admitted_offset,
+            child_pid: pid,
+        };
+        let admitted = setup.session.admitted_source_site(&params).unwrap();
+        let entry_prog =
+            std::os::fd::AsRawFd::as_raw_fd(&setup.session.loaded.progs["observation_entry"]);
+        let return_prog =
+            std::os::fd::AsRawFd::as_raw_fd(&setup.session.loaded.progs["observation_return"]);
+        let (planned, anchor_id, registration_id) = {
+            let session = &mut setup.session;
+            let owner = session.source_owner.as_mut().expect("source owner");
+            let budget = &session.budget;
+            owner.note_gate_open_observed().unwrap();
+            let domain = owner.arm_domain(pid).unwrap();
+            let host_key = owner.enroll_observer().unwrap();
+            let scope = super::source_owner::RequestScope {
+                site_cookie: admitted.site_cookie,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+                link_offset: admitted.link_offset,
+                target_pid: admitted.tgid,
+                target: admitted.target,
+                expected_artifact: admitted.expected_artifact,
+            };
+            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
+                panic!(
+                    "anchor failed: {gap:?} owner: {:?}",
+                    owner.take_last_error()
+                )
+            });
+            // Concurrent close while live: gate open, anchor LIVE, domain
+            // ARMED. Must refuse with everything retained.
+            let refused = owner.close_source();
+            assert!(
+                !refused.cut_confirmed,
+                "live close must not confirm any cut"
+            );
+            assert_eq!(refused.first_error, Some(ObservationGap::Invalidated));
+            assert_eq!(
+                (
+                    refused.guards_retired,
+                    refused.guards_abandoned,
+                    refused.domains_retired
+                ),
+                (0, 0, 0)
+            );
+            assert!(
+                !refused.order_refused,
+                "refused close must not touch the live order"
+            );
+            assert!(owner.anchor_retained_test());
+            assert_eq!(
+                owner.guard_life_test(anchor.anchor_id),
+                Some(super::source_acquire::GuardLife::Live)
+            );
+            assert_eq!(
+                owner.domain_state_test(pid).unwrap(),
+                super::source_owner::contract::DOMAIN_ARMED,
+                "no host racing update of the live domain row"
+            );
+            eprintln!("live close refused with custody retained; continuing");
+            // The live acquisition continues undisturbed to READY.
+            let registration = owner
+                .register_entry_return(&scope, entry_prog, return_prog, &anchor)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "entry/return failed after refused close: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
+            let ready = owner
+                .publish_ready(&scope, &anchor, &registration)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "ready failed after refused close: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
+            assert_ne!(ready, 0);
+            assert!(owner.acquisition_ready());
+            assert_eq!(owner.adopted_link_count(), 2);
+            (
+                domain.planned,
+                anchor.anchor_id,
+                registration.registration_id,
+            )
+        };
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(params);
+        let state = setup
+            .session
+            .note_source_exec(&lease, pid, planned)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (2, 0, 1)
+        );
+        assert!(
+            !close.order_refused,
+            "READY order must stay published at close"
+        );
+        assert!(close.first_error.is_none());
+        assert_eq!(
+            setup
+                .session
+                .source_owner
+                .as_ref()
+                .expect("source owner")
+                .guard_life_test(anchor_id),
+            Some(super::source_acquire::GuardLife::Retired)
+        );
+        assert_eq!(
+            setup
+                .session
+                .source_owner
+                .as_ref()
+                .expect("source owner")
+                .guard_life_test(registration_id),
+            Some(super::source_acquire::GuardLife::Retired)
+        );
         drop(setup.session);
         drop(setup.gate);
         drop(setup.child);
