@@ -51,3 +51,6 @@ pub mod api_activity;
 pub mod crypto_watch;
 
 pub(crate) mod writer_gate;
+
+#[cfg(test)]
+mod writer_gate_native;

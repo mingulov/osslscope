@@ -2066,6 +2066,62 @@ fn object_id(site: &VerifiedSite) -> u64 {
 #[cfg(test)]
 mod tests {
     #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn native_final_cut_delete_failure_read_failure_and_expired_drain() {
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        for mode in ["delete", "read", "deadline"] {
+            let mut session = ProviderSession::open_budgeted(
+                ObservationBudget::new(ObservationLimits::default()),
+                &object,
+            )
+            .unwrap();
+            // Retain a real final consumer but deliberately omit its safe API
+            // aggregate: this makes the actual post-cut map lookup return ENOENT.
+            session.api_owners.insert(91, (std::process::id(), 1, 20));
+            if mode == "delete" {
+                session.gate.fail_next_delete();
+            }
+            let deadline = if mode == "deadline" {
+                Instant::now()
+            } else {
+                Instant::now() + Duration::from_secs(2)
+            };
+            let result = session.finalize_until(deadline);
+            assert_eq!(
+                session.api_owners.len(),
+                1,
+                "final failure discarded its owner"
+            );
+            if mode == "delete" {
+                assert!(session.gate.receipt().is_none());
+                assert!(!session.closed);
+                assert!(result.gaps.contains(&ObservationGap::BpfUnavailable));
+                assert!(result.api_activity.is_empty());
+                assert!(session.gate.close().is_err());
+            } else {
+                let receipt = session
+                    .gate
+                    .receipt()
+                    .expect("successful native deletion survives read failure");
+                assert!(session.closed);
+                assert_eq!(session.gate.close().unwrap(), receipt);
+                assert!(result.gaps.contains(&if mode == "read" {
+                    ObservationGap::InvalidWire
+                } else {
+                    ObservationGap::DrainOverrun
+                }));
+                assert_eq!(result.api_activity.len(), 1);
+                assert_eq!(result.api_activity[0].row.gaps.map, 1);
+            }
+            assert!(session.gate.open().is_err());
+            eprintln!(
+                "native_final_failure={mode} receipt={} owners_retained=1",
+                session.gate.receipt().is_some()
+            );
+        }
+    }
+    #[test]
     fn live_algorithm_identity_separates_thread_local_invocations() {
         use super::super::static_tables::DynamicAlgorithmId;
         let object: ObjectHash = "a".repeat(64).try_into().unwrap();

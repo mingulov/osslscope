@@ -76,6 +76,8 @@ impl GateState {
     }
 }
 struct Inner {
+    #[cfg(test)]
+    fail_delete: std::cell::Cell<bool>,
     outer: OwnedFd,
     token: OwnedFd,
     id: u32,
@@ -139,6 +141,8 @@ impl WriterGate {
         crate::lifecycle_producer::note_acquisition().map_err(io::Error::other)?;
         let (outer, token, id) = create_maps()?;
         Ok(Self(Rc::new(Inner {
+            #[cfg(test)]
+            fail_delete: std::cell::Cell::new(false),
             outer,
             token,
             id,
@@ -156,8 +160,16 @@ impl WriterGate {
         })?;
         Ok(start.elapsed())
     }
+    #[cfg(test)]
+    pub(crate) fn fail_next_delete(&self) {
+        self.0.fail_delete.set(true);
+    }
     pub(crate) fn close(&self) -> io::Result<ClosedReceipt> {
         self.0.state.borrow_mut().close_with(self.0.id, || {
+            #[cfg(test)]
+            if self.0.fail_delete.replace(false) {
+                return Err(io::Error::from_raw_os_error(libc::EIO));
+            }
             // SAFETY: private immutable outer owner comes only from the typed constructor.
             unsafe { ossl_bpf_sys::writer_gate_delete(self.0.outer.as_raw_fd()) }
         })
