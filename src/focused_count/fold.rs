@@ -217,6 +217,11 @@ impl CountFold {
         {
             return Err(CountFailure::Read);
         }
+        // A saturated physical lower bound cannot certify conservation even
+        // when the independent admission ledger has saturated to the same value.
+        if calls == u64::MAX {
+            self.gaps.insert("focused_saturated", 1);
+        }
         if let Some(r) = self
             .rows
             .get_mut(&cookie)

@@ -389,3 +389,32 @@ fn physical_cookie_capacity_is_independent_of_link_fd_capacity() {
     }
     assert_eq!(fold.sample().sites.len(), 600);
 }
+
+#[test]
+fn saturated_physical_count_retains_lower_bound_with_explicit_loss() {
+    let mut fold = CountFold::new(CountLimits::default()).unwrap();
+    let (cookie, generation) = fold
+        .attach(binding(1, 90, "sha256"), |_, _| Ok(()))
+        .unwrap();
+    fold.observe(cookie, generation, &[value(u64::MAX)])
+        .unwrap();
+    let sample = fold.sample();
+    assert_eq!(sample.sites[0].calls, u64::MAX);
+    assert!(
+        sample
+            .gaps
+            .iter()
+            .any(|g| g.name == "focused_saturated" && g.forces_partial())
+    );
+    fold.observe(cookie, generation, &[value(u64::MAX)])
+        .unwrap();
+    assert_eq!(
+        fold.sample()
+            .gaps
+            .iter()
+            .find(|g| g.name == "focused_saturated")
+            .unwrap()
+            .value,
+        1
+    );
+}

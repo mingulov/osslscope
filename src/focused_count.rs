@@ -144,7 +144,9 @@ fn gap(name: &str, value: u64) -> GapCounter {
         "focused_unattributed" | "focused_dropfail" => {
             (CounterUnits::Calls, CounterSource::KernelMap)
         }
-        "focused_namespace_failures" => (CounterUnits::Events, CounterSource::KernelMap),
+        "focused_namespace_failures" | "focused_saturated" => {
+            (CounterUnits::Events, CounterSource::KernelMap)
+        }
         "focused_metadata_changed" => (CounterUnits::Events, CounterSource::Discovery),
         "focused_attach" => (CounterUnits::Probes, CounterSource::Attach),
         "focused_identity" | "focused_namespace" | "focused_close" => {
@@ -780,6 +782,11 @@ impl FocusedCounter {
         let mut sample = self.fold.sample();
         sample.associations = self.associations.values().cloned().collect();
         [sample.admitted, sample.dropfail, sample.namespace_failures] = self.totals;
+        if self.totals.contains(&u64::MAX)
+            && !sample.gaps.iter().any(|g| g.name == "focused_saturated")
+        {
+            sample.gaps.push(gap("focused_saturated", 1));
+        }
         if sample.dropfail > 0 {
             sample.gaps.push(gap("focused_dropfail", sample.dropfail));
         }
@@ -1017,6 +1024,56 @@ mod startup_controls {
         atomic::{AtomicBool, Ordering},
     };
     use std::time::Duration;
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_saturated_physical_cells_keep_evidence_and_poison_final_sample() {
+        let object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let counter = FocusedCounter::open(
+            &object,
+            std::process::id(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: 1,
+                    deadline_ns: u64::MAX,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut counts = vec![0; counter.cpus * 24];
+        counts[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+        counts[8..16].copy_from_slice(&1u64.to_ne_bytes());
+        counts[16..24].copy_from_slice(&2u64.to_ne_bytes());
+        unsafe {
+            ossl_bpf_sys::map_update_elem(
+                counter.loaded.maps["COUNTS"].as_raw_fd(),
+                &((7u64 << 32) | 1).to_ne_bytes(),
+                &counts,
+                0,
+            )
+        }
+        .unwrap();
+        let mut admitted = vec![0; counter.cpus * 8];
+        admitted[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+        unsafe {
+            ossl_bpf_sys::map_update_elem(
+                counter.loaded.maps["ADMITTED"].as_raw_fd(),
+                &0u32.to_ne_bytes(),
+                &admitted,
+                0,
+            )
+        }
+        .unwrap();
+        let sample = counter.close(Instant::now() + Duration::from_secs(1));
+        assert_eq!(sample.unattributed, u64::MAX);
+        assert_eq!(sample.admitted, u64::MAX);
+        assert!(
+            sample.gaps.iter().any(|g| g.name == "focused_saturated"),
+            "equal saturated ledgers cannot certify conservation"
+        );
+    }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]
     fn owned_authority_refresh_preserves_stock_population_and_known_calls() {
