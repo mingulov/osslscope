@@ -46,7 +46,7 @@ impl Producers {
         let bytes =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
         let provider = loader::load_gated(
-            &crate::provider_observation::session::prepare_object(&bytes).unwrap(),
+            &crate::provider_observation::session::prepare_legacy_object(&bytes).unwrap(),
             &gate,
         )
         .unwrap();

@@ -187,6 +187,26 @@ pub(crate) fn host_acquisition_history(blocked: bool) {
         }
     }
 }
+#[cfg(test)]
+pub(crate) fn fake_for_shape_tests(pool: &MemoryPool) -> io::Result<WriterGate> {
+    // Hermetic caps-free gate value for gated-shape tests: plain /dev/null
+    // fds, no BPF syscalls, no bootstrap-registry touch, so concurrent
+    // bootstrap tests cannot flake the holder. Unusable for real loads by
+    // construction: any injection identity check against these fds fails.
+    let reservation = pool
+        .reserve(RESERVATION_BYTES)
+        .ok_or_else(|| io::Error::other("writer gate reservation refused"))?;
+    Ok(WriterGate(Rc::new(Inner {
+        fail_delete: std::cell::Cell::new(false),
+        outer: std::fs::File::open("/dev/null")?.into(),
+        token: std::fs::File::open("/dev/null")?.into(),
+        id: 1,
+        state: RefCell::new(GateState::Setup),
+        _reservation: reservation,
+        injections: RefCell::new(Vec::new()),
+        pool: pool.clone(),
+    })))
+}
 #[derive(Clone)]
 pub(crate) struct WriterGate(Rc<Inner>);
 impl WriterGate {
@@ -344,10 +364,21 @@ mod tests {
         let provider =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
         let count = loader::prepare_focused_count(&count).unwrap();
-        let provider = crate::provider_observation::session::prepare_object(&provider).unwrap();
+        let provider =
+            crate::provider_observation::session::prepare_legacy_object(&provider).unwrap();
         assert!(loader::load(&count).is_err(), "unshared load must refuse");
         let c = loader::load_gated(&count, &gate).unwrap();
         let p = loader::load_gated(&provider, &gate).unwrap();
+        // Legacy-split expectation: the count object loads its single
+        // count_entry root; the shared legacy provider preparation loads
+        // exactly observation_entry (uprobe) + observation_return
+        // (uretprobe) with its 16 legacy maps (ADMIT plus the 15
+        // observation/classifier/control maps). Source roots
+        // (source_reg_in/source_reg_out) and lifecycle roots stay in the
+        // unloaded source half and never reach the gated loader.
+        assert_eq!(c.progs.len(), 1);
+        assert_eq!(p.progs.len(), 2);
+        assert_eq!(p.maps.len(), 16);
         assert_eq!(c.progs.len() + p.progs.len(), 3);
         let second = WriterGate::create(&pool).unwrap();
         for root in c.progs.values().chain(p.progs.values()) {

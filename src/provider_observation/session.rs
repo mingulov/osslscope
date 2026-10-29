@@ -238,7 +238,13 @@ pub(crate) fn prepare_object(object: &[u8]) -> Result<loader::Prepared, Observat
 /// Preserve the sole mandatory legacy load while retaining the fully checked
 /// source roots as unloaded input. Optional maps are acquired only after legacy
 /// startup custody; no tracing root can reach the generic uprobe load adapter.
-fn split_source_preparation(prepared: loader::Prepared) -> (loader::Prepared, loader::Prepared) {
+///
+/// This is the single legacy/source partition rule: production session
+/// startup and both native controls reach the gated-loadable legacy half
+/// only through this split. No second copy of the predicate may exist.
+pub(crate) fn split_source_preparation(
+    prepared: loader::Prepared,
+) -> (loader::Prepared, loader::Prepared) {
     let (legacy, source) = prepared
         .progs
         .into_iter()
@@ -258,6 +264,15 @@ fn split_source_preparation(prepared: loader::Prepared) -> (loader::Prepared, lo
             maps: source_maps,
         },
     )
+}
+/// Shared legacy preparation for the native gated-load consumers: the
+/// unsplit full preparation also carries source and lifecycle roots, which
+/// `load_gated` refuses, so gated consumers load exactly this half.
+/// Production startup reaches the same shared split directly because it
+/// also retains the source half.
+#[cfg(test)]
+pub(crate) fn prepare_legacy_object(object: &[u8]) -> Result<loader::Prepared, ObservationGap> {
+    Ok(split_source_preparation(prepare_object(object)?).0)
 }
 struct Attachment {
     links: Vec<OwnedFd>,
@@ -2793,6 +2808,127 @@ mod tests {
         let owned = OwnedFd::from(link);
         assert!(paired_links(|| Ok(owned), || Err(ObservationGap::AttachFailed)).is_err());
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
+    }
+    fn synthetic_full_preparation() -> loader::Prepared {
+        // Mirror of `prepare_object`'s tables: the same root names/sections
+        // and the same map names in the same order, so the shared split
+        // predicate and the gated allowlist read identical inputs.
+        // Instruction bytes stay empty on purpose: these roots must be
+        // shape-admissible but never loadable.
+        let admit = || loader::MapFixup {
+            insn_off: 0,
+            map: "ADMIT".to_string(),
+        };
+        let prog = |name: &str, section: &str, is_return: bool| loader::PreparedProg {
+            name: name.to_string(),
+            section: section.to_string(),
+            is_return,
+            insns: Vec::new(),
+            map_fixups: vec![admit()],
+            subprogs: Vec::new(),
+        };
+        let progs = [
+            prog("observation_entry", "uprobe", false),
+            prog("observation_return", "uretprobe", true),
+        ]
+        .into_iter()
+        .chain(
+            loader::SOURCE_REGISTRATION_PROGS
+                .iter()
+                .map(|spec| prog(spec.name, spec.section, false)),
+        )
+        .chain(
+            loader::LIFECYCLE_PROGS
+                .iter()
+                .map(|spec| prog(spec.name, spec.section, false)),
+        )
+        .collect();
+        let maps = specs()
+            .into_iter()
+            .chain(super::super::source_owner::MAPS)
+            .map(|spec| loader::MapSpecLite {
+                name: spec.name.to_string(),
+                map_type: spec.map_type,
+                key_size: spec.key_size,
+                value_size: spec.value_size,
+                max_entries: spec.max_entries,
+                flags: spec.flags,
+            })
+            .collect();
+        loader::Prepared { progs, maps }
+    }
+    #[test]
+    fn caller_compatibility_shared_legacy_split_passes_gated_shape() {
+        // Caller-compatibility regression: both native controls once passed
+        // the unsplit full preparation to `load_gated`, which refuses the
+        // source roots. Every gated consumer must now go through the one
+        // shared split. This test runs caps-free with no object file: it
+        // proves (a) the shared split partitions the full shape into
+        // exactly the legacy roots with every source map removed, (b)
+        // `load_gated` refuses the unsplit shape with "ungated producer
+        // root" before any kernel effect, and (c) the shared legacy half
+        // passes `load_gated`'s shape checks and fails only later, at
+        // kernel admission against the fake gate fds. What this cannot
+        // prove caps-free is actual kernel load of the legacy half; that
+        // is proven by the privileged native controls (`writer_gate` /
+        // `writer_gate_native`), which load this same shared legacy shape
+        // from real objects. No assertion here may skip: each arm either
+        // asserts or panics.
+        let full = synthetic_full_preparation();
+        assert_eq!(full.maps.len(), 23, "mirror must track the full map shape");
+        assert_eq!(full.progs.len(), 6, "mirror must track the full root shape");
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        match loader::load_gated(&full, &gate) {
+            Ok(_) => panic!("unsplit full preparation must be refused by load_gated"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("ungated producer root"),
+                "unsplit refusal must be on shape, got: {error:?}"
+            ),
+        }
+        let (legacy, source) = split_source_preparation(full);
+        let legacy_roots: Vec<_> = legacy.progs.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(legacy_roots, ["observation_entry", "observation_return"]);
+        assert_eq!(legacy.maps.len(), 16);
+        assert_eq!(legacy.maps.iter().filter(|m| m.name == "ADMIT").count(), 1);
+        for map in &legacy.maps {
+            assert!(
+                !super::super::source_owner::MAPS
+                    .iter()
+                    .any(|spec| spec.name == map.name),
+                "legacy half must not retain source map {}",
+                map.name
+            );
+        }
+        assert_eq!(source.progs.len(), 4);
+        assert_eq!(source.maps.len(), 7);
+        for map in &source.maps {
+            assert!(
+                super::super::source_owner::MAPS
+                    .iter()
+                    .any(|spec| spec.name == map.name),
+                "source half must hold only source maps, got {}",
+                map.name
+            );
+        }
+        match loader::load_gated(&source, &gate) {
+            Ok(_) => panic!("source half without ADMIT must be refused by load_gated"),
+            Err(error) => assert!(
+                format!("{error:?}").contains("missing shared writer map"),
+                "source-half refusal must be on shape, got: {error:?}"
+            ),
+        }
+        match loader::load_gated(&legacy, &gate) {
+            Ok(_) => panic!("synthetic empty roots against fake gate fds must not load"),
+            Err(error) => {
+                let message = format!("{error:?}");
+                assert!(
+                    !message.contains("ungated producer root")
+                        && !message.contains("missing shared writer map"),
+                    "shared legacy half must pass shape checks, got: {message}"
+                );
+            }
+        }
     }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF pointing to a rebuilt object; preparation only"]
