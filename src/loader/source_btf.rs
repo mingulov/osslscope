@@ -15,6 +15,7 @@ pub(super) struct SourceLayout {
     functions: [u32; 3],
     fields: [u32; 6],
     vma_bytes: u32,
+    registration_function: u32,
 }
 impl SourceLayout {
     pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
@@ -87,10 +88,31 @@ impl SourceLayout {
             }
             functions[i] = id;
         }
+        // The observer-only registration hooks have one finite trampoline ABI.
+        // Checking the consumer pointer type does not authorize reading arg3.
+        let consumer = view.named(4, b"uprobe_consumer")?;
+        let uprobe = view.named(4, b"uprobe")?;
+        let registration_function = view.named(12, b"uprobe_register")?;
+        let function = view.ty(registration_function)?;
+        ensure!(
+            function.count <= 1 && !function.flag,
+            "registration definition"
+        );
+        let proto = view.ty(function.size)?;
+        ensure!(
+            proto.kind == 13 && !proto.flag && proto.count == 4,
+            "registration arguments"
+        );
+        view.pointer(word(proto.data, 4)?, inode)?;
+        view.integer(word(proto.data, 12)?, 8, true, false)?;
+        view.integer(word(proto.data, 20)?, 8, true, false)?;
+        view.pointer(word(proto.data, 28)?, consumer)?;
+        view.pointer(proto.size, uprobe)?;
         Ok(Self {
             functions,
             fields,
             vma_bytes: view.ty(vma)?.size,
+            registration_function,
         })
     }
     pub(super) fn kfunc_ids(&self) -> [u32; 3] {
@@ -101,6 +123,9 @@ impl SourceLayout {
     }
     pub(super) fn vma_size(&self) -> u32 {
         self.vma_bytes
+    }
+    pub(super) fn registration_id(&self) -> u32 {
+        self.registration_function
     }
 }
 fn word(bytes: &[u8], offset: usize) -> Result<u32> {
@@ -415,6 +440,19 @@ mod tests {
         f.ty("bpf_iter_task_vma_next", 12, 1, next_proto, &[]); // 17
         let destroy_proto = f.ty("", 13, 1, 0, &[0, iter_ptr]); // 18
         f.ty("bpf_iter_task_vma_destroy", 12, 1, destroy_proto, &[]); // 19
+        let loff = f.ty("long long int", 1, 0, 8, &[1 << 24 | 64]); // 20
+        let consumer = f.ty("uprobe_consumer", 4, 0, 64, &[]); // 21
+        let consumer_ptr = f.ty("", 2, 0, consumer, &[]); // 22
+        let uprobe = f.ty("uprobe", 4, 0, 64, &[]); // 23
+        let uprobe_ptr = f.ty("", 2, 0, uprobe, &[]); // 24
+        let registration = f.ty(
+            "",
+            13,
+            4,
+            uprobe_ptr,
+            &[0, inode_ptr, 0, loff, 0, loff, 0, consumer_ptr],
+        ); // 25
+        f.ty("uprobe_register", 12, 1, registration, &[]); // 26
         f
     }
     #[test]
@@ -423,6 +461,7 @@ mod tests {
         assert_eq!(got.kfunc_ids(), [15, 17, 19]);
         assert_eq!(got.field_offsets(), [0, 8, 16, 24, 32, 8]);
         assert_eq!(got.vma_size(), 64);
+        assert_eq!(got.registration_id(), 26);
         // vmlinux BTF producers may mark registered kfunc definitions STATIC.
         let mut static_definition = fixture();
         static_definition.mutate(15, 4, 12 << 24);
@@ -472,8 +511,8 @@ mod tests {
             );
         }
         let mut f = fixture();
-        let alias = f.ty("bad_alias", 8, 0, 20, &[]);
-        assert_eq!(alias, 20);
+        let alias = f.ty("bad_alias", 8, 0, 27, &[]);
+        assert_eq!(alias, 27);
         f.mutate(12, 16, alias);
         assert!(SourceLayout::parse(&f.finish()).is_err());
     }
@@ -496,6 +535,17 @@ mod tests {
         assert_eq!(layout.field_offsets(), [0, 8, 16, 24, 32, 8]);
     }
     #[test]
+    fn source_registration_abi_rejects_integer_return_and_wrong_parameters() {
+        for (offset, value) in [(8, 2), (16, 11), (24, 2), (32, 1), (40, 9)] {
+            let mut f = fixture();
+            f.mutate(25, offset, value);
+            assert!(
+                SourceLayout::parse(&f.finish()).is_err(),
+                "registration prototype mutation at {offset}"
+            );
+        }
+    }
+    #[test]
     fn source_kernel_budget_precedes_file_acquisition() {
         let budget = crate::provider_observation::ObservationBudget::new(
             crate::provider_observation::ObservationLimits {
@@ -514,6 +564,7 @@ mod tests {
         let budget = crate::provider_observation::ObservationBudget::default();
         let layout = super::super::SourceKernel::read(&budget).unwrap();
         assert!(layout._configuration[..3].iter().all(|id| *id > 0));
+        assert!(layout._configuration[10] > 0);
         assert!(
             layout._configuration[3..8]
                 .iter()

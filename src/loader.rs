@@ -16,7 +16,7 @@ mod source_btf;
 /// Prepared kernel ABI only; this is not source registration or eligibility.
 /// Retained by the production observation session until its writers are gone.
 pub(crate) struct SourceKernel {
-    _configuration: [u32; 10],
+    _configuration: [u32; 11],
     _reservation: crate::provider_observation::schema::StateReservation,
 }
 impl SourceKernel {
@@ -51,10 +51,11 @@ impl SourceKernel {
         let layout =
             source_btf::SourceLayout::parse(&bytes[..length]).map_err(|_| Gap::BpfUnavailable)?;
         budget.checkpoint()?;
-        let mut configuration = [0; 10];
+        let mut configuration = [0; 11];
         configuration[..3].copy_from_slice(&layout.kfunc_ids());
         configuration[3..9].copy_from_slice(&layout.field_offsets());
         configuration[9] = layout.vma_size();
+        configuration[10] = layout.registration_id();
         Ok(Self {
             _configuration: configuration,
             _reservation: retained,
