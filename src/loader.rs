@@ -2849,6 +2849,191 @@ pub(crate) fn load_gated(
     }
     Ok(owned)
 }
+/// Loaded source roots: fentry/fexit programs with their tracing links plus
+/// retained raw-lifecycle writers. Maps are borrowed (owner + legacy), never
+/// created here.
+pub(crate) struct SourceLoaded {
+    pub programs: std::collections::HashMap<String, OwnedFd>,
+    pub links: std::collections::HashMap<String, OwnedFd>,
+    pub lifecycle: Vec<crate::writer_gate::LifecycleWriter>,
+}
+
+/// Exact map surface a source root may reference: the seven owned source maps,
+/// the two owned control duplicates, the three legacy join maps, and the
+/// shared admission gate. Any other fixup name refuses the load.
+const SOURCE_FIXUP_MAPS: [&str; 13] = [
+    "REL",
+    "SOURCE_GUARD",
+    "SOURCE_REQUEST",
+    "SOURCE_PAIR",
+    "SOURCE_DOMAIN",
+    "SOURCE_OBSERVER",
+    "ITER_SLOT",
+    "ATTR_STATE",
+    "SOURCE_CONFIG",
+    "CONFIG",
+    "MEMBERS",
+    "NAMESPACE",
+    "ADMIT",
+];
+
+/// Load the checked source half under the closed gate: resolve every map
+/// fixup against the owner's source/control maps plus the session's legacy
+/// maps, load fentry/fexit roots through the finite tracing loader and raw
+/// roots through the lifecycle loader, attach all four links, and attest
+/// every program to the shared gate. Needs caps. The gate must be unopened:
+/// raw attach requires it, and no writer may fire mid-load. Partial failure
+/// drops every FD acquired here; maps are borrowed and stay with their owners.
+pub(crate) fn load_source_roots(
+    prepared: &Prepared,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    attach_btf_id: u32,
+    gate: &crate::writer_gate::WriterGate,
+) -> anyhow::Result<SourceLoaded> {
+    use anyhow::Context as _;
+    anyhow::ensure!(attach_btf_id != 0, "source load requires nonzero FUNC ID");
+    anyhow::ensure!(
+        gate.preparing(),
+        "source roots load only under the unopened gate"
+    );
+    anyhow::ensure!(
+        prepared.progs.len() == 4,
+        "source half must hold exactly four roots"
+    );
+    for name in SOURCE_FIXUP_MAPS {
+        if matches!(name, "CONFIG" | "MEMBERS" | "NAMESPACE" | "ADMIT") {
+            anyhow::ensure!(
+                legacy.maps.contains_key(name),
+                "source load missing legacy map {name}"
+            );
+        } else {
+            anyhow::ensure!(
+                source_maps.contains_key(name),
+                "source load missing owned map {name}"
+            );
+        }
+    }
+    let mut loaded = SourceLoaded {
+        programs: std::collections::HashMap::with_capacity(4),
+        links: std::collections::HashMap::with_capacity(2),
+        lifecycle: Vec::with_capacity(2),
+    };
+    for root in &prepared.progs {
+        let tracing = match (root.name.as_str(), root.section.as_str()) {
+            ("source_reg_in", "fentry/uprobe_register") => {
+                Some(ossl_bpf_sys::SourceTracingRoot::Enter)
+            }
+            ("source_reg_out", "fexit/uprobe_register") => {
+                Some(ossl_bpf_sys::SourceTracingRoot::Exit)
+            }
+            _ => None,
+        };
+        let raw = if tracing.is_none() {
+            selected_lifecycle(&root.name, &root.section)
+        } else {
+            None
+        };
+        anyhow::ensure!(
+            tracing.is_some() || raw.is_some(),
+            "unselected source root {}:{}",
+            root.name,
+            root.section
+        );
+        anyhow::ensure!(!root.is_return, "source root forbids return mode");
+        anyhow::ensure!(
+            !root.subprogs.iter().any(|s| s.is_callback),
+            "source root forbids callback BTF"
+        );
+        anyhow::ensure!(
+            root.map_fixups.iter().any(|f| f.map == "ADMIT"),
+            "source root lacks shared-gate fixup"
+        );
+        let mut insns = root.insns.clone();
+        for fixup in &root.map_fixups {
+            anyhow::ensure!(
+                SOURCE_FIXUP_MAPS.contains(&fixup.map.as_str()),
+                "source fixup to unreviewed map {}",
+                fixup.map
+            );
+            check_ld_imm64_site(&insns, fixup.insn_off, &root.name)?;
+            let fd = source_maps
+                .get(fixup.map.as_str())
+                .map(|owned| owned.as_fd())
+                .or_else(|| legacy.maps.get(&fixup.map).map(|owned| owned.as_fd()))
+                .ok_or_else(|| anyhow::anyhow!("source fixup unresolved {}", fixup.map))?;
+            let slot = insns
+                .get_mut(fixup.insn_off..fixup.insn_off + 8)
+                .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", root.name))?;
+            // Same validated ld_imm64 relocation and BPF_PSEUDO_MAP_FD rewrite
+            // as load_prog: the compiler emits map sites with src=0.
+            slot[1] = (slot[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
+            slot[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
+        }
+        // Quiet load first, logged retry on failure (same rationale as
+        // load_prog: success needs no diagnostics; failure needs the report).
+        let quiet = match (tracing, raw) {
+            (Some(kind), None) => {
+                ossl_bpf_sys::prog_load_source_registration(&insns, kind, attach_btf_id, None)
+            }
+            (None, Some(kind)) => ossl_bpf_sys::prog_load_lifecycle(&insns, kind, None),
+            _ => unreachable!("selected exactly one root kind"),
+        };
+        let program = match quiet {
+            Ok(fd) => fd,
+            Err(first) => {
+                let mut log = vec![0u8; 4 << 20];
+                let logged = match (tracing, raw) {
+                    (Some(kind), None) => ossl_bpf_sys::prog_load_source_registration(
+                        &insns,
+                        kind,
+                        attach_btf_id,
+                        Some(&mut log),
+                    ),
+                    (None, Some(kind)) => {
+                        ossl_bpf_sys::prog_load_lifecycle(&insns, kind, Some(&mut log))
+                    }
+                    _ => unreachable!("selected exactly one root kind"),
+                };
+                match logged {
+                    Ok(fd) => fd,
+                    Err(error) => {
+                        let full = trim_nul(&log);
+                        let detail = String::from_utf8_lossy(full)
+                            .chars()
+                            .take(2000)
+                            .collect::<String>();
+                        let spill = spill_verifier_log(&root.name, full)
+                            .map(|path| format!("\n(full verifier log: {})", path.display()));
+                        anyhow::bail!(
+                            "source prog_load {}: {error} (quiet: {first})\n{detail}{}",
+                            root.name,
+                            spill.unwrap_or_default()
+                        );
+                    }
+                }
+            }
+        };
+        gate.attest(&program)
+            .with_context(|| format!("source program {} missing shared gate", root.name))?;
+        match (tracing, raw) {
+            (Some(kind), None) => {
+                let link = ossl_bpf_sys::link_create_source_registration(program.as_raw_fd(), kind)
+                    .with_context(|| format!("source link_create {}", root.name))?;
+                loaded.links.insert(root.name.clone(), link);
+            }
+            (None, Some(kind)) => {
+                let writer = gate
+                    .attach_lifecycle(&program, kind)
+                    .with_context(|| format!("source lifecycle attach {}", root.name))?;
+                loaded.lifecycle.push(writer);
+            }
+            _ => unreachable!("selected exactly one root kind"),
+        }
+        loaded.programs.insert(root.name.clone(), program);
+    }
+    Ok(loaded)
+}
 pub(crate) fn load_controlled(
     prep: &Prepared,
     links: &crate::capture_setup::SetupLinks,
@@ -5968,6 +6153,104 @@ mod tests {
         assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl4, &[]).is_err());
         assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl4, &[0, 512]).is_err());
         assert!(attach_members_subset(obj, &exe, 0, 1, &ctrl5, &[0, 1, 2, 3]).is_err());
+    }
+    fn source_root_fixture(name: &str, section: &str) -> PreparedProg {
+        PreparedProg {
+            name: name.to_owned(),
+            section: section.to_owned(),
+            is_return: false,
+            insns: Vec::new(),
+            map_fixups: vec![MapFixup {
+                insn_off: 0,
+                map: "ADMIT".to_owned(),
+            }],
+            subprogs: Vec::new(),
+        }
+    }
+    fn source_half_fixture() -> Prepared {
+        Prepared {
+            progs: vec![
+                source_root_fixture("source_reg_in", "fentry/uprobe_register"),
+                source_root_fixture("source_reg_out", "fexit/uprobe_register"),
+                source_root_fixture("attr_exit", "raw_tracepoint/sched_process_exit"),
+                source_root_fixture("attr_exec", "raw_tracepoint/sched_process_exec"),
+            ],
+            maps: Vec::new(),
+        }
+    }
+    fn source_map_fixtures() -> (std::collections::BTreeMap<&'static str, OwnedFd>, Loaded) {
+        fn leak(name: &'static str) -> String {
+            name.to_owned()
+        }
+        let owned: std::collections::BTreeMap<&'static str, OwnedFd> = [
+            "REL",
+            "SOURCE_GUARD",
+            "SOURCE_REQUEST",
+            "SOURCE_PAIR",
+            "SOURCE_DOMAIN",
+            "SOURCE_OBSERVER",
+            "ITER_SLOT",
+            "ATTR_STATE",
+            "SOURCE_CONFIG",
+        ]
+        .into_iter()
+        .map(|name| (name, model_fd()))
+        .collect();
+        let legacy = Loaded {
+            progs: std::collections::HashMap::new(),
+            maps: ["ADMIT", "CONFIG", "MEMBERS", "NAMESPACE"]
+                .into_iter()
+                .map(|name| (leak(name), model_fd()))
+                .collect(),
+        };
+        (owned, legacy)
+    }
+    #[test]
+    fn source_root_load_refuses_before_any_native_effect() {
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let prepared = source_half_fixture();
+        let (owned, legacy) = source_map_fixtures();
+        // Zero FUNC ID and non-preparing gate refuse before touching roots.
+        assert!(load_source_roots(&prepared, &owned, &legacy, 0, &gate).is_err());
+        let spent = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        assert!(spent.open().is_err());
+        assert!(!spent.preparing());
+        assert!(load_source_roots(&prepared, &owned, &legacy, 7, &spent).is_err());
+        // Root-count, selection, return-mode, callback-BTF and ADMIT axes.
+        let mut short = source_half_fixture();
+        short.progs.pop();
+        assert!(load_source_roots(&short, &owned, &legacy, 7, &gate).is_err());
+        let mut renamed = source_half_fixture();
+        renamed.progs[0].name = "observation_entry".to_owned();
+        assert!(load_source_roots(&renamed, &owned, &legacy, 7, &gate).is_err());
+        let mut ret = source_half_fixture();
+        ret.progs[1].is_return = true;
+        assert!(load_source_roots(&ret, &owned, &legacy, 7, &gate).is_err());
+        let mut callback = source_half_fixture();
+        callback.progs[2].subprogs.push(SubprogInfo {
+            name: "cb".to_owned(),
+            insn_off: 0,
+            is_callback: true,
+        });
+        assert!(load_source_roots(&callback, &owned, &legacy, 7, &gate).is_err());
+        let mut no_admit = source_half_fixture();
+        no_admit.progs[3].map_fixups.clear();
+        assert!(load_source_roots(&no_admit, &owned, &legacy, 7, &gate).is_err());
+        // Unreviewed fixup maps and missing owned/legacy maps refuse.
+        let mut foreign = source_half_fixture();
+        foreign.progs[0].map_fixups.push(MapFixup {
+            insn_off: 8,
+            map: "PENDING".to_owned(),
+        });
+        assert!(load_source_roots(&foreign, &owned, &legacy, 7, &gate).is_err());
+        let (mut owned, legacy) = source_map_fixtures();
+        owned.remove("SOURCE_GUARD");
+        assert!(load_source_roots(&prepared, &owned, &legacy, 7, &gate).is_err());
+        let (owned, mut legacy) = source_map_fixtures();
+        legacy.maps.remove("CONFIG");
+        assert!(load_source_roots(&prepared, &owned, &legacy, 7, &gate).is_err());
     }
 }
 

@@ -1727,12 +1727,16 @@ impl ProviderSession {
     }
     /// Retain typed startup sources without arming an argument reader or
     /// reinterpreting any legacy API/event role. Source refusal is independent
-    /// of the already acquired legacy startup facts.
+    /// of the already acquired legacy startup facts. Under an enabled native
+    /// lease the retained roots also load, attach and enable mode 1 here
+    /// (pre-open); production passes a disabled lease and observes
+    /// byte-identical behavior (mode stays 0, roots unloaded).
     pub(crate) fn prepare_typed_startup(
         &mut self,
         sites: Vec<super::objects::StartupTypedSite>,
         deadline: Instant,
         cancel: &std::sync::atomic::AtomicBool,
+        lease: &super::source_owner::SourceAcquisitionLease,
     ) -> Result<(), ObservationGap> {
         if self.final_drain || !self.gate.admitting() {
             return Err(ObservationGap::Invalidated);
@@ -1760,7 +1764,177 @@ impl ProviderSession {
             &mut self.typed_startup,
             deadline,
             cancel,
-        )
+        )?;
+        if matches!(
+            lease,
+            super::source_owner::SourceAcquisitionLease::Enabled(_)
+        ) {
+            self.source_owner
+                .as_mut()
+                .ok_or(ObservationGap::Invalidated)?
+                .enable_roots_pre_open(&self.loaded)?;
+        }
+        Ok(())
+    }
+
+    /// Lease-gated post-open source acquisition. Disabled (production):
+    /// inert empty receipts, zero effects. Enabled (owned native
+    /// qualification): the serialized gate-open, domain-arm, enroll, anchor,
+    /// entry/return and READY flow on this session's single pre-exec startup
+    /// attachment, before the held child is released. Single-startup/
+    /// single-attachment is a 5A scope bound: anything else refuses. Any
+    /// phase failure refuses the order before returning.
+    pub(crate) fn acquire_source_after_open(
+        &mut self,
+        lease: &super::source_owner::SourceAcquisitionLease,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<super::source_owner::SourceAcquisitionReceipts, ObservationGap> {
+        use super::source_owner::SourceAcquisitionLease as Lease;
+        let Lease::Enabled(params) = lease else {
+            return Ok(super::source_owner::SourceAcquisitionReceipts {
+                host_key: 0,
+                site_cookie: 0,
+                domain: super::source_owner::DomainArmed {
+                    tgid: 0,
+                    incarnation: 0,
+                    original: 0,
+                    planned: 0,
+                },
+                anchor: super::source_owner::AnchorEstablished {
+                    anchor_id: 0,
+                    epoch: 0,
+                    object_id: 0,
+                    sequence: 0,
+                    hash: [0; 32],
+                },
+                registration: super::source_owner::RegistrationAdopted { registration_id: 0 },
+                ready_sequence: 0,
+                adopted_links: 0,
+            });
+        };
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(ObservationGap::SnapshotLag);
+        }
+        self.budget.checkpoint()?;
+        // Pre-exec startup truth (not post-exec targets): acquisition runs
+        // while the child is still held, before release.
+        if self.startup.len() != 1 {
+            return Err(ObservationGap::Invalidated);
+        }
+        let (tgid, attachments) = self
+            .startup
+            .iter()
+            .next()
+            .ok_or(ObservationGap::Invalidated)?;
+        let (tgid, attachments) = (*tgid, attachments.len());
+        if attachments != 1 || params.child_pid != tgid {
+            return Err(ObservationGap::Invalidated);
+        }
+        let cookie = self.startup[&tgid][0].cookie;
+        if !(1..=4096).contains(&cookie) {
+            return Err(ObservationGap::Invalidated);
+        }
+        let entry_prog = self
+            .loaded
+            .progs
+            .get("observation_entry")
+            .ok_or(ObservationGap::InvalidObject)?;
+        let return_prog = self
+            .loaded
+            .progs
+            .get("observation_return")
+            .ok_or(ObservationGap::InvalidObject)?;
+        let (entry_prog, return_prog) = (
+            std::os::fd::AsRawFd::as_raw_fd(entry_prog),
+            std::os::fd::AsRawFd::as_raw_fd(return_prog),
+        );
+        let owner = self
+            .source_owner
+            .as_mut()
+            .ok_or(ObservationGap::Invalidated)?;
+        let budget = &self.budget;
+        let result = (|| {
+            owner.note_gate_open_observed()?;
+            let domain = owner.arm_domain(tgid)?;
+            let host_key = owner.enroll_observer()?;
+            let anchor = owner.anchor_source(
+                params,
+                budget,
+                host_key,
+                domain.incarnation,
+                domain.planned,
+            )?;
+            let scope = super::source_owner::RequestScope {
+                site_cookie: cookie,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+            };
+            let registration =
+                owner.register_entry_return(params, &scope, entry_prog, return_prog, &anchor)?;
+            let ready_sequence =
+                owner.publish_ready(&scope, params.link_offset, &anchor, &registration)?;
+            if !owner.acquisition_ready() {
+                return Err(ObservationGap::Invalidated);
+            }
+            Ok(super::source_owner::SourceAcquisitionReceipts {
+                host_key,
+                site_cookie: cookie,
+                domain,
+                anchor,
+                registration,
+                ready_sequence,
+                adopted_links: owner.adopted_link_count(),
+            })
+        })();
+        if result.is_err() {
+            owner.refuse_acquisition();
+        }
+        result
+    }
+
+    /// Lease-gated planned-exec mirror. Disabled: Ok(0), zero effects.
+    /// Enabled: refuses unless the kernel row already shows the ACTIVE
+    /// transition to the planned image; returns the mirrored state.
+    pub(crate) fn note_source_exec(
+        &mut self,
+        lease: &super::source_owner::SourceAcquisitionLease,
+        tgid: u32,
+        planned_image: u64,
+    ) -> Result<u64, ObservationGap> {
+        match lease {
+            super::source_owner::SourceAcquisitionLease::Disabled => Ok(0),
+            super::source_owner::SourceAcquisitionLease::Enabled(_) => self
+                .source_owner
+                .as_mut()
+                .ok_or(ObservationGap::Invalidated)?
+                .note_exec_transition(tgid, planned_image),
+        }
+    }
+
+    /// Native-qualification diagnostic passthrough. Test-called only:
+    /// production close paths land with 5B activation.
+    #[allow(dead_code)]
+    pub(crate) fn source_error(&mut self) -> Option<String> {
+        self.source_owner
+            .as_mut()
+            .and_then(|owner| owner.take_last_error())
+    }
+    /// Post-hoc pre-open enablement receipts. Test-called only.
+    #[allow(dead_code)]
+    pub(crate) fn roots_enabled_receipts(&self) -> Option<super::source_owner::RootsEnabled> {
+        self.source_owner
+            .as_ref()
+            .and_then(|owner| owner.roots_enabled_receipts())
+    }
+    /// Explicit test-driven source close. Test-called only: production
+    /// close paths land with 5B activation.
+    #[allow(dead_code)]
+    pub(crate) fn close_source_explicit(
+        &mut self,
+    ) -> Option<super::source_owner::SourceCloseReceipts> {
+        self.source_owner.as_mut().map(|owner| owner.close_source())
     }
 
     /// Sealed public-export capability: static table shapes never grant an ABI.
@@ -3083,6 +3257,374 @@ mod tests {
         );
         super::source_acquire::RetainedSourceRoots::check(&source, kernel.registration_btf_id())
             .expect("real source half must pass owner admission");
+    }
+    fn source_native_fd_targets() -> Vec<String> {
+        let mut targets: Vec<String> = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let target = std::fs::read_link(entry.path()).ok()?;
+                Some(format!(
+                    "{} -> {}",
+                    entry.file_name().to_string_lossy(),
+                    target.display()
+                ))
+            })
+            .collect();
+        targets.sort();
+        targets
+    }
+    /// FD accounting: every BPF FD (maps, programs, links) must return to
+    /// baseline exactly. Non-BPF FDs must return to baseline plus exactly the
+    /// one pre-existing typed-anchor app handle: a Disabled-lease bisect
+    /// proves that survivor appears and persists with zero source
+    /// enablement, i.e. it belongs to the pre-existing typed-retention
+    /// graph, not this acquisition (follow-up: place the ghost Rc holder).
+    fn source_native_assert_fds_return(before: &[String], app: &std::path::Path) {
+        let after = source_native_fd_targets();
+        let bpf = |fds: &[String]| {
+            fds.iter()
+                .filter(|fd| {
+                    fd.contains("bpf-map") || fd.contains("bpf-prog") || fd.contains("bpf_link")
+                })
+                .count()
+        };
+        let app_handles = |fds: &[String]| {
+            fds.iter()
+                .filter(|fd| fd.contains(&app.to_string_lossy().into_owned()))
+                .count()
+        };
+        if bpf(&after) != bpf(before)
+            || after.len() != before.len() + 1
+            || app_handles(&after) != app_handles(before) + 1
+        {
+            eprintln!("FDs before ({})", before.len());
+            for fd in before {
+                eprintln!("  {fd}");
+            }
+            eprintln!("FDs after ({})", after.len());
+            for fd in &after {
+                eprintln!("  {fd}");
+            }
+        }
+        assert_eq!(bpf(&after), bpf(before), "BPF FDs must return to baseline");
+        assert_eq!(after.len(), before.len() + 1, "exactly one known survivor");
+        assert_eq!(
+            app_handles(&after),
+            app_handles(before) + 1,
+            "the survivor must be the pre-existing typed-anchor app handle"
+        );
+    }
+    /// Owned single-purpose fixture: one legacy provider-query export plus
+    /// typed public exports (EVP_MAC_fetch, EVP_MAC_free,
+    /// OSSL_PROVIDER_get0_provider_ctx, OPENSSL_cleanup), an exec-marker
+    /// write at main start, and exit 0. Discovery must yield exactly one API
+    /// site and four typed sites. The legacy query probe fires once
+    /// post-release; the marker plus exit status are the independent
+    /// workload oracle.
+    fn source_native_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+#include <stddef.h>
+struct dispatch { int id; void (*fn)(void); };
+struct algorithm { const char *names, *properties; const struct dispatch *implementation; const char *description; };
+__attribute__((noinline)) static void implementation(void) { __asm__ volatile(""); }
+static const struct dispatch dispatch[] = { { 70001, implementation }, { 0, 0 } };
+static const struct algorithm algorithms[] = { { "FUTURE-DIGEST", 0, dispatch, 0 }, { 0, 0, 0, 0 } };
+__attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider,int op,int *no_cache) {
+ *no_cache=0;
+ (void)provider; (void)op;
+ return algorithms;
+}
+void *EVP_MAC_fetch(void *c,const char *n,const char *p){ (void)n; (void)p; return c; }
+void EVP_MAC_free(void *m){ (void)m; }
+void *OSSL_PROVIDER_get0_provider_ctx(const void *p){ return (void *)p; }
+void OPENSSL_cleanup(void){}
+int main(int argc,char **argv) { if(argc!=2) return 2;
+ FILE *f=fopen(argv[1],"w"); if(!f) return 4; fputs("exec\n",f); fclose(f);
+ { int no_cache=-1;
+   if(OSSL_PROVIDER_query_operation((void*)1,1,&no_cache)==0) return 3; }
+ if(EVP_MAC_fetch((void*)1,"X",0)!=(void*)1) return 3;
+ EVP_MAC_free((void*)1);
+ return 0; }
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O0", "-rdynamic", "-o"])
+                .arg(&app)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        app
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_roots_load_attach_and_enable_mode1() {
+        // First real load of the four retained roots: programs verify,
+        // fentry/fexit links attach to uprobe_register, raw lifecycle links
+        // attach, and mode flips 0 -> 1 under the closed gate. No triggers,
+        // no enrollment, no target attachment beyond prearm.
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-source-roots-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_fixture(&dir);
+        let argv = [
+            app.to_string_lossy().into_owned(),
+            dir.join("marker").to_string_lossy().into_owned(),
+        ];
+        let child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+        )
+        .unwrap();
+        eprintln!(
+            "startup apis={} typed={}",
+            startup.apis.len(),
+            startup.typed.len()
+        );
+        assert!(!startup.typed.is_empty(), "fixture must yield typed sites");
+        let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let fds_before = source_native_fd_targets();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(apis, Instant::now() + Duration::from_secs(5), &cancel)
+            .unwrap();
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams {
+                target: app.clone(),
+                link_offset: 0,
+                child_pid: child.pid(),
+            },
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let roots = session.roots_enabled_receipts().expect("roots receipts");
+        eprintln!(
+            "roots programs={} links={} lifecycle={} mode={}->{}",
+            roots.programs, roots.links, roots.lifecycle, roots.mode_before, roots.mode_after
+        );
+        assert_eq!((roots.programs, roots.links, roots.lifecycle), (4, 2, 2));
+        assert_eq!((roots.mode_before, roots.mode_after), (0, 1));
+        let close = session.close_source_explicit().expect("source close");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (0, 0, 0)
+        );
+        assert!(close.order_refused, "idle order must refuse at close");
+        assert!(close.first_error.is_none());
+        drop(session);
+        drop(gate);
+        drop(child);
+        source_native_assert_fds_return(&fds_before, &app);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_acquisition_publishes_ready_and_mirrors_exec() {
+        // Full native acquisition on an owned held child: gate open under
+        // held custody, domain arm, observer enrollment, anchor with
+        // mapping/hash custody, ENTRY/RETURN adoption of real links, READY
+        // publication, child release, workload oracle (marker + exit 0),
+        // planned-exec mirror, and accounted close.
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-source-acquire-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_fixture(&dir);
+        let marker = dir.join("marker");
+        let argv = [
+            app.to_string_lossy().into_owned(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+        )
+        .unwrap();
+        eprintln!(
+            "startup apis={} typed={}",
+            startup.apis.len(),
+            startup.typed.len()
+        );
+        assert!(!startup.typed.is_empty(), "fixture must yield typed sites");
+        let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let fds_before = source_native_fd_targets();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(apis, Instant::now() + Duration::from_secs(5), &cancel)
+            .unwrap();
+        eprintln!(
+            "startup attachments: {:?}",
+            session
+                .startup
+                .iter()
+                .map(|(pid, rows)| (pid, rows.len()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            session.startup.len(),
+            1,
+            "fixture must yield one startup pid"
+        );
+        assert_eq!(
+            session.startup[&child.pid()].len(),
+            1,
+            "fixture must yield one attachment"
+        );
+        let cookie = session.startup[&child.pid()][0].cookie;
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams {
+                target: app.clone(),
+                link_offset: 0,
+                child_pid: child.pid(),
+            },
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(15), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        eprintln!(
+            "acquired host={:#x} cookie={} domain={} anchor={} epoch={:#x} object={:#x} anchor_seq={} reg={} ready_seq={} adopted={} anchor_hash={}",
+            receipts.host_key,
+            receipts.site_cookie,
+            receipts.domain.tgid,
+            receipts.anchor.anchor_id,
+            receipts.anchor.epoch,
+            receipts.anchor.object_id,
+            receipts.anchor.sequence,
+            receipts.registration.registration_id,
+            receipts.ready_sequence,
+            receipts.adopted_links,
+            receipts
+                .anchor
+                .hash
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+        );
+        assert_ne!(receipts.host_key, 0);
+        assert_eq!(
+            receipts.site_cookie, cookie,
+            "receipt must cite the admitted cookie"
+        );
+        assert_eq!(receipts.domain.tgid, child.pid());
+        assert_ne!(receipts.domain.incarnation, 0);
+        assert_ne!(receipts.domain.original, 0);
+        assert_ne!(receipts.domain.planned, 0);
+        assert_ne!(receipts.domain.original, receipts.domain.planned);
+        assert_ne!(receipts.anchor.anchor_id, 0);
+        assert_ne!(receipts.anchor.epoch, 0);
+        assert_ne!(receipts.anchor.object_id, 0);
+        assert_ne!(receipts.anchor.sequence, 0);
+        assert_ne!(receipts.registration.registration_id, 0);
+        assert_ne!(
+            receipts.registration.registration_id,
+            receipts.anchor.anchor_id
+        );
+        assert_ne!(receipts.ready_sequence, 0);
+        assert_eq!(receipts.adopted_links, 2);
+        // Independent anchor oracle: hash the target file directly.
+        let expected = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(std::fs::read(&app).unwrap())
+        };
+        assert_eq!(receipts.anchor.hash, expected.as_slice());
+        // Release only after READY, then the independent workload oracle.
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "workload must exit 0");
+        let state = session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        let close = session.close_source_explicit().expect("source close");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (2, 0, 1)
+        );
+        assert!(
+            !close.order_refused,
+            "READY order must stay published at close"
+        );
+        assert!(close.first_error.is_none());
+        drop(session);
+        drop(gate);
+        drop(child);
+        source_native_assert_fds_return(&fds_before, &app);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]

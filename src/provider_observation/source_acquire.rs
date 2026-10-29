@@ -19,7 +19,10 @@
 
 use super::{ObservationGap, source_owner::contract};
 use crate::loader;
-use std::{collections::BTreeMap, os::fd::OwnedFd};
+use std::{
+    collections::BTreeMap,
+    os::fd::{AsRawFd, OwnedFd},
+};
 
 /// Conservative accounted host capacity for the acquisition core, charged once
 /// by the source owner before any acquisition. These are reservations, not
@@ -98,9 +101,8 @@ impl HostIds {
             next: contract::HOST_ID_FIRST,
         }
     }
-    // Phase-2 native lease: minting runs from the future after-open
-    // acquisition path, after source/artifact review plus explicit lease.
-    #[allow(dead_code)]
+    // Minting runs from the after-open acquisition path, after source/artifact
+    // review plus explicit native lease.
     pub(super) fn fresh(&mut self) -> Result<u64, ObservationGap> {
         // u64::MAX is the exhaustion sentinel, never a minted ID: minting it
         // would leave no representable successor and risk wrap or reuse.
@@ -116,8 +118,8 @@ impl HostIds {
 /// Synchronous terminal observations of completed trigger invocations. Each
 /// receipt binds the exact nonce the host armed; counts and verdict prove the
 /// kernel completed one hook pair. No in-flight request word is a receipt.
-/// Private fields with no constructors: only tests build literals in phase 1;
-/// validated phase-2 constructors mint these from completed native calls.
+/// Validated constructors mint these from completed native calls: terminal
+/// shape is checked here, binding to the mint at the ledger transition.
 pub(super) struct AnchorReceipt {
     anchor_id: u64,
     nonce: u64,
@@ -157,12 +159,129 @@ pub(super) struct AdoptedLinks {
     epoch: u64,
     links: u8,
 }
+impl AnchorReceipt {
+    /// Mint from a completed phase-1 trigger. Terminal shape only (one
+    /// completed hook pair, success verdict); binding to the minted anchor is
+    /// checked when the receipt is consumed.
+    pub(super) fn observed(
+        anchor_id: u64,
+        nonce: u64,
+        entry_count: u32,
+        exit_count: u32,
+        verdict: u32,
+    ) -> Result<Self, ObservationGap> {
+        if entry_count != 1 || exit_count != 1 || verdict != VERDICT_SUCCESS {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(Self {
+            anchor_id,
+            nonce,
+            entry_count,
+            exit_count,
+            verdict,
+        })
+    }
+}
+impl EntryReceipt {
+    /// Mint from a completed ENTRY/RETURN trigger. Terminal shape plus a
+    /// usable adopted FD; binding to the minted registration is checked when
+    /// the receipt is consumed.
+    pub(super) fn observed(
+        registration_id: u64,
+        nonce: u64,
+        entry_count: u32,
+        exit_count: u32,
+        verdict: u32,
+        syscall_ok: bool,
+    ) -> Result<Self, ObservationGap> {
+        if entry_count != 1 || exit_count != 1 || verdict != VERDICT_SUCCESS || !syscall_ok {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(Self {
+            nonce,
+            registration_id,
+            entry_count,
+            exit_count,
+            verdict,
+            syscall_ok,
+        })
+    }
+}
+impl EnrollmentReceipt {
+    /// Mint from a completed enrollment trigger. The observer coordinates
+    /// must be nonzero; nonce binding is checked when the receipt is consumed.
+    pub(super) fn observed(nonce: u64, host_pid_tgid: u64) -> Result<Self, ObservationGap> {
+        if host_pid_tgid == 0 {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(Self {
+            nonce,
+            host_pid_tgid,
+        })
+    }
+}
+impl ReadyReceipt {
+    /// Mint from a completed phase-4 trigger. Terminal shape plus a nonzero
+    /// publication sequence; binding to the stored registration is checked
+    /// when the receipt is consumed.
+    pub(super) fn observed(
+        nonce: u64,
+        registration_id: u64,
+        entry_count: u32,
+        exit_count: u32,
+        verdict: u32,
+        sequence: u64,
+    ) -> Result<Self, ObservationGap> {
+        if entry_count != 1 || exit_count != 1 || verdict != VERDICT_SUCCESS || sequence == 0 {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(Self {
+            nonce,
+            registration_id,
+            entry_count,
+            exit_count,
+            verdict,
+            sequence,
+        })
+    }
+}
+impl AdoptedLinks {
+    /// Mint after every required actual link FD for one registration was
+    /// retained in the owner. A zero-link proof never exists.
+    pub(super) fn adopted(
+        registration_id: u64,
+        anchor_id: u64,
+        epoch: u64,
+        links: u8,
+    ) -> Result<Self, ObservationGap> {
+        if links == 0 {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(Self {
+            registration_id,
+            anchor_id,
+            epoch,
+            links,
+        })
+    }
+}
+impl OriginalCustody {
+    /// Mint while the caller retains the stopped pre-exec child for this
+    /// TGID. The TGID must be nonzero; stopped-state and session-target
+    /// binding are verified by the caller before minting.
+    pub(super) fn held(tgid: u32) -> Result<Self, ObservationGap> {
+        if tgid == 0 {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(Self { tgid })
+    }
+}
 
 /// Host record of a guard the host minted or created. `Minted` has no kernel
 /// row yet; the remaining states mirror the kernel SOURCE_GUARD word. This is
 /// host issuance bookkeeping, never a readback of private REL state.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum GuardLife {
+pub(super) enum GuardLife {
     Minted,
     Preparing,
     Live,
@@ -196,9 +315,9 @@ pub(super) struct GuardLedger {
     anchors: BTreeMap<u64, AnchorGuard>,
     registrations: BTreeMap<u64, RegistrationGuard>,
 }
-// Phase-2 native lease: transitions run only from the future after-open
-// acquisition path, after source/artifact review plus explicit lease.
-#[allow(dead_code)]
+// Transitions run only from the after-open acquisition path (and its
+// explicit test-driven close), after source/artifact review plus explicit
+// native lease.
 impl GuardLedger {
     pub(super) fn new() -> Self {
         Self {
@@ -420,6 +539,9 @@ impl GuardLedger {
     /// Retire a created guard. Idempotent on terminal rows (first terminal
     /// state wins) so teardown can retire everything unconditionally. Minted
     /// IDs with no kernel row are refused here; abandon them instead.
+    /// Caller: the explicit test-driven source close only; production close
+    /// lands with 5B activation.
+    #[allow(dead_code)]
     pub(super) fn retire(&mut self, id: u64) -> Result<(), ObservationGap> {
         if let Some(guard) = self.anchors.get_mut(&id) {
             return Self::retire_life(&mut guard.life);
@@ -429,6 +551,7 @@ impl GuardLedger {
         }
         Err(ObservationGap::Invalidated)
     }
+    #[allow(dead_code)]
     fn retire_life(life: &mut GuardLife) -> Result<(), ObservationGap> {
         match life {
             GuardLife::Minted => Err(ObservationGap::Invalidated),
@@ -441,7 +564,8 @@ impl GuardLedger {
     }
     /// Conflict a guard after an observed collision or failed invariant.
     /// First terminal state wins; a minted ID with no kernel row conflicts
-    /// without needing any map effect.
+    /// without needing any map effect. The converge step conflicts the
+    /// record when the LIVE map update fails.
     pub(super) fn conflict(&mut self, id: u64) -> Result<(), ObservationGap> {
         if let Some(guard) = self.anchors.get_mut(&id) {
             if !guard.life.terminal() {
@@ -459,6 +583,9 @@ impl GuardLedger {
     }
     /// Drop a minted-never-created ID. Only Minted records may be abandoned;
     /// anything created needs explicit retire/conflict for its kernel row.
+    /// Caller: the explicit test-driven source close only; production close
+    /// lands with 5B activation.
+    #[allow(dead_code)]
     pub(super) fn abandon(&mut self, id: u64) -> Result<(), ObservationGap> {
         if self
             .anchors
@@ -493,6 +620,14 @@ impl GuardLedger {
     pub(super) fn registration_anchor(&self, id: u64) -> Option<u64> {
         self.registrations.get(&id).map(|guard| guard.anchor_id)
     }
+    /// Current host life of a minted guard, if known. The explicit close uses
+    /// this to retire created guards and abandon minted-never-created IDs.
+    pub(super) fn guard_life(&self, id: u64) -> Option<GuardLife> {
+        self.anchors
+            .get(&id)
+            .map(|guard| guard.life)
+            .or_else(|| self.registrations.get(&id).map(|guard| guard.life))
+    }
 }
 
 /// Proof that the host holds the original pre-exec child for one TGID, so
@@ -516,9 +651,9 @@ pub(super) struct DomainIndex {
     /// the shared 8192 allowance.
     claims: u64,
 }
-// Phase-2 native lease: transitions run only from the future after-open
-// acquisition path, after source/artifact review plus explicit lease.
-#[allow(dead_code)]
+// Transitions run only from the after-open acquisition path (and its
+// explicit test-driven close), after source/artifact review plus explicit
+// native lease.
 impl DomainIndex {
     pub(super) fn new() -> Self {
         Self {
@@ -593,6 +728,8 @@ impl DomainIndex {
     /// A normalization failure for a seeded domain revokes exactly that
     /// domain. Unseeded TGIDs are ignored: before a seed no certificates
     /// exist to retire, and unrelated tasks must not poison the session.
+    /// No phase-2 caller: kept for the normalization paths.
+    #[allow(dead_code)]
     pub(super) fn note_normalization_failure(&mut self, tgid: u32) {
         if let Some(row) = self.domains.get_mut(&tgid) {
             if !Self::terminal(row.state) {
@@ -600,6 +737,9 @@ impl DomainIndex {
             }
         }
     }
+    /// Caller: the explicit test-driven source close only; production close
+    /// lands with 5B activation.
+    #[allow(dead_code)]
     pub(super) fn retire(&mut self, tgid: u32) -> Result<(), ObservationGap> {
         let row = self
             .domains
@@ -610,6 +750,8 @@ impl DomainIndex {
         }
         Ok(())
     }
+    /// No phase-2 caller: kept for the invalidation paths.
+    #[allow(dead_code)]
     pub(super) fn poison(&mut self, tgid: u32) -> Result<(), ObservationGap> {
         let row = self
             .domains
@@ -658,9 +800,8 @@ pub(super) struct AcquisitionOrder {
     anchor: Option<u64>,
     capabilities: Vec<RequiredCapability>,
 }
-// Phase-2 native lease: transitions run only from the future after-open
-// acquisition path, after source/artifact review plus explicit lease.
-#[allow(dead_code)]
+// Transitions run only from the after-open acquisition path, after
+// source/artifact review plus explicit native lease.
 impl AcquisitionOrder {
     pub(super) fn new() -> Self {
         Self {
@@ -809,17 +950,19 @@ impl AcquisitionOrder {
 /// READY triggers. At most one provisional link is ever in flight, attached
 /// only to the retained nonzero observer PID; it can never seed a target,
 /// count, or act as source authority.
-// Phase-2 native lease: FD slots fill only from the future trigger path.
-#[allow(dead_code)]
+// FD slots fill only from the trigger path, after source/artifact review plus
+// explicit native lease.
 pub(super) struct NoOpTrigger {
     provisional: Option<OwnedFd>,
     program: Option<OwnedFd>,
     observer_pid: u32,
 }
-// Phase-2 native lease: the PID gate runs from the future trigger path,
-// after source/artifact review plus explicit lease. `new` is already live.
-#[allow(dead_code)]
+// The PID gate runs from the trigger path, after source/artifact review plus
+// explicit native lease.
 impl NoOpTrigger {
+    /// Caller: native tests only in phase 2; production retention builds the
+    /// trigger inline at root adoption.
+    #[allow(dead_code)]
     pub(super) fn new(observer_pid: u32) -> Result<Self, ObservationGap> {
         if observer_pid == 0 {
             return Err(ObservationGap::Invalidated);
@@ -829,6 +972,35 @@ impl NoOpTrigger {
             program: None,
             observer_pid,
         })
+    }
+    /// Load the literal 16-byte NoOp program once for the whole acquisition.
+    /// Refuses if already loaded: exactly one program owner exists.
+    pub(super) fn load_program(&mut self) -> Result<(), ObservationGap> {
+        if self.program.is_some() {
+            return Err(ObservationGap::Invalidated);
+        }
+        self.program = Some(
+            ossl_bpf_sys::prog_load_source_noop().map_err(|_| ObservationGap::BpfUnavailable)?,
+        );
+        Ok(())
+    }
+    pub(super) fn program_fd(&self) -> Result<std::os::fd::RawFd, ObservationGap> {
+        self.program
+            .as_ref()
+            .map(AsRawFd::as_raw_fd)
+            .ok_or(ObservationGap::Invalidated)
+    }
+    /// Retain the single in-flight provisional link. Refuses while one is
+    /// active: no rearm while an earlier request/hook is active.
+    pub(super) fn store_provisional(&mut self, link: OwnedFd) -> Result<(), ObservationGap> {
+        if self.provisional.is_some() {
+            return Err(ObservationGap::Invalidated);
+        }
+        self.provisional = Some(link);
+        Ok(())
+    }
+    pub(super) fn take_provisional(&mut self) -> Option<OwnedFd> {
+        self.provisional.take()
     }
     /// A provisional trigger attaches only to the retained observer PID.
     /// PID 0 and any non-observer PID are refused, never retargeted.
@@ -841,13 +1013,14 @@ impl NoOpTrigger {
 }
 
 /// Validated unloaded source roots plus their future program/link custody.
-/// Fields drop in declaration order: links release before programs, and the
-/// owner declares its roots before its maps so all FDs release before maps.
-// Phase-2 native lease: retained bytes and the FUNC ID load only after
-// source/artifact review plus explicit lease.
-#[allow(dead_code)]
+/// Fields drop in declaration order: links and lifecycle writers release
+/// before programs, and the owner declares its roots before its maps so all
+/// FDs release before maps.
+// Retained bytes and the FUNC ID load only after source/artifact review plus
+// explicit native lease.
 pub(super) struct RetainedSourceRoots {
     links: Vec<OwnedFd>,
+    lifecycle: Vec<crate::writer_gate::LifecycleWriter>,
     programs: Vec<OwnedFd>,
     noop: NoOpTrigger,
     prepared: loader::Prepared,
@@ -906,8 +1079,49 @@ impl RetainedSourceRoots {
         }
         Ok(())
     }
+    pub(super) fn prepared(&self) -> &loader::Prepared {
+        &self.prepared
+    }
+    pub(super) fn attach_btf_id(&self) -> u32 {
+        self.attach_btf_id
+    }
+    pub(super) fn check_observer(&self, pid: u32) -> Result<(), ObservationGap> {
+        self.noop.check_observer_pid(pid)
+    }
+    pub(super) fn load_noop_program(&mut self) -> Result<(), ObservationGap> {
+        self.noop.load_program()
+    }
+    pub(super) fn noop_program_fd(&self) -> Result<std::os::fd::RawFd, ObservationGap> {
+        self.noop.program_fd()
+    }
+    pub(super) fn store_provisional(&mut self, link: OwnedFd) -> Result<(), ObservationGap> {
+        self.noop.store_provisional(link)
+    }
+    pub(super) fn take_provisional(&mut self) -> Option<OwnedFd> {
+        self.noop.take_provisional()
+    }
+    /// Loaded program/link/lifecycle counts. Test-called only (post-hoc
+    /// enablement receipts).
+    #[allow(dead_code)]
+    pub(super) fn loaded_counts(&self) -> (usize, usize, usize) {
+        (self.programs.len(), self.links.len(), self.lifecycle.len())
+    }
+    /// Adopt loaded programs and attached links after a successful load.
+    pub(super) fn adopt_loaded(&mut self, loaded: loader::SourceLoaded) {
+        self.programs.extend(loaded.programs.into_values());
+        self.links.extend(loaded.links.into_values());
+        self.lifecycle.extend(loaded.lifecycle);
+    }
+    /// Release every program/link owner in drop order. Maps stay with the
+    /// source owner until its own drop.
+    pub(super) fn release_loaded(&mut self) {
+        drop(self.noop.take_provisional());
+        self.links.clear();
+        self.lifecycle.clear();
+        self.programs.clear();
+    }
     /// Move validated custody into the owner. Call `check` first; the owner
-    /// does. Program/link FDs stay empty until the phase-2 native lease.
+    /// does. Program/link FDs stay empty until the native lease loads them.
     pub(super) fn retain(
         prepared: loader::Prepared,
         attach_btf_id: u32,
@@ -917,6 +1131,7 @@ impl RetainedSourceRoots {
         debug_assert!(observer_pid != 0);
         Self {
             links: Vec::new(),
+            lifecycle: Vec::new(),
             programs: Vec::new(),
             noop: NoOpTrigger {
                 provisional: None,
@@ -963,10 +1178,62 @@ fn guard_advance_with(
         ossl_bpf_sys::BPF_EXIST,
     )
 }
-// Phase-2 native lease: guard map effects run only from the future after-open
-// acquisition path, after source/artifact review plus explicit lease.
-#[allow(dead_code)]
+// Guard map effects run only from the after-open acquisition path, after
+// source/artifact review plus explicit native lease.
 impl GuardLedger {
+    /// The ONLY anchor-guard creation path with a kernel effect. It takes
+    /// the phase-1 receipt (plus the map FD), validates it against the minted
+    /// record FIRST, performs the single NOEXIST PREPARING insert, then
+    /// records PREPARING. No raw id/epoch creation entry point remains. A
+    /// failed insert terminally conflicts the record, so a failed creation is
+    /// structurally never retried.
+    pub(super) fn create_anchor_guarded(
+        &mut self,
+        map_fd: std::os::fd::RawFd,
+        id: u64,
+        receipt: &AnchorReceipt,
+    ) -> Result<(), ObservationGap> {
+        self.create_anchor_guarded_with(id, receipt, |key, value, flags| unsafe {
+            ossl_bpf_sys::map_update_elem(map_fd, key, value, flags)
+        })
+    }
+    /// Caps-free seam of the anchor creation chokepoint: identical validation
+    /// and bookkeeping with an injected insert operation. Tests drive
+    /// schedules through this; production passes the real map-update call.
+    pub(super) fn create_anchor_guarded_with(
+        &mut self,
+        id: u64,
+        receipt: &AnchorReceipt,
+        call: impl FnOnce(&[u8; 8], &[u8; 16], u64) -> std::io::Result<()>,
+    ) -> Result<(), ObservationGap> {
+        // Receipt validation strictly precedes the injected insert: nothing
+        // reaches the map without an exact terminal phase-1 receipt for this
+        // minted ID.
+        let epoch = self.validated_anchor_epoch(id, receipt)?;
+        if guard_create_with(id, epoch, call).is_err() {
+            // Terminal refusal: a failed creation is never retried.
+            // Validation above proved Minted on the serialized owner, so
+            // conflict here is infallible in practice.
+            self.fail_anchor(id)?;
+            return Err(ObservationGap::BpfUnavailable);
+        }
+        // The insert succeeded; record PREPARING under the same receipt.
+        self.create_anchor(id, receipt)
+    }
+    fn validated_anchor_epoch(
+        &self,
+        id: u64,
+        receipt: &AnchorReceipt,
+    ) -> Result<u64, ObservationGap> {
+        let guard = self.anchors.get(&id).ok_or(ObservationGap::Invalidated)?;
+        if guard.life != GuardLife::Minted
+            || receipt.anchor_id != id
+            || !Self::anchor_receipt_matches(guard, receipt)
+        {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(guard.epoch)
+    }
     /// The ONLY adoption-guard creation path with a kernel effect. It takes
     /// the ENTRY receipt (plus the map FD), validates it against the minted
     /// record FIRST, performs the single NOEXIST PREPARING insert, then
@@ -1029,16 +1296,119 @@ impl GuardLedger {
         }
         Ok(guard.epoch)
     }
-    pub(super) fn advance_guard(
+    /// The ONLY guard-transition path with a kernel effect. It validates the
+    /// ledger record FIRST (known ID, recorded epoch, exact expected life,
+    /// legal successor), performs the single EXIST update, then records the
+    /// new life. A failed update leaves bookkeeping unchanged and refuses
+    /// with `BpfUnavailable`, so a failed transition is never recorded.
+    pub(super) fn advance_guard_checked(
+        &mut self,
         map_fd: std::os::fd::RawFd,
         id: u64,
-        epoch: u64,
-        state: u64,
+        from: GuardLife,
+        to: GuardLife,
     ) -> Result<(), ObservationGap> {
-        guard_advance_with(id, epoch, state, |key, value, flags| unsafe {
+        self.advance_guard_checked_with(id, from, to, |key, value, flags| unsafe {
             ossl_bpf_sys::map_update_elem(map_fd, key, value, flags)
         })
-        .map_err(|_| ObservationGap::BpfUnavailable)
+    }
+    /// Caps-free seam of the transition chokepoint: identical validation and
+    /// bookkeeping with an injected update operation.
+    pub(super) fn advance_guard_checked_with(
+        &mut self,
+        id: u64,
+        from: GuardLife,
+        to: GuardLife,
+        call: impl FnOnce(&[u8; 8], &[u8; 16], u64) -> std::io::Result<()>,
+    ) -> Result<(), ObservationGap> {
+        // Legal kernel transitions only: PREPARING/LIVE advance to
+        // LIVE/RETIRED/CONFLICT, never backwards, never Minted, never onto a
+        // terminal row.
+        let legal = matches!(
+            (from, to),
+            (
+                GuardLife::Preparing,
+                GuardLife::Live | GuardLife::Retired | GuardLife::Conflict
+            ) | (GuardLife::Live, GuardLife::Retired | GuardLife::Conflict)
+        );
+        if !legal {
+            return Err(ObservationGap::Invalidated);
+        }
+        let to_word = match to {
+            GuardLife::Live => contract::GUARD_LIVE,
+            GuardLife::Retired => contract::GUARD_RETIRED,
+            GuardLife::Conflict => contract::GUARD_CONFLICT,
+            GuardLife::Minted | GuardLife::Preparing => return Err(ObservationGap::Invalidated),
+        };
+        // Borrow discipline: resolve the record and its epoch first, release
+        // the borrow across the injected map effect, then record.
+        let epoch = {
+            let (epoch, life) = self.guard_epoch_life(id)?;
+            if life != from {
+                return Err(ObservationGap::Invalidated);
+            }
+            epoch
+        };
+        if guard_advance_with(id, epoch, to_word, call).is_err() {
+            return Err(ObservationGap::BpfUnavailable);
+        }
+        let (_, life) = self.guard_epoch_life_mut(id)?;
+        *life = to;
+        Ok(())
+    }
+    /// Converge a LIVE-recorded guard's kernel row to LIVE. Bookkeeping
+    /// leads: `live_anchor`/`live_adoption` (one-shot, reviewed) record LIVE
+    /// only after the custody proofs, and this EXIST-update converges the
+    /// kernel row to match. The serialized owner performs no trigger between
+    /// the two, so the kernel never observes the intermediate state. A
+    /// failed update terminally conflicts the record and refuses: the stale
+    /// PREPARING row is unreachable afterwards (the order refuses, IDs never
+    /// repeat) and dies with the session maps at close.
+    pub(super) fn converge_guard_live(
+        &mut self,
+        map_fd: std::os::fd::RawFd,
+        id: u64,
+    ) -> Result<(), ObservationGap> {
+        self.converge_guard_live_with(id, |key, value, flags| unsafe {
+            ossl_bpf_sys::map_update_elem(map_fd, key, value, flags)
+        })
+    }
+    /// Caps-free seam of the converge step: identical validation and
+    /// bookkeeping with an injected update operation.
+    pub(super) fn converge_guard_live_with(
+        &mut self,
+        id: u64,
+        call: impl FnOnce(&[u8; 8], &[u8; 16], u64) -> std::io::Result<()>,
+    ) -> Result<(), ObservationGap> {
+        let (epoch, life) = self.guard_epoch_life(id)?;
+        if life != GuardLife::Live {
+            return Err(ObservationGap::Invalidated);
+        }
+        if guard_advance_with(id, epoch, contract::GUARD_LIVE, call).is_err() {
+            // Terminal refusal: the record must never claim LIVE the kernel
+            // row does not have.
+            let _ = self.conflict(id);
+            return Err(ObservationGap::BpfUnavailable);
+        }
+        Ok(())
+    }
+    fn guard_epoch_life(&self, id: u64) -> Result<(u64, GuardLife), ObservationGap> {
+        if let Some(guard) = self.anchors.get(&id) {
+            return Ok((guard.epoch, guard.life));
+        }
+        if let Some(guard) = self.registrations.get(&id) {
+            return Ok((guard.epoch, guard.life));
+        }
+        Err(ObservationGap::Invalidated)
+    }
+    fn guard_epoch_life_mut(&mut self, id: u64) -> Result<(u64, &mut GuardLife), ObservationGap> {
+        if let Some(guard) = self.anchors.get_mut(&id) {
+            return Ok((guard.epoch, &mut guard.life));
+        }
+        if let Some(guard) = self.registrations.get_mut(&id) {
+            return Ok((guard.epoch, &mut guard.life));
+        }
+        Err(ObservationGap::Invalidated)
     }
 }
 
@@ -2255,7 +2625,8 @@ mod tests {
             std::hint::black_box(&order);
         });
         std::hint::black_box((&ids, &ledger, &registrations));
-        // Reserves cover measured live heap plus the inline stack footprint.
+        // Reserves cover measured live heap plus the inline stack footprint (see
+        // asserts below).
         assert!(
             ledger_peak + size_of::<GuardLedger>() <= LEDGER_RESERVE,
             "ledger heap {ledger_peak} + inline exceeds {LEDGER_RESERVE}"
@@ -2268,6 +2639,255 @@ mod tests {
             order_peak + size_of::<AcquisitionOrder>() <= ORDER_RESERVE,
             "order heap {order_peak} + inline exceeds {ORDER_RESERVE}"
         );
+    }
+    #[test]
+    fn anchor_creation_trace_orders_phase1_insert_before_live() {
+        use std::{cell::Cell, rc::Rc};
+        // Every schedule runs through the injected anchor seam with an insert
+        // counter: validation strictly precedes the single NOEXIST insert.
+        let mut ids = HostIds::new();
+        let mut ledger = GuardLedger::new();
+        let epoch = 7;
+        let nonce = ids.fresh().unwrap();
+        let anchor = ledger.mint_anchor(&mut ids, epoch, nonce).unwrap();
+        let inserts = Rc::new(Cell::new(0u32));
+        let attempt = |ledger: &mut GuardLedger, receipt: &AnchorReceipt| {
+            let inserts = Rc::clone(&inserts);
+            ledger.create_anchor_guarded_with(anchor, receipt, |key, value, flags| {
+                inserts.set(inserts.get() + 1);
+                assert_eq!(key, &anchor.to_ne_bytes());
+                let mut expected_preparing = [0u8; 16];
+                expected_preparing[..8].copy_from_slice(&epoch.to_ne_bytes());
+                expected_preparing[8..].copy_from_slice(&contract::GUARD_PREPARING.to_ne_bytes());
+                assert_eq!(value, &expected_preparing);
+                assert_eq!(flags, ossl_bpf_sys::BPF_NOEXIST);
+                Ok(())
+            })
+        };
+        // EARLY (non-terminal receipt) refuses with zero inserts; the mint
+        // survives for the exact receipt.
+        let early = AnchorReceipt {
+            anchor_id: anchor,
+            nonce,
+            entry_count: 1,
+            exit_count: 0,
+            verdict: VERDICT_SUCCESS,
+        };
+        assert!(attempt(&mut ledger, &early).is_err());
+        assert_eq!(inserts.get(), 0);
+        // Exact receipt drives exactly one NOEXIST insert with exact bytes.
+        attempt(&mut ledger, &anchor_receipt(anchor, nonce)).unwrap();
+        assert_eq!(inserts.get(), 1);
+        // DUPLICATE refuses with no second insert.
+        assert!(attempt(&mut ledger, &anchor_receipt(anchor, nonce)).is_err());
+        assert_eq!(inserts.get(), 1);
+        // LATE (after LIVE) refuses.
+        ledger.live_anchor(anchor).unwrap();
+        assert!(attempt(&mut ledger, &anchor_receipt(anchor, nonce)).is_err());
+        assert_eq!(inserts.get(), 1);
+        // FAILED insert maps to BpfUnavailable, conflicts terminally, refuses
+        // retry with no second insert.
+        let nonce = ids.fresh().unwrap();
+        let anchor = ledger.mint_anchor(&mut ids, epoch, nonce).unwrap();
+        let failed =
+            ledger.create_anchor_guarded_with(anchor, &anchor_receipt(anchor, nonce), |_, _, _| {
+                Err(std::io::Error::from_raw_os_error(libc::EEXIST))
+            });
+        assert!(matches!(failed, Err(ObservationGap::BpfUnavailable)));
+        let retry =
+            ledger.create_anchor_guarded_with(anchor, &anchor_receipt(anchor, nonce), |_, _, _| {
+                panic!("conflicted anchor must never reach the map again");
+            });
+        assert!(retry.is_err());
+        assert!(ledger.anchors[&anchor].life.terminal());
+    }
+    #[test]
+    fn checked_advance_validates_ledger_before_exist_update() {
+        use std::{cell::Cell, rc::Rc};
+        let (ids, mut ledger, anchor, epoch) = live_anchor();
+        let updates = Rc::new(Cell::new(0u32));
+        let attempt = |ledger: &mut GuardLedger,
+                       id: u64,
+                       from: GuardLife,
+                       to: GuardLife,
+                       updates: &Rc<Cell<u32>>| {
+            let updates = Rc::clone(updates);
+            ledger.advance_guard_checked_with(id, from, to, |key, value, flags| {
+                updates.set(updates.get() + 1);
+                assert_eq!(key, &id.to_ne_bytes());
+                let mut expected = [0u8; 16];
+                expected[..8].copy_from_slice(&epoch.to_ne_bytes());
+                let word = match to {
+                    GuardLife::Live => contract::GUARD_LIVE,
+                    GuardLife::Retired => contract::GUARD_RETIRED,
+                    GuardLife::Conflict => contract::GUARD_CONFLICT,
+                    _ => unreachable!(),
+                };
+                expected[8..].copy_from_slice(&word.to_ne_bytes());
+                assert_eq!(value, &expected);
+                assert_eq!(flags, ossl_bpf_sys::BPF_EXIST);
+                Ok(())
+            })
+        };
+        // Unknown IDs, wrong from-state and illegal pairs refuse with zero
+        // map effects.
+        assert!(
+            attempt(
+                &mut ledger,
+                anchor + 1000,
+                GuardLife::Live,
+                GuardLife::Retired,
+                &updates
+            )
+            .is_err()
+        );
+        assert!(
+            attempt(
+                &mut ledger,
+                anchor,
+                GuardLife::Preparing,
+                GuardLife::Retired,
+                &updates
+            )
+            .is_err()
+        );
+        assert!(
+            attempt(
+                &mut ledger,
+                anchor,
+                GuardLife::Live,
+                GuardLife::Preparing,
+                &updates
+            )
+            .is_err()
+        );
+        assert!(
+            attempt(
+                &mut ledger,
+                anchor,
+                GuardLife::Live,
+                GuardLife::Live,
+                &updates
+            )
+            .is_err()
+        );
+        assert!(
+            attempt(
+                &mut ledger,
+                anchor,
+                GuardLife::Minted,
+                GuardLife::Live,
+                &updates
+            )
+            .is_err()
+        );
+        assert_eq!(updates.get(), 0);
+        // A failed update refuses WITHOUT recording: bookkeeping still LIVE.
+        let failed = ledger.advance_guard_checked_with(
+            anchor,
+            GuardLife::Live,
+            GuardLife::Retired,
+            |_, _, _| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        );
+        assert!(matches!(failed, Err(ObservationGap::BpfUnavailable)));
+        assert!(ledger.anchor_live(anchor));
+        // Exact success performs one EXIST update and records the new life.
+        attempt(
+            &mut ledger,
+            anchor,
+            GuardLife::Live,
+            GuardLife::Retired,
+            &updates,
+        )
+        .unwrap();
+        assert_eq!(updates.get(), 1);
+        assert!(!ledger.anchor_live(anchor));
+        // Terminal rows never advance again.
+        assert!(
+            attempt(
+                &mut ledger,
+                anchor,
+                GuardLife::Retired,
+                GuardLife::Live,
+                &updates
+            )
+            .is_err()
+        );
+        assert_eq!(updates.get(), 1);
+        let _ = ids;
+    }
+    #[test]
+    fn receipt_constructors_refuse_nonterminal_observations() {
+        // Every constructor mints the exact terminal shape and refuses every
+        // non-terminal axis. Binding to the mint stays with the consumer.
+        assert!(AnchorReceipt::observed(9, 8, 1, 1, VERDICT_SUCCESS).is_ok());
+        assert!(AnchorReceipt::observed(9, 8, 0, 1, VERDICT_SUCCESS).is_err());
+        assert!(AnchorReceipt::observed(9, 8, 1, 0, VERDICT_SUCCESS).is_err());
+        assert!(AnchorReceipt::observed(9, 8, 1, 1, 0).is_err());
+        assert!(AnchorReceipt::observed(9, 8, 1, 1, 2).is_err());
+        assert!(EntryReceipt::observed(9, 8, 1, 1, VERDICT_SUCCESS, true).is_ok());
+        assert!(EntryReceipt::observed(9, 8, 1, 1, VERDICT_SUCCESS, false).is_err());
+        assert!(EntryReceipt::observed(9, 8, 2, 1, VERDICT_SUCCESS, true).is_err());
+        assert!(EnrollmentReceipt::observed(8, 7).is_ok());
+        assert!(EnrollmentReceipt::observed(8, 0).is_err());
+        assert!(ReadyReceipt::observed(8, 9, 1, 1, VERDICT_SUCCESS, 3).is_ok());
+        assert!(ReadyReceipt::observed(8, 9, 1, 1, VERDICT_SUCCESS, 0).is_err());
+        assert!(ReadyReceipt::observed(8, 9, 1, 1, 2, 3).is_err());
+        assert!(AdoptedLinks::adopted(9, 7, 5, 2).is_ok());
+        assert!(AdoptedLinks::adopted(9, 7, 5, 0).is_err());
+        assert!(OriginalCustody::held(11).is_ok());
+        assert!(OriginalCustody::held(0).is_err());
+    }
+    #[test]
+    fn converge_live_updates_only_live_records_and_conflicts_on_failure() {
+        use std::{cell::Cell, rc::Rc};
+        let (mut ids, mut ledger, anchor, epoch) = live_anchor();
+        // Unknown, minted and preparing records refuse with zero map effects.
+        let spare = ids.fresh().unwrap();
+        let minted = ledger.mint_anchor(&mut ids, epoch, spare).unwrap();
+        for id in [anchor + 1000, minted] {
+            let updates = Rc::new(Cell::new(0u32));
+            let refused = ledger.converge_guard_live_with(id, |_, _, _| {
+                updates.set(updates.get() + 1);
+                Ok(())
+            });
+            assert!(refused.is_err());
+            assert_eq!(updates.get(), 0);
+        }
+        // Exact success performs one EXIST update with exact LIVE bytes and
+        // keeps the LIVE record.
+        let updates = Rc::new(Cell::new(0u32));
+        let probe = Rc::clone(&updates);
+        ledger
+            .converge_guard_live_with(anchor, |key, value, flags| {
+                probe.set(probe.get() + 1);
+                assert_eq!(key, &anchor.to_ne_bytes());
+                let mut expected = [0u8; 16];
+                expected[..8].copy_from_slice(&epoch.to_ne_bytes());
+                expected[8..].copy_from_slice(&contract::GUARD_LIVE.to_ne_bytes());
+                assert_eq!(value, &expected);
+                assert_eq!(flags, ossl_bpf_sys::BPF_EXIST);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(updates.get(), 1);
+        assert!(ledger.anchor_live(anchor));
+        // A failed update refuses AND terminally conflicts the record, so a
+        // LIVE claim never outlives its kernel row.
+        let failed = ledger.converge_guard_live_with(anchor, |_, _, _| {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        });
+        assert!(matches!(failed, Err(ObservationGap::BpfUnavailable)));
+        assert!(!ledger.anchor_live(anchor));
+        assert!(ledger.anchors[&anchor].life.terminal());
+        // Terminal records never converge again.
+        let updates = Rc::new(Cell::new(0u32));
+        let refused = ledger.converge_guard_live_with(anchor, |_, _, _| {
+            updates.set(updates.get() + 1);
+            Ok(())
+        });
+        assert!(refused.is_err());
+        assert_eq!(updates.get(), 0);
     }
 }
 

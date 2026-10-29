@@ -757,11 +757,25 @@ impl FocusedSession {
                             std::mem::take(&mut preexec.typed),
                             setup_deadline,
                             cancel,
+                            &crate::provider_observation::SourceAcquisitionLease::Disabled,
                         ),
                 }) {
                     if let Err(gap) = result {
                         gaps.insert(gap);
                     }
+                }
+                // The native source lease stays disabled in production: both
+                // calls below are inert under a Disabled lease (immediate Ok,
+                // zero effects) and exist so the lease-gated acquisition path
+                // has production reachability for the native qualification.
+                let disabled = crate::provider_observation::SourceAcquisitionLease::Disabled;
+                if let Err(gap) =
+                    session.acquire_source_after_open(&disabled, setup_deadline, cancel)
+                {
+                    gaps.insert(gap);
+                }
+                if let Err(gap) = session.note_source_exec(&disabled, 0, 0) {
+                    gaps.insert(gap);
                 }
             }
         }

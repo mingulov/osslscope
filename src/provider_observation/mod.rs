@@ -8,6 +8,7 @@ pub mod objects;
 pub mod schema;
 mod source_acquire;
 mod source_owner;
+pub(crate) use source_owner::SourceAcquisitionLease;
 pub mod static_tables;
 pub use objects::{
     ApiSite, TransientCodeAddress, VerifiedProcess, VerifiedSite, VerifiedStaticCandidate, acquire,
