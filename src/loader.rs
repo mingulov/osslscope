@@ -20,6 +20,9 @@ pub(crate) struct SourceKernel {
     _reservation: crate::provider_observation::schema::StateReservation,
 }
 impl SourceKernel {
+    pub(crate) fn iterator_class(&self) -> u32 {
+        self._configuration[12]
+    }
     pub(crate) fn read(
         budget: &crate::provider_observation::ObservationBudget,
     ) -> Result<Self, crate::provider_observation::ObservationGap> {

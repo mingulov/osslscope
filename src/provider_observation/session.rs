@@ -271,6 +271,7 @@ pub struct ProviderSession {
     // A validated kernel layout is only a prerequisite. No source authority is
     // published without the separately owned anchor and actual registrations.
     _source_kernel: Result<loader::SourceKernel, ObservationGap>,
+    source_owner: Option<super::source_owner::SourceOwner>,
     // Prearmed source preparation is noncertifying until actual source links,
     // post-adoption readiness and target-domain guards are established.
     typed_startup: Vec<super::objects::TypedPublicSite>,
@@ -776,6 +777,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             _source_kernel: source_kernel,
+            source_owner: None,
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
@@ -1682,7 +1684,16 @@ impl ProviderSession {
         if sites.is_empty() {
             return Ok(());
         }
-        self._source_kernel.as_ref().map_err(|gap| *gap)?;
+        let kernel = self._source_kernel.as_ref().map_err(|gap| *gap)?;
+        if self.source_owner.is_none() {
+            self.source_owner = Some(super::source_owner::SourceOwner::prepare(
+                &self.budget,
+                kernel,
+                &self.gate,
+                deadline,
+                cancel,
+            )?);
+        }
         retain_typed_startup(
             sites,
             &self.budget,
