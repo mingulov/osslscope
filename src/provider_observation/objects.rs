@@ -292,13 +292,42 @@ impl StartupProcess {
         Ok(())
     }
 }
+pub(crate) struct StartupCandidates {
+    pub(crate) candidates: Vec<VerifiedStaticCandidate>,
+    pub(crate) apis: Vec<StartupApiSite>,
+    pub(crate) typed: Vec<StartupTypedSite>,
+    pub(crate) partial: bool,
+    pub(crate) typed_gap: Option<ObservationGap>,
+}
+/// Exact export metadata under original-owned custody. The source mapping is
+/// acquired lazily only when the production session can prepare its source ABI.
+pub(crate) struct StartupTypedSite {
+    role: TypedRoleId,
+    site: VerifiedSite,
+}
+impl StartupTypedSite {
+    pub(crate) fn prepare(
+        self,
+        budget: &ObservationBudget,
+    ) -> Result<TypedPublicSite, ObservationGap> {
+        self.site.revalidate_object()?;
+        let anchor = self.site.object.anchor(budget, &self.site.hash)?;
+        self.site.revalidate_object()?;
+        Ok(TypedPublicSite {
+            _anchor: anchor,
+            role: self.role,
+            site: self.site,
+        })
+    }
+}
+
 /// Retain and parse the exact file already opened by bounded dependency discovery.
 /// Typed capabilities require an independently validated public export.
 pub(crate) fn startup_candidates(
     process: Rc<StartupProcess>,
     file: File,
     budget: &ObservationBudget,
-) -> Result<(Vec<VerifiedStaticCandidate>, Vec<StartupApiSite>, bool), ObservationGap> {
+) -> Result<StartupCandidates, ObservationGap> {
     process.validate()?;
     budget.object()?;
     let metadata = file
@@ -377,9 +406,33 @@ pub(crate) fn startup_candidates(
             partial: locator.partial,
         });
     }
+    let mut typed = Vec::new();
+    let mut typed_gap = None;
+    for &(role, offset) in &parsed.typed_exports {
+        if let Err(gap) = budget.state(256) {
+            typed_gap = Some(gap);
+            break;
+        }
+        typed.push(StartupTypedSite {
+            role,
+            site: VerifiedSite {
+                custody: SiteCustody::Startup(process.clone()),
+                object: object.clone(),
+                offset,
+                generation: process.generation,
+                hash: parsed.hash.clone(),
+            },
+        });
+    }
     object.unchanged()?;
     process.validate()?;
-    Ok((candidates, apis, conflict || !tables.gaps().is_empty()))
+    Ok(StartupCandidates {
+        candidates,
+        apis,
+        typed,
+        partial: conflict || !tables.gaps().is_empty(),
+        typed_gap,
+    })
 }
 
 /// Explicit privileged event operand, never a transport value.

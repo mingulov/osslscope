@@ -178,3 +178,90 @@ fn ambiguous_typed_symbol_definition_retains_discovery_but_grants_no_reader() {
     assert!(object.typed_exports.is_empty());
     assert_eq!(object.exports.len(), 1);
 }
+
+#[test]
+fn held_startup_exports_prepare_typed_sources_without_legacy_fetch_promotion() {
+    let fixture = PublicExports::new(false);
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let budget = ObservationBudget::default();
+    let discovered = startup_candidates(
+        StartupProcess::held(&child).unwrap(),
+        File::open(fixture.0.join("public.so")).unwrap(),
+        &budget,
+    )
+    .unwrap();
+    assert!(
+        discovered.apis.is_empty(),
+        "legacy mapped-only fetch stays separate"
+    );
+    assert_eq!(
+        discovered
+            .typed
+            .iter()
+            .map(|site| site.role.id())
+            .collect::<Vec<_>>(),
+        vec![130, 136, 146, 155]
+    );
+    let mut prepared = Vec::new();
+    for candidate in discovered.typed {
+        let site = candidate.prepare(&budget).unwrap();
+        assert!(site.site.is_startup());
+        assert_eq!(site.site.pid(), child.pid());
+        site.site.revalidate_object().unwrap();
+        prepared.push(site);
+    }
+    assert!(
+        prepared[1..]
+            .iter()
+            .all(|site| Rc::ptr_eq(&site._anchor, &prepared[0]._anchor))
+    );
+}
+
+#[test]
+fn refused_startup_source_preparation_keeps_legacy_owned_exports() {
+    use std::io::Write;
+    let fixture = PublicExports::new(false);
+    let mut code = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.0.join("public.c"))
+        .unwrap();
+    code.write_all(b"void OSSL_PROVIDER_unquery_operation(void *p,int op,void *a){}\n")
+        .unwrap();
+    drop(code);
+    assert!(
+        std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(fixture.0.join("public.so"))
+            .arg(fixture.0.join("public.c"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let mut discovered = startup_candidates(
+        StartupProcess::held(&child).unwrap(),
+        File::open(fixture.0.join("public.so")).unwrap(),
+        &ObservationBudget::default(),
+    )
+    .unwrap();
+    assert_eq!(discovered.apis.len(), 1);
+    let refused = ObservationBudget::new(super::super::ObservationLimits {
+        max_state_bytes: 0,
+        ..Default::default()
+    });
+    assert!(matches!(
+        discovered.typed.remove(0).prepare(&refused),
+        Err(ObservationGap::StateLimit)
+    ));
+    let (api, site) = discovered.apis.remove(0).into_parts();
+    assert_eq!(api, ObservationApi::OsslProviderUnqueryOperation);
+    site.revalidate_object().unwrap();
+}

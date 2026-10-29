@@ -247,6 +247,9 @@ pub struct ProviderSession {
     // A validated kernel layout is only a prerequisite. No source authority is
     // published without the separately owned anchor and actual registrations.
     _source_kernel: Result<loader::SourceKernel, ObservationGap>,
+    // Prearmed source preparation is noncertifying until actual source links,
+    // post-adoption readiness and target-domain guards are established.
+    typed_startup: Vec<super::objects::TypedPublicSite>,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
     members: BpfMap<MapData, u32, c::Member>,
@@ -749,6 +752,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             _source_kernel: source_kernel,
+            typed_startup: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
             roles: Roles::default(),
@@ -1639,6 +1643,40 @@ impl ProviderSession {
             }
         }
     }
+    /// Retain typed startup sources without arming an argument reader or
+    /// reinterpreting any legacy API/event role. Source refusal is independent
+    /// of the already acquired legacy startup facts.
+    pub(crate) fn prepare_typed_startup(
+        &mut self,
+        sites: Vec<super::objects::StartupTypedSite>,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
+        if sites.is_empty() {
+            return Ok(());
+        }
+        self._source_kernel.as_ref().map_err(|gap| *gap)?;
+        let mut first_gap = None;
+        for site in sites {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(ObservationGap::SnapshotLag);
+            }
+            if self.typed_startup.len() >= self.budget.limits.max_learned_sites {
+                return Err(ObservationGap::SiteLimit);
+            }
+            match site.prepare(&self.budget) {
+                Ok(prepared) => self.typed_startup.push(prepared),
+                Err(gap) => {
+                    first_gap.get_or_insert(gap);
+                }
+            }
+        }
+        first_gap.map_or(Ok(()), Err)
+    }
+
     /// Sealed public-export capability: static table shapes never grant an ABI.
     pub(crate) fn prearm_startup(
         &mut self,
@@ -3181,7 +3219,7 @@ mod startup_api_controls {
         .unwrap();
         let budget = ObservationBudget::default();
         let mapped_file = file.try_clone().unwrap();
-        let (_, sites, _) = objects::startup_candidates(
+        let objects::StartupCandidates { apis: sites, .. } = objects::startup_candidates(
             objects::StartupProcess::held(&child).unwrap(),
             file,
             &budget,
@@ -4006,7 +4044,7 @@ mod startup_api_controls {
             ".byte 0xe9\n.long query_impl-.-4",
             ".byte 0xeb\n.byte unquery_impl-.-1",
         );
-        let (_, sites, _) = objects::startup_candidates(
+        let objects::StartupCandidates { apis: sites, .. } = objects::startup_candidates(
             objects::StartupProcess::held(child).unwrap(),
             f.file(),
             &ObservationBudget::default(),
@@ -4271,7 +4309,7 @@ mod startup_api_controls {
         .unwrap();
         let budget = ObservationBudget::default();
         let mapped_file = file.try_clone().unwrap();
-        let (_, sites, _) = objects::startup_candidates(
+        let objects::StartupCandidates { apis: sites, .. } = objects::startup_candidates(
             objects::StartupProcess::held(&child).unwrap(),
             file,
             &budget,

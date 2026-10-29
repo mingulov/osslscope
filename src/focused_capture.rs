@@ -746,6 +746,13 @@ impl FocusedSession {
         }
         if let Some(session) = &mut session {
             if let Some(preexec) = &mut preexec {
+                if let Err(gap) = session.prepare_typed_startup(
+                    std::mem::take(&mut preexec.typed),
+                    setup_deadline,
+                    cancel,
+                ) {
+                    gaps.insert(gap);
+                }
                 if let Err(gap) = session.prearm_startup(
                     std::mem::take(&mut preexec.apis),
                     setup_deadline,
