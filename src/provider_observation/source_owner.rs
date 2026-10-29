@@ -32,7 +32,7 @@ pub(super) const MAPS: [loader::MapSpec; 7] = [
     spec("SOURCE_PAIR", 2, 4, 128, 1),
     spec("SOURCE_DOMAIN", 1, 4, 64, 64),
     spec("SOURCE_OBSERVER", 2, 4, 48, 1),
-    spec("ITER_SLOT", 6, 4, 8, 1),
+    spec("ITER_SLOT", 6, 4, 264, 1),
 ];
 const fn spec(
     name: &'static str,
@@ -320,8 +320,8 @@ mod tests {
     #[test]
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
-        assert_eq!(map_reservation(16), Some(6_271_932));
-        assert_eq!(source_reservation(512, 16), Some(12_731_324));
+        assert_eq!(map_reservation(16), Some(6_276_028));
+        assert_eq!(source_reservation(512, 16), Some(12_735_420));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());

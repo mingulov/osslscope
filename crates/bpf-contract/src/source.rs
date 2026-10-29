@@ -144,6 +144,20 @@ pub struct SourceGuard {
     pub source_epoch: u64,
     pub state: u64,
 }
+/// Per-CPU source serialization cell: iterator slot plus REL staging.
+/// `slot@0` keeps its exact single-word CAS semantics for the current-VMA
+/// join. `staging@8` stages one complete REL value for NOEXIST publication
+/// without a 256-byte stack temporary. Only the serialized source writer
+/// touches staging, and every publication zeroes it before writing fields;
+/// stale bytes from a previous CPU-local insert can never enter a new row.
+/// Staging is word-typed so this module stays dependency-free; the BPF writer
+/// casts it to the same-sized, same-aligned REL value for typed stores.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct SourceSlot {
+    pub slot: u64,
+    pub staging: [u64; 32],
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SourceObserver {
@@ -212,6 +226,7 @@ const _: () = {
     assert!(core::mem::size_of::<SourceGuard>() == 16);
     assert!(core::mem::size_of::<SourceControl>() == 64);
     assert!(core::mem::size_of::<SourceConfig>() == 8);
+    assert!(core::mem::size_of::<SourceSlot>() == 264);
 };
 
 #[cfg(test)]
@@ -276,6 +291,14 @@ mod tests {
         request.required_mask = 3;
         request.file_offset = 1 << 63;
         assert!(!request.valid_input());
+    }
+    #[test]
+    fn source_slot_keeps_serialization_word_and_staging_in_reviewed_slots() {
+        assert_eq!(size_of::<SourceSlot>(), 264);
+        assert_eq!(align_of::<SourceSlot>(), 8);
+        assert_eq!(offset_of!(SourceSlot, slot), 0);
+        assert_eq!(offset_of!(SourceSlot, staging), 8);
+        assert_eq!(size_of::<[u64; 32]>(), 256);
     }
     #[test]
     fn source_pair_keeps_request_and_inode_in_the_reviewed_slots() {

@@ -28,7 +28,14 @@ pub static SOURCE_DOMAIN: HashMap<u32, SourceDomain> = HashMap::with_max_entries
 #[map]
 pub static SOURCE_OBSERVER: Array<SourceObserver> = Array::with_max_entries(1, 0);
 #[map]
-pub static ITER_SLOT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+pub static ITER_SLOT: PerCpuArray<SourceSlot> = PerCpuArray::with_max_entries(1, 0);
+
+// Staging casts to the REL value for typed stores. Same size, same alignment.
+const _: () = {
+    assert!(core::mem::size_of::<[u64; 32]>() == core::mem::size_of::<RelValue>());
+    assert!(core::mem::align_of::<[u64; 32]>() == core::mem::align_of::<RelValue>());
+    assert!(core::mem::offset_of!(SourceSlot, staging) == 8);
+};
 
 #[inline(always)]
 fn observer_live() -> bool {
@@ -248,44 +255,45 @@ pub fn source_publish_new(
         let old = unsafe { atom::ordered_read(addr_of_mut!((*control).published_sequence)) };
         let complete = kind != SOURCE_REG || request.required_mask == 1;
         let sequence = if complete { old.checked_add(1)? } else { 0 };
-        let mut value = RelValue {
-            witness_id: 0,
-            parent_id: 0,
-            evidence_epoch: request.source_epoch,
-            born_ns: unsafe { helpers::bpf_ktime_get_ns() },
-            retired_ns: 0,
-            state: 1,
-            cardinality: 0,
-            data: [0; 10],
-            tail: [0; 128],
+        // Stage the complete value in the per-CPU slot cell instead of a
+        // 256-byte stack temporary. Same bytes, same single NOEXIST insert.
+        let Some(cell) = ITER_SLOT.get_ptr_mut(0) else {
+            return None;
         };
+        let staging = unsafe { (*cell).staging.as_mut_ptr().cast::<RelValue>() };
+        unsafe {
+            staging.write_bytes(0, 1);
+            (*staging).evidence_epoch = request.source_epoch;
+            (*staging).born_ns = helpers::bpf_ktime_get_ns();
+            (*staging).state = 1;
+        }
         match kind {
-            SOURCE_ANCHOR => {
-                value.witness_id = request.anchor_id;
-                value.data[0] = request.object_id;
-                value.data[1] = request.source_epoch;
-                value.data[2] = sequence;
-            }
-            SOURCE_REG => {
-                value.witness_id = request.registration_id;
-                value.parent_id = request.anchor_id;
-                value.data[0] = request.object_id;
-                value.data[1] = request.file_offset;
-                value.data[2] = request.site_cookie;
-                value.data[3] = u64::from(request.required_mask);
-                value.data[4] = 1;
-                value.data[5] = sequence;
-            }
-            SOURCE_READY => {
-                value.witness_id = request.nonce;
-                value.parent_id = request.registration_id;
-                value.data[0] = request.anchor_id;
-                value.data[1] = request.registration_id;
-                value.data[2] = sequence;
-            }
+            SOURCE_ANCHOR => unsafe {
+                (*staging).witness_id = request.anchor_id;
+                (*staging).data[0] = request.object_id;
+                (*staging).data[1] = request.source_epoch;
+                (*staging).data[2] = sequence;
+            },
+            SOURCE_REG => unsafe {
+                (*staging).witness_id = request.registration_id;
+                (*staging).parent_id = request.anchor_id;
+                (*staging).data[0] = request.object_id;
+                (*staging).data[1] = request.file_offset;
+                (*staging).data[2] = request.site_cookie;
+                (*staging).data[3] = u64::from(request.required_mask);
+                (*staging).data[4] = 1;
+                (*staging).data[5] = sequence;
+            },
+            SOURCE_READY => unsafe {
+                (*staging).witness_id = request.nonce;
+                (*staging).parent_id = request.registration_id;
+                (*staging).data[0] = request.anchor_id;
+                (*staging).data[1] = request.registration_id;
+                (*staging).data[2] = sequence;
+            },
             _ => return None,
         }
-        if REL.insert(&relation, &value, 1).is_err() {
+        if REL.insert(&relation, unsafe { &*staging }, 1).is_err() {
             return None;
         }
         if complete
@@ -343,9 +351,10 @@ pub fn source_anchor_exit(request: &SourceRequest, output: &mut u64) -> bool {
     if !atom::spend_source_bundle(3) {
         return false;
     }
-    let Some(slot) = ITER_SLOT.get_ptr_mut(0) else {
+    let Some(cell) = ITER_SLOT.get_ptr_mut(0) else {
         return false;
     };
+    let slot = unsafe { addr_of_mut!((*cell).slot) };
     if !unsafe { atom::compare(slot, 0, 1) } {
         return false;
     }
