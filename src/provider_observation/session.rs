@@ -11,6 +11,7 @@ use aya::maps::{
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::CString,
+    fs::File,
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::fs::MetadataExt,
@@ -298,6 +299,16 @@ impl Attachment {
         self.original = Some(std::mem::replace(&mut self.site, mapped));
         Ok(())
     }
+}
+/// Legacy prearm link plan. `Create` attaches the legacy producer links
+/// immediately; `Reserve` mints the cookie and all configuration but creates
+/// no links, leaving the sole required pair to the source-acquisition path.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PrearmLinks {
+    Create,
+    /// Native source qualification only: production never reserves.
+    #[allow(dead_code)]
+    Reserve,
 }
 #[cfg(test)]
 thread_local! { static EXPIRE_STATIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
@@ -861,6 +872,7 @@ impl ProviderSession {
                 .map(|a| a.links.len())
                 .sum::<usize>()
     }
+    #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
     fn attach_pair(
         &mut self,
         pid: u32,
@@ -869,6 +881,7 @@ impl ProviderSession {
         advertisers: Vec<ObjectHash>,
         existing: usize,
         generation: u64,
+        create_links: bool,
     ) -> Result<Attachment, ObservationGap> {
         if self.final_drain || !self.gate.admitting() {
             return Err(ObservationGap::Invalidated);
@@ -889,28 +902,37 @@ impl ProviderSession {
         ))
         .map_err(|_| ObservationGap::AttachFailed)?;
         (|| {
-            let links = paired_links(
-                || {
-                    ossl_bpf_sys::link_create_uprobe_multi(
-                        self.loaded.progs["observation_entry"].as_raw_fd(),
-                        &path,
-                        &[site.file_offset()],
-                        &[cookie],
-                        pid,
-                    )
-                    .map_err(|_| ObservationGap::AttachFailed)
-                },
-                || {
-                    ossl_bpf_sys::link_create_uretprobe_multi(
-                        self.loaded.progs["observation_return"].as_raw_fd(),
-                        &path,
-                        &[site.file_offset()],
-                        &[cookie],
-                        pid,
-                    )
-                    .map_err(|_| ObservationGap::AttachFailed)
-                },
-            )?;
+            // Reserve-only prearm (Enabled source acquisition) mints the
+            // cookie and all configuration below but creates no producer
+            // links: the sole required pair is acquired after admission
+            // opens, from this same retained site. The +2 link-budget
+            // check above still reserves capacity for that pair.
+            let links = if create_links {
+                paired_links(
+                    || {
+                        ossl_bpf_sys::link_create_uprobe_multi(
+                            self.loaded.progs["observation_entry"].as_raw_fd(),
+                            &path,
+                            &[site.file_offset()],
+                            &[cookie],
+                            pid,
+                        )
+                        .map_err(|_| ObservationGap::AttachFailed)
+                    },
+                    || {
+                        ossl_bpf_sys::link_create_uretprobe_multi(
+                            self.loaded.progs["observation_return"].as_raw_fd(),
+                            &path,
+                            &[site.file_offset()],
+                            &[cookie],
+                            pid,
+                        )
+                        .map_err(|_| ObservationGap::AttachFailed)
+                    },
+                )?
+            } else {
+                Vec::new()
+            };
             site.revalidate_object()?;
             if c::operational_api(api) {
                 if self.api_owners.len() >= 1024 {
@@ -1265,6 +1287,7 @@ impl ProviderSession {
                     advertisers,
                     target.attachments.len() * 2,
                     generation,
+                    true,
                 ) {
                     Ok(a) => {
                         arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
@@ -1683,7 +1706,7 @@ impl ProviderSession {
             return;
         }
         let generation = target.generation;
-        match self.attach_pair(pid, api, site, advertisers, 0, generation) {
+        match self.attach_pair(pid, api, site, advertisers, 0, generation, true) {
             Ok(a) => {
                 // Pair exists but CONFIG is absent: full process/maps/object
                 // validation precedes the only arm operation, and runs again after it.
@@ -1777,13 +1800,74 @@ impl ProviderSession {
         Ok(())
     }
 
+    /// Verify the caller's claimed acquisition inputs against the single
+    /// retained pre-exec startup attachment and derive the admitted site
+    /// truth: TGID, cookie, file offset, target-file custody (a dup of the
+    /// site's retained descriptor) and the parsed artifact hash. A
+    /// substituted file (different device/inode), offset or PID refuses
+    /// before any kernel effect. Single-startup/single-attachment is a 5A
+    /// scope bound: anything else refuses.
+    fn admitted_source_site(
+        &self,
+        params: &super::source_owner::NativeSourceParams,
+    ) -> Result<super::source_owner::AdmittedSourceSite, ObservationGap> {
+        if self.startup.len() != 1 {
+            return Err(ObservationGap::Invalidated);
+        }
+        let (tgid, attachments) = self
+            .startup
+            .iter()
+            .next()
+            .ok_or(ObservationGap::Invalidated)?;
+        let (tgid, attachments) = (*tgid, attachments.len());
+        if attachments != 1 || params.child_pid != tgid {
+            return Err(ObservationGap::Invalidated);
+        }
+        let attachment = &self.startup[&tgid][0];
+        // Reserve-only prearm is mandatory: legacy producer links on the
+        // site would duplicate the pair this acquisition creates.
+        if !attachment.links.is_empty() {
+            return Err(ObservationGap::Invalidated);
+        }
+        attachment.site.revalidate_object()?;
+        let cookie = attachment.cookie;
+        if !(1..=4096).contains(&cookie) {
+            return Err(ObservationGap::Invalidated);
+        }
+        if params.link_offset != attachment.site.file_offset() {
+            return Err(ObservationGap::Invalidated);
+        }
+        let claimed = std::fs::metadata(&params.target).map_err(|_| ObservationGap::Invalidated)?;
+        if !claimed.is_file()
+            || claimed.dev() != attachment.site.native_device()
+            || claimed.ino() != attachment.site.inode()
+        {
+            return Err(ObservationGap::Invalidated);
+        }
+        let target = File::from(
+            attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .map_err(|_| ObservationGap::BackingUnavailable)?,
+        );
+        Ok(super::source_owner::AdmittedSourceSite {
+            tgid,
+            site_cookie: cookie,
+            link_offset: attachment.site.file_offset(),
+            target,
+            expected_artifact: attachment.site.object_hash().clone(),
+        })
+    }
+
     /// Lease-gated post-open source acquisition. Disabled (production):
     /// inert empty receipts, zero effects. Enabled (owned native
     /// qualification): the serialized gate-open, domain-arm, enroll, anchor,
     /// entry/return and READY flow on this session's single pre-exec startup
-    /// attachment, before the held child is released. Single-startup/
-    /// single-attachment is a 5A scope bound: anything else refuses. Any
-    /// phase failure refuses the order before returning.
+    /// attachment, before the held child is released. File custody, offset,
+    /// cookie and identity derive from the retained admitted site; the
+    /// caller's params are verified against that truth first and never used
+    /// as authority. Any phase failure refuses the order before returning.
     pub(crate) fn acquire_source_after_open(
         &mut self,
         lease: &super::source_owner::SourceAcquisitionLease,
@@ -1795,6 +1879,7 @@ impl ProviderSession {
             return Ok(super::source_owner::SourceAcquisitionReceipts {
                 host_key: 0,
                 site_cookie: 0,
+                link_offset: 0,
                 domain: super::source_owner::DomainArmed {
                     tgid: 0,
                     incarnation: 0,
@@ -1818,23 +1903,10 @@ impl ProviderSession {
         }
         self.budget.checkpoint()?;
         // Pre-exec startup truth (not post-exec targets): acquisition runs
-        // while the child is still held, before release.
-        if self.startup.len() != 1 {
-            return Err(ObservationGap::Invalidated);
-        }
-        let (tgid, attachments) = self
-            .startup
-            .iter()
-            .next()
-            .ok_or(ObservationGap::Invalidated)?;
-        let (tgid, attachments) = (*tgid, attachments.len());
-        if attachments != 1 || params.child_pid != tgid {
-            return Err(ObservationGap::Invalidated);
-        }
-        let cookie = self.startup[&tgid][0].cookie;
-        if !(1..=4096).contains(&cookie) {
-            return Err(ObservationGap::Invalidated);
-        }
+        // while the child is still held, before release. The claim-vs-truth
+        // check runs before any kernel effect: a substituted file, offset
+        // or PID refuses here.
+        let admitted = self.admitted_source_site(params)?;
         let entry_prog = self
             .loaded
             .progs
@@ -1856,31 +1928,29 @@ impl ProviderSession {
         let budget = &self.budget;
         let result = (|| {
             owner.note_gate_open_observed()?;
-            let domain = owner.arm_domain(tgid)?;
+            let domain = owner.arm_domain(admitted.tgid)?;
             let host_key = owner.enroll_observer()?;
-            let anchor = owner.anchor_source(
-                params,
-                budget,
-                host_key,
-                domain.incarnation,
-                domain.planned,
-            )?;
             let scope = super::source_owner::RequestScope {
-                site_cookie: cookie,
+                site_cookie: admitted.site_cookie,
                 host_key,
                 incarnation: domain.incarnation,
                 planned_image: domain.planned,
+                link_offset: admitted.link_offset,
+                target_pid: admitted.tgid,
+                target: admitted.target,
+                expected_artifact: admitted.expected_artifact,
             };
+            let anchor = owner.anchor_source(&scope, budget)?;
             let registration =
-                owner.register_entry_return(params, &scope, entry_prog, return_prog, &anchor)?;
-            let ready_sequence =
-                owner.publish_ready(&scope, params.link_offset, &anchor, &registration)?;
+                owner.register_entry_return(&scope, entry_prog, return_prog, &anchor)?;
+            let ready_sequence = owner.publish_ready(&scope, &anchor, &registration)?;
             if !owner.acquisition_ready() {
                 return Err(ObservationGap::Invalidated);
             }
             Ok(super::source_owner::SourceAcquisitionReceipts {
                 host_key,
-                site_cookie: cookie,
+                site_cookie: scope.site_cookie,
+                link_offset: scope.link_offset,
                 domain,
                 anchor,
                 registration,
@@ -1938,11 +2008,19 @@ impl ProviderSession {
     }
 
     /// Sealed public-export capability: static table shapes never grant an ABI.
+    /// `Create` prearms the full legacy configuration with its producer
+    /// links (production + legacy natives). `Reserve` mints the same
+    /// configuration (cookie, config/member rows, API ownership) but creates
+    /// no producer links: the sole required pair is acquired after admission
+    /// opens by the source-acquisition path, from the same retained site.
+    /// Enabled source acquisition refuses attachments that already carry
+    /// legacy producer links, so the two plans cannot mix on one site.
     pub(crate) fn prearm_startup(
         &mut self,
         sites: Vec<super::objects::StartupApiSite>,
         deadline: Instant,
         cancel: &std::sync::atomic::AtomicBool,
+        links: PrearmLinks,
     ) -> Result<(), ObservationGap> {
         if self.final_drain || !self.gate.admitting() {
             return Err(ObservationGap::Invalidated);
@@ -2011,7 +2089,15 @@ impl ProviderSession {
             } else {
                 Vec::new()
             };
-            let a = self.attach_pair(pid, api, site, advertisers, 0, generation)?;
+            let a = self.attach_pair(
+                pid,
+                api,
+                site,
+                advertisers,
+                0,
+                generation,
+                matches!(links, PrearmLinks::Create),
+            )?;
             retain_and_arm(&mut self.startup, pid, a, |a| {
                 let result = validate_then_arm(
                     || a.site.revalidate_object(),
@@ -3410,12 +3496,17 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
         let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
         session
-            .prearm_startup(apis, Instant::now() + Duration::from_secs(5), &cancel)
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
             .unwrap();
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
             super::source_owner::NativeSourceParams {
                 target: app.clone(),
-                link_offset: 0,
+                link_offset: session.startup[&child.pid()][0].site.file_offset(),
                 child_pid: child.pid(),
             },
         );
@@ -3498,7 +3589,12 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
         let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
         session
-            .prearm_startup(apis, Instant::now() + Duration::from_secs(5), &cancel)
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
             .unwrap();
         eprintln!(
             "startup attachments: {:?}",
@@ -3518,11 +3614,18 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             1,
             "fixture must yield one attachment"
         );
-        let cookie = session.startup[&child.pid()][0].cookie;
+        let admitted = &session.startup[&child.pid()][0];
+        assert!(
+            admitted.links.is_empty(),
+            "reserve-only prearm must create no producer links"
+        );
+        let cookie = admitted.cookie;
+        let admitted_offset = admitted.site.file_offset();
+        eprintln!("admitted site: cookie={cookie} offset={admitted_offset:#x}");
         let lease = super::source_owner::SourceAcquisitionLease::Enabled(
             super::source_owner::NativeSourceParams {
                 target: app.clone(),
-                link_offset: 0,
+                link_offset: admitted_offset,
                 child_pid: child.pid(),
             },
         );
@@ -3544,9 +3647,10 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 )
             });
         eprintln!(
-            "acquired host={:#x} cookie={} domain={} anchor={} epoch={:#x} object={:#x} anchor_seq={} reg={} ready_seq={} adopted={} anchor_hash={}",
+            "acquired host={:#x} cookie={} offset={:#x} domain={} anchor={} epoch={:#x} object={:#x} anchor_seq={} reg={} ready_seq={} adopted={} anchor_hash={}",
             receipts.host_key,
             receipts.site_cookie,
+            receipts.link_offset,
             receipts.domain.tgid,
             receipts.anchor.anchor_id,
             receipts.anchor.epoch,
@@ -3567,6 +3671,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             receipts.site_cookie, cookie,
             "receipt must cite the admitted cookie"
         );
+        assert_eq!(
+            receipts.link_offset, admitted_offset,
+            "receipt must cite the admitted file offset"
+        );
+        assert_ne!(receipts.link_offset, 0, "header offset 0 is never admitted");
         assert_eq!(receipts.domain.tgid, child.pid());
         assert_ne!(receipts.domain.incarnation, 0);
         assert_ne!(receipts.domain.original, 0);
@@ -3606,6 +3715,29 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             .note_source_exec(&lease, child.pid(), receipts.domain.planned)
             .unwrap();
         assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        // Real callback execution through the derived links: the fixture's
+        // post-release provider query must surface as facts in the final
+        // drain. Finalize first (common cut + drain), then close sources.
+        let batch = session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let queries = batch
+            .facts
+            .iter()
+            .filter(|f| f.api == wire::api(c::PUBLIC_QUERY).unwrap())
+            .filter(|f| {
+                matches!(
+                    f.payload,
+                    ObservationPayload::QueryResult {
+                        outcome: ApiOutcome::Success,
+                        ..
+                    }
+                )
+            })
+            .count();
+        eprintln!("derived-link callbacks: query_successes={queries}");
+        assert!(
+            queries > 0,
+            "the admitted query must fire through the derived links"
+        );
         let close = session.close_source_explicit().expect("source close");
         assert_eq!(
             (
@@ -3625,6 +3757,174 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         drop(child);
         source_native_assert_fds_return(&fds_before, &app);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    struct SourceRefusalSetup {
+        dir: std::path::PathBuf,
+        app: std::path::PathBuf,
+        child: crate::target::OwnedTarget,
+        cancel: std::sync::atomic::AtomicBool,
+        gate: crate::writer_gate::WriterGate,
+        session: ProviderSession,
+        admitted_offset: u64,
+    }
+    /// Owned session carried through reserve-only prearm, typed preparation
+    /// and gate open: the exact position where acquisition verifies its
+    /// claim against the admitted site.
+    fn source_refusal_setup(suffix: &str) -> SourceRefusalSetup {
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-source-refuse-{suffix}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_fixture(&dir);
+        let argv = [
+            app.to_string_lossy().into_owned(),
+            dir.join("marker").to_string_lossy().into_owned(),
+        ];
+        let child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+        )
+        .unwrap();
+        let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        assert_eq!(session.startup[&child.pid()].len(), 1);
+        let admitted_offset = session.startup[&child.pid()][0].site.file_offset();
+        assert_ne!(admitted_offset, 0);
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams {
+                target: app.clone(),
+                link_offset: admitted_offset,
+                child_pid: child.pid(),
+            },
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        gate.open().unwrap();
+        SourceRefusalSetup {
+            dir,
+            app,
+            child,
+            cancel,
+            gate,
+            session,
+            admitted_offset,
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn source_acquisition_rejects_substituted_file_and_offset() {
+        // Claim-vs-truth binding: a substituted offset (the legacy header
+        // offset 0, or any off-by-one) or a substituted file (even a
+        // byte-identical copy: identity is the admitted inode, not content)
+        // refuses before any kernel effect. Fresh owned session per case.
+        // FD contract for a refused acquisition: the refusal itself has
+        // exactly zero fd effects (snapshot equality across the refused
+        // call), and teardown releases everything back to the case-open
+        // baseline (no survivors at all: nothing was ever adopted, so the
+        // success-path ghost allowance does not apply).
+        let baseline = source_native_fd_targets();
+        for case in ["header-offset", "off-by-one", "substituted-file"] {
+            let mut setup = source_refusal_setup(case);
+            let (link_offset, target) = match case {
+                "header-offset" => (0, setup.app.clone()),
+                "off-by-one" => (setup.admitted_offset + 1, setup.app.clone()),
+                _ => {
+                    let copy = setup.dir.join("app-copy");
+                    std::fs::copy(&setup.app, &copy).unwrap();
+                    assert_eq!(
+                        std::fs::read(&copy).unwrap(),
+                        std::fs::read(&setup.app).unwrap(),
+                        "the substituted file must be byte-identical"
+                    );
+                    (setup.admitted_offset, copy)
+                }
+            };
+            let bad = super::source_owner::SourceAcquisitionLease::Enabled(
+                super::source_owner::NativeSourceParams {
+                    target,
+                    link_offset,
+                    child_pid: setup.child.pid(),
+                },
+            );
+            let fds_pre_acquire = source_native_fd_targets();
+            let result = setup.session.acquire_source_after_open(
+                &bad,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            );
+            assert_eq!(
+                source_native_fd_targets(),
+                fds_pre_acquire,
+                "{case}: refused acquisition must have zero fd effects"
+            );
+            let error = match result {
+                Ok(_) => panic!("{case} must refuse"),
+                Err(error) => error,
+            };
+            assert_eq!(error, ObservationGap::Invalidated, "{case}");
+            assert_eq!(
+                setup
+                    .session
+                    .source_owner
+                    .as_ref()
+                    .expect("source owner")
+                    .adopted_link_count(),
+                0,
+                "{case}: refusal must precede any link adoption"
+            );
+            let close = setup.session.close_source_explicit().expect("source close");
+            assert_eq!(
+                (
+                    close.guards_retired,
+                    close.guards_abandoned,
+                    close.domains_retired
+                ),
+                (0, 0, 0),
+                "{case}"
+            );
+            assert!(close.order_refused, "{case}: refused order must refuse");
+            assert!(close.first_error.is_none(), "{case}");
+            drop(setup.session);
+            drop(setup.gate);
+            drop(setup.child);
+            assert_eq!(
+                source_native_fd_targets(),
+                baseline,
+                "{case}: teardown must release every fd"
+            );
+            std::fs::remove_dir_all(&setup.dir).unwrap();
+            eprintln!("{case}: refused Invalidated with zero adoptions");
+        }
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]
@@ -5212,6 +5512,7 @@ mod startup_api_controls {
                     startup.apis,
                     Instant::now() + Duration::from_secs(5),
                     &cancel,
+                    PrearmLinks::Create,
                 )
                 .unwrap();
             let rows = &session.startup[&child.pid()];
@@ -5516,6 +5817,7 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
                 startup.apis,
                 Instant::now() + Duration::from_secs(5),
                 &cancel,
+                PrearmLinks::Create,
             )
             .unwrap();
         let before: BTreeSet<_> = session.api_owners.keys().copied().collect();

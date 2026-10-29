@@ -751,6 +751,7 @@ impl FocusedSession {
                         std::mem::take(&mut preexec.apis),
                         setup_deadline,
                         cancel,
+                        crate::provider_observation::session::PrearmLinks::Create,
                     ),
                     crate::startup_objects::StartupAcquisition::TypedSources => session
                         .prepare_typed_startup(

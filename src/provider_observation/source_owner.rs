@@ -2,7 +2,7 @@
 //! Owned private source maps. Preparation alone cannot mint source eligibility.
 
 use super::{
-    ObservationBudget, ObservationGap,
+    ObjectHash, ObservationBudget, ObservationGap,
     schema::StateReservation,
     source_acquire::{
         ACQUIRE_CORE_RESERVE, AcquisitionOrder, AdoptedLinks, AnchorReceipt, DomainIndex,
@@ -271,6 +271,7 @@ pub(crate) struct RegistrationAdopted {
 pub(crate) struct SourceAcquisitionReceipts {
     pub host_key: u64,
     pub site_cookie: u64,
+    pub link_offset: u64,
     pub domain: DomainArmed,
     pub anchor: AnchorEstablished,
     pub registration: RegistrationAdopted,
@@ -475,14 +476,34 @@ impl SourceOwner {
 /// Required ENTRY/RETURN link kinds for one 5A registration.
 const REQUIRED_LINK_MASK: u32 = 3;
 
+/// Admitted site truth for one acquisition, derived by the session
+/// orchestrator from the single retained pre-exec startup attachment. The
+/// target file is a dup of the site's retained descriptor (same open file
+/// description, never a re-resolved path); the offset, cookie and artifact
+/// hash are the site's own admitted values. The caller-supplied
+/// [`NativeSourceParams`] are verified against this truth before any kernel
+/// effect and never used as authority afterwards.
+pub(super) struct AdmittedSourceSite {
+    pub tgid: u32,
+    pub site_cookie: u64,
+    pub link_offset: u64,
+    pub target: File,
+    pub expected_artifact: ObjectHash,
+}
+
 /// Request scope threaded through one acquisition's phases: the admitted
-/// site cookie, the observer host key, and the minted domain join keys.
-/// Built by the session orchestrator from admitted session truth.
+/// site cookie, offset, target custody and artifact identity, the observer
+/// host key, and the minted domain join keys. Built by the session
+/// orchestrator from admitted session truth only.
 pub(super) struct RequestScope {
     pub site_cookie: u64,
     pub host_key: u64,
     pub incarnation: u64,
     pub planned_image: u64,
+    pub link_offset: u64,
+    pub target_pid: u32,
+    pub target: File,
+    pub expected_artifact: ObjectHash,
 }
 
 impl SourceOwner {
@@ -809,20 +830,17 @@ impl SourceOwner {
         self._order.note_enrolled(nonce, &receipt)?;
         Ok(key)
     }
-    /// Anchor the target file: retain the observer's own read-only private
-    /// full-file mapping plus its SHA256, then run the phase-1 trigger and
-    /// advance the anchor guard to LIVE.
+    /// Anchor the admitted target file: retain the observer's own read-only
+    /// private full-file mapping plus its SHA256, then run the phase-1
+    /// trigger and advance the anchor guard to LIVE. The file is the
+    /// scope's retained admitted-site descriptor, never a re-resolved path.
     pub(super) fn anchor_source(
         &mut self,
-        params: &NativeSourceParams,
+        scope: &RequestScope,
         budget: &ObservationBudget,
-        host_key: u64,
-        incarnation: u64,
-        planned_image: u64,
     ) -> Result<AnchorEstablished, ObservationGap> {
         let _ = self._last_error.take();
-        let file =
-            std::fs::File::open(&params.target).map_err(|_| ObservationGap::BackingUnavailable)?;
+        let file = &scope.target;
         let len = usize::try_from(
             file.metadata()
                 .map_err(|_| ObservationGap::BackingUnavailable)?
@@ -856,6 +874,16 @@ impl SourceOwner {
         let digest = Sha256::digest(bytes);
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&digest);
+        // Bind the anchored bytes to the admitted parsed artifact: a file
+        // swapped between admission and anchor refuses instead of anchoring
+        // foreign bytes.
+        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+        if hex != String::from(scope.expected_artifact.clone()) {
+            unsafe {
+                libc::munmap(mapping, len);
+            }
+            return Err(ObservationGap::ObjectChanged);
+        }
         self._anchor = Some(AnchorCustody {
             mapping,
             len,
@@ -881,21 +909,21 @@ impl SourceOwner {
             verdict: 0,
             reserved: 0,
             publication_sequence: 0,
-            process_incarnation: incarnation,
-            image_epoch: planned_image,
+            process_incarnation: scope.incarnation,
+            image_epoch: scope.planned_image,
             registration_id: 0,
         };
         if !request.valid_input() {
             self._last_error = Some(format!(
-                "anchor valid_input: nonce {nonce:#x} anchor {anchor:#x} obj {object_id:#x} epoch {epoch:#x} addr {:#x} inc {incarnation:#x} img {planned_image:#x}",
-                request.observer_anchor_address
+                "anchor valid_input: nonce {nonce:#x} anchor {anchor:#x} obj {object_id:#x} epoch {epoch:#x} addr {:#x} inc {:#x} img {:#x}",
+                request.observer_anchor_address, scope.incarnation, scope.planned_image
             ));
             return Err(ObservationGap::Invalidated);
         }
-        self.arm_request(host_key, &request)?;
+        self.arm_request(scope.host_key, &request)?;
         let (pid, _, _) = Self::current_host_key()?;
         self.invoke_provisional_trigger(pid)?;
-        let row = self.read_request(host_key)?;
+        let row = self.read_request(scope.host_key)?;
         drop(self._roots.take_provisional());
         if !request.same_input(&row) {
             self._last_error = Some(format!(
@@ -942,20 +970,23 @@ impl SourceOwner {
     /// request, create the actual entry link, consume the ENTRY receipt and
     /// create the adoption guard (PREPARING) strictly before the RETURN pair
     /// may arm; then arm RETURN, create the actual return link, and advance
-    /// the guard to LIVE with the adopted-FD proof.
+    /// the guard to LIVE with the adopted-FD proof. File custody, offset,
+    /// cookie and target PID all come from the admitted scope: this creates
+    /// the SOLE required link pair for the admitted site.
     pub(super) fn register_entry_return(
         &mut self,
-        params: &NativeSourceParams,
         scope: &RequestScope,
         entry_prog: std::os::fd::RawFd,
         return_prog: std::os::fd::RawFd,
         anchor: &AnchorEstablished,
     ) -> Result<RegistrationAdopted, ObservationGap> {
         let _ = self._last_error.take();
-        if !(1..=4096).contains(&scope.site_cookie) || params.link_offset > i64::MAX as u64 {
+        if !(1..=4096).contains(&scope.site_cookie) || scope.link_offset > i64::MAX as u64 {
             return Err(ObservationGap::Invalidated);
         }
-        let path = std::ffi::CString::new(params.target.as_os_str().as_encoded_bytes())
+        // Descriptor custody, never a re-resolved path: the fd names the same
+        // open file description the admitted site retains.
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{}", scope.target.as_raw_fd()))
             .map_err(|_| ObservationGap::Invalidated)?;
         let base = SourceRequest {
             nonce: 0,
@@ -963,7 +994,7 @@ impl SourceOwner {
             object_id: anchor.object_id,
             source_epoch: anchor.epoch,
             site_cookie: scope.site_cookie,
-            file_offset: params.link_offset,
+            file_offset: scope.link_offset,
             observer_anchor_address: 0,
             phase: 0,
             required_mask: REQUIRED_LINK_MASK,
@@ -998,9 +1029,9 @@ impl SourceOwner {
         let entry_link = ossl_bpf_sys::link_create_uprobe_multi(
             entry_prog,
             &path,
-            &[params.link_offset],
+            &[scope.link_offset],
             &[scope.site_cookie],
-            params.child_pid,
+            scope.target_pid,
         )
         .map_err(|_| ObservationGap::BpfUnavailable)?;
         self._adopted.push(entry_link);
@@ -1052,9 +1083,9 @@ impl SourceOwner {
         let return_link = ossl_bpf_sys::link_create_uretprobe_multi(
             return_prog,
             &path,
-            &[params.link_offset],
+            &[scope.link_offset],
             &[scope.site_cookie],
-            params.child_pid,
+            scope.target_pid,
         )
         .map_err(|_| ObservationGap::BpfUnavailable)?;
         self._adopted.push(return_link);
@@ -1093,12 +1124,11 @@ impl SourceOwner {
     pub(super) fn publish_ready(
         &mut self,
         scope: &RequestScope,
-        link_offset: u64,
         anchor: &AnchorEstablished,
         registration: &RegistrationAdopted,
     ) -> Result<u64, ObservationGap> {
         let _ = self._last_error.take();
-        if !(1..=4096).contains(&scope.site_cookie) || link_offset > i64::MAX as u64 {
+        if !(1..=4096).contains(&scope.site_cookie) || scope.link_offset > i64::MAX as u64 {
             return Err(ObservationGap::Invalidated);
         }
         let nonce = self._ids.fresh()?;
@@ -1108,7 +1138,7 @@ impl SourceOwner {
             object_id: anchor.object_id,
             source_epoch: anchor.epoch,
             site_cookie: scope.site_cookie,
-            file_offset: link_offset,
+            file_offset: scope.link_offset,
             observer_anchor_address: 0,
             phase: contract::PHASE_READY,
             required_mask: REQUIRED_LINK_MASK,
