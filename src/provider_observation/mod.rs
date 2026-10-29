@@ -6,6 +6,7 @@ mod assembly;
 pub mod cli;
 pub mod objects;
 pub mod schema;
+mod source_owner;
 pub mod static_tables;
 pub use objects::{
     ApiSite, TransientCodeAddress, VerifiedProcess, VerifiedSite, VerifiedStaticCandidate, acquire,

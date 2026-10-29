@@ -271,6 +271,7 @@ pub struct ProviderSession {
     // A validated kernel layout is only a prerequisite. No source authority is
     // published without the separately owned anchor and actual registrations.
     _source_kernel: Result<loader::SourceKernel, ObservationGap>,
+    source_owner: Option<super::source_owner::SourceOwner>,
     // Prearmed source preparation is noncertifying until actual source links,
     // post-adoption readiness and target-domain guards are established.
     typed_startup: Vec<super::objects::TypedPublicSite>,
@@ -601,6 +602,7 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
                 flags: 0,
             },
         )
+        .chain(super::source_owner::CONTROL_MAPS)
         .collect()
 }
 fn reserve_map_capacity(
@@ -720,6 +722,7 @@ impl ProviderSession {
         budget.checkpoint()?;
         let loaded =
             loader::load_gated(&prepared, &gate).map_err(|_| ObservationGap::BpfUnavailable)?;
+        super::source_owner::initialize_controls(&loaded, &gate, limits.max_pending_calls)?;
         crate::discovery::initialize_classifier_maps(
             &loaded.maps,
             crate::discovery::ClassifierRole::Harvest,
@@ -776,6 +779,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             _source_kernel: source_kernel,
+            source_owner: None,
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
@@ -1682,7 +1686,17 @@ impl ProviderSession {
         if sites.is_empty() {
             return Ok(());
         }
-        self._source_kernel.as_ref().map_err(|gap| *gap)?;
+        let kernel = self._source_kernel.as_ref().map_err(|gap| *gap)?;
+        if self.source_owner.is_none() {
+            self.source_owner = Some(super::source_owner::SourceOwner::prepare(
+                &self.budget,
+                kernel,
+                &self.gate,
+                &self.loaded,
+                deadline,
+                cancel,
+            )?);
+        }
         retain_typed_startup(
             sites,
             &self.budget,
@@ -2707,9 +2721,9 @@ mod tests {
                 flags: m.flags,
             })
             .collect();
-        // Independent fixed total for the actual thirteen ordinary provider maps
+        // Independent fixed total for the actual fifteen ordinary provider maps
         // on sixteen possible CPUs, excluding the separately owned ADMIT gate.
-        let required = 7_034_952;
+        let required = 7_166_360;
         let budget = ObservationBudget::new(ObservationLimits {
             max_state_bytes: required - 1,
             ..Default::default()
@@ -2755,11 +2769,69 @@ mod tests {
                 loader::ProgSpec::uretprobe("observation_return"),
             ],
         );
-        assert!(
-            result.is_ok(),
-            "real object preparation: {}",
-            result.err().unwrap()
-        );
+        let prepared = result.expect("real object preparation");
+        assert_eq!(prepared.maps.len(), 16);
+        for root in &prepared.progs {
+            assert!(root.map_fixups.iter().any(|site| site.map == "ATTR_STATE"));
+            if root.name == "observation_entry" {
+                assert!(
+                    root.map_fixups
+                        .iter()
+                        .any(|site| site.map == "SOURCE_CONFIG")
+                );
+            }
+            for (name, slots, hash) in [
+                (
+                    "claim_pending",
+                    173,
+                    "fb801e221537ccfdc917389e74f002e0d9e6a47cad4a186bf8d4b49b7eb6e5e0",
+                ),
+                (
+                    "release_pending",
+                    139,
+                    "2c499c1f3f17e7fbcbf5e35d0735fd102b215cfede442a7c47de6f76dc47bedd",
+                ),
+            ] {
+                if name == "claim_pending" && root.name == "observation_return" {
+                    continue;
+                }
+                let index = root
+                    .subprogs
+                    .iter()
+                    .position(|s| s.name == name)
+                    .expect("actual pending helper linked into consuming root");
+                let start = root.subprogs[index].insn_off as usize * 8;
+                let end = root
+                    .subprogs
+                    .get(index + 1)
+                    .map_or(root.insns.len(), |s| s.insn_off as usize * 8);
+                let body = &root.insns[start..end];
+                assert_eq!(body.len(), slots * 8, "{name} exact body size");
+                use sha2::Digest as _;
+                assert_eq!(
+                    sha2::Sha256::digest(body)
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<String>(),
+                    hash,
+                    "{name} body"
+                );
+                let atomics: Vec<_> = body.chunks_exact(8).filter(|i| i[0] == 0xdb).collect();
+                assert_eq!(
+                    atomics.len(),
+                    9,
+                    "{name}: ordered read plus eight unrolled CAS attempts"
+                );
+                for atomic in atomics {
+                    assert_eq!(&atomic[2..4], &24i16.to_le_bytes(), "pending_claims offset");
+                    assert_eq!(
+                        &atomic[4..8],
+                        &0xf1u32.to_le_bytes(),
+                        "BPF_CMPXCHG, not a volatile store"
+                    );
+                }
+            }
+        }
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]

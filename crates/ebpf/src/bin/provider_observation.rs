@@ -2,6 +2,12 @@
 //! Public ABI producer. Target strings only exist in stack classifier scratch.
 #![no_std]
 #![no_main]
+// BPF exposes no core AtomicU64 type; the pinned compiler intrinsics emit the
+// actual 64-bit BPF atomic instructions, checked in the object receipt.
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
+#[path = "../source_state.rs"]
+mod source_state;
 #[path = "../writer_gate.rs"]
 mod writer_gate;
 use aya_ebpf::{
@@ -278,7 +284,19 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         depth: old_depth,
         reserved: 0,
     };
+    if !source_state::claim_pending() {
+        thread.failed_entry();
+        if THREADS.insert(key, thread, 0).is_err() {
+            loss(LOSS_MAP)
+        }
+        loss(LOSS_MAP);
+        return 0;
+    }
     if PENDING.insert(pk, p, 1).is_err() {
+        // No new frame exists. Refund only our successful quota claim.
+        if !source_state::release_pending() {
+            loss(LOSS_MAP);
+        }
         thread.failed_entry();
         if THREADS.insert(key, thread, 0).is_err() {
             loss(LOSS_MAP)
@@ -287,7 +305,9 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         return 0;
     }
     if THREADS.insert(key, thread, 0).is_err() {
-        let _ = PENDING.remove(&pk);
+        if PENDING.remove(&pk).is_ok() && !source_state::release_pending() {
+            loss(LOSS_MAP);
+        }
         loss(LOSS_MAP);
         return 0;
     }
@@ -756,6 +776,9 @@ pub fn pop_return(cookie: u64, out_key: &mut ThreadKey, out_pending: &mut Pendin
     if PENDING.remove(&pk).is_err() {
         loss(LOSS_MAP);
         return false;
+    }
+    if !source_state::release_pending() {
+        loss(LOSS_MAP);
     }
     thread.depth -= 1;
     if THREADS.insert(key, thread, 0).is_err() {
