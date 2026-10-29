@@ -571,6 +571,26 @@ mod tests {
         }
     }
     #[test]
+    fn finite_source_layout_refuses_pre_6_12_registration_abi() {
+        // 6.9 through 6.11 expose the 3-argument int-returning
+        // uprobe_register(inode, offset, consumer); the source roots
+        // require the 6.12 shape (ref_ctr_offset argument, struct
+        // uprobe * return). Observed verbatim on 6.9.12 BTF:
+        // FUNC_PROTO vlen=3, SIGNED 32-bit int return.
+        let mut f = fixture();
+        f.mutate(25, 4, 13 << 24 | 3);
+        f.mutate(25, 8, 2);
+        let start = f.offsets[25 - 1];
+        f.types.drain(start + 28..start + 36);
+        let err = SourceLayout::parse(&f.finish())
+            .err()
+            .expect("6.9-shaped layout must refuse");
+        assert!(
+            err.to_string().contains("registration arguments"),
+            "unexpected refusal: {err:#}"
+        );
+    }
+    #[test]
     fn iterator_allocation_metadata_refuses_unaccountable_sizes() {
         for size in [0, 1, 4089, 4096, u32::MAX] {
             let mut f = fixture();
