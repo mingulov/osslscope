@@ -3,6 +3,7 @@
 
 use super::{
     ObjectHash, ObservationBudget, ObservationGap,
+    objects::source_anchor::SourceAnchor,
     schema::StateReservation,
     source_acquire::{
         ACQUIRE_CORE_RESERVE, AcquisitionOrder, AdoptedLinks, AnchorReceipt, DomainIndex,
@@ -17,7 +18,6 @@ pub(super) mod contract;
 #[cfg(test)]
 use contract::SourcePair;
 use contract::{SourceConfig, SourceControl, SourceDomain, SourceObserver, SourceRequest};
-use sha2::{Digest as _, Sha256};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -292,31 +292,39 @@ pub(crate) struct SourceCloseReceipts {
     pub first_error: Option<ObservationGap>,
 }
 
-/// Retained anchor object custody: the observer's own read-only private
-/// full-file mapping plus the SHA256 over those exact mapped bytes and the
-/// retained budget charge for the mapping. The mapping (not a copy or a
-/// plain FD read) is the VMA-join backing.
-struct AnchorCustody {
-    mapping: *mut libc::c_void,
-    len: usize,
-    hash: [u8; 32],
-    _budget: StateReservation,
-}
-// Raw mapping pointer keeps this (and the owner) off Send: the serialized
-// source owner thread is the only accessor.
-impl Drop for AnchorCustody {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.mapping, self.len);
+/// Decode a validated artifact hash to its raw bytes. Runs only after a
+/// fault-safe capture proved the mapped bytes hash to this exact value, so
+/// the result names the anchored mapping, never a re-read.
+fn decode_object_hash_hex(expected: &ObjectHash) -> Result<[u8; 32], ObservationGap> {
+    fn hex_val(byte: u8) -> Result<u8, ObservationGap> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            _ => Err(ObservationGap::Invalidated),
         }
     }
+    let hex = String::from(expected.clone());
+    let digits = hex.as_bytes();
+    if digits.len() != 64 {
+        return Err(ObservationGap::Invalidated);
+    }
+    let mut out = [0u8; 32];
+    for (i, pair) in digits.chunks_exact(2).enumerate() {
+        out[i] = hex_val(pair[0])? << 4 | hex_val(pair[1])?;
+    }
+    Ok(out)
 }
 
 pub(super) struct SourceOwner {
     // Declared first so retained links/programs release before maps on drop.
     _roots: RetainedSourceRoots,
     _adopted: Vec<OwnedFd>,
-    _anchor: Option<AnchorCustody>,
+    // Retained anchor object custody: the observer's own read-only private
+    // full-file mapping (the VMA-join backing) plus its pinned backing
+    // file, via the shared fault-safe capture path. The anchor's raw
+    // mapping pointer keeps the owner off Send: the serialized source
+    // owner thread is the only accessor.
+    _anchor: Option<SourceAnchor>,
     _anchor_id: Option<u64>,
     _registration_ids: Vec<u64>,
     _domain_tgids: Vec<u32>,
@@ -941,8 +949,11 @@ impl SourceOwner {
         self._order.note_enrolled(nonce, &receipt)?;
         Ok(key)
     }
-    /// Anchor the admitted target file: retain the observer's own read-only
-    /// private full-file mapping plus its SHA256, then run the phase-1
+    /// Anchor the admitted target file through the shared fault-safe
+    /// capture path: bounded chunked self-reads, checkpoints, page/overhead
+    /// plus read-budget accounting, and expected-artifact hash validation
+    /// against the admitted parsed hash. A truncated or swapped backing
+    /// returns an observation gap, never a fault. Then run the phase-1
     /// trigger and advance the anchor guard to LIVE. The file is the
     /// scope's retained admitted-site descriptor, never a re-resolved path.
     pub(super) fn anchor_source(
@@ -951,56 +962,12 @@ impl SourceOwner {
         budget: &ObservationBudget,
     ) -> Result<AnchorEstablished, ObservationGap> {
         let _ = self._last_error.take();
-        let file = &scope.target;
-        let len = usize::try_from(
-            file.metadata()
-                .map_err(|_| ObservationGap::BackingUnavailable)?
-                .len(),
-        )
-        .map_err(|_| ObservationGap::StateLimit)?;
-        if !file
-            .metadata()
-            .map_err(|_| ObservationGap::BackingUnavailable)?
-            .is_file()
-            || len == 0
-        {
-            return Err(ObservationGap::Invalidated);
-        }
-        let charge = budget.reserve_state(len)?;
-        let mapping = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if mapping == libc::MAP_FAILED {
-            drop(charge);
-            return Err(ObservationGap::BackingUnavailable);
-        }
-        let bytes = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), len) };
-        let digest = Sha256::digest(bytes);
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&digest);
-        // Bind the anchored bytes to the admitted parsed artifact: a file
-        // swapped between admission and anchor refuses instead of anchoring
-        // foreign bytes.
-        let hex: String = hash.iter().map(|b| format!("{b:02x}")).collect();
-        if hex != String::from(scope.expected_artifact.clone()) {
-            unsafe {
-                libc::munmap(mapping, len);
-            }
-            return Err(ObservationGap::ObjectChanged);
-        }
-        self._anchor = Some(AnchorCustody {
-            mapping,
-            len,
-            hash,
-            _budget: charge,
-        });
+        let captured = SourceAnchor::capture(&scope.target, &scope.expected_artifact, budget)?;
+        // Capture proved the mapped bytes hash to the admitted value; the
+        // receipt names those exact bytes without a second read.
+        let hash = decode_object_hash_hex(&scope.expected_artifact)?;
+        let mapping = captured.address();
+        self._anchor = Some(captured);
         let epoch = self._ids.fresh()?;
         let object_id = self._ids.fresh()?;
         let nonce = self._ids.fresh()?;
@@ -1012,7 +979,7 @@ impl SourceOwner {
             source_epoch: epoch,
             site_cookie: 0,
             file_offset: 0,
-            observer_anchor_address: mapping as u64,
+            observer_anchor_address: mapping,
             phase: contract::PHASE_ANCHOR,
             required_mask: 0,
             entry_count: 0,
@@ -1068,11 +1035,6 @@ impl SourceOwner {
             return Err(ObservationGap::Invalidated);
         }
         self._anchor_id = Some(anchor);
-        let hash = self
-            ._anchor
-            .as_ref()
-            .map(|custody| custody.hash)
-            .ok_or(ObservationGap::Invalidated)?;
         Ok(AnchorEstablished {
             anchor_id: anchor,
             epoch,
@@ -1579,5 +1541,200 @@ mod tests {
         ));
         // Outer-watch refusal must release the temporary component reservation.
         shared.state(bytes).unwrap();
+    }
+    /// Minimal owner for anchor-capture tests: valid (pure-metadata) roots
+    /// admission, real budget/ledger/index/order state, and NO maps, so any
+    /// capture success surfaces as the map-stage `InvalidObject` while every
+    /// capture fault surfaces as its own gap first. Caps-free.
+    fn anchor_test_owner(budget: &ObservationBudget) -> SourceOwner {
+        let prepared = loader::Prepared {
+            progs: [
+                ("source_reg_in", "fentry/uprobe_register"),
+                ("source_reg_out", "fexit/uprobe_register"),
+                ("attr_exit", "raw_tracepoint/sched_process_exit"),
+                ("attr_exec", "raw_tracepoint/sched_process_exec"),
+            ]
+            .into_iter()
+            .map(|(name, section)| loader::PreparedProg {
+                name: name.to_owned(),
+                section: section.to_owned(),
+                is_return: false,
+                insns: Vec::new(),
+                map_fixups: vec![loader::MapFixup {
+                    insn_off: 0,
+                    map: "ADMIT".to_owned(),
+                }],
+                subprogs: Vec::new(),
+            })
+            .collect(),
+            maps: MAPS
+                .iter()
+                .map(|spec| loader::MapSpecLite {
+                    name: spec.name.to_owned(),
+                    map_type: spec.map_type,
+                    key_size: spec.key_size,
+                    value_size: spec.value_size,
+                    max_entries: spec.max_entries,
+                    flags: spec.flags,
+                })
+                .collect(),
+        };
+        RetainedSourceRoots::check(&prepared, 1).expect("fake prepared must check");
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        SourceOwner {
+            _roots: RetainedSourceRoots::retain(prepared, 1, std::process::id()),
+            _adopted: Vec::new(),
+            _anchor: None,
+            _anchor_id: None,
+            _registration_ids: Vec::new(),
+            _domain_tgids: Vec::new(),
+            _mode: None,
+            _fail_next_retire: std::cell::Cell::new(false),
+            _last_error: None,
+            _maps: BTreeMap::new(),
+            _namespace: std::fs::File::open("/proc/self/ns/pid").unwrap(),
+            _gate: gate,
+            _capacity: reserve_source(budget, 512, 16).unwrap(),
+            _ids: HostIds::new(),
+            _ledger: GuardLedger::new(),
+            _domains: DomainIndex::new(),
+            _order: AcquisitionOrder::new(),
+        }
+    }
+    fn anchor_test_scope(target: std::fs::File, expected: ObjectHash) -> RequestScope {
+        RequestScope {
+            site_cookie: 1,
+            host_key: 0x1111_2222_3333_4444,
+            incarnation: 0x8000_0000_0000_0001,
+            planned_image: 0x8000_0000_0000_0002,
+            link_offset: 0x11b4,
+            target_pid: std::process::id(),
+            target,
+            expected_artifact: expected,
+        }
+    }
+    fn anchor_test_hash(bytes: &[u8]) -> (ObjectHash, [u8; 32]) {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(bytes);
+        let mut raw = [0u8; 32];
+        raw.copy_from_slice(&digest);
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        (ObjectHash::try_from(hex).unwrap(), raw)
+    }
+    /// Fault-injection harness (hermetic, documented): files under the test
+    /// temp dir mutated between admission-hash computation and the actual
+    /// acquisition `anchor_source` call. Truncation and mid-read change must
+    /// return observation gaps, never fault. The racy true-mid-read
+    /// truncation (truncate between mmap and read) is covered at the capture
+    /// level by `source_anchor`'s truncate-then-digest test; these controls
+    /// drive the same path through the actual acquisition caller.
+    fn anchor_fault_file(tag: &str, bytes: &[u8]) -> (std::path::PathBuf, std::fs::File) {
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-anchor-fault-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        (path, file)
+    }
+    #[test]
+    fn anchor_source_accepts_unchanged_backing_through_capture() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        let bytes = vec![0xA5u8; 8192];
+        let (expected, _raw) = anchor_test_hash(&bytes);
+        let (path, file) = anchor_fault_file("clean", &bytes);
+        let scope = anchor_test_scope(file, expected);
+        // Capture passes on the unchanged backing; with no maps the call
+        // then fails exactly at the map stage, proving capture succeeded.
+        let error = match owner.anchor_source(&scope, &budget) {
+            Ok(_) => panic!("map stage must fail without maps"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::InvalidObject);
+        assert!(owner.anchor_retained_test());
+        std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn anchor_source_truncation_returns_gap_never_faults() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        let bytes = vec![0xA5u8; 8192];
+        let (expected, _raw) = anchor_test_hash(&bytes);
+        let (path, file) = anchor_fault_file("truncate", &bytes);
+        // Truncate between admission-hash computation and capture.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(0)
+            .unwrap();
+        let scope = anchor_test_scope(file, expected);
+        let error = match owner.anchor_source(&scope, &budget) {
+            Ok(_) => panic!("truncation must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::ReadLimit);
+        assert!(!owner.anchor_retained_test());
+        std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn anchor_source_shrink_returns_gap_never_faults() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        let bytes = vec![0xA5u8; 8192];
+        let (expected, _raw) = anchor_test_hash(&bytes);
+        let (path, file) = anchor_fault_file("shrink", &bytes);
+        // Shrink to a nonzero smaller backing: the captured hash cannot
+        // match the admitted one.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(4096)
+            .unwrap();
+        let scope = anchor_test_scope(file, expected);
+        let error = match owner.anchor_source(&scope, &budget) {
+            Ok(_) => panic!("backing change must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::ObjectChanged);
+        assert!(!owner.anchor_retained_test());
+        std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn anchor_source_mid_read_change_returns_gap_never_faults() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        let bytes = vec![0xA5u8; 8192];
+        let (expected, _raw) = anchor_test_hash(&bytes);
+        let (path, file) = anchor_fault_file("change", &bytes);
+        // Swap the backing bytes (same length) between admission and capture.
+        std::fs::write(&path, vec![0x5Au8; 8192]).unwrap();
+        let scope = anchor_test_scope(file, expected);
+        let error = match owner.anchor_source(&scope, &budget) {
+            Ok(_) => panic!("backing change must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::ObjectChanged);
+        assert!(!owner.anchor_retained_test());
+        std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn decode_object_hash_hex_round_trips_valid_hashes() {
+        let (_expected, raw) = anchor_test_hash(b"osslscope-anchor-bytes");
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        let hash = ObjectHash::try_from(hex).unwrap();
+        assert_eq!(decode_object_hash_hex(&hash).unwrap(), raw);
+        let (empty, _) = anchor_test_hash(b"");
+        assert_eq!(
+            decode_object_hash_hex(&empty).unwrap()[..4],
+            [0xe3, 0xb0, 0xc4, 0x42]
+        );
     }
 }

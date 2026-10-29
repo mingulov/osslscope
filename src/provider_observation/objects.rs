@@ -2,7 +2,7 @@
 //! No target-memory reads or pathname-based attachment. All locators and
 //! addresses are private transient inputs and deliberately lack Debug/serde.
 #[path = "source_anchor.rs"]
-mod source_anchor;
+pub(super) mod source_anchor;
 use super::schema::{APIS, ObjectHash, ObservationApi, ObservationBudget, ObservationGap};
 use super::static_tables::{
     self, DynamicAlgorithmId, StaticTableProvenance, TableDiscovery, TableLimits, TableStorage,

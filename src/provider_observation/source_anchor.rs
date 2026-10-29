@@ -9,14 +9,14 @@ const HASH_CHUNK: usize = 16 << 10;
 
 /// A retained self-mapping pins its actual backing, including overlay lower
 /// inodes. It does not prove that a target registration used that inode.
-pub(super) struct SourceAnchor {
+pub(crate) struct SourceAnchor {
     address: NonNull<libc::c_void>,
     length: usize,
     _file: File,
     _capacity: super::super::schema::StateReservation,
 }
 impl SourceAnchor {
-    pub(super) fn capture(
+    pub(crate) fn capture(
         file: &File,
         expected: &ObjectHash,
         budget: &ObservationBudget,
@@ -86,6 +86,11 @@ impl SourceAnchor {
             return Err(ObservationGap::ObjectChanged);
         }
         Ok(anchor)
+    }
+    /// Mapping base address for BPF-side joins. The mapping outlives this
+    /// borrow: the anchor owner retains the mapping and its backing file.
+    pub(crate) fn address(&self) -> u64 {
+        self.address.as_ptr() as u64
     }
     fn digest(
         &self,
