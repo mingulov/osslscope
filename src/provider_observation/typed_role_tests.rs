@@ -124,6 +124,15 @@ fn typed_capability_memory_is_charged_before_it_can_escape() {
     assert_eq!(sites[0].role().id(), 130);
     assert_eq!(sites[0].site().inode(), file.metadata().unwrap().ino());
     sites[0].site().revalidate_object().unwrap();
+    let reads = available.elf_read_bytes();
+    let free = process.resolve_typed_api(TypedRoleId::from_u32(136).unwrap());
+    assert_eq!(free.len(), 1);
+    assert!(Rc::ptr_eq(&sites[0]._anchor, &free[0]._anchor));
+    assert_eq!(
+        available.elf_read_bytes(),
+        reads,
+        "one backing anchor per retained object"
+    );
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(
         fixture.0.join("public.so"),

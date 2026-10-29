@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! No target-memory reads or pathname-based attachment. All locators and
 //! addresses are private transient inputs and deliberately lack Debug/serde.
+#[path = "source_anchor.rs"]
+mod source_anchor;
 use super::schema::{APIS, ObjectHash, ObservationApi, ObservationBudget, ObservationGap};
 use super::static_tables::{
     self, DynamicAlgorithmId, StaticTableProvenance, TableDiscovery, TableLimits, TableStorage,
@@ -114,6 +116,7 @@ impl ParseError {
 }
 struct Object {
     parse_deferred: Cell<bool>,
+    anchor: OnceCell<Rc<source_anchor::SourceAnchor>>,
     file: File,
     stamp: Stamp,
     expected: Option<ModuleInfo>,
@@ -121,6 +124,21 @@ struct Object {
     tables: OnceCell<Result<TableDiscovery, ObservationGap>>,
 }
 impl Object {
+    fn anchor(
+        &self,
+        budget: &ObservationBudget,
+        hash: &ObjectHash,
+    ) -> Result<Rc<source_anchor::SourceAnchor>, ObservationGap> {
+        self.unchanged()?;
+        if self.anchor.get().is_none() {
+            let anchor = Rc::new(source_anchor::SourceAnchor::capture(
+                &self.file, hash, budget,
+            )?);
+            self.unchanged()?;
+            let _ = self.anchor.set(anchor);
+        }
+        Ok(self.anchor.get().expect("retained anchor").clone())
+    }
     fn parsed(&self, budget: &ObservationBudget) -> Result<&ElfObject, ObservationGap> {
         if self.parsed.get().is_none() {
             // This marker describes this attempt only. An authority/deadline
@@ -291,6 +309,7 @@ pub(crate) fn startup_candidates(
     }
     let object = Rc::new(Object {
         parse_deferred: Cell::new(false),
+        anchor: OnceCell::new(),
         file,
         stamp: Stamp::of(&metadata),
         expected: None,
@@ -559,6 +578,7 @@ pub struct ApiSite {
 /// Separately admitted public relationship ABI. Only retained exact-export
 /// acquisition constructs this capability; a numeric role alone cannot do so.
 pub struct TypedPublicSite {
+    _anchor: Rc<source_anchor::SourceAnchor>,
     role: TypedRoleId,
     site: VerifiedSite,
 }
@@ -775,12 +795,23 @@ impl VerifiedProcess {
                 if !seen.contains(&identity) {
                     // Covers the returned capability, vector growth and bounded
                     // deduplication node; charge before either allocation.
-                    if let Err(gap) = self.budget.state(256) {
-                        self.gaps.borrow_mut().insert(gap);
-                        return sites;
-                    }
+                    let reservation = match self.budget.reserve_state(256) {
+                        Ok(reservation) => reservation,
+                        Err(gap) => {
+                            self.gaps.borrow_mut().insert(gap);
+                            return sites;
+                        }
+                    };
+                    let anchor = match object.anchor(&self.budget, &parsed.hash) {
+                        Ok(anchor) => anchor,
+                        Err(gap) => {
+                            self.gaps.borrow_mut().insert(gap);
+                            return sites;
+                        }
+                    };
                     seen.insert(identity);
                     sites.push(TypedPublicSite {
+                        _anchor: anchor,
                         role,
                         site: VerifiedSite {
                             custody: SiteCustody::Mapped {
@@ -793,6 +824,7 @@ impl VerifiedProcess {
                             hash: parsed.hash.clone(),
                         },
                     });
+                    reservation.retain();
                 }
             }
         }
@@ -1129,6 +1161,7 @@ pub(crate) fn acquire_with_incarnation(
             }
             let object = Rc::new(Object {
                 parse_deferred: Cell::new(false),
+                anchor: OnceCell::new(),
                 file,
                 stamp,
                 expected,
@@ -1949,6 +1982,7 @@ mod tests {
             let file = File::open("/bin/true").unwrap();
             let object = Object {
                 parse_deferred: Cell::new(false),
+                anchor: OnceCell::new(),
                 stamp: Stamp::of(&file.metadata().unwrap()),
                 file,
                 expected: None,
@@ -1997,6 +2031,7 @@ mod tests {
             let file = File::open(&path).unwrap();
             let object = Object {
                 parse_deferred: Cell::new(false),
+                anchor: OnceCell::new(),
                 stamp: Stamp::of(&file.metadata().unwrap()),
                 file,
                 expected: None,
@@ -2054,6 +2089,7 @@ mod tests {
         ] {
             let object = Object {
                 parse_deferred: Cell::new(false),
+                anchor: OnceCell::new(),
                 stamp: Stamp::of(&file.metadata().unwrap()),
                 file,
                 expected: None,
@@ -2088,6 +2124,7 @@ mod tests {
         let file = File::open("/bin/true").unwrap();
         let object = Object {
             parse_deferred: Cell::new(false),
+            anchor: OnceCell::new(),
             stamp: Stamp::of(&file.metadata().unwrap()),
             file,
             expected: None,
@@ -2306,6 +2343,7 @@ pub(super) mod fixture_support {
             parsed: OnceCell::new(),
             tables: OnceCell::new(),
             parse_deferred: Cell::new(false),
+            anchor: OnceCell::new(),
         });
         let mappings: Vec<_> = maps
             .split(|&b| b == b'\n')
