@@ -332,6 +332,10 @@ impl GuardLedger {
     /// This must run strictly after the ENTRY hook pair completed with an
     /// exact success receipt plus a usable link FD: creating earlier kills
     /// all source at ENTRY fentry, and the kernel refuses double creation.
+    /// Bookkeeping half only: production creation runs through the
+    /// `create_adoption_guarded` chokepoint, which validates this same
+    /// receipt BEFORE the injected insert and calls here only after the
+    /// insert succeeds.
     pub(super) fn create_adoption(
         &mut self,
         id: u64,
@@ -884,15 +888,67 @@ fn guard_advance_with(
 // acquisition path, after source/artifact review plus explicit lease.
 #[allow(dead_code)]
 impl GuardLedger {
-    pub(super) fn create_guard_preparing(
+    /// The ONLY adoption-guard creation path with a kernel effect. It takes
+    /// the ENTRY receipt (plus the map FD), validates it against the minted
+    /// record FIRST, performs the single NOEXIST PREPARING insert, then
+    /// records PREPARING. No raw id/epoch creation entry point remains: an
+    /// early insert — the exact operation that terminally poisons ENTRY
+    /// fentry — cannot be expressed. A failed insert terminally conflicts
+    /// the record, so a failed creation is structurally never retried.
+    pub(super) fn create_adoption_guarded(
+        &mut self,
         map_fd: std::os::fd::RawFd,
         id: u64,
-        epoch: u64,
+        receipt: &EntryReceipt,
     ) -> Result<(), ObservationGap> {
-        guard_create_with(id, epoch, |key, value, flags| unsafe {
+        self.create_adoption_guarded_with(id, receipt, |key, value, flags| unsafe {
             ossl_bpf_sys::map_update_elem(map_fd, key, value, flags)
         })
-        .map_err(|_| ObservationGap::BpfUnavailable)
+    }
+    /// Caps-free seam of the creation chokepoint: identical validation and
+    /// bookkeeping with an injected insert operation. Tests drive schedules
+    /// through this; production passes the real map-update call.
+    pub(super) fn create_adoption_guarded_with(
+        &mut self,
+        id: u64,
+        receipt: &EntryReceipt,
+        call: impl FnOnce(&[u8; 8], &[u8; 16], u64) -> std::io::Result<()>,
+    ) -> Result<(), ObservationGap> {
+        // Receipt validation strictly precedes the injected insert: nothing
+        // reaches the map without an exact terminal ENTRY receipt plus a
+        // usable adopted FD for this minted ID.
+        let epoch = self.validated_adoption_epoch(id, receipt)?;
+        if guard_create_with(id, epoch, call).is_err() {
+            // Terminal refusal: EEXIST in particular proves an ID or
+            // lifecycle defect the host must not paper over with a second
+            // insert. Validation above proved Minted on the serialized
+            // owner, so conflict here is infallible in practice.
+            self.fail_adoption(id)?;
+            return Err(ObservationGap::BpfUnavailable);
+        }
+        // The insert succeeded; record PREPARING under the same receipt.
+        self.create_adoption(id, receipt)
+    }
+    fn validated_adoption_epoch(
+        &self,
+        id: u64,
+        receipt: &EntryReceipt,
+    ) -> Result<u64, ObservationGap> {
+        let guard = self
+            .registrations
+            .get(&id)
+            .ok_or(ObservationGap::Invalidated)?;
+        if guard.life != GuardLife::Minted
+            || receipt.registration_id != id
+            || guard.nonce != receipt.nonce
+            || receipt.entry_count != 1
+            || receipt.exit_count != 1
+            || receipt.verdict != VERDICT_SUCCESS
+            || !receipt.syscall_ok
+        {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(guard.epoch)
     }
     pub(super) fn advance_guard(
         map_fd: std::os::fd::RawFd,
@@ -1178,6 +1234,153 @@ mod tests {
         assert!(ledger.return_may_arm(registration).is_ok());
     }
     #[test]
+    fn adoption_creation_trace_orders_entry_insert_before_return() {
+        // Caps-free operation trace around the creation chokepoint: every
+        // schedule below runs through `create_adoption_guarded_with` with an
+        // injected insert, so no carrier FD or privilege is involved.
+        let (mut ids, mut ledger, anchor, epoch) = live_anchor();
+        let nonce = ids.fresh().unwrap();
+        let registration = ledger
+            .mint_registration(&mut ids, anchor, epoch, nonce)
+            .unwrap();
+        let mut events: Vec<&str> = Vec::new();
+        let mut inserts = 0u32;
+        // RETURN must not arm before ENTRY completes and the guard exists.
+        assert!(ledger.return_may_arm(registration).is_err());
+        events.push("return-refused-before-entry");
+        // EARLY: a non-terminal ENTRY observation refuses with NO map effect,
+        // and the mint survives for the later exact receipt.
+        let pending = EntryReceipt {
+            nonce,
+            registration_id: registration,
+            entry_count: 0,
+            exit_count: 0,
+            verdict: 0,
+            syscall_ok: true,
+        };
+        assert!(
+            ledger
+                .create_adoption_guarded_with(registration, &pending, |_, _, _| {
+                    inserts += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(inserts, 0);
+        events.push("early-refused-without-insert");
+        // ENTRY completes: the exact receipt drives exactly one NOEXIST
+        // PREPARING insert with exact key/value bytes, then RETURN arms.
+        events.push("entry");
+        ledger
+            .create_adoption_guarded_with(
+                registration,
+                &entry_receipt(registration, nonce),
+                |key, value, flags| {
+                    inserts += 1;
+                    assert_eq!(key, &registration.to_ne_bytes());
+                    assert_eq!(value, &guard_value_bytes(epoch, contract::GUARD_PREPARING));
+                    assert_eq!(flags, ossl_bpf_sys::BPF_NOEXIST);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        events.push("insert-ok");
+        ledger.return_may_arm(registration).unwrap();
+        events.push("return-armed");
+        // DUPLICATE: a second creation refuses with no second insert.
+        assert!(
+            ledger
+                .create_adoption_guarded_with(
+                    registration,
+                    &entry_receipt(registration, nonce),
+                    |_, _, _| {
+                        inserts += 1;
+                        Ok(())
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(inserts, 1);
+        events.push("duplicate-refused-without-insert");
+        assert_eq!(
+            events,
+            [
+                "return-refused-before-entry",
+                "early-refused-without-insert",
+                "entry",
+                "insert-ok",
+                "return-armed",
+                "duplicate-refused-without-insert",
+            ]
+        );
+        // LATE: creation after the guard already went LIVE refuses with no
+        // further insert.
+        let late_nonce = ids.fresh().unwrap();
+        let late = ledger
+            .mint_registration(&mut ids, anchor, epoch, late_nonce)
+            .unwrap();
+        ledger
+            .create_adoption_guarded_with(late, &entry_receipt(late, late_nonce), |_, _, _| {
+                inserts += 1;
+                Ok(())
+            })
+            .unwrap();
+        ledger
+            .live_adoption(
+                late,
+                &AdoptedLinks {
+                    registration_id: late,
+                    anchor_id: anchor,
+                    epoch,
+                    links: 1,
+                },
+            )
+            .unwrap();
+        assert!(
+            ledger
+                .create_adoption_guarded_with(late, &entry_receipt(late, late_nonce), |_, _, _| {
+                    inserts += 1;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(inserts, 2);
+        // FAILED: a failed insert maps to BpfUnavailable (never a state
+        // verdict), terminally conflicts the record, and is never retried: a
+        // second attempt refuses with no second insert and RETURN never arms.
+        let failed_nonce = ids.fresh().unwrap();
+        let failed = ledger
+            .mint_registration(&mut ids, anchor, epoch, failed_nonce)
+            .unwrap();
+        let error = ledger
+            .create_adoption_guarded_with(
+                failed,
+                &entry_receipt(failed, failed_nonce),
+                |_, _, _| {
+                    inserts += 1;
+                    Err(std::io::Error::from_raw_os_error(libc::EEXIST))
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error, ObservationGap::BpfUnavailable);
+        assert_eq!(inserts, 3);
+        assert!(ledger.return_may_arm(failed).is_err());
+        assert!(
+            ledger
+                .create_adoption_guarded_with(
+                    failed,
+                    &entry_receipt(failed, failed_nonce),
+                    |_, _, _| {
+                        inserts += 1;
+                        Ok(())
+                    }
+                )
+                .is_err()
+        );
+        assert_eq!(inserts, 3);
+        assert!(ledger.return_may_arm(failed).is_err());
+    }
+    #[test]
     fn adoption_live_requires_complete_adoption_proof() {
         let (mut ids, mut ledger, anchor, epoch) = live_anchor();
         let nonce = ids.fresh().unwrap();
@@ -1322,9 +1525,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(calls, 1);
-        // Native failures map to BpfUnavailable, never to a state verdict.
-        let error = GuardLedger::create_guard_preparing(-1, id, epoch).unwrap_err();
-        assert_eq!(error, ObservationGap::BpfUnavailable);
+        // Native-failure mapping to BpfUnavailable is pinned by the creation
+        // operation-trace test through the guarded chokepoint.
     }
     #[test]
     fn domain_arm_binds_held_custody_and_charges_claim() {
