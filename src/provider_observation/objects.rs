@@ -1957,6 +1957,11 @@ fn dynamic_symbols(
 const TYPED_PUBLIC_ROLES: [u32; 17] = [
     5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
 ];
+/// Distinct typed public exports one anchor may need to register. Cited by
+/// the acquisition-core registration capacity and its covering control; any
+/// census growth must review that derivation.
+#[cfg(test)]
+pub(crate) const TYPED_PUBLIC_ROLE_COUNT: usize = TYPED_PUBLIC_ROLES.len();
 const MAX_TYPED_CONFLICTS: usize = TYPED_PUBLIC_ROLES.len() + APIS.len();
 fn record_typed_conflicts(
     typed: &[(TypedRoleId, Option<u64>)],

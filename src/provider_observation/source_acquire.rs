@@ -39,10 +39,34 @@ pub(super) const ACQUIRE_CORE_RESERVE: usize = NOOP_PROGRAM_RESERVE
     + DOMAIN_INDEX_RESERVE
     + IDS_RESERVE;
 
-/// At most one anchor and one registration guard per retained code object;
-/// an owner prepares up to 16 code-object selectors.
-const MAX_ANCHOR_GUARDS: usize = 16;
-const MAX_REGISTRATION_GUARDS: usize = 16;
+/// Host ledger capacities are fixed shares of the shared kernel budgets from
+/// the source-capability contract, never object counts. No "16 code-object
+/// selector" authority exists in the contracts, PLAN, feasibility or plan
+/// records; one anchor alone needs 17 registrations for the typed public
+/// roles (objects.rs TYPED_PUBLIC_ROLES, pinned by
+/// TYPED_PUBLIC_ROLE_COUNT in the capacity control), plus independently
+/// registered provider-callback sites.
+///
+/// Derivation: worst-case logical rows must fit the shared 8192 budget
+/// (capability contract "Finite records and ownership": every row, guard,
+/// projection, index, enrollment cell and tombstone consumes it).
+/// - Anchors: at most one anchor per admitted target domain. SOURCE_DOMAIN
+///   admits at most 64 rows (`source_owner::MAPS` spec
+///   `SOURCE_DOMAIN 1/4/64/64`, `MAX_DOMAINS`), and each SOURCE_ANCHOR key
+///   (process_incarnation/image_epoch) selects one admitted target
+///   configuration. 64 anchors x 2 rows (SOURCE_ANCHOR + anchor guard) = 128.
+/// - Registrations: each registration charges at least 3 rows (SOURCE_REG +
+///   adoption guard + SOURCE_READY; capability "Capacity and acceptance").
+///   1024 x 3 = 3072 rows, under half the shared 8192 budget, leaving
+///   headroom for anchors (<=128), domains (<=64), the observer cell (1) and
+///   CODE_ROLE/index rows. 1024 covers the 17 typed roles plus callback
+///   sites on one anchor with margin.
+///
+/// Both admissions are plain sequential checks inside the serialized source
+/// owner: no host racing read-modify-write. All charges stay inside the
+/// existing reserves (`ACQUIRE_CORE_RESERVE` unchanged).
+const MAX_ANCHOR_GUARDS: usize = 64;
+const MAX_REGISTRATION_GUARDS: usize = 1024;
 /// One domain row per admitted process at most.
 const MAX_DOMAINS: usize = 64;
 /// Kernel verdict word for a completed successful hook pair.
@@ -1061,6 +1085,44 @@ mod tests {
         assert_ne!(registration, anchor);
         assert_ne!(registration, nonce);
         assert!(!ledger.adoption_live(registration));
+    }
+    #[test]
+    fn registration_capacity_covers_typed_roles_and_callback_sites_on_one_anchor() {
+        use super::super::{objects::TYPED_PUBLIC_ROLE_COUNT, schema::APIS};
+        // Structural pin: the registration cap must cover every typed public
+        // role on one anchor plus independently registered callback sites —
+        // one registration per inventoried/operational API as the finite
+        // callback population — with margin under the shared budgets.
+        let required = TYPED_PUBLIC_ROLE_COUNT + APIS.len();
+        assert_eq!(TYPED_PUBLIC_ROLE_COUNT, 17);
+        assert!(MAX_REGISTRATION_GUARDS >= required);
+        let (mut ids, mut ledger, anchor, epoch) = live_anchor();
+        let mut minted = Vec::with_capacity(required);
+        for _ in 0..required {
+            let nonce = ids.fresh().unwrap();
+            minted.push(
+                ledger
+                    .mint_registration(&mut ids, anchor, epoch, nonce)
+                    .unwrap(),
+            );
+        }
+        assert_eq!(minted.len(), required);
+        minted.sort_unstable();
+        minted.dedup();
+        assert_eq!(minted.len(), required);
+        // The cap still binds: fill to it, then the next mint refuses with a
+        // capacity verdict, never an identity verdict.
+        while ledger.registrations.len() < MAX_REGISTRATION_GUARDS {
+            let nonce = ids.fresh().unwrap();
+            ledger
+                .mint_registration(&mut ids, anchor, epoch, nonce)
+                .unwrap();
+        }
+        let nonce = ids.fresh().unwrap();
+        assert!(matches!(
+            ledger.mint_registration(&mut ids, anchor, epoch, nonce),
+            Err(ObservationGap::StateLimit)
+        ));
     }
     #[test]
     fn registration_guard_created_strictly_between_entry_and_return_fentries() {
