@@ -43,7 +43,7 @@ pub(super) const MAPS: [loader::MapSpec; 7] = [
     spec("SOURCE_PAIR", 2, 4, 128, 1),
     spec("SOURCE_DOMAIN", 1, 4, 64, 64),
     spec("SOURCE_OBSERVER", 2, 4, 48, 1),
-    spec("ITER_SLOT", 6, 4, 264, 1),
+    spec("ITER_SLOT", 6, 4, 264, 2),
 ];
 const fn spec(
     name: &'static str,
@@ -1527,11 +1527,13 @@ mod tests {
     #[test]
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
-        assert_eq!(map_reservation(16), Some(6_276_028));
+        // ITER_SLOT carries two per-CPU cells (scratch + commit-tail block):
+        // the second cell adds exactly 4 + 264*16 + 128 = 4356 bytes.
+        assert_eq!(map_reservation(16), Some(6_280_384));
         // The acquisition core adds its NoOp/program/link owner, ledger,
         // domain-index, order and allocator reserves to the component charge.
         assert_eq!(ACQUIRE_CORE_RESERVE, 602_120);
-        assert_eq!(source_reservation(512, 16), Some(13_337_540));
+        assert_eq!(source_reservation(512, 16), Some(13_341_896));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());

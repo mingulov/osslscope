@@ -108,6 +108,203 @@ fn selector_hash_never_accepts_a_prefix_or_unbound_object() {
 }
 
 #[test]
+fn producer_map_layouts_are_exact() {
+    assert_eq!(size_of::<TypedSiteKey>(), 24);
+    assert_eq!(align_of::<TypedSiteKey>(), 8);
+    assert_eq!(offset_of!(TypedSiteKey, process_incarnation), 8);
+    assert_eq!(offset_of!(TypedSiteKey, image_epoch), 16);
+    assert_eq!(size_of::<SiteBindValue>(), 56);
+    assert_eq!(align_of::<SiteBindValue>(), 8);
+    assert_eq!(offset_of!(SiteBindValue, object_sha256), 24);
+    assert_eq!(size_of::<SegmentIndexKey>(), 32);
+    assert_eq!(align_of::<SegmentIndexKey>(), 8);
+    assert_eq!(offset_of!(SegmentIndexKey, reserved), 28);
+    assert_eq!(size_of::<ProducerControl>(), 64);
+    assert_eq!(align_of::<ProducerControl>(), 8);
+    assert_eq!(offset_of!(ProducerControl, producer_mode), 0);
+    assert_eq!(offset_of!(ProducerControl, next_producer_id), 32);
+    assert_eq!(offset_of!(ProducerControl, reserved), 56);
+    assert_eq!(size_of::<ThreadIdentityKey>(), 16);
+    assert_eq!(size_of::<ThreadIdentityValue>(), 16);
+    assert_eq!(size_of::<DigestKey>(), 48);
+    let bound = SiteBindValue {
+        site_id: 1,
+        source_epoch: 1,
+        code_object_id: 1,
+        object_sha256: [7; 32],
+    };
+    assert!(bound.valid());
+    let mut unbound = bound;
+    unbound.site_id = 0;
+    assert!(!unbound.valid());
+    let admitted = ProducerControl {
+        producer_mode: PRODUCER_ADMITTED,
+        session_id: 1,
+        admission_epoch: 1,
+        cut_id: 1,
+        next_producer_id: 1,
+        relation_epoch: 1,
+        loss_epoch: 1,
+        reserved: 0,
+    };
+    assert!(admitted.admitted());
+    for mode in [PRODUCER_CLOSED, PRODUCER_POISONED, 3, u64::MAX] {
+        let mut poisoned = admitted;
+        poisoned.producer_mode = mode;
+        assert!(!poisoned.admitted());
+    }
+    let mut zeroed = admitted;
+    zeroed.cut_id = 0;
+    assert!(!zeroed.admitted());
+    zeroed = admitted;
+    zeroed.reserved = 1;
+    assert!(!zeroed.admitted());
+}
+#[test]
+fn producer_rel_kinds_and_states_are_disjoint() {
+    let kinds = [
+        REL_PROVIDER,
+        REL_QUERY,
+        REL_BINDING,
+        REL_CONTEXT_INDEX,
+        REL_CODE_ROLE,
+        REL_REQUEST_NAME,
+        REL_OBJECT_SELECTOR,
+        REL_METHOD,
+        REL_OWNER,
+        REL_OWNER_SELECTOR,
+        REL_METHOD_AMBIGUITY,
+        REL_CONTEXT_QUARANTINE,
+        REL_X_INDEX,
+        REL_U_INDEX,
+    ];
+    assert_eq!(kinds, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]);
+    assert_eq!(
+        (REL_WITNESS, REL_CERTIFIED, REL_RETIRED, REL_CONFLICT),
+        (1, 2, 3, 4)
+    );
+    assert_ne!(QUARANTINE_OWNER_U, QUARANTINE_CONTEXT_X);
+    assert_eq!(
+        (
+            CONFLICT_METHOD_NAME,
+            CONFLICT_SHARED_X,
+            CONFLICT_SHARED_U,
+            CONFLICT_DUP_EQUALITY
+        ),
+        (1, 2, 3, 4)
+    );
+}
+#[test]
+fn first_slice_role_census_is_exactly_twenty_nine() {
+    let mut admitted = Vec::new();
+    for id in 0..512u32 {
+        if TypedRoleId::from_u32(id).is_some() {
+            admitted.push(id);
+        }
+    }
+    assert_eq!(
+        admitted,
+        vec![
+            5, 18, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308,
+        ]
+    );
+    for id in [
+        0, 1, 12, 48, 49, 127, 128, 129, 132, 156, 160, 176, 256, 257, 260, 309, 511,
+    ] {
+        assert!(
+            TypedRoleId::from_u32(id).is_none(),
+            "role {id} must stay refused"
+        );
+    }
+}
+#[test]
+fn canonical_name_check_implies_from_read_accepts() {
+    // Canonical buffers pass both checks with identical material: the BPF
+    // keyless path uses raw bytes verbatim, `from_read` zero-pads.
+    for n in [1u32, 2, 63, 126] {
+        let mut bytes = [0; 128];
+        bytes[..n as usize].fill(0xAB);
+        assert!(exact_name_canonical(&bytes, n), "length {n}");
+        let key = ExactNameKey::from_read(0, 3, &bytes, n as i64 + 1).unwrap();
+        assert_eq!(key.name_length, n);
+        assert_eq!(&key.name[..n as usize], &bytes[..n as usize]);
+        assert!(key.name[n as usize..].iter().all(|b| *b == 0));
+    }
+    // Both checks reject empty, overlong and unterminated reads.
+    for (bytes, length, result) in [
+        ([0u8; 128], 0, 1),
+        ([0xFFu8; 128], 127, 128),
+        ([0xFFu8; 128], 128, 129),
+    ] {
+        assert!(!exact_name_canonical(&bytes, length));
+        assert!(ExactNameKey::from_read(0, 3, &bytes, result).is_none());
+    }
+    // A garbage tail is canonical-rejected but `from_read`-accepted (the
+    // pinned lenient contract zero-pads): the kernel path refuses what the
+    // host contract normalizes.
+    let mut dirty_tail = [0u8; 128];
+    dirty_tail[0] = b'A';
+    dirty_tail[5] = b'B';
+    assert!(!exact_name_canonical(&dirty_tail, 1));
+    let padded = ExactNameKey::from_read(0, 3, &dirty_tail, 2).unwrap();
+    assert_eq!(padded.name_length, 1);
+    assert_eq!(padded.name[0], b'A');
+    assert!(padded.name[1..].iter().all(|b| *b == 0));
+    // An interior NUL fails both checks.
+    let mut interior_nul = [b'C'; 128];
+    interior_nul[2] = 0;
+    assert!(!exact_name_canonical(&interior_nul, 5));
+    assert!(ExactNameKey::from_read(0, 3, &interior_nul, 6).is_none());
+}
+#[test]
+fn scratch_digest_matches_stack_digest_on_dirty_scratch() {
+    let mut object = [0; 32];
+    for (i, b) in object.iter_mut().enumerate() {
+        *b = (i * 7 + 3) as u8;
+    }
+    for n in [1usize, 63, 64, 119, 120, 126] {
+        let mut bytes = [0; 128];
+        bytes[..n].fill(b'Q');
+        let name = ExactNameKey::from_read(9, 4, &bytes, (n + 1) as i64).unwrap();
+        let stacked = selector_digest(&object, &name).unwrap();
+        let mut scratch = [0xA5u8; 192];
+        let scratched = selector_digest_into(&object, &name, &mut scratch).unwrap();
+        assert_eq!(stacked, scratched, "name length {n}");
+    }
+    let mut bytes = [0; 128];
+    bytes[0] = b'A';
+    let name = ExactNameKey::from_read(0, 3, &bytes, 2).unwrap();
+    let mut scratch = [0u8; 192];
+    assert!(selector_digest_into(&[0; 32], &name, &mut scratch).is_none());
+}
+#[test]
+fn parts_digest_matches_key_digest_and_rejects_bad_parts() {
+    let mut object = [0; 32];
+    for (i, b) in object.iter_mut().enumerate() {
+        *b = (i * 3 + 1) as u8;
+    }
+    for n in [1usize, 64, 126] {
+        let mut bytes = [0; 128];
+        bytes[..n].fill(b'W');
+        let name = ExactNameKey::from_read(5, 3, &bytes, (n + 1) as i64).unwrap();
+        let mut scratch = [0x5Au8; 192];
+        let keyed = selector_digest_into(&object, &name, &mut scratch).unwrap();
+        let mut scratch = [0xA5u8; 192];
+        let parts = selector_digest_parts(3, n as u32, &bytes, &object, &mut scratch).unwrap();
+        assert_eq!(keyed, parts, "name length {n}");
+    }
+    let bytes = [b'X'; 128];
+    let mut scratch = [0u8; 192];
+    assert!(selector_digest_parts(5, 1, &bytes, &object, &mut scratch).is_none());
+    assert!(selector_digest_parts(3, 0, &bytes, &object, &mut scratch).is_none());
+    assert!(selector_digest_parts(3, 127, &bytes, &object, &mut scratch).is_none());
+    let mut bad = [0u8; 128];
+    bad[0] = b'Y';
+    bad[1] = b'Z';
+    assert!(selector_digest_parts(3, 1, &bad, &object, &mut scratch).is_none());
+}
+#[test]
 fn typed_role_has_separate_identity_and_exact_public_exports() {
     let role = TypedRoleId::from_u32(130).unwrap();
     assert_eq!(role.id(), 130);

@@ -9,6 +9,60 @@ pub const MAX_DEPTH: u32 = 8;
 pub const MAX_PREPARED_OBJECTS: u32 = 16;
 pub const SELECTOR_PREFIX: &[u8; 16] = b"ossl-code-req-v1";
 
+/// REL relationship kinds. Kinds 1-5 retain their draft meanings; 6-14 are
+/// the first MAC/KDF producer rows; 15-17 are source rows (see `source.rs`).
+pub const REL_PROVIDER: u32 = 1;
+pub const REL_QUERY: u32 = 2;
+pub const REL_BINDING: u32 = 3;
+pub const REL_CONTEXT_INDEX: u32 = 4;
+pub const REL_CODE_ROLE: u32 = 5;
+pub const REL_REQUEST_NAME: u32 = 6;
+pub const REL_OBJECT_SELECTOR: u32 = 7;
+pub const REL_METHOD: u32 = 8;
+pub const REL_OWNER: u32 = 9;
+pub const REL_OWNER_SELECTOR: u32 = 10;
+pub const REL_METHOD_AMBIGUITY: u32 = 11;
+pub const REL_CONTEXT_QUARANTINE: u32 = 12;
+pub const REL_X_INDEX: u32 = 13;
+pub const REL_U_INDEX: u32 = 14;
+
+/// REL row states. Checked exactly, never inferred bitwise.
+pub const REL_WITNESS: u32 = 1;
+pub const REL_CERTIFIED: u32 = 2;
+pub const REL_RETIRED: u32 = 3;
+pub const REL_CONFLICT: u32 = 4;
+
+/// Quarantine secondary-handle domains (`CONTEXT_QUARANTINE.secondary_handle`).
+pub const QUARANTINE_OWNER_U: u64 = 1;
+pub const QUARANTINE_CONTEXT_X: u64 = 2;
+
+/// Quarantine/ambiguity reasons (`data[0]`).
+pub const CONFLICT_METHOD_NAME: u64 = 1;
+pub const CONFLICT_SHARED_X: u64 = 2;
+pub const CONFLICT_SHARED_U: u64 = 3;
+pub const CONFLICT_DUP_EQUALITY: u64 = 4;
+
+/// Producer control modes (`ProducerControl.producer_mode`). The producer is
+/// inert unless mode is exactly `ADMITTED`; any other value, including a
+/// poison transition, disables every typed read and partition write.
+pub const PRODUCER_CLOSED: u64 = 0;
+pub const PRODUCER_ADMITTED: u64 = 1;
+pub const PRODUCER_POISONED: u64 = 2;
+
+/// Pending-frame name states (`BindPendingValue.name_state`).
+pub const NAME_ABSENT: u32 = 0;
+pub const NAME_COMPLETE: u32 = 1;
+pub const NAME_UNREADABLE: u32 = 2;
+pub const NAME_EMPTY: u32 = 3;
+pub const NAME_BOUNDARY: u32 = 4;
+
+/// Pending-frame transaction flags (`BindPendingValue.transaction_flags`).
+pub const TXN_AMBIGUITY: u32 = 1;
+pub const TXN_GUARD_CHANGED: u32 = 2;
+pub const TXN_SOURCE_CHANGED: u32 = 4;
+pub const TXN_PUBLICATION_FAILED: u32 = 8;
+pub const TXN_COLLISION: u32 = 16;
+
 /// Independent role identity. Neither an API number nor a public function ID
 /// can be converted to this type without the complete finite role-table check.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,8 +203,34 @@ pub struct ExactNameKey {
     pub name_length: u32,
     pub name: [u8; 128],
 }
+/// Check raw helper-read name bytes are already in canonical zero-padded
+/// form: `length` nonzero bytes up front, zeroes after. This is STRICTER
+/// than [`ExactNameKey::from_read`], which zero-pads and therefore accepts
+/// garbage tails: BPF uses the raw buffer verbatim as exact-key and request
+/// row material (see `intern_request`), so only canonical buffers may pass.
+/// The staged frames start zeroed and the string helper preserves the zero
+/// tail, which makes this sound on the kernel path.
+#[inline(always)]
+pub fn exact_name_canonical(bytes: &[u8; 128], length: u32) -> bool {
+    if length == 0 || length > 126 {
+        return false;
+    }
+    let mut check = 0;
+    while check < 128 {
+        if (check < length as usize && bytes[check] == 0)
+            || (check >= length as usize && bytes[check] != 0)
+        {
+            return false;
+        }
+        check += 1;
+    }
+    true
+}
 impl ExactNameKey {
     /// Helper result includes NUL. Return128 may be truncation: never accept it.
+    /// Always inlined: BPF callers materialize the 144-byte key once on the
+    /// merged caller frame instead of nesting it under a call frame.
+    #[inline(always)]
     pub fn from_read(
         object_domain: u64,
         operation: u32,
@@ -270,6 +350,65 @@ pub struct SelectorRef {
     pub selector_id: u64,
     pub dictionary_epoch: u64,
 }
+/// Typed-admission/site-bind key: the full process/image-bound site/cookie
+/// identity, never a naked address. Admission is programmed per incarnation;
+/// exec retires the old image rows by key mismatch. 24 bytes, align 8.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct TypedSiteKey {
+    pub cookie: u64,
+    pub process_incarnation: u64,
+    pub image_epoch: u64,
+}
+/// Host-programmed per-site binding for the typed producer. The site's
+/// `site_id` is the observer dictionary ID the partition writer emits; the
+/// `source_epoch` selects that site's `SOURCE_READY` row; `code_object_id`
+/// is the retained object containing the firing callback; `object_sha256`
+/// is that retained artifact's raw 32-byte fingerprint feeding the request
+/// digest (B in encoding 2). IDs are nonzero. 56 bytes, align 8.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct SiteBindValue {
+    pub site_id: u64,
+    pub source_epoch: u64,
+    pub code_object_id: u64,
+    pub object_sha256: [u8; 32],
+}
+impl SiteBindValue {
+    pub const fn valid(&self) -> bool {
+        self.site_id != 0 && self.source_epoch != 0 && self.code_object_id != 0
+    }
+}
+/// Producer control cell (single-entry array). The host programs the
+/// session/cut/admission coordinates and the initial epochs before opening
+/// admission; only the qualified source-acquisition path may transition
+/// `producer_mode` from `CLOSED` to `ADMITTED`. Kernel poison paths advance
+/// `relation_epoch`/`loss_epoch` and may set `POISONED`; the host never
+/// mutates this cell after admission opens. 64 bytes, align 8.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProducerControl {
+    pub producer_mode: u64,
+    pub session_id: u64,
+    pub admission_epoch: u64,
+    pub cut_id: u64,
+    pub next_producer_id: u64,
+    pub relation_epoch: u64,
+    pub loss_epoch: u64,
+    pub reserved: u64,
+}
+impl ProducerControl {
+    pub const fn admitted(&self) -> bool {
+        self.producer_mode == PRODUCER_ADMITTED
+            && self.session_id != 0
+            && self.admission_epoch != 0
+            && self.cut_id != 0
+            && self.next_producer_id != 0
+            && self.relation_epoch != 0
+            && self.loss_epoch != 0
+            && self.reserved == 0
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct DigestKey {
@@ -277,6 +416,20 @@ pub struct DigestKey {
     pub operation: u32,
     pub reserved: u32,
     pub digest: [u8; 32],
+}
+/// Segment index key: one immutable attribution tuple (site, owner interval,
+/// count generation, operation/function) maps to exactly one nonzero segment
+/// ID. The kernel allocates the segment once per tuple; every later hit with
+/// the same tuple reuses it, so per-CPU shards reduce exactly once. 32 bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentIndexKey {
+    pub site_id: u64,
+    pub owner_id: u64,
+    pub count_generation: u32,
+    pub operation: u32,
+    pub function: u32,
+    pub reserved: u32,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -323,29 +476,73 @@ pub struct PartitionValue {
 /// caller supplies a complete ExactNameKey and the retained callback artifact.
 /// At most three compression blocks and sixteen schedule words are needed.
 pub fn selector_digest(object: &[u8; 32], name: &ExactNameKey) -> Option<[u8; 32]> {
-    if name.object_domain == 0 || name.name_length == 0 || name.name_length > 126 {
+    let mut message = [0u8; 192];
+    selector_digest_into(object, name, &mut message)
+}
+/// Scratch-buffer variant of [`selector_digest`] for BPF callers whose 512B
+/// stack cannot hold the 192-byte padded message beside the 144-byte key.
+/// The caller supplies any 192-byte buffer that no nested producer path can
+/// observe: BPF passes its per-CPU staging cell while holding the shared
+/// publisher lock, which serializes every staging user on every CPU. The
+/// buffer is fully rewritten on success and left unspecified on failure.
+pub fn selector_digest_into(
+    object: &[u8; 32],
+    name: &ExactNameKey,
+    message: &mut [u8; 192],
+) -> Option<[u8; 32]> {
+    if name.object_domain == 0 {
+        return None;
+    }
+    selector_digest_parts(
+        name.operation,
+        name.name_length,
+        &name.name,
+        object,
+        message,
+    )
+}
+/// Parts-based variant hashing an exact request without materializing the
+/// 144-byte key: the BPF commit path marshals directly from the immutable
+/// request row and the retained artifact hash. Validation is identical to
+/// the key-based entry point; only the key container differs. Always
+/// inlined so the BPF caller keeps one flat frame above the block hash.
+#[inline(always)]
+pub fn selector_digest_parts(
+    operation: u32,
+    name_length: u32,
+    name: &[u8; 128],
+    object: &[u8; 32],
+    message: &mut [u8; 192],
+) -> Option<[u8; 32]> {
+    if !matches!(operation, 3 | 4) || name_length == 0 || name_length > 126 {
         return None;
     }
     let mut check = 0;
     while check < 128 {
-        if (check < name.name_length as usize && name.name[check] == 0)
-            || (check >= name.name_length as usize && name.name[check] != 0)
+        if (check < name_length as usize && name[check] == 0)
+            || (check >= name_length as usize && name[check] != 0)
         {
             return None;
         }
         check += 1;
     }
-    let mut message = [0u8; 192];
     message[..16].copy_from_slice(SELECTOR_PREFIX);
     message[16..48].copy_from_slice(object);
-    message[48..52].copy_from_slice(&name.operation.to_le_bytes());
-    message[52..56].copy_from_slice(&name.name_length.to_le_bytes());
-    let length = name.name_length as usize;
+    message[48..52].copy_from_slice(&operation.to_le_bytes());
+    message[52..56].copy_from_slice(&name_length.to_le_bytes());
+    let length = name_length as usize;
     let mut i = 0;
     while i < 126 {
         if i < length {
-            message[56 + i] = name.name[i];
+            message[56 + i] = name[i];
+        } else {
+            message[56 + i] = 0;
         }
+        i += 1;
+    }
+    i = 56 + length;
+    while i < 192 {
+        message[i] = 0;
         i += 1;
     }
     let used = 56 + length;

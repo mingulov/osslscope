@@ -6,10 +6,14 @@
 // actual 64-bit BPF atomic instructions, checked in the object receipt.
 #![feature(core_intrinsics)]
 #![allow(internal_features)]
+#[path = "../shared_maps.rs"]
+mod shared_maps;
 #[path = "../source_registration.rs"]
 mod source_registration;
 #[path = "../source_state.rs"]
 mod source_state;
+#[path = "../typed_producer.rs"]
+mod typed_producer;
 // Code policy is retained unchanged for the subsequent copied callback join.
 #[allow(dead_code)]
 #[path = "../source_vma.rs"]
@@ -231,6 +235,45 @@ pub fn provider_name(pointer: u64) -> u32 {
             Err(_) => return 4,
         };
     provider_name_class(&buf, len)
+}
+/// Typed producer entry: normalize the caller into the observer namespace
+/// and stage/invalidate through the typed state machine. Never attached
+/// unless the host programmed typed admission for this site.
+#[uprobe]
+pub fn typed_entry(ctx: ProbeContext) -> u32 {
+    if !writer_gate::admitted() {
+        return 0;
+    }
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let Some(ns) = NAMESPACE.get(0) else {
+        return 0;
+    };
+    let mut ids = bpf_pidns_info { pid: 0, tgid: 0 };
+    if unsafe { helpers::bpf_get_ns_current_pid_tgid(ns.device, ns.inode, &mut ids, 8) } != 0 {
+        return 0;
+    }
+    let now = unsafe { helpers::bpf_ktime_get_ns() };
+    typed_producer::typed_entry(&ctx, cookie, ids.tgid, ids.pid, now)
+}
+
+/// Typed producer return: pair the staged frame and publish or stage the
+/// role's evidence. Never attached unless the host programmed typed
+/// admission for this site.
+#[uretprobe]
+pub fn typed_return(ctx: RetProbeContext) -> u32 {
+    if !writer_gate::admitted() {
+        return 0;
+    }
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let Some(ns) = NAMESPACE.get(0) else {
+        return 0;
+    };
+    let mut ids = bpf_pidns_info { pid: 0, tgid: 0 };
+    if unsafe { helpers::bpf_get_ns_current_pid_tgid(ns.device, ns.inode, &mut ids, 8) } != 0 {
+        return 0;
+    }
+    let now = unsafe { helpers::bpf_ktime_get_ns() };
+    typed_producer::typed_return(&ctx, cookie, ids.tgid, ids.pid, now)
 }
 #[uprobe]
 pub fn observation_entry(ctx: ProbeContext) -> u32 {

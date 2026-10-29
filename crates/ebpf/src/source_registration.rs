@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Observer-only registration proof. No target operand reader or public event.
-use crate::{source_state as atom, source_vma, writer_gate, CONFIG, MEMBERS, NAMESPACE};
+use crate::{
+    shared_maps::{
+        ITER_SLOT, REL, SOURCE_DOMAIN, SOURCE_GUARD, SOURCE_OBSERVER, SOURCE_PAIR, SOURCE_REQUEST,
+    },
+    source_state as atom, source_vma, typed_producer, writer_gate, CONFIG, MEMBERS, NAMESPACE,
+};
 use aya_ebpf::{
     bindings::bpf_pidns_info,
     helpers,
-    macros::{fentry, fexit, map},
-    maps::{Array, HashMap, PerCpuArray},
+    macros::{fentry, fexit},
     programs::{FEntryContext, FExitContext},
     EbpfContext,
 };
@@ -14,21 +18,6 @@ use osslscope_bpf_contract::{
     attribution::{RelKey, RelValue},
     source::*,
 };
-
-#[map]
-pub static REL: HashMap<RelKey, RelValue> = HashMap::with_max_entries(8192, 0);
-#[map]
-pub static SOURCE_GUARD: HashMap<u64, SourceGuard> = HashMap::with_max_entries(8192, 0);
-#[map]
-pub static SOURCE_REQUEST: HashMap<u64, SourceRequest> = HashMap::with_max_entries(4096, 0);
-#[map]
-pub static SOURCE_PAIR: Array<SourcePair> = Array::with_max_entries(1, 0);
-#[map]
-pub static SOURCE_DOMAIN: HashMap<u32, SourceDomain> = HashMap::with_max_entries(64, 0);
-#[map]
-pub static SOURCE_OBSERVER: Array<SourceObserver> = Array::with_max_entries(1, 0);
-#[map]
-pub static ITER_SLOT: PerCpuArray<SourceSlot> = PerCpuArray::with_max_entries(1, 0);
 
 // Staging casts to the REL value for typed stores. Same size, same alignment.
 const _: () = {
@@ -715,8 +704,13 @@ pub extern "C" fn attr_exit(_ctx: *mut core::ffi::c_void) -> u32 {
     }
     retire_source_observer(false);
     // Source eligibility does not count participating threads or infer group
-    // death from a leader/last-observed crypto-thread exit. Typed pending/thread
-    // incarnation retirement must be added before its target readers are armed.
+    // death from a leader/last-observed crypto-thread exit. Typed pending and
+    // thread-incarnation rows retire synchronously here, before kernel TID
+    // reuse can retarget them. A missing namespace means no typed program
+    // could have normalized this task, so no typed state can exist for it.
+    if let Some(namespace) = NAMESPACE.get(0) {
+        typed_producer::retire_thread(namespace.device, namespace.inode);
+    }
     0
 }
 #[no_mangle]
@@ -729,6 +723,9 @@ pub extern "C" fn attr_exec(_ctx: *mut core::ffi::c_void) -> u32 {
     let Some(namespace) = NAMESPACE.get(0) else {
         return 0;
     };
+    // The execing thread's old-image typed rows retire before the image
+    // transition below; sibling threads retire through their own exits.
+    typed_producer::retire_image(namespace.device, namespace.inode);
     let mut ids = bpf_pidns_info { pid: 0, tgid: 0 };
     let normalized = unsafe {
         helpers::bpf_get_ns_current_pid_tgid(namespace.device, namespace.inode, &mut ids, 8)

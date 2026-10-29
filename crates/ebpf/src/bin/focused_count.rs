@@ -18,8 +18,29 @@
 //!
 //! BPF wire records and `WINDOW` cells use `osslscope-bpf-contract`.
 //! Userspace retains separate ABI-compatible common types.
+//!
+//! The same handler also assigns at most one attribution partition per
+//! stored physical hit through the shared typed producer maps (injected by
+//! the host from the same FDs as the observation program). The partition
+//! write runs only for admitted operational sites; every other hit keeps
+//! exactly its physical behavior.
 #![no_std]
 #![no_main]
+// BPF exposes no core AtomicU64 type; the pinned compiler intrinsics emit the
+// actual 64-bit BPF atomic instructions for the shared sequence capture.
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
+#[path = "../shared_maps.rs"]
+mod shared_maps;
+// Only the same-handler operational check is live in this object; the typed
+// entry/return state machine compiles out per object (verified by the
+// per-object program/map manifest).
+#[allow(dead_code)]
+#[path = "../source_state.rs"]
+mod source_state;
+#[allow(dead_code)]
+#[path = "../typed_producer.rs"]
+mod typed_producer;
 #[path = "../writer_gate.rs"]
 mod writer_gate;
 
@@ -121,6 +142,10 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     if now < start || now >= deadline {
         return 0;
     }
+    // Attribution snapshot, captured before the ledger, the physical store
+    // and any attribution decision: selected owners and dependencies must
+    // already be published in this snapshot.
+    let entry_seq = typed_producer::capture_entry_seq();
     // Independent ledger: every hit admitted past TARGET + window,
     // including cookie-wide and map-full drops below.
     admitted();
@@ -138,6 +163,16 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     let key = make_key(cookie as u32, gen);
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
         bump(slot, now);
+        // At most one eligible partition in this same generation. A failed
+        // attribution leaves the stored physical hit unresolved.
+        let params = typed_producer::OpParams {
+            cookie,
+            tgid: ids.tgid,
+            generation: gen,
+            now_ns: now,
+            entry_seq,
+        };
+        typed_producer::operational_check(&ctx, &params);
         return 0;
     }
     // Fresh-key slow path (F05/R04): bounded zero-seed + relookup.
@@ -161,6 +196,16 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     let _ = COUNTS.insert(&key, &zero, BPF_NOEXIST);
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
         bump(slot, now);
+        // Same-generation partition assignment on the slow path too: the
+        // physical store succeeded, so this hit is eligible exactly once.
+        let params = typed_producer::OpParams {
+            cookie,
+            tgid: ids.tgid,
+            generation: gen,
+            now_ns: now,
+            entry_seq,
+        };
+        typed_producer::operational_check(&ctx, &params);
     } else {
         dropfail();
     }

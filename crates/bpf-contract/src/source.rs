@@ -150,8 +150,17 @@ pub struct SourceGuard {
 /// without a 256-byte stack temporary. Only the serialized source writer
 /// touches staging, and every publication zeroes it before writing fields;
 /// stale bytes from a previous CPU-local insert can never enter a new row.
-/// Staging is word-typed so this module stays dependency-free; the BPF writer
-/// casts it to the same-sized, same-aligned REL value for typed stores.
+/// The typed producer reuses this same cell for its 192-byte digest message
+/// scratch, strictly while holding the shared publisher lock that already
+/// serializes every staging user on every CPU; the digest input is fully
+/// rewritten before hashing, and the REL staging write after hashing fully
+/// rewrites the cell again. The split owner commit additionally crosses a
+/// 96-byte plan (digest plus IDs) in bytes `[144..240)` between its two
+/// shallow phases, with `[240..256)` spare zero; that region is per-CPU
+/// private to a non-preemptible BPF run, so no interleaver can observe or
+/// corrupt it. Staging is word-typed
+/// so this module stays dependency-free; the BPF writer casts it to the
+/// same-sized, same-aligned REL value for typed stores.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SourceSlot {

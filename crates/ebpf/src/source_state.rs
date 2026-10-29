@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //! Shared live pending capacity in the actual provider entry/return handlers.
-use aya_ebpf::{macros::map, maps::Array};
+pub use crate::shared_maps::{ATTR_STATE, SOURCE_CONFIG};
 use core::intrinsics::{atomic_cxchg, AtomicOrdering::SeqCst};
-use osslscope_bpf_contract::source::{
-    pending_claim_value, pending_release_value, SourceConfig, SourceControl,
-};
-
-#[map]
-pub static ATTR_STATE: Array<SourceControl> = Array::with_max_entries(1, 0);
-#[map]
-pub static SOURCE_CONFIG: Array<SourceConfig> = Array::with_max_entries(1, 0);
+use osslscope_bpf_contract::source::{pending_claim_value, pending_release_value};
 
 // A single atomic compare/exchange with equal replacement is a real ordered
 // read. Do not substitute volatile loads or LLVM fences that BPF may discard.
