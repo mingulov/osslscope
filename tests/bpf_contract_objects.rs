@@ -530,12 +530,12 @@ fn assert_reviewed_cycles(role: &str, actual: &[(String, usize, String)]) {
         )),
         "harvest" => expected.extend([
             (
-                "_RNvCsevktOyTz8Qs_17osslscope_harvest12classify_alg",
+                "_RNvCseODenyNQ03x_17osslscope_harvest12classify_alg",
                 1,
                 "dd69c5df43b3a064da2d37f57f2a36cc3a91d53f3e1dc1ab7db91b51ac6e4aab",
             ),
             (
-                "_RNvCsevktOyTz8Qs_17osslscope_harvest13walk_dispatch",
+                "_RNvCseODenyNQ03x_17osslscope_harvest13walk_dispatch",
                 1,
                 "a9b65f762e91574eaeb13fe765afe93fd006270b3b0d5c8923a6ab5faf672083",
             ),
@@ -562,12 +562,12 @@ fn assert_reviewed_cycles(role: &str, actual: &[(String, usize, String)]) {
         ]),
         "members" => expected.extend([
             (
-                "_RNvCs4PN6m3KOtaZ_17osslscope_members12classify_alg",
+                "_RNvCsaubhtxa9GzF_17osslscope_members12classify_alg",
                 1,
                 "dd69c5df43b3a064da2d37f57f2a36cc3a91d53f3e1dc1ab7db91b51ac6e4aab",
             ),
             (
-                "_RNvCs4PN6m3KOtaZ_17osslscope_members13walk_dispatch",
+                "_RNvCsaubhtxa9GzF_17osslscope_members13walk_dispatch",
                 1,
                 "3498fee53f799b03cd71a75c665f76524a941e6a78f57a86f93a72c5df6428f0",
             ),
@@ -1727,7 +1727,7 @@ fn negative_controls(bytes: &[u8], prepared: &loader::Prepared) {
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect::<String>(),
-        "657965b9b89eea790f0bfaed167b2fc9ed9ac4c1f4773ea44b2c3fa115ebecca",
+        "162a95a7c7a421e966353614fd33c0b1948453d81d1a289258c3aba81054e0e8",
         "reviewed scratch-bypass mutant bytes"
     );
     let altered = loader::prepare(&bad_scratch, &MEMBER_MAPS, &MEMBER_PROGS)
