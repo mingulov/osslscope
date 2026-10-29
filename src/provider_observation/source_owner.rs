@@ -11,23 +11,26 @@ use std::{
     collections::BTreeMap,
     fs::File,
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, OwnedFd},
         unix::fs::MetadataExt,
     },
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
 
-const HOST_OWNER_BYTES: usize = 4096;
+// Existing namespace/map owner plus two independently retained shared-map FDs.
+const HOST_OWNER_BYTES: usize = 4096 + 2 * crate::writer_gate::INJECTION_BYTES;
+pub(super) const CONTROL_MAPS: [loader::MapSpec; 2] = [
+    spec("ATTR_STATE", 2, 4, 64, 1),
+    spec("SOURCE_CONFIG", 2, 4, 8, 1),
+];
 // Private REL is available to BPF injection only, never a host readback surface.
-const MAPS: [loader::MapSpec; 7] = [
+const MAPS: [loader::MapSpec; 5] = [
     spec("REL", 1, 48, 256, 8192),
     spec("SOURCE_GUARD", 1, 8, 16, 8192),
     spec("SOURCE_REQUEST", 1, 8, 112, 4096),
     spec("SOURCE_OBSERVER", 2, 4, 48, 1),
     spec("ITER_SLOT", 6, 4, 8, 1),
-    spec("ATTR_STATE", 2, 4, 64, 1),
-    spec("SOURCE_CONFIG", 2, 4, 8, 1),
 ];
 const fn spec(
     name: &'static str,
@@ -125,6 +128,67 @@ fn check(
     budget.checkpoint()
 }
 
+/// Initial mandatory loader owns both maps. Initialize once while ADMIT is
+/// closed; optional source preparation may later duplicate only these exact FDs.
+pub(super) fn initialize_controls(
+    loaded: &loader::Loaded,
+    gate: &WriterGate,
+    pending_limit: usize,
+) -> Result<(), ObservationGap> {
+    if !gate.preparing() {
+        return Err(ObservationGap::Invalidated);
+    }
+    let config = source_configuration(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }, pending_limit)
+        .unwrap_or(SourceConfig {
+            page_shift: 0,
+            pending_limit: 0,
+        });
+    let control = SourceControl::PREPARED;
+    for (spec, value) in CONTROL_MAPS.into_iter().zip([
+        // repr(C), size-asserted records with no implicit padding.
+        unsafe { std::slice::from_raw_parts((&control as *const SourceControl).cast(), 64) },
+        unsafe { std::slice::from_raw_parts((&config as *const SourceConfig).cast(), 8) },
+    ]) {
+        let fd = loaded
+            .maps
+            .get(spec.name)
+            .ok_or(ObservationGap::InvalidObject)?;
+        let map =
+            loader::BorrowedMap::new(fd.as_fd()).map_err(|_| ObservationGap::BpfUnavailable)?;
+        map.shape(
+            &[spec.map_type],
+            spec.key_size as usize,
+            spec.value_size as usize,
+        )
+        .map_err(|_| ObservationGap::InvalidObject)?;
+        if map.info.max_entries != 1 || map.info.flags != 0 {
+            return Err(ObservationGap::InvalidObject);
+        }
+        for name in ["observation_entry", "observation_return"] {
+            // Return consumes only ATTR_STATE; entry also consumes the frozen limit.
+            if spec.name == "SOURCE_CONFIG" && name == "observation_return" {
+                continue;
+            }
+            let program = loaded
+                .progs
+                .get(name)
+                .ok_or(ObservationGap::InvalidObject)?;
+            if !ossl_bpf_sys::prog_map_ids(program.as_raw_fd())
+                .map_err(|_| ObservationGap::BpfUnavailable)?
+                .contains(&map.info.id)
+            {
+                return Err(ObservationGap::InvalidObject);
+            }
+        }
+        // Exact checked key/value dimensions above; both slices stay live for
+        // the synchronous syscall, before any writer can enter this map.
+        unsafe { ossl_bpf_sys::map_update_elem(fd.as_raw_fd(), &0u32.to_ne_bytes(), value, 0) }
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+    }
+    ossl_bpf_sys::map_freeze(loaded.maps["SOURCE_CONFIG"].as_raw_fd())
+        .map_err(|_| ObservationGap::BpfUnavailable)
+}
+
 /// Non-Send through its retained gate/account. Host initializes safe cells only
 /// before writers; preparing these maps grants no registration or READY witness.
 pub(super) struct SourceOwner {
@@ -138,6 +202,7 @@ impl SourceOwner {
         budget: &ObservationBudget,
         kernel: &loader::SourceKernel,
         gate: &WriterGate,
+        loaded: &loader::Loaded,
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<Self, ObservationGap> {
@@ -145,7 +210,7 @@ impl SourceOwner {
             return Err(ObservationGap::Invalidated);
         }
         check(budget, deadline, cancel)?;
-        let configuration = source_configuration(
+        source_configuration(
             unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
             budget.limits.max_pending_calls,
         )?;
@@ -190,14 +255,44 @@ impl SourceOwner {
             .map_err(|_| ObservationGap::BpfUnavailable)?;
             maps.insert(map.name, fd);
         }
+        for spec in CONTROL_MAPS {
+            check(budget, deadline, cancel)?;
+            let original = loaded
+                .maps
+                .get(spec.name)
+                .ok_or(ObservationGap::InvalidObject)?;
+            let original_map = loader::BorrowedMap::new(original.as_fd())
+                .map_err(|_| ObservationGap::BpfUnavailable)?;
+            original_map
+                .shape(
+                    &[spec.map_type],
+                    spec.key_size as usize,
+                    spec.value_size as usize,
+                )
+                .map_err(|_| ObservationGap::InvalidObject)?;
+            if original_map.info.max_entries != 1 || original_map.info.flags != 0 {
+                return Err(ObservationGap::InvalidObject);
+            }
+            crate::lifecycle_producer::note_acquisition()
+                .map_err(|_| ObservationGap::BpfUnavailable)?;
+            let duplicate = original
+                .try_clone()
+                .map_err(|_| ObservationGap::BpfUnavailable)?;
+            if loader::BorrowedMap::new(duplicate.as_fd())
+                .map_err(|_| ObservationGap::BpfUnavailable)?
+                .info
+                .id
+                != original_map.info.id
+            {
+                return Err(ObservationGap::InvalidObject);
+            }
+            maps.insert(spec.name, duplicate);
+        }
         // These repr(C) records have compile-time checked sizes and no padding. No
         // private REL value, pointer or target operand is read back by the host.
         unsafe {
             let observer_bytes =
                 std::slice::from_raw_parts((&observer as *const SourceObserver).cast(), 48);
-            let control = SourceControl::PREPARED;
-            let control_bytes =
-                std::slice::from_raw_parts((&control as *const SourceControl).cast(), 64);
             ossl_bpf_sys::map_update_elem(
                 maps["SOURCE_OBSERVER"].as_raw_fd(),
                 &0u32.to_ne_bytes(),
@@ -205,25 +300,7 @@ impl SourceOwner {
                 0,
             )
             .map_err(|_| ObservationGap::BpfUnavailable)?;
-            ossl_bpf_sys::map_update_elem(
-                maps["ATTR_STATE"].as_raw_fd(),
-                &0u32.to_ne_bytes(),
-                control_bytes,
-                0,
-            )
-            .map_err(|_| ObservationGap::BpfUnavailable)?;
-            let configuration_bytes =
-                std::slice::from_raw_parts((&configuration as *const SourceConfig).cast(), 8);
-            ossl_bpf_sys::map_update_elem(
-                maps["SOURCE_CONFIG"].as_raw_fd(),
-                &0u32.to_ne_bytes(),
-                configuration_bytes,
-                0,
-            )
-            .map_err(|_| ObservationGap::BpfUnavailable)?;
         }
-        ossl_bpf_sys::map_freeze(maps["SOURCE_CONFIG"].as_raw_fd())
-            .map_err(|_| ObservationGap::BpfUnavailable)?;
         check(budget, deadline, cancel)?;
         Ok(Self {
             _maps: maps,
@@ -241,8 +318,8 @@ mod tests {
     #[test]
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
-        assert_eq!(map_reservation(16), Some(6_259_464));
-        assert_eq!(source_reservation(512, 16), Some(12_702_472));
+        assert_eq!(map_reservation(16), Some(6_128_056));
+        assert_eq!(source_reservation(512, 16), Some(12_579_256));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());

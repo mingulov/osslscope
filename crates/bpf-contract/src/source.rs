@@ -88,6 +88,28 @@ impl SourceControl {
     };
 }
 
+/// The serialized source request and entry witness keep the base two claims.
+/// Actual pending insertion may proceed only after a successful atomic CAS to
+/// this value. A smaller caller limit remains binding for every producer.
+#[inline(always)]
+pub const fn pending_claim_value(current: u64, limit: u32) -> Option<u64> {
+    if limit < 2 || limit > 4096 || current < 2 || current >= limit as u64 {
+        None
+    } else {
+        Some(current + 1)
+    }
+}
+/// Release only after actual frame removal. Failure to release is conservative;
+/// never refund a still-live frame or the two fixed source pairing reservations.
+#[inline(always)]
+pub const fn pending_release_value(current: u64) -> Option<u64> {
+    if current <= 2 || current > 4096 {
+        None
+    } else {
+        Some(current - 1)
+    }
+}
+
 const _: () = {
     assert!(core::mem::size_of::<SourceRequest>() == 112);
     assert!(core::mem::size_of::<SourceObserver>() == 48);
@@ -100,6 +122,22 @@ const _: () = {
 mod tests {
     use super::*;
     use core::mem::{align_of, offset_of, size_of};
+    #[test]
+    fn joint_pending_bounds_preserve_reserved_pair_and_caller_limit() {
+        assert_eq!(pending_claim_value(2, 3), Some(3));
+        assert_eq!(pending_claim_value(3, 3), None);
+        assert_eq!(pending_claim_value(4095, 4096), Some(4096));
+        assert_eq!(pending_claim_value(4096, 4096), None);
+        assert_eq!(pending_release_value(3), Some(2));
+        assert_eq!(pending_release_value(2), None);
+        for current in [0, 1, u64::MAX] {
+            assert_eq!(pending_claim_value(current, 4096), None);
+            assert_eq!(pending_release_value(current), None);
+        }
+        for limit in [0, 1, 4097, u32::MAX] {
+            assert_eq!(pending_claim_value(2, limit), None);
+        }
+    }
     #[test]
     fn source_records_match_exact_reviewed_offsets() {
         assert_eq!(
