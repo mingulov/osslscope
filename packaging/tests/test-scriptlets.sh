@@ -101,7 +101,7 @@ fi
 
 # Current construction uses a fresh output tree rather than a shared RPMS
 # glob. Refusing an occupied tree prevents stale output selection/overwrite.
-if python3 "$REPO/packaging/build-package.py" --formats rpm --output "$T" >"$T/refuse.out" 2>&1; then
+if python3 "$REPO/packaging/build-package.py" --source-archives "$T/unused-sources" --formats rpm --output "$T" >"$T/refuse.out" 2>&1; then
     bad "current builder refuses occupied output"
 elif grep -q 'output already exists' "$T/refuse.out"; then
     ok "current builder refuses occupied output"
