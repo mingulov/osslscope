@@ -25,6 +25,20 @@ use std::{
 const MAX_FILES: usize = 128;
 const MAX_METADATA: u64 = 128 << 20;
 const MAX_NEEDED: usize = 256;
+pub(crate) enum StartupAcquisition {
+    Legacy,
+    TypedSources,
+}
+pub(crate) fn acquire_startup(
+    mut acquire: impl FnMut(StartupAcquisition) -> Result<(), ObservationGap>,
+) -> [Result<(), ObservationGap>; 2] {
+    // Anchors retain full-file capacity, including through the Object cache.
+    // Complete legacy acquisition before spending any optional source capacity.
+    [
+        acquire(StartupAcquisition::Legacy),
+        acquire(StartupAcquisition::TypedSources),
+    ]
+}
 pub(crate) struct PreExecSites {
     pub(crate) candidates: Vec<VerifiedStaticCandidate>,
     pub(crate) apis: Vec<objects::StartupApiSite>,

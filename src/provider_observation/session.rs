@@ -195,6 +195,30 @@ fn retain_and_arm(
     rows.push(attachment);
     arm(rows.last().unwrap())
 }
+fn retain_typed_startup(
+    sites: Vec<super::objects::StartupTypedSite>,
+    budget: &ObservationBudget,
+    retained: &mut Vec<super::objects::TypedPublicSite>,
+    deadline: Instant,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(), ObservationGap> {
+    let mut first_gap = None;
+    for site in sites {
+        if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+            return Err(ObservationGap::SnapshotLag);
+        }
+        if retained.len() >= budget.limits.max_learned_sites {
+            return Err(ObservationGap::SiteLimit);
+        }
+        match site.prepare(budget) {
+            Ok(prepared) => retained.push(prepared),
+            Err(gap) => {
+                first_gap.get_or_insert(gap);
+            }
+        }
+    }
+    first_gap.map_or(Ok(()), Err)
+}
 /// Pure object ABI admission, shared with ordinary command preflight.
 pub(crate) fn prepare_object(object: &[u8]) -> Result<loader::Prepared, ObservationGap> {
     let programs = [
@@ -1659,22 +1683,13 @@ impl ProviderSession {
             return Ok(());
         }
         self._source_kernel.as_ref().map_err(|gap| *gap)?;
-        let mut first_gap = None;
-        for site in sites {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
-                return Err(ObservationGap::SnapshotLag);
-            }
-            if self.typed_startup.len() >= self.budget.limits.max_learned_sites {
-                return Err(ObservationGap::SiteLimit);
-            }
-            match site.prepare(&self.budget) {
-                Ok(prepared) => self.typed_startup.push(prepared),
-                Err(gap) => {
-                    first_gap.get_or_insert(gap);
-                }
-            }
-        }
-        first_gap.map_or(Ok(()), Err)
+        retain_typed_startup(
+            sites,
+            &self.budget,
+            &mut self.typed_startup,
+            deadline,
+            cancel,
+        )
     }
 
     /// Sealed public-export capability: static table shapes never grant an ABI.
@@ -4111,6 +4126,151 @@ mod startup_api_controls {
         let mut stale = r;
         stale.api = c::GET_DISPATCH;
         assert!(record_binding(&targets, &startup, &stale).is_err());
+    }
+    #[test]
+    fn legacy_startup_acquisition_survives_retained_typed_prefix_then_refusal() {
+        use crate::startup_objects::{StartupAcquisition, acquire_startup};
+        // Three real, distinct retained ELF files. No fixture function executes.
+        let mut body = String::from("ret\n");
+        for id in 20..=48 {
+            let name = wire::api(id).unwrap().export_name().unwrap();
+            body.push_str(&format!(
+                ".globl {name}\n.type {name},@function\n{name}: mov $1,%eax\nret\n.size {name},.-{name}\n"
+            ));
+        }
+        body.push_str(".globl EVP_MAC_fetch\n.type EVP_MAC_fetch,@function\nEVP_MAC_fetch: mov %rdi,%rax\nret\n.size EVP_MAC_fetch,.-EVP_MAC_fetch\n");
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert_eq!(page, 4096, "this fixture uses the x86_64 base-page ABI");
+        let mut fixtures: Vec<_> = [240, 4, 240]
+            .into_iter()
+            .map(|pages| {
+                let mut f = startup_fixture::ForwarderFixture::new(&body, "ret");
+                assert!(f.image.len() <= pages * page);
+                f.image.resize(pages * page, 0);
+                f
+            })
+            .collect();
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .unwrap();
+        let custody = objects::StartupProcess::held(&child).unwrap();
+        let discovery = ObservationBudget::default();
+        let mut legacy = Vec::new();
+        let mut typed = Vec::new();
+        for (index, fixture) in fixtures.iter_mut().enumerate() {
+            let sources =
+                objects::startup_candidates(custody.clone(), fixture.file(), &discovery).unwrap();
+            assert_eq!(sources.typed.len(), 1);
+            typed.extend(sources.typed);
+            if index == 0 {
+                legacy = sources.apis;
+            }
+        }
+        assert_eq!(legacy.len(), 31); // 29 operational exports plus query/unquery
+        let anchor = 240 * (page + 64) + 4096;
+        // This models remaining acquisition headroom after discovery. BOTH
+        // stages share this account, including every retained anchor prefix.
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_state_bytes: anchor + 29 * (96 + 512 + 256) + (16 << 10) + 4096,
+            ..Default::default()
+        });
+        let mut roles = Roles::default();
+        let mut startup = BTreeMap::new();
+        let mut armed = BTreeSet::new();
+        let mut retained = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut legacy_result = None;
+        let mut typed_result = None;
+        let outcomes = acquire_startup(|stage| match stage {
+            StartupAcquisition::Legacy => {
+                let result = (|| {
+                    let mut resolved = Vec::new();
+                    for source in std::mem::take(&mut legacy) {
+                        let (api, site) = source.into_parts();
+                        let Some(id) = (20..=48).find(|&id| wire::api(id) == Ok(api)) else {
+                            continue;
+                        };
+                        roles.observe(
+                            role_site(site.pid(), site.starttime(), &site),
+                            id,
+                            &budget,
+                        )?;
+                        resolved.push((id, site));
+                    }
+                    for (index, (api, site)) in resolved.into_iter().enumerate() {
+                        budget.state(512)?;
+                        let links = paired_links(
+                            || Ok(std::fs::File::open("/dev/null").unwrap().into()),
+                            || Ok(std::fs::File::open("/dev/null").unwrap().into()),
+                        )?;
+                        budget.state(256)?;
+                        let attachment = Attachment {
+                            object: object_id(&site),
+                            site,
+                            links,
+                            cookie: index as u64 + 1,
+                            api,
+                            generation: 1,
+                            advertisers: Vec::new(),
+                            original: None,
+                            historical: false,
+                        };
+                        retain_and_arm(&mut startup, child.pid(), attachment, |a| {
+                            validate_then_arm(
+                                || a.site.revalidate_object(),
+                                || {
+                                    armed.insert(a.cookie);
+                                    Ok(())
+                                },
+                            )
+                        })?;
+                    }
+                    Ok(())
+                })();
+                legacy_result = Some(result);
+                result
+            }
+            StartupAcquisition::TypedSources => {
+                let result = retain_typed_startup(
+                    std::mem::take(&mut typed),
+                    &budget.clone(),
+                    &mut retained,
+                    deadline,
+                    &cancel,
+                );
+                typed_result = Some(result);
+                result
+            }
+        });
+        assert_eq!(
+            legacy_result,
+            Some(Ok(())),
+            "optional anchors starved legacy acquisition"
+        );
+        assert_eq!(typed_result, Some(Err(ObservationGap::StateLimit)));
+        assert_eq!(outcomes, [Ok(()), Err(ObservationGap::StateLimit)]);
+        assert_eq!(
+            retained.len(),
+            1,
+            "successful source prefix must remain retained"
+        );
+        assert_eq!(startup[&child.pid()].len(), 29);
+        assert_eq!(armed.len(), 29);
+        for a in &startup[&child.pid()] {
+            assert!(roles.accepts(role_site(a.site.pid(), a.site.starttime(), &a.site), a.api));
+            assert_eq!(a.links.len(), 2);
+            assert!(
+                a.links
+                    .iter()
+                    .all(|fd| unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) } >= 0)
+            );
+            a.site.revalidate_object().unwrap();
+        }
+        // The actual installed-owner seam is exercised with inert host FDs;
+        // this is ordering/custody evidence, not a native BPF attachment claim.
     }
     #[test]
     fn startup_partial_arm_failure_keeps_link_and_file_owners_until_cleanup() {

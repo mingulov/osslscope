@@ -746,19 +746,22 @@ impl FocusedSession {
         }
         if let Some(session) = &mut session {
             if let Some(preexec) = &mut preexec {
-                if let Err(gap) = session.prepare_typed_startup(
-                    std::mem::take(&mut preexec.typed),
-                    setup_deadline,
-                    cancel,
-                ) {
-                    gaps.insert(gap);
-                }
-                if let Err(gap) = session.prearm_startup(
-                    std::mem::take(&mut preexec.apis),
-                    setup_deadline,
-                    cancel,
-                ) {
-                    gaps.insert(gap);
+                for result in crate::startup_objects::acquire_startup(|stage| match stage {
+                    crate::startup_objects::StartupAcquisition::Legacy => session.prearm_startup(
+                        std::mem::take(&mut preexec.apis),
+                        setup_deadline,
+                        cancel,
+                    ),
+                    crate::startup_objects::StartupAcquisition::TypedSources => session
+                        .prepare_typed_startup(
+                            std::mem::take(&mut preexec.typed),
+                            setup_deadline,
+                            cancel,
+                        ),
+                }) {
+                    if let Err(gap) = result {
+                        gaps.insert(gap);
+                    }
                 }
             }
         }
