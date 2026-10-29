@@ -46,11 +46,20 @@ lockfiles pin external versions, registry locations and checksums, not an
 aggregate license determination. Later distribution of compiled binaries,
 vendored dependencies or copied tool sources needs a notice/source review for
 those actual contents. The current matched development package builder inventories both locked
-resolved dependency graphs, copies registry license/notice texts, and supplies
-an exact product source archive plus upstream source links. Its
-[restoration index](../packaging/notices/restored.json) preserves missing Aya
+resolved dependency graphs, copies registry notices and requires an actual
+[accompanying-source payload](../packaging/SOURCE-README.md) alongside its binary
+packages. This contains exact product/Cargo sources, two pinned official Rust
+library source components, the bounded host standard-library crate superset and
+original runtime notices. The source manifest binds every payload hash to the
+current product revision/tree and six shipped artifact hashes. Upstream URLs
+are provenance in addition to the actual source payloads.
+
+The [restoration index](../packaging/notices/restored.json) preserves missing Aya
 registry notices from each published crate's exact upstream VCS revision,
-including both upstream texts and the selected MIT option. This is an initial
-construction inventory, not final compiler/sysroot/native-runtime source closure
-or a completed conveyance-rights review. Public binary distribution remains a
-separate release action after those gates.
+including both upstream texts and the selected MIT option. Runtime
+compiler_builtins terms remain conjunctive, including the complete LLVM
+exception and per-file notices; they are not flattened to a blanket MIT option.
+The source recipe explains the ordinary compiler/linker/system-runtime boundary
+and exact pinned prerequisites. Artifact construction is separate from final
+conveyance-rights review, reproducibility, installed runtime qualification and
+public release authorization.

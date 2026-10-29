@@ -4,20 +4,21 @@
 The current builder constructs a prefix tarball, DEB and RPM containing the CLI
 and all five BPF roles from one clean pinned build. These are development
 candidates. Construction and extraction do not establish installed platform,
-reproducibility, source/license closure or release qualification.
+reproducibility, final conveyance-rights or release qualification.
 
 Build from a reviewed clean product checkout:
 
 ```sh
 ./scripts/build-dev.sh --release --offline
-python3 packaging/build-package.py --output dist/current
-# dist/current: prefix tarball, DEB, RPM, product source tar, package-manifest.json
+python3 packaging/build-package.py --source-archives /path/to/source-archives --output dist/current
+# dist/current: prefix tarball, DEB, RPM, product source tar, accompanying-source bundle, package-manifest.json
 ```
 
 The output directory must be new; existing output is refused. The builder never
 installs software, changes privileges, acquires dependencies or starts workloads.
-It requires Python 3.11+, the pinned Cargo toolchains and cached locked dependency
-metadata. DEB construction additionally needs `dpkg-deb`; RPM needs `rpmbuild`.
+It requires Python 3.11+, the pinned Cargo toolchains, cached locked dependency
+metadata and the original source archives described below. DEB construction
+additionally needs `dpkg-deb`; RPM needs `rpmbuild`.
 No Cargo compilation or network access occurs inside packaging.
 
 A full clean `build-dev.sh --release` manifest must record the current source
@@ -31,9 +32,10 @@ attestation against a malicious builder.
 Select formats and the final tar installation prefix explicitly:
 
 ```sh
-python3 packaging/build-package.py --formats tar --prefix /opt/osslscope --output dist/prefix
-./packaging/build-deb.sh --output dist/deb
-RPM_RELEASE=2 ./packaging/build-rpm.sh --output dist/rpm
+python3 packaging/build-package.py --source-archives /path/to/source-archives \
+  --formats tar --prefix /opt/osslscope --output dist/prefix
+./packaging/build-deb.sh --source-archives /path/to/source-archives --output dist/deb
+RPM_RELEASE=2 ./packaging/build-rpm.sh --source-archives /path/to/source-archives --output dist/rpm
 ```
 
 `--revision N`, `DEB_REVISION` and `RPM_RELEASE` select a positive numeric package
@@ -49,7 +51,8 @@ The shared prefix tree contains:
 - `share/osslscope/install-manifest.json` (0644).
 - `share/doc/osslscope/`: installation/licensing documentation, project license
   texts, actual locked host/BPF dependency graphs and copied dependency notices,
-  plus source-availability metadata binding the accompanying product source tar.
+  Rust/runtime notices and source-availability metadata binding the product
+  source tar and accompanying-source bundle.
 
 DEB/RPM install this tree below `/usr`, owned by root with protected directories.
 The current receipt binds the CLI and all five role hashes and source reference.
@@ -73,11 +76,37 @@ published VCS revision to both upstream license texts. The MIT distribution
 option is recorded explicitly, retaining the upstream dual-license declaration.
 Package construction validates these pins without network access.
 
-Product source plus upstream source links is not a complete offline corresponding
-source bundle. Final compiler/sysroot/native-runtime inventory, complete source
-availability and rights review remain release gates. Metadata passing and
-restored notices grant no new rights. Preserve the source tar and package manifest
-alongside the development packages. No upload/tag/publish occurs during builds.
+`--source-archives` is required. Supply the original `.crate` files selected by
+both **current** locked resolved graphs and the reviewed runtime inputs in
+[runtime-sources.json](runtime-sources.json): two official rust-src components
+and the bounded host standard-library crate superset. Filenames are the official
+archive basenames. Every byte is checked against the live lock checksums or
+reviewed runtime hashes; missing, changed or stale inputs refuse construction.
+Rust component revisions must also match the installed pinned compilers. There
+is no download fallback, frozen product dependency list or compiler archive.
+
+`osslscope-<version>-accompanying-source.tar.gz` contains the exact product
+archive, original source payloads, dependency graphs, license/notice texts and a
+[usable source build recipe](SOURCE-README.md). `source-manifest.json` binds
+every payload hash to the current product revision/tree and exact six binary
+artifact hashes. All package formats install the same runtime notices,
+`accompanying-source-manifest.json` and source-availability metadata naming and
+hashing the sidecar bundle. Preserve that sidecar and `package-manifest.json`
+alongside every binary download under this source-accompaniment route; no
+written offer or future human source service is inferred.
+
+The preparation helper validates the payload and creates an ordinary Cargo
+`vendor/` source replacement for both workspaces without a registry index.
+Installed pinned compilers, bpf-linker and ordinary system development/runtime
+prerequisites remain external. Runtime originals preserve the full
+compiler_builtins conjunctive expression and LLVM exception, Unicode permission
+texts, library copyright inventories and the reviewed native-runtime notices.
+Read the recipe for the precise source boundary and tool prerequisites.
+
+Payload construction/extraction alone does not establish an offline build,
+byte-identical reproducibility, installed runtime qualification or final
+conveyance-rights review. Original terms grant permissions; metadata grants
+none. No upload/tag/publish occurs during builds.
 
 ## Capability lifecycle
 
@@ -103,6 +132,7 @@ Host controls (no root):
 
 ```sh
 python3 packaging/tests/test-current-package.py
+python3 packaging/tests/test-source-payload.py
 ./packaging/tests/test-scriptlets.sh
 ./scripts/tests/test-install-dev.sh
 ```

@@ -1,0 +1,140 @@
+{
+  "components": [
+    {
+      "archive": "rust-src-1.88.0.tar.xz",
+      "bytes": 3155272,
+      "root": "rust-src-1.88.0",
+      "rust_revision": "6b00bc3880198600130e1cf62b8f8a93494488cc",
+      "sha256": "d6e7462e5b5e53bde515d8846ffdd4da246b79ba2d7b2872a33b46cc12cf76c7",
+      "toolchain": "1.88.0",
+      "url": "https://static.rust-lang.org/dist/2025-06-26/rust-src-1.88.0.tar.xz"
+    },
+    {
+      "archive": "rust-src-nightly.tar.xz",
+      "bytes": 5660920,
+      "root": "rust-src-nightly",
+      "rust_revision": "e50aa6fba4e63ab34c72bf9acfd2c307c1155d1a",
+      "sha256": "2bd8b226238befcd267bb5dd851205cdb594ea9d0eda8f93d81f8fabba9ae668",
+      "toolchain": "nightly-2026-05-20",
+      "url": "https://static.rust-lang.org/dist/2026-05-20/rust-src-nightly.tar.xz"
+    }
+  ],
+  "host_std_crates": [
+    {
+      "bytes": 39015,
+      "name": "addr2line",
+      "sha256": "dfbe277e56a376000877090da837660b4427aad530e3028d44e0bffe4f89a1c1",
+      "version": "0.24.2"
+    },
+    {
+      "bytes": 13529,
+      "name": "adler2",
+      "sha256": "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627",
+      "version": "2.0.0"
+    },
+    {
+      "bytes": 7934,
+      "name": "cfg-if",
+      "sha256": "baf1de4339761588bc0619e3cbc0120ee582ebb74b53b4efbf79117bd2da40fd",
+      "version": "1.0.0"
+    },
+    {
+      "bytes": 245300,
+      "name": "compiler_builtins",
+      "sha256": "164cdc689e4c6d69417f77a5f48be240c291e84fbef0b1281755dc754b19c809",
+      "version": "0.1.158"
+    },
+    {
+      "bytes": 279515,
+      "name": "gimli",
+      "sha256": "07e28edb80900c19c28f1072f2e8aeca7fa06b23cd4169cefe1af5aa3260783f",
+      "version": "0.31.1"
+    },
+    {
+      "bytes": 140413,
+      "name": "hashbrown",
+      "sha256": "84b26c544d002229e640969970a2e74021aadf6e2f96372b9c58eff97de08eb3",
+      "version": "0.15.3"
+    },
+    {
+      "bytes": 791646,
+      "name": "libc",
+      "sha256": "d750af042f7ef4f724306de029d18836c26c1765a54a6a3f094cbd23a7267ffa",
+      "version": "0.2.172"
+    },
+    {
+      "bytes": 96670,
+      "name": "memchr",
+      "sha256": "78ca9ab1a0babb1e7d5695e3530886289c18cf2f87ec19a575a0abdce112e3a3",
+      "version": "2.7.4"
+    },
+    {
+      "bytes": 67065,
+      "name": "miniz_oxide",
+      "sha256": "3be647b768db090acb35d5ec5db2b0e1f1de11133ca123b9eacf5137868f892a",
+      "version": "0.8.8"
+    },
+    {
+      "bytes": 329938,
+      "name": "object",
+      "sha256": "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87",
+      "version": "0.36.7"
+    },
+    {
+      "bytes": 29047,
+      "name": "rustc-demangle",
+      "sha256": "719b953e2095829ee67db738b3bfa9fa368c94900df327b3f07fe6e794d2fe1f",
+      "version": "0.1.24"
+    }
+  ],
+  "notices": [
+    {
+      "bytes": 376423,
+      "file": "1.88.0/COPYRIGHT-library.html",
+      "sha256": "3d3f60160f5214efa0a7fd804102d02ce9ea6af04b5249a19eeb243450246ae9",
+      "url": "https://static.rust-lang.org/dist/2025-06-26/rust-docs-1.88.0-x86_64-unknown-linux-gnu.tar.xz"
+    },
+    {
+      "bytes": 1995,
+      "file": "1.88.0/Unicode-3.0.txt",
+      "sha256": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/6b00bc3880198600130e1cf62b8f8a93494488cc/LICENSES/Unicode-3.0.txt"
+    },
+    {
+      "bytes": 279302,
+      "file": "nightly-2026-05-20/COPYRIGHT-library.html",
+      "sha256": "0a65bb747c49c7bb816cbc7188319bd6e4e8d08091c1190b8a3c0971c47968ed",
+      "url": "https://static.rust-lang.org/dist/2026-05-20/rust-docs-nightly-x86_64-unknown-linux-gnu.tar.xz"
+    },
+    {
+      "bytes": 1995,
+      "file": "nightly-2026-05-20/Unicode-3.0.txt",
+      "sha256": "f5062c9a188d81dfe66b56db4182dcf9e4b17c0d9b0d311a8e20b3a1b075c443",
+      "url": "https://raw.githubusercontent.com/rust-lang/rust/e50aa6fba4e63ab34c72bf9acfd2c307c1155d1a/LICENSES/Unicode-3.0.txt"
+    },
+    {
+      "bytes": 73793,
+      "file": "native-runtime/libgcc-15-dev-copyright",
+      "origin": {
+        "distribution": "Ubuntu",
+        "installed_notice": "/usr/share/doc/libgcc-15-dev/copyright",
+        "package": "libgcc-15-dev",
+        "version": "15.2.0-16ubuntu1"
+      },
+      "sha256": "41a2d69df964174fb042b6513e99b72177318e94ca0c29a813e6f3155a9c5048"
+    },
+    {
+      "bytes": 53241,
+      "file": "native-runtime/libc6-dev-copyright",
+      "origin": {
+        "distribution": "Ubuntu",
+        "installed_notice": "/usr/share/doc/libc6-dev/copyright",
+        "package": "libc6-dev",
+        "version": "2.43-2ubuntu2.4"
+      },
+      "sha256": "c31d10900fdb95d1889005145a2205bb75e3bc018d3ec8265b81364901748e09"
+    }
+  ],
+  "schema": "osslscope-runtime-sources-v1",
+  "scope": "Reviewed Rust library components and bounded x86_64 GNU host std source superset. Project crates come from current locked metadata, not this index. Original terms and per-file notices remain applicable."
+}
