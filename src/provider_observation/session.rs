@@ -3029,6 +3029,62 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF pointing to a rebuilt object; preparation only"]
+    fn source_writer_inventory_is_exact_and_admit_dominated() {
+        // Ordinary-RCU writer proof, host half: the provider object carries
+        // exactly the six reviewed writer roots, every root references the
+        // shared ADMIT gate as its first mutation guard, and the source half
+        // passes the owner's exact admission against the running kernel's
+        // validated registration FUNC ID. Preparation only: no program loads,
+        // no links, no mode change, read-only running BTF.
+        let path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")
+            .expect("required test-only object path OSSL_PROVIDER_OBSERVATION_TEST_BPF");
+        let object = std::fs::read(path).expect("required test-only object must be readable");
+        let prepared = prepare_object(&object).expect("real object preparation");
+        let mut roots: Vec<_> = prepared
+            .progs
+            .iter()
+            .map(|p| (p.name.as_str(), p.section.as_str()))
+            .collect();
+        roots.sort();
+        assert_eq!(
+            roots,
+            [
+                ("attr_exec", "raw_tracepoint/sched_process_exec"),
+                ("attr_exit", "raw_tracepoint/sched_process_exit"),
+                ("observation_entry", "uprobe"),
+                ("observation_return", "uretprobe"),
+                ("source_reg_in", "fentry/uprobe_register"),
+                ("source_reg_out", "fexit/uprobe_register"),
+            ]
+        );
+        for root in &prepared.progs {
+            assert!(
+                root.map_fixups.iter().any(|fix| fix.map == "ADMIT"),
+                "root {} lacks the shared-gate fixup",
+                root.name
+            );
+        }
+        let (legacy, source) = split_source_preparation(prepared);
+        assert_eq!((legacy.progs.len(), source.progs.len()), (2, 4));
+        for root in &source.progs {
+            assert!(
+                !root.subprogs.iter().any(|s| s.is_callback),
+                "source root {} must not take the callback BTF path",
+                root.name
+            );
+        }
+        let budget = ObservationBudget::default();
+        let kernel = loader::SourceKernel::read(&budget).expect("running kernel source layout");
+        assert_ne!(
+            kernel.registration_btf_id(),
+            0,
+            "running kernel must expose uprobe_register"
+        );
+        super::source_acquire::RetainedSourceRoots::check(&source, kernel.registration_btf_id())
+            .expect("real source half must pass owner admission");
+    }
+    #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]
     fn pooled_discovery_recovers_same_target_without_recharging_or_duplicate_admission() {
         use crate::capture::ClockPort;

@@ -989,6 +989,53 @@ mod tests {
         }
     }
     #[test]
+    fn source_writers_use_only_ordinary_rcu_load_attributes() {
+        // Frozen ordinary-RCU premises for all four source writers, checked
+        // against inspected stable 6.12.113: `prog_flags == 0` selects
+        // non-sleepable execution (`prog->sleepable` is false per
+        // kernel/bpf/syscall.c:2778), so fentry/fexit roots run under
+        // ordinary `rcu_read_lock` via `__bpf_prog_enter`
+        // (kernel/bpf/trampoline.c:1017-1026, selected at :1049-1060) and raw
+        // roots via `__bpf_trace_run` (kernel/trace/bpf_trace.c:2313-2337).
+        // Sleepable execution would use Tasks-Trace RCU instead; these
+        // loaders accept no sleepable flag, program BTF or token.
+        for root in [SourceTracingRoot::Enter, SourceTracingRoot::Exit] {
+            let code = [0x95, 0, 0, 0, 0, 0, 0, 0];
+            let error = prog_load_source_with(&code, root, 4242, None, |attr| {
+                assert_eq!(attr.prog_type, 26);
+                assert_eq!(attr.expected_attach_type, root.attach_type());
+                assert_eq!(attr.prog_flags, 0);
+                assert_eq!(attr.attach_btf_id, 4242);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+            let error = source_link_with(313, root, |cmd, attr| {
+                assert_eq!(cmd, BPF_LINK_CREATE);
+                assert_eq!(
+                    u32::from_ne_bytes(attr[8..12].try_into().unwrap()),
+                    root.attach_type()
+                );
+                // The target frozen at load; no cookie or retargeting identity.
+                assert!(attr[12..].iter().all(|byte| *byte == 0));
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        }
+        for root in [LifecycleTracepoint::Exit, LifecycleTracepoint::Exec] {
+            let code = [0x95, 0, 0, 0, 0, 0, 0, 0];
+            let error = prog_load_lifecycle_with(&code, root, None, |attr| {
+                assert_eq!(attr.prog_type, 17);
+                assert_eq!(attr.expected_attach_type, 0);
+                assert_eq!(attr.prog_flags, 0);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            })
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(libc::EPERM));
+        }
+    }
+    #[test]
     fn source_noop_is_literal_nonwriting_two_instruction_program() {
         let error = source_noop_with(|attr| {
             assert_eq!(attr.prog_type, BPF_PROG_TYPE_KPROBE);
