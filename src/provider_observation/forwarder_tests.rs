@@ -535,3 +535,27 @@ fn forwarding_deadlines_stop_in_memory_work_without_caching_partial_parse() {
         SCAN_PROBE.with(|probe| probe.set(ScanProbe::default()));
     }
 }
+
+#[test]
+fn typed_conflict_at_original_export_survives_query_forward_derivation() {
+    let mut f = ForwarderFixture::new(NEAR, SHORT_BACK);
+    let at = f.symbols[OTHER] + 8;
+    f.image[at..at + 8].copy_from_slice(&f.addresses[QUERY].to_le_bytes());
+    // Equal-width public-name replacement introduces a separately typed free
+    // role at the original query wrapper, before its one-hop derivation.
+    let old = b"EVP_MD_fetch";
+    let replacement = b"EVP_MAC_free";
+    for at in 0..f.image.len() - old.len() + 1 {
+        if &f.image[at..at + old.len()] == old {
+            f.image[at..at + old.len()].copy_from_slice(replacement);
+        }
+    }
+    let object = parsed(&f);
+    assert!(object.typed_partial);
+    assert!(
+        object
+            .typed_exports
+            .iter()
+            .all(|(role, _)| role.id() != 136)
+    );
+}

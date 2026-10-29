@@ -5,6 +5,7 @@ use super::schema::{APIS, ObjectHash, ObservationApi, ObservationBudget, Observa
 use super::static_tables::{
     self, DynamicAlgorithmId, StaticTableProvenance, TableDiscovery, TableLimits, TableStorage,
 };
+use crate::attribution::TypedRoleId;
 use crate::inventory::{
     self, IdentityStatus, ModuleInfo, NamespaceId, NamespaceIds, ProcessRecord,
 };
@@ -30,6 +31,10 @@ const MAX_STRINGS: u64 = 16 * 1024 * 1024;
 // hashing, reads, or construction, including source-only inspection.
 const PARSER_STATE_BYTES: usize = MAX_HEADERS * std::mem::size_of::<Segment>()
     + APIS.len() * std::mem::size_of::<(ObservationApi, u64)>()
+    + TYPED_PUBLIC_ROLES.len()
+        * (std::mem::size_of::<(TypedRoleId, Option<u64>)>()
+            + std::mem::size_of::<(TypedRoleId, u64)>())
+    + MAX_TYPED_CONFLICTS * std::mem::size_of::<u64>()
     + std::mem::size_of::<ElfObject>()
     + 64;
 
@@ -84,6 +89,9 @@ struct ElfObject {
     hash: ObjectHash,
     segments: Vec<Segment>,
     exports: Vec<(ObservationApi, u64)>,
+    typed_exports: Vec<(TypedRoleId, u64)>,
+    typed_conflicts: Vec<u64>,
+    typed_partial: bool,
 }
 // Internal retry classification: shared capacity is not part of a retained
 // file fingerprint. Public diagnostics keep their existing finite gap labels.
@@ -291,8 +299,12 @@ pub(crate) fn startup_candidates(
     });
     let parsed = object.parsed(budget)?;
     let mut apis = Vec::new();
-    let mut conflict = false;
+    let mut conflict = parsed.typed_partial;
     for &(api, offset) in &parsed.exports {
+        if parsed.typed_conflicts.contains(&offset) {
+            conflict = true;
+            continue;
+        }
         // Fetch remains mapped-only. All exported roles still arbitrate collisions
         // before granting any signature, including a scalar operational role.
         if parsed
@@ -544,6 +556,21 @@ pub struct ApiSite {
     pub api: ObservationApi,
     pub site: VerifiedSite,
 }
+/// Separately admitted public relationship ABI. Only retained exact-export
+/// acquisition constructs this capability; a numeric role alone cannot do so.
+pub struct TypedPublicSite {
+    role: TypedRoleId,
+    site: VerifiedSite,
+}
+impl TypedPublicSite {
+    pub fn role(&self) -> TypedRoleId {
+        self.role
+    }
+    pub fn site(&self) -> &VerifiedSite {
+        &self.site
+    }
+}
+
 /// Procdir/pidfd and descriptors remain owned through all cloned sites.
 #[derive(Default)]
 struct StaticDiscovery {
@@ -694,9 +721,67 @@ impl VerifiedProcess {
                 if found != api || !mapping_contains_offset(mapping, offset) {
                     continue;
                 }
+                if parsed.typed_conflicts.contains(&offset) {
+                    self.gaps.borrow_mut().insert(ObservationGap::AmbiguousSite);
+                    continue;
+                }
                 if seen.insert((object.stamp.native, object.stamp.inode, offset)) {
                     sites.push(ApiSite {
                         api,
+                        site: VerifiedSite {
+                            custody: SiteCustody::Mapped {
+                                process: self.process.clone(),
+                                maps: self.maps.clone(),
+                            },
+                            object: object.clone(),
+                            offset,
+                            generation: self.generation,
+                            hash: parsed.hash.clone(),
+                        },
+                    });
+                }
+            }
+        }
+        sites
+    }
+    /// Resolve a new relationship role from exact public exports. Static table
+    /// candidates never construct this capability or grant argument reads.
+    pub fn resolve_typed_api(&self, role: TypedRoleId) -> Vec<TypedPublicSite> {
+        if role.public_export().is_none() {
+            return Vec::new();
+        }
+        if let Err(gap) = self.revalidate() {
+            self.gaps.borrow_mut().insert(gap);
+            return Vec::new();
+        }
+        let mut sites = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for (mapping, object) in &self.mappings {
+            let parsed = match object.parsed(&self.budget) {
+                Ok(parsed) => parsed,
+                Err(gap) => {
+                    self.gaps.borrow_mut().insert(gap);
+                    continue;
+                }
+            };
+            if parsed.typed_partial {
+                self.gaps.borrow_mut().insert(ObservationGap::AmbiguousSite);
+            }
+            for &(found, offset) in &parsed.typed_exports {
+                if found != role || !mapping_contains_offset(mapping, offset) {
+                    continue;
+                }
+                let identity = (object.stamp.native, object.stamp.inode, offset);
+                if !seen.contains(&identity) {
+                    // Covers the returned capability, vector growth and bounded
+                    // deduplication node; charge before either allocation.
+                    if let Err(gap) = self.budget.state(256) {
+                        self.gaps.borrow_mut().insert(gap);
+                        return sites;
+                    }
+                    seen.insert(identity);
+                    sites.push(TypedPublicSite {
+                        role,
                         site: VerifiedSite {
                             custody: SiteCustody::Mapped {
                                 process: self.process.clone(),
@@ -1471,6 +1556,10 @@ fn parse_exports(
         bytes(file, shoff, count as usize * 64, len, budget)?
     };
     let mut exports: Vec<(ObservationApi, u64)> = Vec::with_capacity(APIS.len());
+    let mut typed: Vec<(TypedRoleId, Option<u64>)> = Vec::with_capacity(TYPED_PUBLIC_ROLES.len());
+    let mut typed_conflicts = Vec::with_capacity(MAX_TYPED_CONFLICTS);
+    let mut typed_partial = false;
+    let mut typed_name_conflict = false;
     if let Some(DynamicSymbols { symbols, names }) = dynamic_symbols(file, &programs, len, budget)?
     {
         for symbol in symbols.chunks_exact(24) {
@@ -1497,9 +1586,11 @@ fn parse_exports(
             let Some(tail) = names.get(name..).filter(|tail| !tail.is_empty()) else {
                 return Err(ObservationGap::MalformedElf);
             };
-            let Some(api) = export_api_at(|index| tail.get(index).copied()) else {
+            let api = export_api_at(|index| tail.get(index).copied());
+            let typed_role = typed_export_at(|index| tail.get(index).copied());
+            if api.is_none() && typed_role.is_none() {
                 continue;
-            };
+            }
             let address = word(symbol, 8, 8)?;
             let size = word(symbol, 16, 8)?.max(1);
             let mut matching = segments.iter().filter(|seg| {
@@ -1520,12 +1611,37 @@ fn parse_exports(
                 .offset
                 .checked_add(address - segment.address)
                 .ok_or(ObservationGap::MalformedElf)?;
-            if let Some((_, previous)) = exports.iter().find(|(found, _)| *found == api) {
-                if *previous != offset {
-                    return Err(ObservationGap::AmbiguousSite);
+            if let Some(api) = api {
+                if let Some((_, previous)) = exports.iter().find(|(found, _)| *found == api) {
+                    if *previous != offset {
+                        return Err(ObservationGap::AmbiguousSite);
+                    }
+                } else {
+                    exports.push((api, offset));
                 }
-            } else {
-                exports.push((api, offset));
+            }
+            if let Some(role) = typed_role {
+                if let Some((_, previous)) = typed.iter_mut().find(|(found, _)| *found == role) {
+                    if *previous != Some(offset) {
+                        *previous = None;
+                        typed_partial = true;
+                        typed_name_conflict = true;
+                    }
+                } else {
+                    typed.push((role, Some(offset)));
+                }
+            }
+        }
+        // Original export roles must arbitrate before forwarding changes an
+        // entry offset. Otherwise an alias at the wrapper could disappear.
+        record_typed_conflicts(&typed, &exports, &mut typed_conflicts);
+        if typed_name_conflict {
+            // Ambiguous definitions cannot bound the conflicting target site.
+            // Preserve source facts, withholding readers in this one object.
+            for &(_, offset) in &exports {
+                if !typed_conflicts.contains(&offset) {
+                    typed_conflicts.push(offset);
+                }
             }
         }
         if machine == 62 {
@@ -1544,7 +1660,9 @@ fn parse_exports(
             let mut destinations = [None; 2];
             for (index, api) in forwarder::APIS.into_iter().enumerate() {
                 if let Some((_, offset)) = exports.iter().find(|(found, _)| *found == api) {
-                    destinations[index] = context.resolve(api, *offset, &exports)?;
+                    if !typed_conflicts.contains(offset) {
+                        destinations[index] = context.resolve(api, *offset, &exports)?;
+                    }
                 }
             }
             if destinations[0].is_some() && destinations[0] == destinations[1] {
@@ -1561,11 +1679,32 @@ fn parse_exports(
             }
         }
     }
+    // Derived destinations also arbitrate before any capability can escape.
+    record_typed_conflicts(&typed, &exports, &mut typed_conflicts);
+    typed_partial |= !typed_conflicts.is_empty();
+    typed_conflicts.sort_unstable();
+    typed_conflicts.dedup();
+    let mut typed_exports = Vec::with_capacity(TYPED_PUBLIC_ROLES.len());
+    // Multiple definitions of one typed name prevent a unique finite census.
+    // Preserve ordinary source facts but issue no new typed reader capability.
+    if !typed_name_conflict {
+        for (role, offset) in typed {
+            if let Some(offset) = offset {
+                if !typed_conflicts.contains(&offset) {
+                    typed_exports.push((role, offset));
+                }
+            }
+        }
+    }
+    typed_exports.sort_unstable_by_key(|(role, _)| role.id());
     exports.sort_unstable_by_key(|(api, _)| *api);
     Ok(ElfObject {
         hash,
         segments,
         exports,
+        typed_exports,
+        typed_conflicts,
+        typed_partial,
     })
 }
 
@@ -1727,6 +1866,45 @@ fn dynamic_symbols(
         return Err(ObservationGap::MalformedElf);
     }
     Ok(Some(DynamicSymbols { symbols, names }))
+}
+
+const TYPED_PUBLIC_ROLES: [u32; 17] = [
+    5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+];
+const MAX_TYPED_CONFLICTS: usize = TYPED_PUBLIC_ROLES.len() + APIS.len();
+fn record_typed_conflicts(
+    typed: &[(TypedRoleId, Option<u64>)],
+    exports: &[(ObservationApi, u64)],
+    conflicts: &mut Vec<u64>,
+) {
+    for &(role, offset) in typed {
+        let Some(offset) = offset else {
+            continue;
+        };
+        if (typed
+            .iter()
+            .any(|&(other, at)| other != role && at == Some(offset))
+            || exports
+                .iter()
+                .any(|(api, at)| *at == offset && api.export_name() != role.public_export()))
+            && !conflicts.contains(&offset)
+        {
+            conflicts.push(offset);
+        }
+    }
+}
+fn typed_export_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<TypedRoleId> {
+    TYPED_PUBLIC_ROLES
+        .iter()
+        .filter_map(|&id| TypedRoleId::from_u32(id))
+        .find(|role| {
+            role.public_export().is_some_and(|name| {
+                name.bytes()
+                    .chain(std::iter::once(0))
+                    .enumerate()
+                    .all(|(index, want)| byte_at(index) == Some(want))
+            })
+        })
 }
 
 fn export_api_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<ObservationApi> {
@@ -2154,3 +2332,7 @@ pub(super) mod fixture_support {
         verified
     }
 }
+
+#[cfg(test)]
+#[path = "typed_role_tests.rs"]
+mod typed_role_tests;

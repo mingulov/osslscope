@@ -5,6 +5,7 @@ use crate::evidence::{ObjectId, SiteExecution, SiteKey};
 #[allow(dead_code)]
 #[path = "../crates/bpf-contract/src/attribution.rs"]
 pub(crate) mod wire;
+pub use wire::TypedRoleId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AlgorithmSelector {
