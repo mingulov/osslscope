@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Owned private source maps. Preparation alone cannot mint source eligibility.
 
-use super::{ObservationBudget, ObservationGap, schema::StateReservation};
+use super::{
+    ObservationBudget, ObservationGap,
+    schema::StateReservation,
+    source_acquire::{
+        ACQUIRE_CORE_RESERVE, AcquisitionOrder, DomainIndex, GuardLedger, HostIds,
+        RetainedSourceRoots,
+    },
+};
 use crate::{loader, observation_memory::MemoryLease, writer_gate::WriterGate};
 #[allow(dead_code)]
 #[path = "../../crates/bpf-contract/src/source.rs"]
-mod contract;
+pub(super) mod contract;
 use contract::{SourceConfig, SourceControl, SourceObserver};
 use std::{
     collections::BTreeMap,
@@ -77,7 +84,8 @@ fn map_reservation(cpus: usize) -> Option<usize> {
 fn source_reservation(class: u32, cpus: usize) -> Option<usize> {
     iterator_reservation(class, cpus)?
         .checked_add(map_reservation(cpus)?)?
-        .checked_add(HOST_OWNER_BYTES)
+        .checked_add(HOST_OWNER_BYTES)?
+        .checked_add(ACQUIRE_CORE_RESERVE)
 }
 fn reserve_source(
     budget: &ObservationBudget,
@@ -193,11 +201,20 @@ pub(super) fn initialize_controls(
 
 /// Non-Send through its retained gate/account. Host initializes safe cells only
 /// before writers; preparing these maps grants no registration or READY witness.
+/// The owner retains the validated unloaded roots plus the pure acquisition
+/// core (IDs, guard ledger, domain index, order). No root loads, no mode
+/// change and no target attachment happen here; those need the phase-2 lease.
 pub(super) struct SourceOwner {
+    // Declared first so retained links/programs release before maps on drop.
+    _roots: RetainedSourceRoots,
     _maps: BTreeMap<&'static str, OwnedFd>,
     _namespace: File,
     _gate: WriterGate,
     _capacity: SourceCapacity,
+    _ids: HostIds,
+    _ledger: GuardLedger,
+    _domains: DomainIndex,
+    _order: AcquisitionOrder,
 }
 impl SourceOwner {
     pub(super) fn prepare(
@@ -205,12 +222,16 @@ impl SourceOwner {
         kernel: &loader::SourceKernel,
         gate: &WriterGate,
         loaded: &loader::Loaded,
+        source_prepared: &mut loader::Prepared,
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> Result<Self, ObservationGap> {
         if !gate.preparing() {
             return Err(ObservationGap::Invalidated);
         }
+        // Admit the exact source half before reserving or acquiring anything;
+        // a malformed half refuses typed-source preparation fail-closed.
+        RetainedSourceRoots::check(source_prepared, kernel.registration_btf_id())?;
         check(budget, deadline, cancel)?;
         source_configuration(
             unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
@@ -231,6 +252,7 @@ impl SourceOwner {
         if tid == 0 || tid > u32::MAX as u64 || pid == 0 {
             return Err(ObservationGap::NamespaceChanged);
         }
+        let observer_pid = u32::try_from(pid).map_err(|_| ObservationGap::NamespaceChanged)?;
         let observer = SourceObserver {
             namespace_device: ns.dev(),
             namespace_inode: ns.ino(),
@@ -304,11 +326,30 @@ impl SourceOwner {
             .map_err(|_| ObservationGap::BpfUnavailable)?;
         }
         check(budget, deadline, cancel)?;
+        // Move the checked half into the owner. Nothing mutated it since the
+        // check above: this function holds the only `&mut` while ADMIT stays
+        // closed, so retention cannot admit a different shape than checked.
+        let prepared = std::mem::replace(
+            source_prepared,
+            loader::Prepared {
+                progs: Vec::new(),
+                maps: Vec::new(),
+            },
+        );
         Ok(Self {
+            _roots: RetainedSourceRoots::retain(
+                prepared,
+                kernel.registration_btf_id(),
+                observer_pid,
+            ),
             _maps: maps,
             _namespace: namespace,
             _gate: gate.clone(),
             _capacity: capacity,
+            _ids: HostIds::new(),
+            _ledger: GuardLedger::new(),
+            _domains: DomainIndex::new(),
+            _order: AcquisitionOrder::new(),
         })
     }
 }
@@ -321,7 +362,10 @@ mod tests {
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
         assert_eq!(map_reservation(16), Some(6_276_028));
-        assert_eq!(source_reservation(512, 16), Some(12_735_420));
+        // The acquisition core adds its NoOp/program/link owner, ledger,
+        // domain-index and allocator reserves to the component charge.
+        assert_eq!(ACQUIRE_CORE_RESERVE, 438_280);
+        assert_eq!(source_reservation(512, 16), Some(13_173_700));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());

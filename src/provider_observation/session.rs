@@ -319,8 +319,8 @@ pub struct ProviderSession {
     // published without the separately owned anchor and actual registrations.
     _source_kernel: Result<loader::SourceKernel, ObservationGap>,
     // Unloaded roots retain symbolic map fixups and validated finite kernel
-    // patches until exact source ownership and the native adapter exist.
-    _source_prepared: loader::Prepared,
+    // patches until the source owner adopts them during typed preparation.
+    source_prepared: loader::Prepared,
     source_owner: Option<super::source_owner::SourceOwner>,
     // Prearmed source preparation is noncertifying until actual source links,
     // post-adoption readiness and target-domain guards are established.
@@ -832,7 +832,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
             _source_kernel: source_kernel,
-            _source_prepared: source_prepared,
+            source_prepared,
             source_owner: None,
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
@@ -1742,11 +1742,14 @@ impl ProviderSession {
         }
         let kernel = self._source_kernel.as_ref().map_err(|gap| *gap)?;
         if self.source_owner.is_none() {
+            // The owner checks the retained half before acquiring anything and
+            // moves it in on success; a refused half stays put for diagnosis.
             self.source_owner = Some(super::source_owner::SourceOwner::prepare(
                 &self.budget,
                 kernel,
                 &self.gate,
                 &self.loaded,
+                &mut self.source_prepared,
                 deadline,
                 cancel,
             )?);

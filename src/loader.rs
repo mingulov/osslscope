@@ -23,6 +23,12 @@ impl SourceKernel {
     pub(crate) fn iterator_class(&self) -> u32 {
         self._configuration[12]
     }
+    /// Validated running-vmlinux `uprobe_register` FUNC ID selected by the
+    /// finite prototype validator. Zero is impossible here: parsing refuses
+    /// a missing ID before this configuration exists.
+    pub(crate) fn registration_btf_id(&self) -> u32 {
+        self._configuration[10]
+    }
     pub(crate) fn patch(
         &self,
         prepared: &mut Prepared,

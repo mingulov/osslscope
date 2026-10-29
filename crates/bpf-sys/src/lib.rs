@@ -30,6 +30,7 @@ pub const BPF_TOKEN_CREATE: u32 = 36;
 /// `BPF_MAP_UPDATE_ELEM` flags (create-or-update / must-create).
 pub const BPF_ANY: u64 = 0;
 pub const BPF_NOEXIST: u64 = 1;
+pub const BPF_EXIST: u64 = 2;
 pub const BPF_PROG_TYPE_KPROBE: u32 = 2;
 pub const BPF_MAP_TYPE_ARRAY: u32 = 2;
 pub const BPF_MAP_TYPE_RINGBUF: u32 = 27;
