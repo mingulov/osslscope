@@ -81,6 +81,11 @@ pub struct FocusedResult {
     pub child_exit: Option<i32>,
     pub workload_discarded: bool,
     pub(crate) _reservation: Option<crate::observation_memory::MemoryLease>,
+    /// Finalized same-cut attribution when the one-shot collect certified
+    /// it; `None` when unattempted (no typed sites) or refused (physical
+    /// evidence kept, gap recorded). Task 3 projects this into the
+    /// finalized document; nothing else reads it.
+    pub(crate) finalized_attribution: Option<crate::attribution::FinalizedAttribution>,
 }
 
 /// No event-order proof is exposed within a batch. Invalidation therefore
@@ -440,10 +445,25 @@ impl FocusedSession {
             bail!("focused companion capacity exceeded");
         }
         let mut bytes = (104usize << 20) + objects.observation.len() + objects.count.len();
-        for spec in crate::loader::FOCUSED_COUNT_MAPS
-            .into_iter()
-            .chain(crate::provider_observation::session::specs())
-        {
+        // Borrowed maps are charged once, by the session-side owner: when a
+        // session companion exists the counter shares its producer/source
+        // maps instead of creating them. Standalone counters (no session
+        // companion) create private maps and are charged for them here.
+        let shared = !objects.observation.is_empty();
+        for spec in crate::loader::FOCUSED_COUNT_MAPS {
+            // The counter borrows these from the session owner instead of
+            // creating them; the session side charges them once.
+            if shared && crate::loader::BORROWED_COUNT_MAPS.contains(&spec.name) {
+                continue;
+            }
+            bytes = bytes
+                .checked_add(
+                    spec.reservation_bytes(cpus)
+                        .context("focused map capacity overflow")?,
+                )
+                .context("focused map reservation overflow")?;
+        }
+        for spec in crate::provider_observation::session::specs() {
             bytes = bytes
                 .checked_add(
                     spec.reservation_bytes(cpus)
@@ -702,40 +722,6 @@ impl FocusedSession {
                 end.saturating_duration_since(now).as_nanos(),
             )?)
             .context("focused admission overflow")?;
-        let mut counter = if objects.count.is_empty() || gate.is_none() {
-            gaps.insert(ObservationGap::BpfUnavailable);
-            None
-        } else {
-            match observer_namespace() {
-                Ok(namespace) => match FocusedCounter::open_gated(
-                    &objects.count,
-                    pid,
-                    namespace,
-                    CountLimits {
-                        window: CountAdmissionWindow {
-                            start_ns,
-                            deadline_ns,
-                        },
-                        max_state_bytes: 24 << 20,
-                        ..Default::default()
-                    },
-                    gate.as_ref().unwrap().clone(),
-                ) {
-                    Ok(c) => Some(c),
-                    Err(_) => {
-                        gaps.insert(ObservationGap::BpfUnavailable);
-                        None
-                    }
-                },
-                Err(_) => {
-                    gaps.insert(ObservationGap::NamespaceChanged);
-                    None
-                }
-            }
-        };
-        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
-            bail!("focused setup interrupted or expired");
-        }
         if let Some(gap) = session
             .as_mut()
             .and_then(|s| s.set_api_window(start_ns, deadline_ns).err())
@@ -744,6 +730,9 @@ impl FocusedSession {
             // Never keep the unbounded standalone-session default on failure.
             session = None;
         }
+        // Typed startup runs before the counter opens so the counter can
+        // borrow the session's producer/source maps (one relationship pool
+        // across both programs) instead of creating private ones.
         if let Some(session) = &mut session {
             if let Some(preexec) = &mut preexec {
                 for result in crate::startup_objects::acquire_startup(|stage| match stage {
@@ -779,6 +768,57 @@ impl FocusedSession {
                     gaps.insert(gap);
                 }
             }
+        }
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
+        }
+        let mut counter = if objects.count.is_empty() || gate.is_none() {
+            gaps.insert(ObservationGap::BpfUnavailable);
+            None
+        } else {
+            match observer_namespace() {
+                Ok(namespace) => {
+                    let limits = CountLimits {
+                        window: CountAdmissionWindow {
+                            start_ns,
+                            deadline_ns,
+                        },
+                        max_state_bytes: 24 << 20,
+                        ..Default::default()
+                    };
+                    let gate = gate.as_ref().unwrap().clone();
+                    // Shared maps when the session lends them; private
+                    // (inert producer) for standalone counters.
+                    let borrowed = session.as_ref().and_then(|s| s.borrowed_producer_maps());
+                    let opened = match borrowed {
+                        Some(ref maps) => FocusedCounter::open_gated_shared(
+                            &objects.count,
+                            pid,
+                            namespace,
+                            limits,
+                            gate,
+                            maps,
+                        ),
+                        None => {
+                            FocusedCounter::open_gated(&objects.count, pid, namespace, limits, gate)
+                        }
+                    };
+                    match opened {
+                        Ok(c) => Some(c),
+                        Err(_) => {
+                            gaps.insert(ObservationGap::BpfUnavailable);
+                            None
+                        }
+                    }
+                }
+                Err(_) => {
+                    gaps.insert(ObservationGap::NamespaceChanged);
+                    None
+                }
+            }
+        };
+        if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
+            bail!("focused setup interrupted or expired");
         }
         if let (Some(preexec), Some(counter)) = (preexec, &mut counter) {
             gaps.extend(preexec.gaps);
@@ -1016,6 +1056,76 @@ impl FocusedSession {
             }
         }
     }
+    fn typed_admitted(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|s| !s.typed_site_records().is_empty())
+    }
+    /// One-shot closed attribution over the finished sample. Assembles the
+    /// borrowed maps, admitted-site view and windows, charges the session
+    /// budget for the bounded host buffers, and runs the certifying
+    /// collect+fold. Returns `None` without effect when no typed sites
+    /// were admitted, or when any refusal voids the cut.
+    fn collect_attribution(
+        &mut self,
+        counter_cpus: Option<usize>,
+        report: CaptureWindow,
+        admission: CountAdmissionWindow,
+    ) -> Option<crate::attribution::FinalizedAttribution> {
+        let gate = self.gate.as_ref()?;
+        let cpus = counter_cpus?;
+        // Clone the small site records up front so the budget charge
+        // below can borrow the session mutably.
+        let records: Vec<(u64, crate::provider_observation::session::TypedSiteRecord)> = {
+            let session = self.session.as_ref()?;
+            session
+                .typed_site_records()
+                .iter()
+                .map(|(cookie, record)| (*cookie, record.clone()))
+                .collect()
+        };
+        if records.is_empty() {
+            return None;
+        }
+        let session = self.session.as_mut()?;
+        // Worst-case host buffers: full key iterations plus per-CPU
+        // values, all under kernel-enforced caps. Charged before any
+        // borrow so a blown budget refuses before any kernel read.
+        let bound = 8192usize
+            .checked_mul(104 + 24 * cpus)?
+            .checked_add(1024 * (16 + 64))?
+            .checked_add(1024 * (24 + 56))?
+            .checked_add(8 * 8 * cpus)?
+            .checked_add(64)?;
+        session.charge_attribution_final(bound).ok()?;
+        let maps = session.attribution_maps()?;
+        let mut admitted = Vec::with_capacity(records.len());
+        for (cookie, record) in &records {
+            admitted.push(crate::attribution::AdmittedTypedSite {
+                cookie: *cookie,
+                site_id: std::num::NonZeroU64::new(record.site_id)?,
+                role_id: record.role_id,
+                object: record.object.clone(),
+                device: record.device,
+                inode: record.inode,
+                offset: record.offset,
+                object_id: record.object_id,
+                source_epoch: record.source_epoch,
+            });
+        }
+        let closed_gate = gate.owned_closed().ok()?;
+        crate::attribution::collect_closed_attribution(
+            closed_gate,
+            gate,
+            &maps,
+            cpus,
+            &self.sample,
+            &admitted,
+            admission,
+            report,
+        )
+        .ok()
+    }
     pub(crate) fn finish(mut self, deadline: Instant) -> anyhow::Result<FocusedResult> {
         self.pending = None;
         // One successful map-in-map delete closes metadata, API and physical
@@ -1043,6 +1153,7 @@ impl FocusedSession {
                 .map(|a| a.row)
                 .collect();
         }
+        let counter_cpus = self.counter.as_ref().map(|c| c.cpus());
         if let Some(c) = self.counter.take() {
             self.sample = c.close(deadline);
         }
@@ -1058,19 +1169,36 @@ impl FocusedSession {
                 self.inventory_gaps,
             ));
         }
+        // One-shot closed attribution: claim, strict final reads, collect,
+        // fold. Unattempted without admitted typed sites (legacy-only);
+        // refused collects keep the physical evidence below and record a
+        // gap instead of a result.
+        let report = CaptureWindow {
+            requested_start_ns: self.start_ns,
+            requested_end_ns: self.deadline_ns,
+            effective_start_ns: self.start_ns,
+            effective_end_ns: end_ns.max(self.start_ns),
+            signal_cut: self.signal_cut,
+            count_admission: Some(CountAdmissionWindow {
+                start_ns: self.start_ns,
+                deadline_ns: self.deadline_ns,
+            }),
+        };
+        let admission = CountAdmissionWindow {
+            start_ns: self.start_ns,
+            deadline_ns: self.deadline_ns,
+        };
+        let finalized_attribution = self.collect_attribution(counter_cpus, report, admission);
+        if self.typed_admitted() && finalized_attribution.is_none() {
+            self.sample.gaps.push(loss(
+                "focused.attribution_refused",
+                CounterSource::Discovery,
+                1,
+            ));
+        }
         let mut document = project(
             self.pid,
-            CaptureWindow {
-                requested_start_ns: self.start_ns,
-                requested_end_ns: self.deadline_ns,
-                effective_start_ns: self.start_ns,
-                effective_end_ns: end_ns.max(self.start_ns),
-                signal_cut: self.signal_cut,
-                count_admission: Some(CountAdmissionWindow {
-                    start_ns: self.start_ns,
-                    deadline_ns: self.deadline_ns,
-                }),
-            },
+            report,
             std::mem::take(&mut self.sample),
             &self.gaps.iter().copied().collect::<Vec<_>>(),
         );
@@ -1100,6 +1228,7 @@ impl FocusedSession {
             child_exit,
             workload_discarded: self.workload_discarded,
             _reservation: Some(self._reservation),
+            finalized_attribution,
         })
     }
 }
@@ -1189,8 +1318,16 @@ mod session_tests {
     }
     #[test]
     fn session_reservation_precedes_open_and_shares_parser_headroom() {
+        // Session-like companions for the reservation: a session's
+        // counter borrows maps, so the estimate skips the shared set.
+        // (The `open_reserved` below still runs standalone companions.)
+        let estimate = FocusedObjects {
+            observation: Arc::from([0u8; 1024]),
+            count: Arc::from([0u8; 1024]),
+            count_sha256: Sha256::digest([0u8; 1024]).into(),
+        };
         let objects = objects();
-        let bytes = FocusedSession::reservation_bytes(&objects).unwrap();
+        let bytes = FocusedSession::reservation_bytes(&estimate).unwrap();
         println!("persistent session reservation {bytes} bytes on this CPU configuration");
         let pool = crate::observation_memory::MemoryPool::new(256 << 20);
         let one = pool.reserve(bytes).unwrap();

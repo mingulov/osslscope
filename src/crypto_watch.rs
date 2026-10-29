@@ -664,10 +664,12 @@ mod tests {
     use std::sync::Arc;
     fn objects() -> FocusedObjects {
         use sha2::{Digest, Sha256};
+        // Session-like companions (non-empty observation): the reservation
+        // under test covers a session whose counter borrows maps.
         FocusedObjects {
-            observation: Arc::from([]),
-            count: Arc::from([]),
-            count_sha256: Sha256::digest([]).into(),
+            observation: Arc::from([0u8; 1024]),
+            count: Arc::from([0u8; 1024]),
+            count_sha256: Sha256::digest([0u8; 1024]).into(),
         }
     }
     #[test]

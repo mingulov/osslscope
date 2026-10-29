@@ -225,6 +225,8 @@ pub(crate) fn prepare_object(object: &[u8]) -> Result<loader::Prepared, Observat
     let programs: Vec<_> = [
         loader::ProgSpec::uprobe("observation_entry"),
         loader::ProgSpec::uretprobe("observation_return"),
+        loader::ProgSpec::uprobe("typed_entry"),
+        loader::ProgSpec::uretprobe("typed_return"),
     ]
     .into_iter()
     .chain(loader::SOURCE_REGISTRATION_PROGS)
@@ -312,6 +314,27 @@ pub(crate) enum PrearmLinks {
 }
 #[cfg(test)]
 thread_local! { static EXPIRE_STATIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+/// First cookie of the typed range; see `next_typed_cookie`.
+pub(crate) const TYPED_COOKIE_FIRST: u64 = 1 << 31;
+/// One past the last typed cookie (u32 range end, exclusive).
+pub(crate) const TYPED_COOKIE_END: u64 = 1 << 32;
+/// Session record for one admitted typed site: the physical identity the
+/// counter observes plus the attribution IDs the kernel emits. The
+/// finalizer joins these records against strict SITE_BIND reads.
+#[derive(Debug, Clone)]
+pub(crate) struct TypedSiteRecord {
+    pub site_id: u64,
+    pub role_id: u32,
+    pub pid: u32,
+    pub device: u64,
+    pub inode: u64,
+    pub offset: u64,
+    pub object: crate::evidence::ObjectId,
+    pub object_id: u64,
+    pub source_epoch: u64,
+    pub process_incarnation: u64,
+    pub image_epoch: u64,
+}
 struct Target {
     process: VerifiedProcess,
     starttime: u64,
@@ -336,6 +359,7 @@ pub struct ProviderSession {
     // Prearmed source preparation is noncertifying until actual source links,
     // post-adoption readiness and target-domain guards are established.
     typed_startup: Vec<super::objects::TypedPublicSite>,
+    typed_links: Vec<OwnedFd>,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
     members: BpfMap<MapData, u32, c::Member>,
@@ -353,6 +377,17 @@ pub struct ProviderSession {
     aliases: super::assembly::Sequences,
     budget: ObservationBudget,
     next_cookie: u64,
+    /// First typed cookie. Cookies partition the (cookie, process, image)
+    /// bind space across both programs: the counter mints u32
+    /// `[1, 4096]`, typed sites mint `[2^31, 2^32)` (u32-fitting so the
+    /// counter can pin the same cookie for the same site), legacy session
+    /// cookies skip the typed range. Exhaustion refuses, never wraps.
+    next_typed_cookie: u64,
+    next_site_id: u64,
+    next_object_id: u64,
+    typed_sites: BTreeMap<u64, TypedSiteRecord>,
+    typed_pins: BTreeMap<(u64, u64, u64), u64>,
+    object_ids: BTreeMap<String, u64>,
     next_generation: u64,
     emitted: usize,
     learned: BTreeSet<(u32, u64, u64, u64, u64)>,
@@ -846,12 +881,19 @@ impl ProviderSession {
             source_prepared,
             source_owner: None,
             typed_startup: Vec::new(),
+            typed_links: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
             budget,
             next_cookie: 1,
+            next_typed_cookie: TYPED_COOKIE_FIRST,
+            next_site_id: 1,
+            next_object_id: 1,
+            typed_sites: BTreeMap::new(),
+            typed_pins: BTreeMap::new(),
+            object_ids: BTreeMap::new(),
             next_generation: 1,
             emitted: 0,
             learned: BTreeSet::new(),
@@ -871,6 +913,7 @@ impl ProviderSession {
                 .flatten()
                 .map(|a| a.links.len())
                 .sum::<usize>()
+            + self.typed_links.len()
     }
     #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
     fn attach_pair(
@@ -891,11 +934,14 @@ impl ProviderSession {
         }
         self.budget.state(512 + advertisers.len() * 96)?;
         site.revalidate_object()?;
-        let cookie = self.next_cookie;
-        self.next_cookie = self
-            .next_cookie
-            .checked_add(1)
-            .ok_or(ObservationGap::LinkLimit)?;
+        let mut cookie = self.next_cookie;
+        // Legacy cookies skip the typed range: both programs share one
+        // (cookie, process, image) bind space, and a legacy/typed cookie
+        // collision would misattribute counter hits to a typed site.
+        if (TYPED_COOKIE_FIRST..TYPED_COOKIE_END).contains(&cookie) {
+            cookie = TYPED_COOKIE_END;
+        }
+        self.next_cookie = cookie.checked_add(1).ok_or(ObservationGap::LinkLimit)?;
         let path = CString::new(format!(
             "/proc/self/fd/{}",
             site.attachment_fd().as_raw_fd()
@@ -1654,6 +1700,216 @@ impl ProviderSession {
         });
         self.emitted += 1;
     }
+    /// Consume the retained typed exports through strict forward
+    /// acquisition: per site, revalidate freshness, mint cookie/site/artifact
+    /// IDs, program admission+bind+guards+READY through the source owner,
+    /// then attach the typed entry/return pair at the export offset. Runs
+    /// after the TGID acquisition is ready (armed domain, live anchor) and
+    /// before the held child releases, so no fetch can fire unadmitted.
+    /// Any refusal aborts the whole acquisition: partially admitted sites
+    /// would attribute under incomplete authority.
+    pub(crate) fn acquire_typed_sites(
+        &mut self,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<usize, ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
+        if self.source_owner.is_none() {
+            return Err(ObservationGap::Invalidated);
+        }
+        let mut admitted = 0usize;
+        for index in 0..self.typed_startup.len() {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(ObservationGap::SnapshotLag);
+            }
+            // Clone the site handle (shares Rc anchor + descriptors); the
+            // retained vector keeps custody for the session lifetime.
+            let (role_id, site, object_hash) = {
+                let staged = &self.typed_startup[index];
+                staged.site().revalidate_object()?;
+                (
+                    staged.role().id(),
+                    staged.site().clone(),
+                    staged.site().object_hash().clone(),
+                )
+            };
+            let pid = site.pid();
+            // Evidence device (not native): pins and final joins must use
+            // the same device encoding as the counter's SiteKey.
+            let device = crate::focused_count::evidence_device(site.native_device());
+            let inode = site.inode();
+            let offset = site.file_offset();
+            let hash = String::from(object_hash.clone());
+            let (api, operation, function) =
+                crate::attribution::wire::TypedAdmission::admission_parts(role_id)
+                    .ok_or(ObservationGap::Invalidated)?;
+            if self.next_typed_cookie >= TYPED_COOKIE_END {
+                return Err(ObservationGap::LinkLimit);
+            }
+            let cookie = self.next_typed_cookie;
+            self.next_typed_cookie += 1;
+            let site_id = self.next_site_id;
+            self.next_site_id = self
+                .next_site_id
+                .checked_add(1)
+                .ok_or(ObservationGap::StateLimit)?;
+            let object_id = match self.object_ids.get(&hash) {
+                Some(id) => *id,
+                None => {
+                    let id = self.next_object_id;
+                    self.next_object_id = self
+                        .next_object_id
+                        .checked_add(1)
+                        .ok_or(ObservationGap::StateLimit)?;
+                    self.object_ids.insert(hash.clone(), id);
+                    id
+                }
+            };
+            let object_sha256 = super::source_owner::decode_object_hash_hex(&object_hash)?;
+            let receipts = self
+                .source_owner
+                .as_mut()
+                .ok_or(ObservationGap::Invalidated)?
+                .admit_typed_site(&super::source_owner::TypedAdmissionRequest {
+                    cookie,
+                    site_id,
+                    role_id,
+                    public_api_id: api,
+                    operation,
+                    function,
+                    tgid: pid,
+                    object_id,
+                    object_sha256,
+                })?;
+            self.attach_typed_site(&site, pid, cookie)?;
+            self.typed_sites.insert(
+                cookie,
+                TypedSiteRecord {
+                    site_id: receipts.site_id,
+                    role_id,
+                    pid,
+                    device,
+                    inode,
+                    offset,
+                    object: crate::evidence::ObjectId(hash.clone()),
+                    object_id,
+                    source_epoch: receipts.source_epoch,
+                    process_incarnation: receipts.process_incarnation,
+                    image_epoch: receipts.image_epoch,
+                },
+            );
+            // The counter pins at most one cookie per physical site: first
+            // operational role wins, later roles at the same offset keep
+            // their own cookie (the discovery census already arbitrated
+            // offset conflicts, so this is defense in depth).
+            if matches!(role_id, 304..=308) {
+                self.typed_pins
+                    .entry((device, inode, offset))
+                    .or_insert(cookie);
+            }
+            admitted += 1;
+        }
+        Ok(admitted)
+    }
+    /// Attach one typed entry/return pair at a verified export offset with
+    /// its admitted cookie. Mirrors `attach_pair` link accounting without
+    /// the legacy CONFIG programming (typed authority lives in
+    /// TYPED_ADMISSION/SITE_BIND).
+    fn attach_typed_site(
+        &mut self,
+        site: &VerifiedSite,
+        pid: u32,
+        cookie: u64,
+    ) -> Result<(), ObservationGap> {
+        use std::os::fd::AsRawFd as _;
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
+        if self.link_count() + 2 > self.budget.limits.max_links {
+            return Err(ObservationGap::LinkLimit);
+        }
+        self.budget.state(512 + 96)?;
+        site.revalidate_object()?;
+        let path = CString::new(format!(
+            "/proc/self/fd/{}",
+            site.attachment_fd().as_raw_fd()
+        ))
+        .map_err(|_| ObservationGap::AttachFailed)?;
+        let owner = self
+            .source_owner
+            .as_ref()
+            .ok_or(ObservationGap::Invalidated)?;
+        let entry_fd = owner.typed_program_fd("typed_entry")?.as_raw_fd();
+        let return_fd = owner.typed_program_fd("typed_return")?.as_raw_fd();
+        let links = paired_links(
+            || {
+                ossl_bpf_sys::link_create_uprobe_multi(
+                    entry_fd,
+                    &path,
+                    &[site.file_offset()],
+                    &[cookie],
+                    pid,
+                )
+                .map_err(|_| ObservationGap::AttachFailed)
+            },
+            || {
+                ossl_bpf_sys::link_create_uretprobe_multi(
+                    return_fd,
+                    &path,
+                    &[site.file_offset()],
+                    &[cookie],
+                    pid,
+                )
+                .map_err(|_| ObservationGap::AttachFailed)
+            },
+        )?;
+        site.revalidate_object()?;
+        self.typed_links.extend(links);
+        Ok(())
+    }
+    /// Counter bridge: pinned cookie per physical site for same-cookie
+    /// counter attach, so both programs resolve one SITE_BIND row.
+    pub(crate) fn typed_pins(&self) -> &BTreeMap<(u64, u64, u64), u64> {
+        &self.typed_pins
+    }
+    /// Counter bridge: borrow every shared producer/source map FD the
+    /// counter needs. `None` when no source owner exists (standalone
+    /// counter opens private maps); a missing name refuses the borrow
+    /// rather than mixing shared and private pools.
+    pub(crate) fn borrowed_producer_maps(
+        &self,
+    ) -> Option<BTreeMap<String, std::os::fd::BorrowedFd<'_>>> {
+        let owner = self.source_owner.as_ref()?;
+        let mut maps = BTreeMap::new();
+        for name in loader::BORROWED_COUNT_MAPS {
+            maps.insert(name.to_string(), owner.owned_map(name).ok()?);
+        }
+        Some(maps)
+    }
+    /// Finalizer access to admitted typed-site records.
+    pub(crate) fn typed_site_records(&self) -> &BTreeMap<u64, TypedSiteRecord> {
+        &self.typed_sites
+    }
+    /// Finalizer maps: borrow the five producer maps for one strict
+    /// final read. `None` without a source owner; a missing map refuses
+    /// the whole read rather than a partial cut.
+    pub(crate) fn attribution_maps(&self) -> Option<crate::attribution::ClosedAttributionMaps<'_>> {
+        let owner = self.source_owner.as_ref()?;
+        Some(crate::attribution::ClosedAttributionMaps {
+            partition: owner.owned_map("PARTITION").ok()?,
+            selector: owner.owned_map("SELECTOR_DICT").ok()?,
+            loss: owner.owned_map("PRODUCER_LOSS").ok()?,
+            bind: owner.owned_map("SITE_BIND").ok()?,
+            control: owner.owned_map("ATTRIB_CONTROL").ok()?,
+        })
+    }
+    /// Charge the session budget for the final attribution read's host
+    /// buffers before the one-shot collect runs.
+    pub(crate) fn charge_attribution_final(&mut self, bytes: usize) -> Result<(), ObservationGap> {
+        self.budget.state(bytes)
+    }
     fn attach_learned(
         &mut self,
         pid: u32,
@@ -1961,6 +2217,17 @@ impl ProviderSession {
         })();
         if result.is_err() {
             owner.refuse_acquisition();
+            return result;
+        }
+        // Typed exports consume the ready acquisition while the child is
+        // still held: admit + attach every retained typed site before
+        // release, so no fetch can fire unadmitted. A typed refusal fails
+        // the whole acquisition (partial authority is worse than none).
+        if self.acquire_typed_sites(deadline, cancel).is_err() {
+            if let Some(owner) = self.source_owner.as_mut() {
+                owner.refuse_acquisition();
+            }
+            return Err(ObservationGap::AttachFailed);
         }
         result
     }
@@ -3094,6 +3361,8 @@ mod tests {
         let progs = [
             prog("observation_entry", "uprobe", false),
             prog("observation_return", "uretprobe", true),
+            prog("typed_entry", "uprobe", false),
+            prog("typed_return", "uretprobe", true),
         ]
         .into_iter()
         .chain(
@@ -3139,8 +3408,8 @@ mod tests {
         // from real objects. No assertion here may skip: each arm either
         // asserts or panics.
         let full = synthetic_full_preparation();
-        assert_eq!(full.maps.len(), 23, "mirror must track the full map shape");
-        assert_eq!(full.progs.len(), 6, "mirror must track the full root shape");
+        assert_eq!(full.maps.len(), 34, "mirror must track the full map shape");
+        assert_eq!(full.progs.len(), 8, "mirror must track the full root shape");
         let pool = crate::observation_memory::MemoryPool::new(256 << 20);
         let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
         match loader::load_gated(&full, &gate) {
@@ -3164,8 +3433,8 @@ mod tests {
                 map.name
             );
         }
-        assert_eq!(source.progs.len(), 4);
-        assert_eq!(source.maps.len(), 7);
+        assert_eq!(source.progs.len(), 6);
+        assert_eq!(source.maps.len(), 18);
         for map in &source.maps {
             assert!(
                 super::super::source_owner::MAPS

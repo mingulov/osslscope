@@ -127,7 +127,35 @@ pub struct TypedAdmission {
     pub source_epoch: u64,
 }
 impl TypedAdmission {
+    /// Exact first-slice (api, operation, function) triple per role.
+    /// Single table shared by the constructor and host-side admission
+    /// programming; reserved roles have no triple and never admit.
+    #[inline(always)]
+    pub const fn admission_parts(role_id: u32) -> Option<(u32, u32, u32)> {
+        match role_id {
+            5 => Some((5, 0, 0)),
+            18 => Some((0, 0, 0)),
+            130 => Some((12, 3, 0)),
+            131 => Some((13, 4, 0)),
+            136 | 142 | 147 | 149 | 151 => Some((0, 3, 0)),
+            137 | 143 | 148 | 150 | 152 | 153 => Some((0, 4, 0)),
+            146 | 154 | 155 => Some((0, 0, 0)),
+            258 => Some((0, 3, 1)),
+            259 => Some((0, 4, 1)),
+            274 => Some((0, 3, 3)),
+            275 => Some((0, 4, 3)),
+            290 => Some((0, 3, 2)),
+            291 => Some((0, 4, 2)),
+            304 => Some((0, 3, 4)),
+            305 => Some((0, 3, 5)),
+            306 => Some((0, 3, 6)),
+            307 => Some((0, 4, 5)),
+            308 => Some((0, 4, 4)),
+            _ => None,
+        }
+    }
     /// Exact first-slice role table. Reserved roles are not admitted.
+    #[inline(always)]
     pub const fn new(
         role_id: u32,
         public_api_id: u32,
@@ -136,26 +164,9 @@ impl TypedAdmission {
         abi_epoch: u64,
         source_epoch: u64,
     ) -> Option<Self> {
-        let (api, op, fun) = match role_id {
-            5 => (5, 0, 0),
-            18 => (0, 0, 0),
-            130 => (12, 3, 0),
-            131 => (13, 4, 0),
-            136 | 142 | 147 | 149 | 151 => (0, 3, 0),
-            137 | 143 | 148 | 150 | 152 | 153 => (0, 4, 0),
-            146 | 154 | 155 => (0, 0, 0),
-            258 => (0, 3, 1),
-            259 => (0, 4, 1),
-            274 => (0, 3, 3),
-            275 => (0, 4, 3),
-            290 => (0, 3, 2),
-            291 => (0, 4, 2),
-            304 => (0, 3, 4),
-            305 => (0, 3, 5),
-            306 => (0, 3, 6),
-            307 => (0, 4, 5),
-            308 => (0, 4, 4),
-            _ => return None,
+        let (api, op, fun) = match Self::admission_parts(role_id) {
+            Some(parts) => parts,
+            None => return None,
         };
         if public_api_id != api
             || operation != op
@@ -174,6 +185,7 @@ impl TypedAdmission {
             source_epoch,
         })
     }
+    #[inline(always)]
     pub const fn valid(&self) -> bool {
         Self::new(
             self.role_id,
@@ -185,12 +197,14 @@ impl TypedAdmission {
         )
         .is_some()
     }
+    #[inline(always)]
     pub const fn paired(&self) -> bool {
         matches!(
             self.role_id,
             130 | 131 | 142 | 143 | 146 | 147 | 148 | 151 | 152 | 258 | 259 | 290 | 291
         )
     }
+    #[inline(always)]
     pub const fn operational(&self) -> bool {
         matches!(self.role_id, 304..=307)
     }
@@ -375,6 +389,7 @@ pub struct SiteBindValue {
     pub object_sha256: [u8; 32],
 }
 impl SiteBindValue {
+    #[inline(always)]
     pub const fn valid(&self) -> bool {
         self.site_id != 0 && self.source_epoch != 0 && self.code_object_id != 0
     }
@@ -485,6 +500,7 @@ pub fn selector_digest(object: &[u8; 32], name: &ExactNameKey) -> Option<[u8; 32
 /// observe: BPF passes its per-CPU staging cell while holding the shared
 /// publisher lock, which serializes every staging user on every CPU. The
 /// buffer is fully rewritten on success and left unspecified on failure.
+#[inline(always)]
 pub fn selector_digest_into(
     object: &[u8; 32],
     name: &ExactNameKey,
@@ -526,7 +542,11 @@ pub fn selector_digest_parts(
         }
         check += 1;
     }
-    message[..16].copy_from_slice(SELECTOR_PREFIX);
+    // Immediate stores, not `copy_from_slice(SELECTOR_PREFIX)`: taking the
+    // prefix's address pools it in `.rodata.cst16`, and the loader accepts
+    // no data-section relocation. The pair spells "ossl-code-req-v1".
+    message[..8].copy_from_slice(&u64::from_le_bytes(*b"ossl-cod").to_le_bytes());
+    message[8..16].copy_from_slice(&u64::from_le_bytes(*b"e-req-v1").to_le_bytes());
     message[16..48].copy_from_slice(object);
     message[48..52].copy_from_slice(&operation.to_le_bytes());
     message[52..56].copy_from_slice(&name_length.to_le_bytes());
@@ -563,7 +583,13 @@ pub fn selector_digest_parts(
     let mut block = 0;
     while block < 3 {
         if block < blocks {
-            sha256_block(&mut state, &message, block * 64);
+            // Panic-free chunking: the loader accepts no call into the
+            // cold panic section, so a dynamic `message[offset]` index is
+            // forbidden here; `get` fails closed instead of panicking.
+            let start = block * 64;
+            let slice = message.get(start..start + 64)?;
+            let block_bytes: &[u8; 64] = slice.try_into().ok()?;
+            sha256_block(&mut state, block_bytes);
         }
         block += 1;
     }
@@ -576,8 +602,12 @@ pub fn selector_digest_parts(
     Some(digest)
 }
 #[inline(never)]
-fn sha256_block(state: &mut [u32; 8], message: &[u8; 192], offset: usize) {
-    const K: [u32; 64] = [
+#[cfg_attr(target_arch = "bpf", unsafe(no_mangle))]
+pub fn sha256_block(state: &mut [u32; 8], block: &[u8; 64]) -> u64 {
+    // Stack array, not `const`: a const table is pooled in `.rodata` and
+    // addressed by relocation, which the loader rejects; the 64 immediates
+    // materialize on the stack and the verifier checks the depth on load.
+    let k: [u32; 64] = [
         0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
         0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
         0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
@@ -592,8 +622,8 @@ fn sha256_block(state: &mut [u32; 8], message: &[u8; 192], offset: usize) {
     let mut w = [0u32; 16];
     let mut i = 0;
     while i < 16 {
-        let j = offset + i * 4;
-        w[i] = u32::from_be_bytes([message[j], message[j + 1], message[j + 2], message[j + 3]]);
+        let j = i * 4;
+        w[i] = u32::from_be_bytes([block[j], block[j + 1], block[j + 2], block[j + 3]]);
         i += 1;
     }
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
@@ -614,7 +644,7 @@ fn sha256_block(state: &mut [u32; 8], message: &[u8; 192], offset: usize) {
         let t1 = h
             .wrapping_add(s1)
             .wrapping_add(choose)
-            .wrapping_add(K[i])
+            .wrapping_add(k[i])
             .wrapping_add(w[i & 15]);
         let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
         let majority = (a & b) ^ (a & c) ^ (b & c);
@@ -635,4 +665,8 @@ fn sha256_block(state: &mut [u32; 8], message: &[u8; 192], offset: usize) {
         state[i] = state[i].wrapping_add(values[i]);
         i += 1;
     }
+    // Scalar tail, not `()`: the K-materialization loop leaves a stack
+    // address in R0, and a BPF subprogram may not exit with R0 holding a
+    // stack pointer. Callers ignore the value.
+    u64::from(state[0])
 }

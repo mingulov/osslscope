@@ -1387,6 +1387,7 @@ pub const MEMBER_PROGS: [ProgSpec; 513] = [
 ];
 
 /// A map-fd fixup site: byte offset of the insn + map name.
+#[derive(Debug, Clone)]
 pub struct MapFixup {
     pub insn_off: usize,
     pub map: String,
@@ -1394,6 +1395,7 @@ pub struct MapFixup {
 
 /// One prepared program: relocated bytes (`.text` appended, call
 /// relocs applied) + map fixups for `load()`.
+#[derive(Debug, Clone)]
 pub struct PreparedProg {
     pub name: String,
     /// Preserved for exact load-type selection; raw identity declarations are admission-only.
@@ -1409,12 +1411,14 @@ pub struct PreparedProg {
 }
 
 /// Pure preparation output (no fds — safe unprivileged).
+#[derive(Debug, Clone)]
 pub struct Prepared {
     pub progs: Vec<PreparedProg>,
     pub maps: Vec<MapSpecLite>,
 }
 
 /// Map dims confirmed against the object (load input).
+#[derive(Debug, Clone)]
 pub struct MapSpecLite {
     pub name: String,
     pub map_type: u32,
@@ -1839,6 +1843,7 @@ fn check_func_ptrs_rewritten(
 /// (function-pointer targets for helpers like `bpf_loop`) need the
 /// callback proto; plain static callees take the void placeholder
 /// (the verifier never signature-checks static calls).
+#[derive(Debug, Clone)]
 pub struct SubprogInfo {
     pub name: String,
     pub insn_off: u32,
@@ -2858,10 +2863,11 @@ pub(crate) struct SourceLoaded {
     pub lifecycle: Vec<crate::writer_gate::LifecycleWriter>,
 }
 
-/// Exact map surface a source root may reference: the seven owned source maps,
-/// the two owned control duplicates, the three legacy join maps, and the
-/// shared admission gate. Any other fixup name refuses the load.
-const SOURCE_FIXUP_MAPS: [&str; 13] = [
+/// Exact map surface a source root may reference: the owned source maps,
+/// the owned producer maps, the two owned control duplicates, the three
+/// legacy join maps, and the shared admission gate. Any other fixup name
+/// refuses the load.
+const SOURCE_FIXUP_MAPS: [&str; 24] = [
     "REL",
     "SOURCE_GUARD",
     "SOURCE_REQUEST",
@@ -2869,6 +2875,17 @@ const SOURCE_FIXUP_MAPS: [&str; 13] = [
     "SOURCE_DOMAIN",
     "SOURCE_OBSERVER",
     "ITER_SLOT",
+    "TYPED_ADMISSION",
+    "SITE_BIND",
+    "BIND_PENDING",
+    "EXACT_NAME",
+    "DIGEST_INDEX",
+    "SELECTOR_DICT",
+    "THREAD_IDENTITY",
+    "PARTITION",
+    "ATTRIB_CONTROL",
+    "SEGMENT_INDEX",
+    "PRODUCER_LOSS",
     "ATTR_STATE",
     "SOURCE_CONFIG",
     "CONFIG",
@@ -3033,6 +3050,181 @@ pub(crate) fn load_source_roots(
         loaded.programs.insert(root.name.clone(), program);
     }
     Ok(loaded)
+}
+
+/// Split the source half into registration roots (fentry/raw, loaded +
+/// attached by `load_source_roots`) and typed roots (uprobe/uretprobe,
+/// loaded unattached by `load_typed_borrowed`, attached later per typed
+/// export). Single predicate; exactly the two reviewed typed names pass.
+pub(crate) fn split_typed_preparation(prepared: Prepared) -> anyhow::Result<(Prepared, Prepared)> {
+    let maps = prepared.maps;
+    let (typed, registration): (Vec<PreparedProg>, Vec<PreparedProg>) = prepared
+        .progs
+        .into_iter()
+        .partition(|p| matches!(p.name.as_str(), "typed_entry" | "typed_return"));
+    for p in &typed {
+        anyhow::ensure!(
+            matches!(
+                (p.name.as_str(), p.section.as_str(), p.is_return),
+                ("typed_entry", "uprobe", false) | ("typed_return", "uretprobe", true)
+            ),
+            "typed root shape"
+        );
+    }
+    let typed = Prepared {
+        progs: typed,
+        maps: maps.clone(),
+    };
+    let registration = Prepared {
+        progs: registration,
+        maps,
+    };
+    Ok((registration, typed))
+}
+
+/// Load the typed roots against borrowed maps without attaching: fixups
+/// resolve against the owner's source/producer/control maps plus the
+/// session's legacy maps (same surface as `load_source_roots`), programs
+/// load through the shared kprobe loader with per-writer gate
+/// attestation, and links are created later per typed export. Needs caps.
+/// Maps are borrowed and stay with their owners; programs are returned.
+/// Borrowed-FD table for the typed roots: every owned name in the half's
+/// map list resolves first (a missing owned name refuses), then any
+/// fixup-referenced name absent from that list completes from the same
+/// owner-then-legacy order, mirroring `load_source_roots`. The shared gate
+/// and the legacy join maps arrive only through that completion. Pure FD
+/// duplication; no BPF calls, so unit tests drive it with `/dev/null` FDs.
+fn collect_typed_fixup_maps(
+    prepared: &Prepared,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+) -> anyhow::Result<HashMap<String, OwnedFd>> {
+    use anyhow::Context as _;
+    use std::os::fd::AsFd as _;
+    let mut maps: HashMap<String, OwnedFd> = HashMap::with_capacity(prepared.maps.len());
+    for m in &prepared.maps {
+        let fd = source_maps
+            .get(m.name.as_str())
+            .map(|owned| owned.as_fd())
+            .or_else(|| legacy.maps.get(&m.name).map(|owned| owned.as_fd()));
+        match fd {
+            Some(borrowed) => {
+                let dup = borrowed
+                    .try_clone_to_owned()
+                    .with_context(|| format!("typed borrow dup {}", m.name))?;
+                maps.insert(m.name.clone(), dup);
+            }
+            None => {
+                anyhow::bail!("typed fixup map unresolved {}", m.name);
+            }
+        }
+    }
+    for p in &prepared.progs {
+        for fixup in &p.map_fixups {
+            if maps.contains_key(&fixup.map) {
+                continue;
+            }
+            let borrowed = source_maps
+                .get(fixup.map.as_str())
+                .map(|owned| owned.as_fd())
+                .or_else(|| legacy.maps.get(&fixup.map).map(|owned| owned.as_fd()))
+                .ok_or_else(|| anyhow::anyhow!("typed fixup unresolved {}", fixup.map))?;
+            let dup = borrowed
+                .try_clone_to_owned()
+                .with_context(|| format!("typed borrow dup {}", fixup.map))?;
+            maps.insert(fixup.map.clone(), dup);
+        }
+    }
+    Ok(maps)
+}
+pub(crate) fn load_typed_borrowed(
+    prepared: &Prepared,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    gate: &crate::writer_gate::WriterGate,
+) -> anyhow::Result<std::collections::HashMap<String, OwnedFd>> {
+    use anyhow::Context as _;
+    use std::os::fd::AsFd as _;
+    anyhow::ensure!(
+        prepared.progs.len() == 2
+            && prepared.progs.iter().any(|p| p.name == "typed_entry")
+            && prepared.progs.iter().any(|p| p.name == "typed_return"),
+        "typed half must hold exactly the entry/return pair"
+    );
+    // Borrowed FDs duplicated for fixup patching only; the kernel holds
+    // program-to-map references after load, and every map stays owned by
+    // its session-side owner. Nothing here outlives this call except the
+    // returned unattached programs.
+    let maps = collect_typed_fixup_maps(prepared, source_maps, legacy)?;
+    let mut programs = std::collections::HashMap::with_capacity(2);
+    for p in &prepared.progs {
+        for fixup in &p.map_fixups {
+            anyhow::ensure!(
+                SOURCE_FIXUP_MAPS.contains(&fixup.map.as_str()),
+                "typed fixup to unreviewed map {}",
+                fixup.map
+            );
+        }
+        anyhow::ensure!(
+            p.map_fixups.iter().any(|f| f.map == "ADMIT"),
+            "typed root lacks shared-gate fixup"
+        );
+        let fd = load_prog(p, &maps, true, None)
+            .with_context(|| format!("typed prog_load {}", p.name))?;
+        gate.attest(&fd)
+            .with_context(|| format!("typed program {} missing shared gate", p.name))?;
+        // Deliberately unattached: typed links are created per admitted
+        // export with per-site cookies, never bulk at load.
+        programs.insert(p.name.clone(), fd);
+    }
+    Ok(programs)
+}
+
+/// Gated load with borrowed shared maps: `ADMIT` injects from the gate,
+/// maps present in `borrowed` resolve to dup'd FDs of the same kernel
+/// maps (one relationship pool across both programs), every other map is
+/// created fresh. Programs attest per writer. Needs caps.
+pub(crate) fn load_gated_borrowed(
+    prep: &Prepared,
+    gate: &crate::writer_gate::WriterGate,
+    borrowed: &std::collections::BTreeMap<String, std::os::fd::BorrowedFd<'_>>,
+) -> anyhow::Result<GatedLoaded> {
+    use anyhow::Context as _;
+    anyhow::ensure!(
+        prep.maps.iter().filter(|m| m.name == "ADMIT").count() == 1,
+        "missing shared writer map"
+    );
+    for name in BORROWED_COUNT_MAPS {
+        if prep.maps.iter().any(|m| m.name == name) {
+            anyhow::ensure!(
+                borrowed.contains_key(name),
+                "shared count load missing borrowed map {name}"
+            );
+        }
+    }
+    let mut maps: HashMap<String, OwnedFd> = HashMap::with_capacity(prep.maps.len());
+    for m in &prep.maps {
+        let fd = if m.name == "ADMIT" {
+            gate.inject(m)?
+        } else if let Some(shared) = borrowed.get(m.name.as_str()) {
+            shared
+                .try_clone_to_owned()
+                .with_context(|| format!("borrow dup {}", m.name))?
+        } else {
+            create_native_map(m).with_context(|| format!("map_create {}", m.name))?
+        };
+        maps.insert(m.name.clone(), fd);
+    }
+    let mut progs: HashMap<String, OwnedFd> = HashMap::with_capacity(prep.progs.len());
+    for p in &prep.progs {
+        let fd = load_prog(p, &maps, true, None)?;
+        gate.attest(&fd)?;
+        progs.insert(p.name.clone(), fd);
+    }
+    Ok(GatedLoaded {
+        lifecycle: Vec::new(),
+        loaded: Loaded { maps, progs },
+    })
 }
 pub(crate) fn load_controlled(
     prep: &Prepared,
@@ -6252,6 +6444,70 @@ mod tests {
         legacy.maps.remove("CONFIG");
         assert!(load_source_roots(&prepared, &owned, &legacy, 7, &gate).is_err());
     }
+    #[test]
+    fn typed_fixup_table_completes_shared_gate_from_legacy() {
+        use std::os::fd::AsRawFd as _;
+        fn lite(name: &str) -> MapSpecLite {
+            MapSpecLite {
+                name: name.to_owned(),
+                map_type: 1,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }
+        }
+        fn prog(name: &str, section: &str, is_return: bool, fixups: &[&str]) -> PreparedProg {
+            PreparedProg {
+                name: name.to_owned(),
+                section: section.to_owned(),
+                is_return,
+                insns: Vec::new(),
+                map_fixups: fixups
+                    .iter()
+                    .enumerate()
+                    .map(|(i, map)| MapFixup {
+                        insn_off: i * 8,
+                        map: (*map).to_owned(),
+                    })
+                    .collect(),
+                subprogs: Vec::new(),
+            }
+        }
+        let (owned, legacy) = source_map_fixtures();
+        let prepared = Prepared {
+            progs: vec![
+                prog("typed_entry", "uprobe", false, &["REL", "ADMIT"]),
+                prog(
+                    "typed_return",
+                    "uretprobe",
+                    true,
+                    &["REL", "ADMIT", "CONFIG"],
+                ),
+            ],
+            maps: vec![lite("REL")],
+        };
+        let table = collect_typed_fixup_maps(&prepared, &owned, &legacy).unwrap();
+        // Owned REL plus fixup-completed ADMIT/CONFIG from the legacy half.
+        assert_eq!(table.len(), 3);
+        assert!(table.contains_key("REL"));
+        assert!(table.contains_key("ADMIT"));
+        assert!(table.contains_key("CONFIG"));
+        // Duplicated FDs, not aliases of the owners' FDs.
+        assert_ne!(table["REL"].as_raw_fd(), owned["REL"].as_raw_fd());
+        assert_ne!(table["ADMIT"].as_raw_fd(), legacy.maps["ADMIT"].as_raw_fd());
+        // A listed-but-absent owned name refuses the whole table.
+        let mut missing = prepared.clone();
+        missing.maps.push(lite("NOPE"));
+        assert!(collect_typed_fixup_maps(&missing, &owned, &legacy).is_err());
+        // A fixup-only name absent from both halves refuses too.
+        let mut missing2 = prepared.clone();
+        missing2.progs[0].map_fixups.push(MapFixup {
+            insn_off: 16,
+            map: "NOPE2".to_owned(),
+        });
+        assert!(collect_typed_fixup_maps(&missing2, &owned, &legacy).is_err());
+    }
 }
 
 // Controlled ring consumption follows Aya 0.14.0 maps/ring_buf.rs.
@@ -7057,8 +7313,141 @@ mod fix1_event_tests {
 }
 
 /// Focused Count adds only the public observer PID-namespace helper contract.
+/// Typed-producer shared maps, single source of truth. The session side
+/// owns and creates these (see `source_owner::MAPS`, which indexes this
+/// table); the focused counter borrows the same FDs when a session is
+/// present and creates private instances otherwise. Shapes must match
+/// `crates/ebpf/src/shared_maps.rs` exactly; `prepare` asserts every
+/// dimension against the object.
+pub const PRODUCER_MAPS: [MapSpec; 12] = [
+    MapSpec {
+        name: "REL",
+        map_type: 1,
+        key_size: 48,
+        value_size: 256,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "TYPED_ADMISSION",
+        map_type: 1,
+        key_size: 24,
+        value_size: 32,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SITE_BIND",
+        map_type: 1,
+        key_size: 24,
+        value_size: 56,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "BIND_PENDING",
+        map_type: 1,
+        key_size: 32,
+        value_size: 304,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "EXACT_NAME",
+        map_type: 1,
+        key_size: 144,
+        value_size: 8,
+        max_entries: 2048,
+        flags: 0,
+    },
+    MapSpec {
+        name: "DIGEST_INDEX",
+        map_type: 1,
+        key_size: 48,
+        value_size: 8,
+        max_entries: 2048,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SELECTOR_DICT",
+        map_type: 1,
+        key_size: 16,
+        value_size: 64,
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "THREAD_IDENTITY",
+        map_type: 1,
+        key_size: 16,
+        value_size: 16,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "PARTITION",
+        map_type: 5,
+        key_size: 104,
+        value_size: 24,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ATTRIB_CONTROL",
+        map_type: 2,
+        key_size: 4,
+        value_size: 64,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SEGMENT_INDEX",
+        map_type: 1,
+        key_size: 32,
+        value_size: 8,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "PRODUCER_LOSS",
+        map_type: 6,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 8,
+        flags: 0,
+    },
+];
+
+/// Maps the focused counter borrows from the session owner instead of
+/// creating: the 12 producer maps plus the source/control maps its
+/// same-handler check reads. Single source for the borrow set used by
+/// `load_gated_borrowed`; the reservation estimator charges the full
+/// table conservatively whether or not sharing engages.
+pub const BORROWED_COUNT_MAPS: [&str; 20] = [
+    "REL",
+    "TYPED_ADMISSION",
+    "SITE_BIND",
+    "BIND_PENDING",
+    "EXACT_NAME",
+    "DIGEST_INDEX",
+    "SELECTOR_DICT",
+    "THREAD_IDENTITY",
+    "PARTITION",
+    "ATTRIB_CONTROL",
+    "SEGMENT_INDEX",
+    "PRODUCER_LOSS",
+    "ATTR_STATE",
+    "SOURCE_CONFIG",
+    "SOURCE_GUARD",
+    "SOURCE_REQUEST",
+    "SOURCE_PAIR",
+    "SOURCE_DOMAIN",
+    "SOURCE_OBSERVER",
+    "ITER_SLOT",
+];
+
 /// The legacy seven-map Count owner/validators remain independent.
-pub const FOCUSED_COUNT_MAPS: [MapSpec; 10] = [
+pub const FOCUSED_COUNT_MAPS: [MapSpec; 30] = [
     crate::writer_gate::SPEC,
     COUNT_MAPS[0],
     COUNT_MAPS[1],
@@ -7083,13 +7472,92 @@ pub const FOCUSED_COUNT_MAPS: [MapSpec; 10] = [
         max_entries: 1,
         flags: 0,
     },
+    PRODUCER_MAPS[0],
+    PRODUCER_MAPS[1],
+    PRODUCER_MAPS[2],
+    PRODUCER_MAPS[3],
+    PRODUCER_MAPS[4],
+    PRODUCER_MAPS[5],
+    PRODUCER_MAPS[6],
+    PRODUCER_MAPS[7],
+    PRODUCER_MAPS[8],
+    PRODUCER_MAPS[9],
+    PRODUCER_MAPS[10],
+    PRODUCER_MAPS[11],
+    // Session-owned source/control shapes, duplicated from
+    // `source_owner::MAPS`/`CONTROL_MAPS` (invisible here as
+    // `pub(super)`); `source_owner` tests guard the duplication.
+    MapSpec {
+        name: "ATTR_STATE",
+        map_type: 2,
+        key_size: 4,
+        value_size: 64,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SOURCE_CONFIG",
+        map_type: 2,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SOURCE_GUARD",
+        map_type: 1,
+        key_size: 8,
+        value_size: 16,
+        max_entries: 8192,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SOURCE_REQUEST",
+        map_type: 1,
+        key_size: 8,
+        value_size: 112,
+        max_entries: 4096,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SOURCE_PAIR",
+        map_type: 2,
+        key_size: 4,
+        value_size: 128,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SOURCE_DOMAIN",
+        map_type: 1,
+        key_size: 4,
+        value_size: 64,
+        max_entries: 64,
+        flags: 0,
+    },
+    MapSpec {
+        name: "SOURCE_OBSERVER",
+        map_type: 2,
+        key_size: 4,
+        value_size: 48,
+        max_entries: 1,
+        flags: 0,
+    },
+    MapSpec {
+        name: "ITER_SLOT",
+        map_type: 6,
+        key_size: 4,
+        value_size: 264,
+        max_entries: 2,
+        flags: 0,
+    },
 ];
 /// Pure, fail-closed shape/privacy admission for the learned-site counter.
 pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
     validate_count_object(object)?;
     let prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
     anyhow::ensure!(
-        prepared.maps.len() == 10 && prepared.progs.len() == 1,
+        prepared.maps.len() == FOCUSED_COUNT_MAPS.len() && prepared.progs.len() == 1,
         "focused shape"
     );
     let root = &prepared.progs[0];

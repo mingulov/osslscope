@@ -468,7 +468,7 @@ impl AttributionCollection {
 /// never accepted in place of this type.
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
-struct FinalizedAttribution {
+pub(crate) struct FinalizedAttribution {
     coordinate: CutCoordinate,
     definite: Vec<AttributionRecord>,
     unresolved_calls: u64,
@@ -638,6 +638,277 @@ fn fold_attribution(
         unresolved_calls: unresolved,
         withheld_uncertain,
     })
+}
+
+/// Session-neutral view of one admitted typed site for the final join.
+/// The session converts its records; the finalizer never touches
+/// session state directly.
+pub(crate) struct AdmittedTypedSite {
+    pub cookie: u64,
+    pub site_id: NonZeroU64,
+    pub role_id: u32,
+    pub object: ObjectId,
+    pub device: u64,
+    pub inode: u64,
+    pub offset: u64,
+    pub object_id: u64,
+    pub source_epoch: u64,
+}
+
+/// Borrowed producer maps for one strict final read. All FDs borrow the
+/// session owner's maps; the finalizer creates nothing.
+pub(crate) struct ClosedAttributionMaps<'a> {
+    pub partition: std::os::fd::BorrowedFd<'a>,
+    pub selector: std::os::fd::BorrowedFd<'a>,
+    pub loss: std::os::fd::BorrowedFd<'a>,
+    pub bind: std::os::fd::BorrowedFd<'a>,
+    pub control: std::os::fd::BorrowedFd<'a>,
+}
+
+fn final_map<'a>(
+    fd: std::os::fd::BorrowedFd<'a>,
+    types: &[u32],
+    key: usize,
+    value: usize,
+) -> Result<crate::loader::BorrowedMap<'a>, AttributionError> {
+    let map = crate::loader::BorrowedMap::new(fd).map_err(|_| AttributionError::Resource)?;
+    map.shape(types, key, value)
+        .map_err(|_| AttributionError::Identity)?;
+    Ok(map)
+}
+
+/// One-shot finalizer: claim, strict sequential final reads, collect,
+/// fold. Reads run control → binds → losses → selectors → partitions so
+/// the cut coordinate is fixed before any row is accepted. Any refusal
+/// yields no `FinalizedAttribution`; the caller keeps the physical
+/// evidence it already holds.
+pub(crate) fn collect_closed_attribution(
+    closed_gate: crate::writer_gate::OwnedClosedGate,
+    gate: &crate::writer_gate::WriterGate,
+    maps: &ClosedAttributionMaps<'_>,
+    cpus: usize,
+    sample: &crate::focused_count::CountSample,
+    admitted: &[AdmittedTypedSite],
+    admission: CountAdmissionWindow,
+    report: CaptureWindow,
+) -> Result<FinalizedAttribution, AttributionError> {
+    use AttributionError::*;
+    if cpus == 0 || cpus > 4096 {
+        return Err(Resource);
+    }
+    // Control first: the cut coordinate every row must match. A poisoned
+    // producer taints the whole cut (fail closed, never partial).
+    let control = final_map(maps.control, &[2], 4, 64)?;
+    let mut control_value = [0u8; 64];
+    control
+        .lookup(&0u32.to_ne_bytes(), &mut control_value)
+        .map_err(|_| Resource)?;
+    let mode = u64::from_ne_bytes(control_value[0..8].try_into().unwrap());
+    if mode != wire::PRODUCER_ADMITTED {
+        return Err(Cut);
+    }
+    let coordinate = CutCoordinate {
+        session_id: NonZeroU64::new(u64::from_ne_bytes(control_value[8..16].try_into().unwrap()))
+            .ok_or(Cut)?,
+        admission_epoch: NonZeroU64::new(u64::from_ne_bytes(
+            control_value[16..24].try_into().unwrap(),
+        ))
+        .ok_or(Cut)?,
+        cut_id: NonZeroU64::new(u64::from_ne_bytes(
+            control_value[24..32].try_into().unwrap(),
+        ))
+        .ok_or(Cut)?,
+    };
+    // Binds: exact correspondence between admitted cookies and kernel
+    // rows in both directions; anything else is impossible state.
+    let bind = final_map(maps.bind, &[1], 24, 56)?;
+    let bind_keys = bind.keys(1024).map_err(|_| Resource)?;
+    let mut binds = std::collections::BTreeMap::new();
+    for key in &bind_keys {
+        if key.len() != 24 {
+            return Err(Identity);
+        }
+        let mut value = [0u8; 56];
+        bind.lookup(key, &mut value).map_err(|_| Resource)?;
+        let cookie = u64::from_ne_bytes(key[0..8].try_into().unwrap());
+        let site_id = u64::from_ne_bytes(value[0..8].try_into().unwrap());
+        let source_epoch = u64::from_ne_bytes(value[8..16].try_into().unwrap());
+        let object_id = u64::from_ne_bytes(value[16..24].try_into().unwrap());
+        if cookie == 0 || site_id == 0 || source_epoch == 0 || object_id == 0 {
+            return Err(Identity);
+        }
+        let mut sha = [0u8; 32];
+        sha.copy_from_slice(&value[24..56]);
+        if binds
+            .insert(cookie, (site_id, source_epoch, object_id, sha))
+            .is_some()
+        {
+            return Err(Identity);
+        }
+    }
+    if binds.len() != admitted.len() {
+        return Err(Identity);
+    }
+    for site in admitted {
+        match binds.get(&site.cookie) {
+            Some((site_id, source_epoch, object_id, _))
+                if *site_id == site.site_id.get()
+                    && *source_epoch == site.source_epoch
+                    && *object_id == site.object_id => {}
+            _ => return Err(Identity),
+        }
+    }
+    // Losses: per-CPU sums per cell, then a conservative foreign bound
+    // (every drop event counts; the physical-first order guarantees every
+    // partitionable hit is also physically recorded, so overcounting only
+    // inflates the unresolved remainder, never deflates it).
+    let loss = final_map(maps.loss, &[6], 4, 8)?;
+    let mut foreign_producer = 0u64;
+    for cell in 0..8u32 {
+        let mut values = vec![0u8; 8 * cpus];
+        loss.lookup(&cell.to_ne_bytes(), &mut values)
+            .map_err(|_| Resource)?;
+        for cpu in 0..cpus {
+            let word = u64::from_ne_bytes(values[cpu * 8..cpu * 8 + 8].try_into().unwrap());
+            foreign_producer = foreign_producer.checked_add(word).ok_or(Resource)?;
+        }
+    }
+    // Selectors: decode every dictionary entry, resolving artifact
+    // identities through the admitted registry only.
+    let selector = final_map(maps.selector, &[1], 16, 64)?;
+    let selector_keys = selector.keys(1024).map_err(|_| Resource)?;
+    let mut objects = std::collections::BTreeMap::new();
+    for site in admitted {
+        match objects.insert(site.object_id, site.object.clone()) {
+            None => {}
+            Some(previous) if previous == site.object => {}
+            Some(_) => return Err(Identity),
+        }
+    }
+    let mut selectors = Vec::with_capacity(selector_keys.len());
+    for key in &selector_keys {
+        if key.len() != 16 {
+            return Err(Identity);
+        }
+        let mut value = [0u8; 64];
+        selector.lookup(key, &mut value).map_err(|_| Resource)?;
+        let key_session = u64::from_ne_bytes(key[0..8].try_into().unwrap());
+        let selector_id = u64::from_ne_bytes(key[8..16].try_into().unwrap());
+        if key_session != coordinate.session_id.get() || selector_id == 0 {
+            return Err(Identity);
+        }
+        let object_id = u64::from_ne_bytes(value[0..8].try_into().unwrap());
+        let operation = u32::from_ne_bytes(value[8..12].try_into().unwrap());
+        let encoding = u32::from_ne_bytes(value[12..16].try_into().unwrap());
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&value[16..48]);
+        let dictionary_epoch = u64::from_ne_bytes(value[48..56].try_into().unwrap());
+        let reserved = u64::from_ne_bytes(value[56..64].try_into().unwrap());
+        if encoding != wire::SELECTOR_ENCODING || reserved != 0 {
+            return Err(Identity);
+        }
+        let object = objects.get(&object_id).ok_or(Identity)?.clone();
+        selectors.push(ResolvedSelector {
+            selector_id: NonZeroU64::new(selector_id).ok_or(Identity)?,
+            dictionary_epoch: NonZeroU64::new(dictionary_epoch).ok_or(Identity)?,
+            object,
+            operation,
+            digest,
+        });
+    }
+    // Partitions: per-key per-CPU reduce with the contributing-shard rule,
+    // then decode. Rows outside this cut refuse (never filter silently).
+    let partition = final_map(maps.partition, &[5], 104, 24)?;
+    let partition_keys = partition.keys(8192).map_err(|_| Resource)?;
+    let mut shards = Vec::with_capacity(partition_keys.len());
+    for key in &partition_keys {
+        if key.len() != 104 {
+            return Err(Identity);
+        }
+        let key_session = u64::from_ne_bytes(key[8..16].try_into().unwrap());
+        let key_cut = u64::from_ne_bytes(key[16..24].try_into().unwrap());
+        if key_session != coordinate.session_id.get() || key_cut != coordinate.cut_id.get() {
+            return Err(Cut);
+        }
+        let mut values = vec![0u8; 24 * cpus];
+        partition.lookup(key, &mut values).map_err(|_| Resource)?;
+        let mut calls = 0u64;
+        let mut first = 0u64;
+        let mut last = 0u64;
+        for cpu in 0..cpus {
+            let base = cpu * 24;
+            let shard_calls = u64::from_ne_bytes(values[base..base + 8].try_into().unwrap());
+            let shard_first = u64::from_ne_bytes(values[base + 8..base + 16].try_into().unwrap());
+            let shard_last = u64::from_ne_bytes(values[base + 16..base + 24].try_into().unwrap());
+            if shard_calls == 0 {
+                continue;
+            }
+            calls = calls.checked_add(shard_calls).ok_or(Resource)?;
+            if first == 0 || shard_first < first {
+                first = shard_first;
+            }
+            if shard_last > last {
+                last = shard_last;
+            }
+        }
+        let mut reduced = [0u8; 24];
+        reduced[0..8].copy_from_slice(&calls.to_ne_bytes());
+        reduced[8..16].copy_from_slice(&first.to_ne_bytes());
+        reduced[16..24].copy_from_slice(&last.to_ne_bytes());
+        shards.push(Partition128::decode(key, &reduced)?);
+    }
+    let partitions = reduce_partition_shards(&shards)?;
+    // Physical: join sample executions to admitted sites by full physical
+    // identity; the bind-verified site ID and source epoch attach here.
+    let mut by_site = std::collections::BTreeMap::new();
+    for site in admitted {
+        let key = SiteKey {
+            object: site.object.clone(),
+            device: site.device,
+            inode: site.inode,
+            offset: site.offset,
+        };
+        if by_site.insert(key, site).is_some() {
+            return Err(Identity);
+        }
+    }
+    let mut physical = Vec::new();
+    for execution in &sample.sites {
+        let Some(site) = by_site.get(&execution.site) else {
+            continue;
+        };
+        physical.push(ClosedPhysicalRow {
+            site_id: site.site_id,
+            source_epoch: NonZeroU64::new(site.source_epoch).ok_or(Identity)?,
+            execution: execution.clone(),
+        });
+    }
+    let foreign_calls = sample
+        .unattributed
+        .checked_add(foreign_producer)
+        .ok_or(Resource)?;
+    let receipt = closed_gate.receipt();
+    let window = SnapshotWindow {
+        admission,
+        report,
+        close_before_ns: receipt.close_before_ns,
+        close_after_ns: receipt.close_after_ns,
+    };
+    let mut collection = AttributionCollection::unclaimed();
+    let snapshot = AttributionCollection::collect(
+        &mut collection,
+        closed_gate,
+        gate,
+        CollectedEvidence {
+            coordinate,
+            window,
+            physical,
+            partitions,
+            selectors,
+            losses: ClosedAttributionLosses { foreign_calls },
+        },
+    )?;
+    fold_attribution(snapshot)
 }
 
 #[cfg(test)]

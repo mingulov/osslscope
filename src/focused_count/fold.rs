@@ -88,7 +88,31 @@ impl CountFold {
     }
     pub fn attach(
         &mut self,
+        binding: SiteBinding,
+        install: impl FnOnce(u32, u32) -> Result<(), CountFailure>,
+    ) -> Result<(u32, u32), CountFailure> {
+        self.attach_inner(binding, None, install)
+    }
+    /// Attach with a session-pinned cookie so both programs resolve one
+    /// SITE_BIND row for the same site. The pinned cookie skips the
+    /// counter's own mint ceiling (session-budgeted, disjoint range) but
+    /// keeps every fence, charge and dedup check; zero or a cookie already
+    /// bound to a different site refuses.
+    pub fn attach_pinned(
+        &mut self,
+        binding: SiteBinding,
+        cookie: u32,
+        install: impl FnOnce(u32, u32) -> Result<(), CountFailure>,
+    ) -> Result<(u32, u32), CountFailure> {
+        if cookie == 0 {
+            return Err(CountFailure::Identity);
+        }
+        self.attach_inner(binding, Some(cookie), install)
+    }
+    fn attach_inner(
+        &mut self,
         mut binding: SiteBinding,
+        pinned: Option<u32>,
         install: impl FnOnce(u32, u32) -> Result<(), CountFailure>,
     ) -> Result<(u32, u32), CountFailure> {
         if self.generation == 0 {
@@ -147,14 +171,29 @@ impl CountFold {
             }
             return Ok((cookie, generation));
         }
-        if self.next_cookie as usize > self.limits.max_cookies {
-            return Err(CountFailure::Resource);
-        }
-        let cookie = self.next_cookie;
-        self.next_cookie = self
-            .next_cookie
-            .checked_add(1)
-            .ok_or(CountFailure::Resource)?;
+        let cookie = match pinned {
+            Some(cookie) => {
+                // A pinned cookie already bound to a different site is a
+                // cross-site collision: refuse rather than alias.
+                if let Some(r) = self.rows.get(&cookie) {
+                    if r.row.site != binding.site {
+                        return Err(CountFailure::Resource);
+                    }
+                }
+                cookie
+            }
+            None => {
+                if self.next_cookie as usize > self.limits.max_cookies {
+                    return Err(CountFailure::Resource);
+                }
+                let cookie = self.next_cookie;
+                self.next_cookie = self
+                    .next_cookie
+                    .checked_add(1)
+                    .ok_or(CountFailure::Resource)?;
+                cookie
+            }
+        };
         // Errors are returned to the owner, which records one failure gap.
         install(cookie, self.generation)?;
         self.rows.insert(

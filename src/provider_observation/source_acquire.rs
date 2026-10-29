@@ -37,6 +37,7 @@ pub(super) const PROVISIONAL_LINK_RESERVE: usize = 32 << 10;
 pub(super) const SOURCE_PROGRAM_RESERVE: usize = 32 << 10;
 pub(super) const SOURCE_LINK_RESERVE: usize = 32 << 10;
 pub(super) const SOURCE_ROOT_COUNT: usize = 4;
+pub(super) const TYPED_ROOT_COUNT: usize = 2;
 pub(super) const LEDGER_RESERVE: usize = 128 << 10;
 pub(super) const DOMAIN_INDEX_RESERVE: usize = 12 << 10;
 pub(super) const ORDER_RESERVE: usize = 32 << 10;
@@ -44,6 +45,7 @@ pub(super) const IDS_RESERVE: usize = 8;
 pub(super) const ACQUIRE_CORE_RESERVE: usize = NOOP_PROGRAM_RESERVE
     + PROVISIONAL_LINK_RESERVE
     + SOURCE_ROOT_COUNT * (SOURCE_PROGRAM_RESERVE + SOURCE_LINK_RESERVE)
+    + TYPED_ROOT_COUNT * SOURCE_PROGRAM_RESERVE
     + LEDGER_RESERVE
     + DOMAIN_INDEX_RESERVE
     + ORDER_RESERVE
@@ -737,6 +739,18 @@ impl DomainIndex {
             }
         }
     }
+    /// Current typed-site coordinates for one armed domain: the process
+    /// incarnation and current image the kernel resolves for this TGID.
+    /// Coordinates only — the kernel re-checks domain liveness itself at
+    /// fire time, so a raced exec fails closed on lookup miss. Terminal
+    /// (retired/poisoned) domains refuse admission.
+    pub(super) fn coordinates(&self, tgid: u32) -> Result<(u64, u64), ObservationGap> {
+        let row = self.domains.get(&tgid).ok_or(ObservationGap::Invalidated)?;
+        if Self::terminal(row.state) || row.process_incarnation == 0 || row.current_image == 0 {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok((row.process_incarnation, row.current_image))
+    }
     /// Caller: the explicit test-driven source close only; production close
     /// lands with 5B activation.
     #[allow(dead_code)]
@@ -1022,15 +1036,17 @@ pub(super) struct RetainedSourceRoots {
     links: Vec<OwnedFd>,
     lifecycle: Vec<crate::writer_gate::LifecycleWriter>,
     programs: Vec<OwnedFd>,
+    typed_programs: std::collections::HashMap<String, OwnedFd>,
     noop: NoOpTrigger,
     prepared: loader::Prepared,
     attach_btf_id: u32,
 }
 impl RetainedSourceRoots {
-    /// Exact admission for the source half: the four retained roots with
-    /// their exact sections, no return-mode roots, an ADMIT fixup on every
-    /// root, exactly the seven source maps with exact dimensions, and the
-    /// validated nonzero registration FUNC ID. Pure and caps-free.
+    /// Exact admission for the source half: the four retained roots plus
+    /// the two typed roots, each with exact section and return mode, an
+    /// ADMIT fixup on every root, exactly the owner maps with exact
+    /// dimensions, and the validated nonzero registration FUNC ID. Pure
+    /// and caps-free.
     pub(super) fn check(
         prepared: &loader::Prepared,
         attach_btf_id: u32,
@@ -1038,19 +1054,21 @@ impl RetainedSourceRoots {
         if attach_btf_id == 0 {
             return Err(ObservationGap::InvalidObject);
         }
-        let mut seen = [false; SOURCE_ROOT_COUNT];
-        if prepared.progs.len() != SOURCE_ROOT_COUNT {
+        let mut seen = [false; SOURCE_ROOT_COUNT + TYPED_ROOT_COUNT];
+        if prepared.progs.len() != SOURCE_ROOT_COUNT + TYPED_ROOT_COUNT {
             return Err(ObservationGap::InvalidObject);
         }
         for root in &prepared.progs {
-            let slot = match (root.name.as_str(), root.section.as_str()) {
-                ("source_reg_in", "fentry/uprobe_register") => 0,
-                ("source_reg_out", "fexit/uprobe_register") => 1,
-                ("attr_exit", "raw_tracepoint/sched_process_exit") => 2,
-                ("attr_exec", "raw_tracepoint/sched_process_exec") => 3,
+            let (slot, want_return) = match (root.name.as_str(), root.section.as_str()) {
+                ("source_reg_in", "fentry/uprobe_register") => (0, false),
+                ("source_reg_out", "fexit/uprobe_register") => (1, false),
+                ("attr_exit", "raw_tracepoint/sched_process_exit") => (2, false),
+                ("attr_exec", "raw_tracepoint/sched_process_exec") => (3, false),
+                ("typed_entry", "uprobe") => (4, false),
+                ("typed_return", "uretprobe") => (5, true),
                 _ => return Err(ObservationGap::InvalidObject),
             };
-            if root.is_return || seen[slot] {
+            if root.is_return != want_return || seen[slot] {
                 return Err(ObservationGap::InvalidObject);
             }
             seen[slot] = true;
@@ -1103,14 +1121,45 @@ impl RetainedSourceRoots {
     /// Loaded program/link/lifecycle counts. Test-called only (post-hoc
     /// enablement receipts).
     #[allow(dead_code)]
-    pub(super) fn loaded_counts(&self) -> (usize, usize, usize) {
-        (self.programs.len(), self.links.len(), self.lifecycle.len())
+    pub(super) fn loaded_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.programs.len(),
+            self.links.len(),
+            self.lifecycle.len(),
+            self.typed_programs.len(),
+        )
     }
     /// Adopt loaded programs and attached links after a successful load.
     pub(super) fn adopt_loaded(&mut self, loaded: loader::SourceLoaded) {
         self.programs.extend(loaded.programs.into_values());
         self.links.extend(loaded.links.into_values());
         self.lifecycle.extend(loaded.lifecycle);
+    }
+    /// Adopt the two unattached typed programs by name; attach looks
+    /// them up per admitted export. Anything but exactly the pair
+    /// refuses.
+    pub(super) fn adopt_typed(
+        &mut self,
+        programs: std::collections::HashMap<String, OwnedFd>,
+    ) -> Result<(), ObservationGap> {
+        if programs.len() != TYPED_ROOT_COUNT
+            || !programs.contains_key("typed_entry")
+            || !programs.contains_key("typed_return")
+        {
+            return Err(ObservationGap::InvalidObject);
+        }
+        self.typed_programs = programs;
+        Ok(())
+    }
+    pub(super) fn typed_program(
+        &self,
+        name: &str,
+    ) -> Result<std::os::fd::BorrowedFd<'_>, ObservationGap> {
+        use std::os::fd::AsFd as _;
+        self.typed_programs
+            .get(name)
+            .map(|owned| owned.as_fd())
+            .ok_or(ObservationGap::Invalidated)
     }
     /// Release every program/link owner in drop order. Maps stay with the
     /// source owner until its own drop.
@@ -1119,6 +1168,7 @@ impl RetainedSourceRoots {
         self.links.clear();
         self.lifecycle.clear();
         self.programs.clear();
+        self.typed_programs.clear();
     }
     /// Move validated custody into the owner. Call `check` first; the owner
     /// does. Program/link FDs stay empty until the native lease loads them.
@@ -1133,6 +1183,7 @@ impl RetainedSourceRoots {
             links: Vec::new(),
             lifecycle: Vec::new(),
             programs: Vec::new(),
+            typed_programs: std::collections::HashMap::new(),
             noop: NoOpTrigger {
                 provisional: None,
                 program: None,
@@ -2417,16 +2468,18 @@ mod tests {
     }
     fn valid_source_prepared() -> loader::Prepared {
         let progs = [
-            ("source_reg_in", "fentry/uprobe_register"),
-            ("source_reg_out", "fexit/uprobe_register"),
-            ("attr_exit", "raw_tracepoint/sched_process_exit"),
-            ("attr_exec", "raw_tracepoint/sched_process_exec"),
+            ("source_reg_in", "fentry/uprobe_register", false),
+            ("source_reg_out", "fexit/uprobe_register", false),
+            ("attr_exit", "raw_tracepoint/sched_process_exit", false),
+            ("attr_exec", "raw_tracepoint/sched_process_exec", false),
+            ("typed_entry", "uprobe", false),
+            ("typed_return", "uretprobe", true),
         ]
         .into_iter()
-        .map(|(name, section)| loader::PreparedProg {
+        .map(|(name, section, is_return)| loader::PreparedProg {
             name: name.to_string(),
             section: section.to_string(),
-            is_return: false,
+            is_return,
             insns: Vec::new(),
             map_fixups: vec![loader::MapFixup {
                 insn_off: 0,
@@ -2451,7 +2504,7 @@ mod tests {
     #[test]
     fn source_half_check_admits_exact_roots_and_maps() {
         let prepared = valid_source_prepared();
-        assert_eq!(prepared.progs.len(), SOURCE_ROOT_COUNT);
+        assert_eq!(prepared.progs.len(), SOURCE_ROOT_COUNT + TYPED_ROOT_COUNT);
         assert_eq!(prepared.maps.len(), super::super::source_owner::MAPS.len());
         RetainedSourceRoots::check(&prepared, 1234).unwrap();
         let roots = RetainedSourceRoots::retain(prepared, 1234, 5678);

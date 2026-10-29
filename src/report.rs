@@ -1055,6 +1055,7 @@ pub(crate) fn consume_focused_result(
                     child_exit: None,
                     workload_discarded: false,
                     _reservation: None,
+                    finalized_attribution: None,
                 },
                 command,
                 request,

@@ -12,6 +12,11 @@ use super::{
     },
 };
 use crate::{loader, observation_memory::MemoryLease, writer_gate::WriterGate};
+/// Attribution contract (typed admission/bind shapes, REL kinds, control
+/// cell). Core-only: safe to include by path like `contract` below.
+#[path = "../../crates/bpf-contract/src/attribution.rs"]
+#[allow(dead_code)]
+mod attr_contract;
 #[allow(dead_code)]
 #[path = "../../crates/bpf-contract/src/source.rs"]
 pub(super) mod contract;
@@ -36,7 +41,10 @@ pub(super) const CONTROL_MAPS: [loader::MapSpec; 2] = [
     spec("SOURCE_CONFIG", 2, 4, 8, 1),
 ];
 // Private REL is available to BPF injection only, never a host readback surface.
-pub(super) const MAPS: [loader::MapSpec; 7] = [
+// The 12 producer maps join the 7 source maps through the shared
+// `loader::PRODUCER_MAPS` table (`PRODUCER_MAPS[0]` is REL, already the
+// first entry here, so only [1..12] extend the array).
+pub(super) const MAPS: [loader::MapSpec; 18] = [
     spec("REL", 1, 48, 256, 8192),
     spec("SOURCE_GUARD", 1, 8, 16, 8192),
     spec("SOURCE_REQUEST", 1, 8, 112, 4096),
@@ -44,6 +52,17 @@ pub(super) const MAPS: [loader::MapSpec; 7] = [
     spec("SOURCE_DOMAIN", 1, 4, 64, 64),
     spec("SOURCE_OBSERVER", 2, 4, 48, 1),
     spec("ITER_SLOT", 6, 4, 264, 2),
+    loader::PRODUCER_MAPS[1],
+    loader::PRODUCER_MAPS[2],
+    loader::PRODUCER_MAPS[3],
+    loader::PRODUCER_MAPS[4],
+    loader::PRODUCER_MAPS[5],
+    loader::PRODUCER_MAPS[6],
+    loader::PRODUCER_MAPS[7],
+    loader::PRODUCER_MAPS[8],
+    loader::PRODUCER_MAPS[9],
+    loader::PRODUCER_MAPS[10],
+    loader::PRODUCER_MAPS[11],
 ];
 const fn spec(
     name: &'static str,
@@ -269,6 +288,39 @@ pub(crate) struct RootsEnabled {
     pub lifecycle: usize,
     pub mode_before: u64,
     pub mode_after: u64,
+    pub typed_programs: usize,
+}
+
+/// One typed-site admission request. The caller verified freshness and
+/// mints every ID; the owner binds them to live domain coordinates.
+pub(super) struct TypedAdmissionRequest {
+    pub cookie: u64,
+    pub site_id: u64,
+    pub role_id: u32,
+    pub public_api_id: u32,
+    pub operation: u32,
+    pub function: u32,
+    pub tgid: u32,
+    pub object_id: u64,
+    pub object_sha256: [u8; 32],
+}
+
+/// What the admission programmed, for the caller's records and receipts.
+pub(super) struct TypedAdmissionReceipts {
+    pub cookie: u64,
+    pub site_id: u64,
+    pub source_epoch: u64,
+    pub ready_sequence: u64,
+    pub process_incarnation: u64,
+    pub image_epoch: u64,
+}
+
+/// Producer control coordinates, retained by the session for the final
+/// cut-coordinate cross-check.
+pub(super) struct ProducerControlProgrammed {
+    pub session_id: u64,
+    pub admission_epoch: u64,
+    pub cut_id: u64,
 }
 
 /// Target-domain configuration minted for one acquisition. Fields are
@@ -326,7 +378,7 @@ pub(crate) struct SourceCloseReceipts {
 /// Decode a validated artifact hash to its raw bytes. Runs only after a
 /// fault-safe capture proved the mapped bytes hash to this exact value, so
 /// the result names the anchored mapping, never a re-read.
-fn decode_object_hash_hex(expected: &ObjectHash) -> Result<[u8; 32], ObservationGap> {
+pub(super) fn decode_object_hash_hex(expected: &ObjectHash) -> Result<[u8; 32], ObservationGap> {
     fn hex_val(byte: u8) -> Result<u8, ObservationGap> {
         match byte {
             b'0'..=b'9' => Ok(byte - b'0'),
@@ -360,6 +412,8 @@ pub(super) struct SourceOwner {
     _registration_ids: Vec<u64>,
     _domain_tgids: Vec<u32>,
     _mode: Option<(u64, u64)>,
+    _typed_epoch: Option<u64>,
+    _control: Option<ProducerControlProgrammed>,
     #[cfg(test)]
     _fail_next_retire: std::cell::Cell<bool>,
     _last_error: Option<String>,
@@ -504,6 +558,8 @@ impl SourceOwner {
             _registration_ids: Vec::new(),
             _domain_tgids: Vec::new(),
             _mode: None,
+            _typed_epoch: None,
+            _control: None,
             #[cfg(test)]
             _fail_next_retire: std::cell::Cell::new(false),
             _last_error: None,
@@ -695,8 +751,17 @@ impl SourceOwner {
         if !self._gate.preparing() {
             return Err(ObservationGap::Invalidated);
         }
+        // The retained half holds registration + typed roots; registration
+        // loads attached, typed loads unattached against the same maps.
+        // Cloning the small prepared metadata (no FDs) keeps the retained
+        // half intact for diagnosis on refusal.
+        let (registration, typed) = loader::split_typed_preparation(self._roots.prepared().clone())
+            .map_err(|error| {
+                self._last_error = Some(format!("{error:#}"));
+                ObservationGap::InvalidObject
+            })?;
         let loaded = loader::load_source_roots(
-            self._roots.prepared(),
+            &registration,
             &self._maps,
             legacy,
             self._roots.attach_btf_id(),
@@ -715,12 +780,27 @@ impl SourceOwner {
             ));
             return Err(ObservationGap::Invalidated);
         }
+        let typed_programs = loader::load_typed_borrowed(&typed, &self._maps, legacy, &self._gate)
+            .map_err(|error| {
+                self._last_error = Some(format!("{error:#}"));
+                ObservationGap::BpfUnavailable
+            })?;
+        let typed_count = typed_programs.len();
+        self._roots.adopt_typed(typed_programs)?;
+        // Control cell last among the loads, before the mode flip below:
+        // the producer admits only with all coordinates in place.
+        let control = self.program_producer_control().map_err(|gap| {
+            self._last_error = Some("producer control refused".to_string());
+            gap
+        })?;
+        self._control = Some(control);
         let receipts = RootsEnabled {
             programs: loaded.programs.len(),
             links: loaded.links.len(),
             lifecycle: loaded.lifecycle.len(),
             mode_before: 0,
             mode_after: 0,
+            typed_programs: typed_count,
         };
         self._roots.adopt_loaded(loaded);
         let (before, after) = self.enable_mode1()?;
@@ -754,6 +834,196 @@ impl SourceOwner {
     }
     pub(super) fn adopted_link_count(&self) -> usize {
         self._adopted.len()
+    }
+    /// Borrow one owned map FD for shared injection into the focused
+    /// counter (same kernel map, dup'd FD) or for strict final reads.
+    /// Only maps this owner created are lendable; anything else refuses.
+    pub(super) fn owned_map(
+        &self,
+        name: &str,
+    ) -> Result<std::os::fd::BorrowedFd<'_>, ObservationGap> {
+        use std::os::fd::AsFd as _;
+        self._maps
+            .get(name)
+            .map(|owned| owned.as_fd())
+            .ok_or(ObservationGap::InvalidObject)
+    }
+    fn typed_map_fd(&self, name: &str) -> Result<std::os::fd::RawFd, ObservationGap> {
+        use std::os::fd::AsRawFd as _;
+        self._maps
+            .get(name)
+            .map(|owned| owned.as_raw_fd())
+            .ok_or(ObservationGap::InvalidObject)
+    }
+    /// Program the producer control cell once, before the gate opens: the
+    /// session/cut/admission coordinates (fresh host IDs), initial
+    /// relation/loss epochs, first producer ID, and ADMITTED mode. Refuses
+    /// if already programmed. Single-writer (enablement runs once) under
+    /// the unopened gate, so no writer can race this configuration.
+    pub(super) fn program_producer_control(
+        &mut self,
+    ) -> Result<ProducerControlProgrammed, ObservationGap> {
+        if !self._gate.preparing() {
+            return Err(ObservationGap::Invalidated);
+        }
+        let fd = self.typed_map_fd("ATTRIB_CONTROL")?;
+        let mut current = [0u8; 64];
+        unsafe { ossl_bpf_sys::map_lookup_elem(fd, &0u32.to_ne_bytes(), &mut current) }
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        if current.iter().any(|b| *b != 0) {
+            return Err(ObservationGap::Invalidated);
+        }
+        let session_id = self._ids.fresh()?;
+        let admission_epoch = self._ids.fresh()?;
+        let cut_id = self._ids.fresh()?;
+        let mut value = [0u8; 64];
+        value[0..8].copy_from_slice(&attr_contract::PRODUCER_ADMITTED.to_ne_bytes());
+        value[8..16].copy_from_slice(&session_id.to_ne_bytes());
+        value[16..24].copy_from_slice(&admission_epoch.to_ne_bytes());
+        value[24..32].copy_from_slice(&cut_id.to_ne_bytes());
+        value[32..40].copy_from_slice(&1u64.to_ne_bytes());
+        value[40..48].copy_from_slice(&1u64.to_ne_bytes());
+        value[48..56].copy_from_slice(&1u64.to_ne_bytes());
+        unsafe {
+            ossl_bpf_sys::map_update_elem(fd, &0u32.to_ne_bytes(), &value, ossl_bpf_sys::BPF_ANY)
+        }
+        .map_err(|_| ObservationGap::BpfUnavailable)?;
+        Ok(ProducerControlProgrammed {
+            session_id,
+            admission_epoch,
+            cut_id,
+        })
+    }
+    /// Admit one verified typed site: program its admission, bind, guard
+    /// pair and READY row, all NOEXIST. The caller verified freshness
+    /// (revalidated object, live TGID, armed domain) and mints the cookie,
+    /// site ID and artifact ID; this function binds them to the TGID's
+    /// current domain coordinates and the owner-wide typed epoch. The
+    /// READY row carries the live published sequence (at least 1), so it
+    /// validates exactly the entries admitted from now on.
+    pub(super) fn admit_typed_site(
+        &mut self,
+        request: &TypedAdmissionRequest,
+    ) -> Result<TypedAdmissionReceipts, ObservationGap> {
+        if !self._gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
+        if request.cookie == 0
+            || request.site_id == 0
+            || request.tgid == 0
+            || request.object_id == 0
+        {
+            return Err(ObservationGap::Invalidated);
+        }
+        let (process, image) = self._domains.coordinates(request.tgid)?;
+        let epoch = match self._typed_epoch {
+            Some(epoch) => epoch,
+            None => {
+                let epoch = self._ids.fresh()?;
+                self._typed_epoch = Some(epoch);
+                epoch
+            }
+        };
+        let admission = attr_contract::TypedAdmission::new(
+            request.role_id,
+            request.public_api_id,
+            request.operation,
+            request.function,
+            1,
+            epoch,
+        )
+        .ok_or(ObservationGap::Invalidated)?;
+        if !admission.valid() {
+            return Err(ObservationGap::Invalidated);
+        }
+        let anchor_guard = self._ids.fresh()?;
+        let registration_guard = self._ids.fresh()?;
+        let fd_admission = self.typed_map_fd("TYPED_ADMISSION")?;
+        let fd_bind = self.typed_map_fd("SITE_BIND")?;
+        let fd_guard = self.typed_map_fd("SOURCE_GUARD")?;
+        let fd_rel = self.typed_map_fd("REL")?;
+        let fd_state = self.typed_map_fd("ATTR_STATE")?;
+        let mut site_key = [0u8; 24];
+        site_key[0..8].copy_from_slice(&request.cookie.to_ne_bytes());
+        site_key[8..16].copy_from_slice(&process.to_ne_bytes());
+        site_key[16..24].copy_from_slice(&image.to_ne_bytes());
+        let mut admission_value = [0u8; 32];
+        admission_value[0..4].copy_from_slice(&admission.role_id.to_ne_bytes());
+        admission_value[4..8].copy_from_slice(&admission.public_api_id.to_ne_bytes());
+        admission_value[8..12].copy_from_slice(&admission.operation.to_ne_bytes());
+        admission_value[12..16].copy_from_slice(&admission.function.to_ne_bytes());
+        admission_value[16..24].copy_from_slice(&admission.abi_epoch.to_ne_bytes());
+        admission_value[24..32].copy_from_slice(&admission.source_epoch.to_ne_bytes());
+        unsafe {
+            ossl_bpf_sys::map_update_elem(
+                fd_admission,
+                &site_key,
+                &admission_value,
+                ossl_bpf_sys::BPF_NOEXIST,
+            )
+        }
+        .map_err(|_| ObservationGap::BpfUnavailable)?;
+        let mut bind_value = [0u8; 56];
+        bind_value[0..8].copy_from_slice(&request.site_id.to_ne_bytes());
+        bind_value[8..16].copy_from_slice(&epoch.to_ne_bytes());
+        bind_value[16..24].copy_from_slice(&request.object_id.to_ne_bytes());
+        bind_value[24..56].copy_from_slice(&request.object_sha256);
+        unsafe {
+            ossl_bpf_sys::map_update_elem(
+                fd_bind,
+                &site_key,
+                &bind_value,
+                ossl_bpf_sys::BPF_NOEXIST,
+            )
+        }
+        .map_err(|_| ObservationGap::BpfUnavailable)?;
+        let mut guard_value = [0u8; 16];
+        guard_value[0..8].copy_from_slice(&epoch.to_ne_bytes());
+        guard_value[8..16].copy_from_slice(&contract::GUARD_LIVE.to_ne_bytes());
+        for guard in [anchor_guard, registration_guard] {
+            unsafe {
+                ossl_bpf_sys::map_update_elem(
+                    fd_guard,
+                    &guard.to_ne_bytes(),
+                    &guard_value,
+                    ossl_bpf_sys::BPF_NOEXIST,
+                )
+            }
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        }
+        let mut state = [0u8; 64];
+        unsafe { ossl_bpf_sys::map_lookup_elem(fd_state, &0u32.to_ne_bytes(), &mut state) }
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        let published = u64::from_ne_bytes(state[0..8].try_into().unwrap()).max(1);
+        let mut ready_key = [0u8; 48];
+        ready_key[0..8].copy_from_slice(&process.to_ne_bytes());
+        ready_key[8..16].copy_from_slice(&image.to_ne_bytes());
+        ready_key[24..32].copy_from_slice(&request.cookie.to_ne_bytes());
+        ready_key[32..40].copy_from_slice(&epoch.to_ne_bytes());
+        ready_key[40..44].copy_from_slice(&contract::SOURCE_READY.to_ne_bytes());
+        let mut ready_value = [0u8; 256];
+        ready_value[16..24].copy_from_slice(&epoch.to_ne_bytes());
+        ready_value[40..44].copy_from_slice(&attr_contract::REL_WITNESS.to_ne_bytes());
+        ready_value[48..56].copy_from_slice(&anchor_guard.to_ne_bytes());
+        ready_value[56..64].copy_from_slice(&registration_guard.to_ne_bytes());
+        ready_value[64..72].copy_from_slice(&published.to_ne_bytes());
+        unsafe {
+            ossl_bpf_sys::map_update_elem(
+                fd_rel,
+                &ready_key,
+                &ready_value,
+                ossl_bpf_sys::BPF_NOEXIST,
+            )
+        }
+        .map_err(|_| ObservationGap::BpfUnavailable)?;
+        Ok(TypedAdmissionReceipts {
+            cookie: request.cookie,
+            site_id: request.site_id,
+            source_epoch: epoch,
+            ready_sequence: published,
+            process_incarnation: process,
+            image_epoch: image,
+        })
     }
     /// Test-only close-failure injection: the next guard retirement in
     /// `close_source` fails with `BpfUnavailable`, exercising the
@@ -846,17 +1116,29 @@ impl SourceOwner {
             .map_err(|_| ObservationGap::BpfUnavailable)?;
         Ok(observer.state)
     }
+    /// Programmed control coordinates for the final cut cross-check.
+    pub(super) fn control_programmed(&self) -> Option<&ProducerControlProgrammed> {
+        self._control.as_ref()
+    }
+    /// Borrow one loaded typed program FD for per-export attach.
+    pub(super) fn typed_program_fd(
+        &self,
+        name: &str,
+    ) -> Result<std::os::fd::BorrowedFd<'_>, ObservationGap> {
+        self._roots.typed_program(name)
+    }
     /// Post-hoc pre-open enablement receipts. Test-called only.
     #[allow(dead_code)]
     pub(super) fn roots_enabled_receipts(&self) -> Option<RootsEnabled> {
         let (before, after) = self._mode?;
-        let (programs, links, lifecycle) = self._roots.loaded_counts();
+        let (programs, links, lifecycle, typed_programs) = self._roots.loaded_counts();
         Some(RootsEnabled {
             programs,
             links,
             lifecycle,
             mode_before: before,
             mode_after: after,
+            typed_programs,
         })
     }
     /// Last retained native diagnostic, taken by the qualification harness
@@ -1525,15 +1807,67 @@ mod tests {
         assert_eq!(params.child_pid(), 4242);
     }
     #[test]
+    fn producer_map_tables_share_single_source_shapes() {
+        // REL exists both as MAPS[0] and PRODUCER_MAPS[0]: same shape.
+        for (a, b) in [(&MAPS[0], &loader::PRODUCER_MAPS[0])] {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.map_type, b.map_type);
+            assert_eq!(a.key_size, b.key_size);
+            assert_eq!(a.value_size, b.value_size);
+            assert_eq!(a.max_entries, b.max_entries);
+            assert_eq!(a.flags, b.flags);
+        }
+        // The focused table duplicates the 8 session-owned source/control
+        // shapes (invisible to loader as `pub(super)`): guard the copy.
+        for name in [
+            "ATTR_STATE",
+            "SOURCE_CONFIG",
+            "SOURCE_GUARD",
+            "SOURCE_REQUEST",
+            "SOURCE_PAIR",
+            "SOURCE_DOMAIN",
+            "SOURCE_OBSERVER",
+            "ITER_SLOT",
+        ] {
+            let focused = loader::FOCUSED_COUNT_MAPS
+                .iter()
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("focused table missing {name}"));
+            let owned = MAPS
+                .iter()
+                .chain(CONTROL_MAPS.iter())
+                .find(|m| m.name == name)
+                .unwrap_or_else(|| panic!("owner table missing {name}"));
+            assert_eq!(focused.map_type, owned.map_type, "{name}");
+            assert_eq!(focused.key_size, owned.key_size, "{name}");
+            assert_eq!(focused.value_size, owned.value_size, "{name}");
+            assert_eq!(focused.max_entries, owned.max_entries, "{name}");
+            assert_eq!(focused.flags, owned.flags, "{name}");
+        }
+        // Every producer map the counter borrows is session-owned.
+        for name in loader::BORROWED_COUNT_MAPS {
+            assert!(
+                MAPS.iter()
+                    .chain(CONTROL_MAPS.iter())
+                    .any(|m| m.name == name),
+                "borrowed {name} has no session owner"
+            );
+        }
+    }
+    #[test]
     fn source_capacity_includes_actual_maps_and_declared_iterator_reserve() {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
         // ITER_SLOT carries two per-CPU cells (scratch + commit-tail block):
         // the second cell adds exactly 4 + 264*16 + 128 = 4356 bytes.
-        assert_eq!(map_reservation(16), Some(6_280_384));
+        // The 11 producer maps beyond REL add 11,266,276 bytes at 16
+        // CPUs (per-map: (key + value*cpus + 128) * entries + 65536).
+        assert_eq!(map_reservation(16), Some(17_546_660));
         // The acquisition core adds its NoOp/program/link owner, ledger,
-        // domain-index, order and allocator reserves to the component charge.
-        assert_eq!(ACQUIRE_CORE_RESERVE, 602_120);
-        assert_eq!(source_reservation(512, 16), Some(13_341_896));
+        // domain-index, order and allocator reserves to the component charge,
+        // plus the two unattached typed roots (programs only, links come
+        // per admitted export): 602_120 + 2 * 32768.
+        assert_eq!(ACQUIRE_CORE_RESERVE, 667_656);
+        assert_eq!(source_reservation(512, 16), Some(24_673_708));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());
@@ -1594,16 +1928,18 @@ mod tests {
     fn anchor_test_owner(budget: &ObservationBudget) -> SourceOwner {
         let prepared = loader::Prepared {
             progs: [
-                ("source_reg_in", "fentry/uprobe_register"),
-                ("source_reg_out", "fexit/uprobe_register"),
-                ("attr_exit", "raw_tracepoint/sched_process_exit"),
-                ("attr_exec", "raw_tracepoint/sched_process_exec"),
+                ("source_reg_in", "fentry/uprobe_register", false),
+                ("source_reg_out", "fexit/uprobe_register", false),
+                ("attr_exit", "raw_tracepoint/sched_process_exit", false),
+                ("attr_exec", "raw_tracepoint/sched_process_exec", false),
+                ("typed_entry", "uprobe", false),
+                ("typed_return", "uretprobe", true),
             ]
             .into_iter()
-            .map(|(name, section)| loader::PreparedProg {
+            .map(|(name, section, is_return)| loader::PreparedProg {
                 name: name.to_owned(),
                 section: section.to_owned(),
-                is_return: false,
+                is_return,
                 insns: Vec::new(),
                 map_fixups: vec![loader::MapFixup {
                     insn_off: 0,
@@ -1635,6 +1971,8 @@ mod tests {
             _registration_ids: Vec::new(),
             _domain_tgids: Vec::new(),
             _mode: None,
+            _typed_epoch: None,
+            _control: None,
             _fail_next_retire: std::cell::Cell::new(false),
             _last_error: None,
             _maps: BTreeMap::new(),
@@ -1781,5 +2119,104 @@ mod tests {
             decode_object_hash_hex(&empty).unwrap()[..4],
             [0xe3, 0xb0, 0xc4, 0x42]
         );
+    }
+    /// P2 host-verifier proof: every producer program passes the running
+    /// kernel's verifier through the repo loader, before any attach. Loads
+    /// the legacy observation pair, prepares the source owner (maps only),
+    /// loads the typed entry/return pair against borrowed maps, and loads
+    /// the count root against the shared producer pool. Creates maps and
+    /// unattached programs only: no links, no pins, no target processes,
+    /// no gate opening. The registration half is split out and counted but
+    /// deliberately never loaded (its loader attaches).
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     p2_typed_producer_passes_verifier_load --nocapture
+    /// ```
+    #[test]
+    #[ignore = "loads BPF objects into the host kernel verifier (sudo, no attach)"]
+    fn p2_typed_producer_passes_verifier_load() {
+        use sha2::Digest as _;
+        use std::collections::BTreeMap;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let provider =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        println!(
+            "provider sha256={} len={} count sha256={} len={}",
+            hex(&sha2::Sha256::digest(&provider)),
+            provider.len(),
+            hex(&sha2::Sha256::digest(&count)),
+            count.len()
+        );
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let mut budget = ObservationBudget::new(super::super::ObservationLimits::default());
+        budget.memory = Some(pool.clone());
+        let gate = WriterGate::create(&pool).unwrap();
+        assert!(gate.preparing());
+        // Legacy half: observation_entry + observation_return. The gated
+        // loader attaches lifecycle links only for lifecycle roots, and the
+        // legacy split holds none, so this load is programs-only.
+        let legacy =
+            crate::provider_observation::session::prepare_legacy_object(&provider).unwrap();
+        assert_eq!(legacy.progs.len(), 2);
+        let loaded = loader::load_gated(&legacy, &gate).unwrap();
+        assert!(loaded.progs.contains_key("observation_entry"));
+        assert!(loaded.progs.contains_key("observation_return"));
+        assert_eq!(loaded.progs.len(), 2);
+        // Source half: owner prepares maps only (no program loads).
+        let full = crate::provider_observation::session::prepare_object(&provider).unwrap();
+        let (_, mut source_prepared) =
+            crate::provider_observation::session::split_source_preparation(full);
+        let kernel = loader::SourceKernel::read(&budget).unwrap();
+        kernel.patch(&mut source_prepared).unwrap();
+        let owner = SourceOwner::prepare(
+            &budget,
+            &kernel,
+            &gate,
+            &loaded,
+            &mut source_prepared,
+            Instant::now() + Duration::from_secs(60),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        // Core proof: the typed pair loads against borrowed maps. The
+        // verifier runs inside `load_prog`; any rejection fails here.
+        let (registration, typed) =
+            loader::split_typed_preparation(owner._roots.prepared().clone()).unwrap();
+        assert_eq!(
+            registration.progs.len(),
+            4,
+            "registration half stays unloaded"
+        );
+        assert_eq!(typed.progs.len(), 2);
+        let typed_programs =
+            loader::load_typed_borrowed(&typed, &owner._maps, &loaded, &owner._gate).unwrap();
+        assert!(typed_programs.contains_key("typed_entry"));
+        assert!(typed_programs.contains_key("typed_return"));
+        assert_eq!(typed_programs.len(), 2);
+        // Count side through the shared P2 path: every borrowed name must
+        // resolve to the same kernel maps the owner holds.
+        let count_prepared = loader::prepare_focused_count(&count).unwrap();
+        let mut borrowed = BTreeMap::new();
+        for name in loader::BORROWED_COUNT_MAPS {
+            borrowed.insert(name.to_string(), owner.owned_map(name).unwrap());
+        }
+        let count_loaded = loader::load_gated_borrowed(&count_prepared, &gate, &borrowed).unwrap();
+        assert!(count_loaded.progs.contains_key("count_entry"));
+        assert_eq!(count_loaded.progs.len(), 1);
+        // Tripwire: the gate was never opened, so no attach path that
+        // requires the open gate could have run. (No link/pin primitive is
+        // called above by construction; this asserts the visible half.)
+        assert!(gate.preparing());
+        drop(count_loaded);
+        drop(typed_programs);
+        drop(owner);
+        drop(loaded);
     }
 }

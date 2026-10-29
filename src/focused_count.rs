@@ -241,6 +241,30 @@ impl FocusedCounter {
         limits: CountLimits,
         gate: crate::writer_gate::WriterGate,
     ) -> Result<Self, CountFailure> {
+        Self::open_gated_inner(bytes, pid, namespace, limits, gate, None)
+    }
+    /// Open against session-borrowed producer/source maps (same kernel
+    /// maps, dup'd FDs) instead of creating private ones. Every borrowed
+    /// name must resolve; anything else refuses. The producer stays inert
+    /// until the session admits typed sites.
+    pub(crate) fn open_gated_shared(
+        bytes: &[u8],
+        pid: u32,
+        namespace: NamespaceId,
+        limits: CountLimits,
+        gate: crate::writer_gate::WriterGate,
+        borrowed: &std::collections::BTreeMap<String, std::os::fd::BorrowedFd<'_>>,
+    ) -> Result<Self, CountFailure> {
+        Self::open_gated_inner(bytes, pid, namespace, limits, gate, Some(borrowed))
+    }
+    fn open_gated_inner(
+        bytes: &[u8],
+        pid: u32,
+        namespace: NamespaceId,
+        limits: CountLimits,
+        gate: crate::writer_gate::WriterGate,
+        borrowed: Option<&std::collections::BTreeMap<String, std::os::fd::BorrowedFd<'_>>>,
+    ) -> Result<Self, CountFailure> {
         limits.validate()?;
         if pid == 0 {
             return Err(CountFailure::Identity);
@@ -271,7 +295,11 @@ impl FocusedCounter {
         )?;
         let ns = File::open("/proc/self/ns/pid").map_err(|_| CountFailure::Namespace)?;
         validate_namespace(&ns, namespace)?;
-        let loaded = loader::load_gated(&prepared, &gate).map_err(|_| CountFailure::Object)?;
+        let loaded = match borrowed {
+            Some(borrowed) => loader::load_gated_borrowed(&prepared, &gate, borrowed),
+            None => loader::load_gated(&prepared, &gate),
+        }
+        .map_err(|_| CountFailure::Object)?;
         // Inspect actual kernel FDs before every typed-sized IO, including init.
         for shape in loader::FOCUSED_COUNT_MAPS {
             checked_map(&loaded, shape.name)?;
@@ -308,6 +336,9 @@ impl FocusedCounter {
         counter.write("TARGET", 0, &(pid as u64).to_ne_bytes())?;
         counter.retired = false;
         Ok(counter)
+    }
+    pub(crate) fn cpus(&self) -> usize {
+        self.cpus
     }
     fn write(&self, name: &str, key: u32, value: &[u8]) -> Result<(), CountFailure> {
         if !self.gate.admitting() {
@@ -423,7 +454,7 @@ impl FocusedCounter {
         candidates: Vec<CountCandidate>,
         installed_ns: u64,
     ) -> Result<(), CountFailure> {
-        self.attach_candidates_with_control(candidates, installed_ns, None)
+        self.attach_candidates_with_control(candidates, installed_ns, None, None)
     }
     pub(crate) fn attach_candidates_controlled(
         &mut self,
@@ -432,15 +463,41 @@ impl FocusedCounter {
         deadline: Instant,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<(), CountFailure> {
-        self.attach_candidates_with_control(candidates, installed_ns, Some((deadline, cancel)))
+        self.attach_candidates_with_control(
+            candidates,
+            installed_ns,
+            Some((deadline, cancel)),
+            None,
+        )
+    }
+    /// Attach with optional session-pinned cookies: sites present in `pins`
+    /// attach under the session's cookie for the same physical site, so
+    /// both programs resolve one SITE_BIND row. Absent or out-of-range
+    /// pins fall back to counter-minted cookies (physical evidence
+    /// preserved; the site stays unattributed).
+    pub(crate) fn attach_candidates_pinned(
+        &mut self,
+        candidates: Vec<CountCandidate>,
+        installed_ns: u64,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+        pins: &std::collections::BTreeMap<(u64, u64, u64), u64>,
+    ) -> Result<(), CountFailure> {
+        self.attach_candidates_with_control(
+            candidates,
+            installed_ns,
+            Some((deadline, cancel)),
+            Some(pins),
+        )
     }
     fn attach_candidates_with_control(
         &mut self,
         candidates: Vec<CountCandidate>,
         installed_ns: u64,
         control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
+        pins: Option<&std::collections::BTreeMap<(u64, u64, u64), u64>>,
     ) -> Result<(), CountFailure> {
-        let result = self.attach_candidates_inner(candidates, installed_ns, control);
+        let result = self.attach_candidates_inner(candidates, installed_ns, control, pins);
         if let Err(e) = result {
             if e != CountFailure::Deferred {
                 self.failure(e);
@@ -456,6 +513,7 @@ impl FocusedCounter {
         candidates: Vec<CountCandidate>,
         installed_ns: u64,
         control: Option<(Instant, &std::sync::atomic::AtomicBool)>,
+        pins: Option<&std::collections::BTreeMap<(u64, u64, u64), u64>>,
     ) -> Result<(), CountFailure> {
         if !self.gate.admitting() {
             return Err(CountFailure::Close);
@@ -650,11 +708,24 @@ impl FocusedCounter {
                         .extend(count_binding(c, installed_ns).candidates);
                 }
                 let key = binding.site.clone();
-                let (cookie, generation) = planned.attach(binding, |cookie, _| {
-                    offsets.push(offset);
-                    cookies.push(cookie as u64);
-                    Ok(())
-                })?;
+                let pinned = pins
+                    .and_then(|pins| pins.get(&(key.device, key.inode, key.offset)).copied())
+                    .and_then(|cookie| u32::try_from(cookie).ok());
+                if pins.is_some() && pinned.is_none() {
+                    planned.gap("typed_pin_missing");
+                }
+                let (cookie, generation) = match pinned {
+                    Some(cookie) => planned.attach_pinned(binding, cookie, |cookie, _| {
+                        offsets.push(offset);
+                        cookies.push(cookie as u64);
+                        Ok(())
+                    })?,
+                    None => planned.attach(binding, |cookie, _| {
+                        offsets.push(offset);
+                        cookies.push(cookie as u64);
+                        Ok(())
+                    })?,
+                };
                 for c in group {
                     metadata.push((
                         cookie,

@@ -42,10 +42,12 @@ const LOSS_PAIR: u32 = 2;
 const LOSS_POISON: u32 = 3;
 const LOSS_CONFLICT: u32 = 4;
 
-/// Zero 304-byte pending frame staged in `.rodata`, so inserts never
-/// materialize a frame on the 512-byte stack. All-zero is valid: every field
-/// is numeric and zero means absent/empty.
-static ZERO_FRAME: BindPendingValue = unsafe { core::mem::zeroed() };
+// Zero 304-byte pending frame, materialized on the stack at the single
+// insert site in `stage_frame`. All-zero is valid: every field is numeric
+// and zero means absent/empty. A `.rodata` static would be cheaper, but
+// the loader accepts no data-section relocations (every `ld_imm64` reloc
+// must name a map or a subprogram), so the frame lives on the stack; the
+// verifier checks the depth on every load.
 
 #[inline(always)]
 unsafe fn ordered_read(pointer: *mut u64) -> u64 {
@@ -84,7 +86,7 @@ fn loss(cell: u32) {
 /// Resolved target-domain coordinates for one typed read. The entry sequence
 /// is captured before any attribution decision or physical mutation; every
 /// selected owner and dependency must already be published in that snapshot.
-struct Target {
+pub(crate) struct Target {
     process: u64,
     image: u64,
     relation: u64,
@@ -107,7 +109,7 @@ fn split_ids(packed: u64) -> (u32, u32) {
 
 /// Pending-frame staging parameters: one struct so the staging call keeps a
 /// single register argument.
-struct StageParams<'a> {
+pub(crate) struct StageParams<'a> {
     target: &'a Target,
     thread: u64,
     cookie: u64,
@@ -117,7 +119,7 @@ struct StageParams<'a> {
 }
 
 /// Tombstone parameters, built inside the inlined quarantine wrapper.
-struct Tombstone<'a> {
+pub(crate) struct Tombstone<'a> {
     control: *mut ProducerControl,
     target: &'a Target,
     handle: u64,
@@ -173,7 +175,7 @@ const PLAN_SELECTOR_RELATION: usize = 232;
 /// FIRST, before any cell-0 staging use, and never writes cell 1.
 const TAIL_SLOT: u32 = 1;
 #[repr(C)]
-struct TailArgs {
+pub(crate) struct TailArgs {
     process: u64,
     image: u64,
     relation: u64,
@@ -228,13 +230,34 @@ fn control_cell() -> Option<*mut ProducerControl> {
 /// The entry sequence is captured here for typed entry/return paths; the
 /// operational path passes the sequence its handler captured before the
 /// physical store, so dependencies must predate the hit itself.
+#[inline(always)]
 fn resolve_target(tgid: u32) -> Option<Target> {
     let state = crate::shared_maps::ATTR_STATE.get_ptr_mut(0)?;
     let entry_seq = unsafe { ordered_read(addr_of_mut!((*state).published_sequence)) };
-    resolve_inner(tgid, entry_seq)
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if resolve_inner(tgid, entry_seq, &mut target) {
+        Some(target)
+    } else {
+        None
+    }
 }
 
-fn resolve_inner(tgid: u32, entry_seq: u64) -> Option<Target> {
+#[no_mangle]
+pub fn resolve_inner(tgid: u32, entry_seq: u64, out: &mut Target) -> bool {
+    match resolve_inner_opt(tgid, entry_seq) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn resolve_inner_opt(tgid: u32, entry_seq: u64) -> Option<Target> {
     let control = control_cell()?;
     let admitted = unsafe {
         (*control).producer_mode == PRODUCER_ADMITTED
@@ -279,6 +302,7 @@ fn resolve_inner(tgid: u32, entry_seq: u64) -> Option<Target> {
 /// Retirement-only process lookup: no state or mode gate, so exit/exec roots
 /// retire rows in every domain state. A missing domain means this TGID never
 /// held producer state, so there is nothing to retire.
+#[inline(always)]
 fn process_of(tgid: u32) -> Option<u64> {
     let domain = SOURCE_DOMAIN.get_ptr_mut(&tgid)?;
     let process = unsafe { (*domain).process_incarnation };
@@ -288,7 +312,22 @@ fn process_of(tgid: u32) -> Option<u64> {
 /// Allocate one fresh nonzero observer ID from the session allocator. IDs are
 /// never derived from pointers or hashes and never reused; wrap poisons the
 /// producer terminally instead of recycling an ID.
-fn alloc_id(control: *mut ProducerControl) -> Option<u64> {
+#[no_mangle]
+pub fn alloc_id(control: *mut ProducerControl, out: &mut u64) -> bool {
+    match alloc_id_opt(control) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn alloc_id_opt(control: *mut ProducerControl) -> Option<u64> {
     let next = unsafe { addr_of_mut!((*control).next_producer_id) };
     let mut current = unsafe { ordered_read(next) };
     for _ in 0..8 {
@@ -316,7 +355,8 @@ fn alloc_id(control: *mut ProducerControl) -> Option<u64> {
 /// the shared 8192 budget on `ATTR_STATE.relationship_claims`, the same
 /// counter the source publisher charges. Failed or partial work never
 /// refunds; exhaustion fails the transaction, never evicts silently.
-fn spend(amount: u64) -> bool {
+#[no_mangle]
+pub fn spend(amount: u64) -> bool {
     if amount == 0 || amount > MAX_RELATIONSHIPS as u64 {
         return false;
     }
@@ -351,7 +391,8 @@ fn spend(amount: u64) -> bool {
 /// becomes unreachable for new positives while already emitted partitions
 /// stay immutable. A contended lock poisons by terminal mode instead, which
 /// is strictly stronger. Already-terminal control stays quiet.
-fn poison_domain() {
+#[no_mangle]
+pub fn poison_domain() {
     loss(LOSS_POISON);
     let Some(control) = control_cell() else {
         return;
@@ -465,7 +506,8 @@ fn admission_ptr(cookie: u64, target: &Target) -> Option<*mut TypedAdmission> {
 /// Source authority for one site: its immutable `SOURCE_READY` row plus both
 /// guards `LIVE`, with the ready publication at or before the captured entry
 /// sequence so an old callback can never pick up later readiness.
-fn ready_and_guards(cookie: u64, source_epoch: u64, entry_seq: u64, target: &Target) -> bool {
+#[no_mangle]
+pub fn ready_and_guards(cookie: u64, source_epoch: u64, entry_seq: u64, target: &Target) -> bool {
     if cookie == 0 || source_epoch == 0 {
         return false;
     }
@@ -509,7 +551,27 @@ fn ready_and_guards(cookie: u64, source_epoch: u64, entry_seq: u64, target: &Tar
 /// seen or its image changed. Stale rows are removed, never reused. A racing
 /// exit may delete our fresh row before use; the next read re-allocates from
 /// the monotonic allocator, so incarnations are never recycled.
-fn thread_incarnation(control: *mut ProducerControl, target: &Target, tid: u32) -> Option<u64> {
+#[no_mangle]
+pub fn thread_incarnation(
+    control: *mut ProducerControl,
+    target: &Target,
+    tid: u32,
+    out: &mut u64,
+) -> bool {
+    match thread_incarnation_opt(control, target, tid) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn thread_incarnation_opt(control: *mut ProducerControl, target: &Target, tid: u32) -> Option<u64> {
     if tid == 0 {
         return None;
     }
@@ -527,7 +589,10 @@ fn thread_incarnation(control: *mut ProducerControl, target: &Target, tid: u32) 
     if !spend(1) {
         return None;
     }
-    let id = alloc_id(control)?;
+    let mut id = 0u64;
+    if !alloc_id(control, &mut id) {
+        return None;
+    }
     let value = ThreadIdentityValue {
         thread_incarnation: id,
         image_epoch: target.image,
@@ -549,7 +614,25 @@ fn thread_incarnation(control: *mut ProducerControl, target: &Target, tid: u32) 
 /// stuck frame (lost return) degrades its thread toward depth refusal instead
 /// of corrupting a later transaction. The shared pending quota is claimed
 /// before insertion and refunded only when no frame was created.
-fn stage_frame(params: &StageParams) -> Option<(BindPendingKey, *mut BindPendingValue)> {
+#[no_mangle]
+pub fn stage_frame(
+    params: &StageParams,
+    out: &mut (BindPendingKey, *mut BindPendingValue),
+) -> bool {
+    match stage_frame_opt(params) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn stage_frame_opt(params: &StageParams) -> Option<(BindPendingKey, *mut BindPendingValue)> {
     if params.thread == 0 || params.cookie == 0 || params.occurrence == 0 {
         return None;
     }
@@ -568,7 +651,8 @@ fn stage_frame(params: &StageParams) -> Option<(BindPendingKey, *mut BindPending
             loss(LOSS_MAP);
             return None;
         }
-        if BIND_PENDING.insert(&key, &ZERO_FRAME, BPF_NOEXIST).is_err() {
+        let zero_frame: BindPendingValue = unsafe { core::mem::zeroed() };
+        if BIND_PENDING.insert(&key, &zero_frame, BPF_NOEXIST).is_err() {
             let _ = crate::source_state::release_pending();
             continue;
         }
@@ -594,6 +678,7 @@ fn stage_frame(params: &StageParams) -> Option<(BindPendingKey, *mut BindPending
 /// Pop the deepest frame for this (thread, cookie): by slot-exclusion that is
 /// the innermost live call with this cookie, hence the returning call. The
 /// caller validates the frame and always consumes it with `release_frame`.
+#[inline(always)]
 fn pop_frame(
     target: &Target,
     thread: u64,
@@ -710,7 +795,8 @@ fn quarantine_key(target: &Target, handle: u64, domain: u64) -> RelKey {
 /// A quarantine marker exists for this handle: any state except absent means
 /// the handle can never certify again in this process/image. Tombstones
 /// survive free, refetch, reset and relation/loss epoch changes.
-fn quarantined(target: &Target, handle: u64, domain: u64) -> bool {
+#[no_mangle]
+pub fn quarantined(target: &Target, handle: u64, domain: u64) -> bool {
     if handle == 0 {
         return true;
     }
@@ -723,7 +809,8 @@ fn quarantined(target: &Target, handle: u64, domain: u64) -> bool {
 /// false, because an unrecorded required marker must never leave stale
 /// eligibility behind. Poisoning lives with the caller (not nested here)
 /// to keep the deepest BPF call chain inside the 512-byte stack.
-fn quarantine(tomb: &Tombstone) -> bool {
+#[no_mangle]
+pub fn quarantine(tomb: &Tombstone) -> bool {
     if tomb.handle == 0 || tomb.reason == 0 || tomb.occurrence == 0 {
         return false;
     }
@@ -734,9 +821,10 @@ fn quarantine(tomb: &Tombstone) -> bool {
     if !spend(1) {
         return false;
     }
-    let Some(id) = alloc_id(tomb.control) else {
+    let mut id = 0u64;
+    if !alloc_id(tomb.control, &mut id) {
         return false;
-    };
+    }
     let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
         return false;
     };
@@ -799,7 +887,8 @@ fn must_quarantine(
 /// Retire the live METHOD row for (method, family) at entry of the matching
 /// method-free role. Committed owners survive under their own context-owned
 /// reference; ambiguity tombstones are preserved, never cleared.
-fn retire_method(target: &Target, method: u64, family: u32) {
+#[no_mangle]
+pub fn retire_method(target: &Target, method: u64, family: u32) {
     if method == 0 || !matches!(family, 3 | 4) {
         return;
     }
@@ -810,6 +899,7 @@ fn retire_method(target: &Target, method: u64, family: u32) {
 
 /// Resolve the committed-or-pending index row for X or U. Retired rows are
 /// reported as absent: only live claims collide or resolve.
+#[inline(always)]
 fn live_index(target: &Target, kind: u32, handle: u64) -> Option<*mut RelValue> {
     if handle == 0 || !matches!(kind, REL_X_INDEX | REL_U_INDEX) {
         return None;
@@ -831,7 +921,8 @@ fn live_index(target: &Target, kind: u32, handle: u64) -> Option<*mut RelValue> 
 /// Retire the owner reachable from a live X or U index row: the owner row, the
 /// X row and the U row all retire together before the invalidator's target
 /// body runs. Missing rows are quiet; quarantine is preserved.
-fn retire_owner_reachable(target: &Target, kind: u32, handle: u64) {
+#[no_mangle]
+pub fn retire_owner_reachable(target: &Target, kind: u32, handle: u64) {
     let Some(index) = live_index(target, kind, handle) else {
         return;
     };
@@ -926,7 +1017,10 @@ fn intern_request(
     if !spend(2) {
         return None;
     }
-    let id = alloc_id(control)?;
+    let mut id = 0u64;
+    if !alloc_id(control, &mut id) {
+        return None;
+    }
     // Same lock-free staging rationale as `quarantine`: request rows are
     // immutable session facts published with NOEXIST, never hashed here.
     let staging = unsafe { (*slot).staging.as_mut_ptr().cast::<RelValue>() };
@@ -1069,11 +1163,18 @@ pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns
 /// unresolved (recorded as null, never labeled global) while full-domain
 /// poison on any libctx teardown keeps the lifetime guard sound.
 #[inline(never)]
-fn fetch_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entry_seq: u64) -> u32 {
+#[no_mangle]
+pub fn fetch_entry(
+    ctx: &ProbeContext,
+    control: *mut ProducerControl,
+    ids: u64,
+    entry_seq: u64,
+) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return 0;
-    };
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some(admitted) = admission(cookie, &target) else {
         return 0;
@@ -1081,12 +1182,14 @@ fn fetch_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entr
     if !admitted.valid() || !matches!(admitted.role_id, 130 | 131) {
         return 0;
     }
-    let Some(thread) = thread_incarnation(control, &target, tid) else {
+    let mut thread = 0u64;
+    if !thread_incarnation(control, &target, tid, &mut thread) {
         return 0;
-    };
-    let Some(occurrence) = alloc_id(control) else {
+    }
+    let mut occurrence = 0u64;
+    if !alloc_id(control, &mut occurrence) {
         return 0;
-    };
+    }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
         target: &target,
@@ -1096,9 +1199,11 @@ fn fetch_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entr
         occurrence,
         now_ns,
     };
-    let Some((_, frame)) = stage_frame(&params) else {
+    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    if !stage_frame(&params, &mut staged) {
         return 0;
-    };
+    }
+    let frame = staged.1;
     unsafe {
         (*frame).entry_handle = ctx.arg(0).unwrap_or(0);
     }
@@ -1122,16 +1227,18 @@ fn fetch_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entr
 /// a live observed METHOD row for this family, with no ambiguity tombstone.
 /// Unknown, retired, ambiguous or poisoned methods refuse the transaction.
 #[inline(never)]
-fn ctx_new_entry(
+#[no_mangle]
+pub fn ctx_new_entry(
     ctx: &ProbeContext,
     control: *mut ProducerControl,
     ids: u64,
     entry_seq: u64,
 ) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return 0;
-    };
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some(admitted) = admission(cookie, &target) else {
         return 0;
@@ -1162,12 +1269,14 @@ fn ctx_new_entry(
     {
         return 0;
     }
-    let Some(thread) = thread_incarnation(control, &target, tid) else {
+    let mut thread = 0u64;
+    if !thread_incarnation(control, &target, tid, &mut thread) {
         return 0;
-    };
-    let Some(occurrence) = alloc_id(control) else {
+    }
+    let mut occurrence = 0u64;
+    if !alloc_id(control, &mut occurrence) {
         return 0;
-    };
+    }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
         target: &target,
@@ -1177,9 +1286,11 @@ fn ctx_new_entry(
         occurrence,
         now_ns,
     };
-    let Some((_, frame)) = stage_frame(&params) else {
+    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    if !stage_frame(&params, &mut staged) {
         return 0;
-    };
+    }
+    let frame = staged.1;
     unsafe {
         (*frame).entry_handle = method;
         (*frame).method_observation_id = witness;
@@ -1192,11 +1303,18 @@ fn ctx_new_entry(
 /// destination stays unresolved (no positive propagation); the return path
 /// only enforces collision invalidation.
 #[inline(never)]
-fn dup_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entry_seq: u64) -> u32 {
+#[no_mangle]
+pub fn dup_entry(
+    ctx: &ProbeContext,
+    control: *mut ProducerControl,
+    ids: u64,
+    entry_seq: u64,
+) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return 0;
-    };
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some(admitted) = admission(cookie, &target) else {
         return 0;
@@ -1208,12 +1326,14 @@ fn dup_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entry_
     if source == 0 {
         return 0;
     }
-    let Some(thread) = thread_incarnation(control, &target, tid) else {
+    let mut thread = 0u64;
+    if !thread_incarnation(control, &target, tid, &mut thread) {
         return 0;
-    };
-    let Some(occurrence) = alloc_id(control) else {
+    }
+    let mut occurrence = 0u64;
+    if !alloc_id(control, &mut occurrence) {
         return 0;
-    };
+    }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
         target: &target,
@@ -1223,9 +1343,11 @@ fn dup_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entry_
         occurrence,
         now_ns,
     };
-    let Some((_, frame)) = stage_frame(&params) else {
+    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    if !stage_frame(&params, &mut staged) {
         return 0;
-    };
+    }
+    let frame = staged.1;
     unsafe {
         (*frame).entry_handle = source;
     }
@@ -1238,11 +1360,18 @@ fn dup_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entry_
 /// parent API role. Standalone children (no enclosing parent) stage with no
 /// parent link; their returns stay unresolved.
 #[inline(never)]
-fn child_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entry_seq: u64) -> u32 {
+#[no_mangle]
+pub fn child_entry(
+    ctx: &ProbeContext,
+    control: *mut ProducerControl,
+    ids: u64,
+    entry_seq: u64,
+) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return 0;
-    };
+    }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some(admitted) = admission(cookie, &target) else {
         return 0;
@@ -1254,12 +1383,14 @@ fn child_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entr
     if arg0 == 0 {
         return 0;
     }
-    let Some(thread) = thread_incarnation(control, &target, tid) else {
+    let mut thread = 0u64;
+    if !thread_incarnation(control, &target, tid, &mut thread) {
         return 0;
-    };
-    let Some(occurrence) = alloc_id(control) else {
+    }
+    let mut occurrence = 0u64;
+    if !alloc_id(control, &mut occurrence) {
         return 0;
-    };
+    }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
         target: &target,
@@ -1269,9 +1400,11 @@ fn child_entry(ctx: &ProbeContext, control: *mut ProducerControl, ids: u64, entr
         occurrence,
         now_ns,
     };
-    let Some((key, frame)) = stage_frame(&params) else {
+    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    if !stage_frame(&params, &mut staged) {
         return 0;
-    };
+    }
+    let (key, frame) = staged;
     unsafe {
         (*frame).entry_handle = arg0;
         if matches!(admitted.role_id, 258 | 259 | 290 | 291) {
@@ -1425,7 +1558,8 @@ pub fn typed_return(ctx: &RetProbeContext, cookie: u64, tgid: u32, tid: u32, _no
 /// observed spellings for one method create a persistent ambiguity tombstone
 /// and revoke the association; free/refetch can never restore uniqueness.
 #[inline(never)]
-fn fetch_return(
+#[no_mangle]
+pub fn fetch_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
@@ -1433,9 +1567,10 @@ fn fetch_return(
     entry_seq: u64,
 ) {
     let (tgid, _) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return;
-    };
+    }
     let method: u64 = ctx.ret();
     if method == 0 {
         return;
@@ -1502,9 +1637,10 @@ fn fetch_return(
     if !spend(1) {
         return;
     }
-    let Some(id) = alloc_id(control) else {
+    let mut id = 0u64;
+    if !alloc_id(control, &mut id) {
         return;
-    };
+    }
     let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
         return;
     };
@@ -1549,9 +1685,10 @@ fn publish_ambiguity(
     if !spend(1) {
         return false;
     }
-    let Some(id) = alloc_id(control) else {
+    let mut id = 0u64;
+    if !alloc_id(control, &mut id) {
         return false;
-    };
+    }
     let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
         return false;
     };
@@ -1576,7 +1713,27 @@ fn publish_ambiguity(
 /// Resolve the linked public parent frame for a child return, validating the
 /// stored parent occurrence against the live parent row. Occurrence IDs are
 /// session-unique, so a full depth scan is unambiguous.
-fn child_parent(
+#[no_mangle]
+pub fn child_parent(
+    target: &Target,
+    thread: u64,
+    frame: *mut BindPendingValue,
+    out: &mut *mut BindPendingValue,
+) -> bool {
+    match child_parent_opt(target, thread, frame) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn child_parent_opt(
     target: &Target,
     thread: u64,
     frame: *mut BindPendingValue,
@@ -1606,6 +1763,7 @@ fn child_parent(
 
 /// Current thread incarnation for a handler that only knows its packed IDs.
 /// Refuses stale images and zero rows exactly like the allocator path.
+#[inline(always)]
 fn handler_thread(target: &Target, tid: u32) -> Option<u64> {
     if tid == 0 {
         return None;
@@ -1625,7 +1783,22 @@ fn handler_thread(target: &Target, tid: u32) -> Option<u64> {
 /// Recover a frame's own depth by its session-unique occurrence. Handlers
 /// that only receive the frame pointer re-derive the depth for reservation
 /// provenance instead of carrying it across the call boundary.
-fn frame_depth(target: &Target, thread: u64, occurrence: u64) -> Option<u32> {
+#[no_mangle]
+pub fn frame_depth(target: &Target, thread: u64, occurrence: u64, out: &mut u32) -> bool {
+    match frame_depth_opt(target, thread, occurrence) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn frame_depth_opt(target: &Target, thread: u64, occurrence: u64) -> Option<u32> {
     if thread == 0 || occurrence == 0 {
         return None;
     }
@@ -1652,7 +1825,8 @@ fn frame_depth(target: &Target, thread: u64, occurrence: u64) -> Option<u32> {
 /// Additional direct evidence: it stages P without incrementing the getter
 /// count. A mismatching P flags ambiguity on the parent.
 #[inline(never)]
-fn getter_mp_return(
+#[no_mangle]
+pub fn getter_mp_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
@@ -1661,9 +1835,10 @@ fn getter_mp_return(
 ) {
     let _ = control;
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return;
-    };
+    }
     let provider: u64 = ctx.ret();
     if provider == 0 {
         return;
@@ -1672,9 +1847,10 @@ fn getter_mp_return(
     let Some(thread) = handler_thread(&target, tid) else {
         return;
     };
-    let Some(parent) = child_parent(&target, thread, frame) else {
+    let mut parent: *mut BindPendingValue = core::ptr::null_mut();
+    if !child_parent(&target, thread, frame, &mut parent) {
         return;
-    };
+    }
     unsafe {
         if !matches!((*parent).api_role, 147 | 148) || (*parent).entry_handle != method {
             return;
@@ -1694,7 +1870,8 @@ fn getter_mp_return(
 /// mismatching or repeated getter refuses the transaction, never selects
 /// first or latest.
 #[inline(never)]
-fn getter_pc_return(
+#[no_mangle]
+pub fn getter_pc_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
@@ -1703,9 +1880,10 @@ fn getter_pc_return(
 ) {
     let _ = control;
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return;
-    };
+    }
     let context: u64 = ctx.ret();
     if context == 0 {
         return;
@@ -1714,9 +1892,10 @@ fn getter_pc_return(
     let Some(thread) = handler_thread(&target, tid) else {
         return;
     };
-    let Some(parent) = child_parent(&target, thread, frame) else {
+    let mut parent: *mut BindPendingValue = core::ptr::null_mut();
+    if !child_parent(&target, thread, frame, &mut parent) {
         return;
-    };
+    }
     unsafe {
         if !matches!((*parent).api_role, 147 | 148) {
             return;
@@ -1835,7 +2014,8 @@ fn reserve_pending_x(
 /// Conflict the owner named by a collided live index row and retire that
 /// row, before any later positive can linearize. The new candidate is
 /// refused by its own caller; quarantine is published separately.
-fn collide_old_owner(target: &Target, kind: u32, handle: u64, index: *mut RelValue) {
+#[no_mangle]
+pub fn collide_old_owner(target: &Target, kind: u32, handle: u64, index: *mut RelValue) {
     let (owner_id, other, family) =
         unsafe { ((*index).data[0], (*index).data[4], (*index).data[6] as u32) };
     unsafe {
@@ -1882,7 +2062,8 @@ fn collide_old_owner(target: &Target, kind: u32, handle: u64, index: *mut RelVal
 /// and reserve its X index entry as pending. The staged C must equal the
 /// getter-established context; exactly one constructor per parent.
 #[inline(never)]
-fn newctx_return(
+#[no_mangle]
+pub fn newctx_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
@@ -1890,9 +2071,10 @@ fn newctx_return(
     entry_seq: u64,
 ) {
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return;
-    };
+    }
     let context: u64 = ctx.ret();
     if context == 0 {
         return;
@@ -1908,11 +2090,12 @@ fn newctx_return(
     let Some(thread) = handler_thread(&target, tid) else {
         return;
     };
-    let Some(parent) = child_parent(&target, thread, frame) else {
+    let mut parent: *mut BindPendingValue = core::ptr::null_mut();
+    if !child_parent(&target, thread, frame, &mut parent) {
         // Standalone provider construction: no public parent consumes it,
         // so no index row is reserved and nothing can inherit it.
         return;
-    };
+    }
     let constructor_site = unsafe { (*frame).constructor_cookie };
     unsafe {
         if !matches!((*parent).api_role, 147 | 148) {
@@ -1945,12 +2128,13 @@ fn newctx_return(
         return;
     }
     let occurrence = unsafe { (*frame).occurrence_id };
-    let Some(depth) = frame_depth(&target, thread, occurrence) else {
+    let mut depth = 0u32;
+    if !frame_depth(&target, thread, occurrence, &mut depth) {
         unsafe {
             (*parent).transaction_flags |= TXN_COLLISION;
         }
         return;
-    };
+    }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     if !reserve_pending_x(
         control, &target, parent, family, context, thread, depth, now_ns,
@@ -1983,7 +2167,8 @@ fn newctx_return(
 /// provider dups reserve nothing: provider-internal duplication never
 /// inherits an owner.
 #[inline(never)]
-fn dupctx_return(
+#[no_mangle]
+pub fn dupctx_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
@@ -1991,9 +2176,10 @@ fn dupctx_return(
     entry_seq: u64,
 ) {
     let (tgid, tid) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return;
-    };
+    }
     let context: u64 = ctx.ret();
     if context == 0 {
         return;
@@ -2023,9 +2209,10 @@ fn dupctx_return(
     let Some(thread) = handler_thread(&target, tid) else {
         return;
     };
-    let Some(parent) = child_parent(&target, thread, frame) else {
+    let mut parent: *mut BindPendingValue = core::ptr::null_mut();
+    if !child_parent(&target, thread, frame, &mut parent) {
         return;
-    };
+    }
     let (role, source_u, staged) = unsafe {
         (
             (*parent).api_role,
@@ -2054,12 +2241,13 @@ fn dupctx_return(
             return;
         }
     }
-    let Some(depth) = frame_depth(&target, thread, occurrence) else {
+    let mut depth = 0u32;
+    if !frame_depth(&target, thread, occurrence, &mut depth) {
         unsafe {
             (*parent).transaction_flags |= TXN_COLLISION;
         }
         return;
-    };
+    }
     if !reserve_pending_x(
         control, &target, parent, family, context, thread, depth, now_ns,
     ) {
@@ -2074,7 +2262,8 @@ fn dupctx_return(
 /// and retire any staged provider result. No OWNER is published for the
 /// destination: dup propagation stays unresolved in this slice.
 #[inline(never)]
-fn dup_return(
+#[no_mangle]
+pub fn dup_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
@@ -2082,9 +2271,10 @@ fn dup_return(
     entry_seq: u64,
 ) {
     let (tgid, _) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return;
-    };
+    }
     let destination: u64 = ctx.ret();
     let (source_u, staged_x, occurrence) = unsafe {
         (
@@ -2132,7 +2322,8 @@ fn dup_return(
 /// Retire our own pending X reservation after a dup return. Only the exact
 /// pending row owned by this occurrence retires; anything else is left for
 /// its own owner's lifecycle with a pairing loss recorded.
-fn retire_pending_x(target: &Target, occurrence: u64, context: u64) {
+#[no_mangle]
+pub fn retire_pending_x(target: &Target, occurrence: u64, context: u64) {
     if occurrence == 0 || context == 0 {
         return;
     }
@@ -2160,7 +2351,8 @@ fn retire_pending_x(target: &Target, occurrence: u64, context: u64) {
 /// Retire our own pending X reservation after an aborted owner commit. Only
 /// the exact pending row owned by this occurrence retires; a flipped or
 /// foreign row is left untouched.
-fn cleanup_pending_x(target: &Target, frame: *mut BindPendingValue) {
+#[no_mangle]
+pub fn cleanup_pending_x(target: &Target, frame: *mut BindPendingValue) {
     let (occurrence, staged) = unsafe { ((*frame).occurrence_id, (*frame).staged_x) };
     retire_pending_x(target, occurrence, staged);
 }
@@ -2175,7 +2367,8 @@ fn cleanup_pending_x(target: &Target, frame: *mut BindPendingValue) {
 /// Bind preparation writes the per-CPU plan and consumes the pending X
 /// claim. `rv` is the constructed owner handle; a null pointer return can
 /// never become an owner.
-fn bind_prepare(
+#[no_mangle]
+pub fn bind_prepare(
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
     ids: u64,
@@ -2183,9 +2376,10 @@ fn bind_prepare(
     rv: u64,
 ) -> bool {
     let (tgid, _) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return false;
-    };
+    }
     let family = unsafe {
         match (*frame).api_role {
             147 => 3,
@@ -2294,34 +2488,42 @@ fn bind_prepare(
     };
     // Allocate every ID up front. Reused rows leave their reserve unspent;
     // reserves never refund, and IDs never recycle.
-    let ids_out = match (
-        alloc_id(control),
-        alloc_id(control),
-        alloc_id(control),
-        alloc_id(control),
-        alloc_id(control),
-        alloc_id(control),
-        alloc_id(control),
-    ) {
-        (
-            Some(owner_id),
-            Some(continuity),
-            Some(context_epoch),
-            Some(set_id),
-            Some(selector_relation),
-            Some(selector_fresh),
-            Some(epoch_fresh),
-        ) => (
-            owner_id,
-            continuity,
-            context_epoch,
-            set_id,
-            selector_relation,
-            selector_fresh,
-            epoch_fresh,
-        ),
-        _ => return false,
-    };
+    // All seven calls evaluate unconditionally, exactly as the previous
+    // tuple match: quota charges never refund, so a short-circuit would
+    // observably spend less on the failure path.
+    let mut owner_id = 0u64;
+    let mut continuity = 0u64;
+    let mut context_epoch = 0u64;
+    let mut set_id = 0u64;
+    let mut selector_relation = 0u64;
+    let mut selector_fresh = 0u64;
+    let mut epoch_fresh = 0u64;
+    let ok_owner = alloc_id(control, &mut owner_id);
+    let ok_continuity = alloc_id(control, &mut continuity);
+    let ok_context = alloc_id(control, &mut context_epoch);
+    let ok_set = alloc_id(control, &mut set_id);
+    let ok_relation = alloc_id(control, &mut selector_relation);
+    let ok_selector = alloc_id(control, &mut selector_fresh);
+    let ok_epoch = alloc_id(control, &mut epoch_fresh);
+    if !(ok_owner
+        && ok_continuity
+        && ok_context
+        && ok_set
+        && ok_relation
+        && ok_selector
+        && ok_epoch)
+    {
+        return false;
+    }
+    let ids_out = (
+        owner_id,
+        continuity,
+        context_epoch,
+        set_id,
+        selector_relation,
+        selector_fresh,
+        epoch_fresh,
+    );
     // Reuse probe: stage the bound key and look up the immutable entry.
     // This is a lock-free read; publication revalidates under the lock.
     let keyed = unsafe { (*slot).staging.as_mut_ptr().cast::<ExactNameKey>() };
@@ -2339,9 +2541,10 @@ fn bind_prepare(
     if found != 0 {
         // Reuse path: adopt the immutable coordinates after validation.
         // The digest/IDs allocated above stay spent but unused.
-        let Some(reused) = reuse_bound_selector(found, code_object, family, request) else {
+        let mut reused: BoundSelector = unsafe { core::mem::zeroed() };
+        if !reuse_bound_selector(found, code_object, family, request, &mut reused) {
             return false;
-        };
+        }
         unsafe {
             plan_store(slot, PLAN_SELECTOR, reused.selector);
             plan_store(slot, PLAN_EPOCH, reused.epoch);
@@ -2446,7 +2649,8 @@ const PLAN_OWNER_HANDLE: usize = 240;
 /// context-X domain; quarantine of U uses the owner-U domain. Never called
 /// on the success path.
 #[inline(never)]
-fn dispatch_producer_outcome(
+#[no_mangle]
+pub fn dispatch_producer_outcome(
     control: *mut ProducerControl,
     target: &Target,
     frame: *mut BindPendingValue,
@@ -2488,7 +2692,8 @@ fn dispatch_producer_outcome(
 /// commit last). Returns the outcome code; any nonzero outcome retires our
 /// pending X, and the quarantine/poison bits execute in the dispatcher.
 #[inline(never)]
-fn commit_publish(
+#[no_mangle]
+pub fn commit_publish(
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
     ids: u64,
@@ -2496,9 +2701,10 @@ fn commit_publish(
     owner: u64,
 ) -> u64 {
     let (tgid, _) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return OUT_ABORT;
-    };
+    }
     if owner == 0 {
         return OUT_ABORT;
     }
@@ -2537,7 +2743,13 @@ fn commit_publish(
 
 /// Pre-lock dependency revalidation. Pure reads; any failure aborts cleanly
 /// before charges, IDs or rows are touched.
-fn commit_precheck(target: &Target, frame: *mut BindPendingValue, family: u32, owner: u64) -> bool {
+#[no_mangle]
+pub fn commit_precheck(
+    target: &Target,
+    frame: *mut BindPendingValue,
+    family: u32,
+    owner: u64,
+) -> bool {
     let pre_ok = unsafe {
         (*frame).relation_epoch == target.relation
             && (*frame).loss_epoch == target.loss_epoch
@@ -2602,7 +2814,8 @@ fn now_of() -> u64 {
 /// quarantine or poison (outcome bits instead), so the deepest chain stays
 /// inside the shared stack.
 #[inline(never)]
-fn commit_publish_locked(
+#[no_mangle]
+pub fn commit_publish_locked(
     control: *mut ProducerControl,
     state: *mut osslscope_bpf_contract::source::SourceControl,
     frame: *mut BindPendingValue,
@@ -2610,9 +2823,10 @@ fn commit_publish_locked(
     entry_seq: u64,
 ) -> u64 {
     let (tgid, _) = split_ids(ids);
-    let Some(target) = resolve_inner(tgid, entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
         return OUT_ABORT;
-    };
+    }
     let family = unsafe {
         match (*frame).api_role {
             147 => 3,
@@ -2689,9 +2903,10 @@ fn commit_publish_locked(
         let Some(found) = bound_lookup(request, family, object) else {
             return OUT_ABORT;
         };
-        let Some(reused) = reuse_bound_selector(found, object, family, request) else {
+        let mut reused: BoundSelector = unsafe { core::mem::zeroed() };
+        if !reuse_bound_selector(found, object, family, request, &mut reused) {
             return OUT_POISON;
-        };
+        }
         if reused.object != object || reused.selector != selector || reused.epoch != epoch {
             return OUT_POISON;
         }
@@ -2717,9 +2932,10 @@ fn commit_publish_locked(
     let provider = unsafe { (*frame).current_p };
     let source_epoch = unsafe { (*frame).source_epoch };
     let frame_relation = unsafe { (*frame).relation_epoch };
-    let Some(post) = resolve_inner(tgid, entry_seq) else {
+    let mut post: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut post) {
         return OUT_ABORT;
-    };
+    }
     if post.relation != frame_relation || post.relation != target.relation {
         return OUT_ABORT;
     }
@@ -2842,7 +3058,8 @@ fn bound_lookup(request: u64, family: u32, object: u64) -> Option<u64> {
 /// OBJECT row. Under the lock no concurrent publisher can interleave, so
 /// any insert failure is impossible-state and poisons.
 #[inline(never)]
-fn publish_bound_selector(
+#[no_mangle]
+pub fn publish_bound_selector(
     slot: *mut osslscope_bpf_contract::source::SourceSlot,
     request: u64,
     family: u32,
@@ -3015,7 +3232,8 @@ fn publish_bound_selector(
 
 /// Reauthorize the consuming site's source authority under the lock through
 /// its own current site bind. A missing or zero bind refuses the commit.
-fn reauthorize_site(target: &Target, cookie: u64) -> bool {
+#[no_mangle]
+pub fn reauthorize_site(target: &Target, cookie: u64) -> bool {
     let Some(bound) = site_bind(cookie, target) else {
         return false;
     };
@@ -3027,7 +3245,8 @@ fn reauthorize_site(target: &Target, cookie: u64) -> bool {
 /// concurrent retire wins the race and fails the commit instead of being
 /// resurrected by it. Tail subprogram: fields copy out of staging first.
 #[inline(never)]
-fn flip_x_tail(tail: *const TailArgs) -> bool {
+#[no_mangle]
+pub fn flip_x_tail(tail: *const TailArgs) -> bool {
     let (process, image, relation, staged_x, occurrence, owner, owner_id, next_seq, family) = unsafe {
         (
             (*tail).process,
@@ -3077,7 +3296,8 @@ fn flip_x_tail(tail: *const TailArgs) -> bool {
 /// poisons. Tail subprogram: fields copy out of cell 1 first; the value
 /// build stages in cell 0.
 #[inline(never)]
-fn insert_u_tail(tail: *const TailArgs) -> u64 {
+#[no_mangle]
+pub fn insert_u_tail(tail: *const TailArgs) -> u64 {
     let (process, image, relation, owner, staged_x, owner_id, occurrence, next_seq, family, now_ns) = unsafe {
         (
             (*tail).process,
@@ -3173,7 +3393,8 @@ fn insert_u_tail(tail: *const TailArgs) -> u64 {
 /// poisons. Tail subprogram: fields copy out of cell 1 first; the value
 /// build stages in cell 0.
 #[inline(never)]
-fn insert_owner_selector_tail(tail: *const TailArgs) -> bool {
+#[no_mangle]
+pub fn insert_owner_selector_tail(tail: *const TailArgs) -> bool {
     let (
         process,
         image,
@@ -3238,7 +3459,8 @@ fn insert_owner_selector_tail(tail: *const TailArgs) -> bool {
 /// is impossible-state and poisons. Tail subprogram: fields copy out of
 /// cell 1 first; the value build stages in cell 0.
 #[inline(never)]
-fn insert_owner_tail(tail: *const TailArgs) -> bool {
+#[no_mangle]
+pub fn insert_owner_tail(tail: *const TailArgs) -> bool {
     let (process, image, relation) = unsafe { ((*tail).process, (*tail).image, (*tail).relation) };
     let (owner_id, owner, staged_x, family) = unsafe {
         (
@@ -3298,7 +3520,7 @@ fn insert_owner_tail(tail: *const TailArgs) -> bool {
 
 /// A bound prepared selector: the shared immutable (object, operation,
 /// request) identity plus its safe-dictionary coordinates.
-struct BoundSelector {
+pub(crate) struct BoundSelector {
     object: u64,
     selector: u64,
     epoch: u64,
@@ -3308,7 +3530,28 @@ struct BoundSelector {
 /// row. A mismatching row is impossible-state and poisons. A real
 /// subprogram so the reuse path keeps the caller's frame shallow.
 #[inline(never)]
-fn reuse_bound_selector(
+#[no_mangle]
+pub fn reuse_bound_selector(
+    selector_relation: u64,
+    code_object: u64,
+    family: u32,
+    request: u64,
+    out: &mut BoundSelector,
+) -> bool {
+    match reuse_bound_selector_opt(selector_relation, code_object, family, request) {
+        Some(value) => {
+            *out = value;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Original body, always inlined into the global wrapper above: BPF
+/// subprograms cannot return aggregates across the external ABI, so the
+/// wrapper converts to an out-parameter plus a boolean.
+#[inline(always)]
+fn reuse_bound_selector_opt(
     selector_relation: u64,
     code_object: u64,
     family: u32,
@@ -3360,7 +3603,8 @@ fn reuse_bound_selector(
 /// scratch, so the rebuilt key stages there instead of costing 80 stack
 /// bytes.
 #[inline(never)]
-fn conflict_digest(other_relation: u64, request: u64, family: u32, code_object: u64) -> bool {
+#[no_mangle]
+pub fn conflict_digest(other_relation: u64, request: u64, family: u32, code_object: u64) -> bool {
     let other_key = RelKey {
         process_incarnation: 0,
         image_epoch: 0,
@@ -3452,6 +3696,7 @@ fn conflict_digest(other_relation: u64, request: u64, family: u32, code_object: 
 /// mutation and passes the snapshot to `operational_check`, so selected
 /// owners and dependencies must already be published in that snapshot.
 #[allow(dead_code)]
+#[no_mangle]
 pub fn capture_entry_seq() -> u64 {
     let Some(state) = crate::shared_maps::ATTR_STATE.get_ptr_mut(0) else {
         return 0;
@@ -3475,13 +3720,15 @@ pub fn capture_entry_seq() -> u64 {
 /// handler can interleave — and the store revalidates liveness, so a race
 /// that retires between the siblings fails closed.
 #[allow(dead_code)]
+#[no_mangle]
 pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
     if !writer_gate::admitted() {
         return false;
     }
-    let Some(target) = resolve_inner(params.tgid, params.entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(params.tgid, params.entry_seq, &mut target) {
         return false;
-    };
+    }
     let Some(admitted) = admission_ptr(params.cookie, &target) else {
         return false;
     };
@@ -3522,10 +3769,12 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
 /// once-per-tuple segment allocation. Stages the attribution tuple and
 /// returns the nonzero segment, or zero on any miss.
 #[inline(never)]
-fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
-    let Some(target) = resolve_inner(params.tgid, params.entry_seq) else {
+#[no_mangle]
+pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(params.tgid, params.entry_seq, &mut target) {
         return 0;
-    };
+    }
     let Some(admitted) = admission_ptr(params.cookie, &target) else {
         return 0;
     };
@@ -3692,9 +3941,10 @@ fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
             if !spend(1) {
                 return 0;
             }
-            let Some(fresh) = alloc_id(control) else {
+            let mut fresh = 0u64;
+            if !alloc_id(control, &mut fresh) {
                 return 0;
-            };
+            }
             if SEGMENT_INDEX
                 .insert(&segment_key, &fresh, BPF_NOEXIST)
                 .is_err()
@@ -3775,13 +4025,15 @@ fn digest_live(code_object: u64, operation: u32, digest: &[u8; 32]) -> bool {
 /// closed, then build the 104-byte key and insert or bump the one partition
 /// for this hit in this same generation.
 #[inline(never)]
-fn op_store_partition(params: &OpParams, segment: u64) -> bool {
+#[no_mangle]
+pub fn op_store_partition(params: &OpParams, segment: u64) -> bool {
     if segment == 0 {
         return false;
     }
-    let Some(target) = resolve_inner(params.tgid, params.entry_seq) else {
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(params.tgid, params.entry_seq, &mut target) {
         return false;
-    };
+    }
     let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
         return false;
     };
@@ -3934,6 +4186,7 @@ fn op_store_partition(params: &OpParams, segment: u64) -> bool {
 /// synchronously in the exit root before kernel TID reuse. Present rows
 /// that fail deletion poison, because an unretired row could certify for a
 /// recycled TID; absent rows are quiet.
+#[no_mangle]
 pub fn retire_thread(device: u64, inode: u64) {
     use aya_ebpf::bindings::bpf_pidns_info;
     let mut ids = bpf_pidns_info { pid: 0, tgid: 0 };
@@ -3970,6 +4223,7 @@ pub fn retire_thread(device: u64, inode: u64) {
 /// Retire the execing thread's producer state before the image transition.
 /// Sibling threads retire through their own synchronous exits; the execing
 /// thread's old-image rows must be gone before new-image activity starts.
+#[no_mangle]
 pub fn retire_image(device: u64, inode: u64) {
     use aya_ebpf::bindings::bpf_pidns_info;
     let mut ids = bpf_pidns_info { pid: 0, tgid: 0 };
@@ -4006,7 +4260,8 @@ pub fn retire_image(device: u64, inode: u64) {
 /// Delete one thread's incarnation row and its pending frames. The row is
 /// read first so the frame keys use the retired incarnation even if the row
 /// is gone by the time the frames are visited.
-fn retire_thread_rows(process: u64, tid: u32, incarnation: u64, image: u64) {
+#[no_mangle]
+pub fn retire_thread_rows(process: u64, tid: u32, incarnation: u64, image: u64) {
     let key = ThreadIdentityKey {
         process_incarnation: process,
         tid,
@@ -4038,7 +4293,8 @@ fn retire_thread_rows(process: u64, tid: u32, incarnation: u64, image: u64) {
 }
 
 /// Our X reservation is still pending for this occurrence and family.
-fn own_pending_x(
+#[no_mangle]
+pub fn own_pending_x(
     target: &Target,
     frame: *mut BindPendingValue,
     staged_x: u64,
