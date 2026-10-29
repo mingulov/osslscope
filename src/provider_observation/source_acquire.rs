@@ -40,21 +40,26 @@ pub(super) const ACQUIRE_CORE_RESERVE: usize = NOOP_PROGRAM_RESERVE
     + IDS_RESERVE;
 
 /// Host ledger capacities are fixed shares of the shared kernel budgets from
-/// the source-capability contract, never object counts. No "16 code-object
-/// selector" authority exists in the contracts, PLAN, feasibility or plan
-/// records; one anchor alone needs 17 registrations for the typed public
-/// roles (objects.rs TYPED_PUBLIC_ROLES, pinned by
-/// TYPED_PUBLIC_ROLE_COUNT in the capacity control), plus independently
-/// registered provider-callback sites.
+/// the source-capability contract, never object counts. The frozen
+/// attribution contract does contain a 16-object selector limit ("Generic
+/// request selectors": "Each owner prepares up to 16 retained code-object
+/// selectors before commit",
+/// `docs/2026-10-29-v050-attribution-contract.md:62`); that limit bounds
+/// prepared code-object selectors per owner, not registrations. One object
+/// can require multiple registrations: one anchor alone needs 17
+/// registrations for the typed public roles (objects.rs
+/// TYPED_PUBLIC_ROLES, pinned by TYPED_PUBLIC_ROLE_COUNT in the capacity
+/// control), plus independently registered provider-callback sites, so
+/// registrations need their own budget-derived cap below.
 ///
 /// Derivation: worst-case logical rows must fit the shared 8192 budget
 /// (capability contract "Finite records and ownership": every row, guard,
 /// projection, index, enrollment cell and tombstone consumes it).
-/// - Anchors: at most one anchor per admitted target domain. SOURCE_DOMAIN
-///   admits at most 64 rows (`source_owner::MAPS` spec
-///   `SOURCE_DOMAIN 1/4/64/64`, `MAX_DOMAINS`), and each SOURCE_ANCHOR key
-///   (process_incarnation/image_epoch) selects one admitted target
-///   configuration. 64 anchors x 2 rows (SOURCE_ANCHOR + anchor guard) = 128.
+/// - Anchors: enforced host admission cap of 64 anchor guards, not a
+///   derived source cardinality (SOURCE_DOMAIN's 64-row bound,
+///   `source_owner::MAPS` spec `SOURCE_DOMAIN 1/4/64/64`, does not
+///   establish one anchor per domain). Worst case 64 x 2 rows
+///   (SOURCE_ANCHOR + anchor guard) = 128.
 /// - Registrations: each registration charges at least 3 rows (SOURCE_REG +
 ///   adoption guard + SOURCE_READY; capability "Capacity and acceptance").
 ///   1024 x 3 = 3072 rows, under half the shared 8192 budget, leaving
