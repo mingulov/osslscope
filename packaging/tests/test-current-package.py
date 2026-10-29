@@ -2,6 +2,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Offline staging contract; synthetic ELFs do not qualify installed tracing."""
 import hashlib
+import contextlib
+import io
+import sys
+from unittest.mock import patch
 import importlib.util
 import json
 from pathlib import Path
@@ -171,6 +175,28 @@ class CurrentPackage(unittest.TestCase):
         for version, digest, vcs in [('0.2.2', checksum, '773ca715385b97eb0c26a581b53246c0c4306959'), ('0.2.1', '0'*64, '773ca715385b97eb0c26a581b53246c0c4306959'), ('0.2.1', checksum, '0'*40)]:
             with self.assertRaises(ValueError):
                 self.builder.restored_notices('aya-ebpf', version, digest, vcs)
+
+    def test_compiler_revision_validation_keeps_product_version_for_source_archive(self):
+        # The external Git/Cargo boundaries are stopped at the archive command;
+        # exercise main's actual version selection and artifact validation.
+        (self.root/'Cargo.toml').write_text('[package]\nversion="12.34.56"\n')
+        (self.root/'packaging').mkdir()
+        (self.root/'packaging/runtime-sources.json').write_text(json.dumps({'components':[
+            {'toolchain':'1.88.0','rust_revision':'a'*40}]}))
+        manifest=self.root/'build.json'; manifest.write_text(json.dumps(self.manifest))
+        archive_names=[]
+        def run(command, **kwargs):
+            if command[0]=='rustc': return ('rustc 1.88.0\ncommit-hash: '+'a'*40+'\n').encode()
+            if command[-1]=='a'*40 and 'show' in command: return b'1\n'
+            if 'archive' in command:
+                archive_names.append(Path(next(arg.removeprefix('--output=') for arg in command if arg.startswith('--output='))).name)
+                raise ValueError('archive boundary reached')
+            raise AssertionError(command)
+        argv=[str(SCRIPT),'--manifest',str(manifest),'--source-archives',str(self.root),'--output',str(self.root/'output')]
+        with patch.object(self.builder,'ROOT',self.root), patch.object(self.builder,'source_identity',return_value=('a'*40,'b'*40)), patch.object(self.builder,'dependency_notices',return_value=({},{})), patch.object(self.builder,'run',side_effect=run), patch.object(sys,'argv',argv), patch.object(sys,'path',[str(SCRIPT.parent),*sys.path]), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit): self.builder.main()
+        self.assertEqual(archive_names,['osslscope-12.34.56-source.tar'])
+        self.assertFalse((self.root/'output').exists())
 
     def test_rejects_artifact_changed_after_selection_before_receipt_publication(self):
         artifacts = self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)

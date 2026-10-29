@@ -306,8 +306,8 @@ def main():
         from source_payload import stage_payload
         runtime_pins = json.loads((ROOT/'packaging/runtime-sources.json').read_bytes(), object_pairs_hook=no_duplicates)
         for component in runtime_pins['components']:
-            version = run(['rustc', '+'+component['toolchain'], '-vV']).decode()
-            if 'commit-hash: '+component['rust_revision']+'\n' not in version:
+            compiler_version = run(['rustc', '+'+component['toolchain'], '-vV']).decode()
+            if 'commit-hash: '+component['rust_revision']+'\n' not in compiler_version:
                 raise ValueError('runtime compiler revision needs source review')
         with tempfile.TemporaryDirectory(prefix='.osslscope-package-', dir=args.output.parent) as tmp:
             work = Path(tmp)
