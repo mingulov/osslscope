@@ -44,6 +44,41 @@ pub struct MapSpec {
     pub flags: u32,
 }
 
+impl MapSpec {
+    /// Conservative accounted capacity, not measured kernel allocation/RSS.
+    pub(crate) fn reservation_bytes(&self, possible_cpus: usize) -> Option<usize> {
+        map_capacity_bytes(
+            self.map_type,
+            self.key_size,
+            self.value_size,
+            self.max_entries,
+            possible_cpus,
+        )
+    }
+}
+fn map_capacity_bytes(
+    map_type: u32,
+    key: u32,
+    value: u32,
+    entries: u32,
+    cpus: usize,
+) -> Option<usize> {
+    if cpus == 0 {
+        return None;
+    }
+    let payload = if map_type == 27 {
+        entries as usize
+    } else {
+        let value = (value as usize).checked_add(7)? & !7;
+        let copies = if matches!(map_type, 5 | 6) { cpus } else { 1 };
+        (key as usize)
+            .checked_add(value.checked_mul(copies)?)?
+            .checked_add(128)?
+            .checked_mul(entries as usize)?
+    };
+    payload.checked_add(65_536)
+}
+
 /// Wanted program: looked up by symbol in its section.
 #[derive(Debug, Clone, Copy)]
 pub struct ProgSpec {
@@ -1200,6 +1235,18 @@ pub struct MapSpecLite {
     pub value_size: u32,
     pub max_entries: u32,
     pub flags: u32,
+}
+
+impl MapSpecLite {
+    pub(crate) fn reservation_bytes(&self, possible_cpus: usize) -> Option<usize> {
+        map_capacity_bytes(
+            self.map_type,
+            self.key_size,
+            self.value_size,
+            self.max_entries,
+            possible_cpus,
+        )
+    }
 }
 
 /// Loaded fds (needs caps).
@@ -4975,6 +5022,48 @@ mod tests {
             e.to_string().contains("map site reserved bytes set"),
             "{e:#}"
         );
+    }
+
+    #[test]
+    fn accounted_map_capacity_includes_possible_cpu_replication_and_overhead() {
+        let relation = MapSpec {
+            name: "REL",
+            map_type: 1,
+            key_size: 48,
+            value_size: 256,
+            max_entries: 8192,
+            flags: 0,
+        };
+        assert_eq!(relation.reservation_bytes(16), Some(3_604_480));
+        let partition = MapSpec {
+            name: "PARTITION",
+            map_type: 5,
+            key_size: 104,
+            value_size: 24,
+            max_entries: 8192,
+            flags: 0,
+        };
+        assert_eq!(partition.reservation_bytes(16), Some(5_111_808));
+        assert_eq!(partition.reservation_bytes(0), None);
+        assert_eq!(partition.reservation_bytes(usize::MAX), None);
+        let ring = MapSpec {
+            name: "EVENTS",
+            map_type: 27,
+            key_size: 0,
+            value_size: 0,
+            max_entries: 1 << 20,
+            flags: 0,
+        };
+        assert_eq!(ring.reservation_bytes(16), Some(1_114_112));
+        let unaligned = MapSpec {
+            name: "PAD",
+            map_type: 6,
+            key_size: 4,
+            value_size: 9,
+            max_entries: 1,
+            flags: 0,
+        };
+        assert_eq!(unaligned.reservation_bytes(2), Some(65_700));
     }
 
     #[test]

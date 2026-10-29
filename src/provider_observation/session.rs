@@ -573,6 +573,25 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
         )
         .collect()
 }
+fn reserve_map_capacity(
+    budget: &ObservationBudget,
+    maps: &[loader::MapSpecLite],
+    possible_cpus: usize,
+) -> Result<(), ObservationGap> {
+    let map_capacity = maps
+        .iter()
+        // Shared ADMIT/inner-token owner has its own reservation; descriptors
+        // are charged separately. This call does not allocate another gate.
+        .filter(|m| m.name != "ADMIT")
+        .try_fold(0usize, |bytes, m| {
+            bytes.checked_add(m.reservation_bytes(possible_cpus)?)
+        })
+        .ok_or(ObservationGap::StateLimit)?;
+    // This component ceiling is independent of the outer watch pool lease,
+    // which already reserves these same map capacities before session setup.
+    budget.state(map_capacity)
+}
+
 impl ProviderSession {
     /// Validate enclosing process and current membership, preserving the separate
     /// D3 membership epoch and mapped-object generation domains. This proves
@@ -665,6 +684,8 @@ impl ProviderSession {
                 m.max_entries = budget.limits.max_processes.max(1) as u32;
             }
         }
+        let possible_cpus = aya::util::nr_cpus().map_err(|_| ObservationGap::StateLimit)?;
+        reserve_map_capacity(&budget, &prepared.maps, possible_cpus)?;
         let loaded =
             loader::load_gated(&prepared, &gate).map_err(|_| ObservationGap::BpfUnavailable)?;
         crate::discovery::initialize_classifier_maps(
@@ -2614,6 +2635,44 @@ mod tests {
         );
         assert_eq!(advertisers, before);
     }
+    #[test]
+    fn provider_map_capacity_is_atomic_and_cpu_charged_before_loading() {
+        let maps: Vec<_> = specs()
+            .into_iter()
+            .map(|m| loader::MapSpecLite {
+                name: m.name.into(),
+                map_type: m.map_type,
+                key_size: m.key_size,
+                value_size: m.value_size,
+                max_entries: m.max_entries,
+                flags: m.flags,
+            })
+            .collect();
+        // Independent fixed total for the actual thirteen ordinary provider maps
+        // on sixteen possible CPUs, excluding the separately owned ADMIT gate.
+        let required = 7_034_952;
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_state_bytes: required - 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            reserve_map_capacity(&budget, &maps, 16),
+            Err(ObservationGap::StateLimit)
+        );
+        budget.state(required - 1).unwrap(); // failed batch did not consume a prefix
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_state_bytes: required,
+            ..Default::default()
+        });
+        reserve_map_capacity(&budget, &maps, 16).unwrap();
+        assert_eq!(budget.state(1), Err(ObservationGap::StateLimit));
+        let budget = ObservationBudget::default();
+        assert_eq!(
+            reserve_map_capacity(&budget, &maps, usize::MAX),
+            Err(ObservationGap::StateLimit)
+        );
+    }
+
     #[test]
     fn return_link_failure_rolls_back() {
         use std::{io::Read, os::unix::net::UnixStream};

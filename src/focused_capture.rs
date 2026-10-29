@@ -444,19 +444,11 @@ impl FocusedSession {
             .into_iter()
             .chain(crate::provider_observation::session::specs())
         {
-            let value = (spec.value_size as usize + 7) & !7;
-            let payload = if spec.map_type == 27 {
-                spec.max_entries as usize
-            } else {
-                let copies = if matches!(spec.map_type, 5 | 6) {
-                    cpus
-                } else {
-                    1
-                };
-                (spec.key_size as usize + value * copies + 128) * spec.max_entries as usize
-            };
             bytes = bytes
-                .checked_add(payload + 65_536)
+                .checked_add(
+                    spec.reservation_bytes(cpus)
+                        .context("focused map capacity overflow")?,
+                )
                 .context("focused map reservation overflow")?;
         }
         Ok(bytes)
