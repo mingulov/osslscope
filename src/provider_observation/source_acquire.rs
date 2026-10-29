@@ -540,7 +540,7 @@ impl DomainIndex {
         {
             row.current_image = image;
             row.state = contract::DOMAIN_ACTIVE;
-        } else {
+        } else if !Self::terminal(row.state) {
             row.state = contract::DOMAIN_RETIRED;
         }
         Ok(())
@@ -1342,6 +1342,25 @@ mod tests {
         domains.note_planned_exec(78, 11).unwrap();
         assert_eq!(domains.state(78), Some(contract::DOMAIN_RETIRED));
         assert!(domains.note_planned_exec(7979, 11).is_err());
+    }
+    #[test]
+    fn planned_exec_preserves_first_terminal_state() {
+        let mut domains = DomainIndex::new();
+        domains
+            .arm(70, 1, 10, 11, &OriginalCustody { tgid: 70 })
+            .unwrap();
+        domains.poison(70).unwrap();
+        // Exec on a poisoned domain must not overwrite POISON with RETIRED.
+        domains.note_planned_exec(70, 11).unwrap();
+        assert_eq!(domains.state(70), Some(contract::DOMAIN_POISON));
+        domains.note_planned_exec(70, 12).unwrap();
+        assert_eq!(domains.state(70), Some(contract::DOMAIN_POISON));
+        domains
+            .arm(71, 1, 10, 11, &OriginalCustody { tgid: 71 })
+            .unwrap();
+        domains.retire(71).unwrap();
+        domains.note_planned_exec(71, 11).unwrap();
+        assert_eq!(domains.state(71), Some(contract::DOMAIN_RETIRED));
     }
     #[test]
     fn normalization_failure_retires_only_seeded_domains() {
