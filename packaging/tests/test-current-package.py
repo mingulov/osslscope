@@ -41,7 +41,7 @@ class CurrentPackage(unittest.TestCase):
         self.manifest = {'schema': 'osslscope-dev-build-manifest-v1', 'product_ref': 'a'*40, 'product_tree': 'b'*40, 'product_dirty': False, 'host_toolchain': '1.88.0', 'bpf_toolchain': 'nightly-2026-05-20', 'bpf_linker': 'bpf-linker 0.10.4', 'bpf_target': 'bpfel-unknown-none', 'host_profile': 'release', 'mode': 'both', 'artifacts': self.arts}
         rows=[{key:entry[key] for key in ('bin','bytes','sha256')} for entry in sorted(self.arts[1:],key=lambda a:a['bin'])]
         encoded=(json.dumps(rows,sort_keys=True,separators=(',',':'))+'\n').encode()
-        self.manifest['bpf_runtime_source']={'schema':'osslscope-bpf-runtime-source-v2','compiler_selection':'resolved-pinned-rustc','toolchain':'nightly-2026-05-20',
+        self.manifest['bpf_runtime_source']={'schema':'osslscope-bpf-runtime-source-v3','source_selection':'pinned-default-sysroot','compiler_selection':'resolved-pinned-rustc','toolchain':'nightly-2026-05-20',
             'capture':'before-and-after-build','library':{'schema':'osslscope-rust-library-v1','files':1,'bytes':4,'sha256':'f'*64},
             'artifacts_sha256':hashlib.sha256(encoded).hexdigest()}
 
@@ -86,11 +86,12 @@ class CurrentPackage(unittest.TestCase):
                     self.builder.select_artifacts(dict(self.manifest, **{key:value}), 'a'*40, 'b'*40)
 
     def test_missing_old_or_different_artifact_runtime_binding_refuses_current_packages(self):
-        for mutation in ('missing','old','compiler','artifact','library'):
+        for mutation in ('missing','old','compiler','source','artifact','library'):
             candidate=json.loads(json.dumps(self.manifest))
             if mutation=='missing': del candidate['bpf_runtime_source']
-            elif mutation=='old': candidate['bpf_runtime_source']['schema']='osslscope-bpf-runtime-source-v1'
+            elif mutation=='old': candidate['bpf_runtime_source']['schema']='osslscope-bpf-runtime-source-v2'
             elif mutation=='compiler': candidate['bpf_runtime_source'].pop('compiler_selection')
+            elif mutation=='source': candidate['bpf_runtime_source'].pop('source_selection')
             elif mutation=='artifact': candidate['bpf_runtime_source']['artifacts_sha256']='0'*64
             else: candidate['bpf_runtime_source']['library']['files']=0
             with self.subTest(mutation=mutation), self.assertRaisesRegex(ValueError,'runtime source'):

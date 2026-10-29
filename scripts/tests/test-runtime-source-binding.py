@@ -27,7 +27,10 @@ if tool=='bpf-linker': print('bpf-linker 0.10.4');sys.exit()
 nightly=any('nightly-' in arg for arg in args)
 if tool=='rustc' or tool.endswith('-rustc'):
  nightly=nightly or tool in ('pinned-nightly-rustc','alternate-rustc')
- if '--print' in args: print(root/('alternate-sysroot' if tool=='alternate-rustc' else 'sysroot'))
+ if '--print' in args:
+  explicit=next((arg.split('=',1)[1] for arg in args if arg.startswith('--sysroot=')),None)
+  if '--sysroot' in args: explicit=args[args.index('--sysroot')+1]
+  print(explicit or root/('alternate-sysroot' if tool=='alternate-rustc' else 'sysroot'))
  else: print('rustc 1.97.0-nightly (unchanged fixture revision)' if nightly else 'rustc 1.88.0 (unchanged fixture revision)')
  sys.exit()
 if tool=='cache-wrapper':
@@ -38,7 +41,17 @@ config_path=root/'product/.cargo/config.toml'
 config=tomllib.loads(config_path.read_text()) if config_path.exists() else {}
 compiler=os.environ.get('RUSTC') or os.environ.get('CARGO_BUILD_RUSTC') or config.get('build',{}).get('rustc') or str(root/'tools'/('pinned-nightly-rustc' if nightly else 'pinned-host-rustc'))
 wrapper=os.environ.get('RUSTC_WRAPPER') or config.get('build',{}).get('rustc-wrapper')
-command=([wrapper] if wrapper else [])+[compiler,'--print','sysroot']
+host_enabled=nightly and config.get('unstable',{}).get('host-config',False)
+if 'CARGO_UNSTABLE_HOST_CONFIG' in os.environ: host_enabled=nightly and os.environ['CARGO_UNSTABLE_HOST_CONFIG']=='true'
+if 'unstable.host-config=false' in args: host_enabled=False
+if host_enabled:
+ host=config.get('host',{});flags=host.get('x86_64-unknown-linux-gnu',host).get('rustflags',[])
+elif nightly and '--target' in args: flags=[]
+elif 'CARGO_ENCODED_RUSTFLAGS' in os.environ: flags=os.environ['CARGO_ENCODED_RUSTFLAGS'].split('\x1f') if os.environ['CARGO_ENCODED_RUSTFLAGS'] else []
+elif 'RUSTFLAGS' in os.environ: flags=os.environ['RUSTFLAGS'].split()
+elif 'CARGO_BUILD_RUSTFLAGS' in os.environ: flags=os.environ['CARGO_BUILD_RUSTFLAGS'].split()
+else: flags=config.get('target',{}).get('x86_64-unknown-linux-gnu',{}).get('rustflags',config.get('build',{}).get('rustflags',[]))
+command=([wrapper] if wrapper else [])+[compiler,*flags,'--print','sysroot']
 sysroot=subprocess.check_output(command,text=True).strip()
 with (root/'cargo-compilers.jsonl').open('a') as out: out.write(json.dumps({'nightly':nightly,'compiler':compiler,'sysroot':sysroot,'metadata':'metadata' in args})+'\n')
 if 'metadata' in args: print(json.dumps({'target_directory':str(root/'outputs')}));sys.exit()
@@ -75,7 +88,7 @@ class BuildSourceBinding(unittest.TestCase):
         for name in ('cargo','rustc','rustup','bpf-linker','pinned-host-rustc','pinned-nightly-rustc','alternate-rustc','cache-wrapper'):
             path=self.bin/name;path.write_text(SHIM);path.chmod(0o755)
         self.env=dict(os.environ,PATH=str(self.bin)+os.pathsep+os.environ['PATH'],SOURCE_BINDING_FIXTURE=str(self.root))
-        for selector in ('RUSTC','CARGO_BUILD_RUSTC','RUSTC_WRAPPER','CARGO_BUILD_RUSTC_WRAPPER'):
+        for selector in ('RUSTC','CARGO_BUILD_RUSTC','RUSTC_WRAPPER','CARGO_BUILD_RUSTC_WRAPPER','RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','CARGO_UNSTABLE_HOST_CONFIG','CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST'):
             self.env.pop(selector,None)
         self.manifest=self.root/'build.json'
 
@@ -87,8 +100,9 @@ class BuildSourceBinding(unittest.TestCase):
         data=json.loads(self.manifest.read_bytes())
         self.assertIn('bpf_runtime_source',data,'manifest lacks the source used by build-std')
         binding=data['bpf_runtime_source'];self.assertIsNotNone(binding)
-        self.assertEqual(binding['schema'],'osslscope-bpf-runtime-source-v2')
+        self.assertEqual(binding['schema'],'osslscope-bpf-runtime-source-v3')
         self.assertEqual(binding['compiler_selection'],'resolved-pinned-rustc')
+        self.assertEqual(binding['source_selection'],'pinned-default-sysroot')
         self.assertEqual(data['host_rustc_path'],str(self.bin/'pinned-host-rustc'))
         self.assertEqual(data['bpf_rustc_path'],str(self.bin/'pinned-nightly-rustc'))
         rows=[{'path':'Cargo.lock','bytes':4,'sha256':digest(b'lock')},{'path':'core/lib.rs','bytes':4,'sha256':digest(b'core')}]
@@ -120,6 +134,36 @@ class BuildSourceBinding(unittest.TestCase):
                     self.assertEqual(call['sysroot'],str(self.root/'sysroot'))
                 data=json.loads(self.manifest.read_text())
                 self.assertIn('rustc 1.88.0',data['host_rustc']);self.assertIn('rustc 1.97.0-nightly',data['bpf_rustc'])
+
+    def test_same_compiler_host_sysroot_flags_cannot_redirect_source(self):
+        alternate=self.root/'alternate-sysroot/lib/rustlib/src/rust/library/core'
+        alternate.mkdir(parents=True);(alternate/'lib.rs').write_bytes(b'different source same executable')
+        for table in ('host','host.x86_64-unknown-linux-gnu'):
+            with self.subTest(table=table):
+                config=self.product/'.cargo/config.toml';config.parent.mkdir(exist_ok=True)
+                config.write_text('target-applies-to-host = false\n[unstable]\nhost-config = true\ntarget-applies-to-host = true\n['+table+']\nrustflags = ["--sysroot", '+json.dumps(str(self.root/'alternate-sysroot'))+']\n')
+                log=self.root/'cargo-compilers.jsonl';log.unlink(missing_ok=True)
+                run=self.build();self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+                calls=[json.loads(line) for line in log.read_text().splitlines()]
+                self.assertTrue(any(call['nightly'] and not call['metadata'] for call in calls))
+                for call in calls:
+                    self.assertEqual(call['compiler'],str(self.bin/('pinned-nightly-rustc' if call['nightly'] else 'pinned-host-rustc')))
+                    self.assertEqual(call['sysroot'],str(self.root/'sysroot'),'effective host sysroot differs from captured pinned root')
+
+    def test_environment_build_and_target_flags_cannot_redirect_source(self):
+        alternate=str(self.root/'alternate-sysroot')
+        config=self.product/'.cargo/config.toml';config.parent.mkdir(exist_ok=True)
+        for selector in ('RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','build.rustflags','target.rustflags'):
+            with self.subTest(selector=selector):
+                config.write_text('')
+                environment={}
+                if selector=='CARGO_ENCODED_RUSTFLAGS': environment[selector]='--sysroot\x1f'+alternate
+                elif selector in ('RUSTFLAGS','CARGO_BUILD_RUSTFLAGS'): environment[selector]='--sysroot '+alternate
+                else: config.write_text(('['+('build' if selector=='build.rustflags' else 'target.x86_64-unknown-linux-gnu')+']\nrustflags = ["--sysroot='+alternate+'"]\n'))
+                log=self.root/'cargo-compilers.jsonl';log.unlink(missing_ok=True)
+                run=self.build(('--host-only','--check-only'),**environment);self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+                for call in [json.loads(line) for line in log.read_text().splitlines()]:
+                    self.assertEqual(call['sysroot'],str(self.root/'sysroot'),'ambient flag source changed the pinned sysroot')
 
     def test_compatible_cache_wrapper_receives_the_resolved_pinned_compilers(self):
         for selector in ('RUSTC_WRAPPER','build.rustc-wrapper'):

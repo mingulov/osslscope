@@ -21,9 +21,15 @@ The pinned recipe resolves each compiler through rustup, then uses that exact
 executable for direct source/version queries and all corresponding Cargo
 metadata/build calls. Ordinary compiler selectors (`RUSTC`, `CARGO_BUILD_RUSTC`,
 `build.rustc`) are normalized to that pin, retaining compatible Cargo cache
-wrappers. Runtime-source receipt v2 records this selection; older receipts
-require rebuilding. The normal build captures the complete installed nightly
-library source identity before and after compilation and binds it to its BPF artifact hashes. Packaging
+wrappers. The supported recipe also uses the resolved compiler's default
+sysroot: Cargo calls normalize encoded Rust flags to an empty set and disable
+unstable host-config/target-applies-to-host through process and command-line
+configuration. Environment, build, target and host flag selectors cannot redirect
+the host source query. Custom Rust flags are outside this pinned recipe.
+Runtime-source receipt v3 requires this policy; older receipts require
+rebuilding. The normal build captures the complete installed nightly library
+source identity before and after compilation and binds it to its BPF artifact
+hashes. Packaging
 compares that recorded identity to the accompanying official component, including
 all relative names, lengths and hashes. Missing, altered, extra or stale source
 inputs and old manifests without this evidence refuse current package

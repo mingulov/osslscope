@@ -12,6 +12,8 @@
 #   - No upgrades: pinned toolchains only. Warnings (including the known
 #     bpf-linker/LLVM dlopen fallback warning) are diagnosed and recorded,
 #     never "fixed" by moving the toolchain.
+#   - Default pinned sysroots: ambient Rust flags and unstable host-source
+#     configuration are normalized; compatible Cargo cache wrappers remain.
 #   - Locked dependencies only: every cargo invocation passes --locked.
 #   - Bounded jobs: CARGO_BUILD_JOBS defaults to 2; an explicit setting is
 #     honored and recorded in the manifest.
@@ -115,7 +117,14 @@ run_pinned_cargo() {
         "$BPF_TOOLCHAIN") _cargo_rustc="$BPF_RUSTC_PATH" ;;
         *) echo "error: unsupported pinned Cargo toolchain" >&2; return 2 ;;
     esac
-    RUSTC="$_cargo_rustc" CARGO_BUILD_RUSTC="$_cargo_rustc" cargo +"$_cargo_pin" "$@"
+    # A fixed default sysroot is part of this recipe. An explicitly present
+    # empty encoded flag set overrides ambient build/target flags, while the
+    # scalar config overrides disable separate host-table flag selection.
+    RUSTC="$_cargo_rustc" CARGO_BUILD_RUSTC="$_cargo_rustc" \
+        CARGO_ENCODED_RUSTFLAGS='' RUSTFLAGS='' \
+        CARGO_UNSTABLE_HOST_CONFIG=false CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST=false \
+        cargo +"$_cargo_pin" --config unstable.host-config=false \
+        --config unstable.target-applies-to-host=false "$@"
 }
 
 # --- prerequisite checks (diagnose, never install) ---
@@ -514,7 +523,8 @@ if e.get("MODE") != "host" and e.get("CHECK_ONLY") != "1":
     import sys
     sys.path.insert(0, os.path.join(e["REPO"], "packaging"))
     from source_payload import bpf_artifact_digest
-    runtime_source = {"schema": "osslscope-bpf-runtime-source-v2",
+    runtime_source = {"schema": "osslscope-bpf-runtime-source-v3",
+                      "source_selection": "pinned-default-sysroot",
                       "compiler_selection": "resolved-pinned-rustc",
                       "toolchain": e["BPF_TOOLCHAIN"],
                       "capture": "before-and-after-build",

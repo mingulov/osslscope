@@ -195,7 +195,7 @@ def dependency_notices():
     graphs, texts = [], {}
     for label, manifest, toolchain in [('host', ROOT/'Cargo.toml', '1.88.0'), ('bpf', ROOT/'crates/ebpf/Cargo.toml', 'nightly-2026-05-20')]:
         compiler = pinned_rustc(toolchain)
-        metadata = json.loads(run(['cargo', '+'+toolchain, 'metadata', '--locked', '--offline', '--format-version', '1', '--manifest-path', str(manifest)], cwd=manifest.parent, env=dict(os.environ,RUSTC=compiler,CARGO_BUILD_RUSTC=compiler)))
+        metadata = json.loads(run(['cargo', '+'+toolchain, '--config', 'unstable.host-config=false', '--config', 'unstable.target-applies-to-host=false', 'metadata', '--locked', '--offline', '--format-version', '1', '--manifest-path', str(manifest)], cwd=manifest.parent, env=dict(os.environ,RUSTC=compiler,CARGO_BUILD_RUSTC=compiler,CARGO_ENCODED_RUSTFLAGS='',RUSTFLAGS='',CARGO_UNSTABLE_HOST_CONFIG='false',CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST='false')))
         lock = tomllib.loads((manifest.parent/'Cargo.lock').read_text())
         checksums = {(p['name'], p['version']): p.get('checksum') for p in lock['package']}
         identifiers = {p['id']: p['name']+'@'+p['version'] for p in metadata['packages']}
