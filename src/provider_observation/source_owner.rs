@@ -363,9 +363,9 @@ mod tests {
         assert_eq!(iterator_reservation(512, 16), Some(6_438_912));
         assert_eq!(map_reservation(16), Some(6_276_028));
         // The acquisition core adds its NoOp/program/link owner, ledger,
-        // domain-index and allocator reserves to the component charge.
-        assert_eq!(ACQUIRE_CORE_RESERVE, 438_280);
-        assert_eq!(source_reservation(512, 16), Some(13_173_700));
+        // domain-index, order and allocator reserves to the component charge.
+        assert_eq!(ACQUIRE_CORE_RESERVE, 602_120);
+        assert_eq!(source_reservation(512, 16), Some(13_337_540));
         assert_eq!(iterator_reservation(512, 1), Some(4_334_592));
         for (class, cpus) in [(0, 16), (300, 16), (8192, 16), (512, 0), (512, usize::MAX)] {
             assert!(source_reservation(class, cpus).is_none());

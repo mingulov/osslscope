@@ -23,20 +23,27 @@ use std::{collections::BTreeMap, os::fd::OwnedFd};
 
 /// Conservative accounted host capacity for the acquisition core, charged once
 /// by the source owner before any acquisition. These are reservations, not
-/// measured kernel allocation or RSS.
+/// measured kernel allocation or RSS. The ledger, domain-index and order
+/// reserves below cover measured live host heap at full admission plus
+/// margin for allocator rounding and toolchain drift (see
+/// `host_heap_reserves_cover_measured_worst_case_population`, which fails
+/// loudly if measurement ever exceeds a reserve): ledger 85,224 measured /
+/// 131,072 reserved, domain index 7,728 / 12,288, order 24,624 / 32,768.
 pub(super) const NOOP_PROGRAM_RESERVE: usize = 128 << 10;
 pub(super) const PROVISIONAL_LINK_RESERVE: usize = 32 << 10;
 pub(super) const SOURCE_PROGRAM_RESERVE: usize = 32 << 10;
 pub(super) const SOURCE_LINK_RESERVE: usize = 32 << 10;
 pub(super) const SOURCE_ROOT_COUNT: usize = 4;
-pub(super) const LEDGER_RESERVE: usize = 4096;
-pub(super) const DOMAIN_INDEX_RESERVE: usize = 8192;
+pub(super) const LEDGER_RESERVE: usize = 128 << 10;
+pub(super) const DOMAIN_INDEX_RESERVE: usize = 12 << 10;
+pub(super) const ORDER_RESERVE: usize = 32 << 10;
 pub(super) const IDS_RESERVE: usize = 8;
 pub(super) const ACQUIRE_CORE_RESERVE: usize = NOOP_PROGRAM_RESERVE
     + PROVISIONAL_LINK_RESERVE
     + SOURCE_ROOT_COUNT * (SOURCE_PROGRAM_RESERVE + SOURCE_LINK_RESERVE)
     + LEDGER_RESERVE
     + DOMAIN_INDEX_RESERVE
+    + ORDER_RESERVE
     + IDS_RESERVE;
 
 /// Host ledger capacities are fixed shares of the shared kernel budgets from
@@ -2150,5 +2157,166 @@ mod tests {
         assert!(trigger.check_observer_pid(0).is_err());
         assert!(trigger.check_observer_pid(97532).is_err());
         assert!(trigger.check_observer_pid(u32::MAX).is_err());
+    }
+    #[test]
+    fn host_heap_reserves_cover_measured_worst_case_population() {
+        use super::heap_measure::peak_of;
+        // Ledger at full admission: every anchor LIVE, every registration
+        // minted. Life state never changes heap shape; minting is the heap
+        // maximum per map, and both maps stay alive to the window end.
+        let ledger_peak = peak_of(|| {
+            let mut ids = HostIds::new();
+            let mut ledger = GuardLedger::new();
+            let mut anchors = Vec::with_capacity(MAX_ANCHOR_GUARDS);
+            for i in 0..MAX_ANCHOR_GUARDS {
+                let epoch = 1000 + i as u64;
+                let nonce = ids.fresh().unwrap();
+                let anchor = ledger.mint_anchor(&mut ids, epoch, nonce).unwrap();
+                ledger
+                    .create_anchor(anchor, &anchor_receipt(anchor, nonce))
+                    .unwrap();
+                ledger.live_anchor(anchor).unwrap();
+                anchors.push((anchor, epoch));
+            }
+            for _ in 0..MAX_REGISTRATION_GUARDS {
+                let nonce = ids.fresh().unwrap();
+                ledger
+                    .mint_registration(&mut ids, anchors[0].0, anchors[0].1, nonce)
+                    .unwrap();
+            }
+            assert_eq!(ledger.anchors.len(), MAX_ANCHOR_GUARDS);
+            assert_eq!(ledger.registrations.len(), MAX_REGISTRATION_GUARDS);
+            std::hint::black_box((&ids, &ledger, &anchors));
+        });
+        // Domain index at full admission: 64 armed domains with held-child
+        // custody each.
+        let domain_peak = peak_of(|| {
+            let mut domains = DomainIndex::new();
+            for tgid in 1..=MAX_DOMAINS as u32 {
+                let custody = OriginalCustody { tgid };
+                domains.arm(tgid, 11, 12, 13, &custody).unwrap();
+            }
+            assert_eq!(domains.domains.len(), MAX_DOMAINS);
+            std::hint::black_box(&domains);
+        });
+        // Order at full admission: one stored capability per registration.
+        // The backing ledger is built outside the window so the peak is the
+        // capability vector alone (ledger lookups during adoption allocate
+        // nothing).
+        let mut ids = HostIds::new();
+        let mut ledger = GuardLedger::new();
+        let epoch = 21;
+        let nonce = ids.fresh().unwrap();
+        let anchor = ledger.mint_anchor(&mut ids, epoch, nonce).unwrap();
+        ledger
+            .create_anchor(anchor, &anchor_receipt(anchor, nonce))
+            .unwrap();
+        ledger.live_anchor(anchor).unwrap();
+        let mut registrations = Vec::with_capacity(MAX_REGISTRATION_GUARDS);
+        for _ in 0..MAX_REGISTRATION_GUARDS {
+            let nonce = ids.fresh().unwrap();
+            let registration = ledger
+                .mint_registration(&mut ids, anchor, epoch, nonce)
+                .unwrap();
+            ledger
+                .create_adoption(registration, &entry_receipt(registration, nonce))
+                .unwrap();
+            ledger
+                .live_adoption(
+                    registration,
+                    &AdoptedLinks {
+                        registration_id: registration,
+                        anchor_id: anchor,
+                        epoch,
+                        links: 1,
+                    },
+                )
+                .unwrap();
+            registrations.push(registration);
+        }
+        let order_peak = peak_of(|| {
+            let mut order = AcquisitionOrder::new();
+            order.note_gate_open().unwrap();
+            let enroll = ids.fresh().unwrap();
+            order
+                .note_enrolled(
+                    enroll,
+                    &EnrollmentReceipt {
+                        nonce: enroll,
+                        host_pid_tgid: 7,
+                    },
+                )
+                .unwrap();
+            order.note_anchored(&ledger, anchor).unwrap();
+            for registration in &registrations {
+                order.note_links_adopted(&ledger, *registration).unwrap();
+            }
+            assert_eq!(order.capabilities.len(), MAX_REGISTRATION_GUARDS);
+            std::hint::black_box(&order);
+        });
+        std::hint::black_box((&ids, &ledger, &registrations));
+        // Reserves cover measured live heap plus the inline stack footprint.
+        assert!(
+            ledger_peak + size_of::<GuardLedger>() <= LEDGER_RESERVE,
+            "ledger heap {ledger_peak} + inline exceeds {LEDGER_RESERVE}"
+        );
+        assert!(
+            domain_peak + size_of::<DomainIndex>() <= DOMAIN_INDEX_RESERVE,
+            "domain heap {domain_peak} + inline exceeds {DOMAIN_INDEX_RESERVE}"
+        );
+        assert!(
+            order_peak + size_of::<AcquisitionOrder>() <= ORDER_RESERVE,
+            "order heap {order_peak} + inline exceeds {ORDER_RESERVE}"
+        );
+    }
+}
+
+/// Test-only heap measurement. A thread-gated counting allocator delegates
+/// every operation to `System` and records requested bytes only for the
+/// thread under measurement, so parallel lib tests cannot pollute the
+/// reading. Counts are live requested heap (alloc minus dealloc
+/// high-water), matching the accounted-reserve semantics: reservations,
+/// not kernel allocation or RSS.
+#[cfg(test)]
+mod heap_measure {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+    }
+    static LIVE: AtomicUsize = AtomicUsize::new(0);
+    static PEAK: AtomicUsize = AtomicUsize::new(0);
+    struct Counting;
+    #[global_allocator]
+    static COUNTING: Counting = Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() && ARMED.try_with(|armed| armed.get()).unwrap_or(false) {
+                let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+                PEAK.fetch_max(live, Ordering::Relaxed);
+            }
+            ptr
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            if ARMED.try_with(|armed| armed.get()).unwrap_or(false) {
+                LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            }
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+    /// Run `fill` with counting armed on this thread and return the live-heap
+    /// high-water reached inside it. Sequential use only: one measurement at
+    /// a time across the test binary.
+    pub(super) fn peak_of(fill: impl FnOnce()) -> usize {
+        LIVE.store(0, Ordering::Relaxed);
+        PEAK.store(0, Ordering::Relaxed);
+        ARMED.with(|armed| armed.set(true));
+        fill();
+        ARMED.with(|armed| armed.set(false));
+        PEAK.load(Ordering::Relaxed)
     }
 }
