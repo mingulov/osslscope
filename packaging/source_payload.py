@@ -271,6 +271,25 @@ def prepare(bundle, output):
             (vendor/prefix/'.cargo-checksum.json').write_bytes(canonical({'files':checksums,'package':record['sha256']}))
         elif record['role']=='rust-runtime-source-component':
             write_tree(output/'rust-runtime'/record['toolchain'],content,modes[name])
+    # Cargo's build-std resolver visits the sysroot workspace, including
+    # dependencies outside core. They already accompany the official nightly
+    # component. Merge that ordinary vendor tree without acquiring more crates.
+    for name,content in extracted.items():
+        record = records[name]
+        if record['role'] != 'rust-runtime-source-component' or record['toolchain'] != 'nightly-2026-05-20':
+            continue
+        markers = [path.removesuffix('.cargo-checksum.json') for path in content if '/library/vendor/' in path and path.endswith('/.cargo-checksum.json')]
+        for prefix in markers:
+            directory = PurePosixPath(prefix.rstrip('/')).name
+            checksum = json.loads(content[prefix+'.cargo-checksum.json'])
+            existing = vendor/directory/'.cargo-checksum.json'
+            if existing.exists():
+                if json.loads(existing.read_bytes())['package'] != checksum['package']:
+                    raise ValueError('runtime vendor and crate source checksums disagree')
+                continue
+            subset = {directory+'/'+path[len(prefix):]:data for path,data in content.items() if path.startswith(prefix)}
+            permissions = {directory+'/'+path[len(prefix):]:modes[name][path] for path in content if path.startswith(prefix)}
+            write_tree(vendor,subset,permissions)
     config = product/'.cargo/config.toml'
     config.parent.mkdir(exist_ok=True)
     if config.exists():

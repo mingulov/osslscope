@@ -51,7 +51,13 @@ class SourcePayload(unittest.TestCase):
         pins = {'schema':'osslscope-runtime-sources-v1','components':[], 'host_std_crates':[], 'notices':[]}
         for toolchain, revision in [('1.88.0','a'*40), ('nightly-2026-05-20','b'*40)]:
             name = 'rust-src-'+toolchain
-            data = archive(self.inputs/(name+'.tar.xz'), {name+'/git-commit-hash':revision.encode(), name+'/rust-src/lib/rustlib/src/rust/library/Cargo.lock': b'version = 4\npackage = []\n', name+'/LICENSE-MIT': b'original Rust permission'})
+            content = {name+'/git-commit-hash':revision.encode(), name+'/rust-src/lib/rustlib/src/rust/library/Cargo.lock': b'version = 4\npackage = []\n', name+'/LICENSE-MIT': b'original Rust permission'}
+            if toolchain=='nightly-2026-05-20':
+                prefix=name+'/rust-src/lib/rustlib/src/rust/library/vendor/stdlib-only-2.0.0/'
+                content[prefix+'Cargo.toml']=b'[package]\nname="stdlib-only"\nversion="2.0.0"\n'
+                content[prefix+'LICENSE']=b'original std resolver notice'
+                content[prefix+'.cargo-checksum.json']=json.dumps({'package':'f'*64,'files':{}}).encode()
+            data = archive(self.inputs/(name+'.tar.xz'), content)
             pins['components'].append({'toolchain':toolchain,'archive':name+'.tar.xz','root':name,'rust_revision':revision,'bytes':len(data),'sha256':digest(data),'url':'https://static.rust-lang.org/dist/'+name+'.tar.xz'})
         (product/'packaging/runtime-sources.json').write_text(json.dumps(pins))
         return product, source, notices
@@ -81,6 +87,15 @@ class SourcePayload(unittest.TestCase):
         self.assertEqual((output/'product/Cargo.lock').read_bytes(), b'# host lock')
         with self.assertRaises(FileExistsError):
             self.module.prepare(payload, output)
+
+    def test_preparation_includes_component_vendor_for_build_std_resolution(self):
+        payload, manifest=self.build()
+        output=self.root/'sysroot-vendor'
+        self.module.prepare(payload,output)
+        dependency=output/'product/vendor/stdlib-only-2.0.0'
+        self.assertTrue(dependency.is_dir(),'nightly component resolver sources are missing from Cargo directory source')
+        self.assertEqual((dependency/'LICENSE').read_bytes(),b'original std resolver notice')
+        self.assertEqual(json.loads((dependency/'.cargo-checksum.json').read_bytes())['package'],'f'*64)
 
     def test_missing_or_mutated_locked_source_refuses_payload(self):
         product, source, notices = self.fixture()

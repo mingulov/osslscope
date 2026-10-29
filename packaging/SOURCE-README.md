@@ -32,8 +32,13 @@ The helper validates every payload length and hash before creating output. It
 writes regular files only, materializes validated internal first-party file links,
 rejects external links and dependency aliases, refuses an existing output
 and writes `vendor/` and `.cargo/config.toml`. Both the host and detached BPF
-workspace inherit this ordinary Cargo directory-source replacement, so a fresh
-Cargo home does not need a registry index. Original `.crate` payloads and their
+workspace inherit this ordinary Cargo directory-source replacement. It includes
+the nightly source component's existing vendor tree because Cargo's `build-std`
+resolver visits additional sysroot workspace dependencies even for a core-only
+build. Shared crate versions must agree on their original package checksum;
+original project crate archives take precedence. These extra resolver sources
+already arrive inside the unmodified official component. A fresh Cargo home
+does not need a registry index. Original `.crate` payloads and their
 checksums remain available in the bundle. Do not modify either lockfile.
 The four Aya BPF registry archives omit upstream license files; their exact-source
 notice supplements remain in `notices/dependency-notices/` and the product's
