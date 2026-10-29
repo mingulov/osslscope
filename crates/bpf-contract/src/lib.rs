@@ -45,3 +45,5 @@ pub struct CountNamespace {
 pub const fn focused_namespace_admits(result: i64, tgid: u32, target: u64) -> bool {
     result == 0 && target != 0 && tgid as u64 == target
 }
+
+pub mod attribution;

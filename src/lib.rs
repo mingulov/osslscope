@@ -54,3 +54,5 @@ pub(crate) mod writer_gate;
 
 #[cfg(test)]
 mod writer_gate_native;
+
+pub mod attribution;
