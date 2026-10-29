@@ -12,6 +12,55 @@
 //! unknown relocs, dim mismatch, non-GPL license) is an error, and
 //! map-fd fixups assert `BPF_PSEUDO_MAP_FD` at the site.
 type BorrowedRows<K, V> = (Vec<(K, Vec<V>)>, bool);
+mod source_btf;
+/// Prepared kernel ABI only; this is not source registration or eligibility.
+/// Retained by the production observation session until its writers are gone.
+pub(crate) struct SourceKernel {
+    _configuration: [u32; 10],
+    _reservation: crate::provider_observation::schema::StateReservation,
+}
+impl SourceKernel {
+    pub(crate) fn read(
+        budget: &crate::provider_observation::ObservationBudget,
+    ) -> Result<Self, crate::provider_observation::ObservationGap> {
+        use crate::provider_observation::ObservationGap as Gap;
+        use std::io::Read as _;
+        // Reserve before opening the BTF descriptor or allocating either buffer.
+        let _scratch = budget.reserve_state(source_btf::SCRATCH_RESERVATION)?;
+        let retained = budget.reserve_state(128)?;
+        crate::lifecycle_producer::note_acquisition().map_err(|_| Gap::BpfUnavailable)?;
+        let mut file =
+            std::fs::File::open("/sys/kernel/btf/vmlinux").map_err(|_| Gap::BpfUnavailable)?;
+        let mut bytes = vec![0; source_btf::MAX_BYTES];
+        let mut length = 0;
+        while length < bytes.len() {
+            budget.checkpoint()?;
+            let count = match file.read(&mut bytes[length..]) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                other => other.map_err(|_| Gap::BpfUnavailable)?,
+            };
+            if count == 0 {
+                break;
+            }
+            length += count;
+        }
+        let mut excess = [0; 1];
+        if file.read(&mut excess).map_err(|_| Gap::BpfUnavailable)? != 0 {
+            return Err(Gap::ReadLimit);
+        }
+        let layout =
+            source_btf::SourceLayout::parse(&bytes[..length]).map_err(|_| Gap::BpfUnavailable)?;
+        budget.checkpoint()?;
+        let mut configuration = [0; 10];
+        configuration[..3].copy_from_slice(&layout.kfunc_ids());
+        configuration[3..9].copy_from_slice(&layout.field_offsets());
+        configuration[9] = layout.vma_size();
+        Ok(Self {
+            _configuration: configuration,
+            _reservation: retained,
+        })
+    }
+}
 use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, OwnedFd};
 

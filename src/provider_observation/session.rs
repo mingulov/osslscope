@@ -244,6 +244,9 @@ pub struct ProviderSession {
     final_refusals: BTreeMap<u32, ObservationGap>,
     final_terminal: BTreeSet<u32>,
     loaded: loader::GatedLoaded,
+    // A validated kernel layout is only a prerequisite. No source authority is
+    // published without the separately owned anchor and actual registrations.
+    _source_kernel: Result<loader::SourceKernel, ObservationGap>,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
     members: BpfMap<MapData, u32, c::Member>,
@@ -686,6 +689,8 @@ impl ProviderSession {
         }
         let possible_cpus = aya::util::nr_cpus().map_err(|_| ObservationGap::StateLimit)?;
         reserve_map_capacity(&budget, &prepared.maps, possible_cpus)?;
+        let source_kernel = loader::SourceKernel::read(&budget);
+        budget.checkpoint()?;
         let loaded =
             loader::load_gated(&prepared, &gate).map_err(|_| ObservationGap::BpfUnavailable)?;
         crate::discovery::initialize_classifier_maps(
@@ -743,6 +748,7 @@ impl ProviderSession {
             loss: PerCpuArray::try_from(map(&loaded, "LOSS")?)
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loaded,
+            _source_kernel: source_kernel,
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
             roles: Roles::default(),
