@@ -187,6 +187,21 @@ pub(crate) fn host_acquisition_history(blocked: bool) {
         }
     }
 }
+/// Hermetic closed-gate pair for custody tests: a fake gate plus the
+/// `OwnedClosedGate` its successful close minted. Two pairs share the
+/// fake map id but never match each other, which is exactly what the
+/// swapped-owner rejection tests need. No BPF syscalls, no real barrier.
+#[cfg(test)]
+pub(crate) fn fake_closed_for_shape_tests(
+    pool: &MemoryPool,
+) -> io::Result<(WriterGate, OwnedClosedGate)> {
+    let gate = fake_for_shape_tests(pool)?;
+    *gate.0.state.borrow_mut() = GateState::Open;
+    gate.0.state.borrow_mut().close_with(gate.0.id, || Ok(()))?;
+    let closed = gate.owned_closed()?;
+    debug_assert!(closed.matches(&gate));
+    Ok((gate, closed))
+}
 #[cfg(test)]
 pub(crate) fn fake_for_shape_tests(pool: &MemoryPool) -> io::Result<WriterGate> {
     // Hermetic caps-free gate value for gated-shape tests: plain /dev/null
