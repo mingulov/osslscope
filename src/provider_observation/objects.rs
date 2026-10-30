@@ -1890,11 +1890,49 @@ fn parse_exports(
                 // derived entry cannot inherit either role from these wrappers.
                 destinations.fill(None);
             }
+            // The typed query role names the same public query ABI as the
+            // legacy query API, so it stages at the same derived
+            // destination: resolve is deterministic over (api, entry,
+            // exports), and the role's entry is that ABI's symbol
+            // offset, so a second resolve would repeat the same scans
+            // and budget charges for the same destination. Inherit the
+            // post-refusal destination only on an exact raw-offset
+            // match; anything else keeps the validated raw entry (fail
+            // closed). Without this the typed site stages at the dead
+            // export stub while real libcrypto calls only the
+            // trampoline.
+            let query_entry = exports
+                .iter()
+                .find(|(found, _)| *found == forwarder::APIS[0])
+                .map(|(_, offset)| *offset);
+            let mut query_destinations = Vec::with_capacity(query.len());
+            for &(role, offset) in &query {
+                let Some(offset) = offset else {
+                    continue;
+                };
+                let names_query_abi =
+                    crate::attribution::wire::TypedAdmission::admission_parts(role.id())
+                        .and_then(|(api, _, _)| super::wire::api(api).ok())
+                        == Some(forwarder::APIS[0]);
+                if names_query_abi
+                    && Some(offset) == query_entry
+                    && !typed_conflicts.contains(&offset)
+                {
+                    if let Some(destination) = destinations[0] {
+                        query_destinations.push((role, destination));
+                    }
+                }
+            }
             for (api, destination) in forwarder::APIS.into_iter().zip(destinations) {
                 if let Some(destination) = destination {
                     if let Some((_, offset)) = exports.iter_mut().find(|(found, _)| *found == api) {
                         *offset = destination;
                     }
+                }
+            }
+            for (role, destination) in query_destinations {
+                if let Some((_, offset)) = query.iter_mut().find(|(found, _)| *found == role) {
+                    *offset = Some(destination);
                 }
             }
         }

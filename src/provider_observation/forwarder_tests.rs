@@ -136,6 +136,13 @@ fn offset(parsed: &ElfObject, name: &str) -> Option<u64> {
         .find(|(api, _)| api.export_name() == Some(name))
         .map(|(_, at)| *at)
 }
+fn query_role_offset(parsed: &ElfObject, role: u32) -> Option<u64> {
+    parsed
+        .query_exports
+        .iter()
+        .find(|(found, _)| found.id() == role)
+        .map(|(_, at)| *at)
+}
 
 #[test]
 fn exact_forwarders_resolve_query_and_backward_unquery_once() {
@@ -565,5 +572,73 @@ fn typed_conflict_at_original_export_survives_query_forward_derivation() {
             .typed_exports
             .iter()
             .all(|(role, _)| role.id() != 136)
+    );
+}
+
+#[test]
+fn typed_query_role_stages_at_the_derived_legacy_destination() {
+    for prefix in ["", ".byte 0xf3,0x0f,0x1e,0xfa\n"] {
+        let f = ForwarderFixture::new(&format!("{prefix}{NEAR}"), &format!("{prefix}{SHORT_BACK}"));
+        let parsed = parsed(&f);
+        assert_eq!(
+            query_role_offset(&parsed, 161),
+            Some(f.offsets["query_impl"]),
+            "prefix {prefix:?}"
+        );
+        assert_eq!(
+            query_role_offset(&parsed, 161),
+            offset(&parsed, QUERY),
+            "161 derives exactly as the legacy query API: {prefix:?}"
+        );
+    }
+}
+
+#[test]
+fn typed_query_role_keeps_raw_entry_when_shared_destination_refuses() {
+    let f = ForwarderFixture::new(NEAR, ".byte 0xe9\n.long query_impl-.-4");
+    let parsed = parsed(&f);
+    assert_eq!(offset(&parsed, QUERY), Some(f.offsets[QUERY]));
+    assert_eq!(offset(&parsed, UNQUERY), Some(f.offsets[UNQUERY]));
+    assert_eq!(
+        query_role_offset(&parsed, 161),
+        Some(f.offsets[QUERY]),
+        "the shared-destination refusal covers the typed query role"
+    );
+}
+
+#[test]
+fn typed_query_role_keeps_raw_entry_for_plain_wrappers() {
+    let f = ForwarderFixture::new(".byte 0xc3", SHORT_BACK);
+    let parsed = parsed(&f);
+    assert_eq!(offset(&parsed, QUERY), Some(f.offsets[QUERY]));
+    assert_eq!(
+        query_role_offset(&parsed, 161),
+        Some(f.offsets[QUERY]),
+        "no stub means no derivation, exactly as legacy"
+    );
+}
+
+#[test]
+fn typed_query_role_withholds_when_raw_entry_conflicts() {
+    let mut f = ForwarderFixture::new(NEAR, SHORT_BACK);
+    let at = f.symbols[OTHER] + 8;
+    f.image[at..at + 8].copy_from_slice(&f.addresses[QUERY].to_le_bytes());
+    let old = b"EVP_MD_fetch";
+    let replacement = b"EVP_MAC_free";
+    for at in 0..f.image.len() - old.len() + 1 {
+        if &f.image[at..at + old.len()] == old {
+            f.image[at..at + old.len()].copy_from_slice(replacement);
+        }
+    }
+    let object = parsed(&f);
+    assert_eq!(
+        offset(&object, QUERY),
+        Some(f.offsets[QUERY]),
+        "the conflicted raw entry skips legacy derivation"
+    );
+    assert_eq!(
+        query_role_offset(&object, 161),
+        None,
+        "the same conflict gate withholds the typed query role"
     );
 }
