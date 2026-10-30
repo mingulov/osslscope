@@ -378,7 +378,8 @@ mod tests {
             std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
         let provider =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
-        let count = loader::prepare_focused_count(&count).unwrap();
+        let budget = crate::provider_observation::ObservationBudget::default();
+        let count = loader::prepare_focused_count(&count, &budget).unwrap();
         let provider =
             crate::provider_observation::session::prepare_legacy_object(&provider).unwrap();
         assert!(loader::load(&count).is_err(), "unshared load must refuse");

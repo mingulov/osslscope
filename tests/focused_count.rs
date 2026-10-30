@@ -269,9 +269,13 @@ fn actual_focused_object_shape_privacy_and_namespace_guard() {
     let path = std::env::var("OSSLSCOPE_FOCUSED_COUNT_OBJECT")
         .expect("set OSSLSCOPE_FOCUSED_COUNT_OBJECT to the freshly built object");
     let bytes = std::fs::read(path).expect("read focused BPF object");
-    let prepared = osslscope::loader::prepare_focused_count(&bytes).unwrap();
-    // U1: the count object links the operational join, so it carries the
-    // 20 borrowed producer maps plus its own 10 (gate + 7 count + 2 ns).
+    let budget = osslscope::provider_observation::ObservationBudget::default();
+    let prepared = osslscope::loader::prepare_focused_count(&bytes, &budget).unwrap();
+    // The count object carries the 20 borrowed producer maps plus its own
+    // 10 (gate + 7 count + 2 ns), exactly what FOCUSED_COUNT_MAPS
+    // specifies. This 30-map pin repairs a stale test expectation that
+    // asserted 10: the pre-stage object already defined all 30 maps, so
+    // no object growth is claimed here.
     assert_eq!(prepared.maps.len(), 30);
     assert_eq!(prepared.progs.len(), 1);
     let helpers: Vec<u32> = prepared.progs[0]
@@ -296,7 +300,7 @@ fn actual_focused_object_shape_privacy_and_namespace_guard() {
         .position(|s| s == b"NS_CONFIG")
         .expect("namespace map symbol");
     drift[off] = b'X';
-    assert!(osslscope::loader::prepare_focused_count(&drift).is_err());
+    assert!(osslscope::loader::prepare_focused_count(&drift, &budget).is_err());
 }
 
 #[test]
@@ -305,6 +309,7 @@ fn actual_object_refuses_dimension_root_helper_and_namespace_drift() {
     let path =
         std::env::var("OSSLSCOPE_FOCUSED_COUNT_OBJECT").expect("fresh focused BPF object required");
     let bytes = std::fs::read(path).unwrap();
+    let budget = osslscope::provider_observation::ObservationBudget::default();
     let elf = goblin::elf::Elf::parse(&bytes).unwrap();
     for symbol in &elf.syms {
         let name = elf.strtab.get_at(symbol.st_name).unwrap_or("");
@@ -327,7 +332,7 @@ fn actual_object_refuses_dimension_root_helper_and_namespace_drift() {
                 let mut bad = bytes.clone();
                 bad[offset + field] ^= 1;
                 assert!(
-                    osslscope::loader::prepare_focused_count(&bad).is_err(),
+                    osslscope::loader::prepare_focused_count(&bad, &budget).is_err(),
                     "{name} field {field}"
                 );
             }
@@ -349,7 +354,7 @@ fn actual_object_refuses_dimension_root_helper_and_namespace_drift() {
     let mut bad = bytes.clone();
     bad[base + helper * 8 + 4..base + helper * 8 + 8].copy_from_slice(&14u32.to_le_bytes());
     assert!(
-        osslscope::loader::prepare_focused_count(&bad).is_err(),
+        osslscope::loader::prepare_focused_count(&bad, &budget).is_err(),
         "initial-namespace helper must be refused"
     );
     let root = bytes
@@ -359,7 +364,7 @@ fn actual_object_refuses_dimension_root_helper_and_namespace_drift() {
     let mut bad = bytes.clone();
     bad[root] = b'x';
     assert!(
-        osslscope::loader::prepare_focused_count(&bad).is_err(),
+        osslscope::loader::prepare_focused_count(&bad, &budget).is_err(),
         "unapproved root must be refused"
     );
     let limits = CountLimits {

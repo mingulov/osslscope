@@ -2288,7 +2288,8 @@ mod tests {
         assert_eq!(typed_programs.len(), 2);
         // Count side through the shared P2 path: every borrowed name must
         // resolve to the same kernel maps the owner holds.
-        let count_prepared = loader::prepare_focused_count(&count).unwrap();
+        let count_prepared =
+            loader::prepare_focused_count(&count, &ObservationBudget::default()).unwrap();
         let mut borrowed = BTreeMap::new();
         for name in loader::BORROWED_COUNT_MAPS {
             borrowed.insert(name.to_string(), owner.owned_map(name).unwrap());

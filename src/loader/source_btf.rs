@@ -18,9 +18,39 @@ pub(super) struct SourceLayout {
     registration_function: u32,
     allocation: [u32; 2],
 }
+/// VMA-join layout only: everything the marker patcher needs, without the
+/// registration-hook ABI. Pre-6.12 kernels (6.9 through 6.11) carry the
+/// iterator, VMA fields and kfuncs but expose the 3-argument int-returning
+/// `uprobe_register`, so the join layout admits them while the full layout
+/// (below) refuses. Source-disabled counting patches through this layout;
+/// only Enabled source acquisition requires the registration half.
+pub(super) struct SourceJoinLayout {
+    functions: [u32; 3],
+    fields: [u32; 6],
+    vma_bytes: u32,
+    allocation: [u32; 2],
+}
 impl SourceLayout {
     pub(super) fn parse(bytes: &[u8]) -> Result<Self> {
         let view = View::parse(bytes)?;
+        let join = Self::parse_join_inner(&view)?;
+        let registration_function = Self::parse_registration(&view)?;
+        Ok(Self {
+            functions: join.functions,
+            fields: join.fields,
+            vma_bytes: join.vma_bytes,
+            registration_function,
+            allocation: join.allocation,
+        })
+    }
+    /// Join-only admission for marker patching. Never yields a registration
+    /// hook identity: the returned layout has no `registration_id`, so it
+    /// cannot be mistaken for source-registration admission.
+    pub(super) fn parse_join(bytes: &[u8]) -> Result<SourceJoinLayout> {
+        let view = View::parse(bytes)?;
+        Self::parse_join_inner(&view)
+    }
+    fn parse_join_inner(view: &View) -> Result<SourceJoinLayout> {
         let iterator = view.named(4, b"bpf_iter_task_vma")?;
         let task = view.named(4, b"task_struct")?;
         let vma = view.named(4, b"vm_area_struct")?;
@@ -89,8 +119,34 @@ impl SourceLayout {
             }
             functions[i] = id;
         }
+        // Capacity metadata only: never resolve or read this internal type's
+        // members. The iterator's 8B opaque handle is not its allocation size.
+        let allocation_type = view.ty(view.named(4, b"bpf_iter_task_vma_kern_data")?)?;
+        ensure!(
+            allocation_type.size >= 8 && allocation_type.size % 8 == 0,
+            "iterator allocation extent"
+        );
+        let with_node = allocation_type
+            .size
+            .checked_add(8)
+            .ok_or_else(|| anyhow::anyhow!("iterator allocation overflow"))?;
+        // Reviewed bpf_mem_alloc non-percpu LLIST_NODE_SZ and finite classes.
+        // This validates a class only, not concurrent/cache/deferred capacity.
+        let class = [16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096]
+            .into_iter()
+            .find(|class| *class >= with_node)
+            .ok_or_else(|| anyhow::anyhow!("iterator allocation class unavailable"))?;
+        Ok(SourceJoinLayout {
+            functions,
+            fields,
+            vma_bytes: view.ty(vma)?.size,
+            allocation: [allocation_type.size, class],
+        })
+    }
+    fn parse_registration(view: &View) -> Result<u32> {
         // The observer-only registration hooks have one finite trampoline ABI.
         // Checking the consumer pointer type does not authorize reading arg3.
+        let inode = view.named(4, b"inode")?;
         let consumer = view.named(4, b"uprobe_consumer")?;
         let uprobe = view.named(4, b"uprobe")?;
         let registration_function = view.named(12, b"uprobe_register")?;
@@ -109,30 +165,7 @@ impl SourceLayout {
         view.integer(word(proto.data, 20)?, 8, true, false)?;
         view.pointer(word(proto.data, 28)?, consumer)?;
         view.pointer(proto.size, uprobe)?;
-        // Capacity metadata only: never resolve or read this internal type's
-        // members. The iterator's 8B opaque handle is not its allocation size.
-        let allocation_type = view.ty(view.named(4, b"bpf_iter_task_vma_kern_data")?)?;
-        ensure!(
-            allocation_type.size >= 8 && allocation_type.size % 8 == 0,
-            "iterator allocation extent"
-        );
-        let with_node = allocation_type
-            .size
-            .checked_add(8)
-            .ok_or_else(|| anyhow::anyhow!("iterator allocation overflow"))?;
-        // Reviewed bpf_mem_alloc non-percpu LLIST_NODE_SZ and finite classes.
-        // This validates a class only, not concurrent/cache/deferred capacity.
-        let class = [16, 32, 64, 96, 128, 192, 256, 512, 1024, 2048, 4096]
-            .into_iter()
-            .find(|class| *class >= with_node)
-            .ok_or_else(|| anyhow::anyhow!("iterator allocation class unavailable"))?;
-        Ok(Self {
-            functions,
-            fields,
-            vma_bytes: view.ty(vma)?.size,
-            registration_function,
-            allocation: [allocation_type.size, class],
-        })
+        Ok(registration_function)
     }
     pub(super) fn kfunc_ids(&self) -> [u32; 3] {
         self.functions
@@ -145,6 +178,20 @@ impl SourceLayout {
     }
     pub(super) fn registration_id(&self) -> u32 {
         self.registration_function
+    }
+    pub(super) fn allocation(&self) -> [u32; 2] {
+        self.allocation
+    }
+}
+impl SourceJoinLayout {
+    pub(super) fn kfunc_ids(&self) -> [u32; 3] {
+        self.functions
+    }
+    pub(super) fn field_offsets(&self) -> [u32; 6] {
+        self.fields
+    }
+    pub(super) fn vma_size(&self) -> u32 {
+        self.vma_bytes
     }
     pub(super) fn allocation(&self) -> [u32; 2] {
         self.allocation
@@ -570,25 +617,42 @@ mod tests {
             );
         }
     }
-    #[test]
-    fn finite_source_layout_refuses_pre_6_12_registration_abi() {
-        // 6.9 through 6.11 expose the 3-argument int-returning
-        // uprobe_register(inode, offset, consumer); the source roots
-        // require the 6.12 shape (ref_ctr_offset argument, struct
-        // uprobe * return). Observed verbatim on 6.9.12 BTF:
-        // FUNC_PROTO vlen=3, SIGNED 32-bit int return.
+    // 6.9 through 6.11 expose the 3-argument int-returning
+    // uprobe_register(inode, offset, consumer). Observed verbatim on
+    // 6.9.12 BTF: FUNC_PROTO vlen=3, SIGNED 32-bit int return.
+    fn pre_6_12_registration_fixture() -> Fixture {
         let mut f = fixture();
         f.mutate(25, 4, 13 << 24 | 3);
         f.mutate(25, 8, 2);
         let start = f.offsets[25 - 1];
         f.types.drain(start + 28..start + 36);
-        let err = SourceLayout::parse(&f.finish())
+        f
+    }
+    #[test]
+    fn finite_source_layout_refuses_pre_6_12_registration_abi() {
+        // The source roots require the 6.12 shape (ref_ctr_offset
+        // argument, struct uprobe * return).
+        let err = SourceLayout::parse(&pre_6_12_registration_fixture().finish())
             .err()
             .expect("6.9-shaped layout must refuse");
         assert!(
             err.to_string().contains("registration arguments"),
             "unexpected refusal: {err:#}"
         );
+    }
+    #[test]
+    fn join_layout_admits_pre_6_12_kernels_without_registration() {
+        // Same 6.9-shaped bytes the full layout refuses above: the
+        // VMA-join half (iterator, fields, kfuncs, allocation) is
+        // present, so marker patching admits them. Source-disabled
+        // counting patches through this layout; only Enabled source
+        // acquisition requires the registration half.
+        let join = SourceLayout::parse_join(&pre_6_12_registration_fixture().finish())
+            .expect("6.9-shaped join layout must admit");
+        assert_eq!(join.kfunc_ids(), [15, 17, 19]);
+        assert_eq!(join.field_offsets(), [0, 8, 16, 24, 32, 8]);
+        assert_eq!(join.vma_size(), 64);
+        assert_eq!(join.allocation(), [320, 512]);
     }
     #[test]
     fn iterator_allocation_metadata_refuses_unaccountable_sizes() {

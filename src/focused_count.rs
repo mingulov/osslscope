@@ -167,6 +167,20 @@ fn gap(name: &str, value: u64) -> GapCounter {
 pub fn evidence_device(native: u64) -> u64 {
     crate::plan::encode_device(libc::major(native), libc::minor(native))
 }
+/// Component budget for the kernel-layout read behind marker patching.
+/// Capped at the counter's own remaining state allowance, never a fresh
+/// default: the BTF scratch reserves against this before opening or
+/// allocating.
+fn component_budget(
+    max_state_bytes: usize,
+) -> crate::provider_observation::schema::ObservationBudget {
+    crate::provider_observation::schema::ObservationBudget::new(
+        crate::provider_observation::schema::ObservationLimits {
+            max_state_bytes,
+            ..Default::default()
+        },
+    )
+}
 struct Attachment {
     link: OwnedFd,
     candidates: Vec<CountCandidate>,
@@ -218,7 +232,14 @@ impl FocusedCounter {
         limits: CountLimits,
     ) -> Result<Self, CountFailure> {
         limits.validate()?;
-        loader::prepare_focused_count(bytes).map_err(|_| CountFailure::Object)?;
+        // Peak-validate the transient BTF scratch against the component
+        // budget before preparing: a small-but-valid budget refuses with
+        // Resource here, before any BTF open or allocation.
+        if limits.max_state_bytes < loader::COUNT_JOIN_SCRATCH_BYTES {
+            return Err(CountFailure::Resource);
+        }
+        let component = component_budget(limits.max_state_bytes);
+        loader::prepare_focused_count(bytes, &component).map_err(|_| CountFailure::Object)?;
         if pid == 0 {
             return Err(CountFailure::Identity);
         }
@@ -275,7 +296,18 @@ impl FocusedCounter {
         let mut fold = CountFold::new(limits)?;
         fold.charge(crate::writer_gate::RESERVATION_BYTES + crate::writer_gate::INJECTION_BYTES)?;
         fold.charge(bytes.len().checked_mul(4).ok_or(CountFailure::Resource)?)?;
-        let prepared = loader::prepare_focused_count(bytes).map_err(|_| CountFailure::Object)?;
+        // Peak-validate the transient BTF scratch against the remaining
+        // component budget (checked, not committed: the reservation
+        // releases when the layout read ends), then hand the layout
+        // reader a component budget capped at that same remainder.
+        fold.checked_charge(loader::COUNT_JOIN_SCRATCH_BYTES)?;
+        let remaining = limits
+            .max_state_bytes
+            .checked_sub(fold.state_bytes)
+            .ok_or(CountFailure::Resource)?;
+        let component = component_budget(remaining);
+        let prepared =
+            loader::prepare_focused_count(bytes, &component).map_err(|_| CountFailure::Object)?;
         let cpus = aya::util::nr_cpus().map_err(|_| CountFailure::Read)?;
         if cpus == 0 || cpus > limits.max_cpus {
             return Err(CountFailure::Resource);
@@ -1904,5 +1936,45 @@ mod startup_controls {
             calls
         );
         child.finish_observation().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    /// Small-budget control through the real counter-opening path: a
+    /// small-but-valid `max_state_bytes` refuses with Resource before any
+    /// BTF open or allocation (unprivileged: the refusal precedes the
+    /// first kernel effect). The companion proves the refusal is
+    /// budget-specific: default limits with garbage bytes fail shape
+    /// admission with Object instead.
+    #[test]
+    fn small_valid_budget_refuses_before_btf_scratch() {
+        let namespace = crate::focused_capture::observer_namespace().unwrap();
+        let small = CountLimits {
+            max_state_bytes: 1 << 20,
+            window: CountAdmissionWindow {
+                start_ns: 1,
+                deadline_ns: 2,
+            },
+            ..Default::default()
+        };
+        small.validate().unwrap();
+        assert!(loader::COUNT_JOIN_SCRATCH_BYTES > small.max_state_bytes);
+        assert!(matches!(
+            FocusedCounter::open(&[0u8; 64], 1234, namespace, small),
+            Err(CountFailure::Resource)
+        ));
+        let roomy = CountLimits {
+            window: CountAdmissionWindow {
+                start_ns: 1,
+                deadline_ns: 2,
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            FocusedCounter::open(&[0u8; 64], 1234, namespace, roomy),
+            Err(CountFailure::Object)
+        ));
     }
 }

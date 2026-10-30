@@ -13,9 +13,24 @@
 //! map-fd fixups assert `BPF_PSEUDO_MAP_FD` at the site.
 type BorrowedRows<K, V> = (Vec<(K, Vec<V>)>, bool);
 mod source_btf;
+/// Transient BTF scratch the kernel-layout read reserves before opening
+/// `/sys/kernel/btf/vmlinux` or allocating either buffer. Callers charge
+/// this peak against their own component budget before preparing a
+/// marker-carrying object; the reservation releases when the read ends.
+pub(crate) const COUNT_JOIN_SCRATCH_BYTES: usize = source_btf::SCRATCH_RESERVATION;
 /// Prepared kernel ABI only; this is not source registration or eligibility.
 /// Retained by the production observation session until its writers are gone.
 pub(crate) struct SourceKernel {
+    _configuration: [u32; 13],
+    _reservation: crate::provider_observation::schema::StateReservation,
+}
+/// VMA-join kernel layout only: kfunc IDs, field offsets, VMA extent and
+/// iterator allocation class, without the registration-hook ABI. Marker
+/// patching (including source-disabled counting) reads through this type,
+/// which admits pre-6.12 kernels; it deliberately exposes no registration
+/// hook identity, so it can never authorize source acquisition. Retained
+/// only for the patch call, never across a session.
+pub(crate) struct JoinKernel {
     _configuration: [u32; 13],
     _reservation: crate::provider_observation::schema::StateReservation,
 }
@@ -40,32 +55,8 @@ impl SourceKernel {
         budget: &crate::provider_observation::ObservationBudget,
     ) -> Result<Self, crate::provider_observation::ObservationGap> {
         use crate::provider_observation::ObservationGap as Gap;
-        use std::io::Read as _;
-        // Reserve before opening the BTF descriptor or allocating either buffer.
-        let _scratch = budget.reserve_state(source_btf::SCRATCH_RESERVATION)?;
-        let retained = budget.reserve_state(128)?;
-        crate::lifecycle_producer::note_acquisition().map_err(|_| Gap::BpfUnavailable)?;
-        let mut file =
-            std::fs::File::open("/sys/kernel/btf/vmlinux").map_err(|_| Gap::BpfUnavailable)?;
-        let mut bytes = vec![0; source_btf::MAX_BYTES];
-        let mut length = 0;
-        while length < bytes.len() {
-            budget.checkpoint()?;
-            let count = match file.read(&mut bytes[length..]) {
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                other => other.map_err(|_| Gap::BpfUnavailable)?,
-            };
-            if count == 0 {
-                break;
-            }
-            length += count;
-        }
-        let mut excess = [0; 1];
-        if file.read(&mut excess).map_err(|_| Gap::BpfUnavailable)? != 0 {
-            return Err(Gap::ReadLimit);
-        }
-        let layout =
-            source_btf::SourceLayout::parse(&bytes[..length]).map_err(|_| Gap::BpfUnavailable)?;
+        let (bytes, retained, _scratch) = read_kernel_btf_bytes(budget)?;
+        let layout = source_btf::SourceLayout::parse(&bytes).map_err(|_| Gap::BpfUnavailable)?;
         budget.checkpoint()?;
         let mut configuration = [0; 13];
         configuration[..3].copy_from_slice(&layout.kfunc_ids());
@@ -78,6 +69,78 @@ impl SourceKernel {
             _reservation: retained,
         })
     }
+}
+impl JoinKernel {
+    pub(crate) fn patch(
+        &self,
+        prepared: &mut Prepared,
+    ) -> Result<(), crate::provider_observation::ObservationGap> {
+        patch_source_configuration(&self._configuration, &mut prepared.progs)
+            .map_err(|_| crate::provider_observation::ObservationGap::InvalidObject)
+    }
+    /// Join-only kernel-layout read for marker patching. Reserves the same
+    /// BTF scratch against the CALLER's budget and admits pre-6.12 kernels;
+    /// the registration slot stays zero and no registration-hook identity
+    /// escapes, so this can never authorize source acquisition.
+    pub(crate) fn read_join(
+        budget: &crate::provider_observation::ObservationBudget,
+    ) -> Result<Self, crate::provider_observation::ObservationGap> {
+        use crate::provider_observation::ObservationGap as Gap;
+        let (bytes, retained, _scratch) = read_kernel_btf_bytes(budget)?;
+        let layout =
+            source_btf::SourceLayout::parse_join(&bytes).map_err(|_| Gap::BpfUnavailable)?;
+        budget.checkpoint()?;
+        let mut configuration = [0; 13];
+        configuration[..3].copy_from_slice(&layout.kfunc_ids());
+        configuration[3..9].copy_from_slice(&layout.field_offsets());
+        configuration[9] = layout.vma_size();
+        configuration[11..].copy_from_slice(&layout.allocation());
+        Ok(Self {
+            _configuration: configuration,
+            _reservation: retained,
+        })
+    }
+}
+/// Acquire the running kernel's raw BTF bytes: reserve scratch against the
+/// caller's budget first, then open, bound and read. Shared by the full and
+/// join-only layout readers so their acquisition semantics cannot drift.
+fn read_kernel_btf_bytes(
+    budget: &crate::provider_observation::ObservationBudget,
+) -> Result<
+    (
+        Vec<u8>,
+        crate::provider_observation::schema::StateReservation,
+        crate::provider_observation::schema::StateReservation,
+    ),
+    crate::provider_observation::ObservationGap,
+> {
+    use crate::provider_observation::ObservationGap as Gap;
+    use std::io::Read as _;
+    // Reserve before opening the BTF descriptor or allocating either buffer.
+    let scratch = budget.reserve_state(source_btf::SCRATCH_RESERVATION)?;
+    let retained = budget.reserve_state(128)?;
+    crate::lifecycle_producer::note_acquisition().map_err(|_| Gap::BpfUnavailable)?;
+    let mut file =
+        std::fs::File::open("/sys/kernel/btf/vmlinux").map_err(|_| Gap::BpfUnavailable)?;
+    let mut bytes = vec![0; source_btf::MAX_BYTES];
+    let mut length = 0;
+    while length < bytes.len() {
+        budget.checkpoint()?;
+        let count = match file.read(&mut bytes[length..]) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            other => other.map_err(|_| Gap::BpfUnavailable)?,
+        };
+        if count == 0 {
+            break;
+        }
+        length += count;
+    }
+    let mut excess = [0; 1];
+    if file.read(&mut excess).map_err(|_| Gap::BpfUnavailable)? != 0 {
+        return Err(Gap::ReadLimit);
+    }
+    bytes.truncate(length);
+    Ok((bytes, retained, scratch))
 }
 /// Marker immediates owned by the VMA-join helper (kfunc call identities
 /// plus field-offset identities). Shared by the patcher and the
@@ -102,14 +165,18 @@ fn prepared_has_source_markers(programs: &[PreparedProg]) -> bool {
 /// own image (the session patches only its registration half). Absent
 /// markers skip silently (pre-U1 objects stay loadable); present markers
 /// patch-or-fail loudly: an unpatched VMA call must never reach the
-/// verifier. The throwaway budget covers only the BTF scratch the
-/// kernel-layout read reserves; the caller owns all other budgets.
-pub(crate) fn patch_count_markers(prepared: &mut Prepared) -> anyhow::Result<()> {
+/// verifier. Patching reads the join-only kernel layout (no registration
+/// hook admission, so source-disabled counting stays independent of it)
+/// with the BTF scratch reserved against the CALLER's budget, never a
+/// fresh default.
+pub(crate) fn patch_count_markers(
+    prepared: &mut Prepared,
+    budget: &crate::provider_observation::ObservationBudget,
+) -> anyhow::Result<()> {
     if !prepared_has_source_markers(&prepared.progs) {
         return Ok(());
     }
-    let budget = crate::provider_observation::ObservationBudget::default();
-    let kernel = SourceKernel::read(&budget).map_err(|gap| anyhow::anyhow!("{gap:?}"))?;
+    let kernel = JoinKernel::read_join(budget).map_err(|gap| anyhow::anyhow!("{gap:?}"))?;
     kernel
         .patch(prepared)
         .map_err(|gap| anyhow::anyhow!("{gap:?}"))
@@ -7637,7 +7704,12 @@ pub const FOCUSED_COUNT_MAPS: [MapSpec; 30] = [
     },
 ];
 /// Pure, fail-closed shape/privacy admission for the learned-site counter.
-pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
+/// Marker patching (when the object carries the VMA-join helper) reserves
+/// its BTF scratch against the caller's budget.
+pub fn prepare_focused_count(
+    object: &[u8],
+    budget: &crate::provider_observation::ObservationBudget,
+) -> anyhow::Result<Prepared> {
     validate_count_object(object)?;
     let mut prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
     anyhow::ensure!(
@@ -7662,7 +7734,7 @@ pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
     // allowlist then sees the patched image (kfunc calls use src 2 and
     // skip the helper check; the join's only plain helpers are the
     // kernel-memory read 113 and current-task-BTF 158).
-    patch_count_markers(&mut prepared)?;
+    patch_count_markers(&mut prepared, budget)?;
     let root = &prepared.progs[0];
     let mut namespace_helper = false;
     for i in root.insns.chunks_exact(8) {

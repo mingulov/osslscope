@@ -384,7 +384,8 @@ fn actual_explicit_companions_use_focused_abi_and_retained_bytes() {
     assert_eq!(admitted.observation.as_ref(), observation);
     assert_eq!(admitted.count.as_ref(), count);
     // The admitted bytes remain usable after removal/replacement of locators.
-    osslscope::loader::prepare_focused_count(&admitted.count).unwrap();
+    let budget = osslscope::provider_observation::ObservationBudget::default();
+    osslscope::loader::prepare_focused_count(&admitted.count, &budget).unwrap();
 }
 
 #[test]

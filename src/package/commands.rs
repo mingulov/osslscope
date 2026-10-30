@@ -233,9 +233,20 @@ pub fn resolve_focused_objects(
             Companion::Observation => crate::provider_observation::session::prepare_object(bytes)
                 .map(|_| ())
                 .map_err(|_| PackageError::invalid("observation companion ABI")),
-            Companion::FocusedCount => crate::loader::prepare_focused_count(bytes)
-                .map(|_| ())
-                .map_err(|_| PackageError::invalid("focused Count companion ABI")),
+            Companion::FocusedCount => {
+                // Explicit validation ceiling for the marker-patch BTF
+                // scratch (caller-owned, bounded — never a fresh default
+                // smuggled inside the callee).
+                let budget = crate::provider_observation::schema::ObservationBudget::new(
+                    crate::provider_observation::schema::ObservationLimits {
+                        max_state_bytes: 32 << 20,
+                        ..Default::default()
+                    },
+                );
+                crate::loader::prepare_focused_count(bytes, &budget)
+                    .map(|_| ())
+                    .map_err(|_| PackageError::invalid("focused Count companion ABI"))
+            }
         }
     }
     fn snapshot(path: Option<&Path>, role: Companion) -> Result<Arc<[u8]>, PackageError> {

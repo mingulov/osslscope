@@ -41,8 +41,12 @@ impl Producers {
         let gate = WriterGate::create(&MemoryPool::new(256 << 20)).unwrap();
         let bytes =
             std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
-        let count =
-            loader::load_gated(&loader::prepare_focused_count(&bytes).unwrap(), &gate).unwrap();
+        let budget = crate::provider_observation::ObservationBudget::default();
+        let count = loader::load_gated(
+            &loader::prepare_focused_count(&bytes, &budget).unwrap(),
+            &gate,
+        )
+        .unwrap();
         let bytes =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
         let provider = loader::load_gated(
@@ -555,7 +559,8 @@ fn native_gate_cost_against_historical_rust_count_and_resource_release() {
     loader::validate_count_object(&historical).unwrap();
     let baseline = loader::prepare(&historical, &baseline_specs, &loader::COUNT_PROGS).unwrap();
     assert_eq!(baseline.maps.len(), 9);
-    let current = loader::prepare_focused_count(&current).unwrap();
+    let budget = crate::provider_observation::ObservationBudget::default();
+    let current = loader::prepare_focused_count(&current, &budget).unwrap();
     let mut samples = Vec::new();
     // Alternating AB/BA order, two warmup pairs then eleven retained pairs.
     for pair in 0..13 {
