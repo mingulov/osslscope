@@ -29,7 +29,7 @@ use aya_ebpf::{
 use core::ptr::addr_of_mut;
 use osslscope_bpf_contract::{
     attribution::*,
-    source::{DOMAIN_ACTIVE, DOMAIN_LIVE, GUARD_LIVE, SOURCE_READY},
+    source::{DOMAIN_ACTIVE, DOMAIN_LIVE, GUARD_LIVE, SOURCE_ANCHOR, SOURCE_READY, SOURCE_REG},
 };
 
 /// Kernel UAPI insert flags; aya-ebpf exposes no consts.
@@ -4574,11 +4574,16 @@ pub fn own_pending_x(
 /// firing IP (no subtraction: Linux rewinds it to the probe address),
 /// joins it to the same (inode, file offset) through the same VMA
 /// policy, requires the firing cookie's retained registration/source
-/// epoch to be live, and requires the matching row — same observed
-/// offset, publication sequence at or before the entry snapshot.
-/// Return paths pair to entry-verified frames and need no second join.
-/// A query advertising callback A never authorizes a separately staged
-/// callback B at another offset in the same file: the offsets differ.
+/// epoch to be live, requires the joined identity to equal the
+/// registration-time identity retained for that cookie (SOURCE_REG
+/// offset plus SOURCE_ANCHOR inode, with witness relationships — a
+/// snapshot taken after a concurrent remap joins the transient
+/// identity and must never authorize), and requires the matching row
+/// — same observed offset, publication sequence at or before the entry
+/// snapshot. Return paths pair to entry-verified frames and need no
+/// second join. A query advertising callback A never authorizes a
+/// separately staged callback B at another offset in the same file:
+/// the offsets differ.
 ///
 /// Key amendment note: the source-capability contract sketches
 /// cookie-keyed CODE_ROLE rows, but the firing cookie does not exist at
@@ -4760,14 +4765,124 @@ fn join_firing_identity(ctx: &ProbeContext) -> Option<(u64, u64)> {
     Some((location.inode, location.file_offset))
 }
 
+/// Registration-identity cross-check (remap-TOCTOU closure): the
+/// caller-joined (inode, file offset) must equal the registration-time
+/// identity the kernel retained for THIS firing cookie. The VMA snapshot
+/// races concurrent remaps — Linux releases mmap_lock before invoking
+/// uprobe consumers — so a snapshot taken after another thread remapped
+/// the firing VA joins a transient identity: without this bind, a
+/// previously published CODE_ROLE row for that transient identity would
+/// authorize while this cookie's guards stay LIVE, leaving readiness
+/// and identity two independent facts.
+///
+/// The bind is to kernel witnesses, never host claims: the joined
+/// offset must equal the SOURCE_REG row selected by the firing
+/// (cookie, source epoch) — the exact offset the kernel observed in
+/// the registration arguments — and the joined inode must carry that
+/// registration's retained SOURCE_ANCHOR. Witness relationships are
+/// validated, not just raw numbers: READY→REG→ANCHOR linkage through
+/// (anchor_id, registration_id), WITNESS states, evidence epochs,
+/// proved==required completion, object agreement between REG and
+/// ANCHOR, and publication sequences at or before the entry snapshot.
+/// Guard liveness for both IDs rides the `ready_and_guards` pass the
+/// caller just performed in this same run (immutable READY body, so
+/// the extracted IDs are the guarded ones). Any miss refuses.
+///
+/// Field positions mirror the source publisher (`source_publish_new`)
+/// and its sibling validators (`anchor`, `registration_matches`): a
+/// skew between the two statements breaks every copied-role positive
+/// loudly (the re-green controls pin the agreement behaviorally).
+/// Inlined with one reused key slot so the 6.9 static chain gains no
+/// extra frame level.
+#[inline(always)]
+fn registration_identity_matches(
+    target: &Target,
+    cookie: u64,
+    source_epoch: u64,
+    inode: u64,
+    file_offset: u64,
+) -> bool {
+    // The READY row `ready_and_guards` just validated: re-read to
+    // extract the witness IDs (immutable body) and re-check state and
+    // sequence, so a quarantine landing between the two reads refuses.
+    let mut key = RelKey {
+        process_incarnation: target.process,
+        image_epoch: target.image,
+        relation_epoch: 0,
+        primary_handle: cookie,
+        secondary_handle: source_epoch,
+        kind: SOURCE_READY,
+        operation: 0,
+    };
+    let Some(ready) = REL.get_ptr_mut(&key) else {
+        return false;
+    };
+    let (anchor_id, registration_id) = unsafe {
+        if !row_state_is(ready, REL_WITNESS)
+            || (*ready).evidence_epoch != source_epoch
+            || (*ready).data[2] == 0
+            || (*ready).data[2] > target.entry_seq
+        {
+            return false;
+        }
+        ((*ready).data[0], (*ready).data[1])
+    };
+    if anchor_id == 0 || registration_id == 0 {
+        return false;
+    }
+    // SOURCE_REG selected by the firing (cookie, source epoch): same
+    // key, REG kind. Its data[1] is the registration-time offset.
+    key.kind = SOURCE_REG;
+    let Some(reg) = REL.get_ptr_mut(&key) else {
+        return false;
+    };
+    let reg_object = unsafe {
+        if !row_state_is(reg, REL_WITNESS)
+            || (*reg).witness_id != registration_id
+            || (*reg).parent_id != anchor_id
+            || (*reg).evidence_epoch != source_epoch
+            || (*reg).data[0] == 0
+            || (*reg).data[1] != file_offset
+            || (*reg).data[2] != cookie
+            || (*reg).data[3] == 0
+            || (*reg).data[4] != (*reg).data[3]
+            || (*reg).data[5] == 0
+            || (*reg).data[5] > target.entry_seq
+        {
+            return false;
+        }
+        (*reg).data[0]
+    };
+    // SOURCE_ANCHOR retained for the joined inode under this
+    // registration's anchor: keyed (inode, anchor_id).
+    key.primary_handle = inode;
+    key.secondary_handle = anchor_id;
+    key.kind = SOURCE_ANCHOR;
+    let Some(anchor) = REL.get_ptr_mut(&key) else {
+        return false;
+    };
+    unsafe {
+        row_state_is(anchor, REL_WITNESS)
+            && (*anchor).witness_id == anchor_id
+            && (*anchor).parent_id == 0
+            && (*anchor).evidence_epoch == source_epoch
+            && (*anchor).data[0] == reg_object
+            && (*anchor).data[1] == source_epoch
+            && (*anchor).data[2] != 0
+            && (*anchor).data[2] <= target.entry_seq
+    }
+}
+
 /// Copied-role callback check (two-phase binding, phase 2): the firing
-/// cookie's retained registration/source epoch must be live, and the
-/// caller-joined exact observed inode-and-offset identity must match the
-/// query-published CODE_ROLE row with code-ABI certification and a
-/// publication sequence at or before the entry snapshot. Phase 1 (query
-/// time) publishes the inode-and-offset identity without any cookie,
-/// which is unknowable then; this phase binds it to the consuming
-/// cookie. Any miss refuses before any operand read.
+/// cookie's retained registration/source epoch must be live, the joined
+/// identity must equal the registration-time identity retained for that
+/// cookie (remap-TOCTOU bind), and the caller-joined exact observed
+/// inode-and-offset identity must match the query-published CODE_ROLE
+/// row with code-ABI certification and a publication sequence at or
+/// before the entry snapshot. Phase 1 (query time) publishes the
+/// inode-and-offset identity without any cookie, which is unknowable
+/// then; this phase binds it to the consuming cookie. Any miss refuses
+/// before any operand read.
 ///
 /// The caller performs the VMA join first (`join_firing_identity`,
 /// inlined) and passes the joined identity here: splitting the join
@@ -4797,6 +4912,15 @@ pub fn code_role_check(
     };
     let source_epoch = unsafe { (*bound).source_epoch };
     if !ready_and_guards(cookie, source_epoch, target.entry_seq, target) {
+        return false;
+    }
+    // Registration-identity binding: the joined offset/inode must equal
+    // the registration-time identity retained for this firing cookie
+    // (SOURCE_REG/SOURCE_ANCHOR witnesses). A VMA snapshot taken after
+    // a concurrent remap joins the transient identity; without this
+    // bind a CODE_ROLE row published for it would authorize while this
+    // cookie's guards stay LIVE.
+    if !registration_identity_matches(target, cookie, source_epoch, inode, file_offset) {
         return false;
     }
     let key = code_role_key(target, inode, u64::from(function), operation);
