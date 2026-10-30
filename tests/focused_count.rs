@@ -270,7 +270,9 @@ fn actual_focused_object_shape_privacy_and_namespace_guard() {
         .expect("set OSSLSCOPE_FOCUSED_COUNT_OBJECT to the freshly built object");
     let bytes = std::fs::read(path).expect("read focused BPF object");
     let prepared = osslscope::loader::prepare_focused_count(&bytes).unwrap();
-    assert_eq!(prepared.maps.len(), 10);
+    // U1: the count object links the operational join, so it carries the
+    // 20 borrowed producer maps plus its own 10 (gate + 7 count + 2 ns).
+    assert_eq!(prepared.maps.len(), 30);
     assert_eq!(prepared.progs.len(), 1);
     let helpers: Vec<u32> = prepared.progs[0]
         .insns
