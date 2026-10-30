@@ -746,8 +746,7 @@ fn typed_getctx_derivation_runs_its_own_full_source_scans() {
     assert_eq!(
         with.rows[ScanKind::Source as usize],
         3 * entries,
-        "146 runs its own full source scan ({} entries)",
-        entries
+        "146 runs its own full source scan ({entries} entries)"
     );
     assert!(
         with.rows[ScanKind::Source as usize] > without.rows[ScanKind::Source as usize],
