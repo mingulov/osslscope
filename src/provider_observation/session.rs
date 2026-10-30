@@ -5001,14 +5001,15 @@ int main(int argc, char **argv) {
         );
     }
     /// U2 operational-attach control: same two-pass staging as U1, but the
-    /// pass-2 counter attaches at the four operational sites (304 init,
-    /// 305 update, 306 final, 307 derive) instead of the lifecycle six.
-    /// The first partitions prove the same-handler join end to end: every
-    /// operational hit resolves (admission, CODE_ROLE authorization,
-    /// committed X and OWNER at the entry snapshot, prepared selector,
-    /// live digest) into a definite record. Lifecycle coverage stays
-    /// U1's; U2 counts operational only, so the unresolved remainder
-    /// carries just the teardown-poison foreign bound.
+    /// pass-2 counter attaches at the five operational sites (304 init,
+    /// 305 update, 306 final, 307 derive, 308 reset) instead of the
+    /// lifecycle six. The first partitions prove the same-handler join end
+    /// to end: every partitionable hit resolves (admission, CODE_ROLE
+    /// authorization, committed X and OWNER at the entry snapshot,
+    /// prepared selector, live digest) into a definite record. Site 308
+    /// is retire-only by design (it retires the KDF owner at reset and
+    /// never partitions), so its one hit stays unresolved next to the
+    /// teardown-poison foreign bound. Lifecycle coverage stays U1's.
     ///
     /// ```sh
     /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
@@ -5027,7 +5028,7 @@ int main(int argc, char **argv) {
         let drive = drive_typed_session_with_counter(
             "u2",
             &app,
-            &[304, 305, 306, 307],
+            &[304, 305, 306, 307, 308],
             Some(&plan),
             "marker2",
         );
@@ -5046,24 +5047,24 @@ int main(int argc, char **argv) {
         );
         assert_eq!(
             drive.counter_links, 1,
-            "one multi-link batches the four sites"
+            "one multi-link batches the five sites"
         );
-        assert_eq!(drive.joined_sites, 4, "all four counted sites join");
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
         assert_eq!(
-            drive.joined_calls, 4,
-            "1 init + 1 update + 1 final + 1 derive"
+            drive.joined_calls, 5,
+            "1 init + 1 update + 1 final + 1 derive + 1 reset"
         );
         assert_eq!(
             drive.definite, 4,
-            "first partitions: every operational hit resolves to a definite record"
+            "first partitions: every partitionable hit resolves to a definite record"
         );
         assert_eq!(
-            drive.unresolved_calls, 1,
-            "physical all assigned; only the teardown-poison foreign bound remains"
+            drive.unresolved_calls, 2,
+            "the retire-only 308 hit plus the teardown-poison foreign bound"
         );
         assert_eq!(drive.withheld_uncertain, 0);
-        assert_eq!(drive.sample_sites, 4);
-        assert_eq!(drive.sample_calls, 4);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, 5);
         assert_eq!(
             drive.next_producer_id, 49,
             "U1's 44 mints plus 4 operational segment allocs, counter starts at 1"
