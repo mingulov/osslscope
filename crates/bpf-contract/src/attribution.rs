@@ -294,6 +294,39 @@ pub struct RelKey {
     pub kind: u32,
     pub operation: u32,
 }
+
+/// CODE_ROLE (kind 5) key shape: full target-domain scope plus the
+/// VMA-joined callback inode and the live (operation, function). The
+/// relation epoch is 0 so ordinary relation/loss advance cannot clear
+/// code facts; code replacement changes the inode or image instead.
+///
+/// Inode keying is the carried I1 ruling on the source-capability key
+/// amendment (`docs/2026-10-29-v050-source-capability.md:36`, which
+/// names cookie keying): the firing cookie exists only in the copied
+/// callback's own probe context, so the query-time publisher — which
+/// observes bare dispatch-table addresses — cannot key on it. No
+/// VA/cookie dependence is structural: this constructor takes neither
+/// (see the signature). A caller cannot smuggle either in. The kernel
+/// `code_role_key` wrapper delegates here; the full interpretation
+/// comment lives with it.
+#[inline(always)]
+pub const fn code_role_key(
+    process_incarnation: u64,
+    image_epoch: u64,
+    inode: u64,
+    function: u64,
+    operation: u32,
+) -> RelKey {
+    RelKey {
+        process_incarnation,
+        image_epoch,
+        relation_epoch: 0,
+        primary_handle: inode,
+        secondary_handle: function,
+        kind: REL_CODE_ROLE,
+        operation,
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RelValue {

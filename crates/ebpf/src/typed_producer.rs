@@ -4422,21 +4422,56 @@ fn code_shape(operation: u32, function: u32) -> Option<u64> {
     }
 }
 
-/// CODE_ROLE key: full target-domain scope plus the VMA-joined inode
-/// and the live (operation, function). The relation epoch is 0 so
-/// ordinary relation/loss advance cannot clear code facts (tombstone
-/// precedent); code replacement changes the inode or image instead.
+/// CODE_ROLE key (I1 ruling carried: inode keying STANDS as faithful
+/// to the key amendment's intent — do not rekey to cookies).
+///
+/// The source-capability contract's key amendment
+/// (`docs/2026-10-29-v050-source-capability.md:36`) names cookie keying
+/// ("actual callback lookup uses its firing cookie"), but the firing
+/// cookie is unknowable at query-publication time: `publish_code_role`
+/// runs in `typed_query_return` while walking the provider's returned
+/// dispatch table, where the kernel observes bare code addresses with
+/// no ambient attach cookie. The firing cookie exists only inside the
+/// copied callback's own probe context (via `bpf_get_attach_cookie`),
+/// which the query-return path never enters — and the admission index
+/// runs cookie-to-site, never address-to-cookie, so no reverse lookup
+/// can supply one without trusting the very VA the amendment refuses.
+/// Cookie-keyed rows would therefore be unwritable at the only moment
+/// publication is possible.
+///
+/// Guarantees preserved, and how:
+/// - Kernel-observed identity: both sides derive the inode from live
+///   kernel VMA state through the same qualified join (`code_vma_join`,
+///   `Policy::Code`): publication joins each walked table address, the
+///   callback join joins the firing `rip - 1`. The retained anchor's
+///   pinned file pins the inode address for the session (no reuse
+///   aliasing), and the per-callback source-authority gate still
+///   precedes every join.
+/// - No VA trust: no VA is stored in the key or trusted across time;
+///   the join revalidates the live mapping on every use, and a stale
+///   or remapped VA fails the join (fail closed).
+/// - Full target-domain scope: `process_incarnation` + `image_epoch`
+///   scope the row, and `relation_epoch` 0 keeps ordinary
+///   relation/loss advance from clearing code facts (tombstone
+///   precedent); code replacement changes the inode or image instead.
+/// The amendment's "candidate VA only proposes" half holds verbatim:
+/// host offsets (the plan) propose sites; this join is the kernel's
+/// independent verification. Only the lookup handle adapts
+/// (cookie to inode); the finite operation/function/signature/
+/// query-witness/object/publication fields are unchanged.
+///
+/// Delegates to the contract-crate constructor (same bytes, pinned by
+/// `code_role_key_shape_is_inode_keyed_epoch_zero`); the path is fully
+/// qualified because this wrapper intentionally shadows the glob import.
 #[inline(always)]
 fn code_role_key(target: &Target, inode: u64, function: u64, operation: u32) -> RelKey {
-    RelKey {
-        process_incarnation: target.process,
-        image_epoch: target.image,
-        relation_epoch: 0,
-        primary_handle: inode,
-        secondary_handle: function,
-        kind: REL_CODE_ROLE,
+    osslscope_bpf_contract::attribution::code_role_key(
+        target.process,
+        target.image,
+        inode,
+        function,
         operation,
-    }
+    )
 }
 
 /// VMA-join one address under the Code policy (exec, not write/shared).

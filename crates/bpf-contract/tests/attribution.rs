@@ -357,3 +357,39 @@ fn query_observation_role_admits_paired_query_only() {
     assert!(TypedAdmission::new(161, 8, 3, 0, 1, 1).is_none());
     assert!(TypedAdmission::new(161, 0, 0, 0, 1, 1).is_none());
 }
+#[test]
+fn code_role_key_shape_is_inode_keyed_epoch_zero() {
+    // I1 ruling pin: CODE_ROLE keys compose (process, image, epoch 0,
+    // inode, function, kind 5, op). The kernel `code_role_key` wrapper
+    // delegates to this exact constructor, so any rekey (cookie, VA,
+    // nonzero epoch) fails here. No VA/cookie dependence is
+    // structural: the constructor takes neither (see its signature),
+    // so a caller cannot smuggle either in.
+    let key = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
+    assert_eq!(key.process_incarnation, 0x1111);
+    assert_eq!(key.image_epoch, 0x2222);
+    assert_eq!(key.relation_epoch, 0);
+    assert_eq!(
+        key.primary_handle, 0x3333,
+        "primary is the inode, not a cookie"
+    );
+    assert_eq!(key.secondary_handle, 5, "secondary is the function");
+    assert_eq!(key.kind, REL_CODE_ROLE);
+    assert_eq!(key.operation, 4, "operation rides the key, not admission");
+    // Composition: inode, function and operation each select a distinct
+    // row, and the epoch stays 0 across all of them.
+    let others = [
+        code_role_key(0x1111, 0x2222, 0x4444, 5, 4),
+        code_role_key(0x1111, 0x2222, 0x3333, 6, 4),
+        code_role_key(0x1111, 0x2222, 0x3333, 5, 3),
+    ];
+    assert_ne!(others[0].primary_handle, key.primary_handle);
+    assert_ne!(others[1].secondary_handle, key.secondary_handle);
+    assert_ne!(others[2].operation, key.operation);
+    for other in &others {
+        assert_eq!(other.relation_epoch, 0);
+        assert_eq!(other.kind, REL_CODE_ROLE);
+        assert_eq!(other.process_incarnation, 0x1111);
+        assert_eq!(other.image_epoch, 0x2222);
+    }
+}
