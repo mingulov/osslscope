@@ -1707,10 +1707,12 @@ impl ProviderSession {
     }
     /// Consume the retained typed exports through the receipt-based
     /// source-acquisition protocol, one capability per site: revalidate
-    /// freshness, mint cookie/site/artifact IDs, program admission+bind,
-    /// adopt the typed entry/return pair with ENTRY/RETURN receipts, and
-    /// publish READY through the contracted kernel phase-4 path — all
-    /// under the shared LIVE anchor in `scope`. Runs after the legacy
+    /// freshness, mint cookie/site/artifact IDs, program the CONFIG row
+    /// (the kernel resolves the cookie's TGID through it) and
+    /// admission+bind, adopt the typed entry/return pair with ENTRY/RETURN
+    /// receipts, and publish READY through the contracted kernel phase-4
+    /// path — all under the shared LIVE anchor in `scope`. Runs after the
+    /// legacy
     /// registration lists and before the terminal legacy READY publishes,
     /// while the child is still held: every capability lists before any
     /// READY completes the set, and no fetch can fire unadmitted. Any
@@ -1794,6 +1796,38 @@ impl ProviderSession {
                 }
             };
             let object_sha256 = super::source_owner::decode_object_hash_hex(&object_hash)?;
+            // The kernel's source_domain() resolves the TGID through
+            // CONFIG[cookie]: program this cookie's row (same shape as the
+            // legacy prearm rows) before the ENTRY request can arm. The
+            // typed programs never read CONFIG — this row exists so the
+            // registration receipts join the cookie to its domain.
+            let startup_generation = self
+                .startup
+                .get(&pid)
+                .and_then(|attachments| attachments.first())
+                .map(|attachment| attachment.generation)
+                .ok_or(ObservationGap::Invalidated)?;
+            let config_result = validate_then_arm(
+                || site.revalidate_object(),
+                || {
+                    self.config
+                        .insert(
+                            cookie,
+                            c::Config {
+                                generation: startup_generation,
+                                object: object_id,
+                                pid,
+                                api,
+                            },
+                            0,
+                        )
+                        .map_err(|_| ObservationGap::AttachFailed)
+                },
+            );
+            if config_result.is_err() {
+                let _ = self.config.remove(&cookie);
+            }
+            config_result?;
             let owner = self
                 .source_owner
                 .as_mut()
