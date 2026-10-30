@@ -412,3 +412,29 @@ fn code_role_identity_binds_inode_offset_and_cookie_epoch() {
     assert_eq!(same_key_other_offset[0], value[0]);
     assert_eq!(same_key_other_offset[1], value[1]);
 }
+#[test]
+fn code_role_key_disambiguates_same_function_callbacks_by_file_offset() {
+    // U5K regression pin (§25.4): two distinct callbacks in one file
+    // sharing (inode, function, op) but advertised at different file
+    // offsets must publish distinct CODE_ROLE rows. The pre-fix key
+    // carries no offset slot, so both publications derive this same
+    // key and the second refuses with LOSS_MAP (54 attempts -> 6 rows
+    // + 48 refused attempts on the U5 workload). RED pre-fix: the two
+    // constructor calls below stand for the two offsets (0x1b4,
+    // 0x2c8), which the current signature cannot express.
+    let first = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
+    let second = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
+    assert_ne!(
+        (
+            second.primary_handle,
+            second.secondary_handle,
+            second.operation
+        ),
+        (
+            first.primary_handle,
+            first.secondary_handle,
+            first.operation
+        ),
+        "same (inode, function, op) at two file offsets must key distinct rows"
+    );
+}
