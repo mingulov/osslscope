@@ -79,9 +79,66 @@ impl SourceKernel {
         })
     }
 }
+/// Marker immediates owned by the VMA-join helper (kfunc call identities
+/// plus field-offset identities). Shared by the patcher and the
+/// presence scan so the two can never disagree on what a marker is.
+const SOURCE_KFUNC_MARKERS: core::ops::RangeInclusive<u32> = 0x7f001..=0x7f003;
+const SOURCE_FIELD_MARKERS: core::ops::RangeInclusive<u32> = 0x6f001..=0x6f006;
+
+/// True when any prepared instruction carries a VMA-join marker
+/// immediate. The patcher itself re-validates shape and ownership; this
+/// scan only decides patch-or-skip for objects that predate the join.
+fn prepared_has_source_markers(programs: &[PreparedProg]) -> bool {
+    programs.iter().any(|program| {
+        program.insns.chunks_exact(8).any(|instruction| {
+            let immediate = u32::from_le_bytes(instruction[4..8].try_into().unwrap());
+            SOURCE_KFUNC_MARKERS.contains(&immediate) || SOURCE_FIELD_MARKERS.contains(&immediate)
+        })
+    })
+}
+
+/// Patch VMA-join markers in a prepared count object when present. Each
+/// object carries its own copy of the helper, so the counter patches its
+/// own image (the session patches only its registration half). Absent
+/// markers skip silently (pre-U1 objects stay loadable); present markers
+/// patch-or-fail loudly: an unpatched VMA call must never reach the
+/// verifier. The throwaway budget covers only the BTF scratch the
+/// kernel-layout read reserves; the caller owns all other budgets.
+pub(crate) fn patch_count_markers(prepared: &mut Prepared) -> anyhow::Result<()> {
+    if !prepared_has_source_markers(&prepared.progs) {
+        return Ok(());
+    }
+    let budget = crate::provider_observation::ObservationBudget::default();
+    let kernel = SourceKernel::read(&budget).map_err(|gap| anyhow::anyhow!("{gap:?}"))?;
+    kernel
+        .patch(prepared)
+        .map_err(|gap| anyhow::anyhow!("{gap:?}"))
+}
+
+/// Roots blessed to own a VMA-join helper copy. Reachable-subset linking
+/// copies the helper body into every root that reaches it, so multi-root
+/// ownership is structural (registration fexit + typed pair + count
+/// entry), never incidental: any other root carrying the helper or a
+/// marker still refuses.
+fn blessed_source_owner(program: &PreparedProg) -> bool {
+    matches!(
+        (
+            program.name.as_str(),
+            program.section.as_str(),
+            program.is_return
+        ),
+        ("source_reg_out", "fexit/uprobe_register", false)
+            | ("typed_entry", "uprobe", false)
+            | ("typed_return", "uretprobe", true)
+            | ("count_entry", "uprobe", false)
+    )
+}
+
 /// Finite patch set owned by one global callback-free helper. Validate every
 /// site before changing any bytes; an incidental constant or another root cannot
 /// acquire a kernel-read identity. Values come only from SourceLayout admission.
+/// Every blessed owner root carries its own complete copy of the 9 sites;
+/// all copies validate first, then all patch (never partial).
 fn patch_source_configuration(
     configuration: &[u32; 13],
     programs: &mut [PreparedProg],
@@ -106,8 +163,8 @@ fn patch_source_configuration(
     );
     // f_inode's separate containing-file extent was checked by SourceLayout's
     // semantic member parser; do not substitute the VMA size for that type.
-    let mut sites = [None; 9];
-    let mut helpers = 0;
+    let mut helpers = 0usize;
+    let mut patches: Vec<(usize, usize, usize)> = Vec::new();
     for (root_index, program) in programs.iter().enumerate() {
         let mut helper_range = None;
         for (index, subprogram) in program.subprogs.iter().enumerate() {
@@ -115,12 +172,10 @@ fn patch_source_configuration(
                 continue;
             }
             anyhow::ensure!(
-                program.name == "source_reg_out"
-                    && program.section == "fexit/uprobe_register"
-                    && !program.is_return
-                    && !subprogram.is_callback,
+                blessed_source_owner(program) && !subprogram.is_callback,
                 "source helper owner"
             );
+            anyhow::ensure!(helper_range.is_none(), "duplicate source helper body");
             helpers += 1;
             let start = subprogram.insn_off as usize * 8;
             let end = program
@@ -133,6 +188,7 @@ fn patch_source_configuration(
             );
             helper_range = Some(start..end);
         }
+        let mut sites = [None; 9];
         for (index, instruction) in program.insns.chunks_exact(8).enumerate() {
             let immediate = u32::from_le_bytes(instruction[4..8].try_into().unwrap());
             let site = match immediate {
@@ -160,15 +216,28 @@ fn patch_source_configuration(
                     "source field patch shape"
                 );
             }
-            sites[site] = Some((root_index, offset));
+            sites[site] = Some(offset);
+        }
+        if helper_range.is_some() {
+            anyhow::ensure!(
+                sites.iter().all(Option::is_some),
+                "missing source helper patch"
+            );
+            for (identity, site) in sites.into_iter().enumerate() {
+                patches.push((root_index, site.unwrap(), identity));
+            }
+        } else {
+            anyhow::ensure!(
+                sites.iter().all(Option::is_none),
+                "source marker without helper body"
+            );
         }
     }
     anyhow::ensure!(
-        helpers == 1 && sites.iter().all(Option::is_some),
+        helpers >= 1 && !patches.is_empty(),
         "missing source helper patch"
     );
-    for (identity, site) in sites.into_iter().enumerate() {
-        let (root, offset) = site.unwrap();
+    for (root, offset, identity) in patches {
         let instruction = &mut programs[root].insns[offset..offset + 8];
         if identity < 3 {
             instruction[1] = 0x20;
@@ -4296,13 +4365,16 @@ mod tests {
         patch_source_configuration(&configuration, &mut prepared.progs).unwrap();
         let original = prepare();
         let mut changed = 0;
+        let mut owners: Vec<String> = Vec::new();
         for (old, new) in original.progs.iter().zip(&prepared.progs) {
             assert_eq!(old.insns.len(), new.insns.len());
+            let mut root_changed = 0;
             for (a, b) in old.insns.chunks_exact(8).zip(new.insns.chunks_exact(8)) {
                 if a == b {
                     continue;
                 }
                 changed += 1;
+                root_changed += 1;
                 let marker = u32::from_le_bytes(a[4..8].try_into().unwrap());
                 if (0x7f001..=0x7f003).contains(&marker) {
                     assert_eq!(&b[..4], &[0x85, 0x20, 0, 0]);
@@ -4319,8 +4391,20 @@ mod tests {
                     );
                 }
             }
+            if root_changed > 0 {
+                assert_eq!(root_changed, 9);
+                owners.push(new.name.clone());
+            }
         }
-        assert_eq!(changed, 9);
+        // U1: reachable-subset linking copies the helper into every root
+        // that reaches it (registration fexit + typed pair); each copy
+        // carries the complete 9-site set, nothing else changes.
+        owners.sort();
+        assert_eq!(
+            owners,
+            vec!["source_reg_out", "typed_entry", "typed_return"]
+        );
+        assert_eq!(changed, 27);
         assert!(patch_source_configuration(&configuration, &mut prepared.progs).is_err());
         // Corrupt an actual field opcode, duplicate a field identity, and move
         // the helper to the wrong root. None may produce a partial patched body.
@@ -7555,7 +7639,7 @@ pub const FOCUSED_COUNT_MAPS: [MapSpec; 30] = [
 /// Pure, fail-closed shape/privacy admission for the learned-site counter.
 pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
     validate_count_object(object)?;
-    let prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
+    let mut prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
     anyhow::ensure!(
         prepared.maps.len() == FOCUSED_COUNT_MAPS.len() && prepared.progs.len() == 1,
         "focused shape"
@@ -7573,12 +7657,22 @@ pub fn prepare_focused_count(object: &[u8]) -> anyhow::Result<Prepared> {
             && root.subprogs.iter().all(|s| !s.is_callback),
         "focused root"
     );
+    // Patch VMA-join markers before the helper allowlist runs: pre-patch
+    // kfunc call sites carry reserved immediates, not helper IDs. The
+    // allowlist then sees the patched image (kfunc calls use src 2 and
+    // skip the helper check; the join's only plain helpers are the
+    // kernel-memory read 113 and current-task-BTF 158).
+    patch_count_markers(&mut prepared)?;
+    let root = &prepared.progs[0];
     let mut namespace_helper = false;
     for i in root.insns.chunks_exact(8) {
         anyhow::ensure!(!(i[0] == 0x18 && i[1] >> 4 == 4), "focused callback");
         if i[0] == 0x85 && i[1] >> 4 == 0 {
             let helper = u32le(&i[4..8]);
-            anyhow::ensure!([1, 2, 5, 120, 174].contains(&helper), "focused helper");
+            anyhow::ensure!(
+                [1, 2, 5, 113, 120, 158, 174].contains(&helper),
+                "focused helper"
+            );
             namespace_helper |= helper == 120;
         }
     }

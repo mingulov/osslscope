@@ -697,6 +697,7 @@ impl FocusedSession {
                     &mut budget,
                     setup_deadline,
                     cancel,
+                    None,
                 ) {
                     Ok(sites) => Some(sites),
                     Err(gap) => {

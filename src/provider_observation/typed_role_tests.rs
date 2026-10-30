@@ -209,6 +209,7 @@ fn held_startup_exports_prepare_typed_sources_without_legacy_fetch_promotion() {
         StartupProcess::held(&child).unwrap(),
         File::open(fixture.0.join("public.so")).unwrap(),
         &budget,
+        None,
     )
     .unwrap();
     assert!(
@@ -267,6 +268,7 @@ fn refused_startup_source_preparation_keeps_legacy_owned_exports() {
         StartupProcess::held(&child).unwrap(),
         File::open(fixture.0.join("public.so")).unwrap(),
         &ObservationBudget::default(),
+        None,
     )
     .unwrap();
     assert_eq!(discovered.apis.len(), 1);

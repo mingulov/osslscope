@@ -94,6 +94,10 @@ struct ElfObject {
     typed_exports: Vec<(TypedRoleId, u64)>,
     typed_conflicts: Vec<u64>,
     typed_partial: bool,
+    /// Query-observation exports (role 161), parsed always but staged
+    /// only with a non-empty copied plan. Withheld on any ambiguity,
+    /// exactly like first-slice typed exports.
+    query_exports: Vec<(TypedRoleId, u64)>,
 }
 // Internal retry classification: shared capacity is not part of a retained
 // file fingerprint. Public diagnostics keep their existing finite gap labels.
@@ -298,6 +302,12 @@ pub(crate) struct StartupCandidates {
     pub(crate) typed: Vec<StartupTypedSite>,
     pub(crate) partial: bool,
     pub(crate) typed_gap: Option<ObservationGap>,
+    /// Plan entries verified but withheld (offset already staged under a
+    /// different role, or budget refused). Never staged, always counted.
+    pub(crate) copied_skipped: usize,
+    /// Array-grouping inputs for plan generation, from this file's own
+    /// parse (no re-parse downstream).
+    pub(crate) plan_arrays: super::copied_plan::FileArrays,
 }
 /// Exact export metadata under original-owned custody. The source mapping is
 /// acquired lazily only when the production session can prepare its source ABI.
@@ -327,6 +337,7 @@ pub(crate) fn startup_candidates(
     process: Rc<StartupProcess>,
     file: File,
     budget: &ObservationBudget,
+    plan: Option<&super::copied_plan::CopiedPlan>,
 ) -> Result<StartupCandidates, ObservationGap> {
     process.validate()?;
     budget.object()?;
@@ -424,6 +435,84 @@ pub(crate) fn startup_candidates(
             },
         });
     }
+    // U1 plan staging: the query role rides a non-empty plan (global:
+    // queries in any file may advertise callbacks in another), while
+    // copied sites stage per file, verified against this file's parsed
+    // dispatch candidates (exact offset + function, algorithm-record
+    // provenance, non-partial). Anything already staged under a different
+    // role, or failing membership, is skipped and counted, never staged.
+    let mut copied_skipped = 0usize;
+    if plan.is_some_and(|plan| !plan.is_empty()) {
+        for (index, &(role, offset)) in parsed.query_exports.iter().enumerate() {
+            if let Err(gap) = budget.state(256) {
+                if typed_gap.is_none() {
+                    typed_gap = Some(gap);
+                }
+                copied_skipped += parsed.query_exports.len() - index;
+                break;
+            }
+            typed.push(StartupTypedSite {
+                role,
+                site: VerifiedSite {
+                    custody: SiteCustody::Startup(process.clone()),
+                    object: object.clone(),
+                    offset,
+                    generation: process.generation,
+                    hash: parsed.hash.clone(),
+                },
+            });
+        }
+    }
+    if let Some(plan) = plan {
+        for site in plan.sites_for(&parsed.hash) {
+            let Some(role) = TypedRoleId::from_u32(site.role_id) else {
+                copied_skipped += 1;
+                continue;
+            };
+            let Some((_, _, function)) =
+                crate::attribution::wire::TypedAdmission::admission_parts(site.role_id)
+            else {
+                copied_skipped += 1;
+                continue;
+            };
+            let member = candidates.iter().any(|candidate| {
+                candidate.site.offset == site.offset
+                    && candidate.function_id == function
+                    && !candidate.partial
+                    && matches!(
+                        candidate.provenance,
+                        StaticTableProvenance::AlgorithmRecordShape
+                    )
+            });
+            if !member {
+                copied_skipped += 1;
+                continue;
+            }
+            let taken = apis.iter().any(|api| api.site.offset == site.offset)
+                || typed.iter().any(|typed| typed.site.offset == site.offset);
+            if taken {
+                copied_skipped += 1;
+                continue;
+            }
+            if let Err(gap) = budget.state(256) {
+                if typed_gap.is_none() {
+                    typed_gap = Some(gap);
+                }
+                copied_skipped += 1;
+                continue;
+            }
+            typed.push(StartupTypedSite {
+                role,
+                site: VerifiedSite {
+                    custody: SiteCustody::Startup(process.clone()),
+                    object: object.clone(),
+                    offset: site.offset,
+                    generation: process.generation,
+                    hash: parsed.hash.clone(),
+                },
+            });
+        }
+    }
     object.unchanged()?;
     process.validate()?;
     Ok(StartupCandidates {
@@ -432,6 +521,11 @@ pub(crate) fn startup_candidates(
         typed,
         partial: conflict || !tables.gaps().is_empty(),
         typed_gap,
+        copied_skipped,
+        plan_arrays: super::copied_plan::FileArrays {
+            hash: parsed.hash.clone(),
+            inputs: tables.array_inputs(),
+        },
     })
 }
 
@@ -1646,6 +1740,8 @@ fn parse_exports(
     let mut typed_conflicts = Vec::with_capacity(MAX_TYPED_CONFLICTS);
     let mut typed_partial = false;
     let mut typed_name_conflict = false;
+    let mut query: Vec<(TypedRoleId, Option<u64>)> = Vec::with_capacity(TYPED_QUERY_ROLES.len());
+    let mut query_name_conflict = false;
     if let Some(DynamicSymbols { symbols, names }) = dynamic_symbols(file, &programs, len, budget)?
     {
         for symbol in symbols.chunks_exact(24) {
@@ -1674,7 +1770,8 @@ fn parse_exports(
             };
             let api = export_api_at(|index| tail.get(index).copied());
             let typed_role = typed_export_at(|index| tail.get(index).copied());
-            if api.is_none() && typed_role.is_none() {
+            let query_role = query_export_at(|index| tail.get(index).copied());
+            if api.is_none() && typed_role.is_none() && query_role.is_none() {
                 continue;
             }
             let address = word(symbol, 8, 8)?;
@@ -1715,6 +1812,16 @@ fn parse_exports(
                     }
                 } else {
                     typed.push((role, Some(offset)));
+                }
+            }
+            if let Some(role) = query_role {
+                if let Some((_, previous)) = query.iter_mut().find(|(found, _)| *found == role) {
+                    if *previous != Some(offset) {
+                        *previous = None;
+                        query_name_conflict = true;
+                    }
+                } else {
+                    query.push((role, Some(offset)));
                 }
             }
         }
@@ -1770,6 +1877,23 @@ fn parse_exports(
     typed_partial |= !typed_conflicts.is_empty();
     typed_conflicts.sort_unstable();
     typed_conflicts.dedup();
+    // Query roles arbitrate against legacy exports (same-name co-attach
+    // allowed, like first-slice), against already-conflicted offsets, and
+    // against first-slice typed offsets carrying a different name.
+    let mut query_conflicts = Vec::new();
+    record_typed_conflicts(&query, &exports, &mut query_conflicts);
+    for &(role, offset) in &query {
+        let Some(offset) = offset else {
+            continue;
+        };
+        if typed_conflicts.contains(&offset)
+            || typed.iter().any(|(other, at)| {
+                *at == Some(offset) && other.public_export() != role.public_export()
+            })
+        {
+            query_conflicts.push(offset);
+        }
+    }
     let mut typed_exports = Vec::with_capacity(TYPED_PUBLIC_ROLES.len());
     // Multiple definitions of one typed name prevent a unique finite census.
     // Preserve ordinary source facts but issue no new typed reader capability.
@@ -1778,6 +1902,16 @@ fn parse_exports(
             if let Some(offset) = offset {
                 if !typed_conflicts.contains(&offset) {
                     typed_exports.push((role, offset));
+                }
+            }
+        }
+    }
+    let mut query_exports = Vec::with_capacity(TYPED_QUERY_ROLES.len());
+    if !query_name_conflict {
+        for (role, offset) in query {
+            if let Some(offset) = offset {
+                if !query_conflicts.contains(&offset) {
+                    query_exports.push((role, offset));
                 }
             }
         }
@@ -1791,6 +1925,7 @@ fn parse_exports(
         typed_exports,
         typed_conflicts,
         typed_partial,
+        query_exports,
     })
 }
 
@@ -1957,6 +2092,11 @@ fn dynamic_symbols(
 const TYPED_PUBLIC_ROLES: [u32; 17] = [
     5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
 ];
+/// U1 query-observation roles, staged only with a non-empty copied plan.
+/// Kept out of TYPED_PUBLIC_ROLES so the exact-17 first-slice census and
+/// its premise pins stay verbatim; the query export co-attaches with its
+/// same-named legacy API (complementary consumers, no ambiguity).
+const TYPED_QUERY_ROLES: [u32; 1] = [161];
 /// Distinct typed public exports one anchor may need to register. Cited by
 /// the acquisition-core registration capacity and its covering control; any
 /// census growth must review that derivation.
@@ -1986,6 +2126,19 @@ fn record_typed_conflicts(
 }
 fn typed_export_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<TypedRoleId> {
     TYPED_PUBLIC_ROLES
+        .iter()
+        .filter_map(|&id| TypedRoleId::from_u32(id))
+        .find(|role| {
+            role.public_export().is_some_and(|name| {
+                name.bytes()
+                    .chain(std::iter::once(0))
+                    .enumerate()
+                    .all(|(index, want)| byte_at(index) == Some(want))
+            })
+        })
+}
+fn query_export_at(mut byte_at: impl FnMut(usize) -> Option<u8>) -> Option<TypedRoleId> {
+    TYPED_QUERY_ROLES
         .iter()
         .filter_map(|&id| TypedRoleId::from_u32(id))
         .find(|role| {

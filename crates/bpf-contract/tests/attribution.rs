@@ -336,3 +336,20 @@ fn copied_and_operational_roles_have_no_public_export_or_staging_path() {
         );
     }
 }
+#[test]
+fn query_observation_role_admits_paired_query_only() {
+    // U1: role 161 observes OSSL_PROVIDER_query_operation (legacy query
+    // API 8) to publish CODE_ROLE rows. Paired (entry stages op, return
+    // walks the table), never operational, operation/function 0 in the
+    // triple (the observed op rides the pending frame, never admission).
+    let role = TypedRoleId::from_u32(161).unwrap();
+    assert_eq!(role.id(), 161);
+    assert_eq!(role.public_export(), Some("OSSL_PROVIDER_query_operation"));
+    assert_eq!(TypedAdmission::admission_parts(161), Some((8, 0, 0)));
+    let admission = TypedAdmission::new(161, 8, 0, 0, 1, 1).unwrap();
+    assert!(admission.valid());
+    assert!(admission.paired());
+    assert!(!admission.operational());
+    assert!(TypedAdmission::new(161, 8, 3, 0, 1, 1).is_none());
+    assert!(TypedAdmission::new(161, 0, 0, 0, 1, 1).is_none());
+}

@@ -1343,6 +1343,7 @@ mod startup_controls {
             &mut ObservationBudget::default(),
             Instant::now() + Duration::from_secs(20),
             &cancel,
+            None,
         )
         .unwrap();
         let bytes = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
@@ -1585,6 +1586,7 @@ mod startup_controls {
             &mut crate::provider_observation::ObservationBudget::default(),
             Instant::now() + Duration::from_secs(10),
             &AtomicBool::new(false),
+            None,
         )
         .unwrap();
         let bytes =
@@ -1692,6 +1694,7 @@ mod startup_controls {
             &mut crate::provider_observation::ObservationBudget::default(),
             Instant::now() + Duration::from_secs(10),
             &cancelled,
+            None,
         )
         .unwrap();
         let distinct: std::collections::BTreeSet<_> = sites
@@ -1798,6 +1801,7 @@ mod startup_controls {
             &mut crate::provider_observation::ObservationBudget::default(),
             Instant::now() + Duration::from_secs(10),
             &cancel,
+            None,
         )
         .unwrap();
         let bytes =

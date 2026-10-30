@@ -327,7 +327,7 @@ pub(crate) const APIS: [ObservationApi; 45] = [
     ObservationApi::Operational(crate::api_activity::ApiId::constant(48)),
 ];
 /// Content fingerprint validated on construction and deserialization.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ObjectHash(String);
 impl TryFrom<String> for ObjectHash {

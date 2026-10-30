@@ -44,6 +44,8 @@ pub(crate) struct PreExecSites {
     pub(crate) apis: Vec<objects::StartupApiSite>,
     pub(crate) typed: Vec<objects::StartupTypedSite>,
     pub(crate) gaps: BTreeSet<ObservationGap>,
+    pub(crate) copied_skipped: usize,
+    pub(crate) plan_arrays: Vec<crate::provider_observation::copied_plan::FileArrays>,
 }
 fn check(deadline: Instant, cancel: &AtomicBool) -> Result<(), ObservationGap> {
     if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
@@ -111,6 +113,7 @@ pub(crate) fn prepare_owned_startup(
     budget: &mut ObservationBudget,
     deadline: Instant,
     cancel: &AtomicBool,
+    plan: Option<&crate::provider_observation::copied_plan::CopiedPlan>,
 ) -> Result<PreExecSites, ObservationGap> {
     check(deadline, cancel)?;
     budget.set_deadline(deadline);
@@ -133,6 +136,8 @@ pub(crate) fn prepare_owned_startup(
         apis: Vec::new(),
         typed: Vec::new(),
         gaps: BTreeSet::new(),
+        copied_skipped: 0,
+        plan_arrays: Vec::new(),
     };
     // Loader cache/hwcaps, preloads, scripts, dynamically selected modules and
     // inherited RPATH subtleties cannot establish universal startup coverage.
@@ -276,16 +281,20 @@ pub(crate) fn prepare_owned_startup(
         drop(bytes);
         drop(scratch);
         check(deadline, cancel)?;
-        match objects::startup_candidates(custody.clone(), file, budget) {
+        match objects::startup_candidates(custody.clone(), file, budget, plan) {
             Ok(objects::StartupCandidates {
                 candidates,
                 apis,
                 typed,
                 partial,
                 typed_gap,
+                copied_skipped,
+                plan_arrays,
             }) => {
                 result.apis.extend(apis);
                 result.typed.extend(typed);
+                result.copied_skipped += copied_skipped;
+                result.plan_arrays.push(plan_arrays);
                 if let Some(gap) = typed_gap {
                     result.gaps.insert(gap);
                 }
@@ -337,6 +346,7 @@ mod tests {
             objects::StartupProcess::held(&child).unwrap(),
             File::open(path).unwrap(),
             &ObservationBudget::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -361,7 +371,8 @@ mod tests {
                 &argv,
                 &mut budget,
                 Instant::now() + std::time::Duration::from_secs(2),
-                &AtomicBool::new(true)
+                &AtomicBool::new(true),
+                None,
             ),
             Err(ObservationGap::SnapshotLag)
         ));
@@ -372,7 +383,8 @@ mod tests {
                 &argv,
                 &mut budget,
                 Instant::now(),
-                &AtomicBool::new(false)
+                &AtomicBool::new(false),
+                None,
             ),
             Err(ObservationGap::SnapshotLag)
         ));

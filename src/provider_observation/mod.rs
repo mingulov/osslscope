@@ -4,6 +4,7 @@
 pub mod artifact;
 mod assembly;
 pub mod cli;
+pub mod copied_plan;
 pub mod objects;
 pub mod schema;
 mod source_acquire;

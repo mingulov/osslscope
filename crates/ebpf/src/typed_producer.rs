@@ -16,10 +16,10 @@
 use crate::{
     shared_maps::{
         ATTRIB_CONTROL, BIND_PENDING, DIGEST_INDEX, EXACT_NAME, PARTITION, PRODUCER_LOSS, REL,
-        SEGMENT_INDEX, SELECTOR_DICT, SITE_BIND, SOURCE_DOMAIN, SOURCE_GUARD, THREAD_IDENTITY,
-        TYPED_ADMISSION,
+        SEGMENT_INDEX, SELECTOR_DICT, SITE_BIND, SOURCE_CONFIG, SOURCE_DOMAIN, SOURCE_GUARD,
+        THREAD_IDENTITY, TYPED_ADMISSION,
     },
-    writer_gate,
+    source_vma, writer_gate,
 };
 use aya_ebpf::{
     helpers,
@@ -1121,28 +1121,37 @@ pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns
     let Some(control) = control_cell() else {
         return 0;
     };
-    let arg0: u64 = ctx.arg(0).unwrap_or(0);
     let role = admitted.role_id;
     let operation = admitted.operation;
     let entry_seq = target.entry_seq;
     let ids = ((tgid as u64) << 32) | tid as u64;
     // Handlers re-derive the target from this snapshot and re-read the
     // cookie, admission and probe arguments themselves; nothing but these
-    // scalars crosses the call boundary.
+    // scalars crosses the call boundary. Retire arms read arg0 lazily so
+    // copied-role invalidators (274/275) join live CODE_ROLE authority
+    // before any operand read; first-slice arms read the same value later.
     match role {
         130 | 131 => fetch_entry(ctx, control, ids, entry_seq),
         147 | 148 => ctx_new_entry(ctx, control, ids, entry_seq),
         151 | 152 => dup_entry(ctx, control, ids, entry_seq),
         142 | 143 | 146 | 258 | 259 | 290 | 291 => child_entry(ctx, control, ids, entry_seq),
+        161 => typed_query_entry(ctx, control, ids, entry_seq),
         136 | 137 => {
+            let arg0: u64 = ctx.arg(0).unwrap_or(0);
             retire_method(&target, arg0, operation);
             0
         }
         149 | 150 | 153 => {
+            let arg0: u64 = ctx.arg(0).unwrap_or(0);
             retire_owner_reachable(&target, REL_U_INDEX, arg0);
             0
         }
         274 | 275 => {
+            let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
+            if !code_role_for_callback(ctx, &target, opfun, entry_seq) {
+                return 0;
+            }
+            let arg0: u64 = ctx.arg(0).unwrap_or(0);
             retire_owner_reachable(&target, REL_X_INDEX, arg0);
             0
         }
@@ -1379,6 +1388,12 @@ pub fn child_entry(
     if !admitted.valid() || !matches!(admitted.role_id, 142 | 143 | 146 | 258 | 259 | 290 | 291) {
         return 0;
     }
+    if matches!(admitted.role_id, 258 | 259 | 290 | 291) {
+        let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
+        if !code_role_for_callback(ctx, &target, opfun, entry_seq) {
+            return 0;
+        }
+    }
     let arg0: u64 = ctx.arg(0).unwrap_or(0);
     if arg0 == 0 {
         return 0;
@@ -1548,6 +1563,8 @@ pub fn typed_return(ctx: &RetProbeContext, cookie: u64, tgid: u32, tid: u32, _no
         newctx_return(ctx, control, frame, ids, entry_seq);
     } else if role == 290 || role == 291 {
         dupctx_return(ctx, control, frame, ids, entry_seq);
+    } else if role == 161 {
+        typed_query_return(ctx, control, frame, ids, entry_seq);
     }
     release_frame(&key);
     0
@@ -3732,8 +3749,18 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
     let Some(admitted) = admission_ptr(params.cookie, &target) else {
         return false;
     };
-    let role = unsafe { (*admitted).role_id };
+    let (role, operation, function) = unsafe {
+        (
+            (*admitted).role_id,
+            (*admitted).operation,
+            (*admitted).function,
+        )
+    };
     if !matches!(role, 304 | 305 | 306 | 307 | 308) {
+        return false;
+    }
+    let opfun = (u64::from(function) << 32) | u64::from(operation);
+    if !code_role_for_callback(ctx, &target, opfun, target.entry_seq) {
         return false;
     }
     let context: u64 = ctx.arg(0).unwrap_or(0);
@@ -4322,4 +4349,573 @@ pub fn own_pending_x(
             && (*row).data[5] == 1
             && (*row).data[6] == u64::from(family)
     }
+}
+
+/// U1 copied-role live authority (CODE_ROLE, REL kind 5).
+///
+/// A staged copied-role site (constructor 258/259, lifecycle 274/275,
+/// dup 290/291, operational 304-308) carries host-programmed admission,
+/// but admission alone never authorizes an operand read: every copied
+/// path additionally requires a kernel-published CODE_ROLE row proving
+/// that a completed natural live query for the same (operation,
+/// function) advertised code in the firing callback's own file.
+///
+/// Publication: the typed query role (161) walks the live returned
+/// OSSL_ALGORITHM/OSSL_DISPATCH tables at query return (public UAPI
+/// layouts only), joins each in-slice callback address to its
+/// (inode, file offset) through the current-VMA join, and publishes one
+/// CERTIFIED row per (process, image, inode, operation, function).
+/// CERTIFIED means code ABI only, never provider identity.
+///
+/// Join: at copied-role entry the handler reads the trap instruction
+/// pointer (uprobe INT3 semantics: firing address + 1), joins it to the
+/// same inode through the same VMA policy, and requires the matching
+/// row with a publication sequence at or before the entry snapshot.
+/// Return paths pair to entry-verified frames and need no second join.
+///
+/// Key amendment note: the source-capability contract sketches
+/// cookie-keyed CODE_ROLE rows, but the firing cookie does not exist at
+/// query time, so cookie keying cannot be published from a live walk.
+/// Inode keying preserves the amendment's intent with a stronger,
+/// kernel-grounded identity: the VMA join output on both sides, behind
+/// the retained anchor's pinned file (an open retained descriptor pins
+/// the inode address for the session, so no reuse aliasing), the
+/// registration-time anchor join, and the per-callback source-authority
+/// gate that still precedes every join. Host staging (offsets from
+/// retained dispatch bytes) is a claim; this join is the kernel's
+/// independent verification of it.
+///
+/// Walk bounds: the first 64 algorithms and 32 dispatch entries per
+/// table publish; anything beyond stops with LOSS_MAP and stays
+/// unauthorized (fail closed). Real MAC/KDF tables are far smaller.
+/// U1 publishes cacheable queries only; no-store queries stay
+/// unpublished (documented limit, not silent manufacture).
+
+/// Query-walk bounds (see the section doc above).
+const QUERY_MAX_ALGORITHMS: u64 = 64;
+const QUERY_MAX_ENTRIES: u64 = 32;
+
+/// CODE_ROLE ABI shape IDs (`data[2]`, informational: the join matches
+/// key + state + sequence; the shape records the reviewed signature the
+/// publisher attributed to the (operation, function) pair).
+const CODE_SHAPE_NEWCTX: u64 = 1;
+const CODE_SHAPE_DUPCTX: u64 = 2;
+const CODE_SHAPE_FREECTX: u64 = 3;
+const CODE_SHAPE_MAC_INIT: u64 = 4;
+const CODE_SHAPE_UPDATE: u64 = 5;
+const CODE_SHAPE_MAC_FINAL: u64 = 6;
+const CODE_SHAPE_KDF_RESET: u64 = 7;
+
+/// Reviewed first-slice (operation, function) to ABI-shape map. `None`
+/// means out of slice: the entry is silently skipped, never published.
+#[inline(always)]
+fn code_shape(operation: u32, function: u32) -> Option<u64> {
+    match (operation, function) {
+        (3, 1) | (4, 1) => Some(CODE_SHAPE_NEWCTX),
+        (3, 2) | (4, 2) => Some(CODE_SHAPE_DUPCTX),
+        (3, 3) | (4, 3) => Some(CODE_SHAPE_FREECTX),
+        (3, 4) => Some(CODE_SHAPE_MAC_INIT),
+        (3, 5) | (4, 5) => Some(CODE_SHAPE_UPDATE),
+        (3, 6) => Some(CODE_SHAPE_MAC_FINAL),
+        (4, 4) => Some(CODE_SHAPE_KDF_RESET),
+        _ => None,
+    }
+}
+
+/// CODE_ROLE key: full target-domain scope plus the VMA-joined inode
+/// and the live (operation, function). The relation epoch is 0 so
+/// ordinary relation/loss advance cannot clear code facts (tombstone
+/// precedent); code replacement changes the inode or image instead.
+#[inline(always)]
+fn code_role_key(target: &Target, inode: u64, function: u64, operation: u32) -> RelKey {
+    RelKey {
+        process_incarnation: target.process,
+        image_epoch: target.image,
+        relation_epoch: 0,
+        primary_handle: inode,
+        secondary_handle: function,
+        kind: REL_CODE_ROLE,
+        operation,
+    }
+}
+
+/// VMA-join one address under the Code policy (exec, not write/shared).
+/// Outlined so the query walk and the callback join share one iterator
+/// slot discipline: acquire, join, release on every path.
+#[inline(never)]
+#[no_mangle]
+pub fn code_vma_join(address: u64, out: &mut source_vma::SourceLocation) -> bool {
+    if address == 0 {
+        return false;
+    }
+    let Some(cell) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
+        return false;
+    };
+    let slot = unsafe { addr_of_mut!((*cell).slot) };
+    if !unsafe { compare(slot, 0, 1) } {
+        return false;
+    }
+    let found = match SOURCE_CONFIG.get(0) {
+        Some(config) => unsafe {
+            source_vma::current_source_at(
+                address,
+                source_vma::Policy::Code,
+                config.page_shift,
+                &mut *out,
+            )
+        },
+        None => false,
+    };
+    if !unsafe { compare(slot, 1, 0) } {
+        return false;
+    }
+    found
+}
+
+/// Trapped instruction pointer for a uprobe entry: the INT3 at the
+/// probed address traps with IP one past it, so IP - 1 is the firing
+/// callback address. x86_64 only; other arches fail closed (copied
+/// roles stay unresolved there).
+#[inline(always)]
+fn callback_ip(ctx: &ProbeContext) -> Option<u64> {
+    #[cfg(bpf_target_arch = "x86_64")]
+    {
+        let rip = unsafe { (*ctx.regs).rip };
+        (rip != 0).then_some(rip)
+    }
+    #[cfg(not(bpf_target_arch = "x86_64"))]
+    {
+        let _ = ctx;
+        None
+    }
+}
+
+/// Copied-role callback join: the firing site's live CODE_ROLE row must
+/// exist with code-ABI certification and a publication sequence at or
+/// before the entry snapshot. Any miss refuses before any operand read.
+/// `opfun` packs the staged admission pair (low 32 = operation, high 32
+/// = function) so the five-argument call ABI holds.
+#[inline(never)]
+#[no_mangle]
+pub fn code_role_for_callback(
+    ctx: &ProbeContext,
+    target: &Target,
+    opfun: u64,
+    entry_seq: u64,
+) -> bool {
+    let operation = opfun as u32;
+    let function = (opfun >> 32) as u32;
+    if code_shape(operation, function).is_none() {
+        return false;
+    }
+    let Some(ip) = callback_ip(ctx) else {
+        return false;
+    };
+    let Some(firing) = ip.checked_sub(1) else {
+        return false;
+    };
+    let mut location: source_vma::SourceLocation = unsafe { core::mem::zeroed() };
+    if !code_vma_join(firing, &mut location) || location.inode == 0 {
+        return false;
+    }
+    let key = code_role_key(target, location.inode, u64::from(function), operation);
+    let Some(row) = REL.get_ptr_mut(&key) else {
+        return false;
+    };
+    unsafe {
+        row_state_is(row, REL_CERTIFIED)
+            && (*row).witness_id != 0
+            && (*row).evidence_epoch != 0
+            && (*row).data[0] == u64::from(operation)
+            && (*row).data[1] == u64::from(function)
+            && (*row).data[6] != 0
+            && (*row).data[6] <= entry_seq
+    }
+}
+
+/// Publish one CODE_ROLE row under the shared publisher lock: dedup by
+/// key (idempotent re-query adopts only an identical live row), then
+/// spend, allocate, build in the per-CPU cell, NOEXIST insert, and the
+/// ordered sequence commit. Any failure leaves the entry unauthorized
+/// for this query; a later query republishes (self-healing, no poison:
+/// a CODE_ROLE hiccup must never kill unrelated positives).
+#[inline(never)]
+#[no_mangle]
+pub fn publish_code_role(
+    control: *mut ProducerControl,
+    target: &Target,
+    inode: u64,
+    opfun: u64,
+    occurrence: u64,
+) -> bool {
+    let operation = opfun as u32;
+    let function = (opfun >> 32) as u32;
+    if inode == 0 || occurrence == 0 {
+        return false;
+    }
+    let Some(shape) = code_shape(operation, function) else {
+        return false;
+    };
+    let key = code_role_key(target, inode, u64::from(function), operation);
+    let Some(state) = crate::shared_maps::ATTR_STATE.get_ptr_mut(0) else {
+        return false;
+    };
+    let busy = unsafe { addr_of_mut!((*state).publication_busy) };
+    let mut locked = false;
+    for _ in 0..8 {
+        if unsafe { compare(busy, 0, 1) } {
+            locked = true;
+            break;
+        }
+    }
+    if !locked {
+        return false;
+    }
+    let result = (|| {
+        if let Some(existing) = REL.get_ptr_mut(&key) {
+            return unsafe {
+                row_state_is(existing, REL_CERTIFIED)
+                    && (*existing).witness_id != 0
+                    && (*existing).evidence_epoch != 0
+                    && (*existing).data[0] == u64::from(operation)
+                    && (*existing).data[1] == u64::from(function)
+                    && (*existing).data[2] == shape
+                    && (*existing).data[6] != 0
+            };
+        }
+        let mode_ok = unsafe {
+            (*control).producer_mode == PRODUCER_ADMITTED
+                && (*control).session_id != 0
+                && (*control).admission_epoch != 0
+                && (*control).cut_id != 0
+                && (*control).reserved == 0
+        };
+        if !mode_ok {
+            return false;
+        }
+        if !spend(1) {
+            return false;
+        }
+        let mut id = 0u64;
+        if !alloc_id(control, &mut id) {
+            return false;
+        }
+        let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
+            return false;
+        };
+        let old_seq = unsafe { ordered_read(addr_of_mut!((*state).published_sequence)) };
+        let Some(next_seq) = old_seq.checked_add(1) else {
+            return false;
+        };
+        if next_seq == 0 {
+            return false;
+        }
+        let staging = unsafe { (*slot).staging.as_mut_ptr().cast::<RelValue>() };
+        unsafe {
+            staging.write_bytes(0, 1);
+            (*staging).witness_id = id;
+            (*staging).parent_id = 0;
+            (*staging).evidence_epoch = target.relation;
+            (*staging).born_ns = now_of();
+            (*staging).state = REL_CERTIFIED;
+            (*staging).data[0] = u64::from(operation);
+            (*staging).data[1] = u64::from(function);
+            (*staging).data[2] = shape;
+            (*staging).data[4] = occurrence;
+            (*staging).data[6] = next_seq;
+            if REL.insert(&key, &*staging, BPF_NOEXIST).is_err() {
+                return false;
+            }
+            if !compare(addr_of_mut!((*state).published_sequence), old_seq, next_seq) {
+                return false;
+            }
+            (*control).producer_mode == PRODUCER_ADMITTED
+        }
+    })();
+    unsafe {
+        compare(busy, 1, 0);
+    }
+    result
+}
+
+/// Query entry (161): stage the queried operation (a1) and the no-cache
+/// out-param pointer (a2) for the return walk. Only MAC (3) and KDF (4)
+/// stage a frame; every other op stays quiet here (out of slice, no
+/// loss: unobserved ops simply authorize nothing). The a2 pointer is
+/// staged, never dereferenced at entry.
+#[inline(never)]
+#[no_mangle]
+pub fn typed_query_entry(
+    ctx: &ProbeContext,
+    control: *mut ProducerControl,
+    ids: u64,
+    entry_seq: u64,
+) -> u32 {
+    let (tgid, tid) = split_ids(ids);
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
+        return 0;
+    }
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let Some(admitted) = admission(cookie, &target) else {
+        return 0;
+    };
+    if !admitted.valid() || admitted.role_id != 161 {
+        return 0;
+    }
+    let op: u64 = ctx.arg(1).unwrap_or(0);
+    if !matches!(op, 3 | 4) {
+        return 0;
+    }
+    let nocache: u64 = ctx.arg(2).unwrap_or(0);
+    if nocache == 0 {
+        return 0;
+    }
+    let mut thread = 0u64;
+    if !thread_incarnation(control, &target, tid, &mut thread) {
+        return 0;
+    }
+    let mut occurrence = 0u64;
+    if !alloc_id(control, &mut occurrence) {
+        return 0;
+    }
+    let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
+    let params = StageParams {
+        target: &target,
+        thread,
+        cookie,
+        role: admitted.role_id,
+        occurrence,
+        now_ns,
+    };
+    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    if !stage_frame(&params, &mut staged) {
+        return 0;
+    }
+    let frame = staged.1;
+    unsafe {
+        (*frame).entry_handle = op;
+        (*frame).provider_witness = nocache;
+    }
+    0
+}
+
+/// Query return (161): on a non-NULL table with cacheable outcome, walk
+/// the live OSSL_ALGORITHM array and publish CODE_ROLE rows for every
+/// in-slice dispatch entry. No-store, failed, unreadable or out-of-slice
+/// queries publish nothing; the frame is always consumed by the caller.
+#[inline(never)]
+#[no_mangle]
+pub fn typed_query_return(
+    ctx: &RetProbeContext,
+    control: *mut ProducerControl,
+    frame: *mut BindPendingValue,
+    ids: u64,
+    entry_seq: u64,
+) {
+    let (tgid, _) = split_ids(ids);
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(tgid, entry_seq, &mut target) {
+        return;
+    }
+    let table: u64 = ctx.ret();
+    if table == 0 {
+        return;
+    }
+    let (op, nocache, occurrence) = unsafe {
+        (
+            (*frame).entry_handle,
+            (*frame).provider_witness,
+            (*frame).occurrence_id,
+        )
+    };
+    if !matches!(op, 3 | 4) || nocache == 0 || occurrence == 0 {
+        return;
+    }
+    match unsafe { helpers::bpf_probe_read_user(nocache as *const u32) } {
+        Ok(0) => {}
+        Ok(_) => return,
+        Err(_) => {
+            loss(LOSS_MAP);
+            return;
+        }
+    }
+    query_walk_table(control, &target, table, op as u32, occurrence);
+}
+
+/// Synchronous own-stack bpf_loop contexts for the query walk. The
+/// target stays a caller-owned borrow (bpf_loop is synchronous); no
+/// target address or transport field crosses the callback boundary.
+#[repr(C)]
+struct QueryAlgoScan {
+    control: *mut ProducerControl,
+    target: *const Target,
+    table: u64,
+    operation: u32,
+    stopped: u32,
+    occurrence: u64,
+}
+#[repr(C)]
+struct QueryDispatchScan {
+    control: *mut ProducerControl,
+    target: *const Target,
+    imp: u64,
+    operation: u32,
+    stopped: u32,
+    occurrence: u64,
+}
+
+/// Walk one live OSSL_ALGORITHM array (32-byte records: names @ +0,
+/// implementation @ +16), dispatching each non-NULL table. bpf_loop
+/// keeps the callback under one verification context no matter how many
+/// algorithms run; a NULL names word terminates the walk, and anything
+/// malformed stops it with LOSS_MAP.
+#[inline(never)]
+#[no_mangle]
+pub fn query_walk_table(
+    control: *mut ProducerControl,
+    target: &Target,
+    table: u64,
+    operation: u32,
+    occurrence: u64,
+) {
+    let mut scan = QueryAlgoScan {
+        control,
+        target,
+        table,
+        operation,
+        stopped: 0,
+        occurrence,
+    };
+    let result = unsafe {
+        helpers::bpf_loop(
+            QUERY_MAX_ALGORITHMS as u32,
+            query_algo_slot as *mut core::ffi::c_void,
+            (&mut scan as *mut QueryAlgoScan).cast(),
+            0,
+        )
+    };
+    if result < 0 {
+        loss(LOSS_MAP);
+    } else if scan.stopped == 0 {
+        loss(LOSS_MAP);
+    }
+}
+
+/// One algorithm slot: read names/implementation, walk a non-NULL table.
+/// Return 1 stops the loop (terminator or fatal read); 0 continues.
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn query_algo_slot(index: u64, context: u64) -> u64 {
+    // SAFETY: synchronous bpf_loop receives this initialized own-stack context.
+    let scan = unsafe { &mut *(context as *mut QueryAlgoScan) };
+    let Some(slot) = scan.table.checked_add(index * 32) else {
+        scan.stopped = 1;
+        loss(LOSS_MAP);
+        return 1;
+    };
+    let names = match unsafe { helpers::bpf_probe_read_user(slot as *const u64) } {
+        Ok(value) => value,
+        Err(_) => {
+            scan.stopped = 1;
+            loss(LOSS_MAP);
+            return 1;
+        }
+    };
+    if names == 0 {
+        scan.stopped = 1;
+        return 1;
+    }
+    match unsafe { helpers::bpf_probe_read_user((slot + 16) as *const u64) } {
+        Ok(0) => loss(LOSS_MAP),
+        Ok(imp) => {
+            let mut dispatch = QueryDispatchScan {
+                control: scan.control,
+                target: scan.target,
+                imp,
+                operation: scan.operation,
+                stopped: 0,
+                occurrence: scan.occurrence,
+            };
+            let result = unsafe {
+                helpers::bpf_loop(
+                    QUERY_MAX_ENTRIES as u32,
+                    query_dispatch_slot as *mut core::ffi::c_void,
+                    (&mut dispatch as *mut QueryDispatchScan).cast(),
+                    0,
+                )
+            };
+            if result < 0 {
+                loss(LOSS_MAP);
+            } else if dispatch.stopped == 0 {
+                loss(LOSS_MAP);
+            }
+        }
+        Err(_) => {
+            scan.stopped = 1;
+            loss(LOSS_MAP);
+            return 1;
+        }
+    }
+    0
+}
+
+/// One dispatch slot (16-byte entries: id @ +0, function @ +8):
+/// publish CODE_ROLE rows for in-slice entries. Out-of-slice IDs are
+/// silently skipped; unreadable, NULL, unjoinable or refused entries
+/// record LOSS_MAP and never publish. Return 1 stops the loop.
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn query_dispatch_slot(index: u64, context: u64) -> u64 {
+    // SAFETY: synchronous bpf_loop receives this initialized own-stack context.
+    let scan = unsafe { &mut *(context as *mut QueryDispatchScan) };
+    // SAFETY: the target outlives the synchronous walk; only scalars cross.
+    let target = unsafe { &*scan.target };
+    let Some(entry) = scan.imp.checked_add(index * 16) else {
+        scan.stopped = 1;
+        loss(LOSS_MAP);
+        return 1;
+    };
+    let id = match unsafe { helpers::bpf_probe_read_user(entry as *const u32) } {
+        Ok(value) => value,
+        Err(_) => {
+            scan.stopped = 1;
+            loss(LOSS_MAP);
+            return 1;
+        }
+    };
+    if id == 0 {
+        scan.stopped = 1;
+        return 1;
+    }
+    if id > i32::MAX as u32 {
+        scan.stopped = 1;
+        loss(LOSS_MAP);
+        return 1;
+    }
+    let fun = match unsafe { helpers::bpf_probe_read_user((entry + 8) as *const u64) } {
+        Ok(value) => value,
+        Err(_) => {
+            scan.stopped = 1;
+            loss(LOSS_MAP);
+            return 1;
+        }
+    };
+    if fun == 0 {
+        loss(LOSS_MAP);
+        return 0;
+    }
+    if code_shape(scan.operation, id).is_none() {
+        return 0;
+    }
+    let mut location: source_vma::SourceLocation = unsafe { core::mem::zeroed() };
+    if !code_vma_join(fun, &mut location) || location.inode == 0 {
+        loss(LOSS_MAP);
+        return 0;
+    }
+    let opfun = (u64::from(id) << 32) | u64::from(scan.operation);
+    if !publish_code_role(scan.control, target, location.inode, opfun, scan.occurrence) {
+        loss(LOSS_MAP);
+    }
+    0
 }

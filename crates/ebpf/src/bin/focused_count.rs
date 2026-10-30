@@ -41,6 +41,11 @@ mod source_state;
 #[allow(dead_code)]
 #[path = "../typed_producer.rs"]
 mod typed_producer;
+// The same-handler operational join resolves the firing callback through
+// the current-VMA join; only the Code policy path links into this object.
+#[allow(dead_code)]
+#[path = "../source_vma.rs"]
+mod source_vma;
 #[path = "../writer_gate.rs"]
 mod writer_gate;
 

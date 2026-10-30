@@ -3818,6 +3818,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             &mut budget,
             Instant::now() + Duration::from_secs(15),
             &cancel,
+            None,
         )
         .unwrap();
         eprintln!(
@@ -3916,6 +3917,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             &mut budget,
             Instant::now() + Duration::from_secs(15),
             &cancel,
+            None,
         )
         .unwrap();
         eprintln!(
@@ -4185,6 +4187,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
         sample_calls: u64,
         next_producer_id: u64,
         loss_cells: [u64; 8],
+        staged_roles: Vec<u32>,
     }
     /// P3 hostile-control driver: full Enabled session (single-API prearm,
     /// typed prepare, gate open, source acquisition with typed admission +
@@ -4194,14 +4197,19 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// common cut, counter close, closed attribution collect, source close.
     /// Every kernel verdict is real; `main` already proved public success
     /// via exit 0. Returns count-only receipts for the control asserts.
+    /// U1 extends it with an optional copied plan (None preserves the
+    /// H1/H2/H3 behavior verbatim) and a marker filename so two passes
+    /// can share one fixture directory.
     fn drive_typed_session_with_counter(
         tag: &str,
         app: &std::path::Path,
         count_roles: &[u32],
+        plan: Option<&super::copied_plan::CopiedPlan>,
+        marker_name: &str,
     ) -> TypedCounterDrive {
         use crate::capture::ClockPort as _;
         let dir = app.parent().unwrap().to_path_buf();
-        let marker = dir.join("marker");
+        let marker = dir.join(marker_name);
         let argv = [
             app.to_string_lossy().into_owned(),
             marker.to_string_lossy().into_owned(),
@@ -4217,12 +4225,14 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
             &mut budget,
             Instant::now() + Duration::from_secs(15),
             &cancel,
+            plan,
         )
         .unwrap();
         eprintln!(
-            "startup apis={} typed={}",
+            "startup apis={} typed={} copied_skipped={}",
             startup.apis.len(),
-            startup.typed.len()
+            startup.typed.len(),
+            startup.copied_skipped,
         );
         assert!(!startup.typed.is_empty(), "fixture must yield typed sites");
         let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
@@ -4494,6 +4504,8 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
             finalized.unresolved_calls(),
             finalized.withheld_uncertain(),
         );
+        let mut staged_roles: Vec<u32> = records.iter().map(|(_, record)| record.role_id).collect();
+        staged_roles.sort_unstable();
         let drive = TypedCounterDrive {
             typed_sites,
             counter_links,
@@ -4506,6 +4518,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
             sample_calls,
             next_producer_id,
             loss_cells,
+            staged_roles,
         };
         drop(finalized);
         drop(sample);
@@ -4531,7 +4544,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
         let dir = std::env::temp_dir().join(format!("osslscope-typed-h1-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let app = source_native_fixture(&dir);
-        let drive = drive_typed_session_with_counter("h1", &app, &[130]);
+        let drive = drive_typed_session_with_counter("h1", &app, &[130], None, "marker");
         assert_eq!(drive.typed_sites, 4, "fixture yields four typed sites");
         assert_eq!(drive.counter_links, 1, "counter attaches the fetch site");
         assert_eq!(drive.joined_sites, 1, "the fetch hit must join");
@@ -4571,7 +4584,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
  void *u=EVP_MAC_CTX_new(m); if(!u) return 3;
 "#,
         );
-        let drive = drive_typed_session_with_counter("h2", &app, &[130, 147]);
+        let drive = drive_typed_session_with_counter("h2", &app, &[130, 147], None, "marker");
         assert_eq!(
             drive.typed_sites, 5,
             "chain fixture yields five typed sites"
@@ -4621,7 +4634,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
  void *u=EVP_MAC_CTX_new(c); if(!u) return 3;
 "#,
         );
-        let drive = drive_typed_session_with_counter("h3", &app, &[130, 147]);
+        let drive = drive_typed_session_with_counter("h3", &app, &[130, 147], None, "marker");
         assert_eq!(
             drive.typed_sites, 5,
             "chain fixture yields five typed sites"
@@ -4649,6 +4662,335 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
             [0, 0, 1, 0, 1, 0, 0, 0],
             "exactly the quarantine tombstone (CONFLICT) + its refused \
              construction's unmatched return (PAIR)"
+        );
+    }
+    /// U1 complete-chain fixture: a fake MAC + KDF provider behind one
+    /// query surface. Public typed exports cover fetch/free/getctx/new/
+    /// dup/free/reset/cleanup for both families; the MAC dispatch table
+    /// advertises function IDs 1..6 (new/dup/free/init/update/final) and
+    /// the KDF table 1..5 (new/dup/free/reset/derive). `main` drives the
+    /// full chain (query both ops, fetch, construct with nested getctx +
+    /// newctx, dup, init/update/final/derive, reset, free all, cleanup)
+    /// and exits 0 only if every callback returned its contract value,
+    /// so exit 0 plus the exec marker oracles the public chain. Callback
+    /// bodies differ pairwise (distinct constants) so no toolchain fold
+    /// can merge two callbacks onto one address.
+    fn source_native_complete_chain_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+struct dispatch { int id; void (*fn)(void); };
+struct algorithm { const char *names, *properties; const struct dispatch *implementation; const char *description; };
+__attribute__((noinline)) void *test_mac_newctx(void *c) { (void)c; __asm__ volatile(""); void *x = malloc(32); if (x) memset(x, 0xA1, 32); return x; }
+__attribute__((noinline)) void *test_mac_dupctx(void *x) { (void)x; __asm__ volatile(""); void *y = malloc(32); if (y) memset(y, 0xA2, 32); return y; }
+__attribute__((noinline)) void test_mac_freectx(void *x) { __asm__ volatile(""); volatile unsigned char probe = *(volatile unsigned char *)x; (void)probe; free(x); }
+__attribute__((noinline)) int test_mac_init(void *x, int v) { (void)x; __asm__ volatile(""); return v + 1; }
+__attribute__((noinline)) int test_mac_update(void *x, const void *in, unsigned long len) { (void)x; (void)in; __asm__ volatile(""); return (int)(len & 0x7fffffff); }
+__attribute__((noinline)) int test_mac_final(void *x, void *out) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC3, 16); return 1; }
+__attribute__((noinline)) void *test_kdf_newctx(void *c) { (void)c; __asm__ volatile(""); void *x = malloc(32); if (x) memset(x, 0xB1, 32); return x; }
+__attribute__((noinline)) void *test_kdf_dupctx(void *x) { (void)x; __asm__ volatile(""); void *y = malloc(32); if (y) memset(y, 0xB2, 32); return y; }
+__attribute__((noinline)) void test_kdf_freectx(void *x) { __asm__ volatile(""); free(x); volatile int sink = 0; (void)sink; }
+__attribute__((noinline)) void test_kdf_reset(void *x) { (void)x; __asm__ volatile(""); }
+__attribute__((noinline)) int test_kdf_derive(void *x, void *out, unsigned long len) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC7, len < 32 ? len : 32); return 1; }
+static const struct dispatch mac_dispatch[] = {
+ { 1, (void(*)(void))test_mac_newctx }, { 2, (void(*)(void))test_mac_dupctx }, { 3, (void(*)(void))test_mac_freectx },
+ { 4, (void(*)(void))test_mac_init }, { 5, (void(*)(void))test_mac_update }, { 6, (void(*)(void))test_mac_final }, { 0, 0 } };
+static const struct dispatch kdf_dispatch[] = {
+ { 1, (void(*)(void))test_kdf_newctx }, { 2, (void(*)(void))test_kdf_dupctx }, { 3, (void(*)(void))test_kdf_freectx },
+ { 4, (void(*)(void))test_kdf_reset }, { 5, (void(*)(void))test_kdf_derive }, { 0, 0 } };
+static const struct algorithm mac_algorithms[] = { { "FAKE-MAC", 0, mac_dispatch, "fake mac" }, { 0, 0, 0, 0 } };
+static const struct algorithm kdf_algorithms[] = { { "FAKE-KDF", 0, kdf_dispatch, "fake kdf" }, { 0, 0, 0, 0 } };
+__attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider, int op, int *no_cache) {
+ (void)provider;
+ *no_cache = 0;
+ if (op == 3) return mac_algorithms;
+ if (op == 4) return kdf_algorithms;
+ return 0;
+}
+static void *fake_libctx; static void *fake_mac_method; static void *fake_kdf_method; static void *fake_provider;
+void *EVP_MAC_fetch(void *c, const char *n, const char *p) { (void)p; if (!c || !n || !*n) return 0; return fake_mac_method; }
+void EVP_MAC_free(void *m) { (void)m; }
+void *EVP_KDF_fetch(void *c, const char *n, const char *p) { (void)p; if (!c || !n || !*n) return 0; return fake_kdf_method; }
+void EVP_KDF_free(void *m) { (void)m; }
+void *OSSL_PROVIDER_get0_provider_ctx(const void *p) { if (p != fake_provider) return 0; return fake_libctx; }
+typedef struct { void *method, *provctx, *data; } FAKE_CTX;
+void *EVP_MAC_CTX_new(void *m) {
+ if (m != fake_mac_method) return 0;
+ void *c = OSSL_PROVIDER_get0_provider_ctx(fake_provider); if (!c) return 0;
+ void *x = test_mac_newctx(c); if (!x) return 0;
+ FAKE_CTX *u = malloc(sizeof *u); if (!u) return 0;
+ u->method = m; u->provctx = c; u->data = x; return u;
+}
+void *EVP_KDF_CTX_new(void *k) {
+ if (k != fake_kdf_method) return 0;
+ void *c = OSSL_PROVIDER_get0_provider_ctx(fake_provider); if (!c) return 0;
+ void *x = test_kdf_newctx(c); if (!x) return 0;
+ FAKE_CTX *u = malloc(sizeof *u); if (!u) return 0;
+ u->method = k; u->provctx = c; u->data = x; return u;
+}
+void *EVP_MAC_CTX_dup(void *u) {
+ FAKE_CTX *src = u; if (!src) return 0;
+ void *x2 = test_mac_dupctx(src->data); if (!x2) return 0;
+ FAKE_CTX *dst = malloc(sizeof *dst); if (!dst) return 0;
+ *dst = *src; dst->data = x2; return dst;
+}
+void *EVP_KDF_CTX_dup(void *u) {
+ FAKE_CTX *src = u; if (!src) return 0;
+ void *x2 = test_kdf_dupctx(src->data); if (!x2) return 0;
+ FAKE_CTX *dst = malloc(sizeof *dst); if (!dst) return 0;
+ *dst = *src; dst->data = x2; return dst;
+}
+void EVP_MAC_CTX_free(void *u) { if (!u) return; test_mac_freectx(((FAKE_CTX *)u)->data); free(u); }
+void EVP_KDF_CTX_free(void *u) { if (!u) return; test_kdf_freectx(((FAKE_CTX *)u)->data); free(u); }
+void EVP_KDF_CTX_reset(void *u) { if (!u) return; test_kdf_reset(((FAKE_CTX *)u)->data); }
+int test_mac_init_call(void *u, int v) { return test_mac_init(((FAKE_CTX *)u)->data, v); }
+int test_mac_update_call(void *u, const void *in, unsigned long len) { return test_mac_update(((FAKE_CTX *)u)->data, in, len); }
+int test_mac_final_call(void *u, void *out) { return test_mac_final(((FAKE_CTX *)u)->data, out); }
+int test_kdf_derive_call(void *u, void *out, unsigned long len) { return test_kdf_derive(((FAKE_CTX *)u)->data, out, len); }
+void OPENSSL_cleanup(void) { __asm__ volatile(""); }
+int main(int argc, char **argv) {
+ if (argc != 2) return 2;
+ FILE *f = fopen(argv[1], "w"); if (!f) return 4; fputs("exec\n", f); fclose(f);
+ fake_libctx = malloc(16); fake_mac_method = malloc(16); fake_kdf_method = malloc(16); fake_provider = malloc(16);
+ if (!fake_libctx || !fake_mac_method || !fake_kdf_method || !fake_provider) return 5;
+ int nc = -1;
+ if (OSSL_PROVIDER_query_operation(fake_provider, 3, &nc) == 0 || nc != 0) return 3;
+ nc = -1;
+ if (OSSL_PROVIDER_query_operation(fake_provider, 4, &nc) == 0 || nc != 0) return 3;
+ void *m = EVP_MAC_fetch(fake_libctx, "FAKE-MAC", 0); if (!m) return 3;
+ void *k = EVP_KDF_fetch(fake_libctx, "FAKE-KDF", 0); if (!k) return 3;
+ void *u = EVP_MAC_CTX_new(m); if (!u) return 3;
+ void *ku = EVP_KDF_CTX_new(k); if (!ku) return 3;
+ void *u2 = EVP_MAC_CTX_dup(u); if (!u2 || u2 == u) return 3;
+ void *ku2 = EVP_KDF_CTX_dup(ku); if (!ku2 || ku2 == ku) return 3;
+ if (test_mac_init_call(u, 41) != 42) return 3;
+ if (test_mac_update_call(u, "abc", 3) != 3) return 3;
+ unsigned char out[16];
+ if (test_mac_final_call(u, out) != 1 || out[0] != 0xC3) return 3;
+ unsigned char kout[32];
+ if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3;
+ EVP_KDF_CTX_reset(ku);
+ EVP_MAC_CTX_free(u2); EVP_MAC_CTX_free(u); EVP_KDF_CTX_free(ku2); EVP_KDF_CTX_free(ku);
+ EVP_MAC_free(m); EVP_KDF_free(k);
+ OPENSSL_cleanup();
+ return 0;
+}
+"#,
+        )
+        .unwrap();
+        let status = std::process::Command::new("cc")
+            .args(["-O0", "-rdynamic", "-o"])
+            .arg(&app)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "complete-chain fixture must compile");
+        app
+    }
+    /// U1 pass 1: legacy-only observation run. Attaches the discovered
+    /// legacy API sites (the query export), releases the fixture, waits
+    /// for the exit-0 oracle, and drains validated RAW ring records
+    /// (op, algorithm index, function per IMPLEMENTATION plus the QUERY
+    /// delimiters the matcher groups by). Any undecodable record fails
+    /// the pass: the plan must rest on fully validated observations.
+    /// Returns the records plus every discovered file's array-grouping
+    /// inputs (multi-file: dependency tables participate in matching and
+    /// lose honestly when their shapes differ).
+    fn run_pass1_legacy_observation(
+        app: &std::path::Path,
+    ) -> (
+        Vec<super::wire::contract::Record>,
+        Vec<super::copied_plan::FileArrays>,
+    ) {
+        let dir = app.parent().unwrap().to_path_buf();
+        let marker = dir.join("marker1");
+        let argv = [
+            app.to_string_lossy().into_owned(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let fds_before = source_native_fd_targets();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        assert_eq!(startup.apis.len(), 1, "fixture exposes one legacy API site");
+        eprintln!(
+            "pass1 startup candidates={} gaps={:?} files={}",
+            startup.candidates.len(),
+            startup.gaps,
+            startup.plan_arrays.len(),
+        );
+        assert!(
+            !startup.candidates.is_empty(),
+            "fixture must parse dispatch candidates"
+        );
+        let plan_arrays = startup.plan_arrays;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        session
+            .prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                PrearmLinks::Create,
+            )
+            .unwrap();
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "pass-1 exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "pass-1 workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "pass-1 public oracle");
+        let mut records = Vec::new();
+        let mut decode_failures = 0usize;
+        while let Some(bytes) = session.events.next() {
+            match super::wire::decode_transport(&bytes) {
+                Ok(transport) => records.push(transport.record()),
+                Err(_) => decode_failures += 1,
+            }
+        }
+        eprintln!(
+            "pass1 records={} decode_failures={}",
+            records.len(),
+            decode_failures
+        );
+        assert_eq!(decode_failures, 0, "every ring record must validate");
+        drop(session);
+        drop(child);
+        // Pass-1 FD hygiene is BPF-scoped: every BPF FD (maps, programs,
+        // links) must return to baseline exactly. The non-BPF survivors
+        // (pidfd, deleted /proc handle, retained app/libc handles) are
+        // the same documented ghost-Rc phenomenon the typed driver pins
+        // at +1 for its flow (see source_native_assert_fds_return);
+        // placing the ghost holder is that pre-existing follow-up, and
+        // pass-2's strict check covers the full-flow non-BPF baseline.
+        let after = source_native_fd_targets();
+        let bpf = |fds: &[String]| {
+            fds.iter()
+                .filter(|fd| {
+                    fd.contains("bpf-map") || fd.contains("bpf-prog") || fd.contains("bpf_link")
+                })
+                .count()
+        };
+        eprintln!(
+            "pass1 fds before={} after={}",
+            fds_before.len(),
+            after.len()
+        );
+        assert_eq!(bpf(&after), bpf(&fds_before), "pass-1 BPF FDs must return");
+        (records, plan_arrays)
+    }
+    /// U1 plan assembly: pass-1 live queries exact-matched against every
+    /// discovered file's array inputs (the pass-1 discovery's own parse
+    /// output, not a recomputation or a reopen). Plan entries key by
+    /// file hash; pass-2 discovery verifies membership in its own
+    /// retained bytes before staging.
+    fn stage_copied_plan_from_pass1(app: &std::path::Path) -> super::copied_plan::CopiedPlan {
+        let (records, arrays) = run_pass1_legacy_observation(app);
+        let live = super::copied_plan::collect_live_queries(&records);
+        eprintln!("pass1 live_queries={live:?}");
+        let plan_budget = ObservationBudget::default();
+        super::copied_plan::generate_plan(&arrays, &live, &plan_budget).unwrap()
+    }
+    /// U1 complete-chain staging control: pass 1 (legacy-only) observes
+    /// the live MAC+KDF queries; the plan exact-matches them to the
+    /// retained arrays; pass 2 stages the query role plus all 11 copied
+    /// sites through the receipt protocol and proves constructor commit:
+    /// both owners commit (exact 44-mint decomposition), both dup contexts
+    /// stay unpropagated, both frees retire, the loss vector carries only
+    /// the by-design Phase-1 teardown poison (cell 3, from the trailing
+    /// 155 cleanup; every other cell zero), and definite stays 0 because
+    /// U1 attaches the operational counter nowhere (the typed-side
+    /// operational links are inert by role gate). U2 attaches that counter
+    /// and proves the first partitions.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     copied_roles_stage_from_observed_callbacks --nocapture
+    /// ```
+    #[test]
+    #[ignore = "two-pass copied-role staging control (sudo, cc)"]
+    fn copied_roles_stage_from_observed_callbacks() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-u1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(plan.sites.len(), 11, "MAC 6 + KDF 5 copied sites");
+        let mut roles: Vec<u32> = plan.sites.iter().map(|site| site.role_id).collect();
+        roles.sort_unstable();
+        assert_eq!(
+            roles,
+            vec![258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308]
+        );
+        let mut offsets: Vec<u64> = plan.sites.iter().map(|site| site.offset).collect();
+        offsets.sort_unstable();
+        offsets.dedup();
+        assert_eq!(offsets.len(), 11, "no two callbacks share an address");
+        let drive = drive_typed_session_with_counter(
+            "u1",
+            &app,
+            &[258, 259, 274, 275, 290, 291],
+            Some(&plan),
+            "marker2",
+        );
+        assert_eq!(
+            drive.staged_roles,
+            vec![
+                130, 131, 136, 137, 146, 147, 148, 149, 150, 151, 152, 153, 155, 161, 258, 259,
+                274, 275, 290, 291, 304, 305, 306, 307, 308,
+            ],
+            "13 first-slice + query + 11 copied"
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.counter_links, 1,
+            "one multi-link batches the six sites"
+        );
+        assert_eq!(drive.joined_sites, 6, "all six counted sites join");
+        assert_eq!(drive.joined_calls, 8, "1+1 new + 2+2 free + 1+1 dup");
+        assert_eq!(
+            drive.definite, 0,
+            "U1 attaches no operational counter: typed-side operational links stay inert"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 9,
+            "eight physical hits plus the teardown-poison foreign bound, all unresolved without partitions"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 6);
+        assert_eq!(drive.sample_calls, 8);
+        assert_eq!(
+            drive.next_producer_id, 45,
+            "44 mints on a counter starting at 1: 14 occurrences (fetch/query/new/dup x2, nested newctx/dupctx/getctx x2) + 1 thread + 2 request interns + 2 METHOD rows + 14 commit serials (7 x2 owners) + 11 CODE_ROLE witnesses"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison from the 155 OPENSSL_cleanup entry (the chain's last call); every other cell stays zero"
         );
     }
     /// P3-I1 single-typed-site fixture: the query/dispatch shape of
@@ -4748,6 +5090,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             &mut budget,
             Instant::now() + Duration::from_secs(15),
             &cancel,
+            None,
         )
         .unwrap();
         let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
@@ -5142,6 +5485,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             &mut budget,
             Instant::now() + Duration::from_secs(15),
             &cancel,
+            None,
         )
         .unwrap();
         let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
@@ -6293,6 +6637,7 @@ mod startup_api_controls {
             objects::StartupProcess::held(&child).unwrap(),
             file,
             &budget,
+            None,
         )
         .unwrap();
         let (_, site) = sites
@@ -7118,6 +7463,7 @@ mod startup_api_controls {
             objects::StartupProcess::held(child).unwrap(),
             f.file(),
             &ObservationBudget::default(),
+            None,
         )
         .unwrap();
         let (_, site) = sites
@@ -7216,7 +7562,8 @@ mod startup_api_controls {
         let mut typed = Vec::new();
         for (index, fixture) in fixtures.iter_mut().enumerate() {
             let sources =
-                objects::startup_candidates(custody.clone(), fixture.file(), &discovery).unwrap();
+                objects::startup_candidates(custody.clone(), fixture.file(), &discovery, None)
+                    .unwrap();
             assert_eq!(sources.typed.len(), 1);
             typed.extend(sources.typed);
             if index == 0 {
@@ -7394,6 +7741,7 @@ mod startup_api_controls {
                 &mut budget,
                 Instant::now() + Duration::from_secs(15),
                 &cancel,
+                None,
             )
             .unwrap();
             let mut session = ProviderSession::open_budgeted(budget, &object).unwrap();
@@ -7529,6 +7877,7 @@ mod startup_api_controls {
             objects::StartupProcess::held(&child).unwrap(),
             file,
             &budget,
+            None,
         )
         .unwrap();
         let (_, site) = sites
@@ -7697,6 +8046,7 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             &mut budget,
             Instant::now() + Duration::from_secs(15),
             &cancel,
+            None,
         )
         .unwrap();
         let object =

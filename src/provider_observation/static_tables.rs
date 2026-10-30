@@ -118,6 +118,9 @@ struct Algorithm {
     _aliases: Vec<u8>,
     hint: Option<u16>,
     quality: super::AliasQuality,
+    /// File virtual address of the 32-byte algorithm record (locator for
+    /// array-contiguity grouping; never an ABI claim by itself).
+    address: u64,
 }
 /// Private locators and aliases intentionally have no Debug or serialization.
 pub struct TableDiscovery {
@@ -178,6 +181,24 @@ impl TableDiscovery {
     }
     pub fn gaps(&self) -> &[TableGap] {
         &self.gaps
+    }
+    /// Array-grouping inputs, one per parsed algorithm record: record
+    /// address plus the referenced table's (function ID, code file
+    /// offset) rows. Partial tables contribute no rows: their row sets
+    /// are incomplete by construction, so no live shape may match them.
+    pub(crate) fn array_inputs(&self) -> Vec<(u64, Vec<(u32, u64)>)> {
+        self.algorithms
+            .iter()
+            .map(|algorithm| {
+                let table = &self.tables[algorithm.dispatch];
+                let rows = if table.partial {
+                    Vec::new()
+                } else {
+                    table.rows.iter().map(|row| (row.id, row.offset)).collect()
+                };
+                (algorithm.address, rows)
+            })
+            .collect()
     }
     pub(crate) fn candidates(&self) -> impl Iterator<Item = StaticCandidate> + '_ {
         self.tables.iter().flat_map(move |table| {
@@ -1303,6 +1324,7 @@ fn discover(
                                 id: DynamicAlgorithmId(id.finalize().into()),
                                 dispatch,
                                 _aliases: aliases,
+                                address: at,
                             })
                         })();
                         match record {

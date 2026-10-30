@@ -280,7 +280,14 @@ fn actual_focused_object_shape_privacy_and_namespace_guard() {
         .collect();
     assert!(helpers.contains(&120));
     assert!(!helpers.contains(&14));
-    assert!(helpers.iter().all(|h| [1, 2, 5, 120, 174].contains(h)));
+    // U1: the same-handler operational join adds the kernel-memory read
+    // (113) and current-task-BTF (158) helpers via the VMA join; kfunc
+    // calls use src 2 and never appear in this helper set.
+    assert!(
+        helpers
+            .iter()
+            .all(|h| [1, 2, 5, 113, 120, 158, 174].contains(h))
+    );
     let mut drift = bytes.clone();
     let off = drift
         .windows(9)

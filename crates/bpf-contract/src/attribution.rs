@@ -79,6 +79,7 @@ impl TypedRoleId {
             | 142
             | 143
             | 146..=155
+            | 161
             | 258
             | 259
             | 274
@@ -111,6 +112,7 @@ impl TypedRoleId {
             153 => "EVP_KDF_CTX_reset",
             154 => "OSSL_LIB_CTX_free",
             155 => "OPENSSL_cleanup",
+            161 => "OSSL_PROVIDER_query_operation",
             _ => return None,
         })
     }
@@ -130,11 +132,15 @@ impl TypedAdmission {
     /// Exact first-slice (api, operation, function) triple per role.
     /// Single table shared by the constructor and host-side admission
     /// programming; reserved roles have no triple and never admit.
+    /// Role 161 is the U1 query-observation role: legacy query API 8,
+    /// operation/function 0 (the observed op rides the pending frame,
+    /// never the admission triple).
     #[inline(always)]
     pub const fn admission_parts(role_id: u32) -> Option<(u32, u32, u32)> {
         match role_id {
             5 => Some((5, 0, 0)),
             18 => Some((0, 0, 0)),
+            161 => Some((8, 0, 0)),
             130 => Some((12, 3, 0)),
             131 => Some((13, 4, 0)),
             136 | 142 | 147 | 149 | 151 => Some((0, 3, 0)),
@@ -201,7 +207,7 @@ impl TypedAdmission {
     pub const fn paired(&self) -> bool {
         matches!(
             self.role_id,
-            130 | 131 | 142 | 143 | 146 | 147 | 148 | 151 | 152 | 258 | 259 | 290 | 291
+            130 | 131 | 142 | 143 | 146 | 147 | 148 | 151 | 152 | 161 | 258 | 259 | 290 | 291
         )
     }
     #[inline(always)]

@@ -16,7 +16,7 @@ fn startup_admits_typed_metadata_at_real_forwarded_sites() {
     .unwrap();
     let custody = StartupProcess::held(&child).unwrap();
     let StartupCandidates { apis: sites, .. } =
-        startup_candidates(custody, f.file(), &ObservationBudget::default()).unwrap();
+        startup_candidates(custody, f.file(), &ObservationBudget::default(), None).unwrap();
     let offsets: Vec<_> = sites
         .into_iter()
         .map(|s| s.into_parts().1.file_offset())
@@ -48,6 +48,7 @@ fn startup_metadata_alias_conflict_with_any_public_role_refuses_reader() {
         StartupProcess::held(&child).unwrap(),
         f.file(),
         &ObservationBudget::default(),
+        None,
     )
     .unwrap();
     let offsets: Vec<_> = sites
@@ -74,6 +75,7 @@ fn queued_startup_authority_survives_owned_exit_but_cannot_rearm() {
         StartupProcess::held(&child).unwrap(),
         f.file(),
         &ObservationBudget::default(),
+        None,
     )
     .unwrap();
     let (_, site) = sites.into_iter().next().unwrap().into_parts();
