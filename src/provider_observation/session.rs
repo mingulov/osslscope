@@ -8046,6 +8046,687 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    /// U5 expected MAC digest: `openssl mac -digest SHA256 -macopt
+    /// hexkey:0b*20 -in abc.txt HMAC` over input `abc`. Python-`hmac`
+    /// verified (§13.2, re-verified by the U5 oracle leg): the observed
+    /// workload stdout must equal this and a fresh unobserved re-run.
+    const U5_MAC_DIGEST: &str = "721E281E92410E545A431EAC66267721B917C6BEAF08A86D6E4BC67B657B92DE";
+    /// U5 real-`openssl mac` argv (P4 lane, §13.1 verbatim): ordinary
+    /// unmodified HMAC-SHA256 over the `abc.txt` input in `dir`.
+    fn u5_openssl_mac_argv(dir: &std::path::Path) -> Vec<String> {
+        vec![
+            "/usr/bin/openssl".to_string(),
+            "mac".to_string(),
+            "-digest".to_string(),
+            "SHA256".to_string(),
+            "-macopt".to_string(),
+            format!("hexkey:{}", "0b".repeat(20)),
+            "-in".to_string(),
+            dir.join("abc.txt").to_string_lossy().into_owned(),
+            "HMAC".to_string(),
+        ]
+    }
+    /// U5 pass 1: legacy-only observation of the real `openssl mac`
+    /// workload (38 API sites, real argv, no marker) drained for live
+    /// query observations, exact-matched to the retained arrays into a
+    /// copied-role staging plan. Returns the plan plus the observed
+    /// workload digest (pass-1 oracle agreement).
+    fn u5_pass1_plan_from_live_queries(
+        argv: &[String],
+        dir: &std::path::Path,
+    ) -> (super::copied_plan::CopiedPlan, String) {
+        let stdout_path = dir.join("out1.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            startup.apis.len(),
+            38,
+            "real openssl yields 38 legacy sites"
+        );
+        assert_eq!(
+            startup.typed.len(),
+            17,
+            "real openssl yields 17 typed exports"
+        );
+        eprintln!(
+            "u5 pass1 startup candidates={} gaps={:?} files={}",
+            startup.candidates.len(),
+            startup.gaps,
+            startup.plan_arrays.len(),
+        );
+        assert_eq!(
+            startup.candidates.len(),
+            10722,
+            "real openssl parses its full dispatch closure"
+        );
+        assert_eq!(
+            startup.gaps,
+            std::collections::BTreeSet::from([
+                ObservationGap::MalformedElf,
+                ObservationGap::DispatchPartial,
+                ObservationGap::SamplingPartial,
+            ]),
+            "the known discovery gaps, nothing else"
+        );
+        assert_eq!(
+            startup.plan_arrays.len(),
+            6,
+            "six parsed files carry arrays"
+        );
+        // Bind and release explicitly: pattern-ignored (`..`) fields
+        // stay in the scrutinee until scope end (the §21.2 ghost-Rc
+        // lesson); candidates retain the parsed lib file handles.
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            plan_arrays,
+            ..
+        } = startup;
+        drop(typed);
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let fds_before = source_native_fd_targets();
+        let mut session = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Create,
+            )
+            .unwrap();
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "pass-1 workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "pass-1 public oracle");
+        child.finish_observation().unwrap();
+        let digest = std::fs::read_to_string(&stdout_path).unwrap();
+        let digest = digest.trim().to_ascii_uppercase();
+        assert_eq!(digest, U5_MAC_DIGEST, "pass-1 observed digest must verify");
+        let mut records = Vec::new();
+        let mut decode_failures = 0usize;
+        while let Some(bytes) = session.events.next() {
+            match super::wire::decode_transport(&bytes) {
+                Ok(transport) => records.push(transport.record()),
+                Err(_) => decode_failures += 1,
+            }
+        }
+        eprintln!(
+            "u5 pass1 records={} decode_failures={}",
+            records.len(),
+            decode_failures
+        );
+        assert_eq!(decode_failures, 0, "every ring record must validate");
+        assert_eq!(records.len(), 528, "the deterministic legacy record volume");
+        drop(session);
+        drop(child);
+        let after = source_native_fd_targets();
+        let bpf = |fds: &[String]| {
+            fds.iter()
+                .filter(|fd| {
+                    fd.contains("bpf-map") || fd.contains("bpf-prog") || fd.contains("bpf_link")
+                })
+                .count()
+        };
+        assert_eq!(bpf(&after), bpf(&fds_before), "pass-1 BPF FDs must return");
+        let live = super::copied_plan::collect_live_queries(&records);
+        eprintln!("u5 pass1 live_queries={live:?}");
+        assert_eq!(live.len(), 1, "exactly the MAC query survives agreement");
+        assert_eq!(live[0].operation, 3, "the kept query is op MAC");
+        assert_eq!(
+            live[0]
+                .algos
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            (0..9).collect::<Vec<_>>(),
+            "nine dense live algorithm indices"
+        );
+        let plan_budget = ObservationBudget::default();
+        let plan = super::copied_plan::generate_plan(&plan_arrays, &live, &plan_budget).unwrap();
+        eprintln!("u5 pass1 plan sites={:?}", plan.sites);
+        assert!(
+            !plan.sites.is_empty(),
+            "the live MAC queries must stage copied-role sites"
+        );
+        (plan, digest)
+    }
+    /// U5 committed fit pin (S2-N2): the verbatim P4 re-run (§13.1/§13.6)
+    /// procedure on the real binary. Direct-exec ordinary unmodified
+    /// `openssl mac` (HMAC-SHA256) on host 7.0.0-38 drives the §12.3
+    /// session shape — pass-1 live-query plan, Enabled 38-claim lease,
+    /// typed admit+attach, shared counter at the staged operational
+    /// roles, common cut, closed collect — asserting exact staging,
+    /// full in-kernel chain verdicts, fit under the frozen 64 MiB
+    /// ceiling at every phase, and oracle agreement of the observed
+    /// digest with the Python-verified value plus a fresh unobserved
+    /// re-run. Diagnostic truncations from §13.1 (prearm to 1 API,
+    /// typed to 2) are gone: U3+U4 run the full order.
+    ///
+    /// The first positive itself is BLOCKED (U5 §24): typed role 161
+    /// stages at the `OSSL_PROVIDER_query_operation` export stub,
+    /// which real libcrypto never calls (internal fetch paths call
+    /// the forwarder-derived trampoline directly, where the legacy
+    /// query site correctly stages). No CODE_ROLE publishes, no owner
+    /// commits, and the counted operational hits stay unresolved —
+    /// the receipt below pins that fail-closed refusal exactly. Flip
+    /// the definite assert to the positive when 161 stages at the
+    /// derived destination.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n <lib test binary> \
+    ///     real_openssl_mac_full_acquire_fits_with_oracle_agreement --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "U5 real-openssl fit pin (sudo, pinned BPF objects)"]
+    fn real_openssl_mac_full_acquire_fits_with_oracle_agreement() {
+        use crate::capture::ClockPort as _;
+        const CEILING: usize = 67108864;
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-u5-positive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("abc.txt"), b"abc").unwrap();
+        let argv = u5_openssl_mac_argv(&dir);
+        let (plan, pass1_digest) = u5_pass1_plan_from_live_queries(&argv, &dir);
+        assert_eq!(pass1_digest, U5_MAC_DIGEST);
+        let mut plan_roles: Vec<u32> = plan.sites.iter().map(|site| site.role_id).collect();
+        plan_roles.sort_unstable();
+        eprintln!("u5 plan roles={plan_roles:?}");
+        assert_eq!(
+            plan.sites.len(),
+            49,
+            "the live MAC array stages 49 callbacks"
+        );
+        assert_eq!(
+            plan_roles,
+            vec![
+                258, 258, 258, 258, 258, 258, 258, 258, 258, 274, 274, 274, 274, 274, 274, 274,
+                274, 290, 290, 290, 290, 290, 290, 290, 290, 304, 304, 304, 304, 304, 304, 304,
+                304, 305, 305, 305, 305, 305, 305, 305, 305, 306, 306, 306, 306, 306, 306, 306,
+                306,
+            ],
+            "nine constructors with eight lifecycle/dup/init/update/final each"
+        );
+        // Pass 2: the full §12.3 session shape with the pass-1 plan.
+        let baseline = source_native_fd_targets();
+        let stdout_path = dir.join("out2.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            &argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            Some(&plan),
+        )
+        .unwrap();
+        eprintln!(
+            "u5 startup apis={} typed={} copied_skipped={}",
+            startup.apis.len(),
+            startup.typed.len(),
+            startup.copied_skipped,
+        );
+        assert_eq!(
+            startup.apis.len(),
+            38,
+            "pass-2 rescan keeps 38 legacy sites"
+        );
+        assert_eq!(
+            startup.copied_skipped, 0,
+            "pass-2 rescan agrees with the pass-1 plan on every site"
+        );
+        assert_eq!(
+            startup.typed.len(),
+            18 + plan.sites.len(),
+            "17 first-slice + query + every planned copied site"
+        );
+        let spent_discovery = budget.state_spent_test();
+        eprintln!("u5 spent after-discovery={spent_discovery}");
+        assert!(spent_discovery < CEILING, "discovery must fit the ceiling");
+        // Bind and release explicitly (§21.2 ghost-Rc lesson, as in
+        // pass 1 above); only gaps/copied_skipped/plan_arrays stay.
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            ..
+        } = startup;
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), 38);
+        let spent_prearm = session.budget.state_spent_test();
+        eprintln!("u5 spent after-prearm={spent_prearm}");
+        assert!(spent_prearm < CEILING, "prearm must fit the ceiling");
+        // Claims from the retained attachments themselves (FD-path
+        // targets, no pathname premise); FDs stay alive through acquire.
+        let mut fds = Vec::new();
+        let mut triples = Vec::new();
+        for attachment in &session.startup[&pid] {
+            let fd = attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .unwrap();
+            triples.push((
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+                attachment.site.file_offset(),
+                pid,
+            ));
+            fds.push(fd);
+        }
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(triples),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(60),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let typed_sites = session.typed_startup.len();
+        let spent_prepare = session.budget.state_spent_test();
+        eprintln!("u5 spent after-prepare-typed={spent_prepare}");
+        assert!(
+            spent_prepare < CEILING,
+            "typed prepare must fit the ceiling"
+        );
+        let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let deadline_ns = start_ns + 15_000_000_000;
+        let borrowed = session.borrowed_producer_maps().expect("producer maps");
+        let mut counter = crate::focused_count::FocusedCounter::open_gated_shared(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns,
+                },
+                ..Default::default()
+            },
+            gate.clone(),
+            &borrowed,
+        )
+        .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "full-38 acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        let spent_acquire = session.budget.state_spent_test();
+        eprintln!("u5 spent after-acquire={spent_acquire}");
+        assert!(
+            spent_acquire < CEILING,
+            "full-38 acquire must fit the ceiling"
+        );
+        assert_eq!(receipts.attachments.len(), 38, "every claim acquires");
+        assert_eq!(
+            receipts
+                .attachments
+                .iter()
+                .map(|a| a.site_cookie)
+                .collect::<Vec<_>>(),
+            (1..=38u64).collect::<Vec<_>>(),
+            "claim order is admission order, cookies sequential"
+        );
+        assert!(
+            receipts.attachments.windows(2).all(|pair| {
+                pair[0].anchor.anchor_id == pair[1].anchor.anchor_id
+                    && pair[0].ready_sequence < pair[1].ready_sequence
+            }),
+            "one shared anchor, READY in admission order"
+        );
+        assert_eq!(
+            session.typed_site_records().len(),
+            typed_sites,
+            "every staged typed site must admit"
+        );
+        drop(fds);
+        // Counter at the staged operational roles (304-308 present).
+        let mut count_roles: Vec<u32> = session
+            .typed_site_records()
+            .values()
+            .map(|record| record.role_id)
+            .filter(|role| (304..=308).contains(role))
+            .collect();
+        count_roles.sort_unstable();
+        count_roles.dedup();
+        eprintln!("u5 count_roles={count_roles:?}");
+        assert_eq!(
+            count_roles,
+            vec![304, 305, 306],
+            "MAC init/update/final stage, KDF derive/reset do not"
+        );
+        let mut candidates = Vec::new();
+        for staged in &session.typed_startup {
+            if !count_roles.contains(&staged.role().id()) {
+                continue;
+            }
+            let site = staged.site().clone();
+            let starttime = site.starttime();
+            let record = super::wire::contract::Record {
+                pid: child.pid(),
+                tid: child.pid(),
+                generation: site.generation(),
+                ..super::wire::contract::Record::default()
+            };
+            candidates.push(crate::focused_count::CountCandidate::Learned(
+                VerifiedSiteCandidate {
+                    site,
+                    pid: child.pid(),
+                    starttime,
+                    generation: record.generation,
+                    advertisers: Vec::new(),
+                    operation: super::schema::Operation::Mac,
+                    numeric_operation: 0,
+                    dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                        session.typed_startup[0].site().object_hash(),
+                        starttime,
+                        &record,
+                    ),
+                    observed_ns: start_ns,
+                    algorithm: super::schema::AlgorithmId::try_from(u16::MAX).unwrap(),
+                    alias_quality: super::schema::AliasQuality::default(),
+                    function: super::schema::FunctionIdentity::new(
+                        super::schema::Operation::Mac,
+                        0,
+                    )
+                    .unwrap(),
+                },
+            ));
+        }
+        let staged_operational = session
+            .typed_startup
+            .iter()
+            .filter(|staged| count_roles.contains(&staged.role().id()))
+            .count();
+        assert_eq!(
+            candidates.len(),
+            staged_operational,
+            "one counter site per staged operational site"
+        );
+        assert_eq!(
+            staged_operational, 24,
+            "eight staged sites per operational role"
+        );
+        counter
+            .attach_candidates_pinned(
+                candidates,
+                start_ns,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                session.typed_pins(),
+            )
+            .unwrap();
+        let counter_links = counter.active_link_count();
+        // Release only after READY, then the independent workload oracle.
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "workload must exit 0");
+        child.finish_observation().unwrap();
+        let digest = std::fs::read_to_string(&stdout_path).unwrap();
+        let digest = digest.trim().to_ascii_uppercase();
+        assert_eq!(digest, U5_MAC_DIGEST, "observed digest must verify");
+        let rerun = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(rerun.status.success(), "unobserved re-run must exit 0");
+        let rerun_digest = String::from_utf8_lossy(&rerun.stdout);
+        assert_eq!(
+            rerun_digest.trim().to_ascii_uppercase(),
+            U5_MAC_DIGEST,
+            "unobserved re-run must agree"
+        );
+        assert_eq!(
+            digest,
+            rerun_digest.trim().to_ascii_uppercase(),
+            "observed and re-run digests agree"
+        );
+        session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let cpus = counter.cpus();
+        let sample = counter.close(Instant::now() + Duration::from_secs(10));
+        let records: Vec<(u64, TypedSiteRecord)> = session
+            .typed_site_records()
+            .iter()
+            .map(|(cookie, record)| (*cookie, record.clone()))
+            .collect();
+        session
+            .charge_attribution_final(
+                8192usize
+                    .checked_mul(104 + 24 * cpus)
+                    .and_then(|n| n.checked_add(1024 * (16 + 64)))
+                    .and_then(|n| n.checked_add(1024 * (24 + 56)))
+                    .and_then(|n| n.checked_add(8 * 8 * cpus))
+                    .and_then(|n| n.checked_add(64))
+                    .unwrap(),
+            )
+            .unwrap();
+        let spent_collect = session.budget.state_spent_test();
+        eprintln!("u5 spent after-collect-charge={spent_collect}");
+        assert!(
+            spent_collect < CEILING,
+            "collect charge must fit the ceiling"
+        );
+        let maps = session.attribution_maps().expect("attribution maps");
+        let mut admitted = Vec::with_capacity(records.len());
+        for (cookie, record) in &records {
+            admitted.push(crate::attribution::AdmittedTypedSite {
+                cookie: *cookie,
+                site_id: std::num::NonZeroU64::new(record.site_id).unwrap(),
+                role_id: record.role_id,
+                object: record.object.clone(),
+                device: record.device,
+                inode: record.inode,
+                offset: record.offset,
+                object_id: record.object_id,
+                source_epoch: record.source_epoch,
+            });
+        }
+        let end_ns = crate::capture::LiveClock
+            .checked_monotonic_ns()
+            .unwrap()
+            .min(deadline_ns);
+        let admission = crate::evidence::CountAdmissionWindow {
+            start_ns,
+            deadline_ns,
+        };
+        let finalized = crate::attribution::collect_closed_attribution(
+            gate.owned_closed().expect("closed gate"),
+            &gate,
+            &maps,
+            cpus,
+            &sample,
+            &admitted,
+            admission,
+            crate::evidence::CaptureWindow {
+                requested_start_ns: start_ns,
+                requested_end_ns: deadline_ns,
+                effective_start_ns: start_ns,
+                effective_end_ns: end_ns.max(start_ns),
+                signal_cut: false,
+                count_admission: Some(admission),
+            },
+        )
+        .unwrap_or_else(|error| panic!("closed collect failed: {error:?}"));
+        let mut joined_sites = 0usize;
+        let mut joined_calls = 0u64;
+        for execution in &sample.sites {
+            if admitted.iter().any(|site| {
+                site.object == execution.site.object
+                    && site.device == execution.site.device
+                    && site.inode == execution.site.inode
+                    && site.offset == execution.site.offset
+            }) {
+                joined_sites += 1;
+                joined_calls += execution.calls;
+            }
+        }
+        let sample_calls: u64 = sample.sites.iter().map(|site| site.calls).sum();
+        let next_producer_id = {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("ATTRIB_CONTROL")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[2], 4, 64).unwrap();
+            let mut value = [0u8; 64];
+            map.lookup(&0u32.to_ne_bytes(), &mut value).unwrap();
+            u64::from_ne_bytes(value[32..40].try_into().unwrap())
+        };
+        let mut loss_cells = [0u64; 8];
+        {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("PRODUCER_LOSS")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[6], 4, 8).unwrap();
+            for (cell, total) in loss_cells.iter_mut().enumerate() {
+                let mut values = vec![0u8; 8 * cpus];
+                map.lookup(&(cell as u32).to_ne_bytes(), &mut values)
+                    .unwrap();
+                for cpu in 0..cpus {
+                    *total += u64::from_ne_bytes(values[cpu * 8..cpu * 8 + 8].try_into().unwrap());
+                }
+            }
+        }
+        eprintln!(
+            "u5: typed={typed_sites} counter_links={counter_links} sample_sites={} sample_calls={sample_calls} joined_sites={joined_sites} joined_calls={joined_calls} definite={} unresolved={} withheld={} next_id={next_producer_id} loss={loss_cells:?}",
+            sample.sites.len(),
+            finalized.definite().len(),
+            finalized.unresolved_calls(),
+            finalized.withheld_uncertain(),
+        );
+        let mut staged_roles: Vec<u32> = records.iter().map(|(_, record)| record.role_id).collect();
+        staged_roles.sort_unstable();
+        eprintln!("u5 staged_roles={staged_roles:?}");
+        assert_eq!(
+            staged_roles,
+            vec![
+                5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+                161, 258, 258, 258, 258, 258, 258, 258, 258, 258, 274, 274, 274, 274, 274, 274,
+                274, 274, 290, 290, 290, 290, 290, 290, 290, 290, 304, 304, 304, 304, 304, 304,
+                304, 304, 305, 305, 305, 305, 305, 305, 305, 305, 306, 306, 306, 306, 306, 306,
+                306, 306,
+            ],
+            "17 first-slice + query + 49 copied, every one admitted"
+        );
+        assert_eq!(typed_sites, 67, "17 first-slice + query + 49 copied");
+        assert_eq!(counter_links, 1, "one multi-link batches the 24 sites");
+        assert_eq!(sample.sites.len(), 24, "every operational site sampled");
+        assert_eq!(sample_calls, 3, "HMAC init + update + final fire");
+        assert_eq!(joined_sites, 24, "every sample joins an admitted site");
+        assert_eq!(joined_calls, 3, "the three operational hits join");
+        // BLOCKED (U5 §24): 161 never fires (export stub miss), so no
+        // CODE_ROLE publishes, no owner commits, and the three joined
+        // operational hits stay unresolved next to the loss cells. Flip
+        // to the positive when 161 stages at the derived destination.
+        assert_eq!(
+            finalized.definite().len(),
+            0,
+            "blocked: no partition without a committed owner"
+        );
+        assert_eq!(
+            finalized.unresolved_calls(),
+            6,
+            "three joined hits plus the three loss-bound foreign calls"
+        );
+        assert_eq!(finalized.withheld_uncertain(), 0);
+        assert_eq!(next_producer_id, 7, "six mints, zero CODE_ROLE witnesses");
+        assert_eq!(
+            loss_cells,
+            [0, 0, 1, 2, 0, 0, 0, 0],
+            "one pairing miss plus the two teardown poisons"
+        );
+        drop(finalized);
+        drop(sample);
+        let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert!(close.first_error.is_none());
+        assert!(!close.order_refused, "the completed order must not refuse");
+        drop(session);
+        drop(gate);
+        drop(child);
+        drop(receipts);
+        drop(lease);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "the full real-binary flow must release every fd"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_return_registration_withholds_ready_and_operands() {
