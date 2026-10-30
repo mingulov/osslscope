@@ -1148,7 +1148,10 @@ pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns
         }
         274 | 275 => {
             let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
-            if !code_role_for_callback(ctx, &target, cookie, opfun, entry_seq) {
+            let Some((inode, file_offset)) = join_firing_identity(ctx) else {
+                return 0;
+            };
+            if !code_role_check(&target, cookie, inode, file_offset, opfun) {
                 return 0;
             }
             let arg0: u64 = ctx.arg(0).unwrap_or(0);
@@ -1390,7 +1393,10 @@ pub fn child_entry(
     }
     if matches!(admitted.role_id, 258 | 259 | 290 | 291) {
         let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
-        if !code_role_for_callback(ctx, &target, cookie, opfun, entry_seq) {
+        let Some((inode, file_offset)) = join_firing_identity(ctx) else {
+            return 0;
+        };
+        if !code_role_check(&target, cookie, inode, file_offset, opfun) {
             return 0;
         }
     }
@@ -3728,14 +3734,19 @@ pub fn capture_entry_seq() -> u64 {
 /// leaves the stored physical hit unresolved. Role 308 (KDF reset) retires
 /// instead of attributing and never produces a partition.
 ///
-/// The check splits into two shallow siblings sharing a per-CPU staging
-/// tuple (BPF shares one 512-byte stack across the chain, so one frame
-/// cannot hold the resolution and the 104-byte key): `op_resolve_segment`
-/// validates and allocates the segment, `op_store_partition` re-checks
-/// freshness and inserts. The tuple is per-CPU private to a
-/// non-preemptible run — BPF programs run to completion, so no nested
-/// handler can interleave — and the store revalidates liveness, so a race
-/// that retires between the siblings fails closed.
+/// The check splits into three shallow sequential phases sharing
+/// per-CPU staging (BPF shares one 512-byte stack across the chain, so
+/// one frame cannot hold the resolution and the 104-byte key, and the
+/// 6.9 verifier sums caller frames along the path): phase A
+/// (`op_resolve_segment_a`) validates admission, authority, committed
+/// X/OWNER and tombstones, then stages a handoff; phase B
+/// (`op_resolve_segment_b`) validates the selector, projection and
+/// digest, allocates the segment, and stages the tuple;
+/// `op_store_partition` re-checks freshness and inserts. Staging is
+/// per-CPU private to a non-preemptible run — BPF programs run to
+/// completion, so no nested handler can interleave — and the store
+/// revalidates liveness, so a race that retires between the siblings
+/// fails closed.
 #[allow(dead_code)]
 #[no_mangle]
 pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
@@ -3773,26 +3784,24 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
         retire_owner_reachable(&target, REL_X_INDEX, context);
         return false;
     }
-    // 304-307: SOURCE_READY/guards plus exact CODE_ROLE authority precede
-    // every argument read, including the resolver's read below. The join
-    // itself re-checks the cookie binding, so authority is validated both
-    // at this gate and at the consuming join.
-    let Some(bound) = site_bind_ptr(params.cookie, &target) else {
+    // 304-307: the joined exact identity plus SOURCE_READY/guards and
+    // exact CODE_ROLE authority precede every argument read, including
+    // the resolver's read below.
+    let opfun = (u64::from(function) << 32) | u64::from(operation);
+    let Some((inode, file_offset)) = join_firing_identity(ctx) else {
         return false;
     };
-    let source_epoch = unsafe { (*bound).source_epoch };
-    if !ready_and_guards(params.cookie, source_epoch, target.entry_seq, &target) {
-        return false;
-    }
-    let opfun = (u64::from(function) << 32) | u64::from(operation);
-    if !code_role_for_callback(ctx, &target, params.cookie, opfun, target.entry_seq) {
+    if !code_role_check(&target, params.cookie, inode, file_offset, opfun) {
         return false;
     }
     let context: u64 = ctx.arg(0).unwrap_or(0);
     if context == 0 {
         return false;
     }
-    let segment = op_resolve_segment(ctx, params);
+    if !op_resolve_segment_a(ctx, params) {
+        return false;
+    }
+    let segment = op_resolve_segment_b(params);
     if segment == 0 {
         return false;
     }
@@ -3808,24 +3817,87 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
 /// [104..112) operation, [112..120) function, [120..128) segment,
 /// [128..136) session, [136..144) cut.
 
-/// First operational sibling: full resolution (admission, source authority,
-/// committed X and OWNER at or before the entry snapshot, tombstones,
-/// prepared selector, safe projection, digest conflict refusal) plus the
-/// once-per-tuple segment allocation. Stages the attribution tuple and
-/// returns the nonzero segment, or zero on any miss.
+/// Operational phase scratch in ITER_SLOT cell 0 (`staging` words).
+/// Words 0..18 carry the attribution tuple from the resolve phases to
+/// the store sibling. Words 18..32 are phase scratch, reused
+/// sequentially and never overlapping live data:
+///
+/// - Phase A stages transient lookup keys at `KEY_SCRATCH` (six words
+///   cover any RelKey-class key) and, after its last lookup, writes
+///   the thirteen-word handoff at `HANDOFF` (words 18..31).
+/// - Phase B first copies the handoff into the tuple words, then
+///   reuses `KEY_SCRATCH` for its own lookup keys; every later read
+///   comes from the tuple, never from the clobbered handoff.
+/// - The store sibling reads the tuple (words 0..18) while scratching
+///   keys in the disjoint upper words (RelKey at `KEY_SCRATCH`,
+///   PartitionKey at `PARTITION_SCRATCH`, words 18..31).
+///
+/// Every phase fully rewrites its scratch before reading. Sequential
+/// reuse on one CPU is sound: BPF runs to completion, so no async user
+/// interleaves, and the VMA join's slot use in `operational_check`
+/// completes (releases) before the first phase runs — the same
+/// discipline the tuple staging already relies on.
+const KEY_SCRATCH: usize = 18;
+const PARTITION_SCRATCH: usize = 18;
+const HANDOFF: usize = 18;
+/// Handoff words: owner_id, owner_handle, continuity, set_id,
+/// evidence, method, definition, site_id, source_epoch, code_object,
+/// operation, function, context.
+const HANDOFF_WORDS: usize = 13;
+const _: () = assert!(HANDOFF + HANDOFF_WORDS <= 32);
+const _: () = assert!(KEY_SCRATCH + 6 <= 32);
+const _: () = assert!(PARTITION_SCRATCH + 13 <= 32);
+
+/// Stage one RelKey-class key (48 bytes) in phase scratch, field by
+/// field so the compiler owns the layout. Returns a lookup pointer.
+/// Each lookup fully rewrites the six words.
+#[inline(always)]
+fn stage_rel_key(
+    slot: *mut osslscope_bpf_contract::source::SourceSlot,
+    process: u64,
+    image: u64,
+    relation: u64,
+    primary: u64,
+    secondary: u64,
+    kind: u32,
+    operation: u32,
+) -> *mut RelKey {
+    unsafe {
+        let staged = (*slot)
+            .staging
+            .as_mut_ptr()
+            .add(KEY_SCRATCH)
+            .cast::<RelKey>();
+        (*staged).process_incarnation = process;
+        (*staged).image_epoch = image;
+        (*staged).relation_epoch = relation;
+        (*staged).primary_handle = primary;
+        (*staged).secondary_handle = secondary;
+        (*staged).kind = kind;
+        (*staged).operation = operation;
+        staged
+    }
+}
+
+/// First operational phase: admission, source authority, committed X
+/// and OWNER at or before the entry snapshot, and tombstones. Stages
+/// the thirteen-word handoff for phase B and returns true, or false on
+/// any miss. Split from phase B so no single frame holds the whole
+/// resolution live range (the 6.9 verifier sums caller frames along
+/// the path against 512 bytes).
 #[inline(never)]
 #[no_mangle]
-pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
+pub fn op_resolve_segment_a(ctx: &ProbeContext, params: &OpParams) -> bool {
     let mut target: Target = unsafe { core::mem::zeroed() };
     if !resolve_inner(params.tgid, params.entry_seq, &mut target) {
-        return 0;
+        return false;
     }
     let Some(admitted) = admission_ptr(params.cookie, &target) else {
-        return 0;
+        return false;
     };
     let (operation, function) = unsafe { ((*admitted).operation, (*admitted).function) };
     let Some(bound) = site_bind_ptr(params.cookie, &target) else {
-        return 0;
+        return false;
     };
     let (site_id, source_epoch, code_object) = unsafe {
         (
@@ -3834,30 +3906,34 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
             (*bound).code_object_id,
         )
     };
-    // SOURCE_READY/guards precede this sibling's own argument read. Exact
-    // CODE_ROLE authority was validated by `operational_check` before this
-    // call in the same non-preemptible run, so no second VMA join is due
-    // here; this guard re-check keeps the sibling self-sufficiently
-    // ordered for any future caller.
+    // SOURCE_READY/guards precede this phase's own argument read. Exact
+    // CODE_ROLE authority was validated by `operational_check` before
+    // this call in the same non-preemptible run, so no second VMA join
+    // is due here; this guard re-check keeps the phase
+    // self-sufficiently ordered for any future caller.
     if !ready_and_guards(params.cookie, source_epoch, target.entry_seq, &target) {
-        return 0;
+        return false;
     }
     let context: u64 = ctx.arg(0).unwrap_or(0);
     if context == 0 {
-        return 0;
+        return false;
     }
-    // Committed X row at or before the entry snapshot, for this family.
-    let index_key = RelKey {
-        process_incarnation: target.process,
-        image_epoch: target.image,
-        relation_epoch: target.relation,
-        primary_handle: context,
-        secondary_handle: 0,
-        kind: REL_X_INDEX,
-        operation: 0,
+    let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
+        return false;
     };
-    let Some(index) = REL.get_ptr_mut(&index_key) else {
-        return 0;
+    // Committed X row at or before the entry snapshot, for this family.
+    let index_key = stage_rel_key(
+        slot,
+        target.process,
+        target.image,
+        target.relation,
+        context,
+        0,
+        REL_X_INDEX,
+        0,
+    );
+    let Some(index) = REL.get_ptr_mut(unsafe { &*index_key }) else {
+        return false;
     };
     let (owner_id, owner_handle, index_family, index_seq, committed) = unsafe {
         (
@@ -3875,20 +3951,21 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
         || index_seq == 0
         || index_seq > target.entry_seq
     {
-        return 0;
+        return false;
     }
     // Owner row: live, same identity, published at or before the snapshot.
-    let owner_key = RelKey {
-        process_incarnation: target.process,
-        image_epoch: target.image,
-        relation_epoch: owner_id,
-        primary_handle: owner_handle,
-        secondary_handle: context,
-        kind: REL_OWNER,
+    let owner_key = stage_rel_key(
+        slot,
+        target.process,
+        target.image,
+        owner_id,
+        owner_handle,
+        context,
+        REL_OWNER,
         operation,
-    };
-    let Some(owner_row) = REL.get_ptr_mut(&owner_key) else {
-        return 0;
+    );
+    let Some(owner_row) = REL.get_ptr_mut(unsafe { &*owner_key }) else {
+        return false;
     };
     let owner_ok = unsafe {
         row_state_is(owner_row, REL_WITNESS)
@@ -3901,37 +3978,116 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
             && (*owner_row).data[7] != 0
     };
     if !owner_ok {
-        return 0;
+        return false;
     }
-    let (continuity, set_id, evidence, method, definition) = unsafe {
+    // Extract the ambiguity method alone for the tombstone checks; the
+    // remaining owner fields are extracted after them so they never
+    // spill across the nested quarantine calls (narrow frame).
+    let method = unsafe { (*owner_row).data[7] };
+    // Tombstones: quarantined contexts and ambiguous methods never certify.
+    let ambiguity = stage_rel_key(
+        slot,
+        target.process,
+        target.image,
+        0,
+        method,
+        0,
+        REL_METHOD_AMBIGUITY,
+        operation,
+    );
+    if quarantined(&target, context, QUARANTINE_CONTEXT_X)
+        || quarantined(&target, owner_handle, QUARANTINE_OWNER_U)
+        || REL.get_ptr_mut(unsafe { &*ambiguity }).is_some()
+    {
+        return false;
+    }
+    // Handoff for phase B (thirteen words); this overwrites the key
+    // scratch above, whose lookups are all complete. Owner fields are
+    // extracted here, after the last nested call, so they stay in
+    // registers on the way to staging.
+    let (continuity, set_id, evidence, definition) = unsafe {
         (
             (*owner_row).data[0],
             (*owner_row).data[2],
             (*owner_row).evidence_epoch,
-            (*owner_row).data[7],
             (*owner_row).data[6],
         )
     };
-    // Tombstones: quarantined contexts and ambiguous methods never certify.
-    if quarantined(&target, context, QUARANTINE_CONTEXT_X)
-        || quarantined(&target, owner_handle, QUARANTINE_OWNER_U)
-        || REL
-            .get_ptr_mut(&ambiguity_key(&target, method, operation))
-            .is_some()
-    {
+    unsafe {
+        let base = (*slot).staging.as_mut_ptr().add(HANDOFF);
+        base.add(0).write(owner_id);
+        base.add(1).write(owner_handle);
+        base.add(2).write(continuity);
+        base.add(3).write(set_id);
+        base.add(4).write(evidence);
+        base.add(5).write(method);
+        base.add(6).write(definition);
+        base.add(7).write(site_id);
+        base.add(8).write(source_epoch);
+        base.add(9).write(code_object);
+        base.add(10).write(u64::from(operation));
+        base.add(11).write(u64::from(function));
+        base.add(12).write(context);
+    }
+    true
+}
+/// Read one phase-handoff word from per-CPU staging.
+#[inline(always)]
+fn handoff_word(slot: *mut osslscope_bpf_contract::source::SourceSlot, word: usize) -> u64 {
+    unsafe { (*slot).staging.as_mut_ptr().add(HANDOFF + word).read() }
+}
+
+/// Second operational phase: prepared selector, safe projection,
+/// digest conflict refusal, and the once-per-tuple segment allocation.
+/// Consumes phase A's handoff with an early copy into the tuple words,
+/// then reuses the handoff words as key scratch; every later read
+/// comes from the tuple, never from the clobbered handoff. Stages the
+/// attribution tuple and returns the nonzero segment, or zero on any
+/// miss.
+#[inline(never)]
+#[no_mangle]
+pub fn op_resolve_segment_b(params: &OpParams) -> u64 {
+    let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
+        return 0;
+    };
+    tuple_store(slot, 0, handoff_word(slot, 0));
+    tuple_store(slot, 1, handoff_word(slot, 1));
+    tuple_store(slot, 2, handoff_word(slot, 2));
+    tuple_store(slot, 3, handoff_word(slot, 3));
+    tuple_store(slot, 4, handoff_word(slot, 4));
+    tuple_store(slot, 5, handoff_word(slot, 5));
+    tuple_store(slot, 6, handoff_word(slot, 6));
+    tuple_store(slot, 9, handoff_word(slot, 7));
+    tuple_store(slot, 10, handoff_word(slot, 8));
+    tuple_store(slot, 11, handoff_word(slot, 9));
+    tuple_store(slot, 12, handoff_word(slot, 10));
+    tuple_store(slot, 13, handoff_word(slot, 11));
+    tuple_store(slot, 17, handoff_word(slot, 12));
+    // From here on every read comes from the tuple; words 18..32 are
+    // transient key scratch.
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if !resolve_inner(params.tgid, params.entry_seq, &mut target) {
+        return 0;
+    }
+    let owner_id = tuple_word(slot, 0);
+    let set_id = tuple_word(slot, 3);
+    let code_object = tuple_word(slot, 11);
+    let operation = tuple_word(slot, 12) as u32;
+    if owner_id == 0 || set_id == 0 || code_object == 0 {
         return 0;
     }
     // This site's prepared selector for the firing code object.
-    let selector_key = RelKey {
-        process_incarnation: target.process,
-        image_epoch: target.image,
-        relation_epoch: owner_id,
-        primary_handle: set_id,
-        secondary_handle: code_object,
-        kind: REL_OWNER_SELECTOR,
+    let selector_key = stage_rel_key(
+        slot,
+        target.process,
+        target.image,
+        owner_id,
+        set_id,
+        code_object,
+        REL_OWNER_SELECTOR,
         operation,
-    };
-    let Some(selector_row) = REL.get_ptr_mut(&selector_key) else {
+    );
+    let Some(selector_row) = REL.get_ptr_mut(unsafe { &*selector_key }) else {
         return 0;
     };
     let (parent, selector, dictionary_epoch, selector_live) = unsafe {
@@ -3945,6 +4101,8 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
     if !selector_live || parent != owner_id || selector == 0 || dictionary_epoch == 0 {
         return 0;
     }
+    tuple_store(slot, 7, selector);
+    tuple_store(slot, 8, dictionary_epoch);
     // Safe dictionary projection: exact object, family, encoding and epoch.
     let Some(control) = control_cell() else {
         return 0;
@@ -3973,10 +4131,14 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
     // Digest conflict refusal: an absent or zeroed digest entry withholds
     // the hit. The index value cannot name our exact relation here, but a
     // recorded collision zeroes it, which this check refuses.
-    if !digest_live(code_object, operation, unsafe { &(*dictionary).digest }) {
+    if !digest_live_staged(slot, code_object, operation, unsafe {
+        &(*dictionary).digest
+    }) {
         return 0;
     }
     // One segment per immutable tuple, allocated once and reused.
+    let site_id = tuple_word(slot, 9);
+    let function = tuple_word(slot, 13) as u32;
     let segment_key = SegmentIndexKey {
         site_id,
         owner_id,
@@ -4011,37 +4173,15 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
             }
         }
     };
-    // Stage the attribution tuple for the store sibling, word by word:
-    // no 144-byte array shares the narrow frame.
-    let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
-        return 0;
-    };
-    unsafe {
-        tuple_store(slot, 0, owner_id);
-        tuple_store(slot, 1, owner_handle);
-        tuple_store(slot, 2, continuity);
-        tuple_store(slot, 3, set_id);
-        tuple_store(slot, 4, evidence);
-        tuple_store(slot, 5, method);
-        tuple_store(slot, 6, definition);
-        tuple_store(slot, 7, selector);
-        tuple_store(slot, 8, dictionary_epoch);
-        tuple_store(slot, 9, site_id);
-        tuple_store(slot, 10, source_epoch);
-        tuple_store(slot, 11, code_object);
-        tuple_store(slot, 12, u64::from(operation));
-        tuple_store(slot, 13, u64::from(function));
-        tuple_store(slot, 14, segment);
-        tuple_store(slot, 15, session);
-        tuple_store(slot, 16, cut_id);
-        tuple_store(slot, 17, context);
-    }
+    tuple_store(slot, 14, segment);
+    tuple_store(slot, 15, session);
+    tuple_store(slot, 16, cut_id);
     segment
 }
 
 /// Store one attribution-tuple word into per-CPU staging.
 #[inline(always)]
-unsafe fn tuple_store(
+fn tuple_store(
     slot: *mut osslscope_bpf_contract::source::SourceSlot,
     index: usize,
     value: u64,
@@ -4058,16 +4198,84 @@ fn tuple_word(slot: *mut osslscope_bpf_contract::source::SourceSlot, index: usiz
 }
 
 /// Digest conflict refusal for one (object, operation, digest) triple:
-/// absent or zeroed entries withhold the hit.
+/// absent or zeroed entries withhold the hit. The key is staged in
+/// phase scratch (six words) so no 48-byte DigestKey shares the
+/// narrow frame.
 #[inline(always)]
-fn digest_live(code_object: u64, operation: u32, digest: &[u8; 32]) -> bool {
-    let key = DigestKey {
-        code_object_id: code_object,
-        operation,
-        reserved: 0,
-        digest: *digest,
-    };
-    matches!(unsafe { DIGEST_INDEX.get(&key).copied() }, Some(value) if value != 0)
+fn digest_live_staged(
+    slot: *mut osslscope_bpf_contract::source::SourceSlot,
+    code_object: u64,
+    operation: u32,
+    digest: &[u8; 32],
+) -> bool {
+    unsafe {
+        let staged = (*slot)
+            .staging
+            .as_mut_ptr()
+            .add(KEY_SCRATCH)
+            .cast::<DigestKey>();
+        (*staged).code_object_id = code_object;
+        (*staged).operation = operation;
+        (*staged).reserved = 0;
+        (*staged).digest = *digest;
+        matches!(DIGEST_INDEX.get(&*staged).copied(), Some(value) if value != 0)
+    }
+}
+
+/// Stage one PartitionKey (104 bytes, thirteen words) in phase
+/// scratch, reading the tuple fields at build time so they are never
+/// live across the freshness lookups. Returns a lookup/insert pointer.
+#[inline(always)]
+fn stage_partition_key(
+    slot: *mut osslscope_bpf_contract::source::SourceSlot,
+    segment: u64,
+    generation: u32,
+    operation: u32,
+    source_epoch: u64,
+) -> Option<*mut PartitionKey> {
+    let session = tuple_word(slot, 15);
+    let cut_id = tuple_word(slot, 16);
+    let site_id = tuple_word(slot, 9);
+    let definition = tuple_word(slot, 6);
+    let continuity = tuple_word(slot, 2);
+    let selector = tuple_word(slot, 7);
+    let dictionary_epoch = tuple_word(slot, 8);
+    let evidence = tuple_word(slot, 4);
+    let function = tuple_word(slot, 13) as u32;
+    if continuity == 0
+        || selector == 0
+        || dictionary_epoch == 0
+        || site_id == 0
+        || session == 0
+        || cut_id == 0
+        || evidence == 0
+    {
+        return None;
+    }
+    unsafe {
+        let staged = (*slot)
+            .staging
+            .as_mut_ptr()
+            .add(PARTITION_SCRATCH)
+            .cast::<PartitionKey>();
+        (*staged).version = VERSION;
+        (*staged).size = 128;
+        (*staged).session_id = session;
+        (*staged).cut_id = cut_id;
+        (*staged).site_id = site_id;
+        (*staged).segment_id = segment;
+        (*staged).provider_definition_object_id = definition;
+        (*staged).provider_continuity_id = continuity;
+        (*staged).selector_id = selector;
+        (*staged).dictionary_epoch = dictionary_epoch;
+        (*staged).relation_epoch = evidence;
+        (*staged).source_epoch = source_epoch;
+        (*staged).count_generation = generation;
+        (*staged).operation = operation;
+        (*staged).function = function;
+        (*staged).selector_encoding = SELECTOR_ENCODING;
+        Some(staged)
+    }
 }
 
 /// Second operational sibling: re-check liveness (committed X, live OWNER,
@@ -4103,16 +4311,17 @@ pub fn op_store_partition(params: &OpParams, segment: u64) -> bool {
     // Freshness: the X row is still committed for this owner, the OWNER row
     // is still live, and the site's source authority still holds. Anything
     // that retired between the siblings refuses the store.
-    let index_key = RelKey {
-        process_incarnation: target.process,
-        image_epoch: target.image,
-        relation_epoch: target.relation,
-        primary_handle: context,
-        secondary_handle: 0,
-        kind: REL_X_INDEX,
-        operation: 0,
-    };
-    let Some(index) = REL.get_ptr_mut(&index_key) else {
+    let index_key = stage_rel_key(
+        slot,
+        target.process,
+        target.image,
+        target.relation,
+        context,
+        0,
+        REL_X_INDEX,
+        0,
+    );
+    let Some(index) = REL.get_ptr_mut(unsafe { &*index_key }) else {
         return false;
     };
     let index_ok = unsafe {
@@ -4126,16 +4335,17 @@ pub fn op_store_partition(params: &OpParams, segment: u64) -> bool {
     if !index_ok {
         return false;
     }
-    let owner_key = RelKey {
-        process_incarnation: target.process,
-        image_epoch: target.image,
-        relation_epoch: owner_id,
-        primary_handle: owner_handle,
-        secondary_handle: context,
-        kind: REL_OWNER,
+    let owner_key = stage_rel_key(
+        slot,
+        target.process,
+        target.image,
+        owner_id,
+        owner_handle,
+        context,
+        REL_OWNER,
         operation,
-    };
-    let Some(owner_row) = REL.get_ptr_mut(&owner_key) else {
+    );
+    let Some(owner_row) = REL.get_ptr_mut(unsafe { &*owner_key }) else {
         return false;
     };
     let owner_ok = unsafe {
@@ -4157,47 +4367,16 @@ pub fn op_store_partition(params: &OpParams, segment: u64) -> bool {
     {
         return false;
     }
-    // The one partition write for this hit, in this same generation. The
-    // remaining key fields are read here, just before the build, so they
-    // are never live across the resolution lookups above.
-    let continuity = tuple_word(slot, 2);
-    let selector = tuple_word(slot, 7);
-    let dictionary_epoch = tuple_word(slot, 8);
-    let site_id = tuple_word(slot, 9);
-    let session = tuple_word(slot, 15);
-    let cut_id = tuple_word(slot, 16);
-    let evidence = tuple_word(slot, 4);
-    let definition = tuple_word(slot, 6);
-    let function = tuple_word(slot, 13) as u32;
-    if continuity == 0
-        || selector == 0
-        || dictionary_epoch == 0
-        || site_id == 0
-        || session == 0
-        || cut_id == 0
-        || evidence == 0
-    {
+    // The one partition write for this hit, in this same generation.
+    // The 104-byte key is staged in phase scratch (disjoint from the
+    // live tuple words); the tuple fields are read at build time so
+    // they are never live across the freshness lookups above.
+    let Some(key) = stage_partition_key(slot, segment, params.generation, operation, source_epoch)
+    else {
         return false;
-    }
-    let key = PartitionKey {
-        version: VERSION,
-        size: 128,
-        session_id: session,
-        cut_id,
-        site_id,
-        segment_id: segment,
-        provider_definition_object_id: definition,
-        provider_continuity_id: continuity,
-        selector_id: selector,
-        dictionary_epoch,
-        relation_epoch: evidence,
-        source_epoch,
-        count_generation: params.generation,
-        operation,
-        function,
-        selector_encoding: SELECTOR_ENCODING,
     };
-    if let Some(slot) = PARTITION.get_ptr_mut(&key) {
+    let key = unsafe { &*key };
+    if let Some(slot) = PARTITION.get_ptr_mut(key) {
         unsafe {
             if (*slot).calls == 0 {
                 (*slot).first_ns = params.now_ns;
@@ -4212,8 +4391,8 @@ pub fn op_store_partition(params: &OpParams, segment: u64) -> bool {
         first_ns: params.now_ns,
         last_ns: params.now_ns,
     };
-    let inserted = PARTITION.insert(&key, &fresh, BPF_NOEXIST).is_ok();
-    if let Some(slot) = PARTITION.get_ptr_mut(&key) {
+    let inserted = PARTITION.insert(key, &fresh, BPF_NOEXIST).is_ok();
+    if let Some(slot) = PARTITION.get_ptr_mut(key) {
         if inserted {
             return true;
         }
@@ -4512,11 +4691,14 @@ fn code_role_key(target: &Target, inode: u64, function: u64, operation: u32) -> 
 }
 
 /// VMA-join one address under the Code policy (exec, not write/shared).
-/// Outlined so the query walk and the callback join share one iterator
-/// slot discipline: acquire, join, release on every path.
-#[inline(never)]
-#[no_mangle]
-pub fn code_vma_join(address: u64, out: &mut source_vma::SourceLocation) -> bool {
+/// Inlined at every site so the callback join stays shallow: the 6.9
+/// verifier sums caller frames along the path (512 B total), and an
+/// outlined join level plus the check level overflow it. Every inlined
+/// copy keeps the same iterator-slot discipline (acquire, join, release
+/// on every path); only `current_source_at` stays outlined, keeping one
+/// set of finite patch sites per root for the loader.
+#[inline(always)]
+fn code_vma_join(address: u64, out: &mut source_vma::SourceLocation) -> bool {
     if address == 0 {
         return false;
     }
@@ -4565,28 +4747,47 @@ fn callback_ip(ctx: &ProbeContext) -> Option<u64> {
     }
 }
 
-/// Copied-role callback join (two-phase binding, phase 2): the firing
+/// Join the firing callback's exact (inode, file offset) identity
+/// through the current-VMA join. Inlined so the identity stays in the
+/// caller's frame for the shallow `code_role_check` call below.
+#[inline(always)]
+fn join_firing_identity(ctx: &ProbeContext) -> Option<(u64, u64)> {
+    let firing = callback_ip(ctx)?;
+    let mut location: source_vma::SourceLocation = unsafe { core::mem::zeroed() };
+    if !code_vma_join(firing, &mut location) || location.inode == 0 {
+        return None;
+    }
+    Some((location.inode, location.file_offset))
+}
+
+/// Copied-role callback check (two-phase binding, phase 2): the firing
 /// cookie's retained registration/source epoch must be live, and the
-/// firing VMA's exact observed inode-and-offset identity must match the
+/// caller-joined exact observed inode-and-offset identity must match the
 /// query-published CODE_ROLE row with code-ABI certification and a
 /// publication sequence at or before the entry snapshot. Phase 1 (query
 /// time) publishes the inode-and-offset identity without any cookie,
 /// which is unknowable then; this phase binds it to the consuming
-/// cookie. Any miss refuses before any operand read. `opfun` packs the
-/// staged admission pair (low 32 = operation, high 32 = function) so the
-/// five-argument call ABI holds.
+/// cookie. Any miss refuses before any operand read.
+///
+/// The caller performs the VMA join first (`join_firing_identity`,
+/// inlined) and passes the joined identity here: splitting the join
+/// from the check keeps the call chain shallow (the 6.9 verifier sums
+/// caller frames along the path against 512 B; a five-deep chain
+/// overflows it). `opfun` packs the staged admission pair (low 32 =
+/// operation, high 32 = function) so the five-argument call ABI holds;
+/// the entry sequence rides `target`.
 #[inline(never)]
 #[no_mangle]
-pub fn code_role_for_callback(
-    ctx: &ProbeContext,
+pub fn code_role_check(
     target: &Target,
     cookie: u64,
+    inode: u64,
+    file_offset: u64,
     opfun: u64,
-    entry_seq: u64,
 ) -> bool {
     let operation = opfun as u32;
     let function = (opfun >> 32) as u32;
-    if code_shape(operation, function).is_none() {
+    if inode == 0 || code_shape(operation, function).is_none() {
         return false;
     }
     // Consuming-cookie binding: the cookie's retained registration and
@@ -4595,17 +4796,10 @@ pub fn code_role_for_callback(
         return false;
     };
     let source_epoch = unsafe { (*bound).source_epoch };
-    if !ready_and_guards(cookie, source_epoch, entry_seq, target) {
+    if !ready_and_guards(cookie, source_epoch, target.entry_seq, target) {
         return false;
     }
-    let Some(firing) = callback_ip(ctx) else {
-        return false;
-    };
-    let mut location: source_vma::SourceLocation = unsafe { core::mem::zeroed() };
-    if !code_vma_join(firing, &mut location) || location.inode == 0 {
-        return false;
-    }
-    let key = code_role_key(target, location.inode, u64::from(function), operation);
+    let key = code_role_key(target, inode, u64::from(function), operation);
     let Some(row) = REL.get_ptr_mut(&key) else {
         return false;
     };
@@ -4615,9 +4809,9 @@ pub fn code_role_for_callback(
             && (*row).evidence_epoch != 0
             && (*row).data[0] == u64::from(operation)
             && (*row).data[1] == u64::from(function)
-            && (*row).data[3] == location.file_offset
+            && (*row).data[3] == file_offset
             && (*row).data[6] != 0
-            && (*row).data[6] <= entry_seq
+            && (*row).data[6] <= target.entry_seq
     }
 }
 
