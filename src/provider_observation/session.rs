@@ -304,7 +304,8 @@ impl Attachment {
 }
 /// Legacy prearm link plan. `Create` attaches the legacy producer links
 /// immediately; `Reserve` mints the cookie and all configuration but creates
-/// no links, leaving the sole required pair to the source-acquisition path.
+/// no links, leaving each attachment's required pair to the
+/// source-acquisition path.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PrearmLinks {
     Create,
@@ -955,9 +956,9 @@ impl ProviderSession {
         (|| {
             // Reserve-only prearm (Enabled source acquisition) mints the
             // cookie and all configuration below but creates no producer
-            // links: the sole required pair is acquired after admission
-            // opens, from this same retained site. The +2 link-budget
-            // check above still reserves capacity for that pair.
+            // links: each attachment's required pair is acquired after
+            // admission opens, from its own retained site. The +2
+            // link-budget check above still reserves capacity for that pair.
             let links = if create_links {
                 paired_links(
                     || {
@@ -1869,7 +1870,7 @@ impl ProviderSession {
                 return_prog,
                 &scope.anchor,
             )?;
-            owner.publish_typed_ready(&registration_scope, &scope.anchor, &registration)?;
+            owner.publish_capability_ready(&registration_scope, &scope.anchor, &registration)?;
             site.revalidate_object()?;
             self.typed_sites.insert(
                 cookie,
@@ -2087,17 +2088,17 @@ impl ProviderSession {
         Ok(())
     }
 
-    /// Verify the caller's claimed acquisition inputs against the single
-    /// retained pre-exec startup attachment and derive the admitted site
-    /// truth: TGID, cookie, file offset, target-file custody (a dup of the
-    /// site's retained descriptor) and the parsed artifact hash. A
-    /// substituted file (different device/inode), offset or PID refuses
-    /// before any kernel effect. Single-startup/single-attachment is a 5A
-    /// scope bound: anything else refuses.
-    fn admitted_source_site(
+    /// Multi-attachment lease admission: every claim in the params must
+    /// match one DISTINCT retained startup attachment of the single
+    /// held process, by PID, file identity (claim-path device/inode vs
+    /// the retained site) and file offset, with a legacy-range cookie
+    /// and no legacy producer links. Exact count: an empty claim set,
+    /// an over/under-claimed order, a recycled PID or a double-matched
+    /// attachment refuses. Returns the admitted sites in claim order.
+    fn admitted_source_sites(
         &self,
         params: &super::source_owner::NativeSourceParams,
-    ) -> Result<super::source_owner::AdmittedSourceSite, ObservationGap> {
+    ) -> Result<Vec<super::source_owner::AdmittedSourceSite>, ObservationGap> {
         if self.startup.len() != 1 {
             return Err(ObservationGap::Invalidated);
         }
@@ -2106,61 +2107,92 @@ impl ProviderSession {
             .iter()
             .next()
             .ok_or(ObservationGap::Invalidated)?;
-        let (tgid, attachments) = (*tgid, attachments.len());
-        if attachments != 1 || params.child_pid() != tgid {
+        let (tgid, attachments) = (*tgid, attachments);
+        let claims = params.claims();
+        if claims.is_empty() || claims.len() != attachments.len() {
             return Err(ObservationGap::Invalidated);
         }
-        let attachment = &self.startup[&tgid][0];
-        // Reserve-only prearm is mandatory: legacy producer links on the
-        // site would duplicate the pair this acquisition creates.
-        if !attachment.links.is_empty() {
+        let mut matched = vec![false; attachments.len()];
+        let mut admitted = Vec::with_capacity(claims.len());
+        for claim in claims {
+            if claim.child_pid() != tgid {
+                return Err(ObservationGap::Invalidated);
+            }
+            let claimed =
+                std::fs::metadata(claim.target()).map_err(|_| ObservationGap::Invalidated)?;
+            if !claimed.is_file() {
+                return Err(ObservationGap::Invalidated);
+            }
+            let mut found = None;
+            for (index, attachment) in attachments.iter().enumerate() {
+                if matched[index]
+                    || claim.link_offset() != attachment.site.file_offset()
+                    || claimed.dev() != attachment.site.native_device()
+                    || claimed.ino() != attachment.site.inode()
+                {
+                    continue;
+                }
+                found = Some(index);
+                break;
+            }
+            let index = found.ok_or(ObservationGap::Invalidated)?;
+            matched[index] = true;
+            let attachment = &attachments[index];
+            // Reserve-only prearm is mandatory: legacy producer links on
+            // the site would duplicate the pair this acquisition creates.
+            if !attachment.links.is_empty() {
+                return Err(ObservationGap::Invalidated);
+            }
+            attachment.site.revalidate_object()?;
+            let cookie = attachment.cookie;
+            if !(1..=4096).contains(&cookie) {
+                return Err(ObservationGap::Invalidated);
+            }
+            let target = File::from(
+                attachment
+                    .site
+                    .attachment_fd()
+                    .try_clone_to_owned()
+                    .map_err(|_| ObservationGap::BackingUnavailable)?,
+            );
+            admitted.push(super::source_owner::AdmittedSourceSite {
+                tgid,
+                site_cookie: cookie,
+                link_offset: attachment.site.file_offset(),
+                target,
+                expected_artifact: attachment.site.object_hash().clone(),
+                device: attachment.site.native_device(),
+                inode: attachment.site.inode(),
+            });
+        }
+        Ok(admitted)
+    }
+
+    fn admitted_source_site(
+        &self,
+        params: &super::source_owner::NativeSourceParams,
+    ) -> Result<super::source_owner::AdmittedSourceSite, ObservationGap> {
+        let mut admitted = self.admitted_source_sites(params)?;
+        if admitted.len() != 1 {
             return Err(ObservationGap::Invalidated);
         }
-        attachment.site.revalidate_object()?;
-        let cookie = attachment.cookie;
-        if !(1..=4096).contains(&cookie) {
-            return Err(ObservationGap::Invalidated);
-        }
-        if params.link_offset() != attachment.site.file_offset() {
-            return Err(ObservationGap::Invalidated);
-        }
-        let claimed =
-            std::fs::metadata(params.target()).map_err(|_| ObservationGap::Invalidated)?;
-        if !claimed.is_file()
-            || claimed.dev() != attachment.site.native_device()
-            || claimed.ino() != attachment.site.inode()
-        {
-            return Err(ObservationGap::Invalidated);
-        }
-        let target = File::from(
-            attachment
-                .site
-                .attachment_fd()
-                .try_clone_to_owned()
-                .map_err(|_| ObservationGap::BackingUnavailable)?,
-        );
-        Ok(super::source_owner::AdmittedSourceSite {
-            tgid,
-            site_cookie: cookie,
-            link_offset: attachment.site.file_offset(),
-            target,
-            expected_artifact: attachment.site.object_hash().clone(),
-        })
+        admitted.pop().ok_or(ObservationGap::Invalidated)
     }
 
     /// Lease-gated post-open source acquisition. Disabled (production):
     /// inert empty receipts, zero effects. Enabled (owned native
     /// qualification): the serialized gate-open, domain-arm, enroll, anchor,
-    /// entry/return and READY flow on this session's single pre-exec startup
-    /// attachment, before the held child is released. File custody, offset,
-    /// cookie and identity derive from the retained admitted site; the
-    /// caller's params are verified against that truth first and never used
-    /// as authority. Typed capabilities join the same order between the
-    /// legacy registration and the terminal legacy READY: every
-    /// capability lists before any READY completes the set, so the held
-    /// child releases only after post-adoption READY published for the
-    /// legacy site and every typed cookie. Any phase failure refuses the
-    /// order before returning.
+    /// entry/return and READY flow on this session's admitted pre-exec
+    /// startup attachments (one order, one shared file anchor, one
+    /// registration per attachment), before the held child is released.
+    /// File custody, offset, cookie and identity derive from the retained
+    /// admitted sites; the caller's params are verified against that truth
+    /// first and never used as authority. Typed capabilities join the same
+    /// order between the legacy registrations and the terminal legacy
+    /// READY: every capability lists before any READY completes the set,
+    /// so the held child releases only after post-adoption READY published
+    /// for every legacy site and every typed cookie. Any phase failure
+    /// refuses the order before returning.
     pub(crate) fn acquire_source_after_open(
         &mut self,
         lease: &super::source_owner::SourceAcquisitionLease,
@@ -2189,6 +2221,7 @@ impl ProviderSession {
                 registration: super::source_owner::RegistrationAdopted { registration_id: 0 },
                 ready_sequence: 0,
                 adopted_links: 0,
+                attachments: Vec::new(),
             });
         };
         if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
@@ -2198,8 +2231,51 @@ impl ProviderSession {
         // Pre-exec startup truth (not post-exec targets): acquisition runs
         // while the child is still held, before release. The claim-vs-truth
         // check runs before any kernel effect: a substituted file, offset
-        // or PID refuses here.
-        let admitted = self.admitted_source_site(params)?;
+        // or PID refuses here. The refusal is recorded so the close
+        // receipts carry the diagnosis instead of silence.
+        // Single-attachment leases clear through the singular guard;
+        // multi-attachment orders through the exact-count plural guard.
+        // Both refuse before any kernel effect.
+        let admission = match params.claims().len() {
+            1 => self.admitted_source_site(params).map(|site| vec![site]),
+            _ => self.admitted_source_sites(params),
+        };
+        let admitted = match admission {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if let Some(owner) = self.source_owner.as_mut() {
+                    owner.note_refusal(format!(
+                        "admission refused: {} claims against {} startup pid groups",
+                        params.claims().len(),
+                        self.startup.len(),
+                    ));
+                    owner.refuse_acquisition();
+                }
+                return Err(error);
+            }
+        };
+        // Single-file order: the adoption order carries one anchor, so
+        // attachments spanning files refuse here, before any kernel
+        // effect. (Real provider closures anchor one file; multi-file
+        // orders need a multi-anchor order, which is future work.)
+        let (device, inode) = (admitted[0].device, admitted[0].inode);
+        if admitted
+            .iter()
+            .any(|a| (a.device, a.inode) != (device, inode))
+        {
+            if let Some(owner) = self.source_owner.as_mut() {
+                let mut backings: Vec<(u64, u64)> =
+                    admitted.iter().map(|a| (a.device, a.inode)).collect();
+                backings.sort_unstable();
+                backings.dedup();
+                owner.note_refusal(format!(
+                    "multi-file order refused: {} distinct backings",
+                    backings.len(),
+                ));
+                owner.refuse_acquisition();
+            }
+            return Err(ObservationGap::Invalidated);
+        }
         let entry_prog = self
             .loaded
             .progs
@@ -2219,19 +2295,21 @@ impl ProviderSession {
         // the source anchor reuses it instead of re-capturing. Selection
         // is by site identity only; the owner re-proves stamp and hash
         // inside and falls back to a fresh capture on any mismatch.
-        let candidate = admitted.target.metadata().ok().and_then(|metadata| {
+        let candidate = admitted[0].target.metadata().ok().and_then(|metadata| {
             let (device, inode) = (metadata.dev(), metadata.ino());
             self.typed_startup.iter().find_map(|staged| {
                 let site = staged.site();
                 (site.native_device() == device
                     && site.inode() == inode
-                    && site.object_hash() == &admitted.expected_artifact)
+                    && site.object_hash() == &admitted[0].expected_artifact)
                     .then(|| staged.anchor().clone())
             })
         });
-        // Gate-open through the legacy registration: the legacy capability
-        // lists first, but its READY publishes only after every typed
-        // capability lists, so one terminal READY completes the whole set.
+        // Gate-open through the legacy registrations: every legacy
+        // capability lists first, but READY publishes only after every
+        // typed capability lists, so one terminal READY completes the
+        // whole set. Any phase failure refuses the order before
+        // returning; multi-attachment failures name their claim.
         let prepared = {
             let owner = self
                 .source_owner
@@ -2240,31 +2318,75 @@ impl ProviderSession {
             let budget = &self.budget;
             (|| {
                 owner.note_gate_open_observed()?;
-                let domain = owner.arm_domain(admitted.tgid)?;
+                let domain = owner.arm_domain(admitted[0].tgid)?;
                 let host_key = owner.enroll_observer()?;
-                let scope = super::source_owner::RequestScope {
-                    site_cookie: admitted.site_cookie,
-                    host_key,
-                    incarnation: domain.incarnation,
-                    planned_image: domain.planned,
-                    link_offset: admitted.link_offset,
-                    target_pid: admitted.tgid,
-                    target: admitted.target,
-                    expected_artifact: admitted.expected_artifact,
+                let mut scopes = Vec::with_capacity(admitted.len());
+                for a in admitted {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || Instant::now() >= deadline
+                    {
+                        return Err(ObservationGap::SnapshotLag);
+                    }
+                    budget.checkpoint()?;
+                    scopes.push(super::source_owner::RequestScope {
+                        site_cookie: a.site_cookie,
+                        host_key,
+                        incarnation: domain.incarnation,
+                        planned_image: domain.planned,
+                        link_offset: a.link_offset,
+                        target_pid: a.tgid,
+                        target: a.target,
+                        expected_artifact: a.expected_artifact,
+                    });
+                }
+                let anchor = match owner.anchor_source(&scopes[0], budget, candidate) {
+                    Ok(anchor) => anchor,
+                    Err(error) => {
+                        if scopes.len() > 1 {
+                            owner.context_last_error(&format!(
+                                "attachment 1/{} cookie {} offset {:#x} anchor",
+                                scopes.len(),
+                                scopes[0].site_cookie,
+                                scopes[0].link_offset,
+                            ));
+                        }
+                        return Err(error);
+                    }
                 };
-                let anchor = owner.anchor_source(&scope, budget, candidate)?;
-                let registration =
-                    owner.register_entry_return(&scope, entry_prog, return_prog, &anchor)?;
+                let mut registrations = Vec::with_capacity(scopes.len());
+                for (index, scope) in scopes.iter().enumerate() {
+                    if cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || Instant::now() >= deadline
+                    {
+                        return Err(ObservationGap::SnapshotLag);
+                    }
+                    budget.checkpoint()?;
+                    match owner.register_entry_return(scope, entry_prog, return_prog, &anchor) {
+                        Ok(registration) => registrations.push(registration),
+                        Err(error) => {
+                            if scopes.len() > 1 {
+                                owner.context_last_error(&format!(
+                                    "attachment {}/{} cookie {} offset {:#x} register",
+                                    index + 1,
+                                    scopes.len(),
+                                    scope.site_cookie,
+                                    scope.link_offset,
+                                ));
+                            }
+                            return Err(error);
+                        }
+                    }
+                }
                 let typed = super::source_owner::TypedAcquisitionScope {
                     anchor,
                     host_key,
                     incarnation: domain.incarnation,
                     planned_image: domain.planned,
                 };
-                Ok((scope, domain, host_key, anchor, registration, typed))
+                Ok((scopes, domain, host_key, anchor, registrations, typed))
             })()
         };
-        let (scope, domain, host_key, anchor, registration, typed) = match prepared {
+        let (scopes, domain, host_key, anchor, registrations, typed) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 if let Some(owner) = self.source_owner.as_mut() {
@@ -2283,26 +2405,69 @@ impl ProviderSession {
             }
             return Err(ObservationGap::AttachFailed);
         }
-        // Terminal legacy READY: completes the full listed set (legacy +
-        // typed). Only now may the held child release.
+        // Terminal legacy READY: the last legacy attachment completes the
+        // full listed set (legacy + typed); earlier legacy attachments
+        // publish per-capability READYs first. Only now may the held
+        // child release.
         let owner = self
             .source_owner
             .as_mut()
             .ok_or(ObservationGap::Invalidated)?;
         let result = (|| {
-            let ready_sequence = owner.publish_ready(&scope, &anchor, &registration)?;
+            let mut sequences = Vec::with_capacity(scopes.len());
+            for (index, (scope, registration)) in
+                scopes.iter().zip(registrations.iter()).enumerate()
+            {
+                let last = index + 1 == scopes.len();
+                let sequence = if last {
+                    owner.publish_ready(scope, &anchor, registration)
+                } else {
+                    owner.publish_capability_ready(scope, &anchor, registration)
+                };
+                let sequence = match sequence {
+                    Ok(sequence) => sequence,
+                    Err(error) => {
+                        if scopes.len() > 1 {
+                            owner.context_last_error(&format!(
+                                "attachment {}/{} cookie {} offset {:#x} ready",
+                                index + 1,
+                                scopes.len(),
+                                scope.site_cookie,
+                                scope.link_offset,
+                            ));
+                        }
+                        return Err(error);
+                    }
+                };
+                sequences.push(sequence);
+            }
             if !owner.acquisition_ready() {
                 return Err(ObservationGap::Invalidated);
             }
+            let first = &scopes[0];
             Ok(super::source_owner::SourceAcquisitionReceipts {
                 host_key,
-                site_cookie: scope.site_cookie,
-                link_offset: scope.link_offset,
+                site_cookie: first.site_cookie,
+                link_offset: first.link_offset,
                 domain,
                 anchor,
-                registration,
-                ready_sequence,
+                registration: registrations[0],
+                ready_sequence: sequences[0],
                 adopted_links: owner.adopted_link_count(),
+                attachments: scopes
+                    .iter()
+                    .zip(registrations.iter())
+                    .zip(sequences.iter())
+                    .map(|((scope, registration), sequence)| {
+                        super::source_owner::AttachmentEstablished {
+                            site_cookie: scope.site_cookie,
+                            link_offset: scope.link_offset,
+                            anchor,
+                            registration: *registration,
+                            ready_sequence: *sequence,
+                        }
+                    })
+                    .collect(),
             })
         })();
         if result.is_err() {
@@ -2358,8 +2523,9 @@ impl ProviderSession {
     /// `Create` prearms the full legacy configuration with its producer
     /// links (production + legacy natives). `Reserve` mints the same
     /// configuration (cookie, config/member rows, API ownership) but creates
-    /// no producer links: the sole required pair is acquired after admission
-    /// opens by the source-acquisition path, from the same retained site.
+    /// no producer links: each attachment's required pair is acquired after
+    /// admission opens by the source-acquisition path, from its own
+    /// retained site.
     /// Enabled source acquisition refuses attachments that already carry
     /// legacy producer links, so the two plans cannot mix on one site.
     pub(crate) fn prearm_startup(
@@ -6274,6 +6440,154 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             admitted_offset,
         }
     }
+    /// U4 dual-API fixture: the query/dispatch shape of
+    /// `source_native_single_typed_fixture` (so discovery still yields
+    /// typed role 130) plus a second legacy export
+    /// (`OSSL_PROVIDER_unquery_operation`), so discovery yields TWO
+    /// legacy API sites in one file. `main` calls both exports and the
+    /// fetch, and exits 0 only on public success.
+    fn source_native_dual_api_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+#include <stddef.h>
+struct dispatch { int id; void (*fn)(void); };
+struct algorithm { const char *names, *properties; const struct dispatch *implementation; const char *description; };
+__attribute__((noinline)) static void implementation(void) { __asm__ volatile(""); }
+static const struct dispatch dispatch[] = { { 70001, implementation }, { 0, 0 } };
+static const struct algorithm algorithms[] = { { "FUTURE-DIGEST", 0, dispatch, 0 }, { 0, 0, 0, 0 } };
+__attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider,int op,int *no_cache) {
+ *no_cache=0;
+ (void)provider; (void)op;
+ return algorithms;
+}
+__attribute__((noinline)) void OSSL_PROVIDER_unquery_operation(const void *provider,int op,const struct algorithm *algs) {
+ (void)provider; (void)op; (void)algs;
+}
+void *EVP_MAC_fetch(void *c,const char *n,const char *p){ (void)n; (void)p; return c; }
+int main(int argc,char **argv) { if(argc!=2) return 2;
+ FILE *f=fopen(argv[1],"w"); if(!f) return 4; fputs("exec\n",f); fclose(f);
+ { int no_cache=-1;
+   if(OSSL_PROVIDER_query_operation((void*)1,1,&no_cache)==0) return 3; }
+ OSSL_PROVIDER_unquery_operation((void*)1,1,algorithms);
+ if(EVP_MAC_fetch((void*)1,"X",0)!=(void*)1) return 3;
+ return 0; }
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O0", "-rdynamic", "-o"])
+                .arg(&app)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        app
+    }
+    struct MultiAttachmentSetup {
+        dir: std::path::PathBuf,
+        app: std::path::PathBuf,
+        child: crate::target::OwnedTarget,
+        cancel: std::sync::atomic::AtomicBool,
+        gate: crate::writer_gate::WriterGate,
+        session: ProviderSession,
+        admitted_offsets: Vec<u64>,
+    }
+    /// U4 setup: dual-API fixture through discovery, open, full prearm
+    /// (both legacy attachments, Reserve) and typed preparation, gate
+    /// opened, child still held. Asserts the two-attachment premise.
+    fn multi_attachment_setup(tag: &str) -> MultiAttachmentSetup {
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-multi-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_dual_api_fixture(&dir);
+        let marker = dir.join("marker");
+        let argv = vec![
+            app.to_string_lossy().into_owned(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
+        assert_eq!(
+            apis.len(),
+            2,
+            "dual-API fixture must yield two legacy sites"
+        );
+        assert_eq!(typed.len(), 1, "dual-API fixture keeps one typed export");
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), 2);
+        let admitted_offsets = session.startup[&pid]
+            .iter()
+            .map(|a| a.site.file_offset())
+            .collect::<Vec<_>>();
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(
+                admitted_offsets
+                    .iter()
+                    .map(|offset| (app.clone(), *offset, pid))
+                    .collect(),
+            ),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        assert_eq!(session.typed_startup.len(), 1);
+        gate.open().unwrap();
+        MultiAttachmentSetup {
+            dir,
+            app,
+            child,
+            cancel,
+            gate,
+            session,
+            admitted_offsets,
+        }
+    }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_entry_registration_withholds_ready_and_operands() {
@@ -6509,6 +6823,468 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         // the typed driver pins at +1 for this flow shape.
         source_native_assert_fds_return(&baseline, &setup.app);
         std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_acquire_registers_every_attachment_under_one_anchor() {
+        // U4: two legacy attachments in one file acquire as one order:
+        // one shared file anchor, one registration per attachment, one
+        // READY per attachment (non-terminal per-capability, terminal
+        // last). Every per-attachment guard stays live through the
+        // final consumers (close retires exactly the listed set).
+        let baseline = source_native_fd_targets();
+        let mut setup = multi_attachment_setup("acquire");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(
+                setup
+                    .admitted_offsets
+                    .iter()
+                    .map(|offset| (setup.app.clone(), *offset, pid))
+                    .collect(),
+            ),
+        );
+        let receipts = setup
+            .session
+            .acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "multi acquire failed: {gap:?} owner: {:?}",
+                    setup.session.source_error()
+                )
+            });
+        assert_eq!(receipts.attachments.len(), 2);
+        assert_eq!(receipts.site_cookie, receipts.attachments[0].site_cookie);
+        assert_eq!(receipts.link_offset, receipts.attachments[0].link_offset);
+        assert_eq!(
+            receipts.attachments[0].link_offset, setup.admitted_offsets[0],
+            "claim order is admission order"
+        );
+        assert_eq!(
+            receipts.attachments[1].link_offset,
+            setup.admitted_offsets[1],
+        );
+        assert_eq!(
+            receipts.attachments[0].anchor.anchor_id, receipts.attachments[1].anchor.anchor_id,
+            "one file, one shared anchor"
+        );
+        assert_ne!(
+            receipts.attachments[0].registration.registration_id,
+            receipts.attachments[1].registration.registration_id,
+            "one registration per attachment"
+        );
+        assert!(
+            receipts.attachments[0].ready_sequence < receipts.attachments[1].ready_sequence,
+            "READY publishes in admission order"
+        );
+        assert_eq!(
+            receipts.adopted_links, 6,
+            "two legacy pairs plus the typed pair"
+        );
+        assert_eq!(setup.session.typed_site_records().len(), 1);
+        // Per-attachment guards live through the final consumers.
+        let owner = setup.session.source_owner.as_ref().expect("source owner");
+        assert_eq!(
+            owner.guard_life_test(receipts.attachments[0].anchor.anchor_id),
+            Some(super::source_acquire::GuardLife::Live)
+        );
+        for attachment in &receipts.attachments {
+            assert_eq!(
+                owner.guard_life_test(attachment.registration.registration_id),
+                Some(super::source_acquire::GuardLife::Live),
+                "cookie {} guard must be live",
+                attachment.site_cookie,
+            );
+        }
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(body) = std::fs::read(&marker) {
+                if body == b"exec\n" {
+                    break;
+                }
+            }
+            assert!(Instant::now() < until, "exec marker never carried exec");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        setup
+            .session
+            .note_source_exec(&lease, pid, receipts.domain.planned)
+            .unwrap();
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert!(close.first_error.is_none());
+        assert!(!close.order_refused, "the completed order must not refuse");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (4, 0, 1),
+            "one anchor plus three registrations retire, none abandoned"
+        );
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        // Discovery ran in the setup helper (its rest dropped on
+        // return), so unlike the inline drivers there is no ghost
+        // handle: teardown releases every fd exactly.
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_typed_refusal_fails_the_order_with_receipts() {
+        // U4 mid-order refusal: both legacy pairs adopt, then the armed
+        // typed ENTRY refuses, so the whole multi-attachment order
+        // refuses (partial authority is worse than none). The close
+        // receipts diagnose the refusal; every adopted per-attachment
+        // link and guard is accounted (retired, none leaked).
+        let mut setup = multi_attachment_setup("refuse");
+        let pid = setup.child.pid();
+        setup
+            .session
+            .source_owner
+            .as_ref()
+            .expect("source owner")
+            .fail_next_typed_entry();
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(
+                setup
+                    .admitted_offsets
+                    .iter()
+                    .map(|offset| (setup.app.clone(), *offset, pid))
+                    .collect(),
+            ),
+        );
+        let error = match setup.session.acquire_source_after_open(
+            &lease,
+            Instant::now() + Duration::from_secs(15),
+            &setup.cancel,
+        ) {
+            Ok(_) => panic!("armed typed ENTRY must refuse the order"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::AttachFailed);
+        assert_eq!(
+            setup
+                .session
+                .source_owner
+                .as_ref()
+                .expect("source owner")
+                .adopted_link_count(),
+            5,
+            "both legacy pairs plus the refused typed ENTRY link adopt"
+        );
+        let diagnosis = setup.session.source_error().expect("refusal diagnosis");
+        assert!(
+            diagnosis.contains("ENTRY") || diagnosis.contains("entry"),
+            "diagnosis names the typed ENTRY refusal: {diagnosis}"
+        );
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.order_refused, "the refused order must refuse");
+        assert!(
+            close.first_error.is_none(),
+            "clean guard retirement carries no close error"
+        );
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (3, 0, 1),
+            "anchor plus two legacy registrations retire, none abandoned"
+        );
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_over_claimed_order_refuses_before_any_effect() {
+        // U4 over-limit: three claims against two retained attachments
+        // refuse at admission, before any kernel effect. The close
+        // receipts carry the admission diagnosis; nothing adopts.
+        let mut setup = multi_attachment_setup("overclaim");
+        let pid = setup.child.pid();
+        let mut triples = setup
+            .admitted_offsets
+            .iter()
+            .map(|offset| (setup.app.clone(), *offset, pid))
+            .collect::<Vec<_>>();
+        triples.push((setup.app.clone(), 0x1234, pid));
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(triples),
+        );
+        let error = match setup.session.acquire_source_after_open(
+            &lease,
+            Instant::now() + Duration::from_secs(15),
+            &setup.cancel,
+        ) {
+            Ok(_) => panic!("over-claimed order must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::Invalidated);
+        assert_eq!(
+            setup
+                .session
+                .source_owner
+                .as_ref()
+                .expect("source owner")
+                .adopted_link_count(),
+            0,
+            "admission refusal adopts nothing"
+        );
+        let diagnosis = setup.session.source_error().expect("refusal diagnosis");
+        assert!(
+            diagnosis.contains("admission refused"),
+            "diagnosis names the admission refusal: {diagnosis}"
+        );
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.order_refused, "the refused order must refuse");
+        assert!(
+            close.first_error.is_none(),
+            "refusal before any effect carries no close error"
+        );
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (0, 0, 0),
+            "refusal before any effect retires nothing"
+        );
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    fn multi_admit(
+        session: &ProviderSession,
+        triples: Vec<(std::path::PathBuf, u64, u32)>,
+    ) -> Result<Vec<super::source_owner::AdmittedSourceSite>, ObservationGap> {
+        session.admitted_source_sites(&super::source_owner::NativeSourceParams::for_test_multi(
+            triples,
+        ))
+    }
+    fn multi_refuses(
+        session: &ProviderSession,
+        triples: Vec<(std::path::PathBuf, u64, u32)>,
+        what: &str,
+    ) {
+        let error = match multi_admit(session, triples) {
+            Ok(_) => panic!("{what} must refuse"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::Invalidated, "{what} gap");
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges"]
+    fn real_openssl_multi_attachment_admission_passes_and_over_limit_refuses() {
+        // U4: the real /usr/bin/openssl closure yields 38 legacy API
+        // attachments in one file; the multi-attachment lease admits
+        // all 38 (exact count, distinct match, legacy-range cookies).
+        // The same session then refuses every over-limit shape: over-
+        // and under-claimed orders, double-matched attachments,
+        // substituted offset/file/PID, empty claims and an out-of-range
+        // cookie. Admission is host-side and pure; privilege here is
+        // setup-only (the BPF load the session harness requires).
+        let baseline = source_native_fd_targets();
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-multi-real-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("abc.txt"), b"abc").unwrap();
+        let argv = vec![
+            "/usr/bin/openssl".to_string(),
+            "mac".to_string(),
+            "-digest".to_string(),
+            "SHA256".to_string(),
+            "-macopt".to_string(),
+            format!("hexkey:{}", "0b".repeat(20)),
+            "-in".to_string(),
+            dir.join("abc.txt").to_string_lossy().into_owned(),
+            "HMAC".to_string(),
+        ];
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        // Bind and release explicitly: pattern-ignored (`..`/`_`) fields
+        // stay in the scrutinee until scope end (past the FD assert
+        // below), which is the per-file ghost handle the typed driver
+        // pins at +1 for its single-file flow.
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            ..
+        } = startup;
+        assert_eq!(typed.len(), 17, "real openssl yields 17 typed exports");
+        drop(typed);
+        drop(candidates);
+        assert_eq!(apis.len(), 38, "real openssl must yield 38 legacy sites");
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), 38);
+        // Claims from the retained attachments themselves (FD-path
+        // targets, no pathname premise); FDs stay alive for the matrix.
+        let mut fds = Vec::new();
+        let mut triples = Vec::new();
+        for attachment in &session.startup[&pid] {
+            let fd = attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .unwrap();
+            triples.push((
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+                attachment.site.file_offset(),
+                pid,
+            ));
+            fds.push(fd);
+        }
+        // Admissions (and their per-claim target dups) scope tightly:
+        // nothing admitted outlives this block.
+        {
+            let admitted = multi_admit(&session, triples.clone()).expect("38 claims must admit");
+            assert_eq!(admitted.len(), 38);
+            assert_eq!(
+                admitted.iter().map(|a| a.site_cookie).collect::<Vec<_>>(),
+                (1..=38u64).collect::<Vec<_>>(),
+                "claim order is admission order, cookies sequential"
+            );
+            for (a, &(_, offset, _)) in admitted.iter().zip(triples.iter()) {
+                assert_eq!(a.link_offset, offset);
+            }
+            assert!(
+                session.startup[&pid].iter().all(|a| a.links.is_empty()),
+                "reserve-only prearm carries no producer links"
+            );
+            let (device, inode) = (admitted[0].device, admitted[0].inode);
+            assert!(
+                admitted
+                    .iter()
+                    .all(|a| (a.device, a.inode) == (device, inode)),
+                "all 38 attachments share one backing file (single-anchor order)"
+            );
+            assert!(
+                admitted
+                    .iter()
+                    .all(|a| a.expected_artifact == admitted[0].expected_artifact),
+                "one file, one artifact hash"
+            );
+            // Over-limit matrix: every shape refuses.
+            let mut over = triples.clone();
+            over.push((over[0].0.clone(), 0x1234, pid));
+            multi_refuses(&session, over, "over-claimed");
+            let mut under = triples.clone();
+            under.pop();
+            multi_refuses(&session, under, "under-claimed");
+            let mut dup = triples.clone();
+            dup[37] = dup[0].clone();
+            multi_refuses(&session, dup, "double-matched");
+            let mut offset = triples.clone();
+            offset[0].1 += 1;
+            multi_refuses(&session, offset, "substituted offset");
+            let mut file = triples.clone();
+            file[0].0 = std::path::PathBuf::from("/bin/true");
+            multi_refuses(&session, file, "substituted file");
+            let mut recycled = triples.clone();
+            recycled[0].2 += 1;
+            multi_refuses(&session, recycled, "recycled pid");
+            multi_refuses(&session, Vec::new(), "empty claims");
+        }
+        session.startup.get_mut(&pid).unwrap()[0].cookie = 5000;
+        multi_refuses(&session, triples.clone(), "out-of-range cookie");
+        session.startup.get_mut(&pid).unwrap()[0].cookie = 1;
+        assert_eq!(
+            multi_admit(&session, triples.clone())
+                .expect("restored cookie admits")
+                .len(),
+            38
+        );
+        drop(fds);
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while child.peek_exit().unwrap().is_none() && Instant::now() < until {
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0));
+        drop(session);
+        drop(gate);
+        drop(child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "admission-only flow must release every fd"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]

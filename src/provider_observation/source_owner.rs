@@ -252,10 +252,28 @@ pub(crate) enum SourceAcquisitionLease {
 /// by construction rather than by convention. Production code reads claimed
 /// inputs through the accessors below (claim-vs-truth verification) but can
 /// never mint the claims themselves.
-pub(crate) struct NativeSourceParams {
+/// One claimed attachment: the caller's (target, offset, pid) triple,
+/// verified against one distinct retained startup attachment.
+pub(crate) struct NativeSourceClaim {
     target: std::path::PathBuf,
     link_offset: u64,
     child_pid: u32,
+}
+
+impl NativeSourceClaim {
+    pub(crate) fn target(&self) -> &std::path::Path {
+        &self.target
+    }
+    pub(crate) fn link_offset(&self) -> u64 {
+        self.link_offset
+    }
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+}
+
+pub(crate) struct NativeSourceParams {
+    claims: Vec<NativeSourceClaim>,
 }
 
 impl NativeSourceParams {
@@ -265,19 +283,32 @@ impl NativeSourceParams {
     #[cfg(test)]
     pub(crate) fn for_test(target: std::path::PathBuf, link_offset: u64, child_pid: u32) -> Self {
         Self {
-            target,
-            link_offset,
-            child_pid,
+            claims: vec![NativeSourceClaim {
+                target,
+                link_offset,
+                child_pid,
+            }],
         }
     }
-    pub(crate) fn target(&self) -> &std::path::Path {
-        &self.target
+    /// Test-only multi-attachment claim constructor: one triple per
+    /// claimed attachment, matched in order against distinct retained
+    /// startup attachments. Exact count: over/under-claimed orders
+    /// refuse.
+    #[cfg(test)]
+    pub(crate) fn for_test_multi(claims: Vec<(std::path::PathBuf, u64, u32)>) -> Self {
+        Self {
+            claims: claims
+                .into_iter()
+                .map(|(target, link_offset, child_pid)| NativeSourceClaim {
+                    target,
+                    link_offset,
+                    child_pid,
+                })
+                .collect(),
+        }
     }
-    pub(crate) fn link_offset(&self) -> u64 {
-        self.link_offset
-    }
-    pub(crate) fn child_pid(&self) -> u32 {
-        self.child_pid
+    pub(crate) fn claims(&self) -> &[NativeSourceClaim] {
+        &self.claims
     }
 }
 
@@ -367,8 +398,22 @@ pub(crate) struct AnchorEstablished {
 }
 
 /// Registration identity adopted for one acquisition.
+#[derive(Clone, Copy)]
 pub(crate) struct RegistrationAdopted {
     pub registration_id: u64,
+}
+
+/// Per-attachment establishment within a multi-attachment order, in
+/// admission (claim) order: each attachment's cookie, offset, shared
+/// file anchor, own registration and own READY sequence. Field reads
+/// happen in the native qualification that consumes these receipts.
+#[allow(dead_code)]
+pub(crate) struct AttachmentEstablished {
+    pub site_cookie: u64,
+    pub link_offset: u64,
+    pub anchor: AnchorEstablished,
+    pub registration: RegistrationAdopted,
+    pub ready_sequence: u64,
 }
 
 /// Structural receipts for one complete acquisition: every identity the
@@ -384,6 +429,10 @@ pub(crate) struct SourceAcquisitionReceipts {
     pub registration: RegistrationAdopted,
     pub ready_sequence: u64,
     pub adopted_links: usize,
+    /// Every legacy attachment the order established, in admission
+    /// order. The scalar fields above repeat the first attachment's
+    /// (they are the whole order for single-attachment leases).
+    pub attachments: Vec<AttachmentEstablished>,
 }
 
 /// Structural receipts for the explicit source close.
@@ -634,6 +683,11 @@ pub(super) struct AdmittedSourceSite {
     pub link_offset: u64,
     pub target: File,
     pub expected_artifact: ObjectHash,
+    /// Backing identity the admission check proved (claim path
+    /// device/inode equal the retained site's): the order groups
+    /// attachments by file without re-statting.
+    pub device: u64,
+    pub inode: u64,
 }
 
 /// Request scope threaded through one acquisition's phases: the admitted
@@ -1173,6 +1227,21 @@ impl SourceOwner {
     pub(super) fn take_last_error(&mut self) -> Option<String> {
         self._last_error.take()
     }
+    /// Record an order-level refusal that fired before any owner effect
+    /// (admission or order assembly): the close receipts then carry the
+    /// refusal diagnosis instead of silence. Overwrites any stale slot:
+    /// the latest refusal is the last error.
+    pub(super) fn note_refusal(&mut self, detail: String) {
+        self._last_error = Some(detail);
+    }
+    /// Prefix the pending refusal diagnosis with order context (which
+    /// multi-attachment claim failed, and where). No-op when no
+    /// diagnosis is pending: never invents one.
+    pub(super) fn context_last_error(&mut self, context: &str) {
+        if let Some(prior) = self._last_error.take() {
+            self._last_error = Some(format!("{context}: {prior}"));
+        }
+    }
     /// Arm the target domain for one held pre-exec child. The TGID must be
     /// stopped (procfs state T) at arm time; the test retains pidfd custody
     /// across the acquisition so the TGID cannot be recycled underneath.
@@ -1593,9 +1662,10 @@ impl SourceOwner {
     /// provisional trigger, and consume the READY receipt for the STORED
     /// registration. Returns the READY publication sequence. Terminal: the
     /// full listed capability set must be READY before the held child may
-    /// release, so this refuses unless the order completes here. Typed
-    /// capabilities publish through `publish_typed_ready` before this runs:
-    /// every capability lists before any READY completes the set.
+    /// release, so this refuses unless the order completes here. All
+    /// other capabilities publish through `publish_capability_ready`
+    /// before this runs: every capability lists before any READY
+    /// completes the set.
     pub(super) fn publish_ready(
         &mut self,
         scope: &RequestScope,
@@ -1608,12 +1678,13 @@ impl SourceOwner {
         }
         Ok(sequence)
     }
-    /// Publish post-adoption READY for one typed cookie: the same
-    /// contracted kernel phase-4 publication as `publish_ready`, without
-    /// the terminal release check. The caller publishes every listed
+    /// Publish post-adoption READY for one listed capability (typed
+    /// cookie or non-terminal legacy attachment): the same contracted
+    /// kernel phase-4 publication as `publish_ready`, without the
+    /// terminal release check. The caller publishes every listed
     /// capability and checks `acquisition_ready` before releasing the
     /// held child; a partial set never releases.
-    pub(super) fn publish_typed_ready(
+    pub(super) fn publish_capability_ready(
         &mut self,
         scope: &RequestScope,
         anchor: &AnchorEstablished,
@@ -1624,7 +1695,7 @@ impl SourceOwner {
     /// One phase-4 publication for the STORED registration: arm the
     /// request, fire one provisional trigger, consume the READY receipt.
     /// Shared by the terminal legacy publisher and the per-capability
-    /// typed publisher; only the release check differs.
+    /// publisher; only the release check differs.
     fn publish_ready_inner(
         &mut self,
         scope: &RequestScope,
@@ -1905,15 +1976,27 @@ mod tests {
     use super::*;
     #[test]
     fn native_claims_round_trip_through_the_test_only_constructor() {
-        // The sole `NativeSourceParams` constructor is `#[cfg(test)]`, so
+        // The sole `NativeSourceParams` constructors are `#[cfg(test)]`, so
         // non-test builds cannot mint the claims that `Enabled` wraps; the
         // clean non-test `cargo check` on this commit is the proof. The
         // accessors below are the production claim-vs-truth read path.
         let params =
             NativeSourceParams::for_test(std::path::PathBuf::from("/owned/fixture"), 0x11b4, 4242);
-        assert_eq!(params.target(), std::path::Path::new("/owned/fixture"));
-        assert_eq!(params.link_offset(), 0x11b4);
-        assert_eq!(params.child_pid(), 4242);
+        assert_eq!(params.claims().len(), 1);
+        assert_eq!(
+            params.claims()[0].target(),
+            std::path::Path::new("/owned/fixture")
+        );
+        assert_eq!(params.claims()[0].link_offset(), 0x11b4);
+        assert_eq!(params.claims()[0].child_pid(), 4242);
+        let multi = NativeSourceParams::for_test_multi(vec![
+            (std::path::PathBuf::from("/owned/a"), 0x1000, 111),
+            (std::path::PathBuf::from("/owned/b"), 0x2000, 111),
+        ]);
+        assert_eq!(multi.claims().len(), 2);
+        assert_eq!(multi.claims()[1].target(), std::path::Path::new("/owned/b"));
+        assert_eq!(multi.claims()[1].link_offset(), 0x2000);
+        assert_eq!(multi.claims()[1].child_pid(), 111);
     }
     #[test]
     fn producer_map_tables_share_single_source_shapes() {
@@ -2206,6 +2289,28 @@ mod tests {
         );
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_file(&_other_path).unwrap();
+    }
+    #[test]
+    fn refusal_notes_carry_order_diagnosis_and_context_prefixes_pending() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        // Context with no pending diagnosis: no invention.
+        owner.context_last_error("attachment 2/2 cookie 2 offset 0x0 register");
+        assert_eq!(owner.take_last_error(), None);
+        // A pre-effect refusal records its diagnosis for the close
+        // receipts; a later context prefixes it with claim identity.
+        owner.note_refusal("admission refused: 3 claims against 1 startup pid groups".into());
+        owner.context_last_error("attachment 3/3 cookie 0 offset 0x0 admit");
+        assert_eq!(
+            owner.take_last_error().as_deref(),
+            Some(
+                "attachment 3/3 cookie 0 offset 0x0 admit: admission refused: 3 claims against 1 startup pid groups"
+            ),
+        );
+        // The slot is single: a newer refusal overwrites stale content.
+        owner.note_refusal("first".into());
+        owner.note_refusal("second".into());
+        assert_eq!(owner.take_last_error().as_deref(), Some("second"));
     }
     #[test]
     fn anchor_source_truncation_returns_gap_never_faults() {
