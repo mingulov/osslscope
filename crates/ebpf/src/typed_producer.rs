@@ -3759,10 +3759,6 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
     if !matches!(role, 304 | 305 | 306 | 307 | 308) {
         return false;
     }
-    let opfun = (u64::from(function) << 32) | u64::from(operation);
-    if !code_role_for_callback(ctx, &target, opfun, target.entry_seq) {
-        return false;
-    }
     let context: u64 = ctx.arg(0).unwrap_or(0);
     if context == 0 {
         return false;
@@ -3771,7 +3767,14 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
         // KDF reset retires its dependent owner before the target body.
         // Retirement is fail-closed, so it needs admission but not source
         // authority: an authority lapse must still retire, never certify.
+        // This retire sits above the CODE_ROLE join (admission-only):
+        // placing it below would narrow retirement to authorized sites,
+        // letting a pre-reset owner survive an authority lapse.
         retire_owner_reachable(&target, REL_X_INDEX, context);
+        return false;
+    }
+    let opfun = (u64::from(function) << 32) | u64::from(operation);
+    if !code_role_for_callback(ctx, &target, opfun, target.entry_seq) {
         return false;
     }
     let segment = op_resolve_segment(ctx, params);
