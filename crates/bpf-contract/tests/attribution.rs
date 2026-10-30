@@ -319,3 +319,20 @@ fn typed_role_has_separate_identity_and_exact_public_exports() {
     assert!(TypedAdmission::new(5, 5, 0, 0, 1, 1).is_some());
     assert!(TypedAdmission::new(18, 0, 0, 0, 1, 1).is_some());
 }
+#[test]
+fn copied_and_operational_roles_have_no_public_export_or_staging_path() {
+    // P3-I2 permanent-negative premise: copied callback roles (258/259
+    // constructors, 274/275/290/291 lifecycle) and operational roles
+    // (304-308) have no public export names, so no host staging path can
+    // name them — constructor/operational staging (phase-2 U1) must arrive
+    // before any owner can commit or any partition can assign. H2/H3 pin
+    // the resulting definite=0 from the fail-closed side; this pins the
+    // structural reason those pins must never flip without U1.
+    for role in [258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308] {
+        assert_eq!(
+            TypedRoleId::from_u32(role).unwrap().public_export(),
+            None,
+            "role {role} must have no public export"
+        );
+    }
+}

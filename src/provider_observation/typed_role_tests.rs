@@ -60,6 +60,23 @@ fn exact_typed_public_exports_are_independent_from_legacy_event_roles() {
     assert_eq!(object.exports[0].0.export_name(), Some("EVP_MAC_fetch"));
 }
 #[test]
+fn typed_public_roles_stage_first_slice_exports_only() {
+    // P3-I2 permanent-negative premise: the host stages exactly the 17
+    // first-slice public roles and nothing at or above the copied-role
+    // boundary (256+), so constructor/operational callbacks are
+    // unreachable before phase-2 U1 staging lands. H2/H3 pin the
+    // resulting definite=0 from the fail-closed side; this pins the
+    // table those pins stand on.
+    assert_eq!(
+        TYPED_PUBLIC_ROLES,
+        [
+            5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155
+        ]
+    );
+    assert_eq!(TYPED_PUBLIC_ROLES.len(), TYPED_PUBLIC_ROLE_COUNT);
+    assert!(TYPED_PUBLIC_ROLES.iter().all(|role| *role < 256));
+}
+#[test]
 fn shared_code_conflicting_typed_roles_refuses_both_and_retains_other_facts() {
     let object = PublicExports::new(true).parsed();
     let roles: Vec<_> = object
