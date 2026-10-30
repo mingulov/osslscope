@@ -356,13 +356,14 @@ mod tests {
     }
 
     fn record(kind: u32, pid: u32, tid: u32, invocation: u64) -> c::Record {
-        let mut record = c::Record::default();
-        record.kind = kind;
-        record.api = c::PUBLIC_QUERY;
-        record.pid = pid;
-        record.tid = tid;
-        record.invocation = invocation;
-        record
+        c::Record {
+            kind,
+            api: c::PUBLIC_QUERY,
+            pid,
+            tid,
+            invocation,
+            ..c::Record::default()
+        }
     }
 
     fn query(pid: u32, tid: u32, invocation: u64, op: u32, outcome: u32, cache: u32) -> c::Record {
@@ -463,7 +464,7 @@ mod tests {
     }
 
     fn hash(byte: u8) -> ObjectHash {
-        ObjectHash::try_from(format!("{:02x}", byte).repeat(32)).unwrap()
+        ObjectHash::try_from(format!("{byte:02x}").repeat(32)).unwrap()
     }
 
     #[test]
