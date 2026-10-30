@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! One-hop public query ABI derivation from the retained ELF, never target memory.
+//! One-hop public ABI derivation from the retained ELF, never target memory.
 use super::{
-    ObservationApi, ObservationBudget, ObservationGap, Segment, bytes, export_api_at, word,
+    ObservationApi, ObservationBudget, ObservationGap, Segment, TypedRoleId, bytes, export_api_at,
+    word,
 };
 use std::fs::File;
 
@@ -52,6 +53,15 @@ pub(super) const APIS: [ObservationApi; 2] = [
     ObservationApi::Inventoried(crate::inventory::Api::OsslProviderQueryOperation),
     ObservationApi::OsslProviderUnqueryOperation,
 ];
+
+/// What a derivation resolves: a legacy public API (matched through the
+/// finite legacy spelling table) or a typed role's own public export name
+/// (matched byte-exact, claiming no legacy identity).
+#[derive(Clone, Copy)]
+enum ResolutionSubject<'a> {
+    Legacy(ObservationApi),
+    Typed(&'a str),
+}
 
 pub(super) struct Context<'a> {
     pub file: &'a File,
@@ -109,9 +119,42 @@ impl Context<'_> {
         entry: u64,
         exports: &[(ObservationApi, u64)],
     ) -> Result<Option<u64>, ObservationGap> {
+        self.resolve_inner(ResolutionSubject::Legacy(api), entry, exports)
+    }
+
+    /// Typed-role derivation: the same one-hop stub analysis keyed by the
+    /// role's own public export name instead of a legacy API identity, with
+    /// its own full scans and budget charges. A role without a public
+    /// export, or any legacy export at the entry or the target, refuses
+    /// (fail closed).
+    pub(super) fn resolve_typed(
+        &self,
+        role: TypedRoleId,
+        entry: u64,
+        exports: &[(ObservationApi, u64)],
+    ) -> Result<Option<u64>, ObservationGap> {
+        let Some(name) = role.public_export() else {
+            return Ok(None);
+        };
+        self.resolve_inner(ResolutionSubject::Typed(name), entry, exports)
+    }
+
+    fn resolve_inner(
+        &self,
+        subject: ResolutionSubject<'_>,
+        entry: u64,
+        exports: &[(ObservationApi, u64)],
+    ) -> Result<Option<u64>, ObservationGap> {
+        // A typed derivation claims no legacy identity, so any legacy
+        // export at the entry refuses; the legacy self-exclusion is
+        // unchanged.
+        let legacy = match subject {
+            ResolutionSubject::Legacy(api) => Some(api),
+            ResolutionSubject::Typed(_) => None,
+        };
         if exports
             .iter()
-            .any(|(other, at)| *other != api && *at == entry)
+            .any(|(other, at)| Some(*other) != legacy && *at == entry)
         {
             return Ok(None);
         }
@@ -124,7 +167,20 @@ impl Context<'_> {
                 continue;
             }
             let name = word(symbol, 0, 4)? as usize;
-            if export_api_at(|i| self.names.get(name.checked_add(i)?).copied()) != Some(api) {
+            let matched = match subject {
+                ResolutionSubject::Legacy(api) => {
+                    export_api_at(|i| self.names.get(name.checked_add(i)?).copied()) == Some(api)
+                }
+                ResolutionSubject::Typed(want) => want
+                    .bytes()
+                    .chain(std::iter::once(0))
+                    .enumerate()
+                    .all(|(index, byte)| {
+                        name.checked_add(index)
+                            .is_some_and(|at| self.names.get(at).copied() == Some(byte))
+                    }),
+            };
+            if !matched {
                 continue;
             }
             let address = word(symbol, 8, 8)?;
@@ -167,7 +223,7 @@ impl Context<'_> {
         };
         if exports
             .iter()
-            .any(|(other, at)| *other != api && *at == offset)
+            .any(|(other, at)| Some(*other) != legacy && *at == offset)
         {
             return Ok(None);
         }

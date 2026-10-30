@@ -1923,6 +1923,41 @@ fn parse_exports(
                     }
                 }
             }
+            // Role 146 (OSSL_PROVIDER_get0_provider_ctx) stages through
+            // its OWN resolve: no legacy API derives its symbol (its
+            // admission api is 0, which wire::api rejects), so 161-style
+            // inheritance is impossible. The arch gate (this x86_64
+            // block), the raw-entry conflict gate, and every in-resolve
+            // refusal apply exactly as for legacy, with fresh budget
+            // charges. A destination shared with a derived legacy entry
+            // keeps the validated raw entry (the shared-destination
+            // analogue: different public signatures must not share one
+            // derived entry); anything else keeps raw too (fail closed).
+            // Typed-vs-typed destination collisions stay with the
+            // post-derivation arbitration below, the designated
+            // typed-vs-typed mechanism. Only 146 derives here; the
+            // families stage owns any wider rollout.
+            let mut getctx_destination = None;
+            for &(role, offset) in &typed {
+                if role.id() != 146 {
+                    continue;
+                }
+                let Some(offset) = offset else {
+                    continue;
+                };
+                if typed_conflicts.contains(&offset) {
+                    continue;
+                }
+                let destination = context.resolve_typed(role, offset, &exports)?;
+                if destination.is_some_and(|destination| {
+                    destinations
+                        .into_iter()
+                        .flatten()
+                        .all(|derived| derived != destination)
+                }) {
+                    getctx_destination = destination.map(|destination| (role, destination));
+                }
+            }
             for (api, destination) in forwarder::APIS.into_iter().zip(destinations) {
                 if let Some(destination) = destination {
                     if let Some((_, offset)) = exports.iter_mut().find(|(found, _)| *found == api) {
@@ -1932,6 +1967,11 @@ fn parse_exports(
             }
             for (role, destination) in query_destinations {
                 if let Some((_, offset)) = query.iter_mut().find(|(found, _)| *found == role) {
+                    *offset = Some(destination);
+                }
+            }
+            if let Some((role, destination)) = getctx_destination {
+                if let Some((_, offset)) = typed.iter_mut().find(|(found, _)| *found == role) {
                     *offset = Some(destination);
                 }
             }
