@@ -4200,21 +4200,28 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// via exit 0. Returns count-only receipts for the control asserts.
     /// U1 extends it with an optional copied plan (None preserves the
     /// H1/H2/H3 behavior verbatim) and a marker filename so two passes
-    /// can share one fixture directory.
+    /// can share one fixture directory. The I2 control adds an optional
+    /// third argv word (None preserves every existing receipt verbatim);
+    /// the complete-chain fixture gates its live-table mutation, direct
+    /// reset call and second derive on `argc > 2`.
     fn drive_typed_session_with_counter(
         tag: &str,
         app: &std::path::Path,
         count_roles: &[u32],
         plan: Option<&super::copied_plan::CopiedPlan>,
         marker_name: &str,
+        extra_arg: Option<&str>,
     ) -> TypedCounterDrive {
         use crate::capture::ClockPort as _;
         let dir = app.parent().unwrap().to_path_buf();
         let marker = dir.join(marker_name);
-        let argv = [
+        let mut argv = vec![
             app.to_string_lossy().into_owned(),
             marker.to_string_lossy().into_owned(),
         ];
+        if let Some(extra) = extra_arg {
+            argv.push(extra.to_owned());
+        }
         let mut child =
             crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
                 .unwrap();
@@ -4547,7 +4554,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
         let dir = std::env::temp_dir().join(format!("osslscope-typed-h1-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
         let app = source_native_fixture(&dir);
-        let drive = drive_typed_session_with_counter("h1", &app, &[130], None, "marker");
+        let drive = drive_typed_session_with_counter("h1", &app, &[130], None, "marker", None);
         assert_eq!(drive.typed_sites, 4, "fixture yields four typed sites");
         assert_eq!(drive.counter_links, 1, "counter attaches the fetch site");
         assert_eq!(drive.joined_sites, 1, "the fetch hit must join");
@@ -4587,7 +4594,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
  void *u=EVP_MAC_CTX_new(m); if(!u) return 3;
 "#,
         );
-        let drive = drive_typed_session_with_counter("h2", &app, &[130, 147], None, "marker");
+        let drive = drive_typed_session_with_counter("h2", &app, &[130, 147], None, "marker", None);
         assert_eq!(
             drive.typed_sites, 5,
             "chain fixture yields five typed sites"
@@ -4637,7 +4644,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
  void *u=EVP_MAC_CTX_new(c); if(!u) return 3;
 "#,
         );
-        let drive = drive_typed_session_with_counter("h3", &app, &[130, 147], None, "marker");
+        let drive = drive_typed_session_with_counter("h3", &app, &[130, 147], None, "marker", None);
         assert_eq!(
             drive.typed_sites, 5,
             "chain fixture yields five typed sites"
@@ -4708,11 +4715,23 @@ static const struct dispatch kdf_dispatch[] = {
  { 4, (void(*)(void))test_kdf_reset }, { 5, (void(*)(void))test_kdf_derive }, { 0, 0 } };
 static const struct algorithm mac_algorithms[] = { { "FAKE-MAC", 0, mac_dispatch, "fake mac" }, { 0, 0, 0, 0 } };
 static const struct algorithm kdf_algorithms[] = { { "FAKE-KDF", 0, kdf_dispatch, "fake kdf" }, { 0, 0, 0, 0 } };
+static int g_mutate_kdf_table = 0;
+static struct dispatch kdf_live_dispatch[6];
+static struct algorithm kdf_live_algorithms[2];
 __attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider, int op, int *no_cache) {
  (void)provider;
  *no_cache = 0;
  if (op == 3) return mac_algorithms;
- if (op == 4) return kdf_algorithms;
+ if (op == 4) {
+  if (!g_mutate_kdf_table) return kdf_algorithms;
+  for (int i = 0; i < 6; i++) kdf_live_dispatch[i] = kdf_dispatch[i];
+  kdf_live_dispatch[3] = kdf_live_dispatch[4];
+  kdf_live_algorithms[0].names = "FAKE-KDF"; kdf_live_algorithms[0].properties = 0;
+  kdf_live_algorithms[0].implementation = kdf_live_dispatch; kdf_live_algorithms[0].description = "fake kdf";
+  kdf_live_algorithms[1].names = 0; kdf_live_algorithms[1].properties = 0;
+  kdf_live_algorithms[1].implementation = 0; kdf_live_algorithms[1].description = 0;
+  return kdf_live_algorithms;
+ }
  return 0;
 }
 static void *fake_libctx; static void *fake_mac_method; static void *fake_kdf_method; static void *fake_provider;
@@ -4757,10 +4776,11 @@ int test_mac_final_call(void *u, void *out) { return test_mac_final(((FAKE_CTX *
 int test_kdf_derive_call(void *u, void *out, unsigned long len) { return test_kdf_derive(((FAKE_CTX *)u)->data, out, len); }
 void OPENSSL_cleanup(void) { __asm__ volatile(""); }
 int main(int argc, char **argv) {
- if (argc != 2) return 2;
+ if (argc < 2 || argc > 3) return 2;
  FILE *f = fopen(argv[1], "w"); if (!f) return 4; fputs("exec\n", f); fclose(f);
  fake_libctx = malloc(16); fake_mac_method = malloc(16); fake_kdf_method = malloc(16); fake_provider = malloc(16);
  if (!fake_libctx || !fake_mac_method || !fake_kdf_method || !fake_provider) return 5;
+ g_mutate_kdf_table = (argc > 2);
  int nc = -1;
  if (OSSL_PROVIDER_query_operation(fake_provider, 3, &nc) == 0 || nc != 0) return 3;
  nc = -1;
@@ -4777,7 +4797,8 @@ int main(int argc, char **argv) {
  if (test_mac_final_call(u, out) != 1 || out[0] != 0xC3) return 3;
  unsigned char kout[32];
  if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3;
- EVP_KDF_CTX_reset(ku);
+ if (argc > 2) test_kdf_reset(((FAKE_CTX *)ku)->data); else EVP_KDF_CTX_reset(ku);
+ if (argc > 2) { if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3; }
  EVP_MAC_CTX_free(u2); EVP_MAC_CTX_free(u); EVP_KDF_CTX_free(ku2); EVP_KDF_CTX_free(ku);
  EVP_MAC_free(m); EVP_KDF_free(k);
  OPENSSL_cleanup();
@@ -4959,6 +4980,7 @@ int main(int argc, char **argv) {
             &[258, 259, 274, 275, 290, 291],
             Some(&plan),
             "marker2",
+            None,
         );
         assert_eq!(
             drive.staged_roles,
@@ -5031,6 +5053,7 @@ int main(int argc, char **argv) {
             &[304, 305, 306, 307, 308],
             Some(&plan),
             "marker2",
+            None,
         );
         assert_eq!(
             drive.staged_roles,
@@ -5068,6 +5091,100 @@ int main(int argc, char **argv) {
         assert_eq!(
             drive.next_producer_id, 49,
             "U1's 44 mints plus 4 operational segment allocs, counter starts at 1"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
+        );
+    }
+    /// I2 retire-on-absent-CODE_ROLE control: pass 1 runs the fixture
+    /// normally so the plan stages all 11 copied sites including the 308
+    /// reset; pass 2 runs the same binary with a third argv word, which
+    /// (a) drops fun 4 from the LIVE KDF dispatch table (a duplicate fun
+    /// 5 overwrites it, so the query walk publishes every CODE_ROLE row
+    /// except (4,4) while static staging still matches all 11 sites),
+    /// (b) invokes the reset callback directly, bypassing the
+    /// first-slice wrapper retire (153) so the copied-site retire is the
+    /// sole invalidator, and (c) derives a second time on the same
+    /// pre-reset X after the reset. The first derive partitions (all
+    /// static premises hold); nothing fires between it and the second
+    /// derive except the unauthorized 308. So the second derive's
+    /// refusal pins the fail-closed direction causally: 308 retired the
+    /// shared X with no CODE_ROLE row, and 308's own hit never
+    /// partitions. Against pre-fix objects this fails on unresolved
+    /// (2, not 3): the lapsed 308 refuses without retiring, the second
+    /// derive joins the 307 partition, and only the reset hit plus the
+    /// poison stay unresolved.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     operational_reset_without_code_role_still_retires --nocapture
+    /// ```
+    #[test]
+    #[ignore = "retire-without-authority control (sudo, cc)"]
+    fn operational_reset_without_code_role_still_retires() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-i2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(
+            plan.sites.len(),
+            11,
+            "pass-1 normal mode plans MAC 6 + KDF 5"
+        );
+        let mut roles: Vec<u32> = plan.sites.iter().map(|site| site.role_id).collect();
+        roles.sort_unstable();
+        assert_eq!(
+            roles,
+            vec![258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308]
+        );
+        let drive = drive_typed_session_with_counter(
+            "i2",
+            &app,
+            &[304, 305, 306, 307, 308],
+            Some(&plan),
+            "marker2",
+            Some("mutate-kdf-table"),
+        );
+        assert_eq!(
+            drive.staged_roles,
+            vec![
+                130, 131, 136, 137, 146, 147, 148, 149, 150, 151, 152, 153, 155, 161, 258, 259,
+                274, 275, 290, 291, 304, 305, 306, 307, 308,
+            ],
+            "13 first-slice + query + 11 copied"
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.copied_skipped, 0,
+            "static bytes stage the (4,4) site even though the live table drops it"
+        );
+        assert_eq!(
+            drive.counter_links, 1,
+            "one multi-link batches the five sites"
+        );
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
+        assert_eq!(
+            drive.joined_calls, 6,
+            "1 init + 1 update + 1 final + 2 derive + 1 reset"
+        );
+        assert_eq!(
+            drive.definite, 4,
+            "never certifies: only the four partitionable tuples assign, 308 assigns none"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 3,
+            "still retires: the reset hit plus the post-reset derive refused on the retired X plus the teardown-poison foreign bound"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, 6);
+        assert_eq!(
+            drive.next_producer_id, 48,
+            "U2's 49 minus the unpublished (4,4) CODE_ROLE witness; the duplicate (4,5) dedups without minting and the second derive reuses the 307 segment"
         );
         assert_eq!(
             drive.loss_cells,
