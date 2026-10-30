@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Observer-owned backing anchor. This is not registration or target authority.
 
-use super::{ObjectHash, ObservationBudget, ObservationGap};
+use super::{ObjectHash, ObservationBudget, ObservationGap, Stamp};
 use sha2::Digest;
 
 use std::{fs::File, os::fd::AsRawFd, ptr::NonNull};
@@ -14,6 +14,10 @@ pub(crate) struct SourceAnchor {
     length: usize,
     _file: File,
     _capacity: super::super::schema::StateReservation,
+    /// The artifact hash this mapping's bytes proved at capture, plus the
+    /// backing stamp at that same instant: the reuse proof below.
+    expected: ObjectHash,
+    stamp: Stamp,
 }
 impl SourceAnchor {
     pub(crate) fn capture(
@@ -81,11 +85,29 @@ impl SourceAnchor {
             length,
             _file: owned,
             _capacity: capacity,
+            expected: expected.clone(),
+            stamp: Stamp::of(&metadata),
         };
         if &anchor.digest(budget, &scratch)? != expected {
             return Err(ObservationGap::ObjectChanged);
         }
         Ok(anchor)
+    }
+    /// Reuse proof for an already-captured anchor: the candidate's mapping
+    /// still proves `expected` for `file` only if the file is the same
+    /// backing (device/inode) with the identical stamp the capture
+    /// recorded (any intervening modification bumps size/mtime/ctime)
+    /// and the capture proved this same hash. Same trust basis as site
+    /// revalidation; any mismatch or metadata failure refuses (the caller
+    /// falls back to a fresh capture, which re-proves current bytes).
+    pub(crate) fn verifies_against(&self, file: &File, expected: &ObjectHash) -> bool {
+        if &self.expected != expected {
+            return false;
+        }
+        let Ok(current) = file.metadata() else {
+            return false;
+        };
+        Stamp::of(&current) == self.stamp
     }
     /// Mapping base address for BPF-side joins. The mapping outlives this
     /// borrow: the anchor owner retains the mapping and its backing file.
@@ -200,6 +222,33 @@ mod tests {
             anchor.digest(&budget, &scratch),
             Err(ObservationGap::ObjectChanged)
         );
+    }
+    #[test]
+    fn anchor_reuse_proof_requires_same_backing_stamp_and_hash() {
+        let fixture = Fixture::new();
+        let hash: ObjectHash = sha2::Sha256::digest(vec![7; 8192])
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+            .try_into()
+            .unwrap();
+        let budget = ObservationBudget::default();
+        let anchor = SourceAnchor::capture(&fixture.file, &hash, &budget).unwrap();
+        // Same backing, unchanged, same hash: reusable.
+        assert!(anchor.verifies_against(&fixture.file, &hash));
+        // Wrong hash against the unchanged backing: refused.
+        let other: ObjectHash = "0".repeat(64).try_into().unwrap();
+        assert!(!anchor.verifies_against(&fixture.file, &other));
+        // Different backing (same bytes, different inode): refused.
+        let sibling = Fixture::new();
+        assert!(!anchor.verifies_against(&sibling.file, &hash));
+        // Same-length content swap bumps the stamp (ctime at least):
+        // refused. (Size/mode-only equality would be unsound here.)
+        fixture.file.write_at(&[8; 8192], 0).unwrap();
+        assert!(!anchor.verifies_against(&fixture.file, &hash));
+        // Truncation changes the size: refused.
+        fixture.file.set_len(4096).unwrap();
+        assert!(!anchor.verifies_against(&fixture.file, &hash));
     }
     #[test]
     fn anchor_refuses_wrong_artifact_and_capacity_before_mapping() {

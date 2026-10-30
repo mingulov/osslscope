@@ -128,6 +128,29 @@ pub(crate) struct FileArrays {
     pub inputs: Vec<(u64, Vec<(u32, u64)>)>,
 }
 
+/// Conservative retained-state charge for one file's array inputs: 2x the
+/// capacity-measured heap plus a 1 KiB base covering the struct shell and
+/// the hash string. Discovery holds the table scratch ceiling while
+/// building these inputs, then charges this before retaining them and
+/// releasing the scratch — every retained byte stays covered with no
+/// coverage gap. `None` on arithmetic overflow (fail closed).
+pub(crate) fn plan_arrays_charge(arrays: &FileArrays) -> Option<usize> {
+    let mut charge = 1024usize;
+    charge = charge.checked_add(
+        arrays
+            .inputs
+            .capacity()
+            .checked_mul(2 * std::mem::size_of::<(u64, Vec<(u32, u64)>)>())?,
+    )?;
+    for (_, rows) in &arrays.inputs {
+        charge = charge.checked_add(
+            rows.capacity()
+                .checked_mul(2 * std::mem::size_of::<(u32, u64)>())?,
+        )?;
+    }
+    Some(charge)
+}
+
 /// One statically grouped algorithm array: maximal stride-32 run of
 /// records with their dispatch rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -315,6 +338,41 @@ pub(crate) fn generate_plan(
 mod tests {
     use super::*;
     use crate::attribution::wire::{TypedAdmission, TypedRoleId};
+
+    #[test]
+    fn plan_arrays_charge_covers_capacity_measured_heap() {
+        // Exact formula pin plus a heap-coverage proof on a shaped
+        // value: the charge must cover struct shell, hash string and
+        // every vector buffer at capacity, with margin to spare.
+        let hash: ObjectHash = "ab".repeat(32).try_into().unwrap();
+        let mut inputs: Vec<(u64, Vec<(u32, u64)>)> = Vec::with_capacity(3);
+        let mut rows0: Vec<(u32, u64)> = Vec::with_capacity(5);
+        rows0.extend([(1, 10), (2, 20)]);
+        let mut rows1: Vec<(u32, u64)> = Vec::with_capacity(7);
+        rows1.extend([(3, 30)]);
+        inputs.extend([(100, rows0), (200, rows1), (300, Vec::new())]);
+        let arrays = FileArrays { hash, inputs };
+        let charge = plan_arrays_charge(&arrays).unwrap();
+        // Row capacities are 5, 7 and 0 (the third rows vec is empty).
+        assert_eq!(
+            charge,
+            1024 + 3 * 2 * std::mem::size_of::<(u64, Vec<(u32, u64)>)>()
+                + (5 + 7) * 2 * std::mem::size_of::<(u32, u64)>()
+        );
+        let heap = std::mem::size_of::<FileArrays>()
+            + 24
+            + 64
+            + arrays.inputs.capacity() * std::mem::size_of::<(u64, Vec<(u32, u64)>)>()
+            + arrays
+                .inputs
+                .iter()
+                .map(|(_, rows)| rows.capacity() * std::mem::size_of::<(u32, u64)>())
+                .sum::<usize>();
+        assert!(
+            charge >= heap,
+            "charge {charge} must cover measured heap {heap}"
+        );
+    }
 
     #[test]
     fn copied_role_matches_admission_table() {

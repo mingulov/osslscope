@@ -30,6 +30,7 @@ use std::{
         fd::{AsFd, AsRawFd, OwnedFd},
         unix::fs::MetadataExt,
     },
+    rc::Rc,
     sync::atomic::{AtomicBool, Ordering},
     time::Instant,
 };
@@ -425,10 +426,13 @@ pub(super) struct SourceOwner {
     _adopted: Vec<OwnedFd>,
     // Retained anchor object custody: the observer's own read-only private
     // full-file mapping (the VMA-join backing) plus its pinned backing
-    // file, via the shared fault-safe capture path. The anchor's raw
-    // mapping pointer keeps the owner off Send: the serialized source
-    // owner thread is the only accessor.
-    _anchor: Option<SourceAnchor>,
+    // file, via the shared fault-safe capture path. Shared (`Rc`) with
+    // the typed-staging anchor for the same file when it verifies, so
+    // the mapping is captured and charged once; a fresh capture is
+    // otherwise retained alone. The anchor's raw mapping pointer keeps
+    // the owner off Send: the serialized source owner thread is the
+    // only accessor.
+    _anchor: Option<Rc<SourceAnchor>>,
     _anchor_id: Option<u64>,
     _registration_ids: Vec<u64>,
     _domain_tgids: Vec<u32>,
@@ -1052,6 +1056,13 @@ impl SourceOwner {
     pub(super) fn anchor_retained_test(&self) -> bool {
         self._anchor.is_some()
     }
+    /// Test-only shared-anchor readback: the retained anchor `Rc`, so
+    /// controls can prove (via `Rc::ptr_eq`) the owner shares the
+    /// staging capture instead of re-capturing the file.
+    #[cfg(test)]
+    pub(super) fn anchor_rc_test(&self) -> Option<Rc<SourceAnchor>> {
+        self._anchor.clone()
+    }
     /// Test-only host guard-life readback.
     #[cfg(test)]
     pub(super) fn guard_life_test(&self, id: u64) -> Option<GuardLife> {
@@ -1288,9 +1299,23 @@ impl SourceOwner {
         &mut self,
         scope: &RequestScope,
         budget: &ObservationBudget,
+        candidate: Option<Rc<SourceAnchor>>,
     ) -> Result<AnchorEstablished, ObservationGap> {
         let _ = self._last_error.take();
-        let captured = SourceAnchor::capture(&scope.target, &scope.expected_artifact, budget)?;
+        // Shared staging anchor when it still proves this scope (same
+        // backing, unchanged stamp, same hash): the mapping is captured
+        // and charged once. Any mismatch falls back to a fresh capture,
+        // which re-proves the current bytes — never a refusal.
+        let captured = match candidate {
+            Some(shared) if shared.verifies_against(&scope.target, &scope.expected_artifact) => {
+                shared
+            }
+            _ => Rc::new(SourceAnchor::capture(
+                &scope.target,
+                &scope.expected_artifact,
+                budget,
+            )?),
+        };
         // Capture proved the mapped bytes hash to the admitted value; the
         // receipt names those exact bytes without a second read.
         let hash = decode_object_hash_hex(&scope.expected_artifact)?;
@@ -2121,13 +2146,66 @@ mod tests {
         let scope = anchor_test_scope(file, expected);
         // Capture passes on the unchanged backing; with no maps the call
         // then fails exactly at the map stage, proving capture succeeded.
-        let error = match owner.anchor_source(&scope, &budget) {
+        let error = match owner.anchor_source(&scope, &budget, None) {
             Ok(_) => panic!("map stage must fail without maps"),
             Err(error) => error,
         };
         assert_eq!(error, ObservationGap::InvalidObject);
         assert!(owner.anchor_retained_test());
         std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn anchor_source_reuses_verified_candidate_without_recapture() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        let bytes = vec![0xA5u8; 8192];
+        let (expected, _raw) = anchor_test_hash(&bytes);
+        let (path, file) = anchor_fault_file("shared", &bytes);
+        let candidate =
+            Rc::new(SourceAnchor::capture(&file, &expected, &budget).expect("staging capture"));
+        let scope = anchor_test_scope(file, expected);
+        // Map stage still fails without maps, proving the call ran past
+        // the capture step; the retained anchor must be the candidate
+        // itself (no second capture, no second charge).
+        let error = match owner.anchor_source(&scope, &budget, Some(candidate.clone())) {
+            Ok(_) => panic!("map stage must fail without maps"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::InvalidObject);
+        let retained = owner.anchor_rc_test().expect("anchor retained");
+        assert!(
+            Rc::ptr_eq(&retained, &candidate),
+            "owner must share the verified staging capture"
+        );
+        std::fs::remove_file(&path).unwrap();
+    }
+    #[test]
+    fn anchor_source_recaptures_when_candidate_mismatches() {
+        let budget = ObservationBudget::default();
+        let mut owner = anchor_test_owner(&budget);
+        let bytes = vec![0xA5u8; 8192];
+        let (expected, _raw) = anchor_test_hash(&bytes);
+        let (_other_path, other_file) = anchor_fault_file("mismatch-backing", &bytes);
+        // Same bytes, different backing: the candidate cannot verify.
+        let candidate = Rc::new(
+            SourceAnchor::capture(&other_file, &expected, &budget).expect("staging capture"),
+        );
+        let (path, file) = anchor_fault_file("mismatch-scope", &bytes);
+        let scope = anchor_test_scope(file, expected);
+        // A mismatch falls back to a fresh capture (re-proving current
+        // bytes), never a refusal: the call still reaches the map stage.
+        let error = match owner.anchor_source(&scope, &budget, Some(candidate.clone())) {
+            Ok(_) => panic!("map stage must fail without maps"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ObservationGap::InvalidObject);
+        let retained = owner.anchor_rc_test().expect("anchor retained");
+        assert!(
+            !Rc::ptr_eq(&retained, &candidate),
+            "mismatched candidate must not be shared"
+        );
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_file(&_other_path).unwrap();
     }
     #[test]
     fn anchor_source_truncation_returns_gap_never_faults() {
@@ -2144,7 +2222,7 @@ mod tests {
             .set_len(0)
             .unwrap();
         let scope = anchor_test_scope(file, expected);
-        let error = match owner.anchor_source(&scope, &budget) {
+        let error = match owner.anchor_source(&scope, &budget, None) {
             Ok(_) => panic!("truncation must refuse"),
             Err(error) => error,
         };
@@ -2168,7 +2246,7 @@ mod tests {
             .set_len(4096)
             .unwrap();
         let scope = anchor_test_scope(file, expected);
-        let error = match owner.anchor_source(&scope, &budget) {
+        let error = match owner.anchor_source(&scope, &budget, None) {
             Ok(_) => panic!("backing change must refuse"),
             Err(error) => error,
         };
@@ -2186,7 +2264,7 @@ mod tests {
         // Swap the backing bytes (same length) between admission and capture.
         std::fs::write(&path, vec![0x5Au8; 8192]).unwrap();
         let scope = anchor_test_scope(file, expected);
-        let error = match owner.anchor_source(&scope, &budget) {
+        let error = match owner.anchor_source(&scope, &budget, None) {
             Ok(_) => panic!("backing change must refuse"),
             Err(error) => error,
         };

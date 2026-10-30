@@ -2214,6 +2214,21 @@ impl ProviderSession {
             std::os::fd::AsRawFd::as_raw_fd(entry_prog),
             std::os::fd::AsRawFd::as_raw_fd(return_prog),
         );
+        // Shared staging anchor for the admitted file when staged: typed
+        // staging already captured (and charged) this file's mapping, so
+        // the source anchor reuses it instead of re-capturing. Selection
+        // is by site identity only; the owner re-proves stamp and hash
+        // inside and falls back to a fresh capture on any mismatch.
+        let candidate = admitted.target.metadata().ok().and_then(|metadata| {
+            let (device, inode) = (metadata.dev(), metadata.ino());
+            self.typed_startup.iter().find_map(|staged| {
+                let site = staged.site();
+                (site.native_device() == device
+                    && site.inode() == inode
+                    && site.object_hash() == &admitted.expected_artifact)
+                    .then(|| staged.anchor().clone())
+            })
+        });
         // Gate-open through the legacy registration: the legacy capability
         // lists first, but its READY publishes only after every typed
         // capability lists, so one terminal READY completes the whole set.
@@ -2237,7 +2252,7 @@ impl ProviderSession {
                     target: admitted.target,
                     expected_artifact: admitted.expected_artifact,
                 };
-                let anchor = owner.anchor_source(&scope, budget)?;
+                let anchor = owner.anchor_source(&scope, budget, candidate)?;
                 let registration =
                     owner.register_entry_return(&scope, entry_prog, return_prog, &anchor)?;
                 let typed = super::source_owner::TypedAcquisitionScope {
@@ -6299,12 +6314,14 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 target: admitted.target,
                 expected_artifact: admitted.expected_artifact,
             };
-            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
-                panic!(
-                    "anchor failed: {gap:?} owner: {:?}",
-                    owner.take_last_error()
-                )
-            });
+            let anchor = owner
+                .anchor_source(&scope, budget, None)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "anchor failed: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
             assert_eq!(
                 owner.guard_life_test(anchor.anchor_id),
                 Some(super::source_acquire::GuardLife::Live)
@@ -6412,6 +6429,89 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn acquire_shares_staged_anchor_for_same_file() {
+        // U3 frugality: the admitted API and the staged typed site live
+        // in the same fixture file, so the source anchor must reuse the
+        // staging capture (the same Rc) instead of re-capturing — the
+        // mapping is captured and charged once. Rc identity (not byte
+        // equality) proves no second capture happened.
+        let baseline = source_native_fd_targets();
+        let mut setup = typed_refusal_setup("shared-anchor");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test(
+                setup.app.clone(),
+                setup.admitted_offset,
+                pid,
+            ),
+        );
+        let receipts = setup
+            .session
+            .acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "acquire failed: {gap:?} owner: {:?}",
+                    setup.session.source_error()
+                )
+            });
+        assert_eq!(
+            setup.session.typed_site_records().len(),
+            1,
+            "the staged fetch cookie must admit"
+        );
+        assert_eq!(receipts.adopted_links, 4, "legacy pair plus the typed pair");
+        let staged = setup.session.typed_startup[0].anchor().clone();
+        let owned = setup
+            .session
+            .source_owner
+            .as_ref()
+            .expect("source owner")
+            .anchor_rc_test()
+            .expect("anchor retained");
+        assert!(
+            std::rc::Rc::ptr_eq(&staged, &owned),
+            "owner must share the staged capture, not re-capture the file"
+        );
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(body) = std::fs::read(&marker) {
+                if body == b"exec\n" {
+                    break;
+                }
+            }
+            assert!(Instant::now() < until, "exec marker never carried exec");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        setup
+            .session
+            .note_source_exec(&lease, pid, receipts.domain.planned)
+            .unwrap();
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert!(close.first_error.is_none());
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        // Full-acquire flow hygiene: BPF FDs return exactly; the one
+        // non-BPF survivor is the pre-existing typed-anchor app handle
+        // the typed driver pins at +1 for this flow shape.
+        source_native_assert_fds_return(&baseline, &setup.app);
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_return_registration_withholds_ready_and_operands() {
         // P3-I1 failed-registration control (RETURN): ENTRY succeeds (the
         // adoption guard is created PREPARING) but the armed RETURN claims
@@ -6450,12 +6550,14 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 target: admitted.target,
                 expected_artifact: admitted.expected_artifact,
             };
-            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
-                panic!(
-                    "anchor failed: {gap:?} owner: {:?}",
-                    owner.take_last_error()
-                )
-            });
+            let anchor = owner
+                .anchor_source(&scope, budget, None)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "anchor failed: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
             assert_eq!(
                 owner.guard_life_test(anchor.anchor_id),
                 Some(super::source_acquire::GuardLife::Live)
@@ -6773,12 +6875,14 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 target: admitted.target,
                 expected_artifact: admitted.expected_artifact,
             };
-            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
-                panic!(
-                    "anchor failed: {gap:?} owner: {:?}",
-                    owner.take_last_error()
-                )
-            });
+            let anchor = owner
+                .anchor_source(&scope, budget, None)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "anchor failed: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
             assert!(
                 owner.request_absent_test(host_key).unwrap(),
                 "anchor must disarm its completed request"
@@ -7146,12 +7250,14 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 target: admitted.target,
                 expected_artifact: admitted.expected_artifact,
             };
-            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
-                panic!(
-                    "anchor failed: {gap:?} owner: {:?}",
-                    owner.take_last_error()
-                )
-            });
+            let anchor = owner
+                .anchor_source(&scope, budget, None)
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "anchor failed: {gap:?} owner: {:?}",
+                        owner.take_last_error()
+                    )
+                });
             // Concurrent close while live: gate open, anchor LIVE, domain
             // ARMED. Must refuse with everything retained.
             let refused = owner.close_source();

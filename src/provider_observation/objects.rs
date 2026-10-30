@@ -48,7 +48,7 @@ thread_local! {
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, PartialEq, Eq)]
-struct Stamp {
+pub(crate) struct Stamp {
     native: u64,
     inode: u64,
     size: u64,
@@ -60,7 +60,7 @@ struct Stamp {
     cn: i64,
 }
 impl Stamp {
-    fn of(m: &Metadata) -> Self {
+    pub(crate) fn of(m: &Metadata) -> Self {
         Self {
             native: m.dev(),
             inode: m.ino(),
@@ -302,6 +302,7 @@ pub(crate) struct StartupCandidates {
     pub(crate) typed: Vec<StartupTypedSite>,
     pub(crate) partial: bool,
     pub(crate) typed_gap: Option<ObservationGap>,
+    pub(crate) plan_gap: Option<ObservationGap>,
     /// Plan entries verified but withheld (offset already staged under a
     /// different role, or budget refused). Never staged, always counted.
     pub(crate) copied_skipped: usize,
@@ -389,8 +390,11 @@ pub(crate) fn startup_candidates(
             },
         });
     }
-    let tables =
-        static_tables::discover_tables_budgeted(&object.file, TableLimits::default(), budget)
+    // Transient table scratch: this discovery is dropped after its
+    // separately-charged outputs are extracted, so the peak ceiling is
+    // held across the extraction below and released — never retained.
+    let (tables, held) =
+        static_tables::discover_tables_transient(&object.file, TableLimits::default(), budget)
             .map_err(|g| match g {
                 static_tables::TableGap::Resource => ObservationGap::ReadLimit,
                 static_tables::TableGap::Changed => ObservationGap::ObjectChanged,
@@ -515,17 +519,35 @@ pub(crate) fn startup_candidates(
     }
     object.unchanged()?;
     process.validate()?;
+    // The plan inputs are built under the held table ceiling, then
+    // charged for retention before the ceiling releases: no coverage
+    // gap. A refused charge withholds only the plan inputs (pass 2
+    // stages nothing from this file); the charged sites are kept.
+    let plan_arrays = super::copied_plan::FileArrays {
+        hash: parsed.hash.clone(),
+        inputs: tables.array_inputs(),
+    };
+    let plan_gap = match super::copied_plan::plan_arrays_charge(&plan_arrays) {
+        Some(charge) => budget.state(charge).err(),
+        None => Some(ObservationGap::StateLimit),
+    };
+    let plan_arrays = match plan_gap {
+        None => plan_arrays,
+        Some(_) => super::copied_plan::FileArrays {
+            hash: parsed.hash.clone(),
+            inputs: Vec::new(),
+        },
+    };
+    drop(held);
     Ok(StartupCandidates {
         candidates,
         apis,
         typed,
         partial: conflict || !tables.gaps().is_empty(),
         typed_gap,
+        plan_gap,
         copied_skipped,
-        plan_arrays: super::copied_plan::FileArrays {
-            hash: parsed.hash.clone(),
-            inputs: tables.array_inputs(),
-        },
+        plan_arrays,
     })
 }
 
@@ -735,6 +757,11 @@ impl TypedPublicSite {
     }
     pub fn site(&self) -> &VerifiedSite {
         &self.site
+    }
+    /// The retained per-file anchor this staged site shares: the source
+    /// anchor reuses it (after proof) instead of re-capturing the file.
+    pub(crate) fn anchor(&self) -> &Rc<source_anchor::SourceAnchor> {
+        &self._anchor
     }
 }
 

@@ -284,3 +284,107 @@ fn refused_startup_source_preparation_keeps_legacy_owned_exports() {
     assert_eq!(api, ObservationApi::OsslProviderUnqueryOperation);
     site.revalidate_object().unwrap();
 }
+
+#[test]
+fn startup_discovery_releases_table_scratch_between_files() {
+    // U3 frugality: the startup path drops its table discovery after
+    // extracting the separately-charged outputs, so the 4 MiB table
+    // ceiling must not accumulate per file. Two discoveries of the
+    // same file under an 8 MiB budget prove it: retaining code holds
+    // ~4.4 MiB after the first file and refuses the second file's
+    // ~4.3 MiB peak (~8.7 MiB > 8 MiB); releasing code peaks near
+    // ~4.5 MiB both times. Both discoveries return Ok, which proves
+    // the tables parse succeeded (a failed parse returns Err, which
+    // would make this control vacuous).
+    let fixture = PublicExports::new(false);
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let custody = StartupProcess::held(&child).unwrap();
+    let budget = ObservationBudget::new(super::super::ObservationLimits {
+        max_state_bytes: 8 << 20,
+        ..Default::default()
+    });
+    for round in 0..2 {
+        let discovered = startup_candidates(
+            custody.clone(),
+            File::open(fixture.0.join("public.so")).unwrap(),
+            &budget,
+            None,
+        )
+        .unwrap_or_else(|gap| panic!("round {round} must fit without retained scratch: {gap:?}"));
+        assert_eq!(discovered.plan_gap, None, "round {round} keeps its plan");
+        assert_eq!(
+            discovered.typed_gap, None,
+            "round {round} keeps its typed sites"
+        );
+    }
+}
+
+#[test]
+fn startup_plan_charge_withholds_only_plan_inputs_when_tight() {
+    // U3 accounting: the pass-2 plan inputs carry their own retention
+    // charge (the released table scratch no longer covers them). A
+    // budget sized exactly one byte below the full charge refuses only
+    // the plan inputs — the charged sites are kept and pass 2 stages
+    // nothing from this file — while the exact budget keeps everything.
+    use super::super::copied_plan::plan_arrays_charge;
+    let fixture = PublicExports::new(false);
+    let child = crate::target::OwnedTarget::spawn_stopped(
+        &["/bin/true".into()],
+        crate::target::WorkloadDest::Null,
+    )
+    .unwrap();
+    let custody = StartupProcess::held(&child).unwrap();
+    let generous = startup_candidates(
+        custody.clone(),
+        File::open(fixture.0.join("public.so")).unwrap(),
+        &ObservationBudget::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(generous.plan_gap, None);
+    let files = generous.plan_arrays;
+    let held_peak = TableLimits::default().max_metadata_bytes;
+    let exact = PARSER_STATE_BYTES
+        + held_peak
+        + generous.apis.len() * 256
+        + generous.candidates.len() * (std::mem::size_of::<VerifiedStaticCandidate>() * 2)
+        + generous.typed.len() * 256
+        + plan_arrays_charge(&files).unwrap();
+    // One byte short: the plan charge (the last charge, still under
+    // the held table ceiling) refuses; sites are kept, plan withheld.
+    let tight = ObservationBudget::new(super::super::ObservationLimits {
+        max_state_bytes: exact - 1,
+        ..Default::default()
+    });
+    let refused = startup_candidates(
+        custody.clone(),
+        File::open(fixture.0.join("public.so")).unwrap(),
+        &tight,
+        None,
+    )
+    .unwrap();
+    assert_eq!(refused.plan_gap, Some(ObservationGap::StateLimit));
+    assert_eq!(refused.apis.len(), generous.apis.len());
+    assert_eq!(refused.typed.len(), generous.typed.len());
+    assert_eq!(refused.candidates.len(), generous.candidates.len());
+    assert!(refused.plan_arrays.inputs.is_empty());
+    assert_eq!(refused.plan_arrays.hash, files.hash);
+    // The exact byte keeps everything.
+    let roomy = ObservationBudget::new(super::super::ObservationLimits {
+        max_state_bytes: exact,
+        ..Default::default()
+    });
+    let kept = startup_candidates(
+        custody.clone(),
+        File::open(fixture.0.join("public.so")).unwrap(),
+        &roomy,
+        None,
+    )
+    .unwrap();
+    assert_eq!(kept.plan_gap, None);
+    assert_eq!(kept.plan_arrays, files);
+}

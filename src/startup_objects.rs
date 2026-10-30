@@ -288,6 +288,7 @@ pub(crate) fn prepare_owned_startup(
                 typed,
                 partial,
                 typed_gap,
+                plan_gap,
                 copied_skipped,
                 plan_arrays,
             }) => {
@@ -296,6 +297,9 @@ pub(crate) fn prepare_owned_startup(
                 result.copied_skipped += copied_skipped;
                 result.plan_arrays.push(plan_arrays);
                 if let Some(gap) = typed_gap {
+                    result.gaps.insert(gap);
+                }
+                if let Some(gap) = plan_gap {
                     result.gaps.insert(gap);
                 }
                 if partial {

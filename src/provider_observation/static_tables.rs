@@ -1020,7 +1020,7 @@ impl Elf<'_> {
 }
 /// Inspect a retained descriptor; no pathname is reopened or trusted.
 pub fn discover_tables(file: &File, limits: TableLimits) -> Result<TableDiscovery, TableGap> {
-    discover(file, limits, None)
+    discover(file, limits, None).map(|(discovery, _)| discovery)
 }
 /// Production integration uses the same parser and cumulative session admission.
 #[allow(dead_code)]
@@ -1029,7 +1029,29 @@ pub(crate) fn discover_tables_budgeted(
     limits: TableLimits,
     budget: &ObservationBudget,
 ) -> Result<TableDiscovery, TableGap> {
-    discover(file, limits, Some(budget))
+    let (discovery, reservation) = discover(file, limits, Some(budget))?;
+    if let Some(reservation) = reservation {
+        reservation.retain();
+    }
+    Ok(discovery)
+}
+/// Startup discovery: the same parser under the same peak ceiling, but the
+/// caller extracts its separately-charged outputs (candidates, sites, plan
+/// arrays) and drops the discovery, so the scratch reservation is returned
+/// for release instead of retained. Peak protection during the parse is
+/// identical; only the steady-state retention differs.
+pub(crate) fn discover_tables_transient(
+    file: &File,
+    limits: TableLimits,
+    budget: &ObservationBudget,
+) -> Result<(TableDiscovery, super::schema::StateReservation), TableGap> {
+    let (discovery, reservation) = discover(file, limits, Some(budget))?;
+    // A budgeted discovery holds its reservation or refuses before any
+    // parser allocation; None here is impossible by construction.
+    Ok((
+        discovery,
+        reservation.expect("budgeted discovery holds a reservation"),
+    ))
 }
 fn budget_gap(gap: super::schema::ObservationGap) -> TableGap {
     if gap == super::schema::ObservationGap::SnapshotLag {
@@ -1042,7 +1064,7 @@ fn discover(
     file: &File,
     limits: TableLimits,
     budget: Option<&ObservationBudget>,
-) -> Result<TableDiscovery, TableGap> {
+) -> Result<(TableDiscovery, Option<super::schema::StateReservation>), TableGap> {
     let before = file.metadata().map_err(|_| TableGap::Io)?;
     if !before.is_file() {
         return Err(TableGap::UnsupportedElf);
@@ -1389,10 +1411,7 @@ fn discover(
     if stamp(&before) != stamp(&file.metadata().map_err(|_| TableGap::Changed)?) {
         return Err(TableGap::Changed);
     }
-    if let Some(reservation) = reservation {
-        reservation.retain();
-    }
-    Ok(result)
+    Ok((result, reservation))
 }
 
 #[cfg(test)]
