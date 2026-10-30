@@ -2258,6 +2258,7 @@ impl ProviderSession {
                 ready_sequence: 0,
                 adopted_links: 0,
                 attachments: Vec::new(),
+                acquisition_buffers: None,
             });
         };
         if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
@@ -2292,20 +2293,27 @@ impl ProviderSession {
         };
         // ER-S2-I2: reserve the bounded acquisition peak (scope,
         // registration, sequence and returned-attachment vectors plus the
-        // backing-identity scratch) before allocating any of them.
-        if let Err(error) = self.budget.state(
+        // backing-identity scratch) before allocating any of them. The
+        // reservation moves into the returned receipts, so the charge
+        // survives session teardown and releases exactly when the
+        // returned storage does; every failure path below drops it
+        // (refunding a charge that backs no returned storage).
+        let mut acquisition_reservation = match self.budget.reserve_state(
             super::source_owner::multi_attachment_acquisition_charge(admitted.len())
                 .ok_or(ObservationGap::StateLimit)?,
         ) {
-            if let Some(owner) = self.source_owner.as_mut() {
-                owner.note_refusal(format!(
-                    "acquisition buffers refused: {} attachments exceed the state budget",
-                    admitted.len(),
-                ));
-                owner.refuse_acquisition();
+            Ok(reservation) => Some(reservation),
+            Err(error) => {
+                if let Some(owner) = self.source_owner.as_mut() {
+                    owner.note_refusal(format!(
+                        "acquisition buffers refused: {} attachments exceed the state budget",
+                        admitted.len(),
+                    ));
+                    owner.refuse_acquisition();
+                }
+                return Err(error);
             }
-            return Err(error);
-        }
+        };
         // Single-file order: the adoption order carries one anchor, so
         // attachments spanning files refuse here, before any kernel
         // effect. (Real provider closures anchor one file; multi-file
@@ -2573,6 +2581,7 @@ impl ProviderSession {
                         }
                     })
                     .collect(),
+                acquisition_buffers: acquisition_reservation.take(),
             })
         })();
         if result.is_err() {
@@ -7741,6 +7750,109 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             drop(setup.child);
             std::fs::remove_dir_all(&setup.dir).unwrap();
         }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_receipts_retain_acquisition_charge_across_session_teardown() {
+        // ER-S2-I2 lifetime: the returned receipts own the
+        // acquisition-peak reservation, so the returned-attachment
+        // storage stays charged across session teardown and the
+        // charge releases exactly when the receipts do.
+        let acquisition = super::source_owner::multi_attachment_acquisition_charge(2).unwrap();
+        let baseline = source_native_fd_targets();
+        let mut setup = multi_attachment_setup("acq-lifetime");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(
+                setup
+                    .admitted_offsets
+                    .iter()
+                    .map(|offset| (setup.app.clone(), *offset, pid))
+                    .collect(),
+            ),
+        );
+        let receipts = setup
+            .session
+            .acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "default-budget acquisition must fit: {gap:?} owner: {:?}",
+                    setup.session.source_error()
+                )
+            });
+        assert_eq!(receipts.attachments.len(), 2);
+        assert_eq!(receipts.adopted_links, 6);
+        let probe = setup.session.budget.clone();
+        assert_eq!(
+            receipts.retained_state_spent_test(),
+            Some(probe.state_spent_test()),
+            "receipts observe the live shared accounting"
+        );
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Ok(body) = std::fs::read(&marker) {
+                if body == b"exec\n" {
+                    break;
+                }
+            }
+            assert!(Instant::now() < until, "exec marker never carried exec");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+        setup
+            .session
+            .note_source_exec(&lease, pid, receipts.domain.planned)
+            .unwrap();
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed);
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (4, 0, 1),
+        );
+        // Session teardown while the receipts are retained: the
+        // shared accounting must still carry the acquisition charge.
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        let spent_charged = probe.state_spent_test();
+        assert_eq!(
+            receipts.retained_state_spent_test(),
+            Some(spent_charged),
+            "receipts still observe live accounting after session teardown"
+        );
+        assert!(
+            spent_charged >= acquisition,
+            "teardown must not release the retained charge: spent {spent_charged} < {acquisition}"
+        );
+        // Release boundary: dropping the receipts frees the returned
+        // storage and refunds exactly its charge.
+        drop(receipts);
+        assert_eq!(
+            probe.state_spent_test(),
+            spent_charged - acquisition,
+            "receipt release refunds exactly the acquisition charge"
+        );
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "lifetime teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
     }
     fn multi_admit(
         session: &ProviderSession,

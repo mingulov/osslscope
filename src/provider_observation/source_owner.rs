@@ -433,6 +433,25 @@ pub(crate) struct SourceAcquisitionReceipts {
     /// order. The scalar fields above repeat the first attachment's
     /// (they are the whole order for single-attachment leases).
     pub attachments: Vec<AttachmentEstablished>,
+    /// Retains the acquisition-peak charge (ER-S2-I2) for the
+    /// returned `attachments` storage: session teardown cannot
+    /// release it early, and dropping these receipts releases it
+    /// exactly when the returned storage frees. `None` only for the
+    /// Disabled inert path, which charges nothing and returns no
+    /// attachments.
+    pub acquisition_buffers: Option<StateReservation>,
+}
+
+impl SourceAcquisitionReceipts {
+    /// Test-only readback of the shared state-spent through the
+    /// retained acquisition charge (`None` for the uncharged
+    /// Disabled inert receipts).
+    #[cfg(test)]
+    pub(crate) fn retained_state_spent_test(&self) -> Option<usize> {
+        self.acquisition_buffers
+            .as_ref()
+            .map(StateReservation::spent_test)
+    }
 }
 
 /// Structural receipts for the explicit source close.
@@ -447,12 +466,19 @@ pub(crate) struct SourceCloseReceipts {
 }
 
 /// Conservative caller-budget charges for the multi-attachment order
-/// buffers (ER-S2-I2). Both phases charge through `budget.state` before
-/// allocating, so a tight budget refuses with `StateLimit` before any
-/// kernel effect; the charges are permanent (session lifetime outlives
-/// the returned receipts). Each formula is 2x the capacity-measured heap
-/// plus a 1 KiB base covering vector shells and allocator rounding, in
-/// the `plan_arrays_charge` style. `None` on overflow (fail closed).
+/// buffers (ER-S2-I2). Both phases charge through the caller budget
+/// before allocating, so a tight budget refuses with `StateLimit`
+/// before any kernel effect. The admission charge is permanent: its
+/// matching buffers are transient to acquisition (freed while the
+/// session still runs), so permanence only over-charges. The
+/// acquisition charge instead covers the RETURNED attachment vector,
+/// which outlives session teardown: `acquire_source_after_open` holds
+/// it as a `StateReservation` owned by the returned
+/// `SourceAcquisitionReceipts`, so the charge survives teardown and
+/// releases exactly when the receipts do. Each formula is 2x the
+/// capacity-measured heap plus a 1 KiB base covering vector shells
+/// and allocator rounding, in the `plan_arrays_charge` style. `None`
+/// on overflow (fail closed).
 ///
 /// Admission peak for `n` claimed attachments: the `matched` bitmap, the
 /// admitted-sites vector, and one cloned 64-byte artifact hash per site.

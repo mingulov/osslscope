@@ -119,6 +119,13 @@ impl StateReservation {
     pub(crate) fn retain(mut self) {
         self.bytes = 0;
     }
+    /// Test-only shared-spent readback through the retained
+    /// reservation, so lifetime controls can observe the charge
+    /// after the originating budget owner is gone.
+    #[cfg(test)]
+    pub(crate) fn spent_test(&self) -> usize {
+        self.work.borrow().state
+    }
 }
 impl Drop for StateReservation {
     fn drop(&mut self) {
