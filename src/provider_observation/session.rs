@@ -8223,15 +8223,17 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     /// re-run. Diagnostic truncations from §13.1 (prearm to 1 API,
     /// typed to 2) are gone: U3+U4 run the full order.
     ///
-    /// The first positive itself is BLOCKED (U5 §24): typed role 161
-    /// stages at the `OSSL_PROVIDER_query_operation` export stub,
-    /// which real libcrypto never calls (internal fetch paths call
-    /// the forwarder-derived trampoline directly, where the legacy
-    /// query site correctly stages). No CODE_ROLE publishes, no owner
-    /// commits, and the counted operational hits stay unresolved —
-    /// the receipt below pins that fail-closed refusal exactly. Flip
-    /// the definite assert to the positive when 161 stages at the
-    /// derived destination.
+    /// The first positive itself is BLOCKED (U5-unblock §25): typed
+    /// role 161 now stages at the forwarder-derived trampoline and
+    /// fires, and the query publishes CODE_ROLE rows — but the row
+    /// key (inode, function, op) collides across the nine same-op
+    /// MAC algos, so only the six index-0 rows certify while the
+    /// other 48 publications refuse. The workload algo's rows are
+    /// among the refused, no owner commits, and the counted
+    /// operational hits stay unresolved — the receipt below pins
+    /// that fail-closed refusal exactly. Flip the definite assert
+    /// to the positive when same-(op,fun) callbacks across algos
+    /// publish distinct rows.
     ///
     /// ```sh
     /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
@@ -8688,10 +8690,12 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(sample_calls, 3, "HMAC init + update + final fire");
         assert_eq!(joined_sites, 24, "every sample joins an admitted site");
         assert_eq!(joined_calls, 3, "the three operational hits join");
-        // BLOCKED (U5 §24): 161 never fires (export stub miss), so no
-        // CODE_ROLE publishes, no owner commits, and the three joined
-        // operational hits stay unresolved next to the loss cells. Flip
-        // to the positive when 161 stages at the derived destination.
+        // BLOCKED (U5-unblock §25): 161 fires and the query publishes,
+        // but the CODE_ROLE key collides across the nine MAC algos, so
+        // only the six index-0 rows certify, the workload algo's owner
+        // never commits, and the three joined operational hits stay
+        // unresolved next to the loss cells. Flip to the positive when
+        // same-(op,fun) callbacks across algos publish distinct rows.
         assert_eq!(
             finalized.definite().len(),
             0,
@@ -8699,15 +8703,18 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         assert_eq!(
             finalized.unresolved_calls(),
-            6,
-            "three joined hits plus the three loss-bound foreign calls"
+            55,
+            "three joined hits plus the 52 loss-bound foreign calls"
         );
         assert_eq!(finalized.withheld_uncertain(), 0);
-        assert_eq!(next_producer_id, 7, "six mints, zero CODE_ROLE witnesses");
+        assert_eq!(
+            next_producer_id, 14,
+            "six baseline mints plus the query occurrence plus six CODE_ROLE witnesses"
+        );
         assert_eq!(
             loss_cells,
-            [0, 0, 1, 2, 0, 0, 0, 0],
-            "one pairing miss plus the two teardown poisons"
+            [0, 48, 2, 2, 0, 0, 0, 0],
+            "48 key-collision refusals plus the pairing misses plus the two teardown poisons"
         );
         drop(finalized);
         drop(sample);
@@ -8724,6 +8731,291 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             source_native_fd_targets(),
             baseline,
             "the full real-binary flow must release every fd"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// U5-unblock native: typed role 161 fires on real libcrypto.
+    /// Direct-exec ordinary unmodified `openssl mac` (the P4 lane)
+    /// through the §12.3 session shape with a shared counter at the
+    /// staged 161 site only. Asserts 161 stages co-attached with the
+    /// legacy query API at the forwarder-derived trampoline (not the
+    /// dead export stub) and that the site executes during the
+    /// workload, with the typed query pair observing it (producer IDs
+    /// advance past the query-less baseline).
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n <lib test binary> \
+    ///     typed_query_role_fires_on_real_libcrypto --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "U5-unblock 161 native (sudo, pinned BPF objects)"]
+    fn typed_query_role_fires_on_real_libcrypto() {
+        use crate::capture::ClockPort as _;
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-u5u-native161-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("abc.txt"), b"abc").unwrap();
+        let argv = u5_openssl_mac_argv(&dir);
+        let (plan, pass1_digest) = u5_pass1_plan_from_live_queries(&argv, &dir);
+        assert_eq!(pass1_digest, U5_MAC_DIGEST);
+        assert!(!plan.sites.is_empty(), "161 stages only on a live plan");
+        let baseline = source_native_fd_targets();
+        let stdout_path = dir.join("out2.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            &argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            Some(&plan),
+        )
+        .unwrap();
+        assert_eq!(
+            startup.apis.len(),
+            38,
+            "pass-2 rescan keeps 38 legacy sites"
+        );
+        assert_eq!(
+            startup.typed.len(),
+            67,
+            "17 first-slice + query + 49 copied stage"
+        );
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            ..
+        } = startup;
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), 38);
+        let legacy_query_offset = session.startup[&pid]
+            .iter()
+            .find(|attachment| attachment.api == 8)
+            .unwrap()
+            .site
+            .file_offset();
+        let mut fds = Vec::new();
+        let mut triples = Vec::new();
+        for attachment in &session.startup[&pid] {
+            let fd = attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .unwrap();
+            triples.push((
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+                attachment.site.file_offset(),
+                pid,
+            ));
+            fds.push(fd);
+        }
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(triples),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(60),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let deadline_ns = start_ns + 15_000_000_000;
+        let borrowed = session.borrowed_producer_maps().expect("producer maps");
+        let mut counter = crate::focused_count::FocusedCounter::open_gated_shared(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns,
+                },
+                ..Default::default()
+            },
+            gate.clone(),
+            &borrowed,
+        )
+        .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "full-38 acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        assert_eq!(receipts.attachments.len(), 38, "every claim acquires");
+        drop(fds);
+        let typed_161: Vec<u64> = session
+            .typed_site_records()
+            .values()
+            .filter(|record| record.role_id == 161)
+            .map(|record| record.offset)
+            .collect();
+        assert_eq!(
+            typed_161.len(),
+            1,
+            "exactly one 161 site stages from the single libcrypto"
+        );
+        eprintln!(
+            "u5u native161 legacy8={legacy_query_offset} typed161={}",
+            typed_161[0]
+        );
+        assert_eq!(
+            typed_161[0], legacy_query_offset,
+            "161 stages co-attached with legacy query at the derived trampoline"
+        );
+        let mut candidates = Vec::new();
+        for staged in &session.typed_startup {
+            if staged.role().id() != 161 {
+                continue;
+            }
+            let site = staged.site().clone();
+            let starttime = site.starttime();
+            let record = super::wire::contract::Record {
+                pid: child.pid(),
+                tid: child.pid(),
+                generation: site.generation(),
+                ..super::wire::contract::Record::default()
+            };
+            candidates.push(crate::focused_count::CountCandidate::Learned(
+                VerifiedSiteCandidate {
+                    site,
+                    pid: child.pid(),
+                    starttime,
+                    generation: record.generation,
+                    advertisers: Vec::new(),
+                    operation: super::schema::Operation::Mac,
+                    numeric_operation: 0,
+                    dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                        session.typed_startup[0].site().object_hash(),
+                        starttime,
+                        &record,
+                    ),
+                    observed_ns: start_ns,
+                    algorithm: super::schema::AlgorithmId::try_from(u16::MAX).unwrap(),
+                    alias_quality: super::schema::AliasQuality::default(),
+                    function: super::schema::FunctionIdentity::new(
+                        super::schema::Operation::Mac,
+                        0,
+                    )
+                    .unwrap(),
+                },
+            ));
+        }
+        assert_eq!(candidates.len(), 1, "the counter watches the 161 site only");
+        counter
+            .attach_candidates_pinned(
+                candidates,
+                start_ns,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                session.typed_pins(),
+            )
+            .unwrap();
+        assert_eq!(counter.active_link_count(), 1, "one link on the 161 site");
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "workload must exit 0");
+        child.finish_observation().unwrap();
+        let digest = std::fs::read_to_string(&stdout_path).unwrap();
+        assert_eq!(
+            digest.trim().to_ascii_uppercase(),
+            U5_MAC_DIGEST,
+            "observed digest must verify"
+        );
+        session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let sample = counter.close(Instant::now() + Duration::from_secs(10));
+        assert_eq!(sample.sites.len(), 1, "only the 161 site sampled");
+        eprintln!(
+            "u5u native161 offset={} calls={}",
+            sample.sites[0].site.offset, sample.sites[0].calls
+        );
+        assert_eq!(
+            sample.sites[0].site.offset, typed_161[0],
+            "the sampled site is the staged 161 site"
+        );
+        assert_eq!(
+            sample.sites[0].calls, 2,
+            "the trampoline executes for the op-3 MAC query and the op-1 query"
+        );
+        let next_producer_id = {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("ATTRIB_CONTROL")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[2], 4, 64).unwrap();
+            let mut value = [0u8; 64];
+            map.lookup(&0u32.to_ne_bytes(), &mut value).unwrap();
+            u64::from_ne_bytes(value[32..40].try_into().unwrap())
+        };
+        eprintln!("u5u native161 next_id={next_producer_id}");
+        assert!(
+            next_producer_id > 7,
+            "the typed query pair observed the firing (past the query-less 6-mint baseline)"
+        );
+        drop(sample);
+        let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert!(close.first_error.is_none());
+        assert!(!close.order_refused, "the completed order must not refuse");
+        drop(session);
+        drop(gate);
+        drop(child);
+        drop(receipts);
+        drop(lease);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "the native must release every fd"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
