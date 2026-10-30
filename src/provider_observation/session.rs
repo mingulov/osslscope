@@ -8223,17 +8223,17 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     /// re-run. Diagnostic truncations from §13.1 (prearm to 1 API,
     /// typed to 2) are gone: U3+U4 run the full order.
     ///
-    /// The first positive itself is BLOCKED (U5-unblock §25): typed
-    /// role 161 now stages at the forwarder-derived trampoline and
-    /// fires, and the query publishes CODE_ROLE rows — but the row
-    /// key (inode, function, op) collides across the nine same-op
-    /// MAC algos, so only the six index-0 rows certify while the
-    /// other 48 publications refuse. The workload algo's rows are
-    /// among the refused, no owner commits, and the counted
-    /// operational hits stay unresolved — the receipt below pins
-    /// that fail-closed refusal exactly. Flip the definite assert
-    /// to the positive when same-(op,fun) callbacks across algos
-    /// publish distinct rows.
+    /// The first positive itself is BLOCKED (U5K §26): the CODE_ROLE
+    /// key now carries the callback file offset, so all 49 distinct
+    /// callback identities publish (zero collision refusals) — but
+    /// role 146 (OSSL_PROVIDER_get0_provider_ctx) stages at an
+    /// unexecuted export stub while libcrypto calls the trampoline
+    /// directly, so the owner commit's required getter observation
+    /// (getter_count == 1, provctx) never arrives, no owner commits,
+    /// and the counted operational hits stay unresolved — the
+    /// receipt below pins that fail-closed refusal exactly. Flip
+    /// the definite assert to the positive when 146 observes the
+    /// workload's provider context.
     ///
     /// ```sh
     /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
@@ -8690,12 +8690,13 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(sample_calls, 3, "HMAC init + update + final fire");
         assert_eq!(joined_sites, 24, "every sample joins an admitted site");
         assert_eq!(joined_calls, 3, "the three operational hits join");
-        // BLOCKED (U5-unblock §25): 161 fires and the query publishes,
-        // but the CODE_ROLE key collides across the nine MAC algos, so
-        // only the six index-0 rows certify, the workload algo's owner
-        // never commits, and the three joined operational hits stay
-        // unresolved next to the loss cells. Flip to the positive when
-        // same-(op,fun) callbacks across algos publish distinct rows.
+        // BLOCKED (U5K §26): the query publishes all 49 distinct
+        // CODE_ROLE rows and the fetch publishes its METHOD row, but
+        // role 146 never fires (export stub, trampoline bypassed), so
+        // the owner commit's getter observation never arrives, no
+        // owner commits, and the three joined operational hits stay
+        // unresolved next to the loss cells. Flip to the positive
+        // when 146 observes the workload's provider context.
         assert_eq!(
             finalized.definite().len(),
             0,
@@ -8703,18 +8704,18 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         assert_eq!(
             finalized.unresolved_calls(),
-            55,
-            "three joined hits plus the 52 loss-bound foreign calls"
+            6,
+            "three joined hits plus the 3 loss-bound foreign calls"
         );
         assert_eq!(finalized.withheld_uncertain(), 0);
         assert_eq!(
-            next_producer_id, 14,
-            "six baseline mints plus the query occurrence plus six CODE_ROLE witnesses"
+            next_producer_id, 58,
+            "thread plus fetch/query/142/147/258 occurrences plus intern plus METHOD plus 49 CODE_ROLE witnesses"
         );
         assert_eq!(
             loss_cells,
-            [0, 48, 2, 2, 0, 0, 0, 0],
-            "48 key-collision refusals plus the pairing misses plus the two teardown poisons"
+            [0, 0, 1, 2, 0, 0, 0, 0],
+            "the op-1 frame miss plus the two teardown poisons; zero key-collision refusals"
         );
         drop(finalized);
         drop(sample);
