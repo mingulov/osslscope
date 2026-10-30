@@ -8223,17 +8223,14 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     /// re-run. Diagnostic truncations from §13.1 (prearm to 1 API,
     /// typed to 2) are gone: U3+U4 run the full order.
     ///
-    /// The first positive itself is BLOCKED (U5K §26): the CODE_ROLE
-    /// key now carries the callback file offset, so all 49 distinct
-    /// callback identities publish (zero collision refusals) — but
-    /// role 146 (OSSL_PROVIDER_get0_provider_ctx) stages at an
-    /// unexecuted export stub while libcrypto calls the trampoline
-    /// directly, so the owner commit's required getter observation
-    /// (getter_count == 1, provctx) never arrives, no owner commits,
-    /// and the counted operational hits stay unresolved — the
-    /// receipt below pins that fail-closed refusal exactly. Flip
-    /// the definite assert to the positive when 146 observes the
-    /// workload's provider context.
+    /// The first positive is GREEN (U146 §27): role 146 stages at
+    /// its forwarder-derived trampoline through its own resolve, the
+    /// getter observation lands exactly once on the committing 147
+    /// parent (four trampoline executions, one committing parent —
+    /// bind_prepare enforces getter_count == 1 with zero flags, so a
+    /// second getter would have refused), the owner commits, and the
+    /// three joined operational hits attribute into definite
+    /// partitions — the receipt below pins that positive exactly.
     ///
     /// ```sh
     /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
@@ -8690,27 +8687,27 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(sample_calls, 3, "HMAC init + update + final fire");
         assert_eq!(joined_sites, 24, "every sample joins an admitted site");
         assert_eq!(joined_calls, 3, "the three operational hits join");
-        // BLOCKED (U5K §26): the query publishes all 49 distinct
-        // CODE_ROLE rows and the fetch publishes its METHOD row, but
-        // role 146 never fires (export stub, trampoline bypassed), so
-        // the owner commit's getter observation never arrives, no
-        // owner commits, and the three joined operational hits stay
-        // unresolved next to the loss cells. Flip to the positive
-        // when 146 observes the workload's provider context.
+        // POSITIVE (U146 §27): 146 fires at its derived trampoline
+        // (four executions, one per getter call site), the getter
+        // observation lands exactly once on the committing 147
+        // parent, the owner commits, and the three joined operational
+        // hits attribute into definite partitions next to the loss
+        // cells. Conservation: 3 known + 3 loss-bound foreign − 3
+        // assigned = 3 unresolved.
         assert_eq!(
             finalized.definite().len(),
-            0,
-            "blocked: no partition without a committed owner"
+            3,
+            "positive: one partition per joined operational hit"
         );
         assert_eq!(
             finalized.unresolved_calls(),
-            6,
-            "three joined hits plus the 3 loss-bound foreign calls"
+            3,
+            "the 3 loss-bound foreign calls; every joined hit attributed"
         );
         assert_eq!(finalized.withheld_uncertain(), 0);
         assert_eq!(
-            next_producer_id, 58,
-            "thread plus fetch/query/142/147/258 occurrences plus intern plus METHOD plus 49 CODE_ROLE witnesses"
+            next_producer_id, 72,
+            "the 57-mint U5K baseline plus 4 getter occurrences plus 7 owner-commit IDs plus 3 operational segments"
         );
         assert_eq!(
             loss_cells,
@@ -9255,9 +9252,9 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             sample.sites[0].site.offset, typed_146[0],
             "the sampled site is the staged 146 site"
         );
-        assert!(
-            sample.sites[0].calls > 0,
-            "the staged 146 site executes: the dead export stub never does"
+        assert_eq!(
+            sample.sites[0].calls, 4,
+            "one MAC-constructor getter, one settable getter, two digest-internal getters"
         );
         let next_producer_id = {
             let fd = session
