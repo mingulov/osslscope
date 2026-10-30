@@ -1148,7 +1148,7 @@ pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns
         }
         274 | 275 => {
             let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
-            if !code_role_for_callback(ctx, &target, opfun, entry_seq) {
+            if !code_role_for_callback(ctx, &target, cookie, opfun, entry_seq) {
                 return 0;
             }
             let arg0: u64 = ctx.arg(0).unwrap_or(0);
@@ -1390,7 +1390,7 @@ pub fn child_entry(
     }
     if matches!(admitted.role_id, 258 | 259 | 290 | 291) {
         let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
-        if !code_role_for_callback(ctx, &target, opfun, entry_seq) {
+        if !code_role_for_callback(ctx, &target, cookie, opfun, entry_seq) {
             return 0;
         }
     }
@@ -3759,10 +3759,6 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
     if !matches!(role, 304 | 305 | 306 | 307 | 308) {
         return false;
     }
-    let context: u64 = ctx.arg(0).unwrap_or(0);
-    if context == 0 {
-        return false;
-    }
     if role == 308 {
         // KDF reset retires its dependent owner before the target body.
         // Retirement is fail-closed, so it needs admission but not source
@@ -3770,11 +3766,30 @@ pub fn operational_check(ctx: &ProbeContext, params: &OpParams) -> bool {
         // This retire sits above the CODE_ROLE join (admission-only):
         // placing it below would narrow retirement to authorized sites,
         // letting a pre-reset owner survive an authority lapse.
+        let context: u64 = ctx.arg(0).unwrap_or(0);
+        if context == 0 {
+            return false;
+        }
         retire_owner_reachable(&target, REL_X_INDEX, context);
         return false;
     }
+    // 304-307: SOURCE_READY/guards plus exact CODE_ROLE authority precede
+    // every argument read, including the resolver's read below. The join
+    // itself re-checks the cookie binding, so authority is validated both
+    // at this gate and at the consuming join.
+    let Some(bound) = site_bind_ptr(params.cookie, &target) else {
+        return false;
+    };
+    let source_epoch = unsafe { (*bound).source_epoch };
+    if !ready_and_guards(params.cookie, source_epoch, target.entry_seq, &target) {
+        return false;
+    }
     let opfun = (u64::from(function) << 32) | u64::from(operation);
-    if !code_role_for_callback(ctx, &target, opfun, target.entry_seq) {
+    if !code_role_for_callback(ctx, &target, params.cookie, opfun, target.entry_seq) {
+        return false;
+    }
+    let context: u64 = ctx.arg(0).unwrap_or(0);
+    if context == 0 {
         return false;
     }
     let segment = op_resolve_segment(ctx, params);
@@ -3819,11 +3834,16 @@ pub fn op_resolve_segment(ctx: &ProbeContext, params: &OpParams) -> u64 {
             (*bound).code_object_id,
         )
     };
-    let context: u64 = ctx.arg(0).unwrap_or(0);
-    if context == 0 {
+    // SOURCE_READY/guards precede this sibling's own argument read. Exact
+    // CODE_ROLE authority was validated by `operational_check` before this
+    // call in the same non-preemptible run, so no second VMA join is due
+    // here; this guard re-check keeps the sibling self-sufficiently
+    // ordered for any future caller.
+    if !ready_and_guards(params.cookie, source_epoch, target.entry_seq, &target) {
         return 0;
     }
-    if !ready_and_guards(params.cookie, source_epoch, target.entry_seq, &target) {
+    let context: u64 = ctx.arg(0).unwrap_or(0);
+    if context == 0 {
         return 0;
     }
     // Committed X row at or before the entry snapshot, for this family.
@@ -4365,28 +4385,34 @@ pub fn own_pending_x(
 ///
 /// Publication: the typed query role (161) walks the live returned
 /// OSSL_ALGORITHM/OSSL_DISPATCH tables at query return (public UAPI
-/// layouts only), joins each in-slice callback address to its
+/// layouts only), joins each in-slice callback address to its exact
 /// (inode, file offset) through the current-VMA join, and publishes one
-/// CERTIFIED row per (process, image, inode, operation, function).
-/// CERTIFIED means code ABI only, never provider identity.
+/// CERTIFIED row per (process, image, inode, operation, function)
+/// carrying that observed offset in the value. CERTIFIED means code ABI
+/// only, never provider identity.
 ///
-/// Join: at copied-role entry the handler reads the trap instruction
-/// pointer (uprobe INT3 semantics: firing address + 1), joins it to the
-/// same inode through the same VMA policy, and requires the matching
-/// row with a publication sequence at or before the entry snapshot.
+/// Join: at copied-role entry the handler takes the kernel-supplied
+/// firing IP (no subtraction: Linux rewinds it to the probe address),
+/// joins it to the same (inode, file offset) through the same VMA
+/// policy, requires the firing cookie's retained registration/source
+/// epoch to be live, and requires the matching row — same observed
+/// offset, publication sequence at or before the entry snapshot.
 /// Return paths pair to entry-verified frames and need no second join.
+/// A query advertising callback A never authorizes a separately staged
+/// callback B at another offset in the same file: the offsets differ.
 ///
 /// Key amendment note: the source-capability contract sketches
 /// cookie-keyed CODE_ROLE rows, but the firing cookie does not exist at
 /// query time, so cookie keying cannot be published from a live walk.
-/// Inode keying preserves the amendment's intent with a stronger,
-/// kernel-grounded identity: the VMA join output on both sides, behind
-/// the retained anchor's pinned file (an open retained descriptor pins
-/// the inode address for the session, so no reuse aliasing), the
-/// registration-time anchor join, and the per-callback source-authority
-/// gate that still precedes every join. Host staging (offsets from
-/// retained dispatch bytes) is a claim; this join is the kernel's
-/// independent verification of it.
+/// Two-phase binding preserves the amendment's intent with a stronger,
+/// kernel-grounded identity: phase 1 publishes the VMA-joined exact
+/// inode-and-offset without any cookie; phase 2 (this join) binds it
+/// to the consuming cookie's live registration/source epoch. The
+/// retained anchor's pinned file pins the inode for the session (no
+/// reuse aliasing), and the registration-time anchor join still
+/// precedes every use. Host staging (offsets from retained dispatch
+/// bytes) is a claim; this join is the kernel's independent
+/// verification of it.
 ///
 /// Walk bounds: the first 64 algorithms and 32 dispatch entries per
 /// table publish; anything beyond stops with LOSS_MAP and stays
@@ -4425,8 +4451,11 @@ fn code_shape(operation: u32, function: u32) -> Option<u64> {
     }
 }
 
-/// CODE_ROLE key (I1 ruling carried: inode keying STANDS as faithful
-/// to the key amendment's intent — do not rekey to cookies).
+/// CODE_ROLE key: inode-SCOPED, never inode-sufficient. The key selects
+/// the (process, image, inode, operation, function) row; the value's
+/// observed file offset (`data[3]`, via `code_role_data`) makes the
+/// identity exact, and the consuming join binds it to the firing
+/// cookie's live registration/source epoch (two-phase binding).
 ///
 /// The source-capability contract's key amendment
 /// (`docs/2026-10-29-v050-source-capability.md:36`) names cookie keying
@@ -4440,19 +4469,22 @@ fn code_shape(operation: u32, function: u32) -> Option<u64> {
 /// runs cookie-to-site, never address-to-cookie, so no reverse lookup
 /// can supply one without trusting the very VA the amendment refuses.
 /// Cookie-keyed rows would therefore be unwritable at the only moment
-/// publication is possible.
+/// publication is possible, so phase 1 publishes the exact observed
+/// inode-and-offset without any cookie and phase 2 (the join) binds it.
 ///
 /// Guarantees preserved, and how:
-/// - Kernel-observed identity: both sides derive the inode from live
-///   kernel VMA state through the same qualified join (`code_vma_join`,
-///   `Policy::Code`): publication joins each walked table address, the
-///   callback join joins the firing `rip - 1`. The retained anchor's
-///   pinned file pins the inode address for the session (no reuse
-///   aliasing), and the per-callback source-authority gate still
-///   precedes every join.
+/// - Kernel-observed identity: both sides derive (inode, file offset)
+///   from live kernel VMA state through the same qualified join
+///   (`code_vma_join`, `Policy::Code`): publication joins each walked
+///   table address, the callback join joins the firing IP. The
+///   retained anchor's pinned file pins the inode for the session (no
+///   reuse aliasing), and the consuming cookie's live
+///   registration/source epoch is required before the code identity is
+///   even consulted.
 /// - No VA trust: no VA is stored in the key or trusted across time;
 ///   the join revalidates the live mapping on every use, and a stale
-///   or remapped VA fails the join (fail closed).
+///   or remapped VA fails the join (fail closed). Same-file
+///   different-offset substitution refuses: the offsets differ.
 /// - Full target-domain scope: `process_incarnation` + `image_epoch`
 ///   scope the row, and `relation_epoch` 0 keeps ordinary
 ///   relation/loss advance from clearing code facts (tombstone
@@ -4460,12 +4492,14 @@ fn code_shape(operation: u32, function: u32) -> Option<u64> {
 /// The amendment's "candidate VA only proposes" half holds verbatim:
 /// host offsets (the plan) propose sites; this join is the kernel's
 /// independent verification. Only the lookup handle adapts
-/// (cookie to inode); the finite operation/function/signature/
-/// query-witness/object/publication fields are unchanged.
+/// (cookie to inode-plus-offset-plus-cookie-binding); the finite
+/// operation/function/signature/query-witness/object/publication fields
+/// are unchanged.
 ///
 /// Delegates to the contract-crate constructor (same bytes, pinned by
-/// `code_role_key_shape_is_inode_keyed_epoch_zero`); the path is fully
-/// qualified because this wrapper intentionally shadows the glob import.
+/// `code_role_identity_binds_inode_offset_and_cookie_epoch`); the path
+/// is fully qualified because this wrapper intentionally shadows the
+/// glob import.
 #[inline(always)]
 fn code_role_key(target: &Target, inode: u64, function: u64, operation: u32) -> RelKey {
     osslscope_bpf_contract::attribution::code_role_key(
@@ -4510,10 +4544,13 @@ pub fn code_vma_join(address: u64, out: &mut source_vma::SourceLocation) -> bool
     found
 }
 
-/// Trapped instruction pointer for a uprobe entry: the INT3 at the
-/// probed address traps with IP one past it, so IP - 1 is the firing
-/// callback address. x86_64 only; other arches fail closed (copied
-/// roles stay unresolved there).
+/// Firing instruction pointer for a uprobe entry: Linux rewinds the saved
+/// IP to the probe address before invoking consumers (see `handle_swbp`
+/// in `kernel/events/uprobes.c`), so the kernel-supplied entry IP is the
+/// firing callback address with no subtraction. Subtracting one selects
+/// the preceding byte, which at an executable VMA's first byte lands in
+/// another mapping or a hole and rejects a valid callback. x86_64 only;
+/// other arches fail closed (copied roles stay unresolved there).
 #[inline(always)]
 fn callback_ip(ctx: &ProbeContext) -> Option<u64> {
     #[cfg(bpf_target_arch = "x86_64")]
@@ -4528,16 +4565,22 @@ fn callback_ip(ctx: &ProbeContext) -> Option<u64> {
     }
 }
 
-/// Copied-role callback join: the firing site's live CODE_ROLE row must
-/// exist with code-ABI certification and a publication sequence at or
-/// before the entry snapshot. Any miss refuses before any operand read.
-/// `opfun` packs the staged admission pair (low 32 = operation, high 32
-/// = function) so the five-argument call ABI holds.
+/// Copied-role callback join (two-phase binding, phase 2): the firing
+/// cookie's retained registration/source epoch must be live, and the
+/// firing VMA's exact observed inode-and-offset identity must match the
+/// query-published CODE_ROLE row with code-ABI certification and a
+/// publication sequence at or before the entry snapshot. Phase 1 (query
+/// time) publishes the inode-and-offset identity without any cookie,
+/// which is unknowable then; this phase binds it to the consuming
+/// cookie. Any miss refuses before any operand read. `opfun` packs the
+/// staged admission pair (low 32 = operation, high 32 = function) so the
+/// five-argument call ABI holds.
 #[inline(never)]
 #[no_mangle]
 pub fn code_role_for_callback(
     ctx: &ProbeContext,
     target: &Target,
+    cookie: u64,
     opfun: u64,
     entry_seq: u64,
 ) -> bool {
@@ -4546,10 +4589,16 @@ pub fn code_role_for_callback(
     if code_shape(operation, function).is_none() {
         return false;
     }
-    let Some(ip) = callback_ip(ctx) else {
+    // Consuming-cookie binding: the cookie's retained registration and
+    // source epoch must be live before the code identity is consulted.
+    let Some(bound) = site_bind_ptr(cookie, target) else {
         return false;
     };
-    let Some(firing) = ip.checked_sub(1) else {
+    let source_epoch = unsafe { (*bound).source_epoch };
+    if !ready_and_guards(cookie, source_epoch, entry_seq, target) {
+        return false;
+    }
+    let Some(firing) = callback_ip(ctx) else {
         return false;
     };
     let mut location: source_vma::SourceLocation = unsafe { core::mem::zeroed() };
@@ -4566,35 +4615,40 @@ pub fn code_role_for_callback(
             && (*row).evidence_epoch != 0
             && (*row).data[0] == u64::from(operation)
             && (*row).data[1] == u64::from(function)
+            && (*row).data[3] == location.file_offset
             && (*row).data[6] != 0
             && (*row).data[6] <= entry_seq
     }
 }
 
-/// Publish one CODE_ROLE row under the shared publisher lock: dedup by
-/// key (idempotent re-query adopts only an identical live row), then
-/// spend, allocate, build in the per-CPU cell, NOEXIST insert, and the
-/// ordered sequence commit. Any failure leaves the entry unauthorized
-/// for this query; a later query republishes (self-healing, no poison:
-/// a CODE_ROLE hiccup must never kill unrelated positives).
+/// Publish one CODE_ROLE row under the shared publisher lock (two-phase
+/// binding, phase 1): record the query-observed exact inode-and-offset
+/// identity without any cookie, which is unknowable at query time; the
+/// consuming join binds it to the firing cookie. Dedup by key adopts
+/// only an identical live row with the same observed offset (a same-key
+/// different-offset re-advertisement refuses, fail closed), then spend,
+/// allocate, build in the per-CPU cell, NOEXIST insert, and the ordered
+/// sequence commit. Any failure leaves the entry unauthorized for this
+/// query; a later query republishes (self-healing, no poison: a CODE_ROLE
+/// hiccup must never kill unrelated positives).
 #[inline(never)]
 #[no_mangle]
 pub fn publish_code_role(
     control: *mut ProducerControl,
     target: &Target,
-    inode: u64,
+    location: &source_vma::SourceLocation,
     opfun: u64,
     occurrence: u64,
 ) -> bool {
     let operation = opfun as u32;
     let function = (opfun >> 32) as u32;
-    if inode == 0 || occurrence == 0 {
+    if location.inode == 0 || occurrence == 0 {
         return false;
     }
     let Some(shape) = code_shape(operation, function) else {
         return false;
     };
-    let key = code_role_key(target, inode, u64::from(function), operation);
+    let key = code_role_key(target, location.inode, u64::from(function), operation);
     let Some(state) = crate::shared_maps::ATTR_STATE.get_ptr_mut(0) else {
         return false;
     };
@@ -4618,6 +4672,7 @@ pub fn publish_code_role(
                     && (*existing).data[0] == u64::from(operation)
                     && (*existing).data[1] == u64::from(function)
                     && (*existing).data[2] == shape
+                    && (*existing).data[3] == location.file_offset
                     && (*existing).data[6] != 0
             };
         }
@@ -4656,11 +4711,14 @@ pub fn publish_code_role(
             (*staging).evidence_epoch = target.relation;
             (*staging).born_ns = now_of();
             (*staging).state = REL_CERTIFIED;
-            (*staging).data[0] = u64::from(operation);
-            (*staging).data[1] = u64::from(function);
-            (*staging).data[2] = shape;
-            (*staging).data[4] = occurrence;
-            (*staging).data[6] = next_seq;
+            (*staging).data = code_role_data(
+                u64::from(operation),
+                u64::from(function),
+                shape,
+                location.file_offset,
+                occurrence,
+                next_seq,
+            );
             if REL.insert(&key, &*staging, BPF_NOEXIST).is_err() {
                 return false;
             }
@@ -4952,7 +5010,7 @@ pub extern "C" fn query_dispatch_slot(index: u64, context: u64) -> u64 {
         return 0;
     }
     let opfun = (u64::from(id) << 32) | u64::from(scan.operation);
-    if !publish_code_role(scan.control, target, location.inode, opfun, scan.occurrence) {
+    if !publish_code_role(scan.control, target, &location, opfun, scan.occurrence) {
         loss(LOSS_MAP);
     }
     0

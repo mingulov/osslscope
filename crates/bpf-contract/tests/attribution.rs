@@ -358,20 +358,26 @@ fn query_observation_role_admits_paired_query_only() {
     assert!(TypedAdmission::new(161, 0, 0, 0, 1, 1).is_none());
 }
 #[test]
-fn code_role_key_shape_is_inode_keyed_epoch_zero() {
-    // I1 ruling pin: CODE_ROLE keys compose (process, image, epoch 0,
-    // inode, function, kind 5, op). The kernel `code_role_key` wrapper
-    // delegates to this exact constructor, so any rekey (cookie, VA,
-    // nonzero epoch) fails here. No VA/cookie dependence is
-    // structural: the constructor takes neither (see its signature),
-    // so a caller cannot smuggle either in.
+fn code_role_identity_binds_inode_offset_and_cookie_epoch() {
+    // I1 two-phase-binding pin (replaces the inode-only key pin): the key
+    // scopes by (process, image, epoch 0, inode, function, kind 5, op)
+    // but is never sufficient alone; the value's observed file offset
+    // (data[3]) makes the identity exact; the consuming kernel join
+    // binds it to the firing cookie's live registration/source epoch
+    // (native-proven: the join takes the cookie and checks
+    // SOURCE_READY/guards before consulting the row). The kernel
+    // `code_role_key` wrapper and `publish_code_role` delegate to these
+    // exact constructors, so any rekey, offset drop or position drift
+    // fails here. No VA/cookie dependence is structural in either
+    // constructor: both take neither (see their signatures), so a
+    // caller cannot smuggle either in.
     let key = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
     assert_eq!(key.process_incarnation, 0x1111);
     assert_eq!(key.image_epoch, 0x2222);
     assert_eq!(key.relation_epoch, 0);
     assert_eq!(
         key.primary_handle, 0x3333,
-        "primary is the inode, not a cookie"
+        "primary is the inode scope, not a cookie"
     );
     assert_eq!(key.secondary_handle, 5, "secondary is the function");
     assert_eq!(key.kind, REL_CODE_ROLE);
@@ -392,4 +398,17 @@ fn code_role_key_shape_is_inode_keyed_epoch_zero() {
         assert_eq!(other.process_incarnation, 0x1111);
         assert_eq!(other.image_epoch, 0x2222);
     }
+    // Value identity: every position locked, offset at data[3).
+    let value = code_role_data(4, 5, 5, 0x1b4, 0x77, 0x99);
+    assert_eq!(
+        value,
+        [4, 5, 5, 0x1b4, 0x77, 0, 0x99, 0, 0, 0],
+        "data is [op, fun, shape, offset, occurrence, 0, seq, 0, 0, 0]"
+    );
+    // Substitution killer: same key scope, different observed offsets
+    // are distinct identities — query-for-A never equals staged-B.
+    let same_key_other_offset = code_role_data(4, 5, 5, 0x2c8, 0x77, 0x99);
+    assert_ne!(same_key_other_offset[3], value[3]);
+    assert_eq!(same_key_other_offset[0], value[0]);
+    assert_eq!(same_key_other_offset[1], value[1]);
 }

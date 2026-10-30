@@ -300,15 +300,16 @@ pub struct RelKey {
 /// relation epoch is 0 so ordinary relation/loss advance cannot clear
 /// code facts; code replacement changes the inode or image instead.
 ///
-/// Inode keying is the carried I1 ruling on the source-capability key
-/// amendment (`docs/2026-10-29-v050-source-capability.md:36`, which
-/// names cookie keying): the firing cookie exists only in the copied
-/// callback's own probe context, so the query-time publisher — which
-/// observes bare dispatch-table addresses — cannot key on it. No
-/// VA/cookie dependence is structural: this constructor takes neither
-/// (see the signature). A caller cannot smuggle either in. The kernel
-/// `code_role_key` wrapper delegates here; the full interpretation
-/// comment lives with it.
+/// The key is inode-SCOPED, never inode-sufficient: the value's
+/// observed file offset ([`code_role_data`], `data[3]`) makes the
+/// identity exact, and the consuming kernel join binds it to the firing
+/// cookie's live registration/source epoch (two-phase binding, because
+/// the firing cookie exists only in the copied callback's own probe
+/// context and the query-time publisher observes bare dispatch-table
+/// addresses). No VA/cookie dependence is structural in this
+/// constructor: it takes neither (see the signature). A caller cannot
+/// smuggle either in. The kernel `code_role_key` wrapper delegates
+/// here; the full interpretation comment lives with it.
 #[inline(always)]
 pub const fn code_role_key(
     process_incarnation: u64,
@@ -326,6 +327,37 @@ pub const fn code_role_key(
         kind: REL_CODE_ROLE,
         operation,
     }
+}
+
+/// CODE_ROLE (kind 5) value identity: the live operation, function,
+/// reviewed ABI shape, exact observed file offset of the advertised
+/// callback, publishing query witness and publication sequence. The
+/// offset at `data[3]` is the substitution killer: a query advertising
+/// callback A never authorizes a separately staged callback B at
+/// another offset in the same file. `data[5]` and `data[7..=9]` stay
+/// zero. The kernel publisher writes this exact array; the pin below
+/// locks every position.
+#[inline(always)]
+pub const fn code_role_data(
+    operation: u64,
+    function: u64,
+    shape: u64,
+    file_offset: u64,
+    occurrence: u64,
+    sequence: u64,
+) -> [u64; 10] {
+    [
+        operation,
+        function,
+        shape,
+        file_offset,
+        occurrence,
+        0,
+        sequence,
+        0,
+        0,
+        0,
+    ]
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
