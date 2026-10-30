@@ -218,6 +218,12 @@ impl ObservationBudget {
         work.state = next;
         Ok(())
     }
+    /// Test-only spent-state readback, so small-budget controls can size an
+    /// exact-fit versus one-byte-short budget through the real path.
+    #[cfg(test)]
+    pub(crate) fn state_spent_test(&self) -> usize {
+        self.work.borrow().state
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

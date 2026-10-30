@@ -902,9 +902,11 @@ impl ProviderSession {
         })
     }
     fn link_count(&self) -> usize {
-        // Legacy attachment links plus every link the source owner adopted
-        // (the acquired legacy pair and all typed pairs): the owner is the
-        // sole retainer of acquired links through the final consumers.
+        // Live links only: legacy attachment links plus every link the
+        // source owner adopted (the acquired legacy pair and all typed
+        // pairs): the owner is the sole retainer of acquired links through
+        // the final consumers. Reserve-only prearms carry no live links;
+        // their planned pairs count via `link_pressure` below.
         self.targets
             .values()
             .map(|t| t.attachments.iter().map(|a| a.links.len()).sum::<usize>())
@@ -921,6 +923,23 @@ impl ProviderSession {
                 .map(|owner| owner.adopted_link_count())
                 .unwrap_or(0)
     }
+    /// Planned-link pressure for prearm admission (ER-S2-I1): live links
+    /// plus two planned links per reserve-only startup attachment. A
+    /// reserve-only prearm mints no producer links yet, but its required
+    /// pair is acquired after admission opens, so counting zero per
+    /// reservation would let an unbounded order pass a finite `max_links`.
+    /// Acquisition checks use live `link_count` plus the explicit planned
+    /// order instead (the reserves being converted must not double-count).
+    fn link_pressure(&self) -> usize {
+        let reserved = self
+            .startup
+            .values()
+            .flatten()
+            .filter(|a| a.links.is_empty())
+            .count()
+            .saturating_mul(2);
+        self.link_count().saturating_add(reserved)
+    }
     #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
     fn attach_pair(
         &mut self,
@@ -935,7 +954,12 @@ impl ProviderSession {
         if self.final_drain || !self.gate.admitting() {
             return Err(ObservationGap::Invalidated);
         }
-        if self.link_count() + existing + 2 > self.budget.limits.max_links {
+        if self
+            .link_pressure()
+            .saturating_add(existing)
+            .saturating_add(2)
+            > self.budget.limits.max_links
+        {
             return Err(ObservationGap::LinkLimit);
         }
         self.budget.state(512 + advertisers.len() * 96)?;
@@ -957,8 +981,9 @@ impl ProviderSession {
             // Reserve-only prearm (Enabled source acquisition) mints the
             // cookie and all configuration below but creates no producer
             // links: each attachment's required pair is acquired after
-            // admission opens, from its own retained site. The +2
-            // link-budget check above still reserves capacity for that pair.
+            // admission opens, from its own retained site. The pressure
+            // check above counts two planned links per such reservation,
+            // so the pair's capacity is reserved at prearm time.
             let links = if create_links {
                 paired_links(
                     || {
@@ -1772,7 +1797,12 @@ impl ProviderSession {
             if self.next_typed_cookie >= TYPED_COOKIE_END {
                 return Err(ObservationGap::LinkLimit);
             }
-            if self.link_count() + 2 > self.budget.limits.max_links {
+            if self
+                .link_count()
+                .checked_add(2)
+                .ok_or(ObservationGap::LinkLimit)?
+                > self.budget.limits.max_links
+            {
                 return Err(ObservationGap::LinkLimit);
             }
             self.budget.state(512 + 96)?;
@@ -2112,6 +2142,12 @@ impl ProviderSession {
         if claims.is_empty() || claims.len() != attachments.len() {
             return Err(ObservationGap::Invalidated);
         }
+        // ER-S2-I2: reserve the bounded admission peak through the caller
+        // budget before allocating the matching/admission buffers.
+        self.budget.state(
+            super::source_owner::multi_attachment_admission_charge(claims.len())
+                .ok_or(ObservationGap::StateLimit)?,
+        )?;
         let mut matched = vec![false; attachments.len()];
         let mut admitted = Vec::with_capacity(claims.len());
         for claim in claims {
@@ -2254,6 +2290,22 @@ impl ProviderSession {
                 return Err(error);
             }
         };
+        // ER-S2-I2: reserve the bounded acquisition peak (scope,
+        // registration, sequence and returned-attachment vectors plus the
+        // backing-identity scratch) before allocating any of them.
+        if let Err(error) = self.budget.state(
+            super::source_owner::multi_attachment_acquisition_charge(admitted.len())
+                .ok_or(ObservationGap::StateLimit)?,
+        ) {
+            if let Some(owner) = self.source_owner.as_mut() {
+                owner.note_refusal(format!(
+                    "acquisition buffers refused: {} attachments exceed the state budget",
+                    admitted.len(),
+                ));
+                owner.refuse_acquisition();
+            }
+            return Err(error);
+        }
         // Single-file order: the adoption order carries one anchor, so
         // attachments spanning files refuse here, before any kernel
         // effect. (Real provider closures anchor one file; multi-file
@@ -2305,6 +2357,40 @@ impl ProviderSession {
                     .then(|| staged.anchor().clone())
             })
         });
+        // ER-S2-I1: reserve the complete attachment order before any kernel
+        // effect: live links plus every planned legacy pair plus every
+        // planned typed pair must fit `max_links`. A tight limit refuses
+        // here with zero adoptions instead of adopting legacy pairs and
+        // failing later at the typed-site check.
+        let max_links = self.budget.limits.max_links;
+        let live_links = self.link_count();
+        {
+            let legacy_need = admitted
+                .len()
+                .checked_mul(2)
+                .ok_or(ObservationGap::LinkLimit)?;
+            let typed_need = self
+                .typed_startup
+                .len()
+                .checked_mul(2)
+                .ok_or(ObservationGap::LinkLimit)?;
+            let planned = legacy_need
+                .checked_add(typed_need)
+                .ok_or(ObservationGap::LinkLimit)?;
+            if live_links
+                .checked_add(planned)
+                .ok_or(ObservationGap::LinkLimit)?
+                > max_links
+            {
+                if let Some(owner) = self.source_owner.as_mut() {
+                    owner.note_refusal(format!(
+                        "link budget refused: {live_links} live + {planned} planned exceeds {max_links}",
+                    ));
+                    owner.refuse_acquisition();
+                }
+                return Err(ObservationGap::LinkLimit);
+            }
+        }
         // Gate-open through the legacy registrations: every legacy
         // capability lists first, but READY publishes only after every
         // typed capability lists, so one terminal READY completes the
@@ -2316,6 +2402,11 @@ impl ProviderSession {
                 .as_mut()
                 .ok_or(ObservationGap::Invalidated)?;
             let budget = &self.budget;
+            // Per-pair live accounting for the registration loop below:
+            // the upfront order check passed, and each adopted pair grows
+            // the live count by exactly two, so the loop re-checks before
+            // creating each pair (defense in depth, no TOCTOU window).
+            let mut live_links = live_links;
             (|| {
                 owner.note_gate_open_observed()?;
                 let domain = owner.arm_domain(admitted[0].tgid)?;
@@ -2361,8 +2452,22 @@ impl ProviderSession {
                         return Err(ObservationGap::SnapshotLag);
                     }
                     budget.checkpoint()?;
+                    // ER-S2-I1: the legacy loop checks `max_links` before
+                    // creating each pair; an over-limit order refuses here
+                    // instead of adopting excess links.
+                    if live_links.checked_add(2).ok_or(ObservationGap::LinkLimit)? > max_links {
+                        owner.note_refusal(format!(
+                            "link budget refused: attachment {}/{} needs 2 more within {max_links}",
+                            index + 1,
+                            scopes.len(),
+                        ));
+                        return Err(ObservationGap::LinkLimit);
+                    }
                     match owner.register_entry_return(scope, entry_prog, return_prog, &anchor) {
-                        Ok(registration) => registrations.push(registration),
+                        Ok(registration) => {
+                            registrations.push(registration);
+                            live_links = live_links.saturating_add(2);
+                        }
                         Err(error) => {
                             if scopes.len() > 1 {
                                 owner.context_last_error(&format!(
@@ -2572,10 +2677,11 @@ impl ProviderSession {
                 .ok_or(ObservationGap::ProcessLimit)?;
             generation
         };
+        // Filter to the exact new attachments first, so the complete-order
+        // link reservation below neither double-counts duplicates nor
+        // leaves a partial prearm on refusal (ER-S2-I1).
+        let mut to_add = Vec::with_capacity(resolved.len());
         for (api, site) in resolved {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
-                return Err(ObservationGap::SnapshotLag);
-            }
             let pid = site.pid();
             if self
                 .startup
@@ -2597,6 +2703,27 @@ impl ProviderSession {
             {
                 continue;
             }
+            to_add.push((api, site));
+        }
+        // Reserve the complete prearm order before any effect: live links
+        // plus planned reserve pairs plus this batch must fit `max_links`.
+        let need = to_add
+            .len()
+            .checked_mul(2)
+            .ok_or(ObservationGap::LinkLimit)?;
+        if self
+            .link_pressure()
+            .checked_add(need)
+            .ok_or(ObservationGap::LinkLimit)?
+            > self.budget.limits.max_links
+        {
+            return Err(ObservationGap::LinkLimit);
+        }
+        for (api, site) in to_add {
+            if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
+                return Err(ObservationGap::SnapshotLag);
+            }
+            let pid = site.pid();
             let advertisers = if api == c::PROVIDER_INIT {
                 vec![site.object_hash().clone()]
             } else {
@@ -6502,6 +6629,15 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     /// (both legacy attachments, Reserve) and typed preparation, gate
     /// opened, child still held. Asserts the two-attachment premise.
     fn multi_attachment_setup(tag: &str) -> MultiAttachmentSetup {
+        multi_attachment_setup_with_session_limits(tag, ObservationLimits::default())
+    }
+    /// Same as `multi_attachment_setup` but with custom session limits
+    /// applied after discovery (discovery itself runs under the default
+    /// budget, so a small `max_links` only constrains prearm/acquire).
+    fn multi_attachment_setup_with_session_limits(
+        tag: &str,
+        session_limits: ObservationLimits,
+    ) -> MultiAttachmentSetup {
         let dir = std::env::temp_dir().join(format!(
             "osslscope-multi-{tag}-{}-{}",
             std::process::id(),
@@ -6538,6 +6674,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "dual-API fixture must yield two legacy sites"
         );
         assert_eq!(typed.len(), 1, "dual-API fixture keeps one typed export");
+        budget.limits = session_limits;
         let object =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
         budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
@@ -7093,6 +7230,517 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         drop(setup.gate);
         drop(setup.child);
         std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_prearm_reserve_counts_planned_links() {
+        // ER-S2-I1 prearm: reserve-only prearms count two planned links
+        // each against `max_links`, and the complete prearm order reserves
+        // before any effect (no partial prearm on refusal). Dual-API
+        // fixture yields two legacy sites, so max 4 fits exactly while
+        // max 3 and max 2 (the counterexample shape) refuse with LinkLimit
+        // and zero startup attachments.
+        for (max_links, expect_ok) in [(4usize, true), (3, false), (2, false)] {
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-prearm-link-{max_links}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let app = source_native_dual_api_fixture(&dir);
+            let marker = dir.join("marker");
+            let argv = vec![
+                app.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            let mut child =
+                crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                    .unwrap();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut budget = ObservationBudget::default();
+            let startup = crate::startup_objects::prepare_owned_startup(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(120),
+                &cancel,
+                None,
+            )
+            .unwrap();
+            let crate::startup_objects::PreExecSites {
+                apis,
+                typed,
+                candidates,
+                ..
+            } = startup;
+            assert_eq!(apis.len(), 2, "dual-API fixture must yield two sites");
+            drop(typed);
+            drop(candidates);
+            budget.limits.max_links = max_links;
+            let object =
+                std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap())
+                    .unwrap();
+            budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+            let pool = budget.memory.clone().unwrap_or_else(|| {
+                crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+            });
+            let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+            let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+            let pid = child.pid();
+            let result = session.prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            );
+            if expect_ok {
+                result.unwrap_or_else(|gap| {
+                    panic!("max_links={max_links} must fit two reserves: {gap:?}")
+                });
+                assert_eq!(
+                    session.startup.get(&pid).map_or(0, Vec::len),
+                    2,
+                    "max_links={max_links} prearms both reserves"
+                );
+                assert_eq!(session.link_pressure(), 4, "two reserves pressure 4");
+            } else {
+                assert_eq!(
+                    result.unwrap_err(),
+                    ObservationGap::LinkLimit,
+                    "max_links={max_links} must refuse two reserves"
+                );
+                assert_eq!(
+                    session.startup.get(&pid).map_or(0, Vec::len),
+                    0,
+                    "max_links={max_links} leaves no partial prearm"
+                );
+            }
+            child.release().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            while child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until, "workload never exited");
+                std::thread::yield_now();
+            }
+            assert_eq!(child.poll_exit().unwrap(), Some(0));
+            drop(session);
+            drop(gate);
+            drop(child);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_acquire_link_budget_exact_fits() {
+        // ER-S2-I1 acquisition exact-fit: dual-API needs 6 links (two
+        // legacy pairs + one typed pair); max 6 fits exactly with 6
+        // adoptions.
+        let baseline = source_native_fd_targets();
+        {
+            let mut setup = multi_attachment_setup("link-exact");
+            let pid = setup.child.pid();
+            let marker = setup.dir.join("marker");
+            setup.session.budget.limits.max_links = 6;
+            let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+                super::source_owner::NativeSourceParams::for_test_multi(
+                    setup
+                        .admitted_offsets
+                        .iter()
+                        .map(|offset| (setup.app.clone(), *offset, pid))
+                        .collect(),
+                ),
+            );
+            let receipts = setup
+                .session
+                .acquire_source_after_open(
+                    &lease,
+                    Instant::now() + Duration::from_secs(15),
+                    &setup.cancel,
+                )
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "max_links=6 must fit the dual-API order: {gap:?} owner: {:?}",
+                        setup.session.source_error()
+                    )
+                });
+            assert_eq!(receipts.attachments.len(), 2);
+            assert_eq!(receipts.adopted_links, 6, "two legacy pairs + typed pair");
+            setup.child.release().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(body) = std::fs::read(&marker) {
+                    if body == b"exec\n" {
+                        break;
+                    }
+                }
+                assert!(Instant::now() < until, "exec marker never carried exec");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            while setup.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until, "workload never exited");
+                std::thread::yield_now();
+            }
+            assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+            setup
+                .session
+                .note_source_exec(&lease, pid, receipts.domain.planned)
+                .unwrap();
+            setup.gate.close().unwrap();
+            let close = setup.session.close_source_explicit().expect("source close");
+            assert!(close.cut_confirmed);
+            assert_eq!(
+                (
+                    close.guards_retired,
+                    close.guards_abandoned,
+                    close.domains_retired
+                ),
+                (4, 0, 1),
+                "anchor plus three registrations retire"
+            );
+            drop(setup.session);
+            drop(setup.gate);
+            drop(setup.child);
+            assert_eq!(
+                source_native_fd_targets(),
+                baseline,
+                "exact-fit teardown must release every fd"
+            );
+            std::fs::remove_dir_all(&setup.dir).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_acquire_link_budget_over_refuses() {
+        // ER-S2-I1 acquisition over-limit: max 5 and max 2 (the dual-API
+        // counterexample shape) refuse with LinkLimit, zero adoptions and
+        // a link-budget diagnosis, before any kernel effect.
+        // Over-limit: max 5 and max 2 refuse before any effect.
+        for max_links in [5usize, 2] {
+            let mut setup = multi_attachment_setup(&format!("link-over-{max_links}"));
+            let pid = setup.child.pid();
+            setup.session.budget.limits.max_links = max_links;
+            let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+                super::source_owner::NativeSourceParams::for_test_multi(
+                    setup
+                        .admitted_offsets
+                        .iter()
+                        .map(|offset| (setup.app.clone(), *offset, pid))
+                        .collect(),
+                ),
+            );
+            let error = match setup.session.acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            ) {
+                Ok(_) => panic!("max_links={max_links} must refuse the dual-API order"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                ObservationGap::LinkLimit,
+                "max_links={max_links} gap"
+            );
+            assert_eq!(
+                setup
+                    .session
+                    .source_owner
+                    .as_ref()
+                    .expect("source owner")
+                    .adopted_link_count(),
+                0,
+                "max_links={max_links} adopts nothing (counterexample: buggy code adopted 4)"
+            );
+            let diagnosis = setup.session.source_error().expect("refusal diagnosis");
+            assert!(
+                diagnosis.contains("link budget refused"),
+                "max_links={max_links} diagnosis names the link budget: {diagnosis}"
+            );
+            setup.child.release().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            while setup.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until, "workload never exited");
+                std::thread::yield_now();
+            }
+            assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+            setup.gate.close().unwrap();
+            let close = setup.session.close_source_explicit().expect("source close");
+            assert!(close.order_refused, "the refused order must refuse");
+            assert_eq!(
+                (
+                    close.guards_retired,
+                    close.guards_abandoned,
+                    close.domains_retired
+                ),
+                (0, 0, 0),
+                "refusal before any effect retires nothing"
+            );
+            drop(setup.session);
+            drop(setup.gate);
+            drop(setup.child);
+            std::fs::remove_dir_all(&setup.dir).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_admission_small_budget_refuses_and_exact_admits() {
+        // ER-S2-I2 admission: the matching/admission buffers charge the
+        // caller budget before allocation. A budget one byte below the
+        // admission charge refuses with StateLimit through the real
+        // admission path; the exact byte admits both attachments.
+        for (tight, expect_ok) in [(true, false), (false, true)] {
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-admit-budget-{}-{}-{}",
+                if tight { "tight" } else { "exact" },
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir(&dir).unwrap();
+            let app = source_native_dual_api_fixture(&dir);
+            let marker = dir.join("marker");
+            let argv = vec![
+                app.to_string_lossy().into_owned(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            let mut child =
+                crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                    .unwrap();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let mut budget = ObservationBudget::default();
+            let startup = crate::startup_objects::prepare_owned_startup(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(120),
+                &cancel,
+                None,
+            )
+            .unwrap();
+            let crate::startup_objects::PreExecSites {
+                apis,
+                typed,
+                candidates,
+                ..
+            } = startup;
+            assert_eq!(apis.len(), 2);
+            drop(typed);
+            drop(candidates);
+            budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+            let pool = budget.memory.clone().unwrap_or_else(|| {
+                crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+            });
+            let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+            let mut session = ProviderSession::open_gated(
+                budget,
+                &std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap())
+                    .unwrap(),
+                gate.clone(),
+            )
+            .unwrap();
+            session
+                .prearm_startup(
+                    apis,
+                    Instant::now() + Duration::from_secs(5),
+                    &cancel,
+                    PrearmLinks::Reserve,
+                )
+                .unwrap();
+            let pid = child.pid();
+            assert_eq!(session.startup[&pid].len(), 2);
+            let charge = super::source_owner::multi_attachment_admission_charge(2).unwrap();
+            let spent = session.budget.state_spent_test();
+            session.budget.limits.max_state_bytes = if tight {
+                spent + charge - 1
+            } else {
+                spent + charge
+            };
+            let triples = session.startup[&pid]
+                .iter()
+                .map(|a| (app.clone(), a.site.file_offset(), pid))
+                .collect::<Vec<_>>();
+            let result = multi_admit(&session, triples);
+            if expect_ok {
+                let admitted = result
+                    .unwrap_or_else(|gap| panic!("exact admission budget must admit: {gap:?}"));
+                assert_eq!(admitted.len(), 2);
+                drop(admitted);
+            } else {
+                let error = match result {
+                    Ok(_) => panic!("tight admission budget must refuse"),
+                    Err(error) => error,
+                };
+                assert_eq!(
+                    error,
+                    ObservationGap::StateLimit,
+                    "tight admission budget must refuse"
+                );
+            }
+            child.release().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            while child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until, "workload never exited");
+                std::thread::yield_now();
+            }
+            assert_eq!(child.poll_exit().unwrap(), Some(0));
+            drop(session);
+            drop(gate);
+            drop(child);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_acquisition_small_budget_refuses() {
+        // ER-S2-I2 acquisition tight: a budget one byte below the
+        // acquisition charge refuses with StateLimit and zero adoptions
+        // through the real acquisition path.
+        let admission = super::source_owner::multi_attachment_admission_charge(2).unwrap();
+        let acquisition = super::source_owner::multi_attachment_acquisition_charge(2).unwrap();
+        // Tight: admission fits but the acquisition buffers refuse.
+        {
+            let mut setup = multi_attachment_setup("acq-tight");
+            let pid = setup.child.pid();
+            let spent = setup.session.budget.state_spent_test();
+            setup.session.budget.limits.max_state_bytes = spent + admission + acquisition - 1;
+            let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+                super::source_owner::NativeSourceParams::for_test_multi(
+                    setup
+                        .admitted_offsets
+                        .iter()
+                        .map(|offset| (setup.app.clone(), *offset, pid))
+                        .collect(),
+                ),
+            );
+            let error = match setup.session.acquire_source_after_open(
+                &lease,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            ) {
+                Ok(_) => panic!("tight acquisition budget must refuse"),
+                Err(error) => error,
+            };
+            assert_eq!(error, ObservationGap::StateLimit, "tight gap");
+            assert_eq!(
+                setup
+                    .session
+                    .source_owner
+                    .as_ref()
+                    .expect("source owner")
+                    .adopted_link_count(),
+                0,
+                "tight acquisition adopts nothing"
+            );
+            let diagnosis = setup.session.source_error().expect("refusal diagnosis");
+            assert!(
+                diagnosis.contains("acquisition buffers refused"),
+                "diagnosis names the acquisition buffers: {diagnosis}"
+            );
+            setup.child.release().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            while setup.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until, "workload never exited");
+                std::thread::yield_now();
+            }
+            assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+            setup.gate.close().unwrap();
+            let close = setup.session.close_source_explicit().expect("source close");
+            assert!(close.order_refused);
+            assert_eq!(
+                (
+                    close.guards_retired,
+                    close.guards_abandoned,
+                    close.domains_retired
+                ),
+                (0, 0, 0),
+            );
+            drop(setup.session);
+            drop(setup.gate);
+            drop(setup.child);
+            std::fs::remove_dir_all(&setup.dir).unwrap();
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn multi_attachment_acquisition_small_budget_exact_fits() {
+        // ER-S2-I2 acquisition exact-fit: the full-order budget
+        // (admission + acquisition + the typed per-site charge) fits with
+        // 6 adoptions.
+        let admission = super::source_owner::multi_attachment_admission_charge(2).unwrap();
+        let acquisition = super::source_owner::multi_attachment_acquisition_charge(2).unwrap();
+        // Exact: the full order fits with 6 adoptions.
+        {
+            let mut setup = multi_attachment_setup("acq-exact");
+            let pid = setup.child.pid();
+            let marker = setup.dir.join("marker");
+            let spent = setup.session.budget.state_spent_test();
+            // One typed site at 512 + 96, matching `acquire_typed_sites`.
+            setup.session.budget.limits.max_state_bytes =
+                spent + admission + acquisition + 512 + 96;
+            let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+                super::source_owner::NativeSourceParams::for_test_multi(
+                    setup
+                        .admitted_offsets
+                        .iter()
+                        .map(|offset| (setup.app.clone(), *offset, pid))
+                        .collect(),
+                ),
+            );
+            let receipts = setup
+                .session
+                .acquire_source_after_open(
+                    &lease,
+                    Instant::now() + Duration::from_secs(15),
+                    &setup.cancel,
+                )
+                .unwrap_or_else(|gap| {
+                    panic!(
+                        "exact acquisition budget must fit: {gap:?} owner: {:?}",
+                        setup.session.source_error()
+                    )
+                });
+            assert_eq!(receipts.attachments.len(), 2);
+            assert_eq!(receipts.adopted_links, 6);
+            setup.child.release().unwrap();
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(body) = std::fs::read(&marker) {
+                    if body == b"exec\n" {
+                        break;
+                    }
+                }
+                assert!(Instant::now() < until, "exec marker never carried exec");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            while setup.child.peek_exit().unwrap().is_none() {
+                assert!(Instant::now() < until, "workload never exited");
+                std::thread::yield_now();
+            }
+            assert_eq!(setup.child.poll_exit().unwrap(), Some(0));
+            setup
+                .session
+                .note_source_exec(&lease, pid, receipts.domain.planned)
+                .unwrap();
+            setup.gate.close().unwrap();
+            let close = setup.session.close_source_explicit().expect("source close");
+            assert!(close.cut_confirmed);
+            assert_eq!(
+                (
+                    close.guards_retired,
+                    close.guards_abandoned,
+                    close.domains_retired
+                ),
+                (4, 0, 1),
+            );
+            drop(setup.session);
+            drop(setup.gate);
+            drop(setup.child);
+            std::fs::remove_dir_all(&setup.dir).unwrap();
+        }
     }
     fn multi_admit(
         session: &ProviderSession,

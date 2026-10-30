@@ -446,6 +446,39 @@ pub(crate) struct SourceCloseReceipts {
     pub first_error: Option<ObservationGap>,
 }
 
+/// Conservative caller-budget charges for the multi-attachment order
+/// buffers (ER-S2-I2). Both phases charge through `budget.state` before
+/// allocating, so a tight budget refuses with `StateLimit` before any
+/// kernel effect; the charges are permanent (session lifetime outlives
+/// the returned receipts). Each formula is 2x the capacity-measured heap
+/// plus a 1 KiB base covering vector shells and allocator rounding, in
+/// the `plan_arrays_charge` style. `None` on overflow (fail closed).
+///
+/// Admission peak for `n` claimed attachments: the `matched` bitmap, the
+/// admitted-sites vector, and one cloned 64-byte artifact hash per site.
+pub(crate) fn multi_attachment_admission_charge(n: usize) -> Option<usize> {
+    let per_site = 1usize
+        .checked_add(std::mem::size_of::<AdmittedSourceSite>())?
+        .checked_add(64)?;
+    let heap = n.checked_mul(per_site)?;
+    1024usize.checked_add(heap.checked_mul(2)?)
+}
+
+/// Acquisition peak for `n` admitted legacy attachments: the scope,
+/// registration, sequence and returned-attachment vectors, the transient
+/// backing-identity scratch, and one hash heap per scope (conservatively
+/// re-charged even though the admission hash moves into the scope).
+pub(crate) fn multi_attachment_acquisition_charge(n: usize) -> Option<usize> {
+    let per_site = std::mem::size_of::<RequestScope>()
+        .checked_add(64)?
+        .checked_add(std::mem::size_of::<RegistrationAdopted>())?
+        .checked_add(std::mem::size_of::<u64>())?
+        .checked_add(std::mem::size_of::<AttachmentEstablished>())?
+        .checked_add(std::mem::size_of::<(u64, u64)>())?;
+    let heap = n.checked_mul(per_site)?;
+    1024usize.checked_add(heap.checked_mul(2)?)
+}
+
 /// Decode a validated artifact hash to its raw bytes. Runs only after a
 /// fault-safe capture proved the mapped bytes hash to this exact value, so
 /// the result names the anchored mapping, never a re-read.
@@ -2311,6 +2344,40 @@ mod tests {
         owner.note_refusal("first".into());
         owner.note_refusal("second".into());
         assert_eq!(owner.take_last_error().as_deref(), Some("second"));
+    }
+    #[test]
+    fn multi_attachment_charges_cover_capacity_measured_worst_case_heap() {
+        // ER-S2-I2 worst-case heap proof for the new multi-attachment
+        // buffers: at full registration admission (1024) and at the real
+        // 38-attachment order, each phase charge must cover its
+        // capacity-measured heap (vector buffers at capacity plus one
+        // 64-byte artifact hash heap per site) with margin to spare.
+        // Unprivileged and hermetic: pure arithmetic over `size_of`.
+        for n in [2usize, 38, 1024] {
+            let admission = multi_attachment_admission_charge(n).unwrap();
+            let admission_heap = n
+                + n * std::mem::size_of::<AdmittedSourceSite>()
+                + n * 64
+                + 2 * std::mem::size_of::<Vec<u8>>();
+            assert!(
+                admission >= admission_heap,
+                "admission charge {admission} must cover heap {admission_heap} at n={n}"
+            );
+            let acquisition = multi_attachment_acquisition_charge(n).unwrap();
+            let acquisition_heap = n * std::mem::size_of::<RequestScope>()
+                + n * 64
+                + n * std::mem::size_of::<RegistrationAdopted>()
+                + n * std::mem::size_of::<u64>()
+                + n * std::mem::size_of::<AttachmentEstablished>()
+                + n * std::mem::size_of::<(u64, u64)>()
+                + 5 * std::mem::size_of::<Vec<u8>>();
+            assert!(
+                acquisition >= acquisition_heap,
+                "acquisition charge {acquisition} must cover heap {acquisition_heap} at n={n}"
+            );
+        }
+        assert!(multi_attachment_admission_charge(usize::MAX).is_none());
+        assert!(multi_attachment_acquisition_charge(usize::MAX).is_none());
     }
     #[test]
     fn anchor_source_truncation_returns_gap_never_faults() {
