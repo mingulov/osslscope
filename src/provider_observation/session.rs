@@ -4177,6 +4177,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// closed attribution collect. Counts only; no addresses, no digests.
     struct TypedCounterDrive {
         typed_sites: usize,
+        copied_skipped: usize,
         counter_links: usize,
         joined_sites: usize,
         joined_calls: u64,
@@ -4235,6 +4236,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
             startup.copied_skipped,
         );
         assert!(!startup.typed.is_empty(), "fixture must yield typed sites");
+        let copied_skipped = startup.copied_skipped;
         let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
         let object =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
@@ -4508,6 +4510,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
         staged_roles.sort_unstable();
         let drive = TypedCounterDrive {
             typed_sites,
+            copied_skipped,
             counter_links,
             joined_sites,
             joined_calls,
@@ -4967,6 +4970,10 @@ int main(int argc, char **argv) {
         );
         assert_eq!(drive.typed_sites, 25);
         assert_eq!(
+            drive.copied_skipped, 0,
+            "pass-2 rescan agrees with the pass-1 plan on all 11 sites"
+        );
+        assert_eq!(
             drive.counter_links, 1,
             "one multi-link batches the six sites"
         );
@@ -4991,6 +4998,80 @@ int main(int argc, char **argv) {
             drive.loss_cells,
             [0, 0, 0, 1, 0, 0, 0, 0],
             "cell 3 is the by-design Phase-1 teardown poison from the 155 OPENSSL_cleanup entry (the chain's last call); every other cell stays zero"
+        );
+    }
+    /// U2 operational-attach control: same two-pass staging as U1, but the
+    /// pass-2 counter attaches at the four operational sites (304 init,
+    /// 305 update, 306 final, 307 derive) instead of the lifecycle six.
+    /// The first partitions prove the same-handler join end to end: every
+    /// operational hit resolves (admission, CODE_ROLE authorization,
+    /// committed X and OWNER at the entry snapshot, prepared selector,
+    /// live digest) into a definite record. Lifecycle coverage stays
+    /// U1's; U2 counts operational only, so the unresolved remainder
+    /// carries just the teardown-poison foreign bound.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     operational_roles_partition_from_staged_callbacks --nocapture
+    /// ```
+    #[test]
+    #[ignore = "operational-attach control (sudo, cc)"]
+    fn operational_roles_partition_from_staged_callbacks() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-u2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(plan.sites.len(), 11, "same U1 plan: MAC 6 + KDF 5");
+        let drive = drive_typed_session_with_counter(
+            "u2",
+            &app,
+            &[304, 305, 306, 307],
+            Some(&plan),
+            "marker2",
+        );
+        assert_eq!(
+            drive.staged_roles,
+            vec![
+                130, 131, 136, 137, 146, 147, 148, 149, 150, 151, 152, 153, 155, 161, 258, 259,
+                274, 275, 290, 291, 304, 305, 306, 307, 308,
+            ],
+            "13 first-slice + query + 11 copied"
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.copied_skipped, 0,
+            "pass-2 rescan agrees with the pass-1 plan on all 11 sites"
+        );
+        assert_eq!(
+            drive.counter_links, 1,
+            "one multi-link batches the four sites"
+        );
+        assert_eq!(drive.joined_sites, 4, "all four counted sites join");
+        assert_eq!(
+            drive.joined_calls, 4,
+            "1 init + 1 update + 1 final + 1 derive"
+        );
+        assert_eq!(
+            drive.definite, 4,
+            "first partitions: every operational hit resolves to a definite record"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 1,
+            "physical all assigned; only the teardown-poison foreign bound remains"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 4);
+        assert_eq!(drive.sample_calls, 4);
+        assert_eq!(
+            drive.next_producer_id, 49,
+            "U1's 44 mints plus 4 operational segment allocs, counter starts at 1"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
         );
     }
     /// P3-I1 single-typed-site fixture: the query/dispatch shape of
