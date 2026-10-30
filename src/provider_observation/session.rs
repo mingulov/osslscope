@@ -4205,7 +4205,7 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// the complete-chain fixture selects its live-table mode from that
     /// word (`mutate-kdf-table`/other: I2 drop44 + direct reset + second
     /// derive; `i1-swap45`/`i1-swap34`: alternate advertisement;
-    /// `i3-drop45`: omitted (4,5)).
+    /// `i3-drop45`: omitted (4,5); `i1-remap45:<nonce>`: remap race).
     fn drive_typed_session_with_counter(
         tag: &str,
         app: &std::path::Path,
@@ -4687,23 +4687,44 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// so exit 0 plus the exec marker oracles the public chain. Callback
     /// bodies differ pairwise (distinct constants) so no toolchain fold
     /// can merge two callbacks onto one address.
-    /// Complete-chain C template shared by the standard and firstbyte
-    /// fixtures. `DERIVE_ATTR` marks the derive definition's attribute
-    /// slot: empty for the standard build, a section attribute isolating
-    /// the derive for the firstbyte link. Live-table modes by third argv
-    /// word: none (2-arg) normal; `mutate-kdf-table` or any other word
-    /// drops (4,4) from the live KDF table and drives the direct reset +
-    /// second derive (I2); `i1-swap45`/`i1-swap34` advertise an
-    /// alternate same-file callback the static plan never stages (I1);
-    /// `i3-drop45` omits (4,5) from the live table (I3). Every mode
+    /// Complete-chain C template shared by the standard, firstbyte
+    /// and remap fixtures. `DERIVE_ATTR` marks the derive definition's
+    /// attribute slot: empty for the standard build, a section attribute
+    /// isolating the derive for the firstbyte link (`.text.i2first`)
+    /// or the remap link (`.text.remapx`); the remap link
+    /// additionally isolates the derive's byte-twin
+    /// `test_kdf_derive_y` (defined inside `#ifdef REMAP_RACE`) in
+    /// `.text.remapy`. Live-table modes by
+    /// third argv word: none (2-arg) normal; `mutate-kdf-table` or any
+    /// other word drops (4,4) from the live KDF table and drives the
+    /// direct reset + second derive (I2); `i1-swap45`/`i1-swap34`
+    /// advertise an alternate same-file callback the static plan never
+    /// stages (I1); `i3-drop45` omits (4,5) from the live table (I3);
+    /// `i1-remap45:<nonce>` (remap build only, `REMAP_RACE`) races a
+    /// page toggle against derive calls (remap control). Every mode
     /// exits 0 on the public chain. Callback bodies differ pairwise
     /// (distinct constants) so no toolchain fold can merge two
-    /// callbacks onto one address.
+    /// callbacks onto one address. The KDF derive body is shared via
+    /// the `KDF_DERIVE_BODY` macro (call-free volatile fill, behavior
+    /// identical to the old memset form) so the remap link's byte-twin
+    /// cannot skew from it; the twin's page bytes must equal the
+    /// derive page's (verified, not trusted, by the remap control),
+    /// which is what keeps mid-toggle execution sound. All other
+    /// remap-only C lives inside `#ifdef REMAP_RACE`.
     fn complete_chain_c_template() -> &'static str {
         r#"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef REMAP_RACE
+#include <sys/mman.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <time.h>
+#include <stdatomic.h>
+#endif
 struct dispatch { int id; void (*fn)(void); };
 struct algorithm { const char *names, *properties; const struct dispatch *implementation; const char *description; };
 __attribute__((noinline)) void *test_mac_newctx(void *c) { (void)c; __asm__ volatile(""); void *x = malloc(32); if (x) memset(x, 0xA1, 32); return x; }
@@ -4716,8 +4737,12 @@ __attribute__((noinline)) void *test_kdf_newctx(void *c) { (void)c; __asm__ vola
 __attribute__((noinline)) void *test_kdf_dupctx(void *x) { (void)x; __asm__ volatile(""); void *y = malloc(32); if (y) memset(y, 0xB2, 32); return y; }
 __attribute__((noinline)) void test_kdf_freectx(void *x) { __asm__ volatile(""); free(x); volatile int sink = 0; (void)sink; }
 __attribute__((noinline)) void test_kdf_reset(void *x) { (void)x; __asm__ volatile(""); }
-__attribute__((noinline)) DERIVE_ATTRint test_kdf_derive(void *x, void *out, unsigned long len) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC7, len < 32 ? len : 32); return 1; }
+#define KDF_DERIVE_BODY { (void)x; __asm__ volatile(""); volatile unsigned char *p = (volatile unsigned char *)out; unsigned long n = len < 32 ? len : 32; if (p) { for (unsigned long i = 0; i < n; i++) p[i] = 0xC7; } return 1; }
+__attribute__((noinline)) DERIVE_ATTRint test_kdf_derive(void *x, void *out, unsigned long len) KDF_DERIVE_BODY
 __attribute__((noinline)) int test_kdf_derive_alt(void *x, void *out, unsigned long len) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC9, len < 32 ? len : 32); return 1; }
+#ifdef REMAP_RACE
+__attribute__((noinline, used, section(".text.remapy"))) int test_kdf_derive_y(void *x, void *out, unsigned long len) KDF_DERIVE_BODY
+#endif
 __attribute__((noinline)) int test_mac_init_alt(void *x, int v) { (void)x; __asm__ volatile(""); return v + 7; }
 static const struct dispatch mac_dispatch[] = {
  { 1, (void(*)(void))test_mac_newctx }, { 2, (void(*)(void))test_mac_dupctx }, { 3, (void(*)(void))test_mac_freectx },
@@ -4800,6 +4825,100 @@ int test_mac_update_call(void *u, const void *in, unsigned long len) { return te
 int test_mac_final_call(void *u, void *out) { return test_mac_final(((FAKE_CTX *)u)->data, out); }
 int test_kdf_derive_call(void *u, void *out, unsigned long len) { return test_kdf_derive(((FAKE_CTX *)u)->data, out, len); }
 void OPENSSL_cleanup(void) { __asm__ volatile(""); }
+#ifdef REMAP_RACE
+static atomic_int g_remap_stop = 0;
+static unsigned long g_remap_toggles = 0;
+static void *g_remap_page;
+static unsigned long g_remap_off_x, g_remap_off_y;
+static int g_remap_fd = -1;
+static int remap_page_offset(void *addr, unsigned long *out) {
+ FILE *f = fopen("/proc/self/maps", "r");
+ if (!f) return -1;
+ char *line = 0; size_t n = 0;
+ unsigned long want = (unsigned long)addr & ~(4095UL);
+ int rc = -1;
+ while (getline(&line, &n, f) > 0) {
+  unsigned long lo, hi, off; char perms[8];
+  if (sscanf(line, "%lx-%lx %7s %lx", &lo, &hi, perms, &off) == 4) {
+   if (want >= lo && want < hi) { *out = off + (want - lo); rc = 0; break; }
+  }
+ }
+ free(line); fclose(f);
+ return rc;
+}
+static int remap_map(unsigned long off) {
+ void *r = mmap(g_remap_page, 4096, PROT_READ | PROT_EXEC, MAP_FIXED | MAP_PRIVATE, g_remap_fd, (off_t)off);
+ return r == MAP_FAILED ? -1 : 0;
+}
+static int remap_phase_a(void) {
+ if (sysconf(_SC_PAGESIZE) != 4096) return -1;
+ if ((((unsigned long)test_kdf_derive) & 4095UL) != (((unsigned long)test_kdf_derive_y) & 4095UL)) return -1;
+ g_remap_page = (void *)(((unsigned long)test_kdf_derive) & ~(4095UL));
+ if (remap_page_offset((void *)test_kdf_derive, &g_remap_off_x) != 0) return -1;
+ if (remap_page_offset((void *)test_kdf_derive_y, &g_remap_off_y) != 0) return -1;
+ if (!g_remap_off_x || !g_remap_off_y || g_remap_off_x == g_remap_off_y) return -1;
+ g_remap_fd = open("/proc/self/exe", O_RDONLY);
+ if (g_remap_fd < 0) return -1;
+ return remap_map(g_remap_off_y);
+}
+static void *remap_toggler(void *unused) {
+ (void)unused;
+ int which = 0;
+ while (!atomic_load(&g_remap_stop)) {
+  unsigned long off = which ? g_remap_off_y : g_remap_off_x;
+  which ^= 1;
+  if (remap_map(off) != 0) _exit(8);
+  g_remap_toggles++;
+ }
+ return 0;
+}
+static int remap_race(void *ku, const char *mode_arg) {
+ unsigned char out[32];
+ unsigned long x_exec = 0;
+ int i;
+ for (i = 0; i < 3; i++) {
+  memset(out, 0, sizeof out);
+  if (test_kdf_derive_call(ku, out, 32) != 1 || out[0] != 0xC7) return -1;
+  x_exec++;
+ }
+ pthread_t th;
+ atomic_store(&g_remap_stop, 0);
+ unsigned long toggles_before = g_remap_toggles;
+ if (pthread_create(&th, 0, remap_toggler, 0) != 0) return -1;
+ struct timespec tick = { 0, 5000 };
+ for (i = 0; i < 100000; i++) {
+  if (clock_nanosleep(CLOCK_MONOTONIC, 0, &tick, 0) != 0) { atomic_store(&g_remap_stop, 1); pthread_join(th, 0); return -1; }
+  memset(out, 0, sizeof out);
+  if (test_kdf_derive_call(ku, out, 32) != 1 || out[0] != 0xC7) { atomic_store(&g_remap_stop, 1); pthread_join(th, 0); return -1; }
+  x_exec++;
+ }
+ atomic_store(&g_remap_stop, 1);
+ pthread_join(th, 0);
+ unsigned long toggles_during = g_remap_toggles - toggles_before;
+ if (remap_map(g_remap_off_x) != 0) return -1;
+ const char *colon = strchr(mode_arg, ':');
+ if (!colon || !colon[1]) return -1;
+ const char *nonce = colon + 1;
+ size_t nlen = strlen(nonce);
+ if (nlen == 0 || nlen > 64) return -1;
+ for (size_t k = 0; k < nlen; k++) {
+  char c = nonce[k];
+  if (!((c >= '0' && c <= '9') || c == '-' || c == '_')) return -1;
+ }
+ const char *tmp = getenv("TMPDIR");
+ if (!tmp || !*tmp) tmp = "/tmp";
+ char path[512];
+ int w = snprintf(path, sizeof path, "%s/osslscope-remap-%s.stats", tmp, nonce);
+ if (w < 0 || (size_t)w >= sizeof path) return -1;
+ FILE *sf = fopen(path, "w");
+ if (!sf) return -1;
+ fprintf(sf, "toggles=%lu x_exec=%lu\n", toggles_during, x_exec);
+ if (fclose(sf) != 0) return -1;
+ close(g_remap_fd);
+ g_remap_fd = -1;
+ return 0;
+}
+#endif
 int main(int argc, char **argv) {
  if (argc < 2 || argc > 3) return 2;
  FILE *f = fopen(argv[1], "w"); if (!f) return 4; fputs("exec\n", f); fclose(f);
@@ -4810,12 +4929,21 @@ int main(int argc, char **argv) {
   if (!strcmp(argv[2], "i1-swap45")) g_table_mode = 2;
   else if (!strcmp(argv[2], "i1-swap34")) g_table_mode = 3;
   else if (!strcmp(argv[2], "i3-drop45")) g_table_mode = 4;
+#ifdef REMAP_RACE
+  else if (!strncmp(argv[2], "i1-remap45", 10)) g_table_mode = 5;
+#endif
   else g_table_mode = 1;
  }
+#ifdef REMAP_RACE
+ if (g_table_mode == 5 && remap_phase_a() != 0) return 6;
+#endif
  int nc = -1;
  if (OSSL_PROVIDER_query_operation(fake_provider, 3, &nc) == 0 || nc != 0) return 3;
  nc = -1;
  if (OSSL_PROVIDER_query_operation(fake_provider, 4, &nc) == 0 || nc != 0) return 3;
+#ifdef REMAP_RACE
+ if (g_table_mode == 5 && remap_map(g_remap_off_x) != 0) return 6;
+#endif
  void *m = EVP_MAC_fetch(fake_libctx, "FAKE-MAC", 0); if (!m) return 3;
  void *k = EVP_KDF_fetch(fake_libctx, "FAKE-KDF", 0); if (!k) return 3;
  void *u = EVP_MAC_CTX_new(m); if (!u) return 3;
@@ -4827,6 +4955,9 @@ int main(int argc, char **argv) {
  unsigned char out[16];
  if (test_mac_final_call(u, out) != 1 || out[0] != 0xC3) return 3;
  unsigned char kout[32];
+#ifdef REMAP_RACE
+ if (g_table_mode == 5) { if (remap_race(ku, argv[2]) != 0) return 3; } else
+#endif
  if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3;
  if (g_table_mode == 1) test_kdf_reset(((FAKE_CTX *)ku)->data); else EVP_KDF_CTX_reset(ku);
  if (g_table_mode == 1) { if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3; }
@@ -4909,6 +5040,46 @@ int main(int argc, char **argv) {
         assert!(status.success(), "firstbyte fixture must compile");
         app
     }
+    /// Remap complete-chain fixture: the same chain with the KDF derive
+    /// isolated in `.text.remapx` and its byte-twin `test_kdf_derive_y`
+    /// in `.text.remapy`, each page-aligned on its own page with the
+    /// symbol first (same in-page offset), plus the `REMAP_RACE`
+    /// page-toggle machinery and pthreads. The control verifies the
+    /// placement premises from the ELF before driving (including
+    /// byte-identical page contents, which is what keeps mid-toggle
+    /// execution sound), and refuses loudly if the toolchain
+    /// surprises.
+    fn source_native_remap_chain_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        let script = dir.join("remap.ld");
+        let rendered = complete_chain_c_template()
+            .replace("DERIVE_ATTR", "__attribute__((section(\".text.remapx\"))) ");
+        assert!(
+            !rendered.contains("DERIVE_ATTR"),
+            "template marker must render"
+        );
+        std::fs::write(&source, rendered).unwrap();
+        std::fs::write(
+            &script,
+            "SECTIONS { . = ALIGN(0x1000); .text.remapx : { KEEP(*(.text.remapx)) } . = ALIGN(0x1000); .text.remapy : { KEEP(*(.text.remapy)) } . = ALIGN(0x1000); } INSERT BEFORE .text\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("cc")
+            .args(["-O0", "-rdynamic", "-pthread", "-DREMAP_RACE"])
+            .arg({
+                let mut flag = std::ffi::OsString::from("-Wl,-T,");
+                flag.push(&script);
+                flag
+            })
+            .args(["-o"])
+            .arg(&app)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "remap fixture must compile");
+        app
+    }
     /// Fixture public-chain oracle without BPF: every live-table mode of
     /// the standard fixture exits 0 and writes the exec marker, so any
     /// later native failure is attribution evidence, never a broken
@@ -4953,6 +5124,73 @@ int main(int argc, char **argv) {
             .unwrap();
         assert!(status.success(), "firstbyte normal mode must exit 0");
         assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+    }
+    /// Parse one `toggles=%lu x_exec=%lu` remap stats file. `toggles`
+    /// counts mapping flips strictly inside the race loop (bracketed
+    /// counter, so a still toggle cannot inflate it); `x_exec` counts
+    /// derive calls that returned the expected bytes (3 steady plus
+    /// the 100000 race calls — the X/Y pages are byte-identical, so
+    /// every call observes identical behavior whatever the mapping).
+    fn remap_stats_parse(path: &std::path::Path) -> (u64, u64) {
+        let text = std::fs::read_to_string(path).unwrap();
+        let mut toggles = None;
+        let mut x_exec = None;
+        for cell in text.split_whitespace() {
+            let (key, value) = cell.split_once('=').unwrap();
+            let parsed: u64 = value.parse().unwrap();
+            match key {
+                "toggles" => toggles = Some(parsed),
+                "x_exec" => x_exec = Some(parsed),
+                _ => panic!("unknown stats cell {key}"),
+            }
+        }
+        (
+            toggles.expect("stats carry toggles"),
+            x_exec.expect("stats carry x_exec"),
+        )
+    }
+    /// Remap fixture public-chain oracle without BPF: the normal chain
+    /// exits 0 with the exec marker, and the remap mode exits 0 with
+    /// the exact call count and a well-formed stats file — so any
+    /// later native failure is attribution evidence, never a broken
+    /// workload. Toggle volume is proven by the native (serial,
+    /// trap-slowed loop), not here.
+    #[test]
+    fn remap_fixture_modes_exit_zero() {
+        let dir = std::env::temp_dir().join(format!("osslscope-fixture-rm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_remap_chain_fixture(&dir);
+        let marker = dir.join("marker-rm0");
+        let status = std::process::Command::new(&app)
+            .arg(&marker)
+            .status()
+            .unwrap();
+        assert!(status.success(), "remap normal mode must exit 0");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let marker = dir.join("marker-rm5");
+        let status = std::process::Command::new(&app)
+            .arg(&marker)
+            .arg(format!("i1-remap45:{nonce}"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "remap race mode must exit 0");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        let stats = std::env::temp_dir().join(format!("osslscope-remap-{nonce}.stats"));
+        let (toggles, x_exec) = remap_stats_parse(&stats);
+        std::fs::remove_file(&stats).unwrap();
+        eprintln!("remap oracle: toggles={toggles} x_exec={x_exec}");
+        assert_eq!(
+            x_exec, 100003,
+            "3 steady plus 100000 race calls, all with expected bytes"
+        );
     }
     /// U1 pass 1: legacy-only observation run. Attaches the discovered
     /// legacy API sites (the query export), releases the fixture, waits
@@ -5674,6 +5912,190 @@ int main(int argc, char **argv) {
         assert_eq!(
             drive.next_producer_id, 49,
             "U2's receipt on the firstbyte layout: 44 mints plus 4 operational segment allocs"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
+        );
+    }
+    /// Remap-TOCTOU control: the registration (cookie C at offset X)
+    /// and the query-published CODE_ROLE row (offset Y) deliberately
+    /// disagree — the fixture remaps its derive page to the byte-twin
+    /// page for the queries, then restores it — and a toggler thread
+    /// races MAP_FIXED X<->Y flips against 100000 paced derive calls
+    /// (5us monotonic sleep per call: without pacing, fast untrapped
+    /// calls starve traps to noise level). Trapped fires snapshot X
+    /// or Y through the live VMA join. A Y snapshot matches the row
+    /// while C's guards stay LIVE: pre-fix objects authorize those
+    /// transient hits (definite 4, the leak), fixed objects refuse
+    /// every mismatch because the joined identity must equal the
+    /// SOURCE_REG/SOURCE_ANCHOR witnesses retained for C (definite
+    /// 3). Stable-mapping-only coverage missed this; the stats
+    /// file's bracketed toggle count (flips strictly inside the race
+    /// loop) plus the large trapped-fire count proves the window was
+    /// genuinely raced, so the green is not a never-raced vacuity.
+    /// The X/Y pages are byte-identical (verified below),
+    /// so execution stays sound whatever mid-call flips land —
+    /// only the VMA snapshot races, which is exactly the window
+    /// under test. Every trapped fire refuses, so unresolved
+    /// conservation is exact.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     copied_role_remap_mismatch_refuses --nocapture
+    /// ```
+    #[test]
+    #[ignore = "remap control (sudo, cc)"]
+    fn copied_role_remap_mismatch_refuses() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-i1r-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_remap_chain_fixture(&dir);
+        let bytes = std::fs::read(&app).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let derive = elf
+            .syms
+            .iter()
+            .find(|s| elf.strtab.get_at(s.st_name) == Some("test_kdf_derive"))
+            .expect("derive symbol");
+        let twin = elf
+            .syms
+            .iter()
+            .find(|s| elf.strtab.get_at(s.st_name) == Some("test_kdf_derive_y"))
+            .expect("twin symbol");
+        assert_eq!(
+            derive.st_value % 4096,
+            0,
+            "the derive starts its page (the twin mirrors it below)"
+        );
+        assert_eq!(
+            twin.st_value % 4096,
+            0,
+            "the twin starts its page at the same in-page offset"
+        );
+        assert_ne!(
+            derive.st_value, twin.st_value,
+            "derive and twin occupy different pages"
+        );
+        for sym in elf.syms.iter() {
+            if sym.st_type() != goblin::elf::sym::STT_FUNC || sym.st_value == 0 {
+                continue;
+            }
+            let name = elf.strtab.get_at(sym.st_name);
+            if name == Some("test_kdf_derive") || name == Some("test_kdf_derive_y") {
+                continue;
+            }
+            for base in [derive.st_value, twin.st_value] {
+                assert!(
+                    sym.st_value < base || sym.st_value >= base + 4096,
+                    "no third function may share a remap page"
+                );
+            }
+        }
+        for base in [derive.st_value, twin.st_value] {
+            let segment = elf
+                .program_headers
+                .iter()
+                .find(|ph| {
+                    ph.p_type == goblin::elf::program_header::PT_LOAD
+                        && base >= ph.p_vaddr
+                        && base < ph.p_vaddr + ph.p_memsz
+                })
+                .expect("remap page in a LOAD");
+            assert_ne!(segment.p_flags & 1, 0, "remap pages stay executable");
+            assert_eq!(segment.p_flags & 2, 0, "remap pages stay non-writable");
+        }
+        let derive_offset = fixture_symbol_file_offset(&app, "test_kdf_derive");
+        let twin_offset = fixture_symbol_file_offset(&app, "test_kdf_derive_y");
+        assert_ne!(
+            derive_offset, twin_offset,
+            "different pages means different file offsets (X vs Y)"
+        );
+        let page_x = &bytes[derive_offset as usize..derive_offset as usize + 4096];
+        let page_y = &bytes[twin_offset as usize..twin_offset as usize + 4096];
+        assert_eq!(
+            page_x, page_y,
+            "byte-identical pages keep mid-toggle execution sound; only the snapshot races"
+        );
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(
+            plan.sites.len(),
+            11,
+            "pass-1 normal mode plans MAC 6 + KDF 5"
+        );
+        let site307 = plan
+            .sites
+            .iter()
+            .find(|site| site.role_id == 307)
+            .expect("plan stages the derive");
+        assert_eq!(
+            site307.offset, derive_offset,
+            "the plan stages X; the row below publishes Y, so the refusal is kernel-side"
+        );
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let drive = drive_typed_session_with_counter(
+            "i1r",
+            &app,
+            &[304, 305, 306, 307, 308],
+            Some(&plan),
+            "marker2",
+            Some(&format!("i1-remap45:{nonce}")),
+        );
+        let stats = std::env::temp_dir().join(format!("osslscope-remap-{nonce}.stats"));
+        let (toggles, x_exec) = remap_stats_parse(&stats);
+        std::fs::remove_file(&stats).unwrap();
+        eprintln!("i1r: toggles={toggles} x_exec={x_exec}");
+        assert!(
+            toggles >= 1000,
+            "the mapping must flip inside the race loop (stable mappings miss this)"
+        );
+        assert_eq!(
+            x_exec, 100003,
+            "3 steady plus 100000 race calls, all with expected bytes"
+        );
+        assert_eq!(
+            drive.staged_roles,
+            vec![
+                130, 131, 136, 137, 146, 147, 148, 149, 150, 151, 152, 153, 155, 161, 258, 259,
+                274, 275, 290, 291, 304, 305, 306, 307, 308,
+            ],
+            "13 first-slice + query + 11 copied"
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.copied_skipped, 0,
+            "static bytes stage the derive at X"
+        );
+        assert_eq!(drive.counter_links, 1);
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
+        assert!(
+            drive.joined_calls >= 107,
+            "3 steady + at least 100 trapped race derives plus init/update/final/reset"
+        );
+        assert_eq!(
+            drive.definite, 3,
+            "no transient snapshot authorizes: only init/update/final partition"
+        );
+        assert_eq!(
+            drive.unresolved_calls,
+            drive.joined_calls - 2,
+            "every trapped derive refuses; only the 308 hit and the teardown-poison bound are extra"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, drive.joined_calls);
+        assert_eq!(
+            drive.next_producer_id, 48,
+            "U2's 49 minus the refused derive's segment; the (4,5) row for Y still mints"
         );
         assert_eq!(
             drive.loss_cells,
