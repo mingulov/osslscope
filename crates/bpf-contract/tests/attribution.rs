@@ -360,18 +360,17 @@ fn query_observation_role_admits_paired_query_only() {
 #[test]
 fn code_role_identity_binds_inode_offset_and_cookie_epoch() {
     // I1 two-phase-binding pin (replaces the inode-only key pin): the key
-    // scopes by (process, image, epoch 0, inode, function, kind 5, op)
-    // but is never sufficient alone; the value's observed file offset
-    // (data[3]) makes the identity exact; the consuming kernel join
-    // binds it to the firing cookie's live registration/source epoch
-    // (native-proven: the join takes the cookie and checks
-    // SOURCE_READY/guards before consulting the row). The kernel
-    // `code_role_key` wrapper and `publish_code_role` delegate to these
-    // exact constructors, so any rekey, offset drop or position drift
-    // fails here. No VA/cookie dependence is structural in either
-    // constructor: both take neither (see their signatures), so a
-    // caller cannot smuggle either in.
-    let key = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
+    // scopes by (process, image, epoch 0, inode, file offset, kind 5,
+    // packed pair) and selects one row per (file, offset, op, fun);
+    // the consuming kernel join binds it to the firing cookie's live
+    // registration/source epoch (native-proven: the join takes the
+    // cookie and checks SOURCE_READY/guards before consulting the
+    // row). The kernel `code_role_key` wrapper and `publish_code_role`
+    // delegate to these exact constructors, so any rekey, offset drop
+    // or position drift fails here. No VA/cookie dependence is
+    // structural in either constructor: both take neither (see their
+    // signatures), so a caller cannot smuggle either in.
+    let key = code_role_key(0x1111, 0x2222, 0x3333, 0x1b4, 5, 4);
     assert_eq!(key.process_incarnation, 0x1111);
     assert_eq!(key.image_epoch, 0x2222);
     assert_eq!(key.relation_epoch, 0);
@@ -379,19 +378,50 @@ fn code_role_identity_binds_inode_offset_and_cookie_epoch() {
         key.primary_handle, 0x3333,
         "primary is the inode scope, not a cookie"
     );
-    assert_eq!(key.secondary_handle, 5, "secondary is the function");
+    assert_eq!(
+        key.secondary_handle, 0x1b4,
+        "secondary is the exact file offset"
+    );
     assert_eq!(key.kind, REL_CODE_ROLE);
-    assert_eq!(key.operation, 4, "operation rides the key, not admission");
-    // Composition: inode, function and operation each select a distinct
-    // row, and the epoch stays 0 across all of them.
+    assert_eq!(
+        key.operation,
+        code_role_pair(5, 4),
+        "operation carries the packed pair, not the bare op"
+    );
+    assert_eq!(code_role_pair(5, 4), 0x0005_0004);
+    // Composition: inode, offset, function and operation each select a
+    // distinct row, and the epoch stays 0 across all of them.
     let others = [
-        code_role_key(0x1111, 0x2222, 0x4444, 5, 4),
-        code_role_key(0x1111, 0x2222, 0x3333, 6, 4),
-        code_role_key(0x1111, 0x2222, 0x3333, 5, 3),
+        code_role_key(0x1111, 0x2222, 0x4444, 0x1b4, 5, 4),
+        code_role_key(0x1111, 0x2222, 0x3333, 0x2c8, 5, 4),
+        code_role_key(0x1111, 0x2222, 0x3333, 0x1b4, 6, 4),
+        code_role_key(0x1111, 0x2222, 0x3333, 0x1b4, 5, 3),
     ];
     assert_ne!(others[0].primary_handle, key.primary_handle);
     assert_ne!(others[1].secondary_handle, key.secondary_handle);
     assert_ne!(others[2].operation, key.operation);
+    assert_ne!(others[3].operation, key.operation);
+    // The packed pair is injective over the code_shape domain: all
+    // eleven gated (op, fun) pairs encode distinctly.
+    let mut pairs = Vec::new();
+    for (operation, function) in [
+        (3, 1),
+        (4, 1),
+        (3, 2),
+        (4, 2),
+        (3, 3),
+        (4, 3),
+        (3, 4),
+        (3, 5),
+        (4, 5),
+        (3, 6),
+        (4, 4),
+    ] {
+        pairs.push(code_role_pair(function, operation));
+    }
+    pairs.sort_unstable();
+    pairs.dedup();
+    assert_eq!(pairs.len(), 11, "every gated pair encodes distinctly");
     for other in &others {
         assert_eq!(other.relation_epoch, 0);
         assert_eq!(other.kind, REL_CODE_ROLE);
@@ -417,13 +447,13 @@ fn code_role_key_disambiguates_same_function_callbacks_by_file_offset() {
     // U5K regression pin (§25.4): two distinct callbacks in one file
     // sharing (inode, function, op) but advertised at different file
     // offsets must publish distinct CODE_ROLE rows. The pre-fix key
-    // carries no offset slot, so both publications derive this same
-    // key and the second refuses with LOSS_MAP (54 attempts -> 6 rows
+    // carried no offset slot, so both publications derived the same
+    // key and the second refused with LOSS_MAP (54 attempts -> 6 rows
     // + 48 refused attempts on the U5 workload). RED pre-fix: the two
     // constructor calls below stand for the two offsets (0x1b4,
-    // 0x2c8), which the current signature cannot express.
-    let first = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
-    let second = code_role_key(0x1111, 0x2222, 0x3333, 5, 4);
+    // 0x2c8), which the old signature could not express.
+    let first = code_role_key(0x1111, 0x2222, 0x3333, 0x1b4, 5, 4);
+    let second = code_role_key(0x1111, 0x2222, 0x3333, 0x2c8, 5, 4);
     assert_ne!(
         (
             second.primary_handle,
@@ -436,5 +466,21 @@ fn code_role_key_disambiguates_same_function_callbacks_by_file_offset() {
             first.operation
         ),
         "same (inode, function, op) at two file offsets must key distinct rows"
+    );
+    // And the identical callback re-advertised keys the same row, so
+    // dedup adoption (not a second mint) covers true re-publication.
+    let repeat = code_role_key(0x1111, 0x2222, 0x3333, 0x1b4, 5, 4);
+    assert_eq!(
+        (
+            repeat.primary_handle,
+            repeat.secondary_handle,
+            repeat.operation
+        ),
+        (
+            first.primary_handle,
+            first.secondary_handle,
+            first.operation
+        ),
+        "same (file, offset, op, fun) must key the same row"
     );
 }

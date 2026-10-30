@@ -296,26 +296,39 @@ pub struct RelKey {
 }
 
 /// CODE_ROLE (kind 5) key shape: full target-domain scope plus the
-/// VMA-joined callback inode and the live (operation, function). The
-/// relation epoch is 0 so ordinary relation/loss advance cannot clear
-/// code facts; code replacement changes the inode or image instead.
+/// VMA-joined callback (inode, file offset) and the live packed
+/// (operation, function) pair. One row per (file, offset, op, fun):
+/// same-(op, fun) callbacks across provider algos publish distinct
+/// rows instead of colliding. The relation epoch is 0 so ordinary
+/// relation/loss advance cannot clear code facts; code replacement
+/// changes the inode or image instead.
 ///
-/// The key is inode-SCOPED, never inode-sufficient: the value's
-/// observed file offset ([`code_role_data`], `data[3]`) makes the
-/// identity exact, and the consuming kernel join binds it to the firing
-/// cookie's live registration/source epoch (two-phase binding, because
-/// the firing cookie exists only in the copied callback's own probe
-/// context and the query-time publisher observes bare dispatch-table
-/// addresses). No VA/cookie dependence is structural in this
-/// constructor: it takes neither (see the signature). A caller cannot
-/// smuggle either in. The kernel `code_role_key` wrapper delegates
-/// here; the full interpretation comment lives with it.
+/// `RelKey` has no free slot, so the shape repurposes kind-5 field
+/// meaning inside the unchanged 48-byte key (the OWNER precedent:
+/// explicit per-kind decoding, no map-layout change). `secondary`
+/// carries the exact observed file offset; the `operation` slot
+/// carries [`code_role_pair`], never the bare operation. The value
+/// ([`code_role_data`]) keeps the plain operation/function/offset, and
+/// both kernel readers (publish-adopt, consuming join) re-verify them
+/// from the value, so a hypothetical packed-pair collision fails
+/// closed as a refusal, never a false certification.
+///
+/// The key is inode-SCOPED, never cookie-bound: the consuming kernel
+/// join binds it to the firing cookie's live registration/source epoch
+/// (two-phase binding, because the firing cookie exists only in the
+/// copied callback's own probe context and the query-time publisher
+/// observes bare dispatch-table addresses). No VA/cookie dependence is
+/// structural in this constructor: it takes neither (see the
+/// signature). A caller cannot smuggle either in. The kernel
+/// `code_role_key` wrapper delegates here; the full interpretation
+/// comment lives with it.
 #[inline(always)]
 pub const fn code_role_key(
     process_incarnation: u64,
     image_epoch: u64,
     inode: u64,
-    function: u64,
+    file_offset: u64,
+    function: u32,
     operation: u32,
 ) -> RelKey {
     RelKey {
@@ -323,10 +336,21 @@ pub const fn code_role_key(
         image_epoch,
         relation_epoch: 0,
         primary_handle: inode,
-        secondary_handle: function,
+        secondary_handle: file_offset,
         kind: REL_CODE_ROLE,
-        operation,
+        operation: code_role_pair(function, operation),
     }
+}
+
+/// Pack the live (operation, function) pair into the CODE_ROLE key's
+/// `operation` slot (kind 5 only). Injective over the `code_shape`
+/// domain (operations 3|4, functions 1..=6): callers must gate through
+/// `code_shape` before constructing the key, and both kernel call
+/// sites (publish, consuming join) do. Out-of-domain inputs fold
+/// silently at this layer; the value cross-checks fail them closed.
+#[inline(always)]
+pub const fn code_role_pair(function: u32, operation: u32) -> u32 {
+    ((function & 0xFFFF) << 16) | (operation & 0xFFFF)
 }
 
 /// CODE_ROLE (kind 5) value identity: the live operation, function,
@@ -334,7 +358,9 @@ pub const fn code_role_key(
 /// callback, publishing query witness and publication sequence. The
 /// offset at `data[3]` is the substitution killer: a query advertising
 /// callback A never authorizes a separately staged callback B at
-/// another offset in the same file. `data[5]` and `data[7..=9]` stay
+/// another offset in the same file. The key carries the same offset
+/// plus the packed pair, so the value positions double as the
+/// publish-adopt/join cross-checks. `data[5]` and `data[7..=9]` stay
 /// zero. The kernel publisher writes this exact array; the pin below
 /// locks every position.
 #[inline(always)]

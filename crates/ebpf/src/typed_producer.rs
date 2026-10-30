@@ -22,9 +22,8 @@ use crate::{
     source_vma, writer_gate,
 };
 use aya_ebpf::{
-    helpers,
+    EbpfContext, helpers,
     programs::{ProbeContext, RetProbeContext},
-    EbpfContext,
 };
 use core::ptr::addr_of_mut;
 use osslscope_bpf_contract::{
@@ -4181,11 +4180,7 @@ pub fn op_resolve_segment_b(params: &OpParams) -> u64 {
 
 /// Store one attribution-tuple word into per-CPU staging.
 #[inline(always)]
-fn tuple_store(
-    slot: *mut osslscope_bpf_contract::source::SourceSlot,
-    index: usize,
-    value: u64,
-) {
+fn tuple_store(slot: *mut osslscope_bpf_contract::source::SourceSlot, index: usize, value: u64) {
     unsafe {
         (*slot).staging.as_mut_ptr().add(index).write(value);
     }
@@ -4566,9 +4561,9 @@ pub fn own_pending_x(
 /// OSSL_ALGORITHM/OSSL_DISPATCH tables at query return (public UAPI
 /// layouts only), joins each in-slice callback address to its exact
 /// (inode, file offset) through the current-VMA join, and publishes one
-/// CERTIFIED row per (process, image, inode, operation, function)
-/// carrying that observed offset in the value. CERTIFIED means code ABI
-/// only, never provider identity.
+/// CERTIFIED row per (process, image, inode, file offset, operation,
+/// function) carrying that observed offset in the key and the value.
+/// CERTIFIED means code ABI only, never provider identity.
 ///
 /// Join: at copied-role entry the handler takes the kernel-supplied
 /// firing IP (no subtraction: Linux rewinds it to the probe address),
@@ -4635,11 +4630,11 @@ fn code_shape(operation: u32, function: u32) -> Option<u64> {
     }
 }
 
-/// CODE_ROLE key: inode-SCOPED, never inode-sufficient. The key selects
-/// the (process, image, inode, operation, function) row; the value's
-/// observed file offset (`data[3]`, via `code_role_data`) makes the
-/// identity exact, and the consuming join binds it to the firing
-/// cookie's live registration/source epoch (two-phase binding).
+/// CODE_ROLE key: inode-SCOPED, never cookie-bound. The key selects
+/// the (process, image, inode, file offset, operation, function) row —
+/// one row per (file, offset, op, fun) — and the consuming join binds
+/// it to the firing cookie's live registration/source epoch
+/// (two-phase binding).
 ///
 /// The source-capability contract's key amendment
 /// (`docs/2026-10-29-v050-source-capability.md:36`) names cookie keying
@@ -4685,11 +4680,18 @@ fn code_shape(operation: u32, function: u32) -> Option<u64> {
 /// is fully qualified because this wrapper intentionally shadows the
 /// glob import.
 #[inline(always)]
-fn code_role_key(target: &Target, inode: u64, function: u64, operation: u32) -> RelKey {
+fn code_role_key(
+    target: &Target,
+    inode: u64,
+    file_offset: u64,
+    function: u32,
+    operation: u32,
+) -> RelKey {
     osslscope_bpf_contract::attribution::code_role_key(
         target.process,
         target.image,
         inode,
+        file_offset,
         function,
         operation,
     )
@@ -4923,7 +4925,7 @@ pub fn code_role_check(
     if !registration_identity_matches(target, cookie, source_epoch, inode, file_offset) {
         return false;
     }
-    let key = code_role_key(target, inode, u64::from(function), operation);
+    let key = code_role_key(target, inode, file_offset, function, operation);
     let Some(row) = REL.get_ptr_mut(&key) else {
         return false;
     };
@@ -4943,11 +4945,12 @@ pub fn code_role_check(
 /// binding, phase 1): record the query-observed exact inode-and-offset
 /// identity without any cookie, which is unknowable at query time; the
 /// consuming join binds it to the firing cookie. Dedup by key adopts
-/// only an identical live row with the same observed offset (a same-key
-/// different-offset re-advertisement refuses, fail closed), then spend,
-/// allocate, build in the per-CPU cell, NOEXIST insert, and the ordered
-/// sequence commit. Any failure leaves the entry unauthorized for this
-/// query; a later query republishes (self-healing, no poison: a CODE_ROLE
+/// only an identical live row (same file, offset, op and fun,
+/// re-verified from the value; a same-key different-identity
+/// re-advertisement refuses, fail closed), then spend, allocate, build
+/// in the per-CPU cell, NOEXIST insert, and the ordered sequence
+/// commit. Any failure leaves the entry unauthorized for this query; a
+/// later query republishes (self-healing, no poison: a CODE_ROLE
 /// hiccup must never kill unrelated positives).
 #[inline(never)]
 #[no_mangle]
@@ -4966,7 +4969,13 @@ pub fn publish_code_role(
     let Some(shape) = code_shape(operation, function) else {
         return false;
     };
-    let key = code_role_key(target, location.inode, u64::from(function), operation);
+    let key = code_role_key(
+        target,
+        location.inode,
+        location.file_offset,
+        function,
+        operation,
+    );
     let Some(state) = crate::shared_maps::ATTR_STATE.get_ptr_mut(0) else {
         return false;
     };
