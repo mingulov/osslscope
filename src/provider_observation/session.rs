@@ -4899,11 +4899,20 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         }
         setup.child.release().unwrap();
         let until = Instant::now() + Duration::from_secs(15);
-        while !marker.exists() {
-            assert!(Instant::now() < until, "exec marker never appeared");
+        // P3-I1 fix-round-1: poll until the marker CARRIES the payload,
+        // not merely exists: exists-then-single-read races the
+        // fixture's fopen("w") (creates the empty file) against its
+        // fclose (flushes "exec\n"). The four pre-existing sites keep
+        // the P3 shape verbatim; only these new controls poll.
+        loop {
+            if let Ok(body) = std::fs::read(&marker) {
+                if body == b"exec\n" {
+                    break;
+                }
+            }
+            assert!(Instant::now() < until, "exec marker never carried exec");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
         while setup.child.peek_exit().unwrap().is_none() {
             assert!(Instant::now() < until, "workload never exited");
             std::thread::yield_now();
@@ -5041,11 +5050,20 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         }
         setup.child.release().unwrap();
         let until = Instant::now() + Duration::from_secs(15);
-        while !marker.exists() {
-            assert!(Instant::now() < until, "exec marker never appeared");
+        // P3-I1 fix-round-1: poll until the marker CARRIES the payload,
+        // not merely exists: exists-then-single-read races the
+        // fixture's fopen("w") (creates the empty file) against its
+        // fclose (flushes "exec\n"). The four pre-existing sites keep
+        // the P3 shape verbatim; only these new controls poll.
+        loop {
+            if let Ok(body) = std::fs::read(&marker) {
+                if body == b"exec\n" {
+                    break;
+                }
+            }
+            assert!(Instant::now() < until, "exec marker never carried exec");
             std::thread::sleep(Duration::from_millis(1));
         }
-        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
         while setup.child.peek_exit().unwrap().is_none() {
             assert!(Instant::now() < until, "workload never exited");
             std::thread::yield_now();
