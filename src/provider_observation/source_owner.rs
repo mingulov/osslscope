@@ -292,7 +292,10 @@ pub(crate) struct RootsEnabled {
 }
 
 /// One typed-site admission request. The caller verified freshness and
-/// mints every ID; the owner binds them to live domain coordinates.
+/// mints every ID; the owner binds them to planned domain coordinates.
+/// `source_epoch` is the session anchor's epoch: the typed cookie's
+/// registration and READY rows join that anchor, so they must carry its
+/// epoch (the kernel checks the anchor guard under the request epoch).
 pub(super) struct TypedAdmissionRequest {
     pub cookie: u64,
     pub site_id: u64,
@@ -303,16 +306,31 @@ pub(super) struct TypedAdmissionRequest {
     pub tgid: u32,
     pub object_id: u64,
     pub object_sha256: [u8; 32],
+    pub source_epoch: u64,
 }
 
 /// What the admission programmed, for the caller's records and receipts.
+/// Admission alone grants no source authority: guards go LIVE and READY
+/// publishes only through the per-cookie registration protocol that runs
+/// after this returns.
 pub(super) struct TypedAdmissionReceipts {
     pub cookie: u64,
     pub site_id: u64,
     pub source_epoch: u64,
-    pub ready_sequence: u64,
     pub process_incarnation: u64,
     pub image_epoch: u64,
+}
+
+/// Shared acquisition context for every typed capability: the LIVE session
+/// anchor every typed registration joins plus the enrolled observer key
+/// and the armed domain coordinates. All typed registrations under one
+/// anchor list as required capabilities in the single acquisition order;
+/// the held child releases only after READY published for every one.
+pub(crate) struct TypedAcquisitionScope {
+    pub anchor: AnchorEstablished,
+    pub host_key: u64,
+    pub incarnation: u64,
+    pub planned_image: u64,
 }
 
 /// Producer control coordinates, retained by the session for the final
@@ -334,8 +352,11 @@ pub(crate) struct DomainArmed {
 }
 
 /// Anchor identity established for one acquisition. Fields are consumed
-/// by the native qualification through the acquisition receipts.
+/// by the native qualification through the acquisition receipts. Copied
+/// into the typed acquisition scope so every typed capability joins this
+/// same anchor without re-reading it.
 #[allow(dead_code)]
+#[derive(Clone, Copy)]
 pub(crate) struct AnchorEstablished {
     pub anchor_id: u64,
     pub epoch: u64,
@@ -412,10 +433,23 @@ pub(super) struct SourceOwner {
     _registration_ids: Vec<u64>,
     _domain_tgids: Vec<u32>,
     _mode: Option<(u64, u64)>,
-    _typed_epoch: Option<u64>,
     _control: Option<ProducerControlProgrammed>,
     #[cfg(test)]
     _fail_next_retire: std::cell::Cell<bool>,
+    /// Test-only one-shot typed-registration fault injection: the next
+    /// typed-range ENTRY (resp. RETURN) request arms with a corrupted file
+    /// offset, so the kernel refuses the mismatched registration with a
+    /// genuine refused receipt. Legacy-range scopes never consult these.
+    #[cfg(test)]
+    _fail_typed_entry: std::cell::Cell<bool>,
+    #[cfg(test)]
+    _fail_typed_return: std::cell::Cell<bool>,
+    /// Test-only readback of the most recently minted typed-range
+    /// registration ID (set at mint time, whatever the outcome), so
+    /// refusal controls can pin the exact ledger state of the failed
+    /// capability. Zero when no typed registration was attempted.
+    #[cfg(test)]
+    _last_typed_registration: std::cell::Cell<u64>,
     _last_error: Option<String>,
     _maps: BTreeMap<&'static str, OwnedFd>,
     _namespace: File,
@@ -558,10 +592,15 @@ impl SourceOwner {
             _registration_ids: Vec::new(),
             _domain_tgids: Vec::new(),
             _mode: None,
-            _typed_epoch: None,
             _control: None,
             #[cfg(test)]
             _fail_next_retire: std::cell::Cell::new(false),
+            #[cfg(test)]
+            _fail_typed_entry: std::cell::Cell::new(false),
+            #[cfg(test)]
+            _fail_typed_return: std::cell::Cell::new(false),
+            #[cfg(test)]
+            _last_typed_registration: std::cell::Cell::new(0),
             _last_error: None,
             _maps: maps,
             _namespace: namespace,
@@ -894,13 +933,17 @@ impl SourceOwner {
             cut_id,
         })
     }
-    /// Admit one verified typed site: program its admission, bind, guard
-    /// pair and READY row, all NOEXIST. The caller verified freshness
-    /// (revalidated object, live TGID, armed domain) and mints the cookie,
-    /// site ID and artifact ID; this function binds them to the TGID's
-    /// current domain coordinates and the owner-wide typed epoch. The
-    /// READY row carries the live published sequence (at least 1), so it
-    /// validates exactly the entries admitted from now on.
+    /// Admit one verified typed site: program its admission and bind
+    /// rows, both NOEXIST. The caller verified freshness (revalidated
+    /// object, live TGID, armed domain) and mints the cookie, site ID and
+    /// artifact ID; this function binds them to the TGID's planned domain
+    /// coordinates and the session anchor's epoch. Admission alone grants
+    /// no source authority: no guard is created here and no READY row is
+    /// written — the cookie's guards go LIVE and its READY publishes only
+    /// through the receipt-based registration protocol (ENTRY/RETURN
+    /// receipts, FD adoption, kernel phase-4 publication) that the caller
+    /// runs next. Without that capability the cookie's operand readers
+    /// stay unavailable: every typed callback refuses at the READY gate.
     pub(super) fn admit_typed_site(
         &mut self,
         request: &TypedAdmissionRequest,
@@ -912,18 +955,15 @@ impl SourceOwner {
             || request.site_id == 0
             || request.tgid == 0
             || request.object_id == 0
+            || request.source_epoch == 0
         {
             return Err(ObservationGap::Invalidated);
         }
+        if !contract::valid_site_cookie(request.cookie) {
+            return Err(ObservationGap::Invalidated);
+        }
         let (process, image) = self._domains.planned_coordinates(request.tgid)?;
-        let epoch = match self._typed_epoch {
-            Some(epoch) => epoch,
-            None => {
-                let epoch = self._ids.fresh()?;
-                self._typed_epoch = Some(epoch);
-                epoch
-            }
-        };
+        let epoch = request.source_epoch;
         let admission = attr_contract::TypedAdmission::new(
             request.role_id,
             request.public_api_id,
@@ -936,13 +976,8 @@ impl SourceOwner {
         if !admission.valid() {
             return Err(ObservationGap::Invalidated);
         }
-        let anchor_guard = self._ids.fresh()?;
-        let registration_guard = self._ids.fresh()?;
         let fd_admission = self.typed_map_fd("TYPED_ADMISSION")?;
         let fd_bind = self.typed_map_fd("SITE_BIND")?;
-        let fd_guard = self.typed_map_fd("SOURCE_GUARD")?;
-        let fd_rel = self.typed_map_fd("REL")?;
-        let fd_state = self.typed_map_fd("ATTR_STATE")?;
         let mut site_key = [0u8; 24];
         site_key[0..8].copy_from_slice(&request.cookie.to_ne_bytes());
         site_key[8..16].copy_from_slice(&process.to_ne_bytes());
@@ -977,50 +1012,10 @@ impl SourceOwner {
             )
         }
         .map_err(|_| ObservationGap::BpfUnavailable)?;
-        let mut guard_value = [0u8; 16];
-        guard_value[0..8].copy_from_slice(&epoch.to_ne_bytes());
-        guard_value[8..16].copy_from_slice(&contract::GUARD_LIVE.to_ne_bytes());
-        for guard in [anchor_guard, registration_guard] {
-            unsafe {
-                ossl_bpf_sys::map_update_elem(
-                    fd_guard,
-                    &guard.to_ne_bytes(),
-                    &guard_value,
-                    ossl_bpf_sys::BPF_NOEXIST,
-                )
-            }
-            .map_err(|_| ObservationGap::BpfUnavailable)?;
-        }
-        let mut state = [0u8; 64];
-        unsafe { ossl_bpf_sys::map_lookup_elem(fd_state, &0u32.to_ne_bytes(), &mut state) }
-            .map_err(|_| ObservationGap::BpfUnavailable)?;
-        let published = u64::from_ne_bytes(state[0..8].try_into().unwrap()).max(1);
-        let mut ready_key = [0u8; 48];
-        ready_key[0..8].copy_from_slice(&process.to_ne_bytes());
-        ready_key[8..16].copy_from_slice(&image.to_ne_bytes());
-        ready_key[24..32].copy_from_slice(&request.cookie.to_ne_bytes());
-        ready_key[32..40].copy_from_slice(&epoch.to_ne_bytes());
-        ready_key[40..44].copy_from_slice(&contract::SOURCE_READY.to_ne_bytes());
-        let mut ready_value = [0u8; 256];
-        ready_value[16..24].copy_from_slice(&epoch.to_ne_bytes());
-        ready_value[40..44].copy_from_slice(&attr_contract::REL_WITNESS.to_ne_bytes());
-        ready_value[48..56].copy_from_slice(&anchor_guard.to_ne_bytes());
-        ready_value[56..64].copy_from_slice(&registration_guard.to_ne_bytes());
-        ready_value[64..72].copy_from_slice(&published.to_ne_bytes());
-        unsafe {
-            ossl_bpf_sys::map_update_elem(
-                fd_rel,
-                &ready_key,
-                &ready_value,
-                ossl_bpf_sys::BPF_NOEXIST,
-            )
-        }
-        .map_err(|_| ObservationGap::BpfUnavailable)?;
         Ok(TypedAdmissionReceipts {
             cookie: request.cookie,
             site_id: request.site_id,
             source_epoch: epoch,
-            ready_sequence: published,
             process_incarnation: process,
             image_epoch: image,
         })
@@ -1031,6 +1026,26 @@ impl SourceOwner {
     #[cfg(test)]
     pub(super) fn fail_next_guard_retire(&self) {
         self._fail_next_retire.set(true);
+    }
+    /// Test-only typed-registration fault injection: the next typed-range
+    /// ENTRY (resp. RETURN) request arms with a corrupted file offset while
+    /// the actual link is created at the true offset, so the kernel refuses
+    /// the mismatched registration with a genuine refused receipt. One-shot;
+    /// legacy-range scopes never consult these flags.
+    #[cfg(test)]
+    pub(super) fn fail_next_typed_entry(&self) {
+        self._fail_typed_entry.set(true);
+    }
+    #[cfg(test)]
+    pub(super) fn fail_next_typed_return(&self) {
+        self._fail_typed_return.set(true);
+    }
+    /// Test-only readback of the most recently minted typed-range
+    /// registration ID, whatever the outcome. Zero when no typed
+    /// registration was attempted.
+    #[cfg(test)]
+    pub(super) fn last_typed_registration_test(&self) -> u64 {
+        self._last_typed_registration.get()
     }
     /// Test-only anchor-custody readback.
     #[cfg(test)]
@@ -1361,8 +1376,11 @@ impl SourceOwner {
     /// create the adoption guard (PREPARING) strictly before the RETURN pair
     /// may arm; then arm RETURN, create the actual return link, and advance
     /// the guard to LIVE with the adopted-FD proof. File custody, offset,
-    /// cookie and target PID all come from the admitted scope: this creates
-    /// the SOLE required link pair for the admitted site.
+    /// cookie and target PID all come from the admitted scope. The scope
+    /// carries one capability: the legacy admitted site (legacy programs)
+    /// or one typed cookie (typed programs); every adopted pair lists in
+    /// the acquisition order under the shared anchor, and the owner retains
+    /// every adopted link FD through the final consumers.
     pub(super) fn register_entry_return(
         &mut self,
         scope: &RequestScope,
@@ -1371,9 +1389,12 @@ impl SourceOwner {
         anchor: &AnchorEstablished,
     ) -> Result<RegistrationAdopted, ObservationGap> {
         let _ = self._last_error.take();
-        if !(1..=4096).contains(&scope.site_cookie) || scope.link_offset > i64::MAX as u64 {
+        if !contract::valid_site_cookie(scope.site_cookie) || scope.link_offset > i64::MAX as u64 {
             return Err(ObservationGap::Invalidated);
         }
+        #[cfg(test)]
+        let typed_scope =
+            (contract::TYPED_COOKIE_FIRST..contract::TYPED_COOKIE_END).contains(&scope.site_cookie);
         // Descriptor custody, never a re-resolved path: the fd names the same
         // open file description the admitted site retains.
         let path = std::ffi::CString::new(format!("/proc/self/fd/{}", scope.target.as_raw_fd()))
@@ -1406,12 +1427,31 @@ impl SourceOwner {
             anchor.epoch,
             entry_nonce,
         )?;
+        #[cfg(test)]
+        if typed_scope {
+            self._last_typed_registration.set(registration);
+        }
         let entry = SourceRequest {
             nonce: entry_nonce,
             phase: contract::PHASE_ENTRY,
             registration_id: registration,
             ..base
         };
+        // Test-only fault: arm a well-formed ENTRY request for the WRONG
+        // offset while the link below uses the true offset. The kernel
+        // refuses the mismatch with a genuine refused receipt; the
+        // corrupted value stays inside the valid range so the refusal
+        // lands at the offset check with 1/1 counts.
+        #[cfg(test)]
+        let mut entry = entry;
+        #[cfg(test)]
+        if typed_scope && self._fail_typed_entry.take() {
+            entry.file_offset = if entry.file_offset == i64::MAX as u64 {
+                entry.file_offset - 1
+            } else {
+                entry.file_offset + 1
+            };
+        }
         if !entry.valid_input() {
             return Err(ObservationGap::Invalidated);
         }
@@ -1467,6 +1507,20 @@ impl SourceOwner {
             registration_id: registration,
             ..base
         };
+        // Test-only fault, same shape as ENTRY: the armed RETURN claims
+        // the wrong offset while the link uses the true one. The staged
+        // ENTRY row quarantines and the receipt refuses; the capability
+        // never adopts and no READY can publish for it.
+        #[cfg(test)]
+        let mut back = back;
+        #[cfg(test)]
+        if typed_scope && self._fail_typed_return.take() {
+            back.file_offset = if back.file_offset == i64::MAX as u64 {
+                back.file_offset - 1
+            } else {
+                back.file_offset + 1
+            };
+        }
         if !back.valid_input() {
             return Err(ObservationGap::Invalidated);
         }
@@ -1512,15 +1566,48 @@ impl SourceOwner {
     }
     /// Publish post-adoption READY: arm the phase-4 request, fire one
     /// provisional trigger, and consume the READY receipt for the STORED
-    /// registration. Returns the READY publication sequence.
+    /// registration. Returns the READY publication sequence. Terminal: the
+    /// full listed capability set must be READY before the held child may
+    /// release, so this refuses unless the order completes here. Typed
+    /// capabilities publish through `publish_typed_ready` before this runs:
+    /// every capability lists before any READY completes the set.
     pub(super) fn publish_ready(
         &mut self,
         scope: &RequestScope,
         anchor: &AnchorEstablished,
         registration: &RegistrationAdopted,
     ) -> Result<u64, ObservationGap> {
+        let sequence = self.publish_ready_inner(scope, anchor, registration)?;
+        if !self._order.child_may_release() {
+            return Err(ObservationGap::Invalidated);
+        }
+        Ok(sequence)
+    }
+    /// Publish post-adoption READY for one typed cookie: the same
+    /// contracted kernel phase-4 publication as `publish_ready`, without
+    /// the terminal release check. The caller publishes every listed
+    /// capability and checks `acquisition_ready` before releasing the
+    /// held child; a partial set never releases.
+    pub(super) fn publish_typed_ready(
+        &mut self,
+        scope: &RequestScope,
+        anchor: &AnchorEstablished,
+        registration: &RegistrationAdopted,
+    ) -> Result<u64, ObservationGap> {
+        self.publish_ready_inner(scope, anchor, registration)
+    }
+    /// One phase-4 publication for the STORED registration: arm the
+    /// request, fire one provisional trigger, consume the READY receipt.
+    /// Shared by the terminal legacy publisher and the per-capability
+    /// typed publisher; only the release check differs.
+    fn publish_ready_inner(
+        &mut self,
+        scope: &RequestScope,
+        anchor: &AnchorEstablished,
+        registration: &RegistrationAdopted,
+    ) -> Result<u64, ObservationGap> {
         let _ = self._last_error.take();
-        if !(1..=4096).contains(&scope.site_cookie) || scope.link_offset > i64::MAX as u64 {
+        if !contract::valid_site_cookie(scope.site_cookie) || scope.link_offset > i64::MAX as u64 {
             return Err(ObservationGap::Invalidated);
         }
         let nonce = self._ids.fresh()?;
@@ -1584,9 +1671,6 @@ impl SourceOwner {
         self.disarm_request(scope.host_key)?;
         drop(self._roots.take_provisional());
         self._order.note_ready(&self._ledger, nonce, &receipt)?;
-        if !self._order.child_may_release() {
-            return Err(ObservationGap::Invalidated);
-        }
         Ok(row.publication_sequence)
     }
     /// Mirror an observed planned exec. Refuses unless the kernel row already
@@ -1971,9 +2055,11 @@ mod tests {
             _registration_ids: Vec::new(),
             _domain_tgids: Vec::new(),
             _mode: None,
-            _typed_epoch: None,
             _control: None,
             _fail_next_retire: std::cell::Cell::new(false),
+            _fail_typed_entry: std::cell::Cell::new(false),
+            _fail_typed_return: std::cell::Cell::new(false),
+            _last_typed_registration: std::cell::Cell::new(0),
             _last_error: None,
             _maps: BTreeMap::new(),
             _namespace: std::fs::File::open("/proc/self/ns/pid").unwrap(),

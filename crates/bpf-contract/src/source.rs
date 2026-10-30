@@ -14,6 +14,26 @@ pub const PHASE_RETURN: u32 = 3;
 pub const PHASE_READY: u32 = 4;
 pub const HOST_ID_FIRST: u64 = 1 << 63;
 pub const KERNEL_ID_LAST: u64 = HOST_ID_FIRST - 1;
+/// Last legacy counter cookie admitted as a registration site cookie.
+pub const LEGACY_COOKIE_LAST: u64 = 4096;
+/// First typed-site cookie admitted as a registration site cookie. Typed
+/// cookies stay u32-fitting so the focused counter can pin the same cookie
+/// for the same site; the gap between the legacy and typed ranges admits
+/// nothing, so a legacy/typed cookie can never alias one registration row.
+pub const TYPED_COOKIE_FIRST: u64 = 1 << 31;
+/// One past the last typed-site cookie (u32 range end, exclusive).
+pub const TYPED_COOKIE_END: u64 = 1 << 32;
+
+/// Registration site cookies for ENTRY/RETURN/READY phases: the legacy
+/// counter range plus the typed-site range. The kernel keys SOURCE_REG and
+/// SOURCE_READY rows by (process, image, cookie, epoch) and never indexes
+/// an array by cookie, so both ranges share the one receipt protocol with
+/// the same NOEXIST/quarantine semantics. Pure predicate: no ctx read.
+#[inline(always)]
+pub fn valid_site_cookie(cookie: u64) -> bool {
+    (1..=LEGACY_COOKIE_LAST).contains(&cookie)
+        || (TYPED_COOKIE_FIRST..TYPED_COOKIE_END).contains(&cookie)
+}
 
 /// Observer-only configuration, frozen before source writers start.
 #[repr(C)]
@@ -68,8 +88,7 @@ impl SourceRequest {
                     && self.observer_anchor_address != 0
             }
             PHASE_ENTRY | PHASE_RETURN | PHASE_READY => {
-                self.site_cookie != 0
-                    && self.site_cookie <= 4096
+                valid_site_cookie(self.site_cookie)
                     && self.registration_id >= HOST_ID_FIRST
                     && self.registration_id != self.anchor_id
                     && self.observer_anchor_address == 0
@@ -300,6 +319,55 @@ mod tests {
         request.required_mask = 3;
         request.file_offset = 1 << 63;
         assert!(!request.valid_input());
+    }
+    #[test]
+    fn source_requests_admit_legacy_and_typed_cookies_only() {
+        // P3-I1: typed cookies join the receipt protocol under the same
+        // predicate the kernel enforces; the gap between the ranges and
+        // everything outside both ranges still refuses in every phase.
+        let mut request = SourceRequest {
+            nonce: HOST_ID_FIRST + 1,
+            anchor_id: HOST_ID_FIRST + 2,
+            object_id: 3,
+            source_epoch: 4,
+            site_cookie: 1,
+            phase: PHASE_ENTRY,
+            required_mask: 3,
+            process_incarnation: 5,
+            image_epoch: 6,
+            registration_id: HOST_ID_FIRST + 3,
+            ..SourceRequest::default()
+        };
+        assert!(request.valid_input());
+        for cookie in [
+            1,
+            LEGACY_COOKIE_LAST,
+            TYPED_COOKIE_FIRST,
+            TYPED_COOKIE_FIRST + 1,
+            TYPED_COOKIE_END - 1,
+        ] {
+            for phase in [PHASE_ENTRY, PHASE_RETURN, PHASE_READY] {
+                request.site_cookie = cookie;
+                request.phase = phase;
+                assert!(request.valid_input(), "cookie {cookie} phase {phase}");
+            }
+        }
+        for cookie in [
+            0,
+            LEGACY_COOKIE_LAST + 1,
+            TYPED_COOKIE_FIRST - 1,
+            TYPED_COOKIE_END,
+            u64::MAX,
+        ] {
+            for phase in [PHASE_ENTRY, PHASE_RETURN, PHASE_READY] {
+                request.site_cookie = cookie;
+                request.phase = phase;
+                assert!(
+                    !request.valid_input(),
+                    "cookie {cookie} phase {phase} must refuse"
+                );
+            }
+        }
     }
     #[test]
     fn source_slot_keeps_serialization_word_and_staging_in_reviewed_slots() {

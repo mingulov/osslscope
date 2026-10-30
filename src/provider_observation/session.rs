@@ -359,7 +359,6 @@ pub struct ProviderSession {
     // Prearmed source preparation is noncertifying until actual source links,
     // post-adoption readiness and target-domain guards are established.
     typed_startup: Vec<super::objects::TypedPublicSite>,
-    typed_links: Vec<OwnedFd>,
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
     members: BpfMap<MapData, u32, c::Member>,
@@ -881,7 +880,6 @@ impl ProviderSession {
             source_prepared,
             source_owner: None,
             typed_startup: Vec::new(),
-            typed_links: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
             roles: Roles::default(),
@@ -903,6 +901,9 @@ impl ProviderSession {
         })
     }
     fn link_count(&self) -> usize {
+        // Legacy attachment links plus every link the source owner adopted
+        // (the acquired legacy pair and all typed pairs): the owner is the
+        // sole retainer of acquired links through the final consumers.
         self.targets
             .values()
             .map(|t| t.attachments.iter().map(|a| a.links.len()).sum::<usize>())
@@ -913,7 +914,11 @@ impl ProviderSession {
                 .flatten()
                 .map(|a| a.links.len())
                 .sum::<usize>()
-            + self.typed_links.len()
+            + self
+                .source_owner
+                .as_ref()
+                .map(|owner| owner.adopted_link_count())
+                .unwrap_or(0)
     }
     #[allow(clippy::too_many_arguments, reason = "one coherent attach spec")]
     fn attach_pair(
@@ -1700,25 +1705,41 @@ impl ProviderSession {
         });
         self.emitted += 1;
     }
-    /// Consume the retained typed exports through strict forward
-    /// acquisition: per site, revalidate freshness, mint cookie/site/artifact
-    /// IDs, program admission+bind+guards+READY through the source owner,
-    /// then attach the typed entry/return pair at the export offset. Runs
-    /// after the TGID acquisition is ready (armed domain, live anchor) and
-    /// before the held child releases, so no fetch can fire unadmitted.
-    /// Any refusal aborts the whole acquisition: partially admitted sites
-    /// would attribute under incomplete authority.
+    /// Consume the retained typed exports through the receipt-based
+    /// source-acquisition protocol, one capability per site: revalidate
+    /// freshness, mint cookie/site/artifact IDs, program admission+bind,
+    /// adopt the typed entry/return pair with ENTRY/RETURN receipts, and
+    /// publish READY through the contracted kernel phase-4 path — all
+    /// under the shared LIVE anchor in `scope`. Runs after the legacy
+    /// registration lists and before the terminal legacy READY publishes,
+    /// while the child is still held: every capability lists before any
+    /// READY completes the set, and no fetch can fire unadmitted. Any
+    /// refusal aborts the whole acquisition: partially admitted sites
+    /// would attribute under incomplete authority. The owner retains
+    /// every adopted typed link through the final consumers.
     pub(crate) fn acquire_typed_sites(
         &mut self,
+        scope: &super::source_owner::TypedAcquisitionScope,
         deadline: Instant,
         cancel: &std::sync::atomic::AtomicBool,
     ) -> Result<usize, ObservationGap> {
+        use std::os::fd::AsRawFd as _;
         if self.final_drain || !self.gate.admitting() {
             return Err(ObservationGap::Invalidated);
         }
         if self.source_owner.is_none() {
             return Err(ObservationGap::Invalidated);
         }
+        let (entry_prog, return_prog) = {
+            let owner = self
+                .source_owner
+                .as_ref()
+                .ok_or(ObservationGap::Invalidated)?;
+            (
+                owner.typed_program_fd("typed_entry")?.as_raw_fd(),
+                owner.typed_program_fd("typed_return")?.as_raw_fd(),
+            )
+        };
         let mut admitted = 0usize;
         for index in 0..self.typed_startup.len() {
             if cancel.load(std::sync::atomic::Ordering::Relaxed) || Instant::now() >= deadline {
@@ -1748,6 +1769,11 @@ impl ProviderSession {
             if self.next_typed_cookie >= TYPED_COOKIE_END {
                 return Err(ObservationGap::LinkLimit);
             }
+            if self.link_count() + 2 > self.budget.limits.max_links {
+                return Err(ObservationGap::LinkLimit);
+            }
+            self.budget.state(512 + 96)?;
+            site.revalidate_object()?;
             let cookie = self.next_typed_cookie;
             self.next_typed_cookie += 1;
             let site_id = self.next_site_id;
@@ -1768,22 +1794,49 @@ impl ProviderSession {
                 }
             };
             let object_sha256 = super::source_owner::decode_object_hash_hex(&object_hash)?;
-            let receipts = self
+            let owner = self
                 .source_owner
                 .as_mut()
-                .ok_or(ObservationGap::Invalidated)?
-                .admit_typed_site(&super::source_owner::TypedAdmissionRequest {
-                    cookie,
-                    site_id,
-                    role_id,
-                    public_api_id: api,
-                    operation,
-                    function,
-                    tgid: pid,
-                    object_id,
-                    object_sha256,
-                })?;
-            self.attach_typed_site(&site, pid, cookie)?;
+                .ok_or(ObservationGap::Invalidated)?;
+            let receipts = owner.admit_typed_site(&super::source_owner::TypedAdmissionRequest {
+                cookie,
+                site_id,
+                role_id,
+                public_api_id: api,
+                operation,
+                function,
+                tgid: pid,
+                object_id,
+                object_sha256,
+                source_epoch: scope.anchor.epoch,
+            })?;
+            // Registration custody is a dup of the retained site's own
+            // descriptor (never a re-resolved path); the kernel joins the
+            // registration to the shared anchor by inode, so a site from a
+            // file the anchor does not cover refuses here, fail-closed.
+            let target = File::from(
+                site.attachment_fd()
+                    .try_clone_to_owned()
+                    .map_err(|_| ObservationGap::BackingUnavailable)?,
+            );
+            let registration_scope = super::source_owner::RequestScope {
+                site_cookie: cookie,
+                host_key: scope.host_key,
+                incarnation: scope.incarnation,
+                planned_image: scope.planned_image,
+                link_offset: offset,
+                target_pid: pid,
+                target,
+                expected_artifact: site.object_hash().clone(),
+            };
+            let registration = owner.register_entry_return(
+                &registration_scope,
+                entry_prog,
+                return_prog,
+                &scope.anchor,
+            )?;
+            owner.publish_typed_ready(&registration_scope, &scope.anchor, &registration)?;
+            site.revalidate_object()?;
             self.typed_sites.insert(
                 cookie,
                 TypedSiteRecord {
@@ -1812,62 +1865,6 @@ impl ProviderSession {
             admitted += 1;
         }
         Ok(admitted)
-    }
-    /// Attach one typed entry/return pair at a verified export offset with
-    /// its admitted cookie. Mirrors `attach_pair` link accounting without
-    /// the legacy CONFIG programming (typed authority lives in
-    /// TYPED_ADMISSION/SITE_BIND).
-    fn attach_typed_site(
-        &mut self,
-        site: &VerifiedSite,
-        pid: u32,
-        cookie: u64,
-    ) -> Result<(), ObservationGap> {
-        use std::os::fd::AsRawFd as _;
-        if self.final_drain || !self.gate.admitting() {
-            return Err(ObservationGap::Invalidated);
-        }
-        if self.link_count() + 2 > self.budget.limits.max_links {
-            return Err(ObservationGap::LinkLimit);
-        }
-        self.budget.state(512 + 96)?;
-        site.revalidate_object()?;
-        let path = CString::new(format!(
-            "/proc/self/fd/{}",
-            site.attachment_fd().as_raw_fd()
-        ))
-        .map_err(|_| ObservationGap::AttachFailed)?;
-        let owner = self
-            .source_owner
-            .as_ref()
-            .ok_or(ObservationGap::Invalidated)?;
-        let entry_fd = owner.typed_program_fd("typed_entry")?.as_raw_fd();
-        let return_fd = owner.typed_program_fd("typed_return")?.as_raw_fd();
-        let links = paired_links(
-            || {
-                ossl_bpf_sys::link_create_uprobe_multi(
-                    entry_fd,
-                    &path,
-                    &[site.file_offset()],
-                    &[cookie],
-                    pid,
-                )
-                .map_err(|_| ObservationGap::AttachFailed)
-            },
-            || {
-                ossl_bpf_sys::link_create_uretprobe_multi(
-                    return_fd,
-                    &path,
-                    &[site.file_offset()],
-                    &[cookie],
-                    pid,
-                )
-                .map_err(|_| ObservationGap::AttachFailed)
-            },
-        )?;
-        site.revalidate_object()?;
-        self.typed_links.extend(links);
-        Ok(())
     }
     /// Counter bridge: pinned cookie per physical site for same-cookie
     /// counter attach, so both programs resolve one SITE_BIND row.
@@ -2124,7 +2121,12 @@ impl ProviderSession {
     /// attachment, before the held child is released. File custody, offset,
     /// cookie and identity derive from the retained admitted site; the
     /// caller's params are verified against that truth first and never used
-    /// as authority. Any phase failure refuses the order before returning.
+    /// as authority. Typed capabilities join the same order between the
+    /// legacy registration and the terminal legacy READY: every
+    /// capability lists before any READY completes the set, so the held
+    /// child releases only after post-adoption READY published for the
+    /// legacy site and every typed cookie. Any phase failure refuses the
+    /// order before returning.
     pub(crate) fn acquire_source_after_open(
         &mut self,
         lease: &super::source_owner::SourceAcquisitionLease,
@@ -2178,28 +2180,67 @@ impl ProviderSession {
             std::os::fd::AsRawFd::as_raw_fd(entry_prog),
             std::os::fd::AsRawFd::as_raw_fd(return_prog),
         );
+        // Gate-open through the legacy registration: the legacy capability
+        // lists first, but its READY publishes only after every typed
+        // capability lists, so one terminal READY completes the whole set.
+        let prepared = {
+            let owner = self
+                .source_owner
+                .as_mut()
+                .ok_or(ObservationGap::Invalidated)?;
+            let budget = &self.budget;
+            (|| {
+                owner.note_gate_open_observed()?;
+                let domain = owner.arm_domain(admitted.tgid)?;
+                let host_key = owner.enroll_observer()?;
+                let scope = super::source_owner::RequestScope {
+                    site_cookie: admitted.site_cookie,
+                    host_key,
+                    incarnation: domain.incarnation,
+                    planned_image: domain.planned,
+                    link_offset: admitted.link_offset,
+                    target_pid: admitted.tgid,
+                    target: admitted.target,
+                    expected_artifact: admitted.expected_artifact,
+                };
+                let anchor = owner.anchor_source(&scope, budget)?;
+                let registration =
+                    owner.register_entry_return(&scope, entry_prog, return_prog, &anchor)?;
+                let typed = super::source_owner::TypedAcquisitionScope {
+                    anchor,
+                    host_key,
+                    incarnation: domain.incarnation,
+                    planned_image: domain.planned,
+                };
+                Ok((scope, domain, host_key, anchor, registration, typed))
+            })()
+        };
+        let (scope, domain, host_key, anchor, registration, typed) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(owner) = self.source_owner.as_mut() {
+                    owner.refuse_acquisition();
+                }
+                return Err(error);
+            }
+        };
+        // Typed exports join the same order while the child is still held:
+        // admit, register and READY every retained typed site before
+        // release, so no fetch can fire unadmitted. A typed refusal fails
+        // the whole acquisition (partial authority is worse than none).
+        if self.acquire_typed_sites(&typed, deadline, cancel).is_err() {
+            if let Some(owner) = self.source_owner.as_mut() {
+                owner.refuse_acquisition();
+            }
+            return Err(ObservationGap::AttachFailed);
+        }
+        // Terminal legacy READY: completes the full listed set (legacy +
+        // typed). Only now may the held child release.
         let owner = self
             .source_owner
             .as_mut()
             .ok_or(ObservationGap::Invalidated)?;
-        let budget = &self.budget;
         let result = (|| {
-            owner.note_gate_open_observed()?;
-            let domain = owner.arm_domain(admitted.tgid)?;
-            let host_key = owner.enroll_observer()?;
-            let scope = super::source_owner::RequestScope {
-                site_cookie: admitted.site_cookie,
-                host_key,
-                incarnation: domain.incarnation,
-                planned_image: domain.planned,
-                link_offset: admitted.link_offset,
-                target_pid: admitted.tgid,
-                target: admitted.target,
-                expected_artifact: admitted.expected_artifact,
-            };
-            let anchor = owner.anchor_source(&scope, budget)?;
-            let registration =
-                owner.register_entry_return(&scope, entry_prog, return_prog, &anchor)?;
             let ready_sequence = owner.publish_ready(&scope, &anchor, &registration)?;
             if !owner.acquisition_ready() {
                 return Err(ObservationGap::Invalidated);
@@ -2217,17 +2258,6 @@ impl ProviderSession {
         })();
         if result.is_err() {
             owner.refuse_acquisition();
-            return result;
-        }
-        // Typed exports consume the ready acquisition while the child is
-        // still held: admit + attach every retained typed site before
-        // release, so no fetch can fire unadmitted. A typed refusal fails
-        // the whole acquisition (partial authority is worse than none).
-        if self.acquire_typed_sites(deadline, cancel).is_err() {
-            if let Some(owner) = self.source_owner.as_mut() {
-                owner.refuse_acquisition();
-            }
-            return Err(ObservationGap::AttachFailed);
         }
         result
     }
@@ -3973,7 +4003,13 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             receipts.anchor.anchor_id
         );
         assert_ne!(receipts.ready_sequence, 0);
-        assert_eq!(receipts.adopted_links, 2);
+        // P3-I1: every typed cookie adopts its own entry/return pair into
+        // the owner alongside the legacy pair, so adoptions scale with the
+        // staged typed population (2 + 2 per typed site here).
+        assert_eq!(
+            receipts.adopted_links,
+            2 + 2 * session.typed_site_records().len()
+        );
         // Independent anchor oracle: hash the target file directly.
         let expected = {
             use sha2::Digest as _;
@@ -4024,13 +4060,15 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         // confirms it before retiring anything.
         let close = session.close_source_explicit().expect("source close");
         assert!(close.cut_confirmed, "close must confirm the cut");
+        // P3-I1: the close retires the anchor, the legacy adoption guard
+        // and one adoption guard per typed cookie.
         assert_eq!(
             (
                 close.guards_retired,
                 close.guards_abandoned,
                 close.domains_retired
             ),
-            (2, 0, 1)
+            (2 + session.typed_site_records().len(), 0, 1)
         );
         assert!(
             !close.order_refused,
@@ -4579,6 +4617,445 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
              construction's unmatched return (PAIR)"
         );
     }
+    /// P3-I1 single-typed-site fixture: the query/dispatch shape of
+    /// `source_native_fixture` (so discovery still yields one legacy API
+    /// site) but exactly one typed export (`EVP_MAC_fetch`, role 130).
+    /// `main` calls the export and exits 0 only on public success, so the
+    /// exit-0 oracle proves the export EXECUTED — any attached ENTRY
+    /// uprobe fired — while kernel minting (or its absence) proves what
+    /// the typed callback did with that firing.
+    fn source_native_single_typed_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        std::fs::write(
+            &source,
+            r#"
+#include <stdio.h>
+#include <stddef.h>
+struct dispatch { int id; void (*fn)(void); };
+struct algorithm { const char *names, *properties; const struct dispatch *implementation; const char *description; };
+__attribute__((noinline)) static void implementation(void) { __asm__ volatile(""); }
+static const struct dispatch dispatch[] = { { 70001, implementation }, { 0, 0 } };
+static const struct algorithm algorithms[] = { { "FUTURE-DIGEST", 0, dispatch, 0 }, { 0, 0, 0, 0 } };
+__attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider,int op,int *no_cache) {
+ *no_cache=0;
+ (void)provider; (void)op;
+ return algorithms;
+}
+void *EVP_MAC_fetch(void *c,const char *n,const char *p){ (void)n; (void)p; return c; }
+int main(int argc,char **argv) { if(argc!=2) return 2;
+ FILE *f=fopen(argv[1],"w"); if(!f) return 4; fputs("exec\n",f); fclose(f);
+ { int no_cache=-1;
+   if(OSSL_PROVIDER_query_operation((void*)1,1,&no_cache)==0) return 3; }
+ if(EVP_MAC_fetch((void*)1,"X",0)!=(void*)1) return 3;
+ return 0; }
+"#,
+        )
+        .unwrap();
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O0", "-rdynamic", "-o"])
+                .arg(&app)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        app
+    }
+    /// Host readback of the kernel-minted producer-ID counter (counts only,
+    /// from the already-open ATTRIB_CONTROL map): the host seeds 1, and
+    /// every mint happens strictly downstream of a passed READY gate, so a
+    /// held 1 proves no typed callback passed the gate.
+    fn source_native_next_producer_id(session: &ProviderSession) -> u64 {
+        let fd = session
+            .source_owner
+            .as_ref()
+            .unwrap()
+            .owned_map("ATTRIB_CONTROL")
+            .unwrap();
+        let map = loader::BorrowedMap::new(fd).unwrap();
+        map.shape(&[2], 4, 64).unwrap();
+        let mut value = [0u8; 64];
+        map.lookup(&0u32.to_ne_bytes(), &mut value).unwrap();
+        u64::from_ne_bytes(value[32..40].try_into().unwrap())
+    }
+    struct TypedRefusalSetup {
+        dir: std::path::PathBuf,
+        app: std::path::PathBuf,
+        child: crate::target::OwnedTarget,
+        cancel: std::sync::atomic::AtomicBool,
+        gate: crate::writer_gate::WriterGate,
+        session: ProviderSession,
+        admitted_offset: u64,
+    }
+    /// Owned session over the single-typed-site fixture, carried through
+    /// reserve-only prearm, typed preparation and gate open. Asserts the
+    /// exact single-cookie shape the refusal controls depend on.
+    fn typed_refusal_setup(suffix: &str) -> TypedRefusalSetup {
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-typed-refuse-{suffix}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_single_typed_fixture(&dir);
+        let argv = [
+            app.to_string_lossy().into_owned(),
+            dir.join("marker").to_string_lossy().into_owned(),
+        ];
+        let child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+        )
+        .unwrap();
+        let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        assert_eq!(session.startup[&child.pid()].len(), 1);
+        let admitted_offset = session.startup[&child.pid()][0].site.file_offset();
+        assert_ne!(admitted_offset, 0);
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test(
+                app.clone(),
+                admitted_offset,
+                child.pid(),
+            ),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let roles: Vec<u32> = session
+            .typed_startup
+            .iter()
+            .map(|staged| staged.role().id())
+            .collect();
+        assert_eq!(
+            roles,
+            vec![130],
+            "refusal fixture must stage exactly the fetch cookie"
+        );
+        gate.open().unwrap();
+        TypedRefusalSetup {
+            dir,
+            app,
+            child,
+            cancel,
+            gate,
+            session,
+            admitted_offset,
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn typed_failed_entry_registration_withholds_ready_and_operands() {
+        // P3-I1 failed-registration control (ENTRY): the typed ENTRY
+        // request arms for the wrong offset while the actual link uses the
+        // true one. The kernel refuses with a genuine refused receipt: the
+        // capability never creates its adoption guard (ledger stays
+        // Minted), no READY can publish, and the acquisition refuses as a
+        // whole. The ENTRY link itself IS attached and FIRES when the
+        // workload executes the export (exit 0 proves public success) —
+        // yet the kernel mints nothing (next_producer_id holds 1), proving
+        // typed_entry refused at the READY gate before any operand read:
+        // without the capability the operand readers stay unavailable.
+        let baseline = source_native_fd_targets();
+        let mut setup = typed_refusal_setup("entry");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let params = super::source_owner::NativeSourceParams::for_test(
+            setup.app.clone(),
+            setup.admitted_offset,
+            pid,
+        );
+        let admitted = setup.session.admitted_source_site(&params).unwrap();
+        let typed = {
+            let session = &mut setup.session;
+            let owner = session.source_owner.as_mut().expect("source owner");
+            let budget = &session.budget;
+            owner.note_gate_open_observed().unwrap();
+            let domain = owner.arm_domain(pid).unwrap();
+            let host_key = owner.enroll_observer().unwrap();
+            let scope = super::source_owner::RequestScope {
+                site_cookie: admitted.site_cookie,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+                link_offset: admitted.link_offset,
+                target_pid: admitted.tgid,
+                target: admitted.target,
+                expected_artifact: admitted.expected_artifact,
+            };
+            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
+                panic!(
+                    "anchor failed: {gap:?} owner: {:?}",
+                    owner.take_last_error()
+                )
+            });
+            assert_eq!(
+                owner.guard_life_test(anchor.anchor_id),
+                Some(super::source_acquire::GuardLife::Live)
+            );
+            owner.fail_next_typed_entry();
+            super::source_owner::TypedAcquisitionScope {
+                anchor,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+            }
+        };
+        let error = setup
+            .session
+            .acquire_typed_sites(
+                &typed,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_err();
+        assert_eq!(error, ObservationGap::Invalidated);
+        {
+            let session = &mut setup.session;
+            let typed_empty = session.typed_site_records().is_empty();
+            let owner = session.source_owner.as_mut().expect("source owner");
+            let registration = owner.last_typed_registration_test();
+            assert_ne!(registration, 0, "the refused ENTRY minted a registration");
+            assert_eq!(
+                owner.guard_life_test(registration),
+                Some(super::source_acquire::GuardLife::Minted),
+                "ENTRY refusal must precede guard creation"
+            );
+            assert_eq!(
+                owner.adopted_link_count(),
+                1,
+                "only the refused ENTRY link attached"
+            );
+            assert!(typed_empty, "refused cookies record nothing");
+            assert!(!owner.acquisition_ready(), "no READY, no release");
+            owner.refuse_acquisition();
+            eprintln!(
+                "typed ENTRY refused: reg={registration} adopted=1 next_id={} (pre-release)",
+                source_native_next_producer_id(session)
+            );
+        }
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            setup.child.poll_exit().unwrap(),
+            Some(0),
+            "workload must exit 0: the export executed, so the ENTRY link fired"
+        );
+        assert_eq!(
+            source_native_next_producer_id(&setup.session),
+            1,
+            "typed_entry refused at the READY gate before any mint"
+        );
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(params);
+        let state = setup
+            .session
+            .note_source_exec(&lease, pid, typed.planned_image)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (1, 0, 1),
+            "anchor retired; the Minted typed id owns no kernel row"
+        );
+        assert!(close.order_refused, "refused order must refuse");
+        assert!(close.first_error.is_none());
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn typed_failed_return_registration_withholds_ready_and_operands() {
+        // P3-I1 failed-registration control (RETURN): ENTRY succeeds (the
+        // adoption guard is created PREPARING) but the armed RETURN claims
+        // the wrong offset, so the kernel quarantines the staged row and
+        // refuses with a genuine refused receipt. The capability never
+        // adopts (guard stays PREPARING, never LIVE), no READY can
+        // publish, and the acquisition refuses as a whole. Both links ARE
+        // attached and FIRE when the workload executes the export (exit 0
+        // proves public success) — yet the kernel mints nothing
+        // (next_producer_id holds 1), proving both typed callbacks refused
+        // at the READY gate before any operand read.
+        let baseline = source_native_fd_targets();
+        let mut setup = typed_refusal_setup("return");
+        let pid = setup.child.pid();
+        let marker = setup.dir.join("marker");
+        let params = super::source_owner::NativeSourceParams::for_test(
+            setup.app.clone(),
+            setup.admitted_offset,
+            pid,
+        );
+        let admitted = setup.session.admitted_source_site(&params).unwrap();
+        let typed = {
+            let session = &mut setup.session;
+            let owner = session.source_owner.as_mut().expect("source owner");
+            let budget = &session.budget;
+            owner.note_gate_open_observed().unwrap();
+            let domain = owner.arm_domain(pid).unwrap();
+            let host_key = owner.enroll_observer().unwrap();
+            let scope = super::source_owner::RequestScope {
+                site_cookie: admitted.site_cookie,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+                link_offset: admitted.link_offset,
+                target_pid: admitted.tgid,
+                target: admitted.target,
+                expected_artifact: admitted.expected_artifact,
+            };
+            let anchor = owner.anchor_source(&scope, budget).unwrap_or_else(|gap| {
+                panic!(
+                    "anchor failed: {gap:?} owner: {:?}",
+                    owner.take_last_error()
+                )
+            });
+            assert_eq!(
+                owner.guard_life_test(anchor.anchor_id),
+                Some(super::source_acquire::GuardLife::Live)
+            );
+            owner.fail_next_typed_return();
+            super::source_owner::TypedAcquisitionScope {
+                anchor,
+                host_key,
+                incarnation: domain.incarnation,
+                planned_image: domain.planned,
+            }
+        };
+        let error = setup
+            .session
+            .acquire_typed_sites(
+                &typed,
+                Instant::now() + Duration::from_secs(15),
+                &setup.cancel,
+            )
+            .unwrap_err();
+        assert_eq!(error, ObservationGap::Invalidated);
+        {
+            let session = &mut setup.session;
+            let typed_empty = session.typed_site_records().is_empty();
+            let owner = session.source_owner.as_mut().expect("source owner");
+            let registration = owner.last_typed_registration_test();
+            assert_ne!(registration, 0, "the refused RETURN minted a registration");
+            assert_eq!(
+                owner.guard_life_test(registration),
+                Some(super::source_acquire::GuardLife::Preparing),
+                "RETURN refusal must precede adoption"
+            );
+            assert_eq!(
+                owner.adopted_link_count(),
+                2,
+                "both links attached; the pair never adopted"
+            );
+            assert!(typed_empty, "refused cookies record nothing");
+            assert!(!owner.acquisition_ready(), "no READY, no release");
+            owner.refuse_acquisition();
+            eprintln!(
+                "typed RETURN refused: reg={registration} adopted=2 next_id={} (pre-release)",
+                source_native_next_producer_id(session)
+            );
+        }
+        setup.child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        while setup.child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            setup.child.poll_exit().unwrap(),
+            Some(0),
+            "workload must exit 0: the export executed, so both links fired"
+        );
+        assert_eq!(
+            source_native_next_producer_id(&setup.session),
+            1,
+            "typed callbacks refused at the READY gate before any mint"
+        );
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(params);
+        let state = setup
+            .session
+            .note_source_exec(&lease, pid, typed.planned_image)
+            .unwrap();
+        assert_eq!(state, super::source_owner::contract::DOMAIN_ACTIVE);
+        setup.gate.close().unwrap();
+        let close = setup.session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert_eq!(
+            (
+                close.guards_retired,
+                close.guards_abandoned,
+                close.domains_retired
+            ),
+            (1, 0, 1),
+            "anchor retired; the unlisted PREPARING typed id retires with its maps"
+        );
+        assert!(close.order_refused, "refused order must refuse");
+        assert!(close.first_error.is_none());
+        drop(setup.session);
+        drop(setup.gate);
+        drop(setup.child);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "teardown must release every fd"
+        );
+        std::fs::remove_dir_all(&setup.dir).unwrap();
+    }
     struct SourceRefusalSetup {
         dir: std::path::PathBuf,
         app: std::path::PathBuf,
@@ -4981,8 +5458,12 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
         // Custody retained: adopted links, anchor, loaded roots, LIVE
         // guards, and the kernel domain row untouched (still ACTIVE: the
         // host performed no racing read-modify-write of live state).
+        // P3-I1: the owner also retains every adopted typed pair.
         let owner = setup.session.source_owner.as_ref().expect("source owner");
-        assert_eq!(owner.adopted_link_count(), 2);
+        assert_eq!(
+            owner.adopted_link_count(),
+            2 + 2 * setup.session.typed_site_records().len()
+        );
         assert!(owner.anchor_retained_test());
         let roots = setup
             .session
@@ -5084,7 +5565,11 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
             "failed close must not disturb the READY order"
         );
         let owner = setup.session.source_owner.as_ref().expect("source owner");
-        assert_eq!(owner.adopted_link_count(), 2);
+        // P3-I1: the owner also retains every adopted typed pair.
+        assert_eq!(
+            owner.adopted_link_count(),
+            2 + 2 * setup.session.typed_site_records().len()
+        );
         assert!(owner.anchor_retained_test());
         let roots = setup
             .session
