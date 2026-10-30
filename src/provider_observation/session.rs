@@ -4202,8 +4202,10 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// H1/H2/H3 behavior verbatim) and a marker filename so two passes
     /// can share one fixture directory. The I2 control adds an optional
     /// third argv word (None preserves every existing receipt verbatim);
-    /// the complete-chain fixture gates its live-table mutation, direct
-    /// reset call and second derive on `argc > 2`.
+    /// the complete-chain fixture selects its live-table mode from that
+    /// word (`mutate-kdf-table`/other: I2 drop44 + direct reset + second
+    /// derive; `i1-swap45`/`i1-swap34`: alternate advertisement;
+    /// `i3-drop45`: omitted (4,5)).
     fn drive_typed_session_with_counter(
         tag: &str,
         app: &std::path::Path,
@@ -4685,12 +4687,20 @@ int main(int argc,char **argv) {{ if(argc!=2) return 2;
     /// so exit 0 plus the exec marker oracles the public chain. Callback
     /// bodies differ pairwise (distinct constants) so no toolchain fold
     /// can merge two callbacks onto one address.
-    fn source_native_complete_chain_fixture(dir: &std::path::Path) -> std::path::PathBuf {
-        let source = dir.join("app.c");
-        let app = dir.join("app");
-        std::fs::write(
-            &source,
-            r#"
+    /// Complete-chain C template shared by the standard and firstbyte
+    /// fixtures. `DERIVE_ATTR` marks the derive definition's attribute
+    /// slot: empty for the standard build, a section attribute isolating
+    /// the derive for the firstbyte link. Live-table modes by third argv
+    /// word: none (2-arg) normal; `mutate-kdf-table` or any other word
+    /// drops (4,4) from the live KDF table and drives the direct reset +
+    /// second derive (I2); `i1-swap45`/`i1-swap34` advertise an
+    /// alternate same-file callback the static plan never stages (I1);
+    /// `i3-drop45` omits (4,5) from the live table (I3). Every mode
+    /// exits 0 on the public chain. Callback bodies differ pairwise
+    /// (distinct constants) so no toolchain fold can merge two
+    /// callbacks onto one address.
+    fn complete_chain_c_template() -> &'static str {
+        r#"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -4706,7 +4716,9 @@ __attribute__((noinline)) void *test_kdf_newctx(void *c) { (void)c; __asm__ vola
 __attribute__((noinline)) void *test_kdf_dupctx(void *x) { (void)x; __asm__ volatile(""); void *y = malloc(32); if (y) memset(y, 0xB2, 32); return y; }
 __attribute__((noinline)) void test_kdf_freectx(void *x) { __asm__ volatile(""); free(x); volatile int sink = 0; (void)sink; }
 __attribute__((noinline)) void test_kdf_reset(void *x) { (void)x; __asm__ volatile(""); }
-__attribute__((noinline)) int test_kdf_derive(void *x, void *out, unsigned long len) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC7, len < 32 ? len : 32); return 1; }
+__attribute__((noinline)) DERIVE_ATTRint test_kdf_derive(void *x, void *out, unsigned long len) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC7, len < 32 ? len : 32); return 1; }
+__attribute__((noinline)) int test_kdf_derive_alt(void *x, void *out, unsigned long len) { (void)x; __asm__ volatile(""); if (out) memset(out, 0xC9, len < 32 ? len : 32); return 1; }
+__attribute__((noinline)) int test_mac_init_alt(void *x, int v) { (void)x; __asm__ volatile(""); return v + 7; }
 static const struct dispatch mac_dispatch[] = {
  { 1, (void(*)(void))test_mac_newctx }, { 2, (void(*)(void))test_mac_dupctx }, { 3, (void(*)(void))test_mac_freectx },
  { 4, (void(*)(void))test_mac_init }, { 5, (void(*)(void))test_mac_update }, { 6, (void(*)(void))test_mac_final }, { 0, 0 } };
@@ -4715,17 +4727,30 @@ static const struct dispatch kdf_dispatch[] = {
  { 4, (void(*)(void))test_kdf_reset }, { 5, (void(*)(void))test_kdf_derive }, { 0, 0 } };
 static const struct algorithm mac_algorithms[] = { { "FAKE-MAC", 0, mac_dispatch, "fake mac" }, { 0, 0, 0, 0 } };
 static const struct algorithm kdf_algorithms[] = { { "FAKE-KDF", 0, kdf_dispatch, "fake kdf" }, { 0, 0, 0, 0 } };
-static int g_mutate_kdf_table = 0;
+static int g_table_mode = 0;
 static struct dispatch kdf_live_dispatch[6];
 static struct algorithm kdf_live_algorithms[2];
+static struct dispatch mac_live_dispatch[7];
+static struct algorithm mac_live_algorithms[2];
 __attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider, int op, int *no_cache) {
  (void)provider;
  *no_cache = 0;
- if (op == 3) return mac_algorithms;
+ if (op == 3) {
+  if (g_table_mode != 3) return mac_algorithms;
+  for (int i = 0; i < 7; i++) mac_live_dispatch[i] = mac_dispatch[i];
+  mac_live_dispatch[3].fn = (void(*)(void))test_mac_init_alt;
+  mac_live_algorithms[0].names = "FAKE-MAC"; mac_live_algorithms[0].properties = 0;
+  mac_live_algorithms[0].implementation = mac_live_dispatch; mac_live_algorithms[0].description = "fake mac";
+  mac_live_algorithms[1].names = 0; mac_live_algorithms[1].properties = 0;
+  mac_live_algorithms[1].implementation = 0; mac_live_algorithms[1].description = 0;
+  return mac_live_algorithms;
+ }
  if (op == 4) {
-  if (!g_mutate_kdf_table) return kdf_algorithms;
+  if (!g_table_mode || g_table_mode == 3) return kdf_algorithms;
   for (int i = 0; i < 6; i++) kdf_live_dispatch[i] = kdf_dispatch[i];
-  kdf_live_dispatch[3] = kdf_live_dispatch[4];
+  if (g_table_mode == 1) kdf_live_dispatch[3] = kdf_live_dispatch[4];
+  else if (g_table_mode == 2) kdf_live_dispatch[4].fn = (void(*)(void))test_kdf_derive_alt;
+  else if (g_table_mode == 4) kdf_live_dispatch[4] = kdf_live_dispatch[3];
   kdf_live_algorithms[0].names = "FAKE-KDF"; kdf_live_algorithms[0].properties = 0;
   kdf_live_algorithms[0].implementation = kdf_live_dispatch; kdf_live_algorithms[0].description = "fake kdf";
   kdf_live_algorithms[1].names = 0; kdf_live_algorithms[1].properties = 0;
@@ -4780,7 +4805,13 @@ int main(int argc, char **argv) {
  FILE *f = fopen(argv[1], "w"); if (!f) return 4; fputs("exec\n", f); fclose(f);
  fake_libctx = malloc(16); fake_mac_method = malloc(16); fake_kdf_method = malloc(16); fake_provider = malloc(16);
  if (!fake_libctx || !fake_mac_method || !fake_kdf_method || !fake_provider) return 5;
- g_mutate_kdf_table = (argc > 2);
+ g_table_mode = 0;
+ if (argc > 2) {
+  if (!strcmp(argv[2], "i1-swap45")) g_table_mode = 2;
+  else if (!strcmp(argv[2], "i1-swap34")) g_table_mode = 3;
+  else if (!strcmp(argv[2], "i3-drop45")) g_table_mode = 4;
+  else g_table_mode = 1;
+ }
  int nc = -1;
  if (OSSL_PROVIDER_query_operation(fake_provider, 3, &nc) == 0 || nc != 0) return 3;
  nc = -1;
@@ -4797,16 +4828,24 @@ int main(int argc, char **argv) {
  if (test_mac_final_call(u, out) != 1 || out[0] != 0xC3) return 3;
  unsigned char kout[32];
  if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3;
- if (argc > 2) test_kdf_reset(((FAKE_CTX *)ku)->data); else EVP_KDF_CTX_reset(ku);
- if (argc > 2) { if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3; }
+ if (g_table_mode == 1) test_kdf_reset(((FAKE_CTX *)ku)->data); else EVP_KDF_CTX_reset(ku);
+ if (g_table_mode == 1) { if (test_kdf_derive_call(ku, kout, 32) != 1 || kout[0] != 0xC7) return 3; }
  EVP_MAC_CTX_free(u2); EVP_MAC_CTX_free(u); EVP_KDF_CTX_free(ku2); EVP_KDF_CTX_free(ku);
  EVP_MAC_free(m); EVP_KDF_free(k);
  OPENSSL_cleanup();
  return 0;
 }
-"#,
-        )
-        .unwrap();
+"#
+    }
+    fn source_native_complete_chain_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        let rendered = complete_chain_c_template().replace("DERIVE_ATTR", "");
+        assert!(
+            !rendered.contains("DERIVE_ATTR"),
+            "template marker must render"
+        );
+        std::fs::write(&source, rendered).unwrap();
         let status = std::process::Command::new("cc")
             .args(["-O0", "-rdynamic", "-o"])
             .arg(&app)
@@ -4815,6 +4854,105 @@ int main(int argc, char **argv) {
             .unwrap();
         assert!(status.success(), "complete-chain fixture must compile");
         app
+    }
+    /// Firstbyte complete-chain fixture: the same chain with the KDF
+    /// derive isolated in `.text.i2first` and linked FIRST in the
+    /// executable segment (minimal `_start`, no startfiles, no PLT,
+    /// separate code), so the derive callback sits at the first byte
+    /// of its executable VMA. x86_64 only (assembly `_start`); the
+    /// control verifies the placement premise from the ELF before
+    /// driving, and refuses loudly if the toolchain surprises.
+    #[cfg(target_arch = "x86_64")]
+    fn source_native_firstbyte_chain_fixture(dir: &std::path::Path) -> std::path::PathBuf {
+        let source = dir.join("app.c");
+        let app = dir.join("app");
+        let start = dir.join("start.s");
+        let script = dir.join("firstbyte.ld");
+        let rendered = complete_chain_c_template().replace(
+            "DERIVE_ATTR",
+            "__attribute__((section(\".text.i2first\"))) ",
+        );
+        assert!(
+            !rendered.contains("DERIVE_ATTR"),
+            "template marker must render"
+        );
+        std::fs::write(&source, rendered).unwrap();
+        std::fs::write(
+            &start,
+            ".globl _start\n_start:\n xor %rbp,%rbp\n mov %rdx,%r9\n pop %rsi\n mov %rsp,%rdx\n and $-16,%rsp\n push %rax\n push %rsp\n xor %r8d,%r8d\n xor %ecx,%ecx\n leaq main(%rip),%rdi\n call *__libc_start_main@GOTPCREL(%rip)\n hlt\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &script,
+            "SECTIONS { .text.i2first : { KEEP(*(.text.i2first)) } } INSERT BEFORE .text\n",
+        )
+        .unwrap();
+        let status = std::process::Command::new("cc")
+            .args([
+                "-O0",
+                "-fno-plt",
+                "-rdynamic",
+                "-nostartfiles",
+                "-Wl,-z,separate-code",
+            ])
+            .arg({
+                let mut flag = std::ffi::OsString::from("-Wl,-T,");
+                flag.push(&script);
+                flag
+            })
+            .args(["-o"])
+            .arg(&app)
+            .arg(&start)
+            .arg(&source)
+            .status()
+            .unwrap();
+        assert!(status.success(), "firstbyte fixture must compile");
+        app
+    }
+    /// Fixture public-chain oracle without BPF: every live-table mode of
+    /// the standard fixture exits 0 and writes the exec marker, so any
+    /// later native failure is attribution evidence, never a broken
+    /// workload.
+    #[test]
+    fn complete_chain_fixture_all_modes_exit_zero() {
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-fixture-modes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        for (tag, extra) in [
+            ("m0", None),
+            ("m1", Some("mutate-kdf-table")),
+            ("m2", Some("i1-swap45")),
+            ("m3", Some("i1-swap34")),
+            ("m4", Some("i3-drop45")),
+        ] {
+            let marker = dir.join(format!("marker-{tag}"));
+            let mut command = std::process::Command::new(&app);
+            command.arg(&marker);
+            if let Some(word) = extra {
+                command.arg(word);
+            }
+            let status = command.status().unwrap();
+            assert!(status.success(), "mode {tag} must exit 0");
+            assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        }
+    }
+    /// Firstbyte fixture public-chain oracle without BPF (x86_64):
+    /// the minimal-startup, no-PLT layout runs the normal chain to
+    /// exit 0 with the exec marker.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn firstbyte_fixture_exits_zero() {
+        let dir = std::env::temp_dir().join(format!("osslscope-fixture-fb-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_firstbyte_chain_fixture(&dir);
+        let marker = dir.join("marker-fb");
+        let status = std::process::Command::new(&app)
+            .arg(&marker)
+            .status()
+            .unwrap();
+        assert!(status.success(), "firstbyte normal mode must exit 0");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
     }
     /// U1 pass 1: legacy-only observation run. Attaches the discovered
     /// legacy API sites (the query export), releases the fixture, waits
@@ -5185,6 +5323,357 @@ int main(int argc, char **argv) {
         assert_eq!(
             drive.next_producer_id, 48,
             "U2's 49 minus the unpublished (4,4) CODE_ROLE witness; the duplicate (4,5) dedups without minting and the second derive reuses the 307 segment"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
+        );
+    }
+    /// Fixture symbol file offset through the containing LOAD: the exact
+    /// registration-offset premise for the substitution controls.
+    fn fixture_symbol_file_offset(app: &std::path::Path, name: &str) -> u64 {
+        let bytes = std::fs::read(app).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let sym = elf
+            .syms
+            .iter()
+            .find(|s| elf.strtab.get_at(s.st_name) == Some(name))
+            .unwrap_or_else(|| panic!("fixture must define {name}"));
+        for ph in &elf.program_headers {
+            if ph.p_type == goblin::elf::program_header::PT_LOAD
+                && sym.st_value >= ph.p_vaddr
+                && sym.st_value < ph.p_vaddr + ph.p_memsz
+            {
+                return ph.p_offset + (sym.st_value - ph.p_vaddr);
+            }
+        }
+        panic!("{name} outside any LOAD");
+    }
+    /// I1 substitution control (KDF derive): pass 1 plans the staged
+    /// derive B from static bytes; pass 2's live KDF table advertises
+    /// the alternate same-file callback A for (4,5) instead. The staged
+    /// B fires but must refuse: same inode, same (op,fun), different
+    /// observed offset. Against pre-fix objects this fails with the U2
+    /// receipt (definite 4): the inode-only join authorizes B from A's
+    /// advertisement.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     copied_role_substitution_same_file_offset_refuses --nocapture
+    /// ```
+    #[test]
+    #[ignore = "substitution control (sudo, cc)"]
+    fn copied_role_substitution_same_file_offset_refuses() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-i1a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        let staged_b = fixture_symbol_file_offset(&app, "test_kdf_derive");
+        let advertised_a = fixture_symbol_file_offset(&app, "test_kdf_derive_alt");
+        assert_ne!(
+            staged_b, advertised_a,
+            "same file, different offsets is the premise"
+        );
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(
+            plan.sites.len(),
+            11,
+            "pass-1 normal mode plans MAC 6 + KDF 5"
+        );
+        let site307 = plan
+            .sites
+            .iter()
+            .find(|site| site.role_id == 307)
+            .expect("plan stages the derive");
+        assert_eq!(
+            site307.offset, staged_b,
+            "the plan stages B; the refusal below is kernel-side"
+        );
+        let drive = drive_typed_session_with_counter(
+            "i1a",
+            &app,
+            &[304, 305, 306, 307, 308],
+            Some(&plan),
+            "marker2",
+            Some("i1-swap45"),
+        );
+        assert_eq!(
+            drive.staged_roles,
+            vec![
+                130, 131, 136, 137, 146, 147, 148, 149, 150, 151, 152, 153, 155, 161, 258, 259,
+                274, 275, 290, 291, 304, 305, 306, 307, 308,
+            ],
+            "13 first-slice + query + 11 copied"
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.copied_skipped, 0,
+            "static bytes stage B even though the live table advertises A"
+        );
+        assert_eq!(drive.counter_links, 1);
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
+        assert_eq!(
+            drive.joined_calls, 5,
+            "1 init + 1 update + 1 final + 1 derive + 1 reset"
+        );
+        assert_eq!(
+            drive.definite, 3,
+            "query-for-A never authorizes staged-B: only init/update/final partition"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 3,
+            "the refused derive hit plus the retire-only 308 hit plus the teardown-poison foreign bound"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, 5);
+        assert_eq!(
+            drive.next_producer_id, 48,
+            "U2's 49 minus the refused derive's segment; the (4,5) row for A still mints"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
+        );
+    }
+    /// I1 substitution control (MAC init): the (3,4) mirror of the derive
+    /// control — pass 2's live MAC table advertises the alternate
+    /// same-file init A while the plan stages B. Same discrimination:
+    /// pre-fix objects partition B (definite 4); fixed objects refuse
+    /// it (definite 3).
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     copied_role_substitution_mac_offset_refuses --nocapture
+    /// ```
+    #[test]
+    #[ignore = "substitution control (sudo, cc)"]
+    fn copied_role_substitution_mac_offset_refuses() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-i1b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        let staged_b = fixture_symbol_file_offset(&app, "test_mac_init");
+        let advertised_a = fixture_symbol_file_offset(&app, "test_mac_init_alt");
+        assert_ne!(
+            staged_b, advertised_a,
+            "same file, different offsets is the premise"
+        );
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(
+            plan.sites.len(),
+            11,
+            "pass-1 normal mode plans MAC 6 + KDF 5"
+        );
+        let site304 = plan
+            .sites
+            .iter()
+            .find(|site| site.role_id == 304)
+            .expect("plan stages the init");
+        assert_eq!(
+            site304.offset, staged_b,
+            "the plan stages B; the refusal below is kernel-side"
+        );
+        let drive = drive_typed_session_with_counter(
+            "i1b",
+            &app,
+            &[304, 305, 306, 307, 308],
+            Some(&plan),
+            "marker2",
+            Some("i1-swap34"),
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.copied_skipped, 0,
+            "static bytes stage B even though the live table advertises A"
+        );
+        assert_eq!(drive.counter_links, 1);
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
+        assert_eq!(
+            drive.joined_calls, 5,
+            "1 init + 1 update + 1 final + 1 derive + 1 reset"
+        );
+        assert_eq!(
+            drive.definite, 3,
+            "query-for-A never authorizes staged-B: only update/final/derive partition"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 3,
+            "the refused init hit plus the retire-only 308 hit plus the teardown-poison foreign bound"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, 5);
+        assert_eq!(
+            drive.next_producer_id, 48,
+            "U2's 49 minus the refused init's segment; the (3,4) row for A still mints"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
+        );
+    }
+    /// I3 operational-refusal control: pass 2's live KDF table omits
+    /// (4,5) (a duplicate (4,4) overwrites the slot), so the staged
+    /// derive fires with no CODE_ROLE row and no source authority for
+    /// it. It must refuse without partitioning. This pins the
+    /// fail-closed outcome on both object generations (the authority
+    /// check exists in both; the fix moves it above every argument
+    /// read, which the read-order audit proves structurally).
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     operational_callback_without_advertised_role_refuses --nocapture
+    /// ```
+    #[test]
+    #[ignore = "operational-refusal control (sudo, cc)"]
+    fn operational_callback_without_advertised_role_refuses() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-i3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_complete_chain_fixture(&dir);
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(
+            plan.sites.len(),
+            11,
+            "pass-1 normal mode plans MAC 6 + KDF 5"
+        );
+        let drive = drive_typed_session_with_counter(
+            "i3",
+            &app,
+            &[304, 305, 306, 307, 308],
+            Some(&plan),
+            "marker2",
+            Some("i3-drop45"),
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(
+            drive.copied_skipped, 0,
+            "static bytes stage (4,5) even though the live table drops it"
+        );
+        assert_eq!(drive.counter_links, 1);
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
+        assert_eq!(
+            drive.joined_calls, 5,
+            "1 init + 1 update + 1 final + 1 derive + 1 reset"
+        );
+        assert_eq!(
+            drive.definite, 3,
+            "the unauthorized derive never partitions: only init/update/final do"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 3,
+            "the refused derive hit plus the retire-only 308 hit plus the teardown-poison foreign bound"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, 5);
+        assert_eq!(
+            drive.next_producer_id, 47,
+            "U2's 49 minus the unpublished (4,5) witness (the duplicate (4,4) dedups) minus the refused derive's segment"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 1, 0, 0, 0, 0],
+            "cell 3 is the by-design Phase-1 teardown poison; every other cell zero"
+        );
+    }
+    /// I2 firstbyte control (x86_64): the KDF derive callback sits at
+    /// the first byte of its executable VMA (ELF-verified premise
+    /// below), and the plan stages that exact file offset. The derive
+    /// must authorize and partition: the kernel-supplied entry IP
+    /// needs no subtraction. Against pre-fix objects this fails
+    /// (definite 3, not 4): `rip - 1` lands in the preceding hole and
+    /// the VMA join rejects the valid callback.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n cargo test --locked --offline --lib -- --ignored \
+    ///     copied_firstbyte_callback_authorizes_with_exact_offset --nocapture
+    /// ```
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "firstbyte control (sudo, cc, x86_64)"]
+    fn copied_firstbyte_callback_authorizes_with_exact_offset() {
+        let dir = std::env::temp_dir().join(format!("osslscope-copied-i2b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let app = source_native_firstbyte_chain_fixture(&dir);
+        let bytes = std::fs::read(&app).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let text = elf
+            .program_headers
+            .iter()
+            .filter(|ph| ph.p_type == goblin::elf::program_header::PT_LOAD && ph.p_flags & 1 != 0)
+            .min_by_key(|ph| ph.p_vaddr)
+            .expect("executable LOAD segment");
+        let sym = elf
+            .syms
+            .iter()
+            .find(|s| elf.strtab.get_at(s.st_name) == Some("test_kdf_derive"))
+            .expect("derive symbol");
+        assert_eq!(
+            sym.st_value, text.p_vaddr,
+            "the derive is the first byte of the executable VMA"
+        );
+        assert_eq!(text.p_vaddr % 4096, 0, "segment start is page-aligned");
+        assert_eq!(
+            text.p_offset % 4096,
+            0,
+            "segment file offset is page-aligned"
+        );
+        let derive_offset = text.p_offset + (sym.st_value - text.p_vaddr);
+        assert_eq!(
+            derive_offset, text.p_offset,
+            "first VMA byte means first segment file offset"
+        );
+        let plan = stage_copied_plan_from_pass1(&app);
+        assert_eq!(plan.sites.len(), 11, "MAC 6 + KDF 5 copied sites");
+        let site307 = plan
+            .sites
+            .iter()
+            .find(|site| site.role_id == 307)
+            .expect("plan stages the derive");
+        assert_eq!(
+            site307.offset, derive_offset,
+            "the staged offset is the exact joined registration offset"
+        );
+        let drive = drive_typed_session_with_counter(
+            "i2b",
+            &app,
+            &[304, 305, 306, 307, 308],
+            Some(&plan),
+            "marker2",
+            None,
+        );
+        assert_eq!(drive.typed_sites, 25);
+        assert_eq!(drive.copied_skipped, 0);
+        assert_eq!(drive.counter_links, 1);
+        assert_eq!(drive.joined_sites, 5, "all five counted sites join");
+        assert_eq!(
+            drive.joined_calls, 5,
+            "1 init + 1 update + 1 final + 1 derive + 1 reset"
+        );
+        assert_eq!(
+            drive.definite, 4,
+            "the firstbyte derive authorizes: entry IP needs no subtraction"
+        );
+        assert_eq!(
+            drive.unresolved_calls, 2,
+            "the retire-only 308 hit plus the teardown-poison foreign bound"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 5);
+        assert_eq!(drive.sample_calls, 5);
+        assert_eq!(
+            drive.next_producer_id, 49,
+            "U2's receipt on the firstbyte layout: 44 mints plus 4 operational segment allocs"
         );
         assert_eq!(
             drive.loss_cells,
