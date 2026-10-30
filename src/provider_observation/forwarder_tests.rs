@@ -2,9 +2,10 @@
 use super::*;
 #[path = "../../tests/support/provider_forwarder.rs"]
 mod fixture;
-use fixture::{ForwarderFixture, OTHER, QUERY, UNQUERY};
+use fixture::{ForwarderFixture, GETCTX, OTHER, QUERY, UNQUERY};
 const NEAR: &str = ".byte 0xe9\n.long query_impl-.-4";
 const SHORT_BACK: &str = ".byte 0xeb\n.byte unquery_impl-.-1";
+const GETCTX_NEAR: &str = ".byte 0xe9\n.long getctx_impl-.-4";
 
 #[test]
 fn startup_admits_typed_metadata_at_real_forwarded_sites() {
@@ -139,6 +140,13 @@ fn offset(parsed: &ElfObject, name: &str) -> Option<u64> {
 fn query_role_offset(parsed: &ElfObject, role: u32) -> Option<u64> {
     parsed
         .query_exports
+        .iter()
+        .find(|(found, _)| found.id() == role)
+        .map(|(_, at)| *at)
+}
+fn typed_role_offset(parsed: &ElfObject, role: u32) -> Option<u64> {
+    parsed
+        .typed_exports
         .iter()
         .find(|(found, _)| found.id() == role)
         .map(|(_, at)| *at)
@@ -640,5 +648,109 @@ fn typed_query_role_withholds_when_raw_entry_conflicts() {
         query_role_offset(&object, 161),
         None,
         "the same conflict gate withholds the typed query role"
+    );
+}
+
+#[test]
+fn typed_getctx_role_stages_at_its_own_derived_destination() {
+    for prefix in ["", ".byte 0xf3,0x0f,0x1e,0xfa\n"] {
+        let f =
+            ForwarderFixture::new_with_getctx(NEAR, SHORT_BACK, &format!("{prefix}{GETCTX_NEAR}"));
+        let parsed = parsed(&f);
+        assert_eq!(
+            offset(&parsed, GETCTX),
+            None,
+            "no legacy API derives the getter symbol: {prefix:?}"
+        );
+        assert_eq!(
+            typed_role_offset(&parsed, 146),
+            Some(f.offsets["getctx_impl"]),
+            "146 derives through its own resolve, not inheritance: {prefix:?}"
+        );
+    }
+}
+
+#[test]
+fn typed_getctx_role_keeps_raw_entry_when_shared_destination_refuses() {
+    let f = ForwarderFixture::new_with_getctx(NEAR, SHORT_BACK, ".byte 0xe9\n.long query_impl-.-4");
+    let parsed = parsed(&f);
+    assert_eq!(
+        offset(&parsed, QUERY),
+        Some(f.offsets["query_impl"]),
+        "legacy query still derives to its own trampoline"
+    );
+    assert_eq!(
+        typed_role_offset(&parsed, 146),
+        Some(f.offsets[GETCTX]),
+        "a destination shared with a derived legacy entry keeps the raw getter entry"
+    );
+}
+
+#[test]
+fn typed_getctx_role_keeps_raw_entry_for_plain_wrappers() {
+    let f = ForwarderFixture::new_with_getctx(NEAR, SHORT_BACK, ".byte 0xc3");
+    let parsed = parsed(&f);
+    assert_eq!(
+        typed_role_offset(&parsed, 146),
+        Some(f.offsets[GETCTX]),
+        "no stub means no derivation, exactly as legacy"
+    );
+}
+
+#[test]
+fn typed_getctx_role_withholds_when_raw_entry_conflicts() {
+    let mut f = ForwarderFixture::new_with_getctx(NEAR, SHORT_BACK, GETCTX_NEAR);
+    let at = f.symbols[OTHER] + 8;
+    f.image[at..at + 8].copy_from_slice(&f.addresses[GETCTX].to_le_bytes());
+    let old = b"EVP_MD_fetch";
+    let replacement = b"EVP_MAC_free";
+    for at in 0..f.image.len() - old.len() + 1 {
+        if &f.image[at..at + old.len()] == old {
+            f.image[at..at + old.len()].copy_from_slice(replacement);
+        }
+    }
+    let object = parsed(&f);
+    assert_eq!(
+        offset(&object, QUERY),
+        Some(f.offsets["query_impl"]),
+        "the getter conflict leaves legacy derivation alone"
+    );
+    assert_eq!(
+        typed_role_offset(&object, 146),
+        None,
+        "the same conflict gate withholds the typed getter role"
+    );
+}
+
+#[test]
+fn typed_getctx_derivation_runs_its_own_full_source_scans() {
+    use super::forwarder::{SCAN_PROBE, ScanKind, ScanProbe};
+    let plain = ForwarderFixture::new(NEAR, SHORT_BACK);
+    let getctx = ForwarderFixture::new_with_getctx(NEAR, SHORT_BACK, ".byte 0xc3");
+    let elf = goblin::elf::Elf::parse(&getctx.image).unwrap();
+    let entries = elf
+        .section_headers
+        .iter()
+        .find(|s| s.sh_type == 11)
+        .map(|s| s.sh_size as usize / 24)
+        .unwrap();
+    SCAN_PROBE.with(|probe| probe.set(ScanProbe::default()));
+    parse_object(&mut plain.file(), None, &ObservationBudget::default()).unwrap();
+    let without = SCAN_PROBE.with(|probe| probe.replace(ScanProbe::default()));
+    parse_object(&mut getctx.file(), None, &ObservationBudget::default()).unwrap();
+    let with = SCAN_PROBE.with(|probe| probe.replace(ScanProbe::default()));
+    // Two legacy resolves scan the table without the getter; the 146
+    // derivation adds a third full scan with fresh budget charges rather
+    // than reusing a legacy destination. The plain wrapper refuses after
+    // the scan, so the work itself is the pinned behavior.
+    assert_eq!(
+        with.rows[ScanKind::Source as usize],
+        3 * entries,
+        "146 runs its own full source scan ({} entries)",
+        entries
+    );
+    assert!(
+        with.rows[ScanKind::Source as usize] > without.rows[ScanKind::Source as usize],
+        "the getter derivation adds scan work, never reuses legacy scans"
     );
 }

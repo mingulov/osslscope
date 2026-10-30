@@ -9020,6 +9020,280 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    /// U146 native: typed role 146 fires on real libcrypto.
+    /// Direct-exec ordinary unmodified `openssl mac` (the P4 lane)
+    /// through the §12.3 session shape with a shared counter at the
+    /// staged 146 site only. Asserts exactly one 146 stages, that the
+    /// staged site executes during the workload (the raw export stub
+    /// never executes — U5K gdb STUB 0 / TRAMP 4 — so firing proves
+    /// own-resolve derivation to the trampoline), and that the typed
+    /// pair observed the firing (producer IDs advance past the
+    /// 146-less 57-mint baseline). Unlike 161 there is no legacy peer
+    /// to co-attach against: no legacy API derives this symbol.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n <lib test binary> \
+    ///     typed_getctx_role_fires_on_real_libcrypto --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "U146 146 native (sudo, pinned BPF objects)"]
+    fn typed_getctx_role_fires_on_real_libcrypto() {
+        use crate::capture::ClockPort as _;
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-u146-native146-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("abc.txt"), b"abc").unwrap();
+        let argv = u5_openssl_mac_argv(&dir);
+        let (plan, pass1_digest) = u5_pass1_plan_from_live_queries(&argv, &dir);
+        assert_eq!(pass1_digest, U5_MAC_DIGEST);
+        assert!(!plan.sites.is_empty(), "146 stages only on a live plan");
+        let baseline = source_native_fd_targets();
+        let stdout_path = dir.join("out2.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            &argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            Some(&plan),
+        )
+        .unwrap();
+        assert_eq!(
+            startup.apis.len(),
+            38,
+            "pass-2 rescan keeps 38 legacy sites"
+        );
+        assert_eq!(
+            startup.typed.len(),
+            67,
+            "17 first-slice + query + 49 copied stage"
+        );
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            ..
+        } = startup;
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), 38);
+        let mut fds = Vec::new();
+        let mut triples = Vec::new();
+        for attachment in &session.startup[&pid] {
+            let fd = attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .unwrap();
+            triples.push((
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+                attachment.site.file_offset(),
+                pid,
+            ));
+            fds.push(fd);
+        }
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(triples),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(60),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let deadline_ns = start_ns + 15_000_000_000;
+        let borrowed = session.borrowed_producer_maps().expect("producer maps");
+        let mut counter = crate::focused_count::FocusedCounter::open_gated_shared(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns,
+                },
+                ..Default::default()
+            },
+            gate.clone(),
+            &borrowed,
+        )
+        .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "full-38 acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        assert_eq!(receipts.attachments.len(), 38, "every claim acquires");
+        drop(fds);
+        let typed_146: Vec<u64> = session
+            .typed_site_records()
+            .values()
+            .filter(|record| record.role_id == 146)
+            .map(|record| record.offset)
+            .collect();
+        assert_eq!(
+            typed_146.len(),
+            1,
+            "exactly one 146 site stages from the single libcrypto"
+        );
+        eprintln!("u146 native146 staged146={}", typed_146[0]);
+        let mut candidates = Vec::new();
+        for staged in &session.typed_startup {
+            if staged.role().id() != 146 {
+                continue;
+            }
+            let site = staged.site().clone();
+            let starttime = site.starttime();
+            let record = super::wire::contract::Record {
+                pid: child.pid(),
+                tid: child.pid(),
+                generation: site.generation(),
+                ..super::wire::contract::Record::default()
+            };
+            candidates.push(crate::focused_count::CountCandidate::Learned(
+                VerifiedSiteCandidate {
+                    site,
+                    pid: child.pid(),
+                    starttime,
+                    generation: record.generation,
+                    advertisers: Vec::new(),
+                    operation: super::schema::Operation::Mac,
+                    numeric_operation: 0,
+                    dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                        session.typed_startup[0].site().object_hash(),
+                        starttime,
+                        &record,
+                    ),
+                    observed_ns: start_ns,
+                    algorithm: super::schema::AlgorithmId::try_from(u16::MAX).unwrap(),
+                    alias_quality: super::schema::AliasQuality::default(),
+                    function: super::schema::FunctionIdentity::new(
+                        super::schema::Operation::Mac,
+                        0,
+                    )
+                    .unwrap(),
+                },
+            ));
+        }
+        assert_eq!(candidates.len(), 1, "the counter watches the 146 site only");
+        counter
+            .attach_candidates_pinned(
+                candidates,
+                start_ns,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                session.typed_pins(),
+            )
+            .unwrap();
+        assert_eq!(counter.active_link_count(), 1, "one link on the 146 site");
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "workload must exit 0");
+        child.finish_observation().unwrap();
+        let digest = std::fs::read_to_string(&stdout_path).unwrap();
+        assert_eq!(
+            digest.trim().to_ascii_uppercase(),
+            U5_MAC_DIGEST,
+            "observed digest must verify"
+        );
+        session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let sample = counter.close(Instant::now() + Duration::from_secs(10));
+        assert_eq!(sample.sites.len(), 1, "only the 146 site sampled");
+        eprintln!(
+            "u146 native146 offset={} calls={}",
+            sample.sites[0].site.offset, sample.sites[0].calls
+        );
+        assert_eq!(
+            sample.sites[0].site.offset, typed_146[0],
+            "the sampled site is the staged 146 site"
+        );
+        assert!(
+            sample.sites[0].calls > 0,
+            "the staged 146 site executes: the dead export stub never does"
+        );
+        let next_producer_id = {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("ATTRIB_CONTROL")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[2], 4, 64).unwrap();
+            let mut value = [0u8; 64];
+            map.lookup(&0u32.to_ne_bytes(), &mut value).unwrap();
+            u64::from_ne_bytes(value[32..40].try_into().unwrap())
+        };
+        eprintln!("u146 native146 next_id={next_producer_id}");
+        assert!(
+            next_producer_id > 58,
+            "the typed pair observed the firing (past the 146-less 57-mint baseline)"
+        );
+        drop(sample);
+        let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert!(close.first_error.is_none());
+        assert!(!close.order_refused, "the completed order must not refuse");
+        drop(session);
+        drop(gate);
+        drop(child);
+        drop(receipts);
+        drop(lease);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "the native must release every fd"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_return_registration_withholds_ready_and_operands() {

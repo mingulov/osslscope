@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub const QUERY: &str = "OSSL_PROVIDER_query_operation";
 pub const UNQUERY: &str = "OSSL_PROVIDER_unquery_operation";
 pub const OTHER: &str = "EVP_MD_fetch";
+pub const GETCTX: &str = "OSSL_PROVIDER_get0_provider_ctx";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub struct ForwarderFixture {
@@ -21,6 +22,29 @@ pub struct ForwarderFixture {
 }
 impl ForwarderFixture {
     pub fn new(query: &str, unquery: &str) -> Self {
+        Self::assemble(query, unquery, "")
+    }
+    /// Variant that additionally exports the role-146 provider-context
+    /// getter behind a caller-chosen wrapper plus its local
+    /// implementation, for own-derivation regression tests.
+    pub fn new_with_getctx(query: &str, unquery: &str, getctx: &str) -> Self {
+        let extra = format!(
+            r#"
+.globl OSSL_PROVIDER_get0_provider_ctx
+.type OSSL_PROVIDER_get0_provider_ctx,@function
+OSSL_PROVIDER_get0_provider_ctx:
+{getctx}
+.size OSSL_PROVIDER_get0_provider_ctx,.-OSSL_PROVIDER_get0_provider_ctx
+.space 16,0x90
+.type getctx_impl,@function
+getctx_impl: .byte 0xb8,0x0d,0,0,0,0xc3
+.size getctx_impl,.-getctx_impl
+.space 16,0x90
+"#
+        );
+        Self::assemble(query, unquery, &extra)
+    }
+    fn assemble(query: &str, unquery: &str, extra: &str) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "osslscope-forwarder-{}-{}-{}",
             std::process::id(),
@@ -51,7 +75,7 @@ OSSL_PROVIDER_unquery_operation:
 {unquery}
 .size OSSL_PROVIDER_unquery_operation,.-OSSL_PROVIDER_unquery_operation
 .space 16,0x90
-.globl EVP_MD_fetch
+{extra}.globl EVP_MD_fetch
 .type EVP_MD_fetch,@function
 EVP_MD_fetch: .byte 0xe9
 .long query_impl-.-4
