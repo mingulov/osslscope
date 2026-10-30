@@ -739,17 +739,22 @@ impl DomainIndex {
             }
         }
     }
-    /// Current typed-site coordinates for one armed domain: the process
-    /// incarnation and current image the kernel resolves for this TGID.
-    /// Coordinates only — the kernel re-checks domain liveness itself at
-    /// fire time, so a raced exec fails closed on lookup miss. Terminal
-    /// (retired/poisoned) domains refuse admission.
-    pub(super) fn coordinates(&self, tgid: u32) -> Result<(u64, u64), ObservationGap> {
+    /// Typed-site coordinates for one armed domain: the process
+    /// incarnation and the PLANNED image. Staged typed sites describe the
+    /// post-exec image that will run, and the kernel resolves every live
+    /// callback under current==planned after the exec transition consumes
+    /// the planned image (ARMED->ACTIVE); keying by the pre-exec current
+    /// (original) image would miss every post-exec lookup, muting the
+    /// whole typed producer with a vacuous definite=0. Pre-exec the child
+    /// is stopped, so no callback can resolve under original. Coordinates
+    /// only — the kernel re-checks domain liveness itself at fire time.
+    /// Terminal (retired/poisoned) domains refuse admission.
+    pub(super) fn planned_coordinates(&self, tgid: u32) -> Result<(u64, u64), ObservationGap> {
         let row = self.domains.get(&tgid).ok_or(ObservationGap::Invalidated)?;
-        if Self::terminal(row.state) || row.process_incarnation == 0 || row.current_image == 0 {
+        if Self::terminal(row.state) || row.process_incarnation == 0 || row.planned_image == 0 {
             return Err(ObservationGap::Invalidated);
         }
-        Ok((row.process_incarnation, row.current_image))
+        Ok((row.process_incarnation, row.planned_image))
     }
     /// Caller: the explicit test-driven source close only; production close
     /// lands with 5B activation.

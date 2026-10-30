@@ -3470,14 +3470,18 @@ mod tests {
             .expect("required test-only object path OSSL_PROVIDER_OBSERVATION_TEST_BPF");
         let object = std::fs::read(path).expect("required test-only object must be readable");
         let prepared = prepare_object(&object).expect("real object preparation");
-        assert_eq!(prepared.maps.len(), 23);
-        assert_eq!(prepared.progs.len(), 6);
+        // P3 re-pin (was 23/6 at 5A): the P1 producer adds 11 source maps
+        // (typed admission/bind/pending frames, exact-name/digest index,
+        // selector dictionary, thread identity, partition/control/segment
+        // index/loss; REL itself pre-existed) and the typed entry/return pair.
+        assert_eq!(prepared.maps.len(), 34);
+        assert_eq!(prepared.progs.len(), 8);
         for root in &prepared.progs {
             assert!(root.map_fixups.iter().any(|site| site.map == "ADMIT"));
         }
         let (prepared, source) = split_source_preparation(prepared);
         assert_eq!((prepared.maps.len(), prepared.progs.len()), (16, 2));
-        assert_eq!((source.maps.len(), source.progs.len()), (7, 4));
+        assert_eq!((source.maps.len(), source.progs.len()), (18, 6));
         let all_maps: std::collections::BTreeSet<_> = prepared
             .maps
             .iter()
@@ -3562,11 +3566,12 @@ mod tests {
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF pointing to a rebuilt object; preparation only"]
     fn source_writer_inventory_is_exact_and_admit_dominated() {
         // Ordinary-RCU writer proof, host half: the provider object carries
-        // exactly the six reviewed writer roots, every root references the
-        // shared ADMIT gate as its first mutation guard, and the source half
-        // passes the owner's exact admission against the running kernel's
-        // validated registration FUNC ID. Preparation only: no program loads,
-        // no links, no mode change, read-only running BTF.
+        // exactly the eight reviewed writer roots (P3 re-pin: the P1 typed
+        // entry/return pair joins the six 5A roots), every root references
+        // the shared ADMIT gate as its first mutation guard, and the source
+        // half passes the owner's exact admission against the running
+        // kernel's validated registration FUNC ID. Preparation only: no
+        // program loads, no links, no mode change, read-only running BTF.
         let path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")
             .expect("required test-only object path OSSL_PROVIDER_OBSERVATION_TEST_BPF");
         let object = std::fs::read(path).expect("required test-only object must be readable");
@@ -3586,6 +3591,8 @@ mod tests {
                 ("observation_return", "uretprobe"),
                 ("source_reg_in", "fentry/uprobe_register"),
                 ("source_reg_out", "fexit/uprobe_register"),
+                ("typed_entry", "uprobe"),
+                ("typed_return", "uretprobe"),
             ]
         );
         for root in &prepared.progs {
@@ -3596,7 +3603,7 @@ mod tests {
             );
         }
         let (legacy, source) = split_source_preparation(prepared);
-        assert_eq!((legacy.progs.len(), source.progs.len()), (2, 4));
+        assert_eq!((legacy.progs.len(), source.progs.len()), (2, 6));
         for root in &source.progs {
             assert!(
                 !root.subprogs.iter().any(|s| s.is_callback),
@@ -4035,6 +4042,542 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         drop(child);
         source_native_assert_fds_return(&fds_before, &app);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+    /// P3 hostile-control fixture: the query/fetch/free/getctx/cleanup shape
+    /// of `source_native_fixture` plus a fake `EVP_MAC_CTX_new` that performs
+    /// a natural nested provider-context getter call inside construction.
+    /// `main_body` is the post-fixture-setup workload; it must `return 0`
+    /// only when every fake public call succeeded, so the exit status proves
+    /// public success while the kernel verdicts below prove attribution
+    /// refusal. All handles are private malloc blocks: nonzero, never
+    /// dereferenced by the observer, never transported anywhere.
+    fn source_native_typed_chain_fixture(
+        dir: &std::path::Path,
+        main_body: &str,
+    ) -> std::path::PathBuf {
+        let source = dir.join("chain.c");
+        let app = dir.join("chain");
+        let text = format!(
+            r#"
+#include <stdio.h>
+#include <stdlib.h>
+struct dispatch {{ int id; void (*fn)(void); }};
+struct algorithm {{ const char *names, *properties; const struct dispatch *implementation; const char *description; }};
+__attribute__((noinline)) static void implementation(void) {{ __asm__ volatile(""); }}
+static const struct dispatch dispatch[] = {{ {{ 70001, implementation }}, {{ 0, 0 }} }};
+static const struct algorithm algorithms[] = {{ {{ "FUTURE-DIGEST", 0, dispatch, 0 }}, {{ 0, 0, 0, 0 }} }};
+__attribute__((noinline)) const struct algorithm *OSSL_PROVIDER_query_operation(const void *provider,int op,int *no_cache) {{
+ *no_cache=0;
+ (void)provider; (void)op;
+ return algorithms;
+}}
+static void *fake_libctx;
+static void *fake_method;
+static void *fake_provider;
+void *EVP_MAC_fetch(void *c,const char *n,const char *p){{ (void)p; if(!c||!n||!*n) return 0; return fake_method; }}
+void EVP_MAC_free(void *m){{ (void)m; }}
+void *OSSL_PROVIDER_get0_provider_ctx(const void *p){{ if(p!=fake_provider) return 0; return fake_libctx; }}
+void *EVP_MAC_CTX_new(void *m){{ if(m!=fake_method) return 0; void *u=malloc(16); if(!u) return 0; if(!OSSL_PROVIDER_get0_provider_ctx(fake_provider)) return 0; return u; }}
+void OPENSSL_cleanup(void){{}}
+int main(int argc,char **argv) {{ if(argc!=2) return 2;
+ FILE *f=fopen(argv[1],"w"); if(!f) return 4; fputs("exec\n",f); fclose(f);
+ fake_libctx=malloc(16); fake_method=malloc(16); fake_provider=malloc(16);
+ if(!fake_libctx||!fake_method||!fake_provider) return 5;
+ {main_body}
+ return 0; }}
+"#,
+        );
+        std::fs::write(&source, text).unwrap();
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O0", "-rdynamic", "-o"])
+                .arg(&app)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        app
+    }
+    /// Outcome of one driven typed session with a shared counter and a
+    /// closed attribution collect. Counts only; no addresses, no digests.
+    struct TypedCounterDrive {
+        typed_sites: usize,
+        counter_links: usize,
+        joined_sites: usize,
+        joined_calls: u64,
+        definite: usize,
+        unresolved_calls: u64,
+        withheld_uncertain: u64,
+        sample_sites: usize,
+        sample_calls: u64,
+        next_producer_id: u64,
+        loss_cells: [u64; 8],
+    }
+    /// P3 hostile-control driver: full Enabled session (single-API prearm,
+    /// typed prepare, gate open, source acquisition with typed admission +
+    /// typed-pair attach), a shared-map counter attached at the typed sites
+    /// named by `count_roles` through the session's real pins (empty here,
+    /// so the counter-minted fallback engages honestly), workload release,
+    /// common cut, counter close, closed attribution collect, source close.
+    /// Every kernel verdict is real; `main` already proved public success
+    /// via exit 0. Returns count-only receipts for the control asserts.
+    fn drive_typed_session_with_counter(
+        tag: &str,
+        app: &std::path::Path,
+        count_roles: &[u32],
+    ) -> TypedCounterDrive {
+        use crate::capture::ClockPort as _;
+        let dir = app.parent().unwrap().to_path_buf();
+        let marker = dir.join("marker");
+        let argv = [
+            app.to_string_lossy().into_owned(),
+            marker.to_string_lossy().into_owned(),
+        ];
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+        )
+        .unwrap();
+        eprintln!(
+            "startup apis={} typed={}",
+            startup.apis.len(),
+            startup.typed.len()
+        );
+        assert!(!startup.typed.is_empty(), "fixture must yield typed sites");
+        let crate::startup_objects::PreExecSites { apis, typed, .. } = startup;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let fds_before = source_native_fd_targets();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        assert_eq!(
+            session.startup.len(),
+            1,
+            "fixture must yield one startup pid"
+        );
+        assert_eq!(
+            session.startup[&child.pid()].len(),
+            1,
+            "fixture must yield one attachment"
+        );
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test(
+                app.to_path_buf(),
+                session.startup[&child.pid()][0].site.file_offset(),
+                child.pid(),
+            ),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let typed_sites = session.typed_startup.len();
+        // Counter under the preparing gate (map load only, as in the P2
+        // proof); links attach after the gate opens below.
+        let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let deadline_ns = start_ns + 15_000_000_000;
+        let borrowed = session.borrowed_producer_maps().expect("producer maps");
+        let mut counter = crate::focused_count::FocusedCounter::open_gated_shared(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns,
+                },
+                ..Default::default()
+            },
+            gate.clone(),
+            &borrowed,
+        )
+        .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(15), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        assert_eq!(
+            session.typed_site_records().len(),
+            typed_sites,
+            "every staged typed site must admit"
+        );
+        // Learned counter sites cloned from the admitted typed sites: the
+        // kernel-relevant triple (verified site, pid, starttime) is real;
+        // labels stay honestly unknown (no advertisers observed).
+        let mut candidates = Vec::new();
+        for staged in &session.typed_startup {
+            if !count_roles.contains(&staged.role().id()) {
+                continue;
+            }
+            let site = staged.site().clone();
+            let starttime = site.starttime();
+            let record = super::wire::contract::Record {
+                pid: child.pid(),
+                tid: child.pid(),
+                generation: site.generation(),
+                ..super::wire::contract::Record::default()
+            };
+            candidates.push(crate::focused_count::CountCandidate::Learned(
+                VerifiedSiteCandidate {
+                    site,
+                    pid: child.pid(),
+                    starttime,
+                    generation: record.generation,
+                    advertisers: Vec::new(),
+                    operation: super::schema::Operation::Mac,
+                    numeric_operation: 0,
+                    dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                        session.typed_startup[0].site().object_hash(),
+                        starttime,
+                        &record,
+                    ),
+                    observed_ns: start_ns,
+                    algorithm: super::schema::AlgorithmId::try_from(u16::MAX).unwrap(),
+                    alias_quality: super::schema::AliasQuality::default(),
+                    function: super::schema::FunctionIdentity::new(
+                        super::schema::Operation::Mac,
+                        0,
+                    )
+                    .unwrap(),
+                },
+            ));
+        }
+        assert_eq!(
+            candidates.len(),
+            count_roles.len(),
+            "one counter site per counted role"
+        );
+        counter
+            .attach_candidates_pinned(
+                candidates,
+                start_ns,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                session.typed_pins(),
+            )
+            .unwrap();
+        let counter_links = counter.active_link_count();
+        // Release only after READY, then the independent workload oracle.
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(15);
+        while !marker.exists() {
+            assert!(Instant::now() < until, "exec marker never appeared");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(std::fs::read(&marker).unwrap(), b"exec\n");
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.poll_exit().unwrap(), Some(0), "workload must exit 0");
+        session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        // Common cut first, then the counter close and the closed collect,
+        // mirroring the production finish order.
+        session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let cpus = counter.cpus();
+        let sample = counter.close(Instant::now() + Duration::from_secs(10));
+        let records: Vec<(u64, TypedSiteRecord)> = session
+            .typed_site_records()
+            .iter()
+            .map(|(cookie, record)| (*cookie, record.clone()))
+            .collect();
+        session
+            .charge_attribution_final(
+                8192usize
+                    .checked_mul(104 + 24 * cpus)
+                    .and_then(|n| n.checked_add(1024 * (16 + 64)))
+                    .and_then(|n| n.checked_add(1024 * (24 + 56)))
+                    .and_then(|n| n.checked_add(8 * 8 * cpus))
+                    .and_then(|n| n.checked_add(64))
+                    .unwrap(),
+            )
+            .unwrap();
+        let maps = session.attribution_maps().expect("attribution maps");
+        let mut admitted = Vec::with_capacity(records.len());
+        for (cookie, record) in &records {
+            admitted.push(crate::attribution::AdmittedTypedSite {
+                cookie: *cookie,
+                site_id: std::num::NonZeroU64::new(record.site_id).unwrap(),
+                role_id: record.role_id,
+                object: record.object.clone(),
+                device: record.device,
+                inode: record.inode,
+                offset: record.offset,
+                object_id: record.object_id,
+                source_epoch: record.source_epoch,
+            });
+        }
+        let end_ns = crate::capture::LiveClock
+            .checked_monotonic_ns()
+            .unwrap()
+            .min(deadline_ns);
+        let admission = crate::evidence::CountAdmissionWindow {
+            start_ns,
+            deadline_ns,
+        };
+        let finalized = crate::attribution::collect_closed_attribution(
+            gate.owned_closed().expect("closed gate"),
+            &gate,
+            &maps,
+            cpus,
+            &sample,
+            &admitted,
+            admission,
+            crate::evidence::CaptureWindow {
+                requested_start_ns: start_ns,
+                requested_end_ns: deadline_ns,
+                effective_start_ns: start_ns,
+                effective_end_ns: end_ns.max(start_ns),
+                signal_cut: false,
+                count_admission: Some(admission),
+            },
+        )
+        .unwrap_or_else(|error| panic!("closed collect failed: {error:?}"));
+        let mut joined_sites = 0usize;
+        let mut joined_calls = 0u64;
+        for execution in &sample.sites {
+            if admitted.iter().any(|site| {
+                site.object == execution.site.object
+                    && site.device == execution.site.device
+                    && site.inode == execution.site.inode
+                    && site.offset == execution.site.offset
+            }) {
+                joined_sites += 1;
+                joined_calls += execution.calls;
+            }
+        }
+        let sample_calls: u64 = sample.sites.iter().map(|site| site.calls).sum();
+        // Progress meter for the silent paths: observer-issued ID counter
+        // plus per-cell loss sums, both from already-host-read maps.
+        let next_producer_id = {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("ATTRIB_CONTROL")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[2], 4, 64).unwrap();
+            let mut value = [0u8; 64];
+            map.lookup(&0u32.to_ne_bytes(), &mut value).unwrap();
+            u64::from_ne_bytes(value[32..40].try_into().unwrap())
+        };
+        let mut loss_cells = [0u64; 8];
+        {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("PRODUCER_LOSS")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[6], 4, 8).unwrap();
+            for (cell, total) in loss_cells.iter_mut().enumerate() {
+                let mut values = vec![0u8; 8 * cpus];
+                map.lookup(&(cell as u32).to_ne_bytes(), &mut values)
+                    .unwrap();
+                for cpu in 0..cpus {
+                    *total += u64::from_ne_bytes(values[cpu * 8..cpu * 8 + 8].try_into().unwrap());
+                }
+            }
+        }
+        eprintln!(
+            "{tag}: typed={typed_sites} counter_links={counter_links} sample_sites={} sample_calls={sample_calls} joined_sites={joined_sites} joined_calls={joined_calls} definite={} unresolved={} withheld={} next_id={next_producer_id} loss={loss_cells:?}",
+            sample.sites.len(),
+            finalized.definite().len(),
+            finalized.unresolved_calls(),
+            finalized.withheld_uncertain(),
+        );
+        let drive = TypedCounterDrive {
+            typed_sites,
+            counter_links,
+            joined_sites,
+            joined_calls,
+            definite: finalized.definite().len(),
+            unresolved_calls: finalized.unresolved_calls(),
+            withheld_uncertain: finalized.withheld_uncertain(),
+            sample_sites: sample.sites.len(),
+            sample_calls,
+            next_producer_id,
+            loss_cells,
+        };
+        drop(finalized);
+        drop(sample);
+        let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "close must confirm the cut");
+        assert!(close.first_error.is_none());
+        drop(session);
+        drop(gate);
+        drop(child);
+        source_native_assert_fds_return(&fds_before, app);
+        std::fs::remove_dir_all(&dir).unwrap();
+        drive
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, OSSLSCOPE_FOCUSED_COUNT_OBJECT, native BPF privileges, cc"]
+    fn typed_same_handler_counts_physical_without_operational_admission() {
+        // H1: same-handler/physical-first control. The typed fetch fires
+        // through its admitted pair while the shared counter counts the
+        // same site under a counter-minted cookie (no operational
+        // admission exists anywhere). The kernel must store the physical
+        // hit and assign no partition; the closed fold must keep the
+        // joined call unresolved. Static-only sites never read arg0.
+        let dir = std::env::temp_dir().join(format!("osslscope-typed-h1-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_fixture(&dir);
+        let drive = drive_typed_session_with_counter("h1", &app, &[130]);
+        assert_eq!(drive.typed_sites, 4, "fixture yields four typed sites");
+        assert_eq!(drive.counter_links, 1, "counter attaches the fetch site");
+        assert_eq!(drive.joined_sites, 1, "the fetch hit must join");
+        assert_eq!(drive.joined_calls, 1, "main fetches exactly once");
+        assert_eq!(drive.definite, 0, "no operational admission, no partition");
+        assert_eq!(drive.unresolved_calls, 1, "the hit stays unresolved");
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 1, "counter saw only the fetch site");
+        assert_eq!(drive.sample_calls, 1, "every physical hit joined");
+        assert!(
+            drive.next_producer_id > 1,
+            "kernel minted producer IDs (host seeds 1)"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            "refusal came from verdicts, not loss"
+        );
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, OSSLSCOPE_FOCUSED_COUNT_OBJECT, native BPF privileges, cc"]
+    fn typed_fetch_ctx_new_without_constructor_stays_unresolved() {
+        // H2: constructor-gap control. A natural fetch plus a public
+        // CTX_new with a nested provider-context getter (getter_count 1)
+        // but no independently typed provider constructor
+        // (constructor_count 0) must never commit an owner: exit 0 proves
+        // the public calls succeeded while the kernel withholds the
+        // positive. This pins the exact P4 gap from the fail-closed side.
+        let dir = std::env::temp_dir().join(format!("osslscope-typed-h2-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_typed_chain_fixture(
+            &dir,
+            r#"
+ { int no_cache=-1;
+   if(OSSL_PROVIDER_query_operation((void*)1,1,&no_cache)==0) return 3; }
+ void *m=EVP_MAC_fetch(fake_libctx,"HMAC",0); if(m!=fake_method) return 3;
+ void *u=EVP_MAC_CTX_new(m); if(!u) return 3;
+"#,
+        );
+        let drive = drive_typed_session_with_counter("h2", &app, &[130, 147]);
+        assert_eq!(
+            drive.typed_sites, 5,
+            "chain fixture yields five typed sites"
+        );
+        assert_eq!(
+            drive.counter_links, 1,
+            "one multi-link batches both same-file sites"
+        );
+        assert_eq!(drive.joined_sites, 2, "both hits must join");
+        assert_eq!(drive.joined_calls, 2, "fetch once, construct once");
+        assert_eq!(drive.definite, 0, "no constructor, no owner, no partition");
+        assert_eq!(drive.unresolved_calls, 2, "both hits stay unresolved");
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 2, "counter saw only the two sites");
+        assert_eq!(drive.sample_calls, 2, "every physical hit joined");
+        assert!(
+            drive.next_producer_id > 1,
+            "kernel minted producer IDs (host seeds 1)"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 0, 0, 0, 0, 0, 0],
+            "refusal came from verdicts, not loss"
+        );
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, OSSLSCOPE_FOCUSED_COUNT_OBJECT, native BPF privileges, cc"]
+    fn typed_incompatible_fetch_spellings_quarantine_the_method() {
+        // H3: method-ambiguity control (fetchA->M, fetchB->M, free(M),
+        // fetchB->M). Incompatible observed spellings for one method must
+        // create a tombstone that survives the free/refetch: the later
+        // successful public construction still yields no positive. The
+        // refused CTX_new entry stages no frame (tombstoned method), so
+        // its paired return records the designed pair loss; both loss
+        // events join the conservative unresolved remainder (4+2).
+        let dir = std::env::temp_dir().join(format!("osslscope-typed-h3-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let app = source_native_typed_chain_fixture(
+            &dir,
+            r#"
+ { int no_cache=-1;
+   if(OSSL_PROVIDER_query_operation((void*)1,1,&no_cache)==0) return 3; }
+ void *a=EVP_MAC_fetch(fake_libctx,"HMAC-A",0); if(a!=fake_method) return 3;
+ void *b=EVP_MAC_fetch(fake_libctx,"HMAC-B",0); if(b!=fake_method) return 3;
+ EVP_MAC_free(a);
+ void *c=EVP_MAC_fetch(fake_libctx,"HMAC-B",0); if(c!=fake_method) return 3;
+ void *u=EVP_MAC_CTX_new(c); if(!u) return 3;
+"#,
+        );
+        let drive = drive_typed_session_with_counter("h3", &app, &[130, 147]);
+        assert_eq!(
+            drive.typed_sites, 5,
+            "chain fixture yields five typed sites"
+        );
+        assert_eq!(
+            drive.counter_links, 1,
+            "one multi-link batches both same-file sites"
+        );
+        assert_eq!(drive.joined_sites, 2, "both sites must join");
+        assert_eq!(drive.joined_calls, 4, "three fetches plus one construct");
+        assert_eq!(drive.definite, 0, "ambiguity withholds the positive");
+        assert_eq!(
+            drive.unresolved_calls, 6,
+            "4 known hits + 2 loss events via the conservative foreign bound"
+        );
+        assert_eq!(drive.withheld_uncertain, 0);
+        assert_eq!(drive.sample_sites, 2, "counter saw only the two sites");
+        assert_eq!(drive.sample_calls, 4, "every physical hit joined");
+        assert!(
+            drive.next_producer_id > 1,
+            "kernel minted producer IDs (host seeds 1)"
+        );
+        assert_eq!(
+            drive.loss_cells,
+            [0, 0, 1, 0, 1, 0, 0, 0],
+            "exactly the quarantine tombstone (CONFLICT) + its refused \
+             construction's unmatched return (PAIR)"
+        );
     }
     struct SourceRefusalSetup {
         dir: std::path::PathBuf,

@@ -915,7 +915,7 @@ impl SourceOwner {
         {
             return Err(ObservationGap::Invalidated);
         }
-        let (process, image) = self._domains.coordinates(request.tgid)?;
+        let (process, image) = self._domains.planned_coordinates(request.tgid)?;
         let epoch = match self._typed_epoch {
             Some(epoch) => epoch,
             None => {
