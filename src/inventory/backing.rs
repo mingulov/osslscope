@@ -333,8 +333,7 @@ impl SelfMap {
         // source is one byte inside this owner's own fresh mapping. An
         // out-of-range or truncated source fails the call; no Rust
         // reference to mapping bytes is ever formed.
-        let copied =
-            unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+        let copied = unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
         if copied == 1 {
             Ok(())
         } else {
