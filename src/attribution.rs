@@ -473,6 +473,13 @@ pub(crate) struct FinalizedAttribution {
     definite: Vec<AttributionRecord>,
     unresolved_calls: u64,
     withheld_uncertain: u64,
+    /// Retained foreign/unattributed physical remainder (ER-5C-I2
+    /// remainder: unknown-cookie plus producer-loss calls, already
+    /// inside `unresolved_calls`). The projection adds the skipped
+    /// physical calls to the document-wide remainder on top of
+    /// this component — each exactly once — instead of taking a
+    /// maximum that would lose one contribution.
+    foreign_calls: u64,
 }
 
 #[allow(dead_code)]
@@ -594,7 +601,9 @@ impl FinalizedAttribution {
     /// doc-scoped dictionary (first-seen over the sorted definite
     /// rows, so deterministic), the unresolved bound rides along
     /// raised to at least the document-wide unassigned remainder
-    /// (ER-5C-I2: the collect skips non-admitted physical sites),
+    /// plus the retained foreign component (ER-5C-I2: the collect
+    /// skips non-admitted physical sites and folds foreign calls
+    /// into its count — both contributions ride, additively),
     /// and the schema identity upgrades to v2.5 — including for a
     /// certified EMPTY definite set (an explicit certified zero,
     /// never an absent plane). A non-object-bound row fails
@@ -650,16 +659,20 @@ impl FinalizedAttribution {
                 scope: ATTRIBUTION_SCOPE_V1.to_string(),
             });
         }
-        // ER-5C-I2: the collect skips non-admitted physical
-        // sites, so its unresolved count can understate the
-        // document-wide remainder. Reconcile against every
-        // physical call the document carries (checked sums fail
-        // closed on overflow); the published bound is the
-        // collect's count raised to at least the unassigned
-        // remainder. An over-assigned document (partitions
-        // citing calls the document does not carry) keeps the
-        // collect's count here — site resolution stays the
-        // schema validator's job.
+        // ER-5C-I2 remainder: the collect skips non-admitted
+        // physical sites AND folds foreign/unknown-cookie calls
+        // into its unresolved count, so the published bound must
+        // carry BOTH contributions: the document-wide unassigned
+        // remainder (which adds the skipped physical calls) plus
+        // the retained foreign component — each exactly once, with
+        // checked arithmetic failing closed on overflow. A maximum
+        // here would lose one contribution (48 certified + 52
+        // skipped + 3 foreign must publish 55, not 52). An
+        // over-assigned document (partitions citing calls the
+        // document does not carry) keeps the collect's count —
+        // site resolution stays the schema validator's job. All
+        // `?` returns below run before any `doc` mutation, so a
+        // refused projection leaves the document untouched.
         let mut assigned = 0u64;
         for row in &rows {
             assigned = assigned
@@ -676,7 +689,11 @@ impl FinalizedAttribution {
                 .checked_add(site.calls)
                 .ok_or(AttributionError::Resource)?;
         }
-        let unresolved = self.unresolved_calls.max(total.saturating_sub(assigned));
+        let remainder = total.saturating_sub(assigned);
+        let reconciled = remainder
+            .checked_add(self.foreign_calls)
+            .ok_or(AttributionError::Resource)?;
+        let unresolved = self.unresolved_calls.max(reconciled);
         doc.execution_attributions = rows;
         doc.algorithm_selectors = selectors;
         doc.attribution_bounds = Some(AttributionBounds {
@@ -828,6 +845,7 @@ fn fold_attribution(
         definite,
         unresolved_calls: unresolved,
         withheld_uncertain,
+        foreign_calls: snapshot.losses.foreign_calls,
     })
 }
 
@@ -1895,6 +1913,11 @@ mod tests {
             definite: rows,
             unresolved_calls: unresolved,
             withheld_uncertain: withheld,
+            // Hand-built results carry no foreign remainder (the
+            // fold is the sole foreign source); the combined
+            // foreign-plus-skipped shape rides the real fold in
+            // fold_to_projection_conserves_foreign_and_skipped_calls.
+            foreign_calls: 0,
         }
     }
 
