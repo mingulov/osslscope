@@ -521,19 +521,36 @@ fn hex32(bytes: &[u8; 32]) -> String {
 /// ([`wire::selector_digest_parts`]: ops 3|4, lengths 1..=126,
 /// no interior NUL) runs over the retained code-object sha256
 /// plus that spelling; a digest match proves the requested
-/// spelling equals that registered spelling (up to SHA256
-/// second-preimage) and returns it exactly as registered (the
-/// requested alias, never a merged form). Unregistered
-/// spellings, malformed object hex, and out-of-slice operations
-/// resolve to `None` (opaque but observable). At most one
-/// spelling can match short of a hash break; registry order
-/// decides deterministically.
+/// spelling equals that registered spelling and returns it
+/// exactly as registered (the requested alias, never a merged
+/// form). Unregistered spellings, malformed object hex, and
+/// out-of-slice operations resolve to `None` (opaque but
+/// observable). At most one spelling can match short of a hash
+/// break; registry order decides deterministically.
+///
+/// KNOWN PRODUCER SHAPE (pinned, not assumed): the frozen
+/// producer publishes the encoding-2 digest TRUNCATED — its
+/// bytes `[8..32)` followed by 8 zero bytes (the commit path
+/// forwards the 32-byte digest to staging `[120..152)` but the
+/// safe projection reads `tail[0..32]`, and `RelValue.tail`
+/// starts at byte 128). Resolution therefore matches the
+/// published 192-bit projection explicitly and requires the
+/// zero tail; a full (untruncated) or otherwise-shaped digest
+/// resolves to `None` (a changed producer shape degrades to
+/// opaque, never to a wrong name). The 192-bit match still
+/// proves the spelling up to a 2^-192 collision; the filed
+/// kernel fix is to forward the digest to the tail window.
 pub(crate) fn canonical_selector_name(
     object: &ObjectId,
     operation: u32,
     digest: &[u8; 32],
 ) -> Option<&'static str> {
     if !matches!(operation, 3 | 4) {
+        return None;
+    }
+    // The known-producer truncation marker: anything else is a
+    // changed producer shape — opaque, never a wrong name.
+    if digest[24..32] != [0u8; 8] {
         return None;
     }
     let hex = object.0.as_bytes();
@@ -562,7 +579,7 @@ pub(crate) fn canonical_selector_name(
         ) else {
             continue;
         };
-        if &got == digest {
+        if got[8..32] == digest[0..24] {
             return Some(alg.name);
         }
     }
@@ -1789,7 +1806,20 @@ mod tests {
         assert_eq!(finalized.unresolved_calls(), 100 + 40 - 37 - 13);
     }
 
+    /// The kernel-published digest form for a request: the
+    /// encoding-2 digest's bytes `[8..32)` plus the 8 zero tail
+    /// (the known-producer truncation — see
+    /// [`canonical_selector_name`]).
     fn request_digest(object_hex: &str, operation: u32, spelling: &str) -> [u8; 32] {
+        let full = full_digest(object_hex, operation, spelling);
+        let mut published = [0u8; 32];
+        published[0..24].copy_from_slice(&full[8..32]);
+        published
+    }
+
+    /// The full (untruncated) encoding-2 digest: a changed
+    /// producer shape the resolver must refuse, never match.
+    fn full_digest(object_hex: &str, operation: u32, spelling: &str) -> [u8; 32] {
         let hex = object_hex.as_bytes();
         let mut raw = [0u8; 32];
         for (i, pair) in hex.chunks(2).enumerate() {
@@ -1902,6 +1932,11 @@ mod tests {
             Some("HMAC")
         );
         assert_eq!(canonical_selector_name(&obj, 3, &hmac_other), None);
+        // A full (untruncated) digest is a changed producer
+        // shape: refused (opaque), never matched.
+        let full = full_digest(&obj.0, 3, "HMAC");
+        assert_ne!(full[24..32], [0u8; 8]);
+        assert_eq!(canonical_selector_name(&obj, 3, &full), None);
     }
 
     #[test]
