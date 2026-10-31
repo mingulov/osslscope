@@ -7876,7 +7876,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges"]
     fn real_openssl_multi_attachment_admission_passes_and_over_limit_refuses() {
-        // U4: the real /usr/bin/openssl closure yields 38 legacy API
+        // U4: the real /usr/bin/openssl closure yields 62 legacy API
         // attachments in one file; the multi-attachment lease admits
         // all 38 (exact count, distinct match, legacy-range cookies).
         // The same session then refuses every over-limit shape: over-
@@ -7933,7 +7933,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(typed.len(), 17, "real openssl yields 17 typed exports");
         drop(typed);
         drop(candidates);
-        assert_eq!(apis.len(), 38, "real openssl must yield 38 legacy sites");
+        assert_eq!(apis.len(), 62, "real openssl must yield 62 legacy sites (38 + 24 additive)");
         let object =
             std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
         budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
@@ -7951,7 +7951,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             )
             .unwrap();
         let pid = child.pid();
-        assert_eq!(session.startup[&pid].len(), 38);
+        assert_eq!(session.startup[&pid].len(), 62);
         // Claims from the retained attachments themselves (FD-path
         // targets, no pathname premise); FDs stay alive for the matrix.
         let mut fds = Vec::new();
@@ -7973,10 +7973,10 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         // nothing admitted outlives this block.
         {
             let admitted = multi_admit(&session, triples.clone()).expect("38 claims must admit");
-            assert_eq!(admitted.len(), 38);
+            assert_eq!(admitted.len(), 62);
             assert_eq!(
                 admitted.iter().map(|a| a.site_cookie).collect::<Vec<_>>(),
-                (1..=38u64).collect::<Vec<_>>(),
+                (1..=62u64).collect::<Vec<_>>(),
                 "claim order is admission order, cookies sequential"
             );
             for (a, &(_, offset, _)) in admitted.iter().zip(triples.iter()) {
@@ -7991,7 +7991,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 admitted
                     .iter()
                     .all(|a| (a.device, a.inode) == (device, inode)),
-                "all 38 attachments share one backing file (single-anchor order)"
+                "all 62 attachments share one backing file (single-anchor order)"
             );
             assert!(
                 admitted
@@ -8007,7 +8007,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             under.pop();
             multi_refuses(&session, under, "under-claimed");
             let mut dup = triples.clone();
-            dup[37] = dup[0].clone();
+            dup[61] = dup[0].clone();
             multi_refuses(&session, dup, "double-matched");
             let mut offset = triples.clone();
             offset[0].1 += 1;
@@ -8027,7 +8027,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             multi_admit(&session, triples.clone())
                 .expect("restored cookie admits")
                 .len(),
-            38
+            62
         );
         drop(fds);
         child.release().unwrap();
@@ -8095,8 +8095,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         .unwrap();
         assert_eq!(
             startup.apis.len(),
-            38,
-            "real openssl yields 38 legacy sites"
+            62,
+            "real openssl yields 62 legacy sites (38 + 24 additive Task-7 APIs)"
         );
         assert_eq!(
             startup.typed.len(),
@@ -8302,8 +8302,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         assert_eq!(
             startup.apis.len(),
-            38,
-            "pass-2 rescan keeps 38 legacy sites"
+            62,
+            "pass-2 rescan keeps 62 legacy sites (38 + 24 additive)"
         );
         assert_eq!(
             startup.copied_skipped, 0,
@@ -8345,7 +8345,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             )
             .unwrap();
         let pid = child.pid();
-        assert_eq!(session.startup[&pid].len(), 38);
+        assert_eq!(session.startup[&pid].len(), 62);
         let spent_prearm = session.budget.state_spent_test();
         eprintln!("u5 spent after-prearm={spent_prearm}");
         assert!(spent_prearm < CEILING, "prearm must fit the ceiling");
@@ -8407,7 +8407,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
             .unwrap_or_else(|gap| {
                 panic!(
-                    "full-38 acquire failed: {gap:?} owner: {:?}",
+                    "full-62 acquire failed: {gap:?} owner: {:?}",
                     session.source_error()
                 )
             });
@@ -8415,16 +8415,16 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         eprintln!("u5 spent after-acquire={spent_acquire}");
         assert!(
             spent_acquire < CEILING,
-            "full-38 acquire must fit the ceiling"
+            "full-62 acquire must fit the ceiling"
         );
-        assert_eq!(receipts.attachments.len(), 38, "every claim acquires");
+        assert_eq!(receipts.attachments.len(), 62, "every claim acquires");
         assert_eq!(
             receipts
                 .attachments
                 .iter()
                 .map(|a| a.site_cookie)
                 .collect::<Vec<_>>(),
-            (1..=38u64).collect::<Vec<_>>(),
+            (1..=62u64).collect::<Vec<_>>(),
             "claim order is admission order, cookies sequential"
         );
         assert!(
@@ -8786,8 +8786,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         .unwrap();
         assert_eq!(
             startup.apis.len(),
-            38,
-            "pass-2 rescan keeps 38 legacy sites"
+            62,
+            "pass-2 rescan keeps 62 legacy sites (38 + 24 additive)"
         );
         assert_eq!(
             startup.typed.len(),
@@ -8820,7 +8820,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             )
             .unwrap();
         let pid = child.pid();
-        assert_eq!(session.startup[&pid].len(), 38);
+        assert_eq!(session.startup[&pid].len(), 62);
         let legacy_query_offset = session.startup[&pid]
             .iter()
             .find(|attachment| attachment.api == 8)
@@ -8876,11 +8876,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
             .unwrap_or_else(|gap| {
                 panic!(
-                    "full-38 acquire failed: {gap:?} owner: {:?}",
+                    "full-62 acquire failed: {gap:?} owner: {:?}",
                     session.source_error()
                 )
             });
-        assert_eq!(receipts.attachments.len(), 38, "every claim acquires");
+        assert_eq!(receipts.attachments.len(), 62, "every claim acquires");
         drop(fds);
         let typed_161: Vec<u64> = session
             .typed_site_records()
@@ -9073,8 +9073,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         .unwrap();
         assert_eq!(
             startup.apis.len(),
-            38,
-            "pass-2 rescan keeps 38 legacy sites"
+            62,
+            "pass-2 rescan keeps 62 legacy sites (38 + 24 additive)"
         );
         assert_eq!(
             startup.typed.len(),
@@ -9107,7 +9107,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             )
             .unwrap();
         let pid = child.pid();
-        assert_eq!(session.startup[&pid].len(), 38);
+        assert_eq!(session.startup[&pid].len(), 62);
         let mut fds = Vec::new();
         let mut triples = Vec::new();
         for attachment in &session.startup[&pid] {
@@ -9157,11 +9157,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
             .unwrap_or_else(|gap| {
                 panic!(
-                    "full-38 acquire failed: {gap:?} owner: {:?}",
+                    "full-62 acquire failed: {gap:?} owner: {:?}",
                     session.source_error()
                 )
             });
-        assert_eq!(receipts.attachments.len(), 38, "every claim acquires");
+        assert_eq!(receipts.attachments.len(), 62, "every claim acquires");
         drop(fds);
         let typed_146: Vec<u64> = session
             .typed_site_records()
