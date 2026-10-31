@@ -10479,6 +10479,146 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "17 first-slice + query + 49 MAC + 63 KDF copied, every one admitted"
         );
     }
+    /// Families-stage 3.0.22 KDF refusal pin: the §12.3 shape on the
+    /// stock HKDF workload with the counter at 307/308. The 3.0
+    /// constructors never call the public provider-context getter
+    /// (role 146 dark, firemap §28; H1 source finding), so no owner
+    /// can commit and the closed collect must fail closed with
+    /// definite=0 — a completed order with zero manufactured
+    /// attribution. Requires `OSSLSCOPE_TEST_OPENSSL` +
+    /// `LD_LIBRARY_PATH` selecting the 3.0.22 lane.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// OSSLSCOPE_TEST_OPENSSL=<3.0.22 CLI> LD_LIBRARY_PATH=<3.0.22 lib> \
+    /// sudo -n <lib test binary> \
+    ///     kdf_refuses_without_natural_getter_on_3022 --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "families 3.0.22 KDF refusal (sudo, pinned BPF objects)"]
+    fn kdf_refuses_without_natural_getter_on_3022() {
+        const TAG: &str = "fam-kdf-30neg";
+        let openssl = fam_openssl_argv0();
+        assert_ne!(
+            openssl, "/usr/bin/openssl",
+            "the 3.0.22 refusal pin needs OSSLSCOPE_TEST_OPENSSL on the 3.0.22 lane"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-fam-kdf-30neg-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let argv = fam_openssl_kdf_argv(&openssl);
+        let receipt = fam_full_acquire(
+            &argv,
+            &dir,
+            TAG,
+            FAM_KDF_OKM,
+            &[307, 308],
+            super::schema::Operation::Kdf,
+        );
+        assert_eq!(receipt.count_roles, vec![307, 308]);
+        assert_eq!(
+            receipt.typed_sites, 109,
+            "17 first-slice + query + 91 copied"
+        );
+        assert_eq!(receipt.counter_links, 1);
+        assert_eq!(receipt.sample_sites, 22, "12 derive + 10 reset staged");
+        assert_eq!(receipt.sample_calls, 2, "derive + free-path reset fire");
+        assert_eq!(
+            receipt.joined_sites, 22,
+            "every sample joins an admitted site"
+        );
+        assert_eq!(receipt.joined_calls, 2, "both operational hits join");
+        assert_eq!(
+            receipt.definite, 0,
+            "refusal: no getter, no commit, no partition"
+        );
+        assert_eq!(
+            receipt.unresolved, 5,
+            "both joined hits plus the 3 loss-bound foreign calls"
+        );
+        assert_eq!(receipt.withheld, 0);
+        assert_eq!(receipt.next_id, 107);
+        assert_eq!(
+            receipt.loss,
+            [0, 0, 1, 2, 0, 0, 0, 0],
+            "same loss shape as U5 (frame miss + teardown poisons)"
+        );
+    }
+    /// Families-stage 4.0.3 KDF positive pin: the §12.3 shape on the
+    /// stock HKDF workload with the counter at 307/308. The derive
+    /// hit (307) attributes; the dispatch RESET entry (308) stays
+    /// dark because 4.0.3 free bypasses it via `reset_ex` (firemap
+    /// §28), so only one hit joins. Requires
+    /// `OSSLSCOPE_TEST_OPENSSL` + `LD_LIBRARY_PATH` selecting the
+    /// 4.0.3 lane.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// OSSLSCOPE_TEST_OPENSSL=<4.0.3 CLI> LD_LIBRARY_PATH=<4.0.3 lib> \
+    /// sudo -n <lib test binary> \
+    ///     kdf_full_acquire_positive_on_403 --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "families 4.0.3 KDF positive (sudo, pinned BPF objects)"]
+    fn kdf_full_acquire_positive_on_403() {
+        const TAG: &str = "fam-kdf-40pos";
+        let openssl = fam_openssl_argv0();
+        assert_ne!(
+            openssl, "/usr/bin/openssl",
+            "the 4.0.3 positive pin needs OSSLSCOPE_TEST_OPENSSL on the 4.0.3 lane"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-fam-kdf-40pos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let argv = fam_openssl_kdf_argv(&openssl);
+        let receipt = fam_full_acquire(
+            &argv,
+            &dir,
+            TAG,
+            FAM_KDF_OKM,
+            &[307, 308],
+            super::schema::Operation::Kdf,
+        );
+        assert_eq!(receipt.count_roles, vec![307, 308]);
+        assert_eq!(
+            receipt.typed_sites, 144,
+            "17 first-slice + query + 126 copied"
+        );
+        assert_eq!(receipt.counter_links, 1);
+        assert_eq!(receipt.sample_sites, 30, "16 derive + 14 reset staged");
+        assert_eq!(receipt.sample_calls, 1, "only derive fires on 4.0.3");
+        assert_eq!(
+            receipt.joined_sites, 30,
+            "every sample joins an admitted site"
+        );
+        assert_eq!(receipt.joined_calls, 1, "the derive hit joins");
+        assert_eq!(receipt.definite, 1, "positive: the derive hit attributes");
+        assert_eq!(
+            receipt.unresolved, 3,
+            "the 3 loss-bound foreign calls; the joined hit attributed"
+        );
+        assert_eq!(receipt.withheld, 0);
+        assert_eq!(receipt.next_id, 165);
+        assert_eq!(
+            receipt.loss,
+            [0, 0, 1, 2, 0, 0, 0, 0],
+            "same loss shape as U5 (frame miss + teardown poisons)"
+        );
+    }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_return_registration_withholds_ready_and_operands() {
