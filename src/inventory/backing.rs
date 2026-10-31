@@ -1573,44 +1573,519 @@ mod tests {
         verify_mapped_backing(&target, &range, &own).unwrap();
     }
 
-    struct MountGuard {
+    #[derive(Debug)]
+    struct FixtureMount {
         point: std::path::PathBuf,
-        base: std::path::PathBuf,
+        // None means acquisition outcome is unknown: never delete its backing.
+        mountinfo: Option<String>,
+        unique_id: Option<u64>,
     }
+
+    struct MountGuard {
+        base: std::path::PathBuf,
+        base_identity: (u64, u64),
+        namespace: std::path::PathBuf,
+        origin_namespace_path: std::path::PathBuf,
+        mounts: Vec<FixtureMount>,
+        cleaned: bool,
+        // Pins prevent namespace/base inode reuse while the guard is live.
+        namespace_pin: File,
+        _base_pin: File,
+    }
+
+    fn fixture_unique_mount_id(point: &std::path::Path) -> Result<u64, String> {
+        use std::os::unix::ffi::OsStrExt as _;
+        // Linux statx ABI (include/uapi/linux/stat.h), available since 6.8.
+        // Ordinary mountinfo IDs can be immediately recycled after umount.
+        const STATX_MNT_ID_UNIQUE: u32 = 0x0000_4000;
+        let path = CString::new(point.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+        let mut stat = std::mem::MaybeUninit::<libc::statx>::uninit();
+        // SAFETY: NUL-terminated path and correctly sized writable result.
+        let result = unsafe {
+            libc::statx(
+                libc::AT_FDCWD,
+                path.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+                STATX_MNT_ID_UNIQUE,
+                stat.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        // SAFETY: successful statx initializes the result.
+        let stat = unsafe { stat.assume_init() };
+        if stat.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
+            return Err("kernel did not supply unique mount ID; retain fixture".into());
+        }
+        Ok(stat.stx_mnt_id)
+    }
+
+    fn fixture_mounts() -> Result<Vec<(std::path::PathBuf, String)>, String> {
+        use std::os::unix::ffi::OsStringExt as _;
+        let text =
+            std::fs::read_to_string("/proc/thread-self/mountinfo").map_err(|e| e.to_string())?;
+        text.lines()
+            .map(|line| {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() < 10 || !fields.contains(&"-") {
+                    return Err("unrecognized mountinfo; retain fixture".into());
+                }
+                let mut decoded = Vec::new();
+                unescape_octal_into(fields[4].as_bytes(), &mut decoded);
+                Ok((
+                    std::ffi::OsString::from_vec(decoded).into(),
+                    line.to_owned(),
+                ))
+            })
+            .collect()
+    }
+
+    impl MountGuard {
+        fn new(base: std::path::PathBuf) -> Self {
+            let meta = std::fs::symlink_metadata(&base).unwrap();
+            let guard = Self {
+                base: base.clone(),
+                base_identity: (meta.dev(), meta.ino()),
+                namespace: std::fs::read_link("/proc/thread-self/ns/mnt").unwrap(),
+                origin_namespace_path: std::path::PathBuf::from("/proc")
+                    .join(std::fs::read_link("/proc/thread-self").unwrap())
+                    .join("ns/mnt"),
+                mounts: Vec::new(),
+                cleaned: false,
+                namespace_pin: File::open("/proc/thread-self/ns/mnt").unwrap(),
+                _base_pin: File::open(&base).unwrap(),
+            };
+            // Require the caller's isolated private namespace before acquiring
+            // anything. Shared/slave propagation is unsuitable for fixtures.
+            assert_ne!(
+                guard.namespace,
+                std::fs::read_link("/proc/1/ns/mnt").unwrap(),
+                "mount fixtures require an isolated mount namespace"
+            );
+            // Fail before mounting when unique identity is unavailable.
+            fixture_unique_mount_id(&guard.base).unwrap();
+            let mounts = fixture_mounts().unwrap();
+            assert!(
+                mounts.iter().all(|(_, row)| row
+                    .split(" - ")
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .all(|f| !f.starts_with("shared:") && !f.starts_with("master:"))),
+                "mount fixtures require unshare --mount --propagation private"
+            );
+            assert!(mounts.iter().all(|(p, _)| !p.starts_with(&guard.base)));
+            guard
+        }
+
+        fn mount(&mut self, point: std::path::PathBuf, args: &[&str]) -> Result<(), String> {
+            if self.cleaned || !point.starts_with(&self.base) || point == self.base {
+                return Err("mountpoint outside live owned fixture".into());
+            }
+            if std::fs::read_link("/proc/thread-self/ns/mnt").map_err(|e| e.to_string())?
+                != self.namespace
+            {
+                return Err("mount namespace changed before acquisition".into());
+            }
+            if !std::fs::symlink_metadata(&point)
+                .map_err(|e| e.to_string())?
+                .is_dir()
+                || fixture_mounts()?.iter().any(|(p, _)| p == &point)
+            {
+                return Err("mountpoint is not an unmounted owned directory".into());
+            }
+            // Register before invoking mount: even a failed/unknown subprocess
+            // outcome must keep this tree out of recursive deletion.
+            self.mounts.push(FixtureMount {
+                point: point.clone(),
+                mountinfo: None,
+                unique_id: None,
+            });
+            let status = Command::new("mount")
+                .args(args)
+                .arg(&point)
+                .status()
+                .map_err(|e| e.to_string())?;
+            let mounts = fixture_mounts()?;
+            let rows: Vec<_> = mounts.iter().filter(|(p, _)| p == &point).collect();
+            if !status.success() {
+                if rows.is_empty() {
+                    self.mounts.pop();
+                }
+                return Err(format!("mount failed: {status}, point={point:?}"));
+            }
+            if rows.len() != 1 {
+                return Err(format!("ambiguous mount identity: {point:?}"));
+            }
+            let unique_id = fixture_unique_mount_id(&point)?;
+            self.mounts.last_mut().unwrap().mountinfo = Some(rows[0].1.clone());
+            self.mounts.last_mut().unwrap().unique_id = Some(unique_id);
+            eprintln!(
+                "fixture acquired pid={} namespace={:?} base={:?} base_identity={:?} mount={:?}",
+                std::process::id(),
+                self.namespace,
+                self.base,
+                self.base_identity,
+                self.mounts.last().unwrap()
+            );
+            Ok(())
+        }
+
+        fn refusal(&self, reason: impl std::fmt::Display) -> String {
+            let reclaim: Vec<_> = self
+                .mounts
+                .iter()
+                .rev()
+                .map(|m| {
+                    vec![
+                        "nsenter".to_owned(),
+                        format!("--mount={}", self.origin_namespace_path.display()),
+                        "--".to_owned(),
+                        "umount".to_owned(),
+                        "--".to_owned(),
+                        m.point.to_string_lossy().into_owned(),
+                    ]
+                })
+                .collect();
+            format!(
+                "fixture cleanup REFUSED: {reason}; retained base={:?} base_identity={:?}; owner pid={} namespace={:?}; mounts={:?}. Origin PID/TID namespace path={:?}; retained namespace FD=/proc/{}/fd/{} (FD locator valid only while guard lives). Before reclaim, verify the origin path still names the recorded namespace, then recheck base dev/inode, full mountinfo rows and statx unique mount IDs; release blockers and use normal-unmount argv (reverse order)={reclaim:?}. If the origin path/namespace is gone or ownership cannot be re-established, leave backing retained: independently establish recorded mount absence in every remaining holder namespace before removing the exact owned base. Recheck /proc/thread-self/mountinfo for all descendant mounts before deletion. Never force/lazy unmount.",
+                self.base,
+                self.base_identity,
+                std::process::id(),
+                self.namespace,
+                self.mounts,
+                self.origin_namespace_path,
+                std::process::id(),
+                self.namespace_pin.as_raw_fd()
+            )
+        }
+
+        fn cleanup(&mut self) -> Result<(), String> {
+            if self.cleaned {
+                return Ok(());
+            }
+            self.cleanup_checked().map_err(|e| self.refusal(e))
+        }
+
+        fn cleanup_checked(&mut self) -> Result<(), String> {
+            if std::fs::read_link("/proc/thread-self/ns/mnt").map_err(|e| e.to_string())?
+                != self.namespace
+            {
+                return Err("mount namespace changed".into());
+            }
+            let meta = std::fs::symlink_metadata(&self.base).map_err(|e| e.to_string())?;
+            if !meta.is_dir() || (meta.dev(), meta.ino()) != self.base_identity {
+                return Err("base directory identity changed".into());
+            }
+            while let Some(owned) = self.mounts.last() {
+                let mounts = fixture_mounts()?;
+                let rows: Vec<_> = mounts.iter().filter(|(p, _)| p == &owned.point).collect();
+                if rows.len() != 1
+                    || owned.mountinfo.as_ref() != Some(&rows[0].1)
+                    || owned.unique_id != Some(fixture_unique_mount_id(&owned.point)?)
+                {
+                    return Err(format!("mount identity changed/unknown: {owned:?}"));
+                }
+                // No -l/-f: refusal must preserve every backing directory.
+                let status = Command::new("umount")
+                    .arg("--")
+                    .arg(&owned.point)
+                    .status()
+                    .map_err(|e| e.to_string())?;
+                if !status.success() {
+                    return Err(format!("normal umount refused: {status}; {owned:?}"));
+                }
+                if fixture_mounts()?.iter().any(|(p, _)| p == &owned.point) {
+                    return Err(format!("mount remains after umount: {owned:?}"));
+                }
+                self.mounts.pop();
+            }
+            if fixture_mounts()?
+                .iter()
+                .any(|(p, _)| p.starts_with(&self.base))
+            {
+                return Err("unowned mount beneath fixture".into());
+            }
+            std::fs::remove_dir_all(&self.base).map_err(|e| e.to_string())?;
+            self.cleaned = true;
+            Ok(())
+        }
+    }
+
     impl Drop for MountGuard {
         fn drop(&mut self) {
-            let _ = Command::new("umount").arg(&self.point).status();
-            let _ = std::fs::remove_dir_all(&self.base);
+            if let Err(error) = self.cleanup() {
+                eprintln!("{error}");
+                // A normal test must fail on refusal. During unwind retain the
+                // original panic and report refusal without double-panicking.
+                if !std::thread::panicking() {
+                    panic!("{error}");
+                }
+            }
         }
     }
 
     fn mount_overlay() -> (MountGuard, std::path::PathBuf) {
         let base = scratch("overlay");
+        let mut guard = MountGuard::new(base.clone());
         for name in ["lower", "upper", "work", "merged"] {
             std::fs::create_dir(base.join(name)).unwrap();
         }
-        let status = Command::new("mount")
-            .args([
-                "-t",
-                "overlay",
-                "overlay",
-                "-o",
-                &format!(
-                    "lowerdir={},upperdir={},workdir={}",
-                    base.join("lower").display(),
-                    base.join("upper").display(),
-                    base.join("work").display()
-                ),
-            ])
-            .arg(base.join("merged"))
-            .status()
+        guard
+            .mount(
+                base.join("merged"),
+                &[
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    &format!(
+                        "lowerdir={},upperdir={},workdir={}",
+                        base.join("lower").display(),
+                        base.join("upper").display(),
+                        base.join("work").display()
+                    ),
+                ],
+            )
             .unwrap();
-        assert!(status.success(), "overlay mount requires privilege");
-        let guard = MountGuard {
-            point: base.join("merged"),
-            base: base.clone(),
-        };
         (guard, base)
+    }
+
+    fn mount_tmpfs_siblings(base: std::path::PathBuf, points: &[std::path::PathBuf]) -> MountGuard {
+        let mut guard = MountGuard::new(base);
+        for point in points {
+            guard
+                .mount(point.clone(), &["-t", "tmpfs", "tmpfs"])
+                .unwrap();
+        }
+        guard
+    }
+
+    #[test]
+    #[ignore = "requires owned private mount namespace + privilege (G1F)"]
+    fn fixture_busy_unmount_preserves_backing() {
+        let (mut guard, base) = mount_overlay();
+        let point = base.join("merged");
+        let sentinel = base.join("upper/owned-sentinel");
+        std::fs::write(&sentinel, b"preserve on refusal").unwrap();
+        let blocker = File::open(&point).unwrap();
+        eprintln!(
+            "G1F busy pid={} namespace={:?} base={base:?}",
+            std::process::id(),
+            std::fs::read_link("/proc/thread-self/ns/mnt").unwrap()
+        );
+        // An open directory pins this real mount, so normal umount refuses.
+        let refusal = guard.cleanup().unwrap_err();
+        eprintln!("{refusal}");
+        let preserved = std::fs::read(&sentinel).ok() == Some(b"preserve on refusal".to_vec());
+        let mounted = Command::new("findmnt")
+            .args([
+                "--mountpoint",
+                point.to_str().unwrap(),
+                "-n",
+                "-o",
+                "ID,TARGET,FSTYPE",
+            ])
+            .output()
+            .unwrap();
+        eprintln!(
+            "G1F busy after cleanup mounted={} preserved={} identity={}",
+            mounted.status.success(),
+            preserved,
+            String::from_utf8_lossy(&mounted.stdout)
+        );
+        drop(blocker);
+        guard.cleanup().unwrap();
+        assert!(
+            !Command::new("findmnt")
+                .arg("--mountpoint")
+                .arg(&point)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(!base.exists());
+        assert!(
+            preserved,
+            "cleanup deleted backing after normal umount refused"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires owned private mount namespace + privilege (G1F)"]
+    fn fixture_first_sibling_setup_failure_cleans_mount() {
+        let base = scratch("partial-siblings");
+        let first = base.join("m1");
+        let absent_second = base.join("missing-m2");
+        std::fs::create_dir(&first).unwrap();
+        let setup = std::panic::catch_unwind(|| {
+            mount_tmpfs_siblings(base.clone(), &[first.clone(), absent_second])
+        });
+        assert!(setup.is_err(), "second sibling setup must fail");
+        let mounted = Command::new("findmnt")
+            .args([
+                "--mountpoint",
+                first.to_str().unwrap(),
+                "-n",
+                "-o",
+                "ID,TARGET,FSTYPE",
+            ])
+            .output()
+            .unwrap();
+        eprintln!(
+            "G1F partial pid={} namespace={:?} base={base:?} leaked={} identity={}",
+            std::process::id(),
+            std::fs::read_link("/proc/thread-self/ns/mnt").unwrap(),
+            mounted.status.success(),
+            String::from_utf8_lossy(&mounted.stdout)
+        );
+        if mounted.status.success() {
+            assert!(
+                Command::new("umount")
+                    .arg("--")
+                    .arg(&first)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(
+            !Command::new("findmnt")
+                .arg("--mountpoint")
+                .arg(&first)
+                .status()
+                .unwrap()
+                .success()
+        );
+        if base.exists() {
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+        assert!(
+            !mounted.status.success(),
+            "first sibling mount leaked on second-mount setup failure"
+        );
+    }
+
+    fn independently_mounted(point: &std::path::Path) -> bool {
+        let output = Command::new("findmnt")
+            .arg("--mountpoint")
+            .arg(point)
+            .args(["-n", "-o", "ID,TARGET,FSTYPE"])
+            .output()
+            .unwrap();
+        assert!(matches!(output.status.code(), Some(0 | 1)));
+        eprintln!(
+            "independent mount observation: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        output.status.success()
+    }
+
+    #[test]
+    #[ignore = "requires owned private mount namespace + privilege (G1F)"]
+    fn fixture_normal_exit_cleans_overlay_and_siblings() {
+        let (guard, base) = mount_overlay();
+        let merged = base.join("merged");
+        assert!(independently_mounted(&merged));
+        drop(guard);
+        assert!(!independently_mounted(&merged));
+        assert!(!base.exists());
+        let base = scratch("normal-siblings");
+        let points = [base.join("m1"), base.join("m2")];
+        for point in &points {
+            std::fs::create_dir(point).unwrap();
+        }
+        let guard = mount_tmpfs_siblings(base.clone(), &points);
+        assert!(points.iter().all(|p| independently_mounted(p)));
+        drop(guard);
+        assert!(points.iter().all(|p| !independently_mounted(p)));
+        assert!(!base.exists());
+    }
+
+    #[test]
+    #[ignore = "requires owned private mount namespace + privilege (G1F)"]
+    fn fixture_unwind_cleans_acquired_mounts() {
+        let base = scratch("unwind-siblings");
+        let points = [base.join("m1"), base.join("m2")];
+        for point in &points {
+            std::fs::create_dir(point).unwrap();
+        }
+        let unwind = std::panic::catch_unwind(|| {
+            let _guard = mount_tmpfs_siblings(base.clone(), &points);
+            assert!(points.iter().all(|p| independently_mounted(p)));
+            panic!("intentional owned fixture unwind");
+        });
+        assert!(unwind.is_err());
+        assert!(points.iter().all(|p| !independently_mounted(p)));
+        assert!(!base.exists());
+    }
+
+    #[test]
+    #[ignore = "requires owned private mount namespace + privilege (G1F)"]
+    fn fixture_cooperative_cancellation_cleans_mount() {
+        let (guard, base) = mount_overlay();
+        let point = base.join("merged");
+        let cancelled: Result<(), &str> = (move || {
+            let _guard = guard;
+            assert!(independently_mounted(&point));
+            Err("intentional fixture cancellation")
+        })();
+        assert_eq!(cancelled, Err("intentional fixture cancellation"));
+        assert!(!independently_mounted(&base.join("merged")));
+        assert!(!base.exists());
+    }
+
+    #[test]
+    #[ignore = "requires owned private mount namespace + privilege (G1F)"]
+    fn fixture_replaced_mount_refuses_unmount_and_deletion() {
+        let base = scratch("replaced-mount");
+        let point = base.join("m1");
+        std::fs::create_dir(&point).unwrap();
+        let mut guard = mount_tmpfs_siblings(base.clone(), std::slice::from_ref(&point));
+        assert!(
+            Command::new("umount")
+                .arg("--")
+                .arg(&point)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("mount")
+                .args(["-t", "tmpfs", "tmpfs"])
+                .arg(&point)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(point.join("replacement-sentinel"), b"replacement").unwrap();
+        let refusal = guard.cleanup();
+        eprintln!("replacement cleanup outcome: {refusal:?}");
+        let preserved =
+            std::fs::read(point.join("replacement-sentinel")).ok() == Some(b"replacement".to_vec());
+        let mounted = independently_mounted(&point);
+        // A normal Drop must fail visibly and preserve the replacement too.
+        let drop_refused = std::panic::catch_unwind(move || drop(guard)).is_err();
+        if mounted {
+            assert!(
+                Command::new("umount")
+                    .arg("--")
+                    .arg(&point)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        assert!(!independently_mounted(&point));
+        if base.exists() {
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+        assert!(refusal.is_err());
+        assert!(
+            preserved && mounted && drop_refused,
+            "changed mount must remain intact and refusal visible"
+        );
     }
 
     fn copy_up_same_bytes(path: &std::path::Path) {
@@ -1706,23 +2181,7 @@ mod tests {
         let m2 = base.join("m2");
         std::fs::create_dir(&m1).unwrap();
         std::fs::create_dir(&m2).unwrap();
-        for point in [&m1, &m2] {
-            let status = Command::new("mount")
-                .args(["-t", "tmpfs", "tmpfs"])
-                .arg(point)
-                .status()
-                .unwrap();
-            assert!(status.success(), "tmpfs mount requires privilege");
-        }
-        struct Cleanup(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = Command::new("umount").arg(&self.1).status();
-                let _ = Command::new("umount").arg(&self.2).status();
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(base.clone(), m1.clone(), m2.clone());
+        let _cleanup = mount_tmpfs_siblings(base.clone(), &[m1.clone(), m2.clone()]);
         let bytes = vec![0x5au8; 4096];
         std::fs::write(m1.join("x"), &bytes).unwrap();
         std::fs::write(m2.join("x"), &bytes).unwrap();
