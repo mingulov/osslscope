@@ -1050,8 +1050,8 @@ impl RetainedSourceRoots {
     /// Exact admission for the source half: the four retained roots plus
     /// the two typed roots, each with exact section and return mode, an
     /// ADMIT fixup on every root, exactly the owner maps with exact
-    /// dimensions, and the validated nonzero registration FUNC ID. Pure
-    /// and caps-free.
+    /// dimensions, no program-BTF-requiring callbacks, and the validated
+    /// nonzero registration FUNC ID. Pure and caps-free.
     pub(super) fn check(
         prepared: &loader::Prepared,
         attach_btf_id: u32,
@@ -1074,6 +1074,13 @@ impl RetainedSourceRoots {
                 _ => return Err(ObservationGap::InvalidObject),
             };
             if root.is_return != want_return || seen[slot] {
+                return Err(ObservationGap::InvalidObject);
+            }
+            // Match the loader's actual BTF-synthesis classification. This
+            // includes transitive address-taken subprograms, even in an ELF
+            // with no BTF sections. SourceOwner runs this check before any
+            // capacity reservation, map creation or native-resource borrow.
+            if root.subprogs.iter().any(|subprog| subprog.is_callback) {
                 return Err(ObservationGap::InvalidObject);
             }
             seen[slot] = true;
@@ -2521,6 +2528,28 @@ mod tests {
         assert!(roots.links.is_empty());
         assert!(roots.noop.program.is_none());
         assert!(roots.noop.provisional.is_none());
+    }
+    #[test]
+    fn source_half_check_refuses_callbacks_before_retention() {
+        // The loader marks address-taken functions, including transitive
+        // callees, as callbacks. Any such function would require program
+        // BTF at load time, even when the ELF has no BTF sections.
+        for slot in 0..6 {
+            let mut prepared = valid_source_prepared();
+            prepared.progs[slot].subprogs.push(loader::SubprogInfo {
+                name: "ordinary_static_callee".to_string(),
+                insn_off: 1,
+                is_callback: false,
+            });
+            assert_eq!(RetainedSourceRoots::check(&prepared, 7), Ok(()));
+            prepared.progs[slot].subprogs[0].is_callback = true;
+            assert_eq!(
+                RetainedSourceRoots::check(&prepared, 7),
+                Err(ObservationGap::InvalidObject),
+                "{} must refuse at pure shape admission, before retention or native resources",
+                prepared.progs[slot].name
+            );
+        }
     }
     #[test]
     fn source_half_check_refuses_shape_drift() {

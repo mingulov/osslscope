@@ -3845,6 +3845,110 @@ mod tests {
         }
     }
     #[test]
+    fn typed_query_walk_compiles_production_bodies_and_preserves_boundaries() {
+        // Compile the complete production query-return/walker tail. Only the
+        // external nofault, source-join, publication and loss boundaries are
+        // supplied by the host fixture; there is no second walker algorithm.
+        fn region<'a>(source: &'a str, start: &str, end: Option<&str>) -> &'a str {
+            assert_eq!(source.matches(start).count(), 1, "ambiguous start {start}");
+            let begin = source.find(start).unwrap();
+            let finish = end.map_or(source.len(), |marker| {
+                assert_eq!(source.matches(marker).count(), 1, "ambiguous end {marker}");
+                source.find(marker).unwrap()
+            });
+            assert!(begin < finish, "reversed source region");
+            &source[begin..finish]
+        }
+        let producer = include_str!("../../crates/ebpf/src/typed_producer.rs");
+        let vma = include_str!("../../crates/ebpf/src/source_vma.rs");
+        let fixture = include_str!("../../tests/runtime/typed_query_walk_host.rs");
+        let tail = region(producer, "\n/// Query return (161):", None);
+        for definition in [
+            "fn typed_query_return(",
+            "struct QueryAlgoScan",
+            "struct QueryDispatchScan",
+            "fn query_walk_table(",
+            "fn query_algo_slot(",
+            "fn query_dispatch_slot(",
+        ] {
+            assert_eq!(tail.matches(definition).count(), 1, "{definition}");
+        }
+        let generated = format!(
+            "#![allow(dead_code, private_interfaces)]\n#[path = {:?}] mod attribution;\n\
+             use attribution::{{BindPendingValue, ProducerControl}};\n{}\n{}\n{}\n\
+             mod source_vma {{ {} }}\n{}\n{}\n",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("crates/bpf-contract/src/attribution.rs"),
+            region(
+                producer,
+                "\npub(crate) struct Target {",
+                Some("\n/// BPF subprograms")
+            ),
+            region(
+                producer,
+                "\nfn split_ids(",
+                Some("\n/// Pending-frame staging")
+            ),
+            region(
+                producer,
+                "\n/// Query-walk bounds",
+                Some("\n/// CODE_ROLE key:")
+            ),
+            region(
+                vma,
+                "\npub struct SourceLocation {",
+                Some("\n#[repr(C, align(8))]")
+            ),
+            tail,
+            fixture,
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-query-walk-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("query_walk.rs");
+        let binary = dir.join("query_walk");
+        std::fs::write(&input, &generated).unwrap();
+        use sha2::Digest as _;
+        let digest = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        eprintln!(
+            "query walk source={} producer_sha256={} generated_sha256={}",
+            input.display(),
+            digest(producer.as_bytes()),
+            digest(generated.as_bytes())
+        );
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = std::process::Command::new(compiler)
+            .args(["--edition=2021", "-Dwarnings", "-Coverflow-checks=yes"])
+            .arg(&input)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "production walker host compilation: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let controls = std::process::Command::new(&binary).output().unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&controls.stdout));
+        assert!(
+            controls.status.success(),
+            "production walker controls: {}",
+            String::from_utf8_lossy(&controls.stderr)
+        );
+    }
+    #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF pointing to a rebuilt object; preparation only"]
     fn real_bpf_object_prepares_when_built() {
         let path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")

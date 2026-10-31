@@ -22,8 +22,9 @@ use crate::{
     source_vma, writer_gate,
 };
 use aya_ebpf::{
-    EbpfContext, helpers,
+    helpers,
     programs::{ProbeContext, RetProbeContext},
+    EbpfContext,
 };
 use core::ptr::addr_of_mut;
 use osslscope_bpf_contract::{
@@ -1483,7 +1484,7 @@ pub fn typed_return(ctx: &RetProbeContext, cookie: u64, tgid: u32, tid: u32, _no
     if !writer_gate::admitted() {
         return 0;
     }
-    let Some(target) = resolve_target(tgid) else {
+    let Some(mut target) = resolve_target(tgid) else {
         return 0;
     };
     let Some(admitted) = admission(cookie, &target) else {
@@ -1531,9 +1532,9 @@ pub fn typed_return(ctx: &RetProbeContext, cookie: u64, tgid: u32, tid: u32, _no
         release_frame(&key);
         return 0;
     }
-    // Handlers re-read the return value, the target snapshot and the
-    // frame fields themselves; nothing but these scalars crosses the call
-    // boundary. The owner commit splits into two shallow siblings sharing
+    // Handlers re-read the return value, target snapshot and frame fields;
+    // only scalars and synchronous stack borrows cross the call boundary.
+    // The owner commit splits into two shallow siblings sharing
     // the per-CPU staging plan; either may refuse, and any refusal retires
     // our pending X before the frame is consumed.
     let role = admitted.role_id;
@@ -1569,7 +1570,9 @@ pub fn typed_return(ctx: &RetProbeContext, cookie: u64, tgid: u32, tid: u32, _no
     } else if role == 290 || role == 291 {
         dupctx_return(ctx, control, frame, ids, entry_seq);
     } else if role == 161 {
-        typed_query_return(ctx, control, frame, ids, entry_seq);
+        // Query revalidation reuses this now-dead target storage. The
+        // pending key is independent, and only frame release follows.
+        typed_query_return(ctx, control, frame, tgid, &mut target);
     }
     release_frame(&key);
     0
@@ -5127,18 +5130,18 @@ pub fn typed_query_entry(
 /// the live OSSL_ALGORITHM array and publish CODE_ROLE rows for every
 /// in-slice dispatch entry. No-store, failed, unreadable or out-of-slice
 /// queries publish nothing; the frame is always consumed by the caller.
+// Reuse the caller-owned target storage while repeating exactly the same
+// source revalidation. A second Target would deepen the publication stack.
 #[inline(never)]
 #[no_mangle]
 pub fn typed_query_return(
     ctx: &RetProbeContext,
     control: *mut ProducerControl,
     frame: *mut BindPendingValue,
-    ids: u64,
-    entry_seq: u64,
+    tgid: u32,
+    target: &mut Target,
 ) {
-    let (tgid, _) = split_ids(ids);
-    let mut target: Target = unsafe { core::mem::zeroed() };
-    if !resolve_inner(tgid, entry_seq, &mut target) {
+    if !resolve_inner(tgid, target.entry_seq, target) {
         return;
     }
     let table: u64 = ctx.ret();
@@ -5163,39 +5166,37 @@ pub fn typed_query_return(
             return;
         }
     }
-    query_walk_table(control, &target, table, op as u32, occurrence);
+    query_walk_table(control, target, table, op as u32, occurrence);
 }
 
-/// Synchronous own-stack bpf_loop contexts for the query walk. The
-/// target stays a caller-owned borrow (bpf_loop is synchronous); no
-/// target address or transport field crosses the callback boundary.
+/// Invocation-owned query walk state. Static callees borrow this stack
+/// state and the target only for the synchronous return walk; no target
+/// address or table borrow is retained after it returns.
 #[repr(C)]
-struct QueryAlgoScan {
+struct QueryAlgoScan<'a> {
     control: *mut ProducerControl,
-    target: *const Target,
+    target: &'a Target,
     table: u64,
     operation: u32,
     stopped: u32,
     occurrence: u64,
 }
 #[repr(C)]
-struct QueryDispatchScan {
-    control: *mut ProducerControl,
-    target: *const Target,
+struct QueryDispatchScan<'a, 't> {
+    algorithm: &'a QueryAlgoScan<'t>,
     imp: u64,
-    operation: u32,
     stopped: u32,
-    occurrence: u64,
 }
 
 /// Walk one live OSSL_ALGORITHM array (32-byte records: names @ +0,
-/// implementation @ +16), dispatching each non-NULL table. bpf_loop
-/// keeps the callback under one verification context no matter how many
-/// algorithms run; a NULL names word terminates the walk, and anything
-/// malformed stops it with LOSS_MAP.
-#[inline(never)]
-#[no_mangle]
-pub fn query_walk_table(
+/// implementation @ +16), dispatching each non-NULL table. Ordinary
+/// bounded loops and static callees require no program callback BTF.
+/// A NULL names word terminates the walk; a failed read or arithmetic
+/// stops it with LOSS_MAP, as does an unterminated full bound.
+// The own-stack scan shares the return frame rather than adding a frame
+// along the already deep publication path. Slot bodies stay outlined.
+#[inline(always)]
+fn query_walk_table(
     control: *mut ProducerControl,
     target: &Target,
     table: u64,
@@ -5210,135 +5211,132 @@ pub fn query_walk_table(
         stopped: 0,
         occurrence,
     };
-    let result = unsafe {
-        helpers::bpf_loop(
-            QUERY_MAX_ALGORITHMS as u32,
-            query_algo_slot as *mut core::ffi::c_void,
-            (&mut scan as *mut QueryAlgoScan).cast(),
-            0,
-        )
-    };
-    if result < 0 {
-        loss(LOSS_MAP);
-    } else if scan.stopped == 0 {
+    for index in 0..QUERY_MAX_ALGORITHMS {
+        if query_algo_slot(index, &mut scan) {
+            break;
+        }
+    }
+    if scan.stopped == 0 {
         loss(LOSS_MAP);
     }
 }
 
 /// One algorithm slot: read names/implementation, walk a non-NULL table.
-/// Return 1 stops the loop (terminator or fatal read); 0 continues.
+/// True stops the loop (terminator or fatal read); false continues.
 #[inline(never)]
 #[no_mangle]
-pub extern "C" fn query_algo_slot(index: u64, context: u64) -> u64 {
-    // SAFETY: synchronous bpf_loop receives this initialized own-stack context.
-    let scan = unsafe { &mut *(context as *mut QueryAlgoScan) };
+fn query_algo_slot(index: u64, scan: &mut QueryAlgoScan<'_>) -> bool {
     let Some(slot) = scan.table.checked_add(index * 32) else {
         scan.stopped = 1;
         loss(LOSS_MAP);
-        return 1;
+        return true;
     };
     let names = match unsafe { helpers::bpf_probe_read_user(slot as *const u64) } {
         Ok(value) => value,
         Err(_) => {
             scan.stopped = 1;
             loss(LOSS_MAP);
-            return 1;
+            return true;
         }
     };
     if names == 0 {
         scan.stopped = 1;
-        return 1;
+        return true;
     }
-    match unsafe { helpers::bpf_probe_read_user((slot + 16) as *const u64) } {
+    let Some(implementation) = slot.checked_add(16) else {
+        scan.stopped = 1;
+        loss(LOSS_MAP);
+        return true;
+    };
+    match unsafe { helpers::bpf_probe_read_user(implementation as *const u64) } {
         Ok(0) => loss(LOSS_MAP),
         Ok(imp) => {
             let mut dispatch = QueryDispatchScan {
-                control: scan.control,
-                target: scan.target,
+                algorithm: scan,
                 imp,
-                operation: scan.operation,
                 stopped: 0,
-                occurrence: scan.occurrence,
             };
-            let result = unsafe {
-                helpers::bpf_loop(
-                    QUERY_MAX_ENTRIES as u32,
-                    query_dispatch_slot as *mut core::ffi::c_void,
-                    (&mut dispatch as *mut QueryDispatchScan).cast(),
-                    0,
-                )
-            };
-            if result < 0 {
-                loss(LOSS_MAP);
-            } else if dispatch.stopped == 0 {
+            for index in 0..QUERY_MAX_ENTRIES {
+                if query_dispatch_slot(index, &mut dispatch) {
+                    break;
+                }
+            }
+            if dispatch.stopped == 0 {
                 loss(LOSS_MAP);
             }
         }
         Err(_) => {
             scan.stopped = 1;
             loss(LOSS_MAP);
-            return 1;
+            return true;
         }
     }
-    0
+    false
 }
 
 /// One dispatch slot (16-byte entries: id @ +0, function @ +8):
 /// publish CODE_ROLE rows for in-slice entries. Out-of-slice IDs are
 /// silently skipped; unreadable, NULL, unjoinable or refused entries
-/// record LOSS_MAP and never publish. Return 1 stops the loop.
+/// record LOSS_MAP and never publish. True stops the loop.
 #[inline(never)]
 #[no_mangle]
-pub extern "C" fn query_dispatch_slot(index: u64, context: u64) -> u64 {
-    // SAFETY: synchronous bpf_loop receives this initialized own-stack context.
-    let scan = unsafe { &mut *(context as *mut QueryDispatchScan) };
-    // SAFETY: the target outlives the synchronous walk; only scalars cross.
-    let target = unsafe { &*scan.target };
+fn query_dispatch_slot(index: u64, scan: &mut QueryDispatchScan<'_, '_>) -> bool {
     let Some(entry) = scan.imp.checked_add(index * 16) else {
         scan.stopped = 1;
         loss(LOSS_MAP);
-        return 1;
+        return true;
     };
     let id = match unsafe { helpers::bpf_probe_read_user(entry as *const u32) } {
         Ok(value) => value,
         Err(_) => {
             scan.stopped = 1;
             loss(LOSS_MAP);
-            return 1;
+            return true;
         }
     };
     if id == 0 {
         scan.stopped = 1;
-        return 1;
+        return true;
     }
     if id > i32::MAX as u32 {
         scan.stopped = 1;
         loss(LOSS_MAP);
-        return 1;
+        return true;
     }
-    let fun = match unsafe { helpers::bpf_probe_read_user((entry + 8) as *const u64) } {
+    let Some(function) = entry.checked_add(8) else {
+        scan.stopped = 1;
+        loss(LOSS_MAP);
+        return true;
+    };
+    let fun = match unsafe { helpers::bpf_probe_read_user(function as *const u64) } {
         Ok(value) => value,
         Err(_) => {
             scan.stopped = 1;
             loss(LOSS_MAP);
-            return 1;
+            return true;
         }
     };
     if fun == 0 {
         loss(LOSS_MAP);
-        return 0;
+        return false;
     }
-    if code_shape(scan.operation, id).is_none() {
-        return 0;
+    if code_shape(scan.algorithm.operation, id).is_none() {
+        return false;
     }
     let mut location: source_vma::SourceLocation = unsafe { core::mem::zeroed() };
     if !code_vma_join(fun, &mut location) || location.inode == 0 {
         loss(LOSS_MAP);
-        return 0;
+        return false;
     }
-    let opfun = (u64::from(id) << 32) | u64::from(scan.operation);
-    if !publish_code_role(scan.control, target, &location, opfun, scan.occurrence) {
+    let opfun = (u64::from(id) << 32) | u64::from(scan.algorithm.operation);
+    if !publish_code_role(
+        scan.algorithm.control,
+        scan.algorithm.target,
+        &location,
+        opfun,
+        scan.algorithm.occurrence,
+    ) {
         loss(LOSS_MAP);
     }
-    0
+    false
 }

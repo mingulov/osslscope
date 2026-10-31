@@ -3280,7 +3280,6 @@ pub(crate) fn load_typed_borrowed(
     gate: &crate::writer_gate::WriterGate,
 ) -> anyhow::Result<std::collections::HashMap<String, OwnedFd>> {
     use anyhow::Context as _;
-    use std::os::fd::AsFd as _;
     anyhow::ensure!(
         prepared.progs.len() == 2
             && prepared.progs.iter().any(|p| p.name == "typed_entry")
