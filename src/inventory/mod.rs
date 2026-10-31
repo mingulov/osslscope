@@ -7,6 +7,8 @@ pub mod elf;
 pub mod scope;
 pub mod watch;
 
+pub(crate) mod backing;
+
 use serde::{Deserialize, Serialize};
 
 /// Recognized dynamic code exports. Unknown symbol names are discarded.
