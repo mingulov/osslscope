@@ -895,18 +895,158 @@ impl BackingAssociation {
     }
 }
 
-/// One overlay mount's layer directories as host-absolute paths.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct OverlayLayers {
-    pub mountpoint: Vec<u8>,
-    pub upper: Option<Vec<u8>>,
-    pub lower: Vec<Vec<u8>>,
+/// Fixed-container slack for one bounded layer-discovery extraction: the
+/// admitted candidates vector (at most [`MAX_LAYER_CANDIDATES`] open files)
+/// plus iterator and table state. Declared bytes only — allocator slack is
+/// out of model, per `observation_memory`.
+const LAYER_SCRATCH_SLOP: usize = 1024;
+
+/// Borrowed best-match overlay mount: the unescaped mountpoint length the
+/// relative-path cut applies (exactly as the match compared it) plus the raw
+/// superoptions slice the admitted layer dirs stream from. Borrowed so
+/// selection retains nothing per line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BestOverlayMount<'a> {
+    point_len: usize,
+    super_options: &'a [u8],
 }
 
-fn unescape_octal(bytes: &[u8]) -> Vec<u8> {
-    // mountinfo escapes space/tab/newline/backslash as octal; anything else
-    // passes through. Malformed escapes fail the whole entry later.
-    let mut out = Vec::with_capacity(bytes.len());
+/// Streaming best-match overlay selection over raw mountinfo: per-line field
+/// navigation borrows (no field vectors) and only the winning line's
+/// superoptions slice is retained. Match semantics are exactly the replaced
+/// full parse's — skip empty, NUL-bearing, short, dashless and non-overlay
+/// lines; unescape the mountpoint for the prefix test; longest match wins
+/// with ties keeping mountinfo order. The working buffer is reused across
+/// lines and never exceeds the longest mountpoint (at most the input
+/// length); the caller reserves that scratch before calling.
+fn select_overlay_mount<'a>(
+    mountinfo: &'a [u8],
+    maps_path: &[u8],
+    scratch: &mut Vec<u8>,
+) -> Option<BestOverlayMount<'a>> {
+    // Fields: id parent major:minor root mountpoint options ... " - " fstype source superoptions.
+    let mut best: Option<BestOverlayMount<'a>> = None;
+    for line in mountinfo.split(|b| *b == b'\n') {
+        if line.is_empty() || line.contains(&0) {
+            continue;
+        }
+        let mut parts = line.split(|b| *b == b' ');
+        let mut mountpoint = None;
+        let mut count = 0;
+        for field in parts.by_ref().take(6) {
+            if count == 4 {
+                mountpoint = Some(field);
+            }
+            count += 1;
+        }
+        if count < 6 {
+            continue;
+        }
+        let Some(mountpoint) = mountpoint else {
+            continue;
+        };
+        let mut dash = false;
+        for field in parts.by_ref() {
+            if field == b"-" {
+                dash = true;
+                break;
+            }
+        }
+        if !dash {
+            continue;
+        }
+        let (Some(fstype), Some(_source), Some(super_options)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if fstype != b"overlay" {
+            continue;
+        }
+        unescape_octal_into(mountpoint, scratch);
+        let point = scratch.as_slice();
+        let matches = maps_path == point
+            || (maps_path.starts_with(point)
+                && (point == b"/" || maps_path.get(point.len()) == Some(&b'/')));
+        if matches && best.is_none_or(|won| point.len() > won.point_len) {
+            best = Some(BestOverlayMount {
+                point_len: point.len(),
+                super_options,
+            });
+        }
+    }
+    best
+}
+
+/// Admitted layer dirs for the winning mount, streaming: the LAST `upperdir=`
+/// value first (repeated options overwrite, as the replaced full parse did),
+/// then every `lowerdir=` value's non-empty segments in order across repeated
+/// options. Borrowed slices, no allocation; the caller stops after the
+/// candidate bound (early cutoff) and unescapes only the admitted dirs.
+fn overlay_layer_dirs(super_options: &[u8]) -> impl Iterator<Item = &[u8]> + '_ {
+    let mut upper = None;
+    for option in super_options.split(|b| *b == b',') {
+        if let Some(dir) = option.strip_prefix(b"upperdir=") {
+            upper = Some(dir);
+        }
+    }
+    upper.into_iter().chain(
+        super_options
+            .split(|b| *b == b',')
+            .filter_map(|option| option.strip_prefix(b"lowerdir="))
+            .flat_map(LowerSplit::new),
+    )
+}
+
+/// Borrowed `lowerdir=` segments: a backslash quotes the next byte and only
+/// an unquoted ':' separates; empty segments are skipped. The same split the
+/// replaced full parse performed, without allocating.
+struct LowerSplit<'a> {
+    rest: &'a [u8],
+}
+impl<'a> LowerSplit<'a> {
+    fn new(dirs: &'a [u8]) -> Self {
+        Self { rest: dirs }
+    }
+}
+impl<'a> Iterator for LowerSplit<'a> {
+    type Item = &'a [u8];
+    fn next(&mut self) -> Option<&'a [u8]> {
+        loop {
+            if self.rest.is_empty() {
+                return None;
+            }
+            let bytes = self.rest;
+            let mut end = 0;
+            while end < bytes.len() {
+                if bytes[end] == b'\\' {
+                    end += 1;
+                    if end < bytes.len() {
+                        end += 1;
+                    }
+                    continue;
+                }
+                if bytes[end] == b':' {
+                    break;
+                }
+                end += 1;
+            }
+            let segment = &bytes[..end];
+            self.rest = bytes.get(end + 1..).unwrap_or(b"");
+            if segment.is_empty() {
+                continue;
+            }
+            return Some(segment);
+        }
+    }
+}
+
+/// Unescape mountinfo octal (`\040` and friends) into a reused buffer:
+/// space, tab, newline and backslash arrive octal-escaped; anything else
+/// passes through. Malformed escapes fail the whole entry later, at
+/// validation. Clears first; never grows past the input it unescapes.
+fn unescape_octal_into(bytes: &[u8], out: &mut Vec<u8>) {
+    out.clear();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'\\' && i + 3 < bytes.len() + 1 {
@@ -924,78 +1064,6 @@ fn unescape_octal(bytes: &[u8]) -> Vec<u8> {
         out.push(bytes[i]);
         i += 1;
     }
-    out
-}
-
-/// Pure `mountinfo` parser: overlay mounts with their layer directories.
-/// Unparseable lines are skipped; resolution failures are the caller's.
-pub(crate) fn parse_overlay_layers(mountinfo: &[u8]) -> Vec<OverlayLayers> {
-    let mut mounts = Vec::new();
-    for line in mountinfo.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
-        if line.contains(&0) {
-            continue;
-        }
-        // Fields: id parent major:minor root mountpoint options ... " - " fstype source superoptions.
-        let mut parts = line.split(|b| *b == b' ');
-        let mut fields = Vec::new();
-        for _ in 0..6 {
-            match parts.next() {
-                Some(field) => fields.push(field),
-                None => break,
-            }
-        }
-        if fields.len() < 6 {
-            continue;
-        }
-        let rest: Vec<&[u8]> = parts.collect();
-        let dash = rest.iter().position(|f| *f == b"-");
-        let Some(dash) = dash else { continue };
-        if rest.len() < dash + 4 {
-            continue;
-        }
-        if rest[dash + 1] != b"overlay" {
-            continue;
-        }
-        let superoptions = rest[dash + 3];
-        let mut upper = None;
-        let mut lower = Vec::new();
-        for option in superoptions.split(|b| *b == b',') {
-            if let Some(dir) = option.strip_prefix(b"upperdir=") {
-                upper = Some(unescape_octal(dir));
-            } else if let Some(dirs) = option.strip_prefix(b"lowerdir=") {
-                // Lowerdirs separate with ':'; an escaped colon stays data.
-                // Split on unescaped ':' only.
-                let mut current = Vec::new();
-                let mut bytes = dirs.iter();
-                while let Some(b) = bytes.next() {
-                    if *b == b'\\' {
-                        current.push(*b);
-                        if let Some(next) = bytes.next() {
-                            current.push(*next);
-                        }
-                        continue;
-                    }
-                    if *b == b':' {
-                        if !current.is_empty() {
-                            lower.push(unescape_octal(&current));
-                            current.clear();
-                        }
-                        continue;
-                    }
-                    current.push(*b);
-                }
-                if !current.is_empty() {
-                    lower.push(unescape_octal(&current));
-                }
-            }
-        }
-        mounts.push(OverlayLayers {
-            mountpoint: unescape_octal(fields[4]),
-            upper,
-            lower,
-        });
-    }
-    mounts
 }
 
 fn join_layer(layer: &[u8], relative: &[u8]) -> Option<Vec<u8>> {
@@ -1012,13 +1080,33 @@ fn join_layer(layer: &[u8], relative: &[u8]) -> Option<Vec<u8>> {
     if layer.contains(&0) {
         return None;
     }
-    let mut joined = layer.to_vec();
+    // Exact capacity: the caller reserves one joined path before building it,
+    // so construction must not grow past the declared bound.
+    let mut joined = Vec::with_capacity(layer.len() + 1 + relative.len());
+    joined.extend_from_slice(layer);
     if !joined.ends_with(b"/") {
         joined.push(b'/');
     }
     joined.extend_from_slice(relative);
     let _ = std::ffi::OsStr::from_bytes(&joined);
     Some(joined)
+}
+
+/// Open one joined layer path for verification. Symlinked layer members are
+/// skipped (the range-bound map_files route still verifies them when they are
+/// unambiguous); no link chasing, no path authority.
+fn open_layer_candidate(path: &[u8]) -> Option<File> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
+        .open(std::ffi::OsStr::from_bytes(path))
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    Some(file)
 }
 
 /// Direct layer candidates for a mapped path: host-absolute upper/lower
@@ -1036,75 +1124,79 @@ pub(crate) fn direct_layer_candidates(
     direct_layer_candidates_charged(process_dir, maps_path, max, &mut UnboundedBudget)
 }
 
+/// Budget-charged layer discovery (ER-5E-I2 remainder): the mountinfo buffer
+/// reservation is held for the whole extraction (released only with the
+/// buffer), parser/path/candidate scratch is reserved BEFORE any of it is
+/// allocated, and the candidate bound cuts the layer stream BEFORE paths are
+/// joined — at most [`MAX_LAYER_CANDIDATES`] joins, one at a time, each
+/// opened (or dropped) before the next is built. A budget refusal yields no
+/// candidates and the caller re-derives the precise gap downstream, exactly
+/// as a mountinfo read refusal does.
 pub(crate) fn direct_layer_candidates_charged<B: BackingBudget>(
     process_dir: &File,
     maps_path: &[u8],
     max: usize,
     budget: &mut B,
 ) -> Vec<File> {
+    let limit = max.min(MAX_LAYER_CANDIDATES);
     let mut candidates = Vec::new();
     if maps_path.is_empty() || !maps_path.starts_with(b"/") || maps_path.ends_with(b" (deleted)") {
         return candidates;
     }
-    // The mountinfo buffer is transient: reserved before the read, released
-    // once the layer hints are extracted.
-    let mountinfo = match read_at_charged(process_dir, b"mountinfo", MAX_MOUNTINFO_READ, budget) {
-        Ok((bytes, _lease)) => bytes,
-        Err(_) => return candidates,
-    };
-    let layers = parse_overlay_layers(&mountinfo);
-    // Longest mountpoint prefix wins; ties keep mountinfo order.
-    let mut best: Option<&OverlayLayers> = None;
-    for mount in &layers {
-        let point = &mount.mountpoint;
-        let matches = maps_path == point.as_slice()
-            || (maps_path.starts_with(point.as_slice())
-                && (point == b"/" || maps_path.get(point.len()) == Some(&b'/')));
-        if matches && best.is_none_or(|b: &OverlayLayers| point.len() > b.mountpoint.len()) {
-            best = Some(mount);
-        }
-    }
-    let Some(best) = best else {
+    // The raw reservation lives in this scope with the buffer: both release
+    // together at the end, never the lease first while bytes are live.
+    let (mountinfo, _mountinfo_lease) =
+        match read_at_charged(process_dir, b"mountinfo", MAX_MOUNTINFO_READ, budget) {
+            Ok(pair) => pair,
+            Err(_) => return candidates,
+        };
+    // Worst-case owned extraction scratch, reserved BEFORE any of it is
+    // allocated: the reused working buffer (exact capacity, at most one
+    // input length of content) plus the single joined path under
+    // construction (one layer dir plus '/' plus the caller path, exact
+    // capacity) plus fixed containers. Mountinfo is scanned streaming —
+    // field navigation borrows, only the winning line's superoptions slice
+    // is retained — and layer dirs stream with early cutoff at the bound, so
+    // nothing else is allocated at any input size up to the cap. Declared
+    // bytes only (allocator slack out of model, per `observation_memory`).
+    let Some(scratch_bytes) = mountinfo
+        .len()
+        .checked_add(mountinfo.len())
+        .and_then(|n| n.checked_add(maps_path.len()))
+        .and_then(|n| n.checked_add(1 + LAYER_SCRATCH_SLOP))
+    else {
         return candidates;
     };
-    let mut relative = maps_path.get(best.mountpoint.len()..).unwrap_or(b"");
+    let Ok(_layer_scratch) = budget.reserve_state(scratch_bytes) else {
+        return candidates;
+    };
+    candidates.reserve_exact(limit);
+    let mut scratch = Vec::with_capacity(mountinfo.len());
+    let Some(best) = select_overlay_mount(&mountinfo, maps_path, &mut scratch) else {
+        return candidates;
+    };
+    let mut relative = maps_path.get(best.point_len..).unwrap_or(b"");
     if relative.starts_with(b"/") {
         relative = &relative[1..];
     }
     if relative.is_empty() {
         return candidates;
     }
-    let mut paths: Vec<Vec<u8>> = Vec::new();
-    if let Some(upper) = &best.upper
-        && let Some(joined) = join_layer(upper, relative)
-    {
-        paths.push(joined);
-    }
-    for dir in &best.lower {
-        if let Some(joined) = join_layer(dir, relative) {
-            paths.push(joined);
+    // The bound cuts the stream: join (and open) only until `limit` paths
+    // are joined — open failures still consume slots, as before.
+    let mut joined = 0;
+    for dir in overlay_layer_dirs(best.super_options) {
+        if joined >= limit {
+            break;
         }
-    }
-    let limit = max.min(MAX_LAYER_CANDIDATES);
-    for path in paths.into_iter().take(limit) {
-        use std::os::unix::ffi::OsStrExt as _;
-        // Symlinked layer members are skipped (the range-bound map_files
-        // route still verifies them when they are unambiguous); no link
-        // chasing, no path authority.
-        let Ok(file) = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(std::ffi::OsStr::from_bytes(&path))
-        else {
+        unescape_octal_into(dir, &mut scratch);
+        let Some(path) = join_layer(&scratch, relative) else {
             continue;
         };
-        let Ok(metadata) = file.metadata() else {
-            continue;
-        };
-        if !metadata.is_file() {
-            continue;
+        joined += 1;
+        if let Some(file) = open_layer_candidate(&path) {
+            candidates.push(file);
         }
-        candidates.push(file);
     }
     candidates
 }
@@ -1309,23 +1401,75 @@ mod tests {
     }
 
     #[test]
-    fn mountinfo_parser_reads_overlay_layers() {
+    fn overlay_mount_selection_prefers_longest_prefix() {
         let info =
             b"27 1 0:24 / / rw - overlay overlay rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w\n\
             28 1 0:25 / /mnt rw - ext4 /dev/x rw\n\
             bad line\n\
             29 1 0:26 / /mnt/sub rw - overlay overlay rw,lowerdir=/l3\n\
             30 0 0:27 / /sp\\040ace rw - overlay overlay rw,lowerdir=/l\\0404\n";
-        let mounts = parse_overlay_layers(info);
-        assert_eq!(mounts.len(), 3);
-        assert_eq!(mounts[0].mountpoint, b"/");
-        assert_eq!(mounts[0].upper, Some(b"/u".to_vec()));
-        assert_eq!(mounts[0].lower, vec![b"/l1".to_vec(), b"/l2".to_vec()]);
-        assert_eq!(mounts[1].mountpoint, b"/mnt/sub");
-        assert_eq!(mounts[1].upper, None);
-        assert_eq!(mounts[1].lower, vec![b"/l3".to_vec()]);
-        assert_eq!(mounts[2].mountpoint, b"/sp ace");
-        assert_eq!(mounts[2].lower, vec![b"/l 4".to_vec()]);
+        let mut scratch = Vec::new();
+        // Longest match wins: /mnt/sub beats / for a path under it; the
+        // non-overlay and malformed lines never select.
+        let best = select_overlay_mount(info, b"/mnt/sub/file", &mut scratch).unwrap();
+        assert_eq!(best.point_len, 8);
+        assert_eq!(best.super_options, b"rw,lowerdir=/l3");
+        // The root mount matches anything absolute.
+        let best = select_overlay_mount(info, b"/other/file", &mut scratch).unwrap();
+        assert_eq!(best.point_len, 1);
+        assert_eq!(
+            best.super_options,
+            b"rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w"
+        );
+        // Escaped mountpoints unescape for the match (length 7 proves the
+        // octal escape collapsed).
+        let best = select_overlay_mount(info, b"/sp ace/x", &mut scratch).unwrap();
+        assert_eq!(best.point_len, 7);
+        // A mountpoint boundary still falls back to the root mount.
+        let best = select_overlay_mount(info, b"/mnt-sub/x", &mut scratch).unwrap();
+        assert_eq!(best.point_len, 1);
+        // Ties keep mountinfo order.
+        let tied = b"1 1 0:1 / /a rw - overlay overlay rw,lowerdir=/x\n\
+            2 1 0:2 / /a rw - overlay overlay rw,lowerdir=/y\n";
+        let best = select_overlay_mount(tied, b"/a/f", &mut scratch).unwrap();
+        assert_eq!(best.super_options, b"rw,lowerdir=/x");
+        // No overlay line at all: nothing selects.
+        assert!(
+            select_overlay_mount(
+                b"28 1 0:25 / /mnt rw - ext4 /dev/x rw\n",
+                b"/mnt/x",
+                &mut scratch
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn layer_dir_streaming_preserves_order_and_cutoff() {
+        // Upper (last wins) first, then lowers in order across repeated
+        // options; empty segments are skipped.
+        let dirs: Vec<&[u8]> =
+            overlay_layer_dirs(b"rw,upperdir=/u1,lowerdir=/a::/b,upperdir=/u2,lowerdir=/c")
+                .collect();
+        assert_eq!(
+            dirs,
+            vec![
+                b"/u2".as_slice(),
+                b"/a".as_slice(),
+                b"/b".as_slice(),
+                b"/c".as_slice()
+            ]
+        );
+        // An escaped colon stays data.
+        let dirs: Vec<&[u8]> = overlay_layer_dirs(b"lowerdir=/x\\:y:/z").collect();
+        assert_eq!(dirs, vec![b"/x\\:y".as_slice(), b"/z".as_slice()]);
+        // Early cutoff: the caller stops after the bound; the rest of the
+        // stream is never touched.
+        let mut stream = overlay_layer_dirs(b"lowerdir=/1:/2:/3:/4");
+        assert_eq!(stream.next(), Some(b"/1".as_slice()));
+        assert_eq!(stream.next(), Some(b"/2".as_slice()));
+        // No layer options: empty stream.
+        assert_eq!(overlay_layer_dirs(b"rw,workdir=/w").count(), 0);
     }
 
     #[test]
