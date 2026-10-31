@@ -9,8 +9,9 @@
 //! definite/possible bounds; there is no boolean-first-alias shortcut.
 
 use crate::evidence::{
-    CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness, EngineWindow, GapReason,
-    MatchBounds, PredicateMatch, RuleVerdict, SiteExecution, SiteKey, match_bounds,
+    AlgorithmSelectorEntry, CandidateCoverage, CandidateIdentity, CaptureDocument, Completeness,
+    EngineWindow, ExecutionAttribution, GapReason, MatchBounds, PredicateMatch, RuleVerdict,
+    SiteExecution, SiteKey, match_bounds,
 };
 
 /// Classification bucket for unknown, aliased, overlong or unreadable
@@ -603,11 +604,29 @@ pub fn engine_match_bounds(doc: &CaptureDocument) -> MatchBounds {
     }
 }
 
+/// The cited selector behind one execution row, when the row
+/// consumes it: the index resolves AND the dictionary entry's
+/// object and operation equal the row's code object and
+/// operation (ER-5C-I3: the native fold's binding, mirrored
+/// here so unvalidated documents match nothing through swapped
+/// citations).
+fn selector_row_consumes<'a>(
+    doc: &'a CaptureDocument,
+    row: &ExecutionAttribution,
+) -> Option<&'a AlgorithmSelectorEntry> {
+    let entry = doc.algorithm_selectors.get(row.selector as usize)?;
+    if entry.object != row.site.object || entry.operation != row.operation {
+        return None;
+    }
+    Some(entry)
+}
+
 /// Conserved execution-plane bounds for one object-bound
 /// selector (v2.5): definite sums the certified partition calls
 /// behind the exact (code-object, digest) identity; the upper
 /// adds the effective unresolved bound. A dangling selector
-/// index matches nothing (validated documents never carry one —
+/// index or a swapped object/operation citation matches nothing
+/// and relieves nothing (validated documents never carry one —
 /// fail closed). The stated bound is raised to at least the
 /// document-wide unassigned remainder (ER-5C-I2: mixed-admission
 /// collects and hand-written documents understate it), computed
@@ -622,7 +641,7 @@ pub fn selector_match_bounds(doc: &CaptureDocument, object: &str, id: &str) -> M
     let mut consumed = 0u64;
     let mut consumed_overflow = false;
     for row in &doc.execution_attributions {
-        let entry = match doc.algorithm_selectors.get(row.selector as usize) {
+        let entry = match selector_row_consumes(doc, row) {
             Some(entry) => entry,
             None => continue,
         };
@@ -674,7 +693,7 @@ pub fn selector_match_bounds(doc: &CaptureDocument, object: &str, id: &str) -> M
 fn selector_partition_hits(doc: &CaptureDocument, object: &str, id: &str) -> Vec<DefiniteHit> {
     let mut hits = Vec::new();
     for row in &doc.execution_attributions {
-        let entry = match doc.algorithm_selectors.get(row.selector as usize) {
+        let entry = match selector_row_consumes(doc, row) {
             Some(entry) => entry,
             None => continue,
         };

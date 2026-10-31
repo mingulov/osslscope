@@ -1712,8 +1712,9 @@ pub fn render_human(doc: &CaptureDocument) -> String {
     // v2.5: the execution-attribution plane renders only when
     // the closed collect certified a result (old-shaped
     // documents keep their exact bytes). A dangling selector
-    // index marks visibly (validated documents never carry
-    // one); the CBOM renderer refuses such documents outright.
+    // index or a swapped object/operation citation marks visibly
+    // (validated documents never carry one); the CBOM renderer
+    // refuses such documents outright.
     if !doc.execution_attributions.is_empty() || doc.attribution_bounds.is_some() {
         let (unresolved, withheld) = doc
             .attribution_bounds
@@ -1727,10 +1728,17 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         ));
         for row in &doc.execution_attributions {
             let identity = match doc.algorithm_selectors.get(row.selector as usize) {
-                Some(entry) => match &entry.canonical_name {
-                    Some(canonical) => safe_display(canonical),
-                    None => format!("object-bound {}", fp_short(&entry.id)),
-                },
+                Some(entry)
+                    if entry.object == row.site.object && entry.operation == row.operation =>
+                {
+                    match &entry.canonical_name {
+                        Some(canonical) => safe_display(canonical),
+                        None => format!("object-bound {}", fp_short(&entry.id)),
+                    }
+                }
+                // ER-5C-I3: a swapped citation marks visibly
+                // (validated documents never carry one).
+                Some(_) => "(unbound selector)".to_string(),
                 None => "(unlisted selector)".to_string(),
             };
             let definition = row
@@ -2371,9 +2379,10 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
         // separate from the executing code object, identities are
         // labeled object-bound, and the bom-ref carries the full
         // site+segment key (never a bare algorithm name — no
-        // cross-build equivalence). A dangling selector index
-        // refuses the render (validated documents never carry
-        // one): an audit artifact drops no partition silently.
+        // cross-build equivalence). A dangling selector index or
+        // a swapped object/operation citation refuses the render
+        // (validated documents never carry one): an audit
+        // artifact drops no partition silently.
         for row in &doc.execution_attributions {
             let entry = doc
                 .algorithm_selectors
@@ -2384,6 +2393,22 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
                         row.segment
                     )
                 })?;
+            // ER-5C-I3: the dictionary entry's object and
+            // operation must equal the row's code object and
+            // operation (the native fold's binding) — a swapped
+            // citation refuses the render like a dangling one.
+            if entry.object != row.site.object {
+                anyhow::bail!(
+                    "execution attribution segment {} cites a selector bound to another object",
+                    row.segment
+                );
+            }
+            if entry.operation != row.operation {
+                anyhow::bail!(
+                    "execution attribution segment {} cites a selector bound to another operation",
+                    row.segment
+                );
+            }
             let name = match &entry.canonical_name {
                 Some(canonical) => format!(
                     "{} ({}) via object-bound execution",

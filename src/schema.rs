@@ -641,6 +641,10 @@ fn check_execution_attributions(
         ));
     }
     let (known_ids, _) = known_objects(root)?;
+    // ER-5C-I3: retain each entry's object + operation so rows
+    // citing it prove the native fold's binding (not just a
+    // valid index).
+    let mut selector_bindings: Vec<(String, u64)> = Vec::new();
     let selector_count = match selectors {
         None => 0,
         Some(value) => {
@@ -659,7 +663,7 @@ fn check_execution_attributions(
                 if !known_ids.contains(object) {
                     return Err(format!("{ctx}.object: unlisted object {object:?}"));
                 }
-                get_u64(record, "operation", &ctx)?;
+                let operation = get_u64(record, "operation", &ctx)?;
                 let id = record
                     .get("id")
                     .and_then(|v| v.as_str())
@@ -684,6 +688,7 @@ fn check_execution_attributions(
                         }
                     }
                 }
+                selector_bindings.push((object.to_string(), operation));
             }
             items.len() as u64
         }
@@ -786,8 +791,9 @@ fn check_execution_attributions(
         assigned = assigned
             .checked_add(part_calls)
             .ok_or_else(|| format!("{ctx}: partition sums overflow"))?;
+        let row_operation = get_u64(record, "operation", &ctx)?;
         if get_u64(record, "provider_instance", &ctx)? == 0
-            || get_u64(record, "operation", &ctx)? == 0
+            || row_operation == 0
             || get_u64(record, "function", &ctx)? == 0
         {
             return Err(format!(
@@ -822,6 +828,22 @@ fn check_execution_attributions(
         if selector >= selector_count {
             return Err(format!(
                 "{ctx}.selector: {selector} indexes no listed selector"
+            ));
+        }
+        // ER-5C-I3: the dictionary entry's object and operation
+        // must equal the execution row's code object and
+        // operation (the native fold's binding — an A/op3 row
+        // citing a B/op4 selector is a swapped citation, never
+        // a match). The range check above bounds the index.
+        let (selector_object, selector_operation) = &selector_bindings[selector as usize];
+        if *selector_object != key.0 {
+            return Err(format!(
+                "{ctx}.selector: cites a selector bound to another object"
+            ));
+        }
+        if *selector_operation != row_operation {
+            return Err(format!(
+                "{ctx}.selector: cites a selector bound to another operation"
             ));
         }
         if let Some(definition) = record.get("provider_definition") {
