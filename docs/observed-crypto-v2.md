@@ -103,10 +103,14 @@ selected triple — pair-only selection is recorded too),
 `attach_diagnostics` (omitted when no
 attach failed: sorted, deduped, capped producer literals
 identifying failed attaches — diagnostic only, counters stay
-the exact counts), and `refusal_diagnostics` (omitted when no
+the exact counts), `refusal_diagnostics` (omitted when no
 budget refusal was recorded: sorted, deduped, capped numeric
 entries identifying device/inode, refusal kind, bytes and allowance;
-diagnostic only, not an exhaustive refusal count). Both diagnostic
+diagnostic only, not an exhaustive refusal count), and the v2.5
+execution-attribution triple `execution_attributions`,
+`algorithm_selectors`, `attribution_bounds` (present only when
+the window certified a closed attribution result; see below).
+Both diagnostic
 sections contain no target strings or runtime addresses;
 refusal entries contain no paths. Selection paths identify
 observer BPF objects, not target memory.
@@ -346,6 +350,19 @@ documents alike, even when artifact delivery failed. A rule's
 inconclusive result is not an unconditional exit-11 promise;
 violations, usable fatal, child and delivery failures have higher
 priority. See [the exit table](usage.md#exit-codes).
+`deny-selector`/`require-selector` rules (policy v2) evaluate
+the execution plane instead of candidates: `definite` sums the
+certified partition calls behind the exact pinned
+(code-object, digest) identity, and `possible` adds the
+document's certified unresolved bound (unknown when the plane
+is absent or the window is relevant-partial). A positive
+partition violates a deny rule even in a `PARTIAL` window;
+unresolved calls can never satisfy a require rule or acquit a
+deny rule. API-success rows and candidate hints never enter
+execution bounds. Selector predicates render as
+`object-bound:<object>:<id>` (full pinned identity, never a
+truncation), and violation evidence cites the matched
+partitions' sites with partition calls.
 Each rule carries three-valued `result`, conserved
 `definite`/`possible` bounds (`possible: null` means the upper
 bound is unknown; `definite` never exceeds a known `possible`) and
@@ -431,6 +448,20 @@ unusable `FATAL` has zero components; usable Runtime and qualifying
 AttachZero documents export any definite sites under the same
 certainty rules as non-fatal documents. ENGINE observations stay
 separate count metadata, never provider-site assets.
+
+Each certified execution partition (v2.5) renders exactly one
+`cryptographic-asset` component (`urn:osslscope:exec-attr:v2.5:…`,
+keyed by site plus segment — never a bare algorithm name, so no
+cross-build equivalence is implied). The provider definition
+(often `unknown`) stays separate from the executing code
+object; identities are labeled `object-bound`, with a
+`canonical-algorithm` property only when the spelling resolved
+(opaque legs name `object-bound:<digest-prefix>` and invent no
+name). Sites carrying partitions suppress the legacy site-rule
+asset (the partition is the finer truth; overlapping calls are
+never double-minted), and the unresolved/withheld counts ride
+as explicit omission metadata. Fetch/query/API rows and hints
+never mint components.
 
 ## Human report
 
@@ -653,3 +684,49 @@ sites and a separate API summary. Callback totals, the legacy partition,
 rules. Unknown candidate coverage stays Unknown even when a familiar hint or a
 successful API return is shown. v2.3 documents without these sections preserve
 their prior interpretation.
+
+## Certified execution attribution (v2.5)
+
+All older required fields keep their meanings. When the window ran
+the closed attribution collect and it certified a result, the
+producer projects three optional sections and upgrades
+`schema_version` to `observed-crypto-v2.5` (v2.4 documents never
+carry them; strict validators pinned to v2.4 reject documents
+that do):
+
+- `execution_attributions` holds one record per certified
+  definite partition: the proved slice of one physical site's
+  calls (site key plus generation, nonzero unique segment,
+  inclusive hit extrema, calls, provider definition or
+  explicit `unknown`, nonzero continuity id, operation,
+  function, and an index into `algorithm_selectors`). Per-site
+  partition sums never exceed the site's executed calls. A
+  positive partition coexists with a `PARTIAL` window: the gap
+  widens the upper bound, never the proved calls.
+- `algorithm_selectors` is the document-scoped selector
+  dictionary: the opaque object-bound request identities
+  (retained code object, operation, digest) plus an optional
+  `canonical_name`. The name is proved by re-hashing the
+  observer's own frozen registry against the digest — the host
+  never reads a request spelling back. Unregistered spellings
+  stay opaque (`null`) but observable and matchable by
+  object-bound policy; a present-but-unregistered name is
+  malformed. The same spelling under another code object is
+  another identity: selectors never match across builds.
+- `attribution_bounds` carries the certified unresolved
+  remainder (`unresolved_calls`, plus `withheld_uncertain`
+  segments whose calls stay inside it) from the same closed
+  result as the definite rows — present even when the definite
+  set is empty (an explicit certified zero, never an absent
+  plane).
+
+Published selector digests carry the producer's 192-bit
+projection (digest bytes `[8..32)` plus an 8-zero tail);
+canonical resolution matches that projection explicitly and
+treats any other shape as opaque. Human output adds an
+`execution attributions` block only when the plane is present.
+The observe → pin → enforce workflow is: `report` shows the
+observed selectors, the operator pins them into a policy-v2
+file (`deny-selector`/`require-selector`), and `check` enforces
+the exact identities — a migrated algorithm (or rebuilt
+library) carries a different identity and stops matching.

@@ -67,6 +67,7 @@ warmup guarantees a complete window.
 | `deny-provider` | A denied provider serves the observed call. | Correct provider configuration and module selection, then verify the intended provider. |
 | `deny-engine` | A 3.x ENGINE API still executes. | Migrate the caller to provider APIs; OpenSSL 4.x removes ENGINE. |
 | `require-provider` / `require-executed` | Required execution is absent in a sufficiently covered window. | Confirm representative traffic and configuration. An inconclusive rule needs gap triage before an absence conclusion. |
+| `deny-selector` / `require-selector` | A pinned object-bound identity executed (or is unproven). | The predicate names the exact code object plus digest: match it against the report's `algorithm_selectors`. A rebuilt library or migrated algorithm carries a different identity — re-observe and re-pin rather than editing the digest by hand. |
 
 FIPS-lane policy results need manual interpretation per
 [the FIPS interim rule](fips-interim.md): observed executions may

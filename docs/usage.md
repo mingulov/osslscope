@@ -490,6 +490,24 @@ evidence leaves algorithm rules inconclusive, including when the physical
 fixture count is positive. Accepting provider/ENGINE/weak rules does not turn
 Unknown attribution into definite policy evidence.
 
+Policy version 2 adds object-bound execution selectors
+(`deny-selector`, `require-selector`), evaluated against the
+v2.5 execution plane instead of candidates; v1 files are
+accepted unchanged, and unknown versions fail before capture:
+
+```toml
+version = 2
+deny-selector = [{ object = "<64-hex code object>", id = "<64-hex digest>" }]
+```
+
+Both identities are 64 lowercase hex. Observe the selectors in
+a `report` document's `algorithm_selectors` first, then pin and
+enforce: the same spelling under another build is another
+identity, so a migrated algorithm (or rebuilt library) stops
+matching. A positive partition violates a deny rule even in a
+`PARTIAL` window; unresolved calls keep unmatched rules
+inconclusive.
+
 Explicit legacy diagnostics (`--libcrypto`) accept only `--require-executed`
 and `--deny-algorithm`; provider, ENGINE and weak predicates are refused.
 
