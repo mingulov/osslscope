@@ -9332,6 +9332,23 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "HKDF".to_string(),
         ]
     }
+    /// Families-stage stock MAC argv (U5 §13.1 shape, lane-aware
+    /// argv[0]): ordinary unmodified HMAC-SHA256 over the `abc.txt`
+    /// input in `dir` (the caller creates it before pass 1 spawns
+    /// the workload). Oracle is [`U5_MAC_DIGEST`].
+    fn fam_openssl_mac_argv(openssl: &str, dir: &std::path::Path) -> Vec<String> {
+        vec![
+            openssl.to_string(),
+            "mac".to_string(),
+            "-digest".to_string(),
+            "SHA256".to_string(),
+            "-macopt".to_string(),
+            format!("hexkey:{}", "0b".repeat(20)),
+            "-in".to_string(),
+            dir.join("abc.txt").to_string_lossy().into_owned(),
+            "HMAC".to_string(),
+        ]
+    }
     /// Families-stage canary needles: the KDF workload's input
     /// key material in the byte shapes that must never cross the
     /// observer boundary — the raw 22-octet 0x0b key and its exact
@@ -9342,6 +9359,18 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         vec![
             vec![0x0bu8; 22],
             format!("hexkey:{}", "0b".repeat(22)).into_bytes(),
+        ]
+    }
+    /// Families-stage MAC canary needles: the MAC workload's input
+    /// key material — the raw 20-octet 0x0b key and its exact
+    /// `hexkey:` argv spelling. Pass 1 scans the union of both
+    /// workloads' needles on every lane (strictly stronger than
+    /// either alone; the two key lengths cannot cross-match a
+    /// honest ring).
+    fn fam_canary_needles_mac() -> Vec<Vec<u8>> {
+        vec![
+            vec![0x0bu8; 20],
+            format!("hexkey:{}", "0b".repeat(20)).into_bytes(),
         ]
     }
     /// Families-stage canary scan: returns the index of the first
@@ -9392,6 +9421,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         argv: &[String],
         dir: &std::path::Path,
         tag: &str,
+        oracle: &str,
+        expected_op: u32,
     ) -> (super::copied_plan::CopiedPlan, String) {
         let stdout_path = dir.join(format!("{tag}-out1.txt"));
         std::fs::write(&stdout_path, b"").unwrap();
@@ -9473,8 +9504,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             .replace([':', '\n', ' '], "")
             .to_ascii_uppercase();
         assert_eq!(
-            digest, FAM_KDF_OKM,
-            "{tag}: pass-1 observed KDF output must verify"
+            digest, oracle,
+            "{tag}: pass-1 observed workload output must verify"
         );
         let mut records = Vec::new();
         let mut decode_failures = 0usize;
@@ -9493,8 +9524,10 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             ring_bytes.len(),
         );
         assert_eq!(decode_failures, 0, "{tag}: every ring record must validate");
-        // Canary negative leg: no input key material in the raw ring.
-        let needles = fam_canary_needles();
+        // Canary negative leg: no input key material in the raw ring
+        // (union of both stock workloads' needles on every lane).
+        let mut needles = fam_canary_needles();
+        needles.extend(fam_canary_needles_mac());
         assert_eq!(
             fam_canary_scan(&ring_bytes, &needles),
             None,
@@ -9532,8 +9565,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "{tag}: live queries stay in the MAC/KDF first slice"
         );
         assert!(
-            live.iter().any(|query| query.operation == 4),
-            "{tag}: the KDF workload must produce a live KDF query"
+            live.iter().any(|query| query.operation == expected_op),
+            "{tag}: the workload must produce a live op-{expected_op} query"
         );
         let plan_budget = ObservationBudget::default();
         let plan = super::copied_plan::generate_plan(&plan_arrays, &live, &plan_budget).unwrap();
@@ -9592,7 +9625,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         ));
         std::fs::create_dir(&dir).unwrap();
         let argv = fam_openssl_kdf_argv(&openssl);
-        let (plan, pass1_digest) = fam_pass1_plan_from_live_queries(&argv, &dir, TAG);
+        let (plan, pass1_digest) =
+            fam_pass1_plan_from_live_queries(&argv, &dir, TAG, FAM_KDF_OKM, 4);
         assert_eq!(pass1_digest, FAM_KDF_OKM);
         let baseline = source_native_fd_targets();
         let stdout_path = dir.join("out2.txt");
@@ -9953,7 +9987,9 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     /// the workload oracle (observed + fresh re-run), ceiling fit at
     /// every phase, full admission, cut confirmation, and FD release;
     /// returns the receipt for the caller to pin. `operation` labels
-    /// the counter candidates (observer-side nominal label, as in U5).
+    /// the counter candidates (observer-side nominal label, as in U5)
+    /// and selects the pass-1 live-query op (MAC 3 / KDF 4 — the
+    /// first slice only).
     fn fam_full_acquire(
         argv: &[String],
         dir: &std::path::Path,
@@ -9969,7 +10005,13 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 .replace([':', '\n', ' '], "")
                 .to_ascii_uppercase()
         };
-        let (plan, pass1_digest) = fam_pass1_plan_from_live_queries(argv, dir, tag);
+        let expected_op = match operation {
+            super::schema::Operation::Mac => 3,
+            super::schema::Operation::Kdf => 4,
+            _ => panic!("{tag}: fam_full_acquire covers the MAC/KDF first slice only"),
+        };
+        let (plan, pass1_digest) =
+            fam_pass1_plan_from_live_queries(argv, dir, tag, oracle, expected_op);
         assert_eq!(pass1_digest, oracle);
         let baseline = source_native_fd_targets();
         let stdout_path = dir.join("out2.txt");
@@ -10617,6 +10659,96 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             receipt.loss,
             [0, 0, 1, 2, 0, 0, 0, 0],
             "same loss shape as U5 (frame miss + teardown poisons)"
+        );
+    }
+    /// Task-3 queue-head MAC-on-4.0.3 pin: the §12.3 shape on the
+    /// stock HMAC workload (U5 §13.1 argv, lane-aware argv[0]) with
+    /// the counter at the MAC operational roles (304/305/306).
+    /// Expected PROVEN (the KDF-lane firemap shows 146 firing on
+    /// 4.0.3, so the getter route is available): init/update/final
+    /// attribute into definite partitions. Requires
+    /// `OSSLSCOPE_TEST_OPENSSL` + `LD_LIBRARY_PATH` selecting the
+    /// 4.0.3 lane.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// OSSLSCOPE_TEST_OPENSSL=<4.0.3 CLI> LD_LIBRARY_PATH=<4.0.3 lib> \
+    /// sudo -n <lib test binary> \
+    ///     mac_full_acquire_positive_on_403 --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "task-3 queue head: 4.0.3 MAC positive (sudo, pinned BPF objects)"]
+    fn mac_full_acquire_positive_on_403() {
+        const TAG: &str = "task3-mac-40pos";
+        let openssl = fam_openssl_argv0();
+        assert_ne!(
+            openssl, "/usr/bin/openssl",
+            "the 4.0.3 MAC pin needs OSSLSCOPE_TEST_OPENSSL on the 4.0.3 lane"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-task3-mac-40pos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("abc.txt"), b"abc").unwrap();
+        let argv = fam_openssl_mac_argv(&openssl, &dir);
+        let receipt = fam_full_acquire(
+            &argv,
+            &dir,
+            TAG,
+            U5_MAC_DIGEST,
+            &[304, 305, 306],
+            super::schema::Operation::Mac,
+        );
+        assert_eq!(receipt.count_roles, vec![304, 305, 306]);
+        // The 4.0.3 MAC provider behaves exactly like host U5
+        // (first-guess RED held on the first run): the same 49-site
+        // MAC plan, the same three operational hits, the same
+        // commit/segment mint census.
+        assert_eq!(
+            receipt.typed_sites, 67,
+            "17 first-slice + query + 49 copied"
+        );
+        assert_eq!(receipt.counter_links, 1);
+        assert_eq!(receipt.sample_sites, 24, "every operational site sampled");
+        assert_eq!(receipt.sample_calls, 3, "HMAC init + update + final fire");
+        assert_eq!(
+            receipt.joined_sites, 24,
+            "every sample joins an admitted site"
+        );
+        assert_eq!(receipt.joined_calls, 3, "the three operational hits join");
+        assert_eq!(
+            receipt.definite, 3,
+            "positive: one partition per joined operational hit"
+        );
+        assert_eq!(
+            receipt.unresolved, 3,
+            "the 3 loss-bound foreign calls; every joined hit attributed"
+        );
+        assert_eq!(receipt.withheld, 0);
+        assert_eq!(receipt.next_id, 72, "same mint census as host U5");
+        assert_eq!(
+            receipt.loss,
+            [0, 0, 1, 2, 0, 0, 0, 0],
+            "same loss shape as U5 (frame miss + teardown poisons)"
+        );
+        let mut expected_roles = vec![
+            5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 161,
+        ];
+        expected_roles.extend(std::iter::repeat_n(258, 9));
+        expected_roles.extend(std::iter::repeat_n(274, 8));
+        expected_roles.extend(std::iter::repeat_n(290, 8));
+        expected_roles.extend(std::iter::repeat_n(304, 8));
+        expected_roles.extend(std::iter::repeat_n(305, 8));
+        expected_roles.extend(std::iter::repeat_n(306, 8));
+        assert_eq!(
+            receipt.staged_roles, expected_roles,
+            "17 first-slice + query + 49 MAC copied, every one admitted"
         );
     }
     #[test]
