@@ -38,10 +38,10 @@
 
 use super::NamespaceId;
 use std::ffi::CString;
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{File, Metadata};
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::MetadataExt as _;
 
 /// Internal-only virtual-memory range under verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1066,8 +1066,16 @@ fn unescape_octal_into(bytes: &[u8], out: &mut Vec<u8>) {
     }
 }
 
+/// Join a layer dir with the caller-relative path into the single charged
+/// NUL-terminated buffer that also serves the open: `open_layer_candidate`
+/// passes its pointer straight to `libc::open`, so std never heap-copies
+/// long paths outside the reservation (Rust 1.88 `small_c_string`
+/// heap-copies paths of `len >= 384` while the joined buffer stays live).
+/// Exact capacity plus the terminator: the caller reserves one joined path
+/// before building it, so construction must not grow past the declared
+/// bound. Rejects the same shapes as before; the terminator is the only
+/// new byte.
 fn join_layer(layer: &[u8], relative: &[u8]) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt as _;
     if layer.is_empty() || !layer.starts_with(b"/") || relative.is_empty() {
         return None;
     }
@@ -1080,28 +1088,37 @@ fn join_layer(layer: &[u8], relative: &[u8]) -> Option<Vec<u8>> {
     if layer.contains(&0) {
         return None;
     }
-    // Exact capacity: the caller reserves one joined path before building it,
-    // so construction must not grow past the declared bound.
-    let mut joined = Vec::with_capacity(layer.len() + 1 + relative.len());
+    let mut joined = Vec::with_capacity(layer.len() + 1 + relative.len() + 1);
     joined.extend_from_slice(layer);
     if !joined.ends_with(b"/") {
         joined.push(b'/');
     }
     joined.extend_from_slice(relative);
-    let _ = std::ffi::OsStr::from_bytes(&joined);
+    joined.push(0);
     Some(joined)
 }
 
 /// Open one joined layer path for verification. Symlinked layer members are
 /// skipped (the range-bound map_files route still verifies them when they are
-/// unambiguous); no link chasing, no path authority.
+/// unambiguous); no link chasing, no path authority. Opens from a BORROWED
+/// C string over the caller-charged NUL-terminated buffer — no conversion
+/// copy at any path length — with the exact flags the previous `OpenOptions`
+/// shape produced (read-only + CLOEXEC + NOFOLLOW + NONBLOCK + NOCTTY).
 fn open_layer_candidate(path: &[u8]) -> Option<File> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY)
-        .open(std::ffi::OsStr::from_bytes(path))
-        .ok()?;
+    let cstr = std::ffi::CStr::from_bytes_with_nul(path).ok()?;
+    // SAFETY: the pointer borrows the live caller-owned buffer for the
+    // syscall; no O_CREAT, so no mode argument is needed.
+    let raw = unsafe {
+        libc::open(
+            cstr.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,
+        )
+    };
+    if raw < 0 {
+        return None;
+    }
+    // SAFETY: `raw` is a fresh owned FD from the successful open above.
+    let file = unsafe { File::from_raw_fd(raw) };
     let metadata = file.metadata().ok()?;
     if !metadata.is_file() {
         return None;
@@ -1153,17 +1170,19 @@ pub(crate) fn direct_layer_candidates_charged<B: BackingBudget>(
     // Worst-case owned extraction scratch, reserved BEFORE any of it is
     // allocated: the reused working buffer (exact capacity, at most one
     // input length of content) plus the single joined path under
-    // construction (one layer dir plus '/' plus the caller path, exact
-    // capacity) plus fixed containers. Mountinfo is scanned streaming —
-    // field navigation borrows, only the winning line's superoptions slice
-    // is retained — and layer dirs stream with early cutoff at the bound, so
-    // nothing else is allocated at any input size up to the cap. Declared
-    // bytes only (allocator slack out of model, per `observation_memory`).
+    // construction (one layer dir plus '/' plus the caller path plus the NUL
+    // terminator, exact capacity) plus fixed containers. Mountinfo is
+    // scanned streaming — field navigation borrows, only the winning line's
+    // superoptions slice is retained — layer dirs stream with early cutoff
+    // at the bound, and the open borrows the charged buffer directly, so
+    // nothing else is allocated at any input size up to the cap, at any
+    // path length. Declared bytes only (allocator slack out of model, per
+    // `observation_memory`).
     let Some(scratch_bytes) = mountinfo
         .len()
         .checked_add(mountinfo.len())
         .and_then(|n| n.checked_add(maps_path.len()))
-        .and_then(|n| n.checked_add(1 + LAYER_SCRATCH_SLOP))
+        .and_then(|n| n.checked_add(2 + LAYER_SCRATCH_SLOP))
     else {
         return candidates;
     };
@@ -1474,8 +1493,8 @@ mod tests {
 
     #[test]
     fn layer_join_rejects_escape_and_relative() {
-        assert_eq!(join_layer(b"/l", b"a/b"), Some(b"/l/a/b".to_vec()));
-        assert_eq!(join_layer(b"/l/", b"a"), Some(b"/l/a".to_vec()));
+        assert_eq!(join_layer(b"/l", b"a/b"), Some(b"/l/a/b\0".to_vec()));
+        assert_eq!(join_layer(b"/l/", b"a"), Some(b"/l/a\0".to_vec()));
         assert_eq!(join_layer(b"/l", b"../x"), None);
         assert_eq!(join_layer(b"/l", b"a/../../x"), None);
         assert_eq!(join_layer(b"relative", b"a"), None);
