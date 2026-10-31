@@ -62,3 +62,21 @@ qualification. The shared UPDATE's N calls remain N total across all candidates.
 unpaced) after every digest/cipher operation, for realistic-rate
 measurement points. Pacing changes wall time only; operation counts and
 the predicted totals above are unchanged. Malformed values exit 2.
+
+# Additive-API control workload
+
+`task7_cprobe.c` is the Task-7 (5G) observed control workload: it exercises
+operational APIs 49–72 that have no stock-CLI path (one-shot Q_digest,
+uninstantiated-nonce failures, parameter copies onto mismatched keys,
+invalid-key check legs, init/update failures) plus a size-query-only
+encapsulation leg. Non-stock workload (disclosed caveat); every call uses
+public libcrypto APIs only. Each `<name>-ok`/`<name>-bad` mode exits 0 iff
+the probed call returns the documented value and prints a marker line the
+E2E oracle asserts. The session E2E (`task7_g*_control`) builds it per-lane
+at test time against the lane headers/library:
+
+```sh
+cc -O1 -Wno-deprecated-declarations -o /tmp/task7_cprobe \
+  tests/runtime/task7_cprobe.c -lcrypto
+/tmp/task7_cprobe qdigest-ok
+```

@@ -13475,6 +13475,730 @@ mod startup_api_controls {
         assert!(wire::api(19).is_ok());
         assert_eq!(ApiId::all().count(), 53);
     }
+    const TASK7_CPROBE_SRC: &str = include_str!("../../tests/runtime/task7_cprobe.c");
+
+    struct Task7Run {
+        tag: String,
+        exit: Option<i32>,
+        rows: Vec<crate::api_activity::ApiActivityRow>,
+        gaps: Vec<ObservationGap>,
+        stdout: Vec<u8>,
+    }
+
+    fn task7_openssl() -> String {
+        std::env::var_os("OSSLSCOPE_TEST_OPENSSL")
+            .map(|path| path.into_string().expect("OSSLSCOPE_TEST_OPENSSL must be UTF-8"))
+            .unwrap_or_else(|| "/usr/bin/openssl".into())
+    }
+
+    /// Lane root for a lane CLI (`.../apps/openssl`); None means host system paths.
+    fn task7_lane_root(openssl: &str) -> Option<std::path::PathBuf> {
+        let path = std::path::Path::new(openssl);
+        if path.file_name().and_then(|n| n.to_str()) != Some("openssl") {
+            return None;
+        }
+        let apps = path.parent()?;
+        if apps.file_name().and_then(|n| n.to_str()) != Some("apps") {
+            return None;
+        }
+        apps.parent().map(|root| root.to_path_buf())
+    }
+
+    fn task7_fixture(openssl: &str, dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new(openssl)
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "fixture failed: {args:?}");
+    }
+
+    fn task7_compile_cprobe(
+        dir: &std::path::Path,
+        lane_root: Option<&std::path::Path>,
+    ) -> std::path::PathBuf {
+        let src = dir.join("task7_cprobe.c");
+        let app = dir.join("task7_cprobe");
+        std::fs::write(&src, TASK7_CPROBE_SRC).unwrap();
+        let mut cmd = std::process::Command::new("cc");
+        cmd.args(["-O1", "-Wno-deprecated-declarations", "-o"])
+            .arg(&app)
+            .arg(&src);
+        if let Some(root) = lane_root {
+            cmd.arg(format!("-I{}", root.join("include").display()));
+            cmd.arg(format!("-L{}", root.display()));
+        }
+        cmd.arg("-lcrypto");
+        let status = cmd.status().expect("cc must exist for Task-7 C legs");
+        assert!(status.success(), "cprobe build failed");
+        app
+    }
+
+    fn task7_object() -> Vec<u8> {
+        std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").expect("fresh BPF object"))
+            .unwrap()
+    }
+
+    /// Run one workload under a fresh observed session; absolute argv.
+    fn task7_run(
+        tag: &str,
+        argv: &[String],
+        dir: &std::path::Path,
+        object: &[u8],
+        capture: bool,
+    ) -> Task7Run {
+        let out_path = dir.join(format!("{tag}.out"));
+        let dest = if capture {
+            crate::target::WorkloadDest::File(out_path.clone())
+        } else {
+            crate::target::WorkloadDest::Null
+        };
+        let mut child = crate::target::OwnedTarget::spawn_stopped(argv, dest).unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        let mut session = ProviderSession::open_budgeted(budget, object).unwrap();
+        session
+            .prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Create,
+            )
+            .unwrap();
+        child.release_retaining_exit().unwrap();
+        // Hang detector, not a perf pin: 120 s covers a slow randomized DH
+        // prime search inside an observed C leg under full-suite load.
+        let until = Instant::now() + Duration::from_secs(120);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "{tag}: workload hung");
+            std::thread::yield_now();
+        }
+        let exit = child.peek_exit().unwrap();
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        });
+        let reconciliation = session.reconcile(&snapshot);
+        let mut batch = session.close_until(Instant::now() + Duration::from_secs(10));
+        for gap in reconciliation.gaps {
+            batch.gap(gap);
+        }
+        // Budget-denylist: ceiling/resource failures are never acceptable here.
+        for gap in &batch.gaps {
+            assert!(
+                !matches!(
+                    gap,
+                    ObservationGap::StateLimit
+                        | ObservationGap::ReadLimit
+                        | ObservationGap::BpfUnavailable
+                        | ObservationGap::AttachFailed
+                        | ObservationGap::InvalidObject
+                        | ObservationGap::InvalidWire
+                        | ObservationGap::ClassifierFailed
+                        | ObservationGap::TargetReadFailed
+                        | ObservationGap::ProcessLimit
+                        | ObservationGap::ObjectLimit
+                        | ObservationGap::LinkLimit
+                        | ObservationGap::PendingLimit
+                        | ObservationGap::DepthLimit
+                        | ObservationGap::SiteLimit
+                        | ObservationGap::FactLimit
+                ),
+                "{tag}: budget gap {gap:?}"
+            );
+        }
+        let rows: Vec<_> = batch.api_activity.iter().map(|a| a.row.clone()).collect();
+        let stdout = if capture {
+            std::fs::read(&out_path).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        eprintln!("TASK7 {tag} exit={exit:?} gaps={:?}", batch.gaps);
+        for id in 49..=72u32 {
+            let (e, ok, fail, mm, un) = task7_totals(&rows, id);
+            if e > 0 {
+                eprintln!("TASK7 {tag} api={id} entries={e} ok={ok} fail={fail} mm={mm} unsup={un}");
+            }
+        }
+        child.finish_observation().unwrap();
+        Task7Run {
+            tag: tag.to_string(),
+            exit,
+            rows,
+            gaps: batch.gaps,
+            stdout,
+        }
+    }
+
+    fn task7_totals(rows: &[crate::api_activity::ApiActivityRow], api: u32) -> (u64, u64, u64, u64, u64) {
+        rows.iter()
+            .filter(|r| u32::from(r.api) == api)
+            .fold((0, 0, 0, 0, 0), |acc, r| {
+                (
+                    acc.0 + r.entries,
+                    acc.1 + r.observed_success,
+                    acc.2 + r.observed_failure,
+                    acc.3 + r.verification_mismatch,
+                    acc.4 + r.unsupported,
+                )
+            })
+    }
+
+    /// Attached-but-uncalled: rows present, every counter zero, attached.
+    /// Live-decoded rows always carry attachment+finality (wire.rs); only
+    /// `unavailable()` rows set not_attached.
+    fn task7_assert_idle(run: &Task7Run, api: u32) {
+        let rows: Vec<_> = run.rows.iter().filter(|r| u32::from(r.api) == api).collect();
+        assert!(!rows.is_empty(), "{}: api {api} has no row (not attached?)", run.tag);
+        for r in rows {
+            assert_eq!((r.entries, r.observed_success, r.observed_failure), (0, 0, 0), "{}: api {api}", run.tag);
+            assert_eq!((r.verification_mismatch, r.unsupported), (0, 0), "{}: api {api}", run.tag);
+            let g = &r.gaps;
+            assert_eq!(
+                (g.map, g.depth, g.unpaired, g.tail, g.unsupported_return),
+                (0, 0, 0, 0, 0),
+                "{}: api {api}",
+                run.tag
+            );
+            assert!(
+                !g.saturated && !g.not_attached && g.attachment && g.finality,
+                "{}: api {api}",
+                run.tag
+            );
+        }
+    }
+
+    /// Void-exclusivity (D1 pin): every return classified success, nothing else.
+    fn task7_assert_void_clean(run: &Task7Run, api: u32) {
+        let rows: Vec<_> = run.rows.iter().filter(|r| u32::from(r.api) == api).collect();
+        assert!(!rows.is_empty(), "{}: api {api} has no row", run.tag);
+        let (e, ok, fail, mm, un) = task7_totals(&run.rows, api);
+        assert!(e > 0, "{}: api {api} never fired", run.tag);
+        assert_eq!((ok, fail, mm, un), (e, 0, 0, 0), "{}: api {api}", run.tag);
+        for r in rows {
+            let g = &r.gaps;
+            assert_eq!(
+                (g.map, g.depth, g.unpaired, g.tail, g.unsupported_return),
+                (0, 0, 0, 0, 0),
+                "{}: api {api}",
+                run.tag
+            );
+            assert!(
+                !g.saturated && !g.not_attached && g.attachment && g.finality,
+                "{}: api {api}",
+                run.tag
+            );
+        }
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g1_kem_control() {
+        let openssl = task7_openssl();
+        let lane_root = task7_lane_root(&openssl);
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "ML-KEM-768", "-out", "mlkem.pem"]);
+        task7_fixture(&openssl, &dir, &["pkey", "-in", "mlkem.pem", "-pubout", "-out", "mlkem-pub.pem"]);
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", "rsa.pem"]);
+        task7_fixture(&openssl, &dir, &["pkey", "-in", "rsa.pem", "-pubout", "-out", "rsa-pub.pem"]);
+        task7_fixture(&openssl, &dir, &["pkeyutl", "-encap", "-inkey", "mlkem-pub.pem", "-pubin", "-secret", "s1", "-out", "ct1"]);
+        let mut ct_bad = std::fs::read(dir.join("ct1")).unwrap();
+        ct_bad[10] ^= 0x01;
+        std::fs::write(dir.join("ct_bad"), &ct_bad).unwrap();
+        std::fs::write(dir.join("ct_trunc"), &ct_bad[..10]).unwrap();
+        let cprobe = task7_compile_cprobe(&dir, lane_root.as_deref());
+        let cprobe = cprobe.to_string_lossy().into_owned();
+        // T1 ML-KEM-768 (PQC): pkeyutl size-queries then runs (entries==2).
+        let r = task7_run(
+            "g1-encap-mlkem",
+            &[openssl.clone(), "pkeyutl".into(), "-encap".into(), "-inkey".into(), s("mlkem-pub.pem"), "-pubin".into(), "-secret".into(), s("sA"), "-out".into(), s("ctA")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 49), (2, 2, 0, 0, 0));
+        let r = task7_run(
+            "g1-decap-mlkem",
+            &[openssl.clone(), "pkeyutl".into(), "-decap".into(), "-inkey".into(), s("mlkem.pem"), "-in".into(), s("ctA"), "-secret".into(), s("sB")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 50), (2, 2, 0, 0, 0));
+        assert_eq!(std::fs::read(dir.join("sA")).unwrap(), std::fs::read(dir.join("sB")).unwrap());
+        // T1 RSA-KEM (classic): same two-phase shape.
+        let r = task7_run(
+            "g1-encap-rsa",
+            &[openssl.clone(), "pkeyutl".into(), "-encap".into(), "-inkey".into(), s("rsa-pub.pem"), "-pubin".into(), "-secret".into(), s("sR"), "-out".into(), s("ctR")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 49), (2, 2, 0, 0, 0));
+        let r = task7_run(
+            "g1-decap-rsa",
+            &[openssl.clone(), "pkeyutl".into(), "-decap".into(), "-inkey".into(), s("rsa.pem"), "-in".into(), s("ctR"), "-secret".into(), s("sR2")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 50), (2, 2, 0, 0, 0));
+        assert_eq!(std::fs::read(dir.join("sR")).unwrap(), std::fs::read(dir.join("sR2")).unwrap());
+        // Size-query-only leg: one NULL-out call, then stop.
+        let r = task7_run("g1-encap-query", &[cprobe.clone(), "encap-query".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("encap_query rv=1"));
+        assert_eq!(task7_totals(&r.rows, 49), (1, 1, 0, 0, 0));
+        // T3: truncated ciphertext fails the actual call (query still succeeds).
+        let r = task7_run(
+            "g1-decap-trunc",
+            &[openssl.clone(), "pkeyutl".into(), "-decap".into(), "-inkey".into(), s("mlkem.pem"), "-in".into(), s("ct_trunc"), "-secret".into(), s("sU")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert_eq!(task7_totals(&r.rows, 50), (2, 1, 1, 0, 0));
+        // Tampered-ciphertext oracle leg: ML-KEM implicit rejection keeps
+        // exit 0 with a divergent secret (proves the leg is meaningful).
+        let r = task7_run(
+            "g1-decap-tamper",
+            &[openssl.clone(), "pkeyutl".into(), "-decap".into(), "-inkey".into(), s("mlkem.pem"), "-in".into(), s("ct_bad"), "-secret".into(), s("sT")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 50), (2, 2, 0, 0, 0));
+        assert_ne!(std::fs::read(dir.join("s1")).unwrap(), std::fs::read(dir.join("sT")).unwrap());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g2_keygen_control() {
+        let openssl = task7_openssl();
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        // T1 EC keygen: init + keygen once each; the key must parse back.
+        let r = task7_run(
+            "g2-genpkey-ec",
+            &[openssl.clone(), "genpkey".into(), "-algorithm".into(), "EC".into(), "-pkeyopt".into(), "ec_paramgen_curve:P-256".into(), "-out".into(), s("ec1.pem")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 51), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 52), (1, 1, 0, 0, 0));
+        task7_fixture(&openssl, &dir, &["pkey", "-in", "ec1.pem", "-noout", "-text"]);
+        // T1 DH paramgen: init + paramgen once each; params must parse back.
+        let r = task7_run(
+            "g2-genparam-dh",
+            &[openssl.clone(), "genpkey".into(), "-genparam".into(), "-algorithm".into(), "DH".into(), "-pkeyopt".into(), "dh_paramgen_prime_len:512".into(), "-out".into(), s("dhp.pem")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 53), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 54), (1, 1, 0, 0, 0));
+        task7_fixture(&openssl, &dir, &["dhparam", "-in", "dhp.pem", "-noout", "-text"]);
+        // T3: RSA keygen with an even public exponent fails inside keygen.
+        let r = task7_run(
+            "g2-pubexp2",
+            &[openssl.clone(), "genpkey".into(), "-algorithm".into(), "RSA".into(), "-pkeyopt".into(), "rsa_keygen_bits:512".into(), "-pkeyopt".into(), "rsa_keygen_pubexp:2".into(), "-out".into(), s("badX")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert_eq!(task7_totals(&r.rows, 51), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 52), (1, 0, 1, 0, 0));
+        // T3: DH paramgen with a 64-bit prime fails inside paramgen.
+        let r = task7_run(
+            "g2-tiny-dh",
+            &[openssl.clone(), "genpkey".into(), "-genparam".into(), "-algorithm".into(), "DH".into(), "-pkeyopt".into(), "dh_paramgen_prime_len:64".into(), "-out".into(), s("dhTX")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert_eq!(task7_totals(&r.rows, 53), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 54), (1, 0, 1, 0, 0));
+        // T3: EC keygen without a curve fails inside keygen.
+        let r = task7_run(
+            "g2-ec-nocurve",
+            &[openssl.clone(), "genpkey".into(), "-algorithm".into(), "EC".into(), "-out".into(), s("ecX")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert_eq!(task7_totals(&r.rows, 52), (1, 0, 1, 0, 0));
+        // T3: paramgen for RSA fails inside paramgen_init (no params exist).
+        let r = task7_run(
+            "g2-genparam-rsa",
+            &[openssl.clone(), "genpkey".into(), "-genparam".into(), "-algorithm".into(), "RSA".into(), "-out".into(), s("x1")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert_eq!(task7_totals(&r.rows, 53), (1, 0, 1, 0, 0));
+        task7_assert_idle(&r, 54);
+        // T3-negative: unknown algorithm dies in fetch, before any init call.
+        let r = task7_run(
+            "g2-bad-alg",
+            &[openssl.clone(), "genpkey".into(), "-algorithm".into(), "NOPE".into(), "-out".into(), s("x3")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        task7_assert_idle(&r, 51);
+        task7_assert_idle(&r, 52);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g3_derive_check_control() {
+        let openssl = task7_openssl();
+        let lane_root = task7_lane_root(&openssl);
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g3-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", "ec1.pem"]);
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", "ec2.pem"]);
+        task7_fixture(&openssl, &dir, &["pkey", "-in", "ec2.pem", "-pubout", "-out", "ec2pub.pem"]);
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", "rsa.pem"]);
+        task7_fixture(&openssl, &dir, &["genpkey", "-genparam", "-algorithm", "DH", "-pkeyopt", "dh_paramgen_prime_len:512", "-out", "dhp.pem"]);
+        task7_fixture(&openssl, &dir, &["ecparam", "-name", "prime256v1", "-out", "ecp.pem"]);
+        let mut dhp_bad = std::fs::read(dir.join("dhp.pem")).unwrap();
+        dhp_bad[60] ^= 0x01;
+        std::fs::write(dir.join("dhp_bad.pem"), &dhp_bad).unwrap();
+        let cprobe = task7_compile_cprobe(&dir, lane_root.as_deref());
+        let cprobe = cprobe.to_string_lossy().into_owned();
+        // T1 ECDH derive: 32-byte secret, deterministic across two runs.
+        let r = task7_run(
+            "g3-derive",
+            &[openssl.clone(), "pkeyutl".into(), "-derive".into(), "-inkey".into(), s("ec1.pem"), "-peerkey".into(), s("ec2pub.pem"), "-out".into(), s("sec1")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 55), (1, 1, 0, 0, 0));
+        task7_fixture(&openssl, &dir, &["pkeyutl", "-derive", "-inkey", "ec1.pem", "-peerkey", "ec2pub.pem", "-out", "sec2"]);
+        assert_eq!(std::fs::read(dir.join("sec1")).unwrap().len(), 32);
+        assert_eq!(std::fs::read(dir.join("sec1")).unwrap(), std::fs::read(dir.join("sec2")).unwrap());
+        // T3: RSA has no derive op: derive_init returns documented -2.
+        let r = task7_run(
+            "g3-rsa-derive",
+            &[openssl.clone(), "pkeyutl".into(), "-derive".into(), "-inkey".into(), s("rsa.pem"), "-peerkey".into(), s("ec2pub.pem"), "-out".into(), s("secX")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert_eq!(task7_totals(&r.rows, 55), (1, 0, 1, 0, 1));
+        // T1/T3 check-family: stock valid legs + C invalid-key legs.
+        let r = task7_run(
+            "g3-check",
+            &[openssl.clone(), "pkey".into(), "-in".into(), s("ec1.pem"), "-check".into(), "-noout".into()],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("Key is valid"));
+        assert_eq!(task7_totals(&r.rows, 56), (1, 1, 0, 0, 0));
+        let r = task7_run("g3-check-bad", &[cprobe.clone(), "check-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("check_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 56), (1, 0, 1, 0, 0));
+        let r = task7_run(
+            "g3-pubcheck",
+            &[openssl.clone(), "pkey".into(), "-in".into(), s("ec1.pem"), "-pubcheck".into(), "-noout".into()],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("Key is valid"));
+        assert_eq!(task7_totals(&r.rows, 57), (1, 1, 0, 0, 0));
+        let r = task7_run("g3-pubcheck-bad", &[cprobe.clone(), "pubcheck-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("pubcheck_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 57), (1, 0, 1, 0, 0));
+        let r = task7_run(
+            "g3-dhparam-check",
+            &[openssl.clone(), "dhparam".into(), "-check".into(), "-in".into(), s("dhp.pem"), "-noout".into()],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 58), (1, 1, 0, 0, 0));
+        let r = task7_run(
+            "g3-ecparam-check",
+            &[openssl.clone(), "ecparam".into(), "-check".into(), "-in".into(), s("ecp.pem"), "-noout".into()],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 58), (1, 1, 0, 0, 0));
+        let r = task7_run(
+            "g3-dhparam-tamper",
+            &[openssl.clone(), "dhparam".into(), "-check".into(), "-in".into(), s("dhp_bad.pem"), "-noout".into()],
+            &dir, &object, false,
+        );
+        assert_ne!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 58), (1, 0, 1, 0, 0));
+        // 59 has no stock path: C legs with marker oracles (non-stock caveat).
+        let r = task7_run("g3-copyparams-ok", &[cprobe.clone(), "copyparams-ok".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("copyparams_ok rv=1"));
+        assert_eq!(task7_totals(&r.rows, 59), (1, 1, 0, 0, 0));
+        let r = task7_run("g3-copyparams-bad", &[cprobe.clone(), "copyparams-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("copyparams_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 59), (1, 0, 1, 0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g4_digestsign_control() {
+        let openssl = task7_openssl();
+        let lane_root = task7_lane_root(&openssl);
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g4-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(dir.join("data16"), b"0123456789abcdef").unwrap();
+        std::fs::write(dir.join("data1m"), vec![0x42u8; 1 << 20]).unwrap();
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048", "-out", "rsa.pem"]);
+        task7_fixture(&openssl, &dir, &["pkey", "-in", "rsa.pem", "-pubout", "-out", "rsa-pub.pem"]);
+        task7_fixture(&openssl, &dir, &["dgst", "-sha256", "-sign", "rsa.pem", "-out", "sig", "data16"]);
+        let mut sig_bad = std::fs::read(dir.join("sig")).unwrap();
+        sig_bad[0] ^= 0xff;
+        std::fs::write(dir.join("sig_bad"), &sig_bad).unwrap();
+        let cprobe = task7_compile_cprobe(&dir, lane_root.as_deref());
+        let cprobe = cprobe.to_string_lossy().into_owned();
+        // T1 sign/verify pair with the application oracle.
+        let r = task7_run(
+            "g4-sign",
+            &[openssl.clone(), "dgst".into(), "-sha256".into(), "-sign".into(), s("rsa.pem"), "-out".into(), s("sigA"), s("data16")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 60), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 61), (1, 1, 0, 0, 0));
+        let r = task7_run(
+            "g4-verify",
+            &[openssl.clone(), "dgst".into(), "-sha256".into(), "-verify".into(), s("rsa-pub.pem"), "-signature".into(), s("sig"), s("data16")],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("Verified OK"));
+        assert_eq!(task7_totals(&r.rows, 62), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 63), (1, 1, 0, 0, 0));
+        // T1 multi-block: 1 MiB through pkeyutl raw streaming = 512 Updates.
+        let r = task7_run(
+            "g4-sign-raw",
+            &[openssl.clone(), "pkeyutl".into(), "-sign".into(), "-rawin".into(), "-digest".into(), "sha256".into(), "-inkey".into(), s("rsa.pem"), "-in".into(), s("data1m"), "-out".into(), s("sig2")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 61), (512, 512, 0, 0, 0));
+        let r = task7_run(
+            "g4-verify-raw",
+            &[openssl.clone(), "pkeyutl".into(), "-verify".into(), "-rawin".into(), "-digest".into(), "sha256".into(), "-pubin".into(), "-inkey".into(), s("rsa-pub.pem"), "-sigfile".into(), s("sig2"), "-in".into(), s("data1m")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 63), (512, 512, 0, 0, 0));
+        // T3: tampered signature mismatches at Final; Init/Update stay clean
+        // (pins the no-new-mismatch arm: 62/63 never report mismatch).
+        let r = task7_run(
+            "g4-verify-tamper",
+            &[openssl.clone(), "dgst".into(), "-sha256".into(), "-verify".into(), s("rsa-pub.pem"), "-signature".into(), s("sig_bad"), s("data16")],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(1));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("Verification failure"));
+        assert_eq!(task7_totals(&r.rows, 45), (1, 0, 1, 1, 0));
+        assert_eq!(task7_totals(&r.rows, 62), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 63), (1, 1, 0, 0, 0));
+        // T3: C failure legs the CLI cannot induce (non-stock caveat).
+        let r = task7_run("g4-signinit-bad", &[cprobe.clone(), "signinit-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("signinit_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 60), (1, 0, 1, 0, 0));
+        let r = task7_run("g4-verifyinit-bad", &[cprobe.clone(), "verifyinit-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("verifyinit_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 62), (1, 0, 1, 0, 0));
+        let r = task7_run("g4-signupdate-bad", &[cprobe.clone(), "signupdate-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("signupdate_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 61), (1, 0, 1, 0, 0));
+        let r = task7_run("g4-verifyupdate-bad", &[cprobe.clone(), "verifyupdate-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("verifyupdate_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 63), (1, 0, 1, 0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g5_oneshot_control() {
+        let openssl = task7_openssl();
+        let lane_root = task7_lane_root(&openssl);
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("data16"), b"0123456789abcdef").unwrap();
+        let cprobe = task7_compile_cprobe(&dir, lane_root.as_deref());
+        let cprobe = cprobe.to_string_lossy().into_owned();
+        // T1 EVP_Q_mac via stock HKDF (RFC 5869 TC1, the FAM_KDF_OKM oracle).
+        let r = task7_run(
+            "g5-kdf-hkdf",
+            &[openssl.clone(), "kdf".into(), "-keylen".into(), "42".into(), "-kdfopt".into(), "digest:SHA256".into(), "-kdfopt".into(), format!("hexkey:{}", "0b".repeat(22)), "-kdfopt".into(), "hexsalt:000102030405060708090a0b0c".into(), "-kdfopt".into(), "hexinfo:f0f1f2f3f4f5f6f7f8f9".into(), "HKDF".into()],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(0));
+        let stripped: String = String::from_utf8_lossy(&r.stdout)
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        assert_eq!(stripped, "3CB25F25FAACD57A90434F64D0362F2A2D2D0A90CF1A5A4C5DB02D56ECC4C5BF34007208D5B887185865");
+        assert_eq!(task7_totals(&r.rows, 65), (1, 1, 0, 0, 0));
+        // T1 EVP_Q_digest via C (no stock path; oracle = independent CLI digest).
+        task7_fixture(&openssl, &dir, &["dgst", "-sha256", "-hex", "-out", "qref.hex", "data16"]);
+        let r = task7_run("g5-qdigest-ok", &[cprobe.clone(), "qdigest-ok".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        let out = String::from_utf8_lossy(&r.stdout);
+        assert!(out.contains("qdigest_ok rv=1"));
+        let expect = String::from_utf8_lossy(&std::fs::read(dir.join("qref.hex")).unwrap()).into_owned();
+        let hex: String = out.lines().nth(1).unwrap().trim().to_string();
+        assert!(expect.to_lowercase().contains(&hex.to_lowercase()), "C digest must equal CLI digest");
+        assert_eq!(task7_totals(&r.rows, 64), (1, 1, 0, 0, 0));
+        // T1 EVP_Q_mac via C with the same cross-check shape (CLI mac oracle).
+        std::fs::write(dir.join("qdata"), b"0123456789abcdef").unwrap();
+        task7_fixture(&openssl, &dir, &["mac", "-digest", "SHA256", "-macopt", "hexkey:000102030405060708090a0b0c0d0e0f", "-in", "qdata", "-out", "mref.hex", "HMAC"]);
+        let r = task7_run("g5-qmac-ok", &[cprobe.clone(), "qmac-ok".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        let out = String::from_utf8_lossy(&r.stdout);
+        assert!(out.contains("qmac_ok null=0"));
+        let expect = String::from_utf8_lossy(&std::fs::read(dir.join("mref.hex")).unwrap()).into_owned();
+        let hex: String = out.lines().nth(1).unwrap().trim().to_string();
+        assert!(expect.to_lowercase().contains(&hex.to_lowercase()), "C MAC must equal CLI MAC");
+        assert_eq!(task7_totals(&r.rows, 65), (1, 1, 0, 0, 0));
+        // T3: unknown names fail (0 / NULL).
+        let r = task7_run("g5-qdigest-bad", &[cprobe.clone(), "qdigest-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("qdigest_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 64), (1, 0, 1, 0, 0));
+        let r = task7_run("g5-qmac-bad", &[cprobe.clone(), "qmac-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("qmac_bad null=1"));
+        assert_eq!(task7_totals(&r.rows, 65), (1, 0, 1, 0, 0));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g6_rand_control() {
+        let openssl = task7_openssl();
+        let lane_root = task7_lane_root(&openssl);
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g6-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", "ec1.pem"]);
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        let cprobe = task7_compile_cprobe(&dir, lane_root.as_deref());
+        let cprobe = cprobe.to_string_lossy().into_owned();
+        // T1 RAND_CTX lifecycle via stock `rand`: 32 hex chars out.
+        let r = task7_run(
+            "g6-rand",
+            &[openssl.clone(), "rand".into(), "-hex".into(), "16".into()],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(0));
+        let hex = String::from_utf8_lossy(&r.stdout).trim().to_string();
+        assert_eq!(hex.len(), 32);
+        assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+        let (e67, ok67, _, _, _) = task7_totals(&r.rows, 67);
+        assert!(e67 >= 1 && ok67 == e67, "67 must fire successfully");
+        task7_assert_void_clean(&r, 68);
+        // T1/T3 EVP_RAND_nonce via C (no stock path: no internal callers).
+        let r = task7_run("g6-nonce-ok", &[cprobe.clone(), "nonce-ok".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("nonce_ok rv=1"));
+        assert_eq!(task7_totals(&r.rows, 66), (1, 1, 0, 0, 0));
+        let r = task7_run("g6-nonce-bad", &[cprobe.clone(), "nonce-bad".into()], &dir, &object, true);
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("nonce_bad rv=0"));
+        assert_eq!(task7_totals(&r.rows, 66), (1, 0, 1, 0, 0));
+        // T3-negative for 67: `pkey -check` frees (possibly NULL) RAND
+        // contexts but news none — attached, zero entries, zero gaps.
+        let r = task7_run(
+            "g6-check-neg67",
+            &[openssl.clone(), "pkey".into(), "-in".into(), s("ec1.pem"), "-check".into(), "-noout".into()],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 56), (1, 1, 0, 0, 0));
+        task7_assert_idle(&r, 67);
+        task7_assert_void_clean(&r, 68);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g7_mdctx_control() {
+        let openssl = task7_openssl();
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(dir.join("data1m"), vec![0x42u8; 1 << 20]).unwrap();
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", "ec1.pem"]);
+        task7_fixture(&openssl, &dir, &["genpkey", "-algorithm", "EC", "-pkeyopt", "ec_paramgen_curve:P-256", "-out", "ec2.pem"]);
+        task7_fixture(&openssl, &dir, &["pkey", "-in", "ec2.pem", "-pubout", "-out", "ec2pub.pem"]);
+        // T1: the digest BIO news one MD_CTX and frees (CTX + NULL guard).
+        let r = task7_run(
+            "g7-dgst",
+            &[openssl.clone(), "dgst".into(), "-sha256".into(), s("data1m")],
+            &dir, &object, true,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert!(String::from_utf8_lossy(&r.stdout).contains("SHA2-256("));
+        assert_eq!(task7_totals(&r.rows, 69), (1, 1, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 70), (2, 2, 0, 0, 0));
+        task7_assert_void_clean(&r, 70);
+        // T3-negative for 69: derive frees an MD_CTX without news.
+        let r = task7_run(
+            "g7-derive-neg69",
+            &[openssl.clone(), "pkeyutl".into(), "-derive".into(), "-inkey".into(), s("ec1.pem"), "-peerkey".into(), s("ec2pub.pem"), "-out".into(), s("sec1")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        task7_assert_idle(&r, 69);
+        task7_assert_void_clean(&r, 70);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
+    fn task7_g8_cipherctx_control() {
+        let openssl = task7_openssl();
+        let object = task7_object();
+        let dir = std::env::temp_dir().join(format!("task7-g8-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = |name: &str| dir.join(name).to_string_lossy().into_owned();
+        std::fs::write(dir.join("data16"), b"0123456789abcdef").unwrap();
+        // T1: the cipher BIO news/frees seven CIPHER_CTXs on one enc run.
+        let r = task7_run(
+            "g8-enc",
+            &[openssl.clone(), "enc".into(), "-aes-256-cbc".into(), "-pass".into(), "pass:x".into(), "-in".into(), s("data16"), "-out".into(), s("e1")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        assert_eq!(task7_totals(&r.rows, 71), (7, 7, 0, 0, 0));
+        assert_eq!(task7_totals(&r.rows, 72), (7, 7, 0, 0, 0));
+        task7_assert_void_clean(&r, 72);
+        // Round-trip oracle: decrypt with the same password, compare bytes.
+        task7_fixture(&openssl, &dir, &["enc", "-d", "-aes-256-cbc", "-pass", "pass:x", "-in", "e1", "-out", "d1"]);
+        assert_eq!(std::fs::read(dir.join("data16")).unwrap(), std::fs::read(dir.join("d1")).unwrap());
+        // T3-negative for 71/72: plain digest touches no cipher contexts.
+        let r = task7_run(
+            "g8-dgst-neg71",
+            &[openssl.clone(), "dgst".into(), "-sha256".into(), s("data16")],
+            &dir, &object, false,
+        );
+        assert_eq!(r.exit, Some(0));
+        task7_assert_idle(&r, 71);
+        task7_assert_idle(&r, 72);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn legacy_startup_acquisition_survives_retained_typed_prefix_then_refusal() {
         use crate::startup_objects::{StartupAcquisition, acquire_startup};

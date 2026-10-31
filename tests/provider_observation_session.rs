@@ -1326,3 +1326,135 @@ fn additive_api_activity_decodes_with_per_api_subset_guards() {
     assert!(wire::decode_activity(49, &aggregate(1, 1, 1, 0, 0)).is_err());
     assert!(wire::decode_activity(72, &aggregate(2, 0, 1, 1, 1)).is_err());
 }
+
+#[test]
+#[ignore = "requires fresh BPF object and native tracing privileges"]
+fn additive_api_live_calls_classify_per_pinned_arms() {
+    // Task 7 (5G) round 2, integration tier: a fixture exporting new-API
+    // stubs with controlled return scalars drives the full
+    // discover -> attach -> live-call -> close path. One arm
+    // representative each: INT2N (49: 1 then -2), PTR (65: pointer then
+    // NULL), VOID (70), CHECK (56: 0 is failure, never mismatch), INT01
+    // (64: undocumented 2 stays unknown via unsupported_return).
+    use std::{
+        fs,
+        io::{BufRead, BufReader, Write},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    struct Owned(std::process::Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+    let dir = std::env::temp_dir().join(format!("osslscope-additive-arms-{}", std::process::id()));
+    fs::create_dir(&dir).unwrap();
+    let source = dir.join("arms.c");
+    let app = dir.join("arms");
+    fs::write(&source, r#"
+#include <stdio.h>
+#include <unistd.h>
+#include <stddef.h>
+int EVP_PKEY_encapsulate(void);
+unsigned char *EVP_Q_mac(void);
+void EVP_MD_CTX_free(void);
+int EVP_PKEY_check(void);
+int EVP_Q_digest(void);
+static int enc_n = 0;
+static unsigned char macbuf[32];
+static int mac_n = 0;
+__attribute__((noinline)) int EVP_PKEY_encapsulate(void) { return (++enc_n == 2) ? -2 : 1; }
+__attribute__((noinline)) unsigned char *EVP_Q_mac(void) { return (++mac_n == 2) ? (unsigned char*)0 : macbuf; }
+__attribute__((noinline)) void EVP_MD_CTX_free(void) { }
+__attribute__((noinline)) int EVP_PKEY_check(void) { return 0; }
+__attribute__((noinline)) int EVP_Q_digest(void) { return 2; }
+int main(void) {
+ char byte; puts("inside"); fflush(stdout); if(read(0,&byte,1) != 1) return 0;
+ if (EVP_PKEY_encapsulate() != 1) return 1;
+ if (EVP_PKEY_encapsulate() != -2) return 1;
+ if (EVP_Q_mac() == (unsigned char*)0) return 1;
+ if (EVP_Q_mac() != (unsigned char*)0) return 1;
+ EVP_MD_CTX_free();
+ if (EVP_PKEY_check() != 0) return 1;
+ if (EVP_Q_digest() != 2) return 1;
+ puts("done"); fflush(stdout); return 0;
+}
+"#).unwrap();
+    assert!(
+        Command::new("cc")
+            .args(["-O0", "-rdynamic", "-o"])
+            .arg(&app)
+            .arg(source)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = Owned(
+        Command::new(&app)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut out = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line, "inside\n");
+    let object =
+        fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").expect("fresh BPF object"))
+            .unwrap();
+    let mut session = po::ProviderSession::open(Default::default(), &object).unwrap();
+    let snapshot = osslscope::inventory::snapshot(&osslscope::inventory::SnapshotOptions {
+        pids: vec![child.0.id()],
+        ..Default::default()
+    });
+    let setup = session.reconcile(&snapshot);
+    assert!(
+        !setup.gaps.contains(&po::ObservationGap::AttachFailed),
+        "{:?}",
+        setup.gaps
+    );
+    child.0.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    line.clear();
+    out.read_line(&mut line).unwrap();
+    assert_eq!(line, "done\n");
+    for _ in 0..3 {
+        let batch = session.drain(Instant::now() + Duration::from_millis(100));
+        assert!(batch.facts.is_empty(), "operational hot calls entered cold ring");
+        assert!(batch.api_activity.is_empty(), "interim snapshot must not be accumulated");
+    }
+    let batch = session.close();
+    let totals = |api: u32| {
+        batch
+            .api_activity
+            .iter()
+            .filter(|a| u32::from(a.row.api) == api)
+            .fold((0, 0, 0, 0, 0, 0), |acc, a| {
+                (
+                    acc.0 + a.row.entries,
+                    acc.1 + a.row.observed_success,
+                    acc.2 + a.row.observed_failure,
+                    acc.3 + a.row.verification_mismatch,
+                    acc.4 + a.row.unsupported,
+                    acc.5 + a.row.gaps.unsupported_return,
+                )
+            })
+    };
+    assert_eq!(totals(49), (2, 1, 1, 0, 1, 0), "{:?}", batch.gaps);
+    assert_eq!(totals(65), (2, 1, 1, 0, 0, 0), "{:?}", batch.gaps);
+    assert_eq!(totals(70), (1, 1, 0, 0, 0, 0), "{:?}", batch.gaps);
+    assert_eq!(totals(56), (1, 0, 1, 0, 0, 0), "{:?}", batch.gaps);
+    assert_eq!(totals(64), (1, 0, 0, 0, 0, 1), "{:?}", batch.gaps);
+    for api in [49, 56, 64, 65, 70] {
+        for a in batch.api_activity.iter().filter(|a| u32::from(a.row.api) == api) {
+            assert_eq!(
+                (a.row.gaps.tail, a.row.gaps.unpaired, a.row.gaps.map, a.row.gaps.depth),
+                (0, 0, 0, 0),
+                "api {api}"
+            );
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
