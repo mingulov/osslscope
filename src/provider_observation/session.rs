@@ -10931,14 +10931,12 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         // child_exit Some(0): fam_full_acquire asserts the
         // observed workload exits 0 in-flow — truthful, not a
         // default. The document already carries the projection
-        // (the production finish() shape); the seam field stays
-        // None exactly as consume_document expects.
+        // (the production finish() shape).
         crate::focused_capture::FocusedResult {
             document,
             child_exit: Some(0),
             workload_discarded: false,
             _reservation: None,
-            finalized_attribution: None,
         }
     }
 

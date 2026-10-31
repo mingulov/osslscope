@@ -81,11 +81,6 @@ pub struct FocusedResult {
     pub child_exit: Option<i32>,
     pub workload_discarded: bool,
     pub(crate) _reservation: Option<crate::observation_memory::MemoryLease>,
-    /// Finalized same-cut attribution when the one-shot collect certified
-    /// it; `None` when unattempted (no typed sites) or refused (physical
-    /// evidence kept, gap recorded). Task 3 projects this into the
-    /// finalized document; nothing else reads it.
-    pub(crate) finalized_attribution: Option<crate::attribution::FinalizedAttribution>,
 }
 
 /// No event-order proof is exposed within a batch. Invalidation therefore
@@ -1249,7 +1244,6 @@ impl FocusedSession {
             child_exit,
             workload_discarded: self.workload_discarded,
             _reservation: Some(self._reservation),
-            finalized_attribution,
         })
     }
 }
