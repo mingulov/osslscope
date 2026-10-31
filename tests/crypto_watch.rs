@@ -726,3 +726,231 @@ finally:
         "actual numeric PID reuse preserved two independently acquired positive segments; replacement survived observer stop"
     );
 }
+
+// 5E: one run observes a bounded container workload and a hot sibling side by
+// side. The workload must show positive execution while staying bounded (no
+// sibling leakage); the sibling must be hot in the SAME run; both processes
+// and cgroups are identified independently of the observer.
+const WORKLOAD_INPUT_BYTES: u64 = 3_000_000_000;
+const WORKLOAD_CALL_CEILING: u64 = 200_000;
+const SIBLING_HOT_FLOOR: u64 = 500_000;
+struct TestContainer {
+    name: String,
+}
+impl TestContainer {
+    fn start(name: &str, image: &str, args: &[&str]) -> Self {
+        let name = format!("{name}-{}", std::process::id());
+        let status = Command::new("docker")
+            .arg("run")
+            .arg("-d")
+            .arg("--name")
+            .arg(&name)
+            .arg(image)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "docker run requires docker + image");
+        Self { name }
+    }
+    fn pid(&self) -> u32 {
+        let out = Command::new("docker")
+            .args(["inspect", "-f", "{{.State.Pid}}", &self.name])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+    fn running(&self) -> bool {
+        let out = Command::new("docker")
+            .args(["inspect", "-f", "{{.State.Running}}", &self.name])
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim() == "true"
+    }
+}
+impl Drop for TestContainer {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["stop", &self.name]).output();
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .output();
+    }
+}
+fn wait_for_exe(pid: u32, marker: &str) {
+    let link = format!("/proc/{pid}/exe");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let target = std::fs::read_link(&link)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        if target.contains(marker) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "PID {pid} never became {marker}: {target}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+#[test]
+#[ignore = "requires installed CLI + docker + privileged BPF (5E)"]
+fn container_workload_reports_positive_without_sibling_attribution() {
+    let binary = std::env::var_os("OSSLSCOPE_TEST_INSTALLED_CLI").expect("installed CLI");
+    // Ordinary image: stock Debian openssl in its own layer over slim.
+    let image = "ossl5e-workload:local";
+    let have = Command::new("docker")
+        .args(["images", "-q", image])
+        .output()
+        .unwrap();
+    if String::from_utf8(have.stdout).unwrap().trim().is_empty() {
+        let dir = std::env::temp_dir().join(format!("ossl5e-image-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("Dockerfile"),
+            "FROM debian:trixie-slim\nRUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*\n",
+        )
+        .unwrap();
+        let build = Command::new("docker")
+            .args(["build", "-t", image])
+            .arg(&dir)
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            build.status.success(),
+            "image build: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+    let out = Command::new("docker")
+        .args(["run", "--rm", image, "openssl", "version"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "image must ship stock openssl");
+    eprintln!(
+        "workload image: {}",
+        String::from_utf8_lossy(&out.stdout).trim()
+    );
+    // Independent oracle: the input is exactly N zero bytes.
+    let mut expected = sha2::Sha256::new();
+    use sha2::Digest as _;
+    let zeros = vec![0u8; 1 << 20];
+    for _ in 0..WORKLOAD_INPUT_BYTES / (1 << 20) {
+        expected.update(&zeros);
+    }
+    let expected: String = expected
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let workload = TestContainer::start(
+        "ossl5e-workload",
+        image,
+        &[
+            "sh",
+            "-c",
+            &format!(
+                "head -c {WORKLOAD_INPUT_BYTES} /dev/zero > /tmp/input && exec openssl dgst -sha256 /tmp/input"
+            ),
+        ],
+    );
+    let sibling = TestContainer::start(
+        "ossl5e-sibling",
+        image,
+        &["openssl", "speed", "-seconds", "40", "-evp", "sha256"],
+    );
+    let wpid = workload.pid();
+    let spid = sibling.pid();
+    assert!(wpid > 1 && spid > 1 && wpid != spid);
+    wait_for_exe(wpid, "openssl");
+    // Independent process + cgroup identification, outside the observer.
+    for (pid, tag) in [(wpid, "workload"), (spid, "sibling")] {
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        assert!(cgroup.contains("docker"), "{tag} cgroup: {cgroup}");
+    }
+    let wcgroup = std::fs::read_to_string(format!("/proc/{wpid}/cgroup")).unwrap();
+    let scgroup = std::fs::read_to_string(format!("/proc/{spid}/cgroup")).unwrap();
+    assert_ne!(wcgroup, scgroup, "distinct container cgroups required");
+    let output = Command::new(binary)
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &wpid.to_string(),
+            "--pid",
+            &spid.to_string(),
+            "--duration",
+            "6",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(sibling.running(), "sibling must stay hot through the run");
+    let rows = records(&output);
+    let docs: Vec<_> = rows
+        .iter()
+        .filter(|r| r["kind"] == "process_observation")
+        .collect();
+    assert_eq!(docs.len(), 2, "one document per observed process");
+    let mut saw = std::collections::BTreeSet::new();
+    for row in &docs {
+        let pid = row["incarnation"]["pid"].as_u64().unwrap() as u32;
+        assert!(pid == wpid || pid == spid, "no foreign attribution");
+        assert!(saw.insert(pid), "duplicate document for {pid}");
+        osslscope::schema::validate_v2(&row["document"]).unwrap();
+    }
+    let calls = |pid: u32| {
+        physical(
+            &docs
+                .iter()
+                .find(|r| r["incarnation"]["pid"] == pid)
+                .unwrap()["document"],
+        )
+    };
+    let api = |pid: u32| {
+        docs.iter()
+            .find(|r| r["incarnation"]["pid"] == pid)
+            .unwrap()["document"]["api_activity"]
+            .as_array()
+            .expect("separate public API ledger")
+            .iter()
+            .map(|r| r["entries"].as_u64().unwrap())
+            .sum::<u64>()
+    };
+    assert!(calls(wpid) > 0, "workload must show positive execution");
+    assert!(api(wpid) > 0, "workload must show API activity");
+    assert!(
+        calls(wpid) < WORKLOAD_CALL_CEILING,
+        "workload calls {} exceed the no-leakage ceiling",
+        calls(wpid)
+    );
+    assert!(
+        calls(spid) > SIBLING_HOT_FLOOR,
+        "sibling must be hot in the same run"
+    );
+    // Workload success oracle: the observed digest must match the host digest.
+    let wait = Command::new("docker")
+        .args(["wait", &workload.name])
+        .output()
+        .unwrap();
+    assert!(wait.status.success());
+    assert_eq!(String::from_utf8(wait.stdout).unwrap().trim(), "0");
+    let logs = Command::new("docker")
+        .args(["logs", &workload.name])
+        .output()
+        .unwrap();
+    let digest = String::from_utf8(logs.stdout)
+        .unwrap()
+        .split_whitespace()
+        .last()
+        .unwrap()
+        .to_owned();
+    assert_eq!(digest, expected, "workload digest oracle");
+}

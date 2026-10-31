@@ -4,6 +4,7 @@ use osslscope::provider_observation::{self as observation, *};
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -682,5 +683,156 @@ fn public_forwarder_inspection_preserves_finite_exports_and_object_identity() {
     assert_eq!(
         inspect_expected_exports(&mut file, &expected, &mut ObservationBudget::default()),
         Err(ObservationGap::ObjectChanged)
+    );
+}
+
+// 5E RED: ordinary overlay lower backing must attach; after copy-up the old
+// lower mapping must stay traced through its direct backing, never the
+// overlay identity. A changed executable must invalidate custody.
+struct OverlayMount {
+    base: PathBuf,
+    merged: PathBuf,
+}
+impl OverlayMount {
+    fn mount() -> Self {
+        let base = std::env::temp_dir().join(format!(
+            "osslscope-overlay-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        for name in ["lower", "upper", "work", "merged"] {
+            fs::create_dir_all(base.join(name)).unwrap();
+        }
+        let status = Command::new("mount")
+            .args([
+                "-t",
+                "overlay",
+                "overlay",
+                "-o",
+                &format!(
+                    "lowerdir={},upperdir={},workdir={}",
+                    base.join("lower").display(),
+                    base.join("upper").display(),
+                    base.join("work").display()
+                ),
+            ])
+            .arg(base.join("merged"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "overlay mount requires privilege");
+        Self {
+            merged: base.join("merged"),
+            base,
+        }
+    }
+}
+impl Drop for OverlayMount {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.merged).status();
+        let _ = fs::remove_dir_all(&self.base);
+    }
+}
+fn copy_up_same_bytes(path: &Path) {
+    use std::os::unix::fs::FileExt as _;
+    let bytes = fs::read(path).unwrap();
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    writer.write_all_at(&bytes, 0).unwrap();
+    writer.sync_all().unwrap();
+}
+impl OwnedChild {
+    fn command(&mut self, byte: u8) {
+        self.0.stdin.as_mut().unwrap().write_all(&[byte]).unwrap();
+        self.0.stdin.as_mut().unwrap().flush().unwrap();
+    }
+}
+fn snapshot_pid(pid: u32) -> inventory::ProcessRecord {
+    inventory::snapshot(&inventory::SnapshotOptions {
+        pids: vec![pid],
+        ..Default::default()
+    })
+    .processes
+    .remove(0)
+}
+#[test]
+#[ignore = "requires privileged overlay mount + map_files/pagemap (5E)"]
+fn overlay_lower_only_acquires_and_resolves() {
+    let overlay = OverlayMount::mount();
+    let fixture = Fixture::new();
+    fs::copy(
+        fixture.0.join("renamed.so"),
+        overlay.base.join("lower/renamed.so"),
+    )
+    .unwrap();
+    let merged = overlay.merged.join("renamed.so");
+    let child = OwnedChild::spawn(&fixture, &[merged]);
+    let record = snapshot_pid(child.pid());
+    let process = acquire(&record, &mut ObservationBudget::default()).unwrap();
+    assert!(
+        !process
+            .resolve_api(ObservationApi::Inventoried(Api::OsslProviderLoad))
+            .is_empty(),
+        "overlay lower sites must resolve"
+    );
+    process.revalidate().unwrap();
+}
+#[test]
+#[ignore = "requires privileged overlay mount + map_files/pagemap (5E)"]
+fn overlay_copyup_old_mapping_traced_via_direct_lower() {
+    let overlay = OverlayMount::mount();
+    let fixture = Fixture::new();
+    let lower = overlay.base.join("lower/renamed.so");
+    fs::copy(fixture.0.join("renamed.so"), &lower).unwrap();
+    let merged = overlay.merged.join("renamed.so");
+    let child = OwnedChild::spawn(&fixture, &[merged.clone()]);
+    copy_up_same_bytes(&merged);
+    assert!(
+        overlay.base.join("upper/renamed.so").metadata().is_ok(),
+        "copy-up proof: upper file must exist"
+    );
+    let record = snapshot_pid(child.pid());
+    let process = acquire(&record, &mut ObservationBudget::default()).unwrap();
+    let sites = process.resolve_api(ObservationApi::Inventoried(Api::OsslProviderLoad));
+    assert!(!sites.is_empty(), "old lower mapping must stay traced");
+    let lower_meta = fs::metadata(&lower).unwrap();
+    assert!(
+        sites
+            .iter()
+            .any(|s| s.site.native_device() == lower_meta.dev()
+                && s.site.inode() == lower_meta.ino()),
+        "sites must bind the direct lower backing"
+    );
+    let merged_meta = fs::metadata(&merged).unwrap();
+    assert!(
+        sites
+            .iter()
+            .all(|s| s.site.native_device() != merged_meta.dev()
+                || s.site.inode() != merged_meta.ino()),
+        "sites must never bind the overlay identity after copy-up"
+    );
+    process.revalidate().unwrap();
+}
+#[test]
+#[ignore = "requires privileged map_files (5E; this host denies map_files unprivileged)"]
+fn changed_executable_invalidates_acquired_process() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("renamed.so");
+    let mut child = OwnedChild::spawn(&fixture, &[path]);
+    let binary = fixture.0.join("mmap");
+    let record = snapshot_pid(child.pid());
+    let process = acquire(&record, &mut ObservationBudget::default()).unwrap();
+    child.command(b'e');
+    let exe = format!("/proc/{}/exe", child.pid());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while fs::read_link(&exe).unwrap() == binary {
+        assert!(std::time::Instant::now() < deadline, "child never exec'd");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        process.revalidate().is_err(),
+        "exec must invalidate custody"
     );
 }

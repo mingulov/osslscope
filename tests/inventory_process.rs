@@ -401,6 +401,155 @@ fn zero_pid_is_unavailable_and_empty_limits_do_not_panic() {
     }
 }
 
+// 5E RED: ordinary overlay lower backing must verify; after copy-up the
+// overlay identity must stay unverified while the old lower mapping stays
+// positively traced through its direct backing.
+struct OverlayMount {
+    base: PathBuf,
+    merged: PathBuf,
+}
+impl OverlayMount {
+    fn mount() -> Self {
+        let base = std::env::temp_dir().join(format!(
+            "osslscope-overlay-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        for name in ["lower", "upper", "work", "merged"] {
+            fs::create_dir_all(base.join(name)).unwrap();
+        }
+        let status = Command::new("mount")
+            .args([
+                "-t",
+                "overlay",
+                "overlay",
+                "-o",
+                &format!(
+                    "lowerdir={},upperdir={},workdir={}",
+                    base.join("lower").display(),
+                    base.join("upper").display(),
+                    base.join("work").display()
+                ),
+            ])
+            .arg(base.join("merged"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "overlay mount requires privilege");
+        Self {
+            merged: base.join("merged"),
+            base,
+        }
+    }
+}
+impl Drop for OverlayMount {
+    fn drop(&mut self) {
+        let _ = Command::new("umount").arg(&self.merged).status();
+        let _ = fs::remove_dir_all(&self.base);
+    }
+}
+fn build_so(dir: &Path, name: &str, source: &str) -> PathBuf {
+    let src = dir.join(format!("{name}.c"));
+    let out = dir.join(name);
+    fs::write(&src, source).unwrap();
+    let result = Command::new("cc")
+        .args(["-shared", "-fPIC", "-Wl,--build-id=none", "-o"])
+        .arg(&out)
+        .arg(src)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    out
+}
+fn copy_up_same_bytes(path: &Path) {
+    use std::os::unix::fs::FileExt as _;
+    let bytes = fs::read(path).unwrap();
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .unwrap();
+    writer.write_all_at(&bytes, 0).unwrap();
+    writer.sync_all().unwrap();
+}
+#[test]
+#[ignore = "requires privileged overlay mount + map_files/pagemap (5E)"]
+fn overlay_lower_only_module_verifies() {
+    let overlay = OverlayMount::mount();
+    let fixture = Fixture::new();
+    let lower = build_so(
+        &overlay.base.join("lower"),
+        "PRIVATE_CANARY_lower",
+        "int OSSL_provider_init(void) { return 11; }",
+    );
+    let merged = overlay.merged.join("PRIVATE_CANARY_lower");
+    let child = fixture.child(&[merged.clone()]);
+    let result = snap(vec![child.pid()], Limits::default());
+    let process = result
+        .processes
+        .iter()
+        .find(|p| p.pid == child.pid())
+        .unwrap();
+    let merged_meta = fs::metadata(&merged).unwrap();
+    let module = process
+        .modules
+        .iter()
+        .find(|m| m.info.sha256 == digest(&lower))
+        .expect("overlay module missing");
+    assert_eq!(
+        (module.info.device, module.info.inode),
+        (merged_meta.dev(), merged_meta.ino())
+    );
+    assert_eq!(module.identity_status, IdentityStatus::Verified);
+}
+#[test]
+#[ignore = "requires privileged overlay mount + map_files/pagemap (5E)"]
+fn overlay_copyup_old_mapping_verifies_via_direct_lower_not_overlay() {
+    let overlay = OverlayMount::mount();
+    let fixture = Fixture::new();
+    let lower = build_so(
+        &overlay.base.join("lower"),
+        "PRIVATE_CANARY_lower",
+        "int OSSL_provider_init(void) { return 11; }",
+    );
+    let merged = overlay.merged.join("PRIVATE_CANARY_lower");
+    let child = fixture.child(&[merged.clone()]);
+    copy_up_same_bytes(&merged);
+    assert!(
+        overlay
+            .base
+            .join("upper/PRIVATE_CANARY_lower")
+            .metadata()
+            .is_ok(),
+        "copy-up proof: upper file must exist"
+    );
+    let result = snap(vec![child.pid()], Limits::default());
+    let process = result
+        .processes
+        .iter()
+        .find(|p| p.pid == child.pid())
+        .unwrap();
+    let lower_meta = fs::metadata(&lower).unwrap();
+    let merged_meta = fs::metadata(&merged).unwrap();
+    assert!(
+        process.modules.iter().all(|m| {
+            (m.info.device, m.info.inode) != (merged_meta.dev(), merged_meta.ino())
+                || m.identity_status != IdentityStatus::Verified
+        }),
+        "overlay identity must never verify the old lower mapping"
+    );
+    let direct = process
+        .modules
+        .iter()
+        .find(|m| (m.info.device, m.info.inode) == (lower_meta.dev(), lower_meta.ino()))
+        .expect("direct-lower module missing");
+    assert_eq!(direct.identity_status, IdentityStatus::Verified);
+    assert_eq!(direct.info.sha256, digest(&lower));
+}
+
 // Catches early maps-device/inode deduplication across Btrfs subvolumes.
 // Prepare two different relevant ELF files externally in separate Btrfs
 // subvolumes with equal inode numbers; this test never creates subvolumes.

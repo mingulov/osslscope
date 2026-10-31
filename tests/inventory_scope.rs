@@ -397,3 +397,86 @@ fn module_or_filters_and_explicit_elf_without_openssl_exports_work() {
         osslscope::inventory::ObjectKind::Other
     );
 }
+
+// 5E RED: a genuine container process maps lower-only overlay image layers;
+// the snapshot must verify them (not merely list them as candidates) while
+// independently identifying the process and its container cgroup.
+struct Container {
+    name: String,
+}
+impl Container {
+    fn run(image: &str, args: &[&str]) -> Self {
+        let name = format!("ossl5e-scope-{}", std::process::id());
+        let status = Command::new("docker")
+            .arg("run")
+            .arg("-d")
+            .arg("--name")
+            .arg(&name)
+            .arg(image)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "docker run requires docker + image");
+        Self { name }
+    }
+    fn pid(&self) -> u32 {
+        let out = Command::new("docker")
+            .args(["inspect", "-f", "{{.State.Pid}}", &self.name])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+}
+impl Drop for Container {
+    fn drop(&mut self) {
+        let _ = Command::new("docker").args(["stop", &self.name]).output();
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.name])
+            .output();
+    }
+}
+#[test]
+#[ignore = "requires docker + privileged map_files/pagemap (5E)"]
+fn container_pid_snapshot_reports_verified_overlay_module() {
+    let container = Container::run("debian:trixie-slim", &["sleep", "120"]);
+    let pid = container.pid();
+    assert!(pid > 1, "container PID required");
+    // Independent process + cgroup identification, outside the snapshot.
+    let cgroup = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    assert!(
+        cgroup.contains("docker"),
+        "expected a docker cgroup: {cgroup}"
+    );
+    let exe = fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    assert!(exe.to_string_lossy().contains("sleep"));
+    let mut scanner = ScopedScanner::new(
+        Selection {
+            pids: vec![pid],
+            cgroup: None,
+            modules: vec![],
+        },
+        Limits::default(),
+    )
+    .unwrap();
+    let result = scanner.snapshot();
+    let process = result
+        .processes
+        .iter()
+        .find(|p| p.pid == pid)
+        .unwrap_or_else(|| panic!("container process missing: {result:?}"));
+    assert!(process.starttime > 0);
+    assert!(process.namespaces.pid.is_some());
+    assert!(process.namespaces.mount.is_some());
+    assert!(
+        process
+            .modules
+            .iter()
+            .any(|m| m.identity_status == osslscope::inventory::IdentityStatus::Verified),
+        "lower-only overlay image modules must verify: {result:?}"
+    );
+}
