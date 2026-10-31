@@ -1885,6 +1885,14 @@ fn parse_exports(
                     }
                 }
             }
+            // The shared-destination refusal clears the conflicting
+            // target along with the candidates; the getter arbitration
+            // below must still refuse derivation to it (an all() over
+            // the emptied list would accept vacuously). Retain the
+            // pre-refusal candidates. Nothing else mutates
+            // destinations before the getter check, so these subsume
+            // the post-refusal list.
+            let pre_refusal = destinations;
             if destinations[0].is_some() && destinations[0] == destinations[1] {
                 // Query and unquery have different public signatures. A shared
                 // derived entry cannot inherit either role from these wrappers.
@@ -1932,7 +1940,9 @@ fn parse_exports(
             // charges. A destination shared with a derived legacy entry
             // keeps the validated raw entry (the shared-destination
             // analogue: different public signatures must not share one
-            // derived entry); anything else keeps raw too (fail closed).
+            // derived entry); the check runs against the pre-refusal
+            // candidates so a legacy shared-destination refusal cannot
+            // vacate the gate. Anything else keeps raw too (fail closed).
             // Typed-vs-typed destination collisions stay with the
             // post-derivation arbitration below, the designated
             // typed-vs-typed mechanism. Only 146 derives here; the
@@ -1950,7 +1960,7 @@ fn parse_exports(
                 }
                 let destination = context.resolve_typed(role, offset, &exports)?;
                 if destination.is_some_and(|destination| {
-                    destinations
+                    pre_refusal
                         .into_iter()
                         .flatten()
                         .all(|derived| derived != destination)

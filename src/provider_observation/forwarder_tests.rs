@@ -687,6 +687,39 @@ fn typed_getctx_role_keeps_raw_entry_when_shared_destination_refuses() {
 }
 
 #[test]
+fn typed_getctx_role_keeps_raw_entry_when_all_three_wrappers_share_one_destination() {
+    // Three-way signature collision: query, unquery, AND the getter all
+    // jump to query_impl. Legacy resolution produces [T, T] and the
+    // shared-destination refusal clears both — but the cleared list must
+    // not let the getter derive to the known-conflicting T (an all()
+    // over the emptied list would accept vacuously). All three keep
+    // their validated raw entries.
+    let shared = ".byte 0xe9\n.long query_impl-.-4";
+    let f = ForwarderFixture::new_with_getctx(shared, shared, shared);
+    let parsed = parsed(&f);
+    assert_eq!(
+        offset(&parsed, QUERY),
+        Some(f.offsets[QUERY]),
+        "legacy shared-destination refusal keeps the raw query entry"
+    );
+    assert_eq!(
+        offset(&parsed, UNQUERY),
+        Some(f.offsets[UNQUERY]),
+        "legacy shared-destination refusal keeps the raw unquery entry"
+    );
+    assert_eq!(
+        query_role_offset(&parsed, 161),
+        Some(f.offsets[QUERY]),
+        "the shared-destination refusal covers the typed query role"
+    );
+    assert_eq!(
+        typed_role_offset(&parsed, 146),
+        Some(f.offsets[GETCTX]),
+        "the getter must not derive to the refused shared destination"
+    );
+}
+
+#[test]
 fn typed_getctx_role_keeps_raw_entry_for_plain_wrappers() {
     let f = ForwarderFixture::new_with_getctx(NEAR, SHORT_BACK, ".byte 0xc3");
     let parsed = parsed(&f);
