@@ -475,6 +475,22 @@ fn direct_filesystem(file: &File) -> bool {
         )
     )
 }
+/// Test-only rendezvous for ER-5E-I3 (no production behavior): after a
+/// candidate verifies and before its metadata is re-read, the witness
+/// reports the verified descriptor's identity and waits for release. The
+/// barrier test uses this to land a copy-up deterministically inside the
+/// verify→parse window. A dropped test side releases the wait; failures are
+/// ignored so a broken rendezvous fails the test's window assertions loudly
+/// instead of hanging the snapshot.
+#[cfg(test)]
+struct VerifyParseRendezvous {
+    observed: std::sync::mpsc::Sender<(u64, u64)>,
+    proceed: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+static VERIFY_PARSE_HOOK: std::sync::Mutex<Option<VerifyParseRendezvous>> =
+    std::sync::Mutex::new(None);
+
 fn backing(
     view: Option<&backing::BackingProcess>,
     process: &Process,
@@ -510,6 +526,14 @@ fn backing(
         for index in 0..ordered.len() {
             match view.verify_with_process_charged(&range, &ordered[index], work) {
                 Ok(association) => {
+                    #[cfg(test)]
+                    if let Ok(guard) = VERIFY_PARSE_HOOK.lock()
+                        && let Some(hook) = guard.as_ref()
+                        && let Ok(verified) = ordered[index].metadata()
+                    {
+                        let _ = hook.observed.send((verified.dev(), verified.ino()));
+                        let _ = hook.proceed.recv();
+                    }
                     let page = association.witness_page();
                     let file = ordered.remove(index);
                     let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
@@ -1053,5 +1077,266 @@ mod tests {
         assert_eq!(fresh.totals.read_bytes, 0);
         assert_eq!(fresh.totals.objects_inspected, 0);
         fs::remove_file(path).unwrap();
+    }
+
+    struct I3Overlay {
+        base: std::path::PathBuf,
+        merged: std::path::PathBuf,
+    }
+    impl I3Overlay {
+        fn mount(scratch: &std::path::Path) -> Self {
+            let base = scratch.join("overlay");
+            for name in ["lower", "upper", "work", "merged"] {
+                fs::create_dir_all(base.join(name)).unwrap();
+            }
+            let status = std::process::Command::new("mount")
+                .args([
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    &format!(
+                        "lowerdir={},upperdir={},workdir={}",
+                        base.join("lower").display(),
+                        base.join("upper").display(),
+                        base.join("work").display()
+                    ),
+                ])
+                .arg(base.join("merged"))
+                .status()
+                .unwrap();
+            assert!(status.success(), "overlay mount requires privilege");
+            Self {
+                merged: base.join("merged"),
+                base,
+            }
+        }
+    }
+    impl Drop for I3Overlay {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("umount")
+                .arg(&self.merged)
+                .status();
+            let _ = fs::remove_dir_all(&self.base);
+        }
+    }
+    fn i3_build_so(dir: &std::path::Path, name: &str, source: &str) -> std::path::PathBuf {
+        let src = dir.join(format!("{name}.c"));
+        let out = dir.join(name);
+        fs::write(&src, source).unwrap();
+        let result = std::process::Command::new("cc")
+            .args(["-shared", "-fPIC", "-Wl,--build-id=none", "-o"])
+            .arg(&out)
+            .arg(src)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        out
+    }
+    struct I3Child(std::process::Child);
+    impl I3Child {
+        fn spawn(scratch: &std::path::Path, paths: &[std::path::PathBuf]) -> Self {
+            use std::io::BufRead as _;
+            let executable = scratch.join("mmap-child");
+            if !executable.exists() {
+                let src = scratch.join("mmap-child.c");
+                fs::write(
+                    &src,
+                    r#"
+                    #include <sys/mman.h>
+                    #include <sys/stat.h>
+                    #include <fcntl.h>
+                    #include <stdio.h>
+                    #include <unistd.h>
+                    int main(int argc, char **argv) {
+                        for (int i = 1; i < argc; ++i) {
+                            int fd = open(argv[i], O_RDONLY); struct stat st;
+                            if (fd < 0 || fstat(fd, &st)) return 2;
+                            void *at = mmap(0, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+                            if (at == MAP_FAILED) return 3;
+                            { volatile char touch = ((char *)at)[0]; (void)touch; }
+                            close(fd);
+                        }
+                        puts("ready"); fflush(stdout);
+                        while (getchar() != EOF) {}
+                        return 0;
+                    }
+                "#,
+                )
+                .unwrap();
+                let result = std::process::Command::new("cc")
+                    .args(["-o"])
+                    .arg(&executable)
+                    .arg(src)
+                    .output()
+                    .unwrap();
+                assert!(
+                    result.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&result.stderr)
+                );
+            }
+            let mut child = std::process::Command::new(&executable)
+                .args(paths)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(child.stdout.take().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(line, "ready\n");
+            Self(child)
+        }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+    impl Drop for I3Child {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            assert!(self.0.wait().unwrap().success());
+        }
+    }
+    struct I3HookGuard;
+    impl Drop for I3HookGuard {
+        fn drop(&mut self) {
+            *VERIFY_PARSE_HOOK.lock().unwrap() = None;
+        }
+    }
+
+    // Catches publishing post-copy-up bytes as Verified for a pre-copy-up
+    // mapping (ER-5E-I3). A rendezvous lands a different-bytes copy-up
+    // deterministically inside the verify→parse window — no sleeps: the
+    // snapshot reports each verification and waits; this thread copies up
+    // exactly when the overlay mapping verifies, then releases. RED
+    // publishes the upper hash as Verified; GREEN revalidates before
+    // publication and downgrades to a locator candidate.
+    #[test]
+    #[ignore = "requires privileged overlay mount + map_files/pagemap (5E-I3)"]
+    fn copyup_between_verify_and_parse_downgrades_to_candidate() {
+        use sha2::Digest as _;
+        use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+        let scratch = std::env::temp_dir().join(format!(
+            "osslscope-i3-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&scratch).unwrap();
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _scratch = Scratch(scratch.clone());
+        let overlay = I3Overlay::mount(&scratch);
+        let lower = i3_build_so(
+            &overlay.base.join("lower"),
+            "PRIVATE_CANARY_i3",
+            "int OSSL_provider_init(void) { return 11; }",
+        );
+        let upper_src = i3_build_so(
+            &scratch,
+            "PRIVATE_CANARY_i3_upper",
+            "int OSSL_provider_init(void) { return 99; } int EVP_MD_fetch(void) { return 42; }",
+        );
+        let upper_bytes = fs::read(&upper_src).unwrap();
+        let merged = overlay.merged.join("PRIVATE_CANARY_i3");
+        let child = I3Child::spawn(&scratch, &[merged.clone()]);
+        let merged_meta = fs::metadata(&merged).unwrap();
+        let merged_id = (merged_meta.dev(), merged_meta.ino());
+        let lower_hash: String = sha2::Sha256::digest(fs::read(&lower).unwrap())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let upper_hash: String = sha2::Sha256::digest(&upper_bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_ne!(lower_hash, upper_hash, "copy-up must change bytes");
+        let (observed_tx, observed) = std::sync::mpsc::channel();
+        let (proceed_tx, proceed_rx) = std::sync::mpsc::channel();
+        *VERIFY_PARSE_HOOK.lock().unwrap() = Some(VerifyParseRendezvous {
+            observed: observed_tx,
+            proceed: proceed_rx,
+        });
+        let _hook_guard = I3HookGuard;
+        let pid = child.pid();
+        let mut copied_up = false;
+        let result = std::thread::scope(|scope| {
+            let snapshot = scope.spawn(|| {
+                let result = snapshot(&SnapshotOptions {
+                    pids: vec![pid],
+                    ..Default::default()
+                });
+                // Release the rendezvous consumer: no more events can arrive.
+                *VERIFY_PARSE_HOOK.lock().unwrap() = None;
+                result
+            });
+            for (dev, ino) in &observed {
+                if (dev, ino) == merged_id && !copied_up {
+                    let writer = fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&merged)
+                        .unwrap();
+                    writer.write_all_at(&upper_bytes, 0).unwrap();
+                    writer.sync_all().unwrap();
+                    assert!(
+                        overlay
+                            .base
+                            .join("upper/PRIVATE_CANARY_i3")
+                            .metadata()
+                            .is_ok(),
+                        "copy-up proof: upper file must exist"
+                    );
+                    copied_up = true;
+                }
+                if proceed_tx.send(()).is_err() {
+                    break;
+                }
+            }
+            snapshot.join().unwrap()
+        });
+        assert!(copied_up, "the copy-up never landed in the window");
+        let process = result
+            .processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("child must be inventoried");
+        // The parse read post-copy-up bytes through the retained FD; those
+        // bytes must never publish as Verified for the old lower mapping.
+        assert!(
+            process.modules.iter().all(|m| {
+                m.info.sha256 != upper_hash || m.identity_status != IdentityStatus::Verified
+            }),
+            "upper bytes published as Verified: {result:?}"
+        );
+        let upper = process
+            .modules
+            .iter()
+            .find(|m| m.info.sha256 == upper_hash)
+            .expect("parse must have read post-copy-up bytes");
+        assert_eq!(
+            upper.identity_status,
+            IdentityStatus::LocatorCandidate,
+            "post-window bytes must downgrade: {result:?}"
+        );
+        assert!(
+            result
+                .gaps
+                .iter()
+                .any(|gap| gap.reason == GapReason::IdentityUnverified),
+            "downgrade must record unverified identity: {result:?}"
+        );
     }
 }
