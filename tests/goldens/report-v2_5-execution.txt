@@ -1,0 +1,33 @@
+osslscope report (observed-crypto-v2.5): pid=7 (demo) window=0..100ns effective=0..100ns
+duration: requested=100ns effective=100ns (monotonic; authoritative)
+kernel: 6.9.0-test
+wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
+openssl: 3.5.1 (verified object metadata)
+target: argv_redacted=true container_id=(none) image_digest=(none)
+disposition: exited code=0
+
+sites (3, 100 calls):
+  site aaaaaaaaaaaa file-offset=4096 gen=0: 40 calls, UNATTRIBUTED (candidate set incomplete)
+  site aaaaaaaaaaaa file-offset=8192 gen=0: 11 calls, UNATTRIBUTED (candidate set incomplete)
+  site aaaaaaaaaaaa file-offset=12288 gen=0: 49 calls, UNATTRIBUTED (candidate set incomplete)
+
+execution attributions (2 partitions, 52 unresolved calls, 0 withheld):
+  segment 1 site aaaaaaaaaaaa file-offset=4096 gen=0: 37 calls, HMAC (MAC) [provider-definition unknown]
+  segment 2 site aaaaaaaaaaaa file-offset=8192 gen=0: 11 calls, HMAC (MAC) [provider-definition unknown]
+
+coverage:
+  none recorded
+
+counters:
+  none recorded
+
+completeness: PARTIAL
+
+reasons:
+  - unattributed-calls: 3 sites, 100 calls (candidate sets incomplete)
+
+policy: (not evaluated)
+
+status=PARTIAL
+absence = not-observed in window (never "not present / never used")
+note: argv redacted; file offsets are not runtime addresses; window-only claims

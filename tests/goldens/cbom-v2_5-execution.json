@@ -1,0 +1,235 @@
+{
+  "bomFormat": "CycloneDX",
+  "components": [
+    {
+      "bom-ref": "urn:osslscope:exec-attr:v2.5:0:8:100:4096:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "HMAC (MAC) via object-bound execution",
+      "properties": [
+        {
+          "name": "osslscope:selector-scope",
+          "value": "object-bound"
+        },
+        {
+          "name": "osslscope:canonical-algorithm",
+          "value": "HMAC"
+        },
+        {
+          "name": "osslscope:selector-object",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "name": "osslscope:selector-id",
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "name": "osslscope:provider-definition",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:code-object",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "MAC"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "5"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "37"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:segment",
+          "value": "1"
+        },
+        {
+          "name": "osslscope:provider-instance",
+          "value": "9"
+        },
+        {
+          "name": "osslscope:attribution-scope",
+          "value": "observed-successful-request-for-consumed-method-at-callback-object-v1"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "PARTIAL"
+        },
+        {
+          "name": "osslscope:window-requested-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-requested-end-ns",
+          "value": "100"
+        },
+        {
+          "name": "osslscope:window-effective-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-effective-end-ns",
+          "value": "100"
+        }
+      ],
+      "type": "cryptographic-asset"
+    },
+    {
+      "bom-ref": "urn:osslscope:exec-attr:v2.5:0:8:100:8192:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:2",
+      "cryptoProperties": {
+        "assetType": "algorithm"
+      },
+      "name": "HMAC (MAC) via object-bound execution",
+      "properties": [
+        {
+          "name": "osslscope:selector-scope",
+          "value": "object-bound"
+        },
+        {
+          "name": "osslscope:canonical-algorithm",
+          "value": "HMAC"
+        },
+        {
+          "name": "osslscope:selector-object",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "name": "osslscope:selector-id",
+          "value": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        {
+          "name": "osslscope:provider-definition",
+          "value": "unknown"
+        },
+        {
+          "name": "osslscope:code-object",
+          "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "name": "osslscope:op",
+          "value": "MAC"
+        },
+        {
+          "name": "osslscope:funcid",
+          "value": "5"
+        },
+        {
+          "name": "osslscope:calls",
+          "value": "11"
+        },
+        {
+          "name": "osslscope:generation",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:segment",
+          "value": "2"
+        },
+        {
+          "name": "osslscope:provider-instance",
+          "value": "9"
+        },
+        {
+          "name": "osslscope:attribution-scope",
+          "value": "observed-successful-request-for-consumed-method-at-callback-object-v1"
+        },
+        {
+          "name": "osslscope:execution-evidence-completeness",
+          "value": "PARTIAL"
+        },
+        {
+          "name": "osslscope:window-requested-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-requested-end-ns",
+          "value": "100"
+        },
+        {
+          "name": "osslscope:window-effective-start-ns",
+          "value": "0"
+        },
+        {
+          "name": "osslscope:window-effective-end-ns",
+          "value": "100"
+        }
+      ],
+      "type": "cryptographic-asset"
+    }
+  ],
+  "metadata": {
+    "properties": [
+      {
+        "name": "osslscope:schema-version",
+        "value": "observed-crypto-v2.5"
+      },
+      {
+        "name": "osslscope:execution-evidence-completeness",
+        "value": "PARTIAL"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-sites",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-ambiguous-calls",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-sites",
+        "value": "1"
+      },
+      {
+        "name": "osslscope:omitted-unknown-coverage-calls",
+        "value": "49"
+      },
+      {
+        "name": "osslscope:omitted-evidence-refs",
+        "value": "aaaaaaaaaaaa@12288#0:49"
+      },
+      {
+        "name": "osslscope:execution-partitions",
+        "value": "2"
+      },
+      {
+        "name": "osslscope:unresolved-attribution-calls",
+        "value": "52"
+      },
+      {
+        "name": "osslscope:withheld-uncertain-segments",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:window-requested-start-ns",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:window-requested-end-ns",
+        "value": "100"
+      },
+      {
+        "name": "osslscope:window-effective-start-ns",
+        "value": "0"
+      },
+      {
+        "name": "osslscope:window-effective-end-ns",
+        "value": "100"
+      },
+      {
+        "name": "osslscope:completeness-disclaimer",
+        "value": "PARTIAL evidence (unattributed-calls); absence = not-observed in window"
+      }
+    ]
+  },
+  "specVersion": "1.6",
+  "version": 1
+}

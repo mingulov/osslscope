@@ -1,0 +1,145 @@
+{
+  "algorithm_selectors": [
+    {
+      "canonical_name": "HMAC",
+      "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "object": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "operation": 3
+    }
+  ],
+  "attribution_bounds": {
+    "unresolved_calls": 52,
+    "withheld_uncertain": 0
+  },
+  "completeness": {
+    "counters": [],
+    "fatal_kind": null,
+    "reasons": [
+      {
+        "calls": 100,
+        "kind": "unattributed-calls",
+        "sites": 3
+      }
+    ],
+    "status": "PARTIAL"
+  },
+  "context": {
+    "kernel_release": "6.9.0-test",
+    "wall_end_unix_ns": 1700000030000000000,
+    "wall_start_unix_ns": 1700000000000000000
+  },
+  "coverage": [],
+  "disposition": {
+    "code": 0,
+    "outcome": "exited",
+    "pid": null
+  },
+  "execution_attributions": [
+    {
+      "calls": 37,
+      "device": 8,
+      "end_ns": 80,
+      "function": 5,
+      "generation": 0,
+      "inode": 100,
+      "object": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "offset": 4096,
+      "operation": 3,
+      "provider_definition": null,
+      "provider_instance": 9,
+      "scope": "observed-successful-request-for-consumed-method-at-callback-object-v1",
+      "segment": 1,
+      "selector": 0,
+      "start_ns": 20
+    },
+    {
+      "calls": 11,
+      "device": 8,
+      "end_ns": 80,
+      "function": 5,
+      "generation": 0,
+      "inode": 100,
+      "object": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "offset": 8192,
+      "operation": 3,
+      "provider_definition": null,
+      "provider_instance": 9,
+      "scope": "observed-successful-request-for-consumed-method-at-callback-object-v1",
+      "segment": 2,
+      "selector": 0,
+      "start_ns": 20
+    }
+  ],
+  "fenced": [],
+  "legacy_partition": {
+    "legacy_exclusive_calls": 0,
+    "non_legacy_exclusive_calls": 100,
+    "shared_ambiguous_calls": 0,
+    "unfenced_tail_calls": 0
+  },
+  "objects": [
+    {
+      "device": 8,
+      "display_locator": "libcrypto.so.3",
+      "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "inode": 100
+    }
+  ],
+  "openssl": {
+    "state": "verified",
+    "version": "3.5.1"
+  },
+  "schema_version": "observed-crypto-v2.5",
+  "sites": [
+    {
+      "calls": 40,
+      "candidates": [],
+      "candidates_coverage": "unknown",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "offset": 4096
+    },
+    {
+      "calls": 11,
+      "candidates": [],
+      "candidates_coverage": "unknown",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "offset": 8192
+    },
+    {
+      "calls": 49,
+      "candidates": [],
+      "candidates_coverage": "unknown",
+      "device": 8,
+      "first_ns": 10,
+      "generation": 0,
+      "inode": 100,
+      "last_ns": 90,
+      "object": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "offset": 12288
+    }
+  ],
+  "target": {
+    "argv_redacted": true,
+    "comm": "demo",
+    "container_id": "",
+    "image_digest": "",
+    "pid": 7
+  },
+  "window": {
+    "effective_end_ns": 100,
+    "effective_start_ns": 0,
+    "requested_end_ns": 100,
+    "requested_start_ns": 0,
+    "signal_cut": false
+  }
+}

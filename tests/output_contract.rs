@@ -467,6 +467,90 @@ fn fatal_doc() -> CaptureDocument {
     doc
 }
 
+/// v2.5 execution document: certified 37 + 11 HMAC partitions
+/// over 100 physical calls (52 unresolved), PARTIAL via
+/// unknown-coverage sites — the golden v2.5 producer shape.
+fn v25_execution_doc() -> CaptureDocument {
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut input = input_base();
+    input.sites = vec![
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x1000,
+            0,
+            40,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x3000,
+            0,
+            49,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+    ];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: Some("HMAC".to_string()),
+    }];
+    let row = |offset: u64, segment: u64, calls: u64| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation: 0,
+        segment,
+        start_ns: 20,
+        end_ns: 80,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    doc.execution_attributions = vec![row(0x1000, 1, 37), row(0x2000, 2, 11)];
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 52,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    doc
+}
+
 fn evidence_ref(
     object: &str,
     device: u64,
@@ -2208,6 +2292,16 @@ fn v2_goldens_pinned() {
     assert_golden(
         "report-v2-traversal.json",
         &String::from_utf8(render_json(&traversal).unwrap()).unwrap(),
+    );
+    let execution = v25_execution_doc();
+    assert_golden(
+        "report-v2_5-execution.json",
+        &String::from_utf8(render_json(&execution).unwrap()).unwrap(),
+    );
+    assert_golden("report-v2_5-execution.txt", &render_human(&execution));
+    assert_golden(
+        "cbom-v2_5-execution.json",
+        &String::from_utf8(render_cbom(&execution).unwrap()).unwrap(),
     );
 }
 
