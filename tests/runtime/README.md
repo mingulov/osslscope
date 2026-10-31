@@ -57,3 +57,8 @@ example `report ... run -- "$OSSL_PREVIEW_WORKLOAD" both`. An observer needs
 authorized BPF/perf privileges; the workload alone does not. A valid workload
 exit does not establish observer counts, process isolation, cleanup or release
 qualification. The shared UPDATE's N calls remain N total across all candidates.
+
+`OSSL_PREVIEW_PACE_US` sleeps that many microseconds (0–1000000, default
+unpaced) after every digest/cipher operation, for realistic-rate
+measurement points. Pacing changes wall time only; operation counts and
+the predicted totals above are unchanged. Malformed values exit 2.

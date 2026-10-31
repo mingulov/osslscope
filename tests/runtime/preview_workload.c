@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Finite EVP workload for the installed foreground preview, not a capture runner.
 // Keys, IVs, ciphertext and tags remain in ephemeral process memory.
+#define _GNU_SOURCE
 #include <errno.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -10,7 +11,23 @@
 #include <string.h>
 #include <sys/random.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
+
+// Optional per-operation pacing for realistic-rate measurement points
+// (5D): OSSL_PREVIEW_PACE_US sleeps that many microseconds after every
+// digest/cipher operation. Unset or empty means unpaced; pacing never
+// changes operation counts or predicted totals.
+static unsigned long g_pace_us = 0;
+
+static void pace(void) {
+    if (!g_pace_us) return;
+    struct timespec ts = {
+        .tv_sec = (time_t)(g_pace_us / 1000000),
+        .tv_nsec = (long)((g_pace_us % 1000000) * 1000),
+    };
+    nanosleep(&ts, NULL);
+}
 
 static const unsigned char message[] = "abc";
 static const unsigned char sha256_abc[32] = {
@@ -54,6 +71,7 @@ static int sha_loop(unsigned long n) {
             && size == sizeof sha256_abc
             && memcmp(digest, sha256_abc, sizeof sha256_abc) == 0;
         EVP_MD_CTX_free(ctx);
+        pace();
     }
     EVP_MD_free(md);
     return ok;
@@ -76,6 +94,7 @@ static int encrypt_loop(struct work *work) {
             && EVP_EncryptFinal_ex(ctx, tail, &final_size) == 1 && final_size == 0
             && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, sizeof c->tag, c->tag) == 1;
         EVP_CIPHER_CTX_free(ctx);
+        pace();
     }
     EVP_CIPHER_free(cipher);
     return ok;
@@ -154,6 +173,13 @@ int main(int argc, char **argv) {
     char *end = NULL;
     unsigned long n = argc == 3 ? strtoul(argv[2], &end, 10) : 32;
     if (!n || n > 100000 || (argc == 3 && (!*argv[2] || *end))) return 2;
+    const char *pace_env = getenv("OSSL_PREVIEW_PACE_US");
+    if (pace_env && *pace_env) {
+        char *pace_end = NULL;
+        unsigned long pace_us = strtoul(pace_env, &pace_end, 10);
+        if (*pace_end || pace_us > 1000000) return 2;
+        g_pace_us = pace_us;
+    }
     const char *mode = argv[1];
     if (!strcmp(mode, "exec") || !strcmp(mode, "worker-exec")) {
         char count[32];
