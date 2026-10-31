@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4 today. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4, or observed-crypto-v2.5 when the window certified execution attribution. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
@@ -582,6 +582,26 @@
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
     },
+    "execution_attributions": {
+      "description": "Certified definite execution partitions (v2.5, optional): proved slices of physical sites' calls, projected only from the certifying closed collect. Omitted when the window certified no partitions. Each record cites a listed site plus its selector in algorithm_selectors; per-site partition sums never exceed the site's calls. A positive partition coexists with a PARTIAL window: the gap widens the upper bound, never the proved calls.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/execution_attribution" }
+    },
+    "algorithm_selectors": {
+      "description": "Doc-scoped algorithm selector dictionary (v2.5, optional): the opaque object-bound request identities behind the execution_attributions records. Omitted when the window certified no partitions. canonical_name (when present) is a frozen-registry spelling the host proved equal to the requested spelling by re-hashing its own registry; absent means opaque-but-observable. Selectors never cross builds: the same spelling under another code object is another identity.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/algorithm_selector" }
+    },
+    "attribution_bounds": {
+      "description": "Certified unresolved attribution bounds (v2.5, optional): calls the closed collect could not attribute plus segments withheld for unproved optional identity (whose calls stay inside unresolved_calls). Present iff the window certified a closed attribution result, even when the definite set is empty. Bounds from the same closed result as the definite rows.",
+      "type": "object",
+      "required": ["unresolved_calls", "withheld_uncertain"],
+      "additionalProperties": false,
+      "properties": {
+        "unresolved_calls": { "$ref": "#/$defs/u64" },
+        "withheld_uncertain": { "$ref": "#/$defs/u64" }
+      }
+    },
     "traversal": {
       "description": "Traversal outcome (v2.1, optional — present iff the window ran the members backend): the exact selected triple plus record/findings/poll counts, the admitted-query census, per-record native facts, and census loss. Absent on harvest-only runs. The six triple/count keys are required; the census/entry keys are optional (additive — old readers ignore them) but always emitted by current producers.",
       "type": "object",
@@ -1008,6 +1028,41 @@
         "entrypoint_name": { "type": "string", "minLength": 1 },
         "window": { "enum": ["in-window", "pre-window", "untimed"] },
         "calls": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "execution_attribution": {
+      "description": "One certified definite execution partition (v2.5): a proved slice of one physical site's calls. segment is the nonzero fold-issued identity, unique per document; start_ns/end_ns are inclusive actual-hit extrema; provider_definition is null (Unknown origin) unless independent evidence bound a defining artifact; provider_instance is the nonzero proved continuity interval; selector indexes the document's algorithm_selectors; scope is the V1 token.",
+      "type": "object",
+      "required": ["object", "device", "inode", "offset", "generation", "segment", "start_ns", "end_ns", "calls", "provider_definition", "provider_instance", "operation", "function", "selector", "scope"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "device": { "$ref": "#/$defs/u64" },
+        "inode": { "$ref": "#/$defs/u64" },
+        "offset": { "$ref": "#/$defs/u64" },
+        "generation": { "$ref": "#/$defs/u32" },
+        "segment": { "$ref": "#/$defs/u64" },
+        "start_ns": { "$ref": "#/$defs/u64" },
+        "end_ns": { "$ref": "#/$defs/u64" },
+        "calls": { "$ref": "#/$defs/u64" },
+        "provider_definition": { "type": ["string", "null"], "minLength": 1 },
+        "provider_instance": { "$ref": "#/$defs/u64" },
+        "operation": { "$ref": "#/$defs/u32" },
+        "function": { "$ref": "#/$defs/u32" },
+        "selector": { "$ref": "#/$defs/u32" },
+        "scope": { "enum": ["observed-successful-request-for-consumed-method-at-callback-object-v1"] }
+      }
+    },
+    "algorithm_selector": {
+      "description": "One doc-scoped algorithm selector (v2.5): the opaque object-bound request identity. object is the retained artifact containing the actual firing operational callback; operation is the public operation the digest binds; id is the encoding-2 digest (64 lowercase hex — length here, hex shape in semantic validation); canonical_name (when present) is a frozen-registry spelling proved equal to the requested spelling, or null when the spelling is unregistered (opaque but observable).",
+      "type": "object",
+      "required": ["object", "operation", "id", "canonical_name"],
+      "additionalProperties": false,
+      "properties": {
+        "object": { "type": "string", "minLength": 1 },
+        "operation": { "$ref": "#/$defs/u32" },
+        "id": { "type": "string", "minLength": 64, "maxLength": 64 },
+        "canonical_name": { "type": ["string", "null"], "minLength": 1 }
       }
     },
     "engine_evidence": {

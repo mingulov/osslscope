@@ -102,11 +102,21 @@ pub const FORBIDDEN_V2_KEYS: &[&str] = &[
 /// (full types/enums/required fields/ranges, no silent keyword
 /// skips: schemas using unsupported keywords fail closed).
 pub fn validate_v2(doc: &serde_json::Value) -> Result<(), SchemaError> {
-    let schema: serde_json::Value =
-        serde_json::from_str(V2_SCHEMA_JSON).map_err(|e| SchemaError {
-            path: "$".to_string(),
-            message: format!("v2 schema file is not valid JSON: {e}"),
-        })?;
+    validate_v2_with_schema(V2_SCHEMA_JSON, doc)
+}
+
+/// Validate a document against an explicit v2 schema text with
+/// the same embedded engine (compat aid: pinning what an older
+/// strict minor reader accepts, or what a newer candidate schema
+/// would accept). Unparseable schema text fails closed.
+pub fn validate_v2_with_schema(
+    schema_json: &str,
+    doc: &serde_json::Value,
+) -> Result<(), SchemaError> {
+    let schema: serde_json::Value = serde_json::from_str(schema_json).map_err(|e| SchemaError {
+        path: "$".to_string(),
+        message: format!("v2 schema text is not valid JSON: {e}"),
+    })?;
     validate_against(&schema, doc, &schema, "$", 0)
 }
 
@@ -587,10 +597,260 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_object_refs(root)?;
     check_records(root, bounds)?;
     check_legacy_partition(root)?;
+    check_execution_attributions(root, bounds)?;
     check_traversal_fingerprints(root)?;
     check_package_provenance(root)?;
     check_preview_count_provenance(root)?;
     check_dynamic_sections(root)?;
+    Ok(())
+}
+
+/// Certified execution attribution (v2.5): every partition
+/// cites a listed site plus a listed selector, segments are
+/// nonzero and unique, per-site partition sums never exceed the
+/// site's executed calls (checked arithmetic — overflow fails
+/// closed), extrema sit inside the site's activity and the
+/// guarded window, and selector/provider identities resolve to
+/// listed objects. Canonical names resolve against the frozen
+/// registry only (a present-but-unregistered name is malformed;
+/// unknown selectors carry null). Absent sections skip;
+/// present-but-malformed fails closed. Any section present
+/// requires schema minor ≥ 5 (the producer upgrades exactly
+/// when it projects; forward-compatible with later minors).
+fn check_execution_attributions(
+    root: &serde_json::Map<String, serde_json::Value>,
+    bounds: ActivityBounds,
+) -> Result<(), String> {
+    let attributions = root.get("execution_attributions");
+    let selectors = root.get("algorithm_selectors");
+    let has_bounds = root.contains_key("attribution_bounds");
+    if attributions.is_none() && selectors.is_none() && !has_bounds {
+        return Ok(());
+    }
+    let version = root
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "doc.schema_version: expected string".to_string())?;
+    let minor: u64 = version
+        .strip_prefix("observed-crypto-v2.")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    if minor < 5 {
+        return Err(format!(
+            "doc.schema_version: attribution sections need minor >= 5, got {version:?}"
+        ));
+    }
+    let (known_ids, _) = known_objects(root)?;
+    let selector_count = match selectors {
+        None => 0,
+        Some(value) => {
+            let items = value
+                .as_array()
+                .ok_or_else(|| "doc.algorithm_selectors: expected array".to_string())?;
+            for (index, item) in items.iter().enumerate() {
+                let ctx = format!("doc.algorithm_selectors[{index}]");
+                let record = item
+                    .as_object()
+                    .ok_or_else(|| format!("{ctx}: expected object"))?;
+                let object = record
+                    .get("object")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("{ctx}.object: expected string"))?;
+                if !known_ids.contains(object) {
+                    return Err(format!("{ctx}.object: unlisted object {object:?}"));
+                }
+                get_u64(record, "operation", &ctx)?;
+                let id = record
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| format!("{ctx}.id: expected string"))?;
+                if !(id.len() == 64
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || matches!(b, b'a'..=b'f')))
+                {
+                    return Err(format!("{ctx}.id: expected 64 lowercase hex chars"));
+                }
+                match record.get("canonical_name") {
+                    None | Some(serde_json::Value::Null) => {}
+                    Some(name) => {
+                        let name = name
+                            .as_str()
+                            .ok_or_else(|| format!("{ctx}.canonical_name: expected string"))?;
+                        if !crate::kinds::is_known_alg(name) {
+                            return Err(format!(
+                                "{ctx}.canonical_name: unregistered {name:?} (unknown selectors carry null)"
+                            ));
+                        }
+                    }
+                }
+            }
+            items.len() as u64
+        }
+    };
+    // (object, device, inode, offset, generation) →
+    // (calls, first_ns, last_ns) for every listed site.
+    let mut sites = std::collections::BTreeMap::new();
+    let mut insert = |site: &serde_json::Value, ctx: &str| -> Result<(), String> {
+        let record = site
+            .as_object()
+            .ok_or_else(|| format!("{ctx}: expected object"))?;
+        let object = record
+            .get("object")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.object: expected string"))?
+            .to_string();
+        let key = (
+            object,
+            get_u64(record, "device", ctx)?,
+            get_u64(record, "inode", ctx)?,
+            get_u64(record, "offset", ctx)?,
+            get_u64(record, "generation", ctx)?,
+        );
+        let row = (
+            get_u64(record, "calls", ctx)?,
+            get_u64(record, "first_ns", ctx)?,
+            get_u64(record, "last_ns", ctx)?,
+        );
+        if sites.insert(key, row).is_some() {
+            return Err(format!("{ctx}: duplicated site key"));
+        }
+        Ok(())
+    };
+    let listed = root
+        .get("sites")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.sites: expected array".to_string())?;
+    for (index, site) in listed.iter().enumerate() {
+        insert(site, &format!("doc.sites[{index}]"))?;
+    }
+    let fenced = root
+        .get("fenced")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.fenced: expected array".to_string())?;
+    for (bucket, fenced_doc) in fenced.iter().enumerate() {
+        let inner = fenced_doc
+            .as_object()
+            .and_then(|o| o.get("sites"))
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| format!("doc.fenced[{bucket}].sites: expected array"))?;
+        for (index, site) in inner.iter().enumerate() {
+            insert(site, &format!("doc.fenced[{bucket}].sites[{index}]"))?;
+        }
+    }
+    let rows = match attributions {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| "doc.execution_attributions: expected array".to_string())?
+            .clone(),
+    };
+    let mut segments = std::collections::BTreeSet::new();
+    let mut spent: std::collections::BTreeMap<(String, u64, u64, u64, u64), u64> =
+        std::collections::BTreeMap::new();
+    for (index, item) in rows.iter().enumerate() {
+        let ctx = format!("doc.execution_attributions[{index}]");
+        let record = item
+            .as_object()
+            .ok_or_else(|| format!("{ctx}: expected object"))?;
+        let object = record
+            .get("object")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.object: expected string"))?
+            .to_string();
+        let key = (
+            object,
+            get_u64(record, "device", &ctx)?,
+            get_u64(record, "inode", &ctx)?,
+            get_u64(record, "offset", &ctx)?,
+            get_u64(record, "generation", &ctx)?,
+        );
+        let (calls, first, last) = sites
+            .get(&key)
+            .copied()
+            .ok_or_else(|| format!("{ctx}: resolves to no listed site"))?;
+        let segment = get_u64(record, "segment", &ctx)?;
+        if segment == 0 {
+            return Err(format!("{ctx}.segment: must be nonzero"));
+        }
+        if !segments.insert(segment) {
+            return Err(format!("{ctx}.segment: duplicated {segment}"));
+        }
+        let part_calls = get_u64(record, "calls", &ctx)?;
+        if part_calls == 0 {
+            return Err(format!("{ctx}.calls: a partition proves at least one call"));
+        }
+        if get_u64(record, "provider_instance", &ctx)? == 0
+            || get_u64(record, "operation", &ctx)? == 0
+            || get_u64(record, "function", &ctx)? == 0
+        {
+            return Err(format!(
+                "{ctx}: provider_instance/operation/function must be nonzero"
+            ));
+        }
+        let start = get_u64(record, "start_ns", &ctx)?;
+        let end = get_u64(record, "end_ns", &ctx)?;
+        if start == 0 || start > end || start < first || end > last {
+            return Err(format!(
+                "{ctx}: extrema [{start}, {end}] escape the site activity [{first}, {last}]"
+            ));
+        }
+        if start < bounds.start
+            || match bounds.admission_end {
+                Some(deadline) => end >= deadline,
+                None => end > bounds.effective_end,
+            }
+        {
+            return Err(format!(
+                "{ctx}: extrema [{start}, {end}] escape the guarded window"
+            ));
+        }
+        let scope = record
+            .get("scope")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{ctx}.scope: expected string"))?;
+        if scope != crate::evidence::ATTRIBUTION_SCOPE_V1 {
+            return Err(format!("{ctx}.scope: unknown {scope:?}"));
+        }
+        let selector = get_u64(record, "selector", &ctx)?;
+        if selector >= selector_count {
+            return Err(format!(
+                "{ctx}.selector: {selector} indexes no listed selector"
+            ));
+        }
+        if let Some(definition) = record.get("provider_definition") {
+            if !definition.is_null() {
+                let definition = definition
+                    .as_str()
+                    .ok_or_else(|| format!("{ctx}.provider_definition: expected string"))?;
+                if !known_ids.contains(definition) {
+                    return Err(format!(
+                        "{ctx}.provider_definition: unlisted object {definition:?}"
+                    ));
+                }
+            }
+        }
+        let total = spent
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(part_calls)
+            .ok_or_else(|| format!("{ctx}: partition sums overflow"))?;
+        spent.insert(key, total);
+        if total > calls {
+            return Err(format!(
+                "{ctx}: partitions claim {total} calls, site executed {calls}"
+            ));
+        }
+    }
+    if has_bounds {
+        let bounds_obj = root
+            .get("attribution_bounds")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "doc.attribution_bounds: expected object".to_string())?;
+        get_u64(bounds_obj, "unresolved_calls", "doc.attribution_bounds")?;
+        get_u64(bounds_obj, "withheld_uncertain", "doc.attribution_bounds")?;
+    }
     Ok(())
 }
 
@@ -893,7 +1153,19 @@ fn engine_calls_map(
     Ok(map)
 }
 
-fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+/// Registered object identities: every fingerprint plus every
+/// (fingerprint, device, inode) triple.
+type KnownObjects = (
+    std::collections::BTreeSet<String>,
+    std::collections::BTreeSet<(String, u64, u64)>,
+);
+
+/// Read the registered object identities. Shared by
+/// [`check_object_refs`] and the v2.5 attribution check so the
+/// two can never disagree on what is listed.
+fn known_objects(
+    root: &serde_json::Map<String, serde_json::Value>,
+) -> Result<KnownObjects, String> {
     let objects = root
         .get("objects")
         .and_then(|v| v.as_array())
@@ -921,6 +1193,11 @@ fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Resul
             get_u64(record, "inode", &format!("doc.objects[{index}]"))?,
         ));
     }
+    Ok((known_ids, known_triples))
+}
+
+fn check_object_refs(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let (known_ids, known_triples) = known_objects(root)?;
     let check_site = |site: &serde_json::Value, ctx: &str| -> Result<(), String> {
         let record = site
             .as_object()

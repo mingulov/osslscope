@@ -1305,6 +1305,53 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     if !doc.api_activity.is_empty() {
         out["api_activity"] = serde_json::json!(doc.api_activity);
     }
+    // v2.5: certified execution partitions ride only when the
+    // closed collect certified them; bounds ride whenever the
+    // collect certified a result (even a certified-empty definite
+    // set). Omitted sections keep v2.4 documents byte-identical.
+    if !doc.execution_attributions.is_empty() {
+        out["execution_attributions"] = serde_json::json!(
+            doc.execution_attributions
+                .iter()
+                .map(|r| serde_json::json!({
+                    "object": r.site.object.0,
+                    "device": r.site.device,
+                    "inode": r.site.inode,
+                    "offset": r.site.offset,
+                    "generation": r.generation,
+                    "segment": r.segment,
+                    "start_ns": r.start_ns,
+                    "end_ns": r.end_ns,
+                    "calls": r.calls,
+                    "provider_definition": r.provider_definition.as_ref().map(|o| &o.0),
+                    "provider_instance": r.provider_instance,
+                    "operation": r.operation,
+                    "function": r.function,
+                    "selector": r.selector,
+                    "scope": r.scope,
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    if !doc.algorithm_selectors.is_empty() {
+        out["algorithm_selectors"] = serde_json::json!(
+            doc.algorithm_selectors
+                .iter()
+                .map(|s| serde_json::json!({
+                    "object": s.object.0,
+                    "operation": s.operation,
+                    "id": s.id,
+                    "canonical_name": s.canonical_name,
+                }))
+                .collect::<Vec<_>>()
+        );
+    }
+    if let Some(bounds) = &doc.attribution_bounds {
+        out["attribution_bounds"] = serde_json::json!({
+            "unresolved_calls": bounds.unresolved_calls,
+            "withheld_uncertain": bounds.withheld_uncertain,
+        });
+    }
     if let Some(admission) = doc.window.count_admission {
         out["window"]["count_admission"] = serde_json::json!({
             "start_ns": admission.start_ns,
