@@ -1190,9 +1190,21 @@ impl FocusedSession {
             deadline_ns: self.deadline_ns,
         };
         let finalized_attribution = self.collect_attribution(counter_cpus, report, admission);
+        // Projectability is pre-scanned so a refusal records its
+        // typed gap here, before finalization — the post-finalize
+        // projection below is infallible after this gate.
+        let projectable = finalized_attribution
+            .as_ref()
+            .is_some_and(|a| a.is_projectable());
         if self.typed_admitted() && finalized_attribution.is_none() {
             self.sample.gaps.push(loss(
                 "focused.attribution_refused",
+                CounterSource::Discovery,
+                1,
+            ));
+        } else if finalized_attribution.is_some() && !projectable {
+            self.sample.gaps.push(loss(
+                "focused.attribution_projection_refused",
                 CounterSource::Discovery,
                 1,
             ));
@@ -1203,6 +1215,14 @@ impl FocusedSession {
             std::mem::take(&mut self.sample),
             &self.gaps.iter().copied().collect::<Vec<_>>(),
         );
+        if projectable {
+            if let Some(ref attribution) = finalized_attribution {
+                // Infallible after the pre-scan (the projection
+                // re-checks and fails closed atomically); the
+                // binding documents the unreachable error.
+                let _ = attribution.project_into_document(&mut document);
+            }
+        }
         document.api_activity = crate::api_activity::merge(api_activity)?;
         let disposition = match &mut self.owned {
             Some(child) => child.finish_observation()?,

@@ -495,6 +495,151 @@ impl FinalizedAttribution {
     pub(crate) fn withheld_uncertain(&self) -> u64 {
         self.withheld_uncertain
     }
+
+    /// True when every definite row is object-bound — the only
+    /// shape [`FinalizedAttribution::project_into_document`]
+    /// accepts. The fold guarantees this; the producer pre-scans
+    /// so a refusal records a typed gap before finalization
+    /// instead of failing silently after it.
+    pub(crate) fn is_projectable(&self) -> bool {
+        self.definite
+            .iter()
+            .all(|r| matches!(r.algorithm, AlgorithmSelector::ObjectBound { .. }))
+    }
+}
+
+/// Lowercase hex of a 32-byte digest (the `prov_hash` spelling).
+fn hex32(bytes: &[u8; 32]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Resolve the canonical registry spelling behind an object-bound
+/// selector digest by re-hashing the observer's OWN frozen
+/// registry — never a read-back target string. For each
+/// [`crate::kinds::ALG_NAMES`] spelling, the SAME shared-code
+/// constructor the kernel commit path calls
+/// ([`wire::selector_digest_parts`]: ops 3|4, lengths 1..=126,
+/// no interior NUL) runs over the retained code-object sha256
+/// plus that spelling; a digest match proves the requested
+/// spelling equals that registered spelling (up to SHA256
+/// second-preimage) and returns it exactly as registered (the
+/// requested alias, never a merged form). Unregistered
+/// spellings, malformed object hex, and out-of-slice operations
+/// resolve to `None` (opaque but observable). At most one
+/// spelling can match short of a hash break; registry order
+/// decides deterministically.
+pub(crate) fn canonical_selector_name(
+    object: &ObjectId,
+    operation: u32,
+    digest: &[u8; 32],
+) -> Option<&'static str> {
+    if !matches!(operation, 3 | 4) {
+        return None;
+    }
+    let hex = object.0.as_bytes();
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut raw = [0u8; 32];
+    for (i, pair) in hex.chunks(2).enumerate() {
+        let text = std::str::from_utf8(pair).ok()?;
+        raw[i] = u8::from_str_radix(text, 16).ok()?;
+    }
+    let mut message = [0u8; 192];
+    for alg in crate::kinds::ALG_NAMES {
+        let spelling = alg.name.as_bytes();
+        if spelling.is_empty() || spelling.len() > 126 {
+            continue;
+        }
+        let mut name = [0u8; 128];
+        name[..spelling.len()].copy_from_slice(spelling);
+        let Some(got) = wire::selector_digest_parts(
+            operation,
+            spelling.len() as u32,
+            &name,
+            &raw,
+            &mut message,
+        ) else {
+            continue;
+        };
+        if &got == digest {
+            return Some(alg.name);
+        }
+    }
+    None
+}
+
+impl FinalizedAttribution {
+    /// Project this certified result into a finalized document's
+    /// v2.5 sections: definite rows become
+    /// [`crate::evidence::ExecutionAttribution`] records, their
+    /// selectors dedupe by (object, operation, digest) into the
+    /// doc-scoped dictionary (first-seen over the sorted definite
+    /// rows, so deterministic), the unresolved bound rides along,
+    /// and the schema identity upgrades to v2.5 — including for a
+    /// certified EMPTY definite set (an explicit certified zero,
+    /// never an absent plane). A non-object-bound row fails
+    /// closed (`Identity`; the fold never emits one, so this is
+    /// unreachable except against a hand-built result) without
+    /// touching the document.
+    pub(crate) fn project_into_document(
+        &self,
+        doc: &mut crate::evidence::CaptureDocument,
+    ) -> Result<(), AttributionError> {
+        use crate::evidence::{
+            ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+            ExecutionAttribution,
+        };
+        use std::collections::BTreeMap;
+        let mut selectors: Vec<AlgorithmSelectorEntry> = Vec::new();
+        let mut index: BTreeMap<(&ObjectId, u32, [u8; 32]), u32> = BTreeMap::new();
+        let mut rows = Vec::with_capacity(self.definite.len());
+        for record in &self.definite {
+            let (object, digest) = match &record.algorithm {
+                AlgorithmSelector::ObjectBound { object, id } => (object, *id),
+                AlgorithmSelector::Known(_) => return Err(AttributionError::Identity),
+            };
+            let key = (object, record.operation, digest);
+            let selector = match index.get(&key) {
+                Some(found) => *found,
+                None => {
+                    let at =
+                        u32::try_from(selectors.len()).map_err(|_| AttributionError::Resource)?;
+                    selectors.push(AlgorithmSelectorEntry {
+                        object: object.clone(),
+                        operation: record.operation,
+                        id: hex32(&digest),
+                        canonical_name: canonical_selector_name(object, record.operation, &digest)
+                            .map(str::to_string),
+                    });
+                    index.insert(key, at);
+                    at
+                }
+            };
+            rows.push(ExecutionAttribution {
+                site: record.site.clone(),
+                generation: record.generation,
+                segment: record.segment,
+                start_ns: record.start_ns,
+                end_ns: record.end_ns,
+                calls: record.calls,
+                provider_definition: record.provider_definition.clone(),
+                provider_instance: record.provider_instance,
+                operation: record.operation,
+                function: record.function,
+                selector,
+                scope: ATTRIBUTION_SCOPE_V1.to_string(),
+            });
+        }
+        doc.execution_attributions = rows;
+        doc.algorithm_selectors = selectors;
+        doc.attribution_bounds = Some(AttributionBounds {
+            unresolved_calls: self.unresolved_calls,
+            withheld_uncertain: self.withheld_uncertain,
+        });
+        doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+        Ok(())
+    }
 }
 
 /// Certifying fold: consumes one privately collected closed snapshot and
@@ -1642,5 +1787,223 @@ mod tests {
         .unwrap();
         assert_eq!(finalized.definite().len(), 2);
         assert_eq!(finalized.unresolved_calls(), 100 + 40 - 37 - 13);
+    }
+
+    fn request_digest(object_hex: &str, operation: u32, spelling: &str) -> [u8; 32] {
+        let hex = object_hex.as_bytes();
+        let mut raw = [0u8; 32];
+        for (i, pair) in hex.chunks(2).enumerate() {
+            raw[i] = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        let mut name = [0u8; 128];
+        name[..spelling.len()].copy_from_slice(spelling.as_bytes());
+        let mut message = [0u8; 192];
+        wire::selector_digest_parts(operation, spelling.len() as u32, &name, &raw, &mut message)
+            .unwrap()
+    }
+
+    fn definite_row(
+        segment: u64,
+        calls: u64,
+        operation: u32,
+        function: u32,
+        algorithm: AlgorithmSelector,
+    ) -> AttributionRecord {
+        AttributionRecord {
+            site: site(),
+            generation: 3,
+            segment,
+            start_ns: 20,
+            end_ns: 80,
+            calls,
+            provider_definition: None,
+            provider_instance: 9,
+            operation,
+            function,
+            algorithm,
+            algorithm_scope:
+                AlgorithmScope::ObservedSuccessfulRequestForConsumedMethodAtCallbackObjectV1,
+        }
+    }
+
+    fn finalized(
+        rows: Vec<AttributionRecord>,
+        unresolved: u64,
+        withheld: u64,
+    ) -> FinalizedAttribution {
+        FinalizedAttribution {
+            coordinate: coordinate(),
+            definite: rows,
+            unresolved_calls: unresolved,
+            withheld_uncertain: withheld,
+        }
+    }
+
+    fn empty_doc() -> crate::evidence::CaptureDocument {
+        use crate::evidence::{
+            CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord,
+            finalize,
+        };
+        finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 1,
+                requested_end_ns: 2,
+                effective_start_ns: 1,
+                effective_end_ns: 2,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites: Vec::new(),
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        })
+    }
+
+    #[test]
+    fn canonical_name_resolves_registered_spellings_and_stays_opaque_otherwise() {
+        let obj = object();
+        let hmac = request_digest(&obj.0, 3, "HMAC");
+        assert_eq!(canonical_selector_name(&obj, 3, &hmac), Some("HMAC"));
+        // The digest binds the operation: an op-3 digest never
+        // resolves under op 4 (nor does any op-2 query resolve).
+        assert_eq!(canonical_selector_name(&obj, 4, &hmac), None);
+        assert_eq!(canonical_selector_name(&obj, 2, &hmac), None);
+        // Exact requested spelling, never a merged form: SHA256 is
+        // registered (its own alias) and resolves to itself.
+        let sha256 = request_digest(&obj.0, 3, "SHA256");
+        assert_eq!(canonical_selector_name(&obj, 3, &sha256), Some("SHA256"));
+        // Unregistered spellings stay opaque but observable (None
+        // name, not a wrong name).
+        let unknown = request_digest(&obj.0, 3, "NOPE-XYZ-9Q");
+        assert_eq!(canonical_selector_name(&obj, 3, &unknown), None);
+        // Malformed object identities never resolve.
+        for bad in ["", "zz", &"g".repeat(64), &"a".repeat(63)] {
+            let bad_obj = ObjectId(bad.to_string());
+            assert_eq!(canonical_selector_name(&bad_obj, 3, &hmac), None);
+        }
+        // A different code object is a different scope: the same
+        // spelling under another object resolves under that object
+        // only (never cross-build).
+        let other = ObjectId("b".repeat(64));
+        let hmac_other = request_digest(&other.0, 3, "HMAC");
+        assert_ne!(hmac, hmac_other);
+        assert_eq!(
+            canonical_selector_name(&other, 3, &hmac_other),
+            Some("HMAC")
+        );
+        assert_eq!(canonical_selector_name(&obj, 3, &hmac_other), None);
+    }
+
+    #[test]
+    fn projection_dedupes_selectors_upgrades_schema_and_carries_bounds() {
+        let obj = object();
+        let hmac = request_digest(&obj.0, 3, "HMAC");
+        let hkdf = request_digest(&obj.0, 4, "HKDF");
+        let rows = vec![
+            definite_row(
+                1,
+                37,
+                3,
+                5,
+                AlgorithmSelector::ObjectBound {
+                    object: obj.clone(),
+                    id: hmac,
+                },
+            ),
+            definite_row(
+                2,
+                11,
+                3,
+                6,
+                AlgorithmSelector::ObjectBound {
+                    object: obj.clone(),
+                    id: hmac,
+                },
+            ),
+            definite_row(
+                3,
+                5,
+                4,
+                5,
+                AlgorithmSelector::ObjectBound {
+                    object: obj.clone(),
+                    id: hkdf,
+                },
+            ),
+        ];
+        let mut doc = empty_doc();
+        assert_eq!(doc.schema, crate::evidence::CAPTURE_SCHEMA_V2);
+        finalized(rows, 52, 1)
+            .project_into_document(&mut doc)
+            .unwrap();
+        assert_eq!(doc.schema, crate::evidence::CAPTURE_SCHEMA_V2_5);
+        assert_eq!(doc.execution_attributions.len(), 3);
+        assert_eq!(
+            doc.execution_attributions
+                .iter()
+                .map(|r| (r.segment, r.calls, r.selector))
+                .collect::<Vec<_>>(),
+            vec![(1, 37, 0), (2, 11, 0), (3, 5, 1)]
+        );
+        assert!(
+            doc.execution_attributions
+                .iter()
+                .all(|r| r.scope == crate::evidence::ATTRIBUTION_SCOPE_V1
+                    && r.provider_definition.is_none())
+        );
+        assert_eq!(doc.algorithm_selectors.len(), 2);
+        assert_eq!(
+            doc.algorithm_selectors[0].canonical_name.as_deref(),
+            Some("HMAC")
+        );
+        assert_eq!(
+            doc.algorithm_selectors[1].canonical_name.as_deref(),
+            Some("HKDF")
+        );
+        assert_eq!(
+            doc.attribution_bounds,
+            Some(crate::evidence::AttributionBounds {
+                unresolved_calls: 52,
+                withheld_uncertain: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn projection_of_certified_empty_definite_keeps_explicit_bounds() {
+        let mut doc = empty_doc();
+        finalized(Vec::new(), 5, 0)
+            .project_into_document(&mut doc)
+            .unwrap();
+        assert_eq!(doc.schema, crate::evidence::CAPTURE_SCHEMA_V2_5);
+        assert!(doc.execution_attributions.is_empty());
+        assert!(doc.algorithm_selectors.is_empty());
+        assert_eq!(
+            doc.attribution_bounds
+                .map(|b| (b.unresolved_calls, b.withheld_uncertain)),
+            Some((5, 0))
+        );
+    }
+
+    #[test]
+    fn projection_rejects_non_object_bound_rows_without_touching_the_document() {
+        let mut doc = empty_doc();
+        let before = doc.clone();
+        let rows = vec![definite_row(1, 37, 3, 5, AlgorithmSelector::Known(7))];
+        assert_eq!(
+            finalized(rows, 52, 0).project_into_document(&mut doc),
+            Err(AttributionError::Identity)
+        );
+        assert_eq!(doc, before);
     }
 }
