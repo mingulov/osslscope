@@ -1084,7 +1084,8 @@ fn h5_t3_every_device_site_names_one_domain() {
         ),
         ("src/plan.rs", "stat", "render_device(encode_device(", 1),
         // report.rs: device words rendered (display-only, ×5;
-        // R05 adds the engine-observation and engine-evidence rows).
+        // R05 adds the engine-observation and engine-evidence rows;
+        // 5C adds the v2.5 attribution render rows, ×2).
         ("src/report.rs", "display", "\"device\": e.device,", 2),
         ("src/report.rs", "display", "\"device\": o.device,", 1),
         ("src/report.rs", "display", "\"device\": o.key.device,", 1),
@@ -1095,6 +1096,11 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/report.rs", "display", "site.site.device,", 1),
+        // 5C: admitted site-key devices rendered into the v2.5
+        // attribution JSON and the partition bom-ref —
+        // display-only, same domain as the site rows above.
+        ("src/report.rs", "display", "\"device\": r.site.device,", 1),
+        ("src/report.rs", "display", "row.site.device,", 1),
         // target.rs: staging-cleanup unlink guard (R06: lstat dev_t
         // vs the fstat-recorded dev_t — a raw-vs-raw same-file check
         // so a stale worker unlinks only the inode it created; no
