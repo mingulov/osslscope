@@ -22,6 +22,22 @@ use serde::{Deserialize, Serialize};
 /// Schema identity carried by every finalized capture document.
 pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.4";
 
+/// Schema identity for finalized documents carrying certified
+/// execution attribution (v2.5): the producer upgrades to this
+/// identity exactly when it projects a certified closed
+/// attribution result (definite partitions and/or the certified
+/// unresolved bound). [`finalize`] keeps emitting
+/// [`CAPTURE_SCHEMA_V2`].
+pub const CAPTURE_SCHEMA_V2_5: &str = "observed-crypto-v2.5";
+
+/// Scope token for a certified execution attribution: an observed
+/// successful fetch of an exact spelling returned a method, and
+/// the consuming API used that method under the public-reference
+/// guard at the callback object. Kebab-case (the `EngineWindow`
+/// precedent); the only scope the v2.5 producer emits.
+pub const ATTRIBUTION_SCOPE_V1: &str =
+    "observed-successful-request-for-consumed-method-at-callback-object-v1";
+
 /// Verified object fingerprint. A pathname may locate a file for display,
 /// but it never defines identity (R02).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -736,6 +752,68 @@ pub struct PolicyRecord {
     pub rules: Vec<PolicyRuleResult>,
 }
 
+/// One certified definite execution partition (v2.5): a proved
+/// slice of one physical site's calls. Projected only from the
+/// certifying fold's definite rows — producers never hand-build
+/// these. `segment` is the nonzero fold-issued identity, unique
+/// per document; `start_ns`/`end_ns` are inclusive actual-hit
+/// extrema; `provider_definition` is `None` (Unknown origin)
+/// unless independent evidence bound a defining artifact (it is
+/// never filled from the executing code object); `selector`
+/// indexes the same document's [`AlgorithmSelectorEntry`] list.
+/// Field order defines the total document order: `(site,
+/// generation, segment)` first, full record after.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ExecutionAttribution {
+    pub site: SiteKey,
+    pub generation: u32,
+    pub segment: u64,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub calls: u64,
+    pub provider_definition: Option<ObjectId>,
+    pub provider_instance: u64,
+    pub operation: u32,
+    pub function: u32,
+    pub selector: u32,
+    pub scope: String,
+}
+
+/// One doc-scoped algorithm selector (v2.5): the opaque
+/// object-bound request identity behind one or more
+/// [`ExecutionAttribution`] records. `object` is the
+/// independently retained artifact containing the actual firing
+/// operational callback (never the provider definition); `id`
+/// is the encoding-2 digest as 64 lowercase hex; `operation`
+/// is the public operation the digest binds. `canonical_name`
+/// is a frozen-registry spelling the host proved equal to the
+/// requested spelling by re-hashing its own registry strings —
+/// never a read-back target string — or `None` when the
+/// requested spelling is unregistered (opaque but still
+/// observable and matchable by object-bound policy; a present
+/// but unregistered name is malformed, never emitted).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AlgorithmSelectorEntry {
+    pub object: ObjectId,
+    pub operation: u32,
+    pub id: String,
+    pub canonical_name: Option<String>,
+}
+
+/// Certified unresolved attribution bounds (v2.5): calls the
+/// closed collect could not attribute to any certified
+/// partition, plus segments withheld for unproved optional
+/// identity (whose calls stay inside `unresolved_calls`).
+/// Bounds from the same closed result as the definite rows —
+/// never an arithmetic projection over unrelated counters.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct AttributionBounds {
+    pub unresolved_calls: u64,
+    pub withheld_uncertain: u64,
+}
+
 /// Unfinalized capture input. Producers fill this; only [`finalize`]
 /// turns it into a [`CaptureDocument`].
 #[derive(Debug, Clone)]
@@ -866,6 +944,25 @@ pub struct CaptureDocument {
     /// keeps its exact shape.
     #[serde(default)]
     pub refusal_diagnostics: Vec<String>,
+    /// Certified definite execution partitions (v2.5, optional —
+    /// present iff the window ran the closed attribution collect
+    /// and certified partitions). Projected post-finalization
+    /// from the certifying fold only; [`finalize`] leaves it
+    /// empty so every existing producer keeps its exact shape.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_attributions: Vec<ExecutionAttribution>,
+    /// Doc-scoped algorithm selector dictionary (v2.5, optional —
+    /// referenced by [`Self::execution_attributions`]).
+    /// Projected post-finalization with the partitions;
+    /// [`finalize`] leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub algorithm_selectors: Vec<AlgorithmSelectorEntry>,
+    /// Certified unresolved attribution bounds (v2.5, optional —
+    /// present iff the closed collect certified a result, even
+    /// when the definite set is empty). Projected
+    /// post-finalization; [`finalize`] leaves it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution_bounds: Option<AttributionBounds>,
 }
 
 /// One BPF object selected for the window (path locates for
@@ -1149,6 +1246,9 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         selected_objects: None,
         attach_diagnostics: Vec::new(),
         refusal_diagnostics: Vec::new(),
+        execution_attributions: Vec::new(),
+        algorithm_selectors: Vec::new(),
+        attribution_bounds: None,
     }
 }
 
