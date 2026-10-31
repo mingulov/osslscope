@@ -312,10 +312,33 @@ impl SelfMap {
         }
         Ok(Self { address, length })
     }
-    fn fault(&self, index: usize) {
-        // SAFETY: index addresses one byte inside our own fresh mapping.
-        unsafe {
-            std::ptr::read_volatile((self.address as *const u8).add(index));
+    /// Touch one mapped byte through a fault-safe observer-self read: the
+    /// kernel resolves the fault and reports a truncation (or unmapping)
+    /// that lands after the size check as a failed or short read instead
+    /// of delivering SIGBUS to a direct load. Same primitive the source
+    /// anchor uses for its retained mapping.
+    fn fault(&self, index: usize) -> Result<(), BackingError> {
+        let mut byte = 0u8;
+        let local = libc::iovec {
+            iov_base: std::ptr::addr_of_mut!(byte).cast(),
+            iov_len: 1,
+        };
+        let remote = libc::iovec {
+            // SAFETY: pointer arithmetic only; the address is consumed by
+            // the checked read below, never dereferenced by us.
+            iov_base: unsafe { (self.address as *mut u8).add(index) }.cast(),
+            iov_len: 1,
+        };
+        // SAFETY: the destination is a live one-byte stack slot and the
+        // source is one byte inside this owner's own fresh mapping. An
+        // out-of-range or truncated source fails the call; no Rust
+        // reference to mapping bytes is ever formed.
+        let copied =
+            unsafe { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0) };
+        if copied == 1 {
+            Ok(())
+        } else {
+            Err(BackingError::Unavailable)
         }
     }
     fn start(&self) -> u64 {
@@ -490,7 +513,7 @@ impl BackingProcess {
         let mapping = SelfMap::map(candidate, aligned, page)?;
         #[cfg(test)]
         fire_fault_hook(1);
-        mapping.fault(index);
+        mapping.fault(index)?;
         self.check_self_map(&mapping, candidate_fp)?;
         let target_pagemap = open_at(&self.directory, b"pagemap")?;
         let self_pagemap = File::open("/proc/self/pagemap").map_err(io_error)?;
@@ -517,7 +540,7 @@ impl BackingProcess {
         let fresh_map = SelfMap::map(&fresh, aligned, page)?;
         #[cfg(test)]
         fire_fault_hook(2);
-        fresh_map.fault(index);
+        fresh_map.fault(index)?;
         let fresh_frame = pagemap_frame(&self_pagemap, fresh_map.start() + index as u64, page)?;
         if fresh_frame != own_frame {
             return Err(BackingError::Changed);
