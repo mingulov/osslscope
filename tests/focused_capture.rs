@@ -86,6 +86,28 @@ fn check_open(doc: &CaptureDocument) {
     assert!(doc.objects.iter().all(|o| o.display_locator == "unknown"));
 }
 #[test]
+fn project_leaves_attribution_projection_to_finish() {
+    // project() assembles the physical/candidate document only:
+    // v2.5 sections stay empty and the schema stays v2.4 until
+    // finish() projects a certified closed result (or records
+    // the typed gap when the collect refuses).
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            sites: vec![site(37, &["SHA2-256"])],
+            ..Default::default()
+        },
+        &[],
+    );
+    check_open(&doc);
+    assert_eq!(doc.schema, CAPTURE_SCHEMA_V2);
+    assert!(doc.execution_attributions.is_empty());
+    assert!(doc.algorithm_selectors.is_empty());
+    assert_eq!(doc.attribution_bounds, None);
+}
+
+#[test]
 fn advertisements_without_calls_never_become_execution_assets() {
     let doc = project(
         42,

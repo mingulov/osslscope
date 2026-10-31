@@ -2842,3 +2842,330 @@ fn dynamic_hints_and_successful_api_returns_do_not_satisfy_require_executed() {
     assert_eq!(after.rules[0].verdict, RuleVerdict::Inconclusive);
     assert_eq!(document.total_calls(), 7);
 }
+
+// ---------------------------------------------------------------- v2.5
+// Execution-plane policy contract: certified partitions prove
+// positive execution (even in a PARTIAL window), unresolved
+// calls never prove absence, and object-bound selectors never
+// match another build.
+
+const SEL_OBJECT: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const SEL_ID_HMAC: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+const SEL_ID_OTHER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+const SEL_OBJECT_2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+const SEL_ID_HMAC_2: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+/// A v2.5 execution-plane document in the Task-2 battery shape:
+/// 100 physical calls, certified 37 + 11, 52 unresolved.
+/// `coverage` selects the candidate plane each site carries
+/// (production-shaped Unknown, or Complete-empty for the
+/// COMPLETE leg); `window` selects PARTIAL vs COMPLETE.
+fn execution_doc(coverage: CandidateCoverage, window: CaptureWindow) -> CaptureDocument {
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    fn site(offset: u64, calls: u64, coverage: CandidateCoverage) -> SiteExecution {
+        SiteExecution {
+            site: SiteKey {
+                object: obj(SEL_OBJECT),
+                device: 7,
+                inode: 9,
+                offset,
+            },
+            generation: 3,
+            candidates: Vec::new(),
+            candidates_coverage: coverage,
+            calls,
+            first_ns: 1000,
+            last_ns: 2000,
+            installed_at: None,
+        }
+    }
+    let mut document = doc(
+        vec![
+            site(0x1000, 40, coverage),
+            site(0x2000, 11, coverage),
+            site(0x3000, 49, coverage),
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        window,
+        None,
+    );
+    document.objects = vec![ObjectRecord {
+        id: obj(SEL_OBJECT),
+        device: 7,
+        inode: 9,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    document.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(SEL_OBJECT),
+        operation: 3,
+        id: SEL_ID_HMAC.to_string(),
+        canonical_name: Some("HMAC".to_string()),
+    }];
+    let row = |offset: u64, segment: u64, calls: u64| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(SEL_OBJECT),
+            device: 7,
+            inode: 9,
+            offset,
+        },
+        generation: 3,
+        segment,
+        start_ns: 1100,
+        end_ns: 1900,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    document.execution_attributions = vec![row(0x1000, 1, 37), row(0x2000, 2, 11)];
+    document.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 52,
+        withheld_uncertain: 0,
+    });
+    document.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    assert_eq!(document.total_calls(), 100);
+    document
+}
+
+fn partial_window() -> CaptureWindow {
+    CaptureWindow {
+        requested_start_ns: 500,
+        requested_end_ns: 2000,
+        effective_start_ns: 1000,
+        effective_end_ns: 2000,
+        signal_cut: false,
+        count_admission: None,
+    }
+}
+
+#[test]
+fn positive_partition_can_violate_deny_in_partial_window() {
+    let document = execution_doc(CandidateCoverage::Unknown, partial_window());
+    assert!(matches!(document.status, Completeness::Partial { .. }));
+    // 37 + 11 certified calls prove positive execution: the deny
+    // rule violates even though the window is PARTIAL (the gap
+    // widens the upper bound to unknown — F-E/B5 — never the
+    // proved calls).
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 48);
+    assert_eq!(violated.rules[0].bounds.possible, None);
+    assert!(!violated.rules[0].relevant_complete);
+    let hits: Vec<u64> = violated.rules[0].hits.iter().map(|h| h.calls).collect();
+    assert_eq!(hits, vec![37, 11]);
+    // The matching require rule passes on the same evidence.
+    let passed = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(passed.overall(), PolicyOutcome::Pass);
+    // An unmatched selector stays inconclusive (never a pass or
+    // violation from unresolved calls).
+    for rule in [
+        PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_OTHER),
+        PolicyRule::require_selector(SEL_OBJECT, SEL_ID_OTHER),
+    ] {
+        let verdict = evaluate_document(std::slice::from_ref(&rule), &document);
+        assert_eq!(
+            verdict.overall(),
+            PolicyOutcome::Inconclusive,
+            "{}",
+            rule.name
+        );
+        assert_eq!(verdict.rules[0].bounds.definite, 0);
+    }
+    // R02 evidence refs cite the partition sites with partition
+    // calls (never more than the site executed).
+    let record = policy_record(&violated);
+    assert_eq!(record.rules[0].evidence.len(), 2);
+    let claimed: u64 = record.rules[0].evidence.iter().map(|e| e.calls).sum();
+    assert_eq!(claimed, 48);
+}
+
+#[test]
+fn unresolved_calls_and_api_success_cannot_satisfy_execution_rules() {
+    // COMPLETE window, certified 37 + 11, 52 unresolved — plus
+    // API-success rows and candidate hints naming HMAC. The 52
+    // unresolved still cannot prove absence, and the API/hint
+    // plane cannot satisfy execution rules.
+    let mut document = execution_doc(CandidateCoverage::Complete, exact_window());
+    assert_eq!(document.status, Completeness::Complete);
+    for site in &mut document.sites {
+        site.candidates = vec![cand(SEL_OBJECT, "default", 3, 5, &["HMAC"], false)];
+    }
+    document
+        .api_activity
+        .push(osslscope::api_activity::ApiActivityRow {
+            api: 35.try_into().unwrap(),
+            entries: 5,
+            observed_success: 5,
+            observed_failure: 0,
+            verification_mismatch: 0,
+            unsupported: 0,
+            gaps: osslscope::api_activity::ApiActivityGaps::default(),
+        });
+    let denied = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_OTHER)],
+        &document,
+    );
+    assert_eq!(denied.overall(), PolicyOutcome::Inconclusive);
+    assert_eq!(denied.rules[0].bounds.definite, 0);
+    assert_eq!(denied.rules[0].bounds.possible, Some(52));
+    let required = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, SEL_ID_OTHER)],
+        &document,
+    );
+    assert_eq!(required.overall(), PolicyOutcome::Inconclusive);
+    // The matching rules still decide on the partitions alone.
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 48);
+    assert_eq!(violated.rules[0].bounds.possible, Some(100));
+    let passed = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(passed.overall(), PolicyOutcome::Pass);
+}
+
+#[test]
+fn object_bound_selector_does_not_match_other_build() {
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    // Two builds execute the same canonical spelling (HMAC) —
+    // each partition cites its own code object and digest.
+    let mut document = doc(
+        vec![
+            SiteExecution {
+                site: SiteKey {
+                    object: obj(SEL_OBJECT),
+                    device: 7,
+                    inode: 9,
+                    offset: 0x1000,
+                },
+                generation: 3,
+                candidates: Vec::new(),
+                candidates_coverage: CandidateCoverage::Complete,
+                calls: 37,
+                first_ns: 1000,
+                last_ns: 2000,
+                installed_at: None,
+            },
+            SiteExecution {
+                site: SiteKey {
+                    object: obj(SEL_OBJECT_2),
+                    device: 7,
+                    inode: 10,
+                    offset: 0x1000,
+                },
+                generation: 3,
+                candidates: Vec::new(),
+                candidates_coverage: CandidateCoverage::Complete,
+                calls: 11,
+                first_ns: 1000,
+                last_ns: 2000,
+                installed_at: None,
+            },
+        ],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        exact_window(),
+        None,
+    );
+    document.objects = vec![
+        ObjectRecord {
+            id: obj(SEL_OBJECT),
+            device: 7,
+            inode: 9,
+            display_locator: "libcrypto-a.so".to_string(),
+        },
+        ObjectRecord {
+            id: obj(SEL_OBJECT_2),
+            device: 7,
+            inode: 10,
+            display_locator: "libcrypto-b.so".to_string(),
+        },
+    ];
+    document.algorithm_selectors = vec![
+        AlgorithmSelectorEntry {
+            object: obj(SEL_OBJECT),
+            operation: 3,
+            id: SEL_ID_HMAC.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+        AlgorithmSelectorEntry {
+            object: obj(SEL_OBJECT_2),
+            operation: 3,
+            id: SEL_ID_HMAC_2.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+    ];
+    let row =
+        |object: &str, inode: u64, segment: u64, calls: u64, selector: u32| ExecutionAttribution {
+            site: SiteKey {
+                object: obj(object),
+                device: 7,
+                inode,
+                offset: 0x1000,
+            },
+            generation: 3,
+            segment,
+            start_ns: 1100,
+            end_ns: 1900,
+            calls,
+            provider_definition: None,
+            provider_instance: 9,
+            operation: 3,
+            function: 5,
+            selector,
+            scope: ATTRIBUTION_SCOPE_V1.to_string(),
+        };
+    document.execution_attributions = vec![
+        row(SEL_OBJECT, 9, 1, 37, 0),
+        row(SEL_OBJECT_2, 10, 2, 11, 1),
+    ];
+    document.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 52,
+        withheld_uncertain: 0,
+    });
+    document.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    // Same canonical name, different build: the selector bound
+    // to build 1 matches 37 calls only — never the 11 from
+    // build 2, and cross-digest pairs match nothing.
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 37);
+    assert_eq!(violated.rules[0].hits.len(), 1);
+    assert_eq!(violated.rules[0].hits[0].calls, 37);
+    let passed = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT_2, SEL_ID_HMAC_2)],
+        &document,
+    );
+    assert_eq!(passed.overall(), PolicyOutcome::Pass);
+    assert_eq!(passed.rules[0].bounds.definite, 11);
+    for (object, id) in [(SEL_OBJECT, SEL_ID_HMAC_2), (SEL_OBJECT_2, SEL_ID_HMAC)] {
+        let verdict = evaluate_document(&[PolicyRule::deny_selector(object, id)], &document);
+        assert_eq!(verdict.overall(), PolicyOutcome::Inconclusive);
+        assert_eq!(verdict.rules[0].bounds.definite, 0);
+    }
+}

@@ -29,7 +29,7 @@ use osslscope::report::{
 };
 use osslscope::schema::{
     FORBIDDEN_V2_KEYS, V2_SCHEMA_JSON, check_v2_semantics, check_version, check_version_v2,
-    validate_v2,
+    validate_v2, validate_v2_with_schema,
 };
 use serde_json::{Value, json};
 use std::path::PathBuf;
@@ -4966,6 +4966,319 @@ fn dynamic_metadata_rejects_invented_authority_and_raw_fields() {
     let mut bad = value;
     bad["algorithm_identities"][0]["id"] = json!("raw-custom-name");
     assert!(check_v2_semantics(&bad).is_err());
+}
+
+#[test]
+fn unused_fetch_never_creates_cbom_asset() {
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    fn fetch_success(api: u32) -> osslscope::api_activity::ApiActivityRow {
+        osslscope::api_activity::ApiActivityRow {
+            api: api.try_into().unwrap(),
+            entries: 5,
+            observed_success: 5,
+            observed_failure: 0,
+            verification_mismatch: 0,
+            unsupported: 0,
+            gaps: osslscope::api_activity::ApiActivityGaps::default(),
+        }
+    }
+    // Fetched and advertised (API-success rows + HMAC hints) but
+    // never executed through dispatch: quiet sites, no
+    // partitions — the CBOM stays empty.
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        0,
+        vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+        CandidateCoverage::Complete,
+    )];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut quiet = finalize_honest(input);
+    quiet.api_activity = vec![fetch_success(35), fetch_success(38)];
+    let cbom = cbom_of(&quiet);
+    assert_eq!(cbom["components"], json!([]));
+    assert!(
+        cbom["metadata"]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| !p["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("osslscope:unresolved-attribution")),
+        "no attribution accounting without a certified result"
+    );
+    // Executed-but-unattributed sites add omissions, never assets.
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        40,
+        vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+        CandidateCoverage::Unknown,
+    )];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut unattributed = finalize_honest(input);
+    unattributed.api_activity = vec![fetch_success(35)];
+    let cbom = cbom_of(&unattributed);
+    assert_eq!(cbom["components"], json!([]));
+    // The same evidence PLUS certified partitions mints exactly
+    // the partition assets (once each): the fetch plane adds
+    // nothing, and the legacy site rule stays suppressed on the
+    // covered site (site A alone would have minted a legacy
+    // HMAC asset — its calls are partition-accounted instead).
+    let mut input = input_base();
+    input.sites = vec![
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x1000,
+            0,
+            40,
+            vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+            CandidateCoverage::Complete,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x3000,
+            0,
+            49,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+    ];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut executed = finalize_honest(input);
+    executed.api_activity = vec![fetch_success(35), fetch_success(38)];
+    executed.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: Some("HMAC".to_string()),
+    }];
+    let row = |offset: u64, segment: u64, calls: u64| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation: 0,
+        segment,
+        start_ns: 20,
+        end_ns: 80,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    executed.execution_attributions = vec![row(0x1000, 1, 37), row(0x2000, 2, 11)];
+    executed.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 52,
+        withheld_uncertain: 0,
+    });
+    executed.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    let rendered = json_of(&executed);
+    validate_v2(&rendered).expect("v2.5 producer shape validates");
+    check_v2_semantics(&rendered).expect("v2.5 producer shape is semantic-clean");
+    let cbom = cbom_of(&executed);
+    let components = cbom["components"].as_array().unwrap();
+    assert_eq!(components.len(), 2, "one asset per partition, once");
+    for (component, segment) in components.iter().zip([1, 2]) {
+        let bom_ref = component["bom-ref"].as_str().unwrap();
+        assert!(
+            bom_ref.starts_with("urn:osslscope:exec-attr:v2.5:"),
+            "no cross-build equivalence: {bom_ref}"
+        );
+        assert!(bom_ref.ends_with(&format!(":{segment}")));
+        assert_eq!(component["type"], json!("cryptographic-asset"));
+        let props = component["properties"].as_array().unwrap();
+        let get = |name: &str| {
+            props
+                .iter()
+                .find(|p| p["name"] == json!(name))
+                .unwrap_or_else(|| panic!("missing prop {name}"))["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(get("osslscope:selector-scope"), "object-bound");
+        assert_eq!(get("osslscope:canonical-algorithm"), "HMAC");
+        assert_eq!(get("osslscope:provider-definition"), "unknown");
+        assert_eq!(get("osslscope:code-object"), OBJ);
+    }
+    assert!(
+        !cbom.to_string().contains("urn:osslscope:exec:v2:"),
+        "the legacy site asset stays suppressed on covered sites"
+    );
+    let metadata = cbom["metadata"]["properties"].as_array().unwrap();
+    let get_meta = |name: &str| {
+        metadata
+            .iter()
+            .find(|p| p["name"] == json!(name))
+            .unwrap_or_else(|| panic!("missing metadata {name}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get_meta("osslscope:execution-partitions"), "2");
+    assert_eq!(get_meta("osslscope:unresolved-attribution-calls"), "52");
+    // A dangling selector index refuses the render (an audit
+    // artifact drops no partition silently).
+    let mut dangling = executed.clone();
+    dangling.execution_attributions[0].selector = 7;
+    assert!(render_cbom(&dangling).is_err());
+}
+
+#[test]
+fn v24_documents_remain_readable() {
+    // The current producer's v2.4 output (no attribution plane)
+    // reads end to end under the new code: schema, semantics,
+    // policy, CBOM and human render.
+    let doc = complete_doc();
+    assert_eq!(doc.schema, osslscope::evidence::CAPTURE_SCHEMA_V2);
+    let rendered = json_of(&doc);
+    assert_eq!(rendered["schema_version"], json!("observed-crypto-v2.4"));
+    for key in [
+        "execution_attributions",
+        "algorithm_selectors",
+        "attribution_bounds",
+    ] {
+        assert!(rendered.get(key).is_none(), "v2.4 documents carry no {key}");
+    }
+    validate_v2(&rendered).expect("v2.4 validates under the new schema");
+    check_v2_semantics(&rendered).expect("v2.4 stays semantic-clean");
+    let verdict = evaluate_document(&[PolicyRule::require_executed("AES-128-GCM")], &doc);
+    assert_eq!(verdict.overall(), PolicyOutcome::Pass);
+    let cbom = cbom_of(&doc);
+    assert!(
+        cbom["components"].as_array().unwrap().is_empty()
+            || cbom.to_string().contains("urn:osslscope:exec:v2:"),
+        "v2.4 CBOMs mint legacy site assets only"
+    );
+    assert!(!render_human(&doc).contains("execution attributions"));
+}
+
+/// Frozen v2.4 strict-reader schema: exact public schema from
+/// 1d2e49b (pre-5C); SHA-256
+/// 6acc3d35412b7826bab047e0f47a87bb7c3baa17d0e598c642bb6a1c78dc0327.
+/// This preimage was frozen before the v2.5 attribution extension.
+const V24_SCHEMA_JSON: &str = include_str!("support/observed_crypto_v2_4_schema.json");
+
+#[test]
+fn strict_old_reader_rejects_v25() {
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        40,
+        Vec::new(),
+        CandidateCoverage::Unknown,
+    )];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: None,
+    }];
+    doc.execution_attributions = vec![ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset: 0x1000,
+        },
+        generation: 0,
+        segment: 1,
+        start_ns: 20,
+        end_ns: 80,
+        calls: 37,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    }];
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 3,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    let v25 = json_of(&doc);
+    // Controls: the v2.5 document is valid under the new reader,
+    // and the frozen v2.4 schema is a real old reader (it
+    // accepts a v2.4 document).
+    validate_v2(&v25).expect("v2.5 validates under the new schema");
+    check_v2_semantics(&v25).expect("v2.5 stays semantic-clean");
+    let v24 = json_of(&complete_doc());
+    validate_v2_with_schema(V24_SCHEMA_JSON, &v24)
+        .expect("the frozen v2.4 schema accepts v2.4 documents");
+    // The strict old reader rejects the v2.5 document at the
+    // first unknown key in sorted key order (structural
+    // additionalProperties).
+    let error = validate_v2_with_schema(V24_SCHEMA_JSON, &v25).unwrap_err();
+    assert_eq!(error.path, "$.algorithm_selectors");
+    assert!(error.message.contains("forbidden"), "{}", error.message);
 }
 
 #[test]

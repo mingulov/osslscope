@@ -104,6 +104,34 @@ fn duplicate_policy_is_a_usage_error() {
 }
 
 #[test]
+fn unknown_policy_version_has_no_effects() {
+    reject(
+        "version-3",
+        Some(b"version=3\ndeny-weak=true"),
+        &[],
+        "policy version must be integer 1 or 2",
+    );
+    reject(
+        "version-0",
+        Some(b"version=0\ndeny-weak=true"),
+        &[],
+        "policy version must be integer 1 or 2",
+    );
+}
+
+#[test]
+fn version_1_selector_rules_have_no_effects() {
+    reject(
+        "v1-selector",
+        Some(
+            b"version=1\ndeny-selector=[{object='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', id='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'}]",
+        ),
+        &[],
+        "selector rules require policy version 2",
+    );
+}
+
+#[test]
 fn contradictory_file_and_cli_have_no_effects() {
     reject(
         "contradiction",
