@@ -491,21 +491,23 @@ struct VerifyParseRendezvous {
 static VERIFY_PARSE_HOOK: std::sync::Mutex<Option<VerifyParseRendezvous>> =
     std::sync::Mutex::new(None);
 
+/// Bound mapping evidence: the retained descriptor, its metadata, the
+/// identity status, the witnessed page (if any), and the retained
+/// association (if any) for revalidation before publication.
+type BoundBacking = (
+    File,
+    Metadata,
+    IdentityStatus,
+    Option<u64>,
+    Option<backing::BackingAssociation>,
+);
+
 fn backing(
     view: Option<&backing::BackingProcess>,
     process: &Process,
     mapping: &Mapping<'_>,
     work: &mut Work<'_>,
-) -> Result<
-    (
-        File,
-        Metadata,
-        IdentityStatus,
-        Option<u64>,
-        Option<backing::BackingAssociation>,
-    ),
-    GapReason,
-> {
+) -> Result<BoundBacking, GapReason> {
     // Acquisition failures must remain distinct from a successfully acquired
     // LocatorCandidate: failure leaves mapping visibility unresolved and can
     // never support a sampled absence claim in watch.

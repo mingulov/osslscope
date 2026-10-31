@@ -104,7 +104,9 @@ pub(crate) trait BackingBudget {
 }
 
 /// Shared-capacity lease held by backing buffers. Dropping a lease releases
-/// its reservation; read charges are cumulative and never released.
+/// its reservation; read charges are cumulative and never released. Payloads
+/// are intentionally write-only RAII holders, never read.
+#[allow(dead_code)]
 pub(crate) enum BackingLease {
     Pool(crate::observation_memory::MemoryLease),
     Held(Box<dyn HeldCapacity>),
@@ -501,7 +503,7 @@ pub(crate) struct BackingProcess {
     maps: Vec<u8>,
     /// Caller-budget leases for the retained maps buffer: the reservation
     /// lives exactly as long as the buffer it accounts for.
-    leases: Vec<BackingLease>,
+    _leases: Vec<BackingLease>,
 }
 
 impl BackingProcess {
@@ -528,7 +530,7 @@ impl BackingProcess {
             mount_namespace,
             executable,
             maps,
-            leases: vec![lease],
+            _leases: vec![lease],
         })
     }
 
@@ -812,6 +814,9 @@ impl BackingAssociation {
     /// Re-prove the association against live state. The witness path re-runs
     /// the full page witness (a copy-up after verification changes the
     /// re-resolution leg); the direct path re-checks fingerprints and keys.
+    /// Uncharged entry point for unit tests; production uses the charged
+    /// variant with real caller budgets.
+    #[allow(dead_code)]
     pub(crate) fn revalidate(&self) -> Result<(), BackingError> {
         self.revalidate_charged(&mut UnboundedBudget)
     }
@@ -870,7 +875,7 @@ impl BackingAssociation {
                 mount_namespace: self.mount_namespace,
                 executable: self.executable.clone(),
                 maps,
-                leases: vec![maps_lease],
+                _leases: vec![maps_lease],
             };
             let frame = view.verify_witness(
                 &self.range,
@@ -1020,6 +1025,9 @@ fn join_layer(layer: &[u8], relative: &[u8]) -> Option<Vec<u8>> {
 /// resolutions from the target's `mountinfo`, bounded. These are hints only;
 /// every candidate still requires independent verification. Empty for
 /// non-absolute paths, deleted mappings, and unresolvable layers.
+/// Uncharged entry point for unit tests; production uses the charged
+/// variant with real caller budgets.
+#[allow(dead_code)]
 pub(crate) fn direct_layer_candidates(
     process_dir: &File,
     maps_path: &[u8],
