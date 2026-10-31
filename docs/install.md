@@ -101,12 +101,14 @@ From a clean reviewed product checkout:
 
 ```sh
 ./scripts/build-dev.sh --release --offline
-python3 packaging/build-package.py --output dist/current
+python3 packaging/build-package.py --source-archives /path/to/source-archives --output dist/current
 ```
 
-This constructs a prefix tarball, DEB, RPM, exact product source archive and
-package manifest. All formats include the CLI, five roles and protected current
-receipt plus source/notices links. See [packaging](../packaging/README.md) for
+This constructs a prefix tarball, DEB, RPM, exact product source archive,
+accompanying-source bundle and package manifest. All formats include the CLI,
+five roles and protected current receipt plus installed source/notices. The
+`--source-archives` directory must hold the original locked `.crate` files and
+reviewed runtime source components; see [packaging](../packaging/README.md) for
 format selection, prefix binding, prerequisites and installed acceptance gates.
 Construction/extraction does not establish platform support or release readiness.
 
