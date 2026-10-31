@@ -326,9 +326,23 @@ impl FiniteEvidence {
 }
 
 /// Public operational return class; no target arguments participate.
+/// IDs 49-72 are the Task 7 (5G) additive range (D1-D4 in task-7-report
+/// §7); 20-48 behavior is bit-identical to before.
 pub const fn operational_outcome(api: u32, rv: u64) -> u32 {
     if !operational_api(api) {
         return 0;
+    }
+    // D1: void-return exports have no scalar. A paired return proves the
+    // teardown call completed; rv is caller garbage and is ignored.
+    if matches!(api, 68 | 70 | 72) {
+        return 1;
+    }
+    // D2: pointer-return exports compare the FULL 64-bit scalar: NULL is
+    // failure, any nonzero pointer is success. This precedes the int
+    // truncation below, which would misread a nonzero pointer with zero
+    // low 32 bits as NULL.
+    if matches!(api, 65 | 67 | 69 | 71) {
+        return if rv == 0 { 2 } else { 1 };
     }
     let rv = rv as u32 as i32;
     if rv == 1 {
@@ -337,16 +351,20 @@ pub const fn operational_outcome(api: u32, rv: u64) -> u32 {
     if rv == 0 {
         return if matches!(api, 40 | 45 | 47) { 3 } else { 2 };
     }
-    if matches!(api, 39..=43) && rv == -2 {
+    if matches!(api, 39..=43 | 49..=58) && rv == -2 {
         return 4;
     }
-    if matches!(api, 39..=43 | 48) && rv < 0 || matches!(api, 45 | 47) {
+    // D3 CHECK arm: doc-literal "1 success, others failure".
+    if matches!(api, 56..=58) {
+        return 2;
+    }
+    if matches!(api, 39..=43 | 48 | 49..=55) && rv < 0 || matches!(api, 45 | 47) {
         return 2;
     }
     0
 }
 pub const fn operational_api(api: u32) -> bool {
-    api >= 20 && api <= 48
+    api >= 20 && api <= 72
 }
 /// Cookie-bound scalars; no target handles or arguments. Counters are per CPU.
 #[derive(Clone, Copy, Default)]
