@@ -1545,9 +1545,13 @@ mod tests {
         let range = child.range_of(&merged);
         let target = child.dir();
         let candidate = File::open(&merged).unwrap();
+        // Truncate the LOWER file, not the merged path: a merged-path
+        // truncate copies up and leaves the mmap'd lower pages intact
+        // (harmless Changed refusal), while truncating the actual backing
+        // invalidates the mapped pages (the SIGBUS hazard).
         let writable = std::fs::OpenOptions::new()
             .write(true)
-            .open(&merged)
+            .open(base.join("lower/file"))
             .unwrap();
         *FAULT_TRUNCATE.lock().unwrap() = Some((writable, site));
         let process = BackingProcess::capture(&target).unwrap();
