@@ -1907,4 +1907,231 @@ mod tests {
             );
         }
     }
+
+    /// Shared outstanding-state cell for the peak-charge control below.
+    struct PeakShared {
+        current: std::cell::Cell<usize>,
+        peak: std::cell::Cell<usize>,
+    }
+
+    /// Caller-budget capacity whose drop releases its outstanding charge, so
+    /// the control observes live (peak) charges, not just admissions.
+    struct PeakCapacity {
+        shared: std::rc::Rc<PeakShared>,
+        bytes: usize,
+    }
+    impl HeldCapacity for PeakCapacity {}
+    impl Drop for PeakCapacity {
+        fn drop(&mut self) {
+            self.shared
+                .current
+                .set(self.shared.current.get() - self.bytes);
+        }
+    }
+
+    /// Outstanding-based caller budget for the peak-charge control: state
+    /// reservations accumulate while their leases live (pool-shaped, like
+    /// both production callers) and refusals are recorded with the denied
+    /// amount, so the control can tell "raw admitted, copies refused".
+    struct PeakBudget {
+        shared: std::rc::Rc<PeakShared>,
+        max_state: usize,
+        max_reads: u64,
+        reads: u64,
+        denials: Vec<usize>,
+    }
+    impl PeakBudget {
+        fn new(max_state: usize) -> Self {
+            Self {
+                shared: std::rc::Rc::new(PeakShared {
+                    current: std::cell::Cell::new(0),
+                    peak: std::cell::Cell::new(0),
+                }),
+                max_state,
+                max_reads: u64::MAX,
+                reads: 0,
+                denials: Vec::new(),
+            }
+        }
+    }
+    impl BackingBudget for PeakBudget {
+        fn checkpoint(&mut self) -> Result<(), BackingError> {
+            Ok(())
+        }
+        fn allow_read(&mut self, want: usize) -> Result<usize, BackingError> {
+            let remaining = self.max_reads.saturating_sub(self.reads);
+            if remaining == 0 {
+                return Err(BackingError::Unavailable);
+            }
+            Ok(want
+                .max(1)
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX)))
+        }
+        fn commit_read(&mut self, bytes: u64) -> Result<(), BackingError> {
+            self.reads += bytes;
+            Ok(())
+        }
+        fn reserve_state(&mut self, bytes: usize) -> Result<BackingLease, BackingError> {
+            let next = self.shared.current.get().saturating_add(bytes);
+            if next > self.max_state {
+                self.denials.push(bytes);
+                return Err(BackingError::Unavailable);
+            }
+            self.shared.current.set(next);
+            self.shared.peak.set(self.shared.peak.get().max(next));
+            Ok(BackingLease::held(PeakCapacity {
+                shared: self.shared.clone(),
+                bytes,
+            }))
+        }
+    }
+
+    /// I2-remainder control (ER-5E-I2): successful layer discovery near the
+    /// mountinfo input cap must hold BOTH the raw-buffer reservation and the
+    /// parser/path scratch reservation while the bytes are live, and a caller
+    /// budget that admits the raw read but not the copies must refuse (fail
+    /// closed with no candidates). Drives the real
+    /// `direct_layer_candidates_charged` shared by both production callers
+    /// against a synthetic near-cap mountinfo in a scratch dir — the charged
+    /// entry point reads `mountinfo` relative to any directory File, so no
+    /// privilege is needed.
+    #[test]
+    fn layer_discovery_holds_raw_and_scratch_charges_at_peak() {
+        let base = scratch("layer-peak");
+        for name in ["upper", "lower1", "lower2"] {
+            let dir = base.join(name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("libtest.so"), b"layer-bytes").unwrap();
+        }
+        let dir = |name: &str| base.join(name).to_string_lossy().into_owned();
+        let mut mountinfo = format!(
+            "100 1 0:100 / /target/mount rw - overlay overlay rw,lowerdir={}:{},upperdir={}\n",
+            dir("lower1"),
+            dir("lower2"),
+            dir("upper")
+        )
+        .into_bytes();
+        // Filler overlay mounts with short non-matching mountpoints pad the
+        // input to just under the cap; the target mount wins longest-match.
+        let mut filler = 0u32;
+        while mountinfo.len() + 256 < MAX_MOUNTINFO_READ {
+            filler += 1;
+            mountinfo.extend_from_slice(
+                format!(
+                    "{filler} 1 0:200 / /f{filler:06} rw - overlay overlay rw,lowerdir=/nonexistent/filler-{filler:06}\n"
+                )
+                .as_bytes(),
+            );
+        }
+        let size = mountinfo.len();
+        assert!(
+            size > MAX_MOUNTINFO_READ - 8192 && size <= MAX_MOUNTINFO_READ,
+            "near-cap input required, got {size} vs cap {MAX_MOUNTINFO_READ}"
+        );
+        std::fs::write(base.join("mountinfo"), &mountinfo).unwrap();
+        let process_dir = File::open(&base).unwrap();
+        let maps_path = b"/target/mount/libtest.so";
+        let expected: Vec<(u64, u64)> = ["upper", "lower1", "lower2"]
+            .iter()
+            .map(|name| {
+                let meta = std::fs::metadata(base.join(name).join("libtest.so")).unwrap();
+                (meta.dev(), meta.ino())
+            })
+            .collect();
+
+        let mut failures: Vec<String> = Vec::new();
+
+        // Success half: a generous outstanding-based budget. Discovery must
+        // succeed AND the peak live charge must cover the raw reservation
+        // plus input-sized scratch at the same instant.
+        {
+            let mut budget = PeakBudget::new(usize::MAX);
+            let found = direct_layer_candidates_charged(
+                &process_dir,
+                maps_path,
+                MAX_LAYER_CANDIDATES,
+                &mut budget,
+            );
+            let identities: Vec<(u64, u64)> = found
+                .iter()
+                .map(|f| {
+                    let meta = f.metadata().unwrap();
+                    (meta.dev(), meta.ino())
+                })
+                .collect();
+            if identities != expected {
+                failures.push(format!(
+                    "success half: expected upper+lowers in order {expected:?}, got {identities:?}"
+                ));
+            }
+            let peak = budget.shared.peak.get();
+            if peak < MAX_MOUNTINFO_READ + size {
+                failures.push(format!(
+                    "success half: peak live charge {peak} does not cover raw {MAX_MOUNTINFO_READ} + scratch {size} (lease dropped early or scratch unreserved)"
+                ));
+            }
+            if budget.reads != size as u64 {
+                failures.push(format!(
+                    "success half: raw read must charge exactly {size} bytes, got {}",
+                    budget.reads
+                ));
+            }
+            if budget.shared.current.get() != 0 {
+                failures.push(format!(
+                    "success half: outstanding charge must release, still {}",
+                    budget.shared.current.get()
+                ));
+            }
+        }
+
+        // Tight half: admits the raw read plus one input of scratch, but not
+        // the raw-plus-copies peak — must refuse fail-closed, no candidates.
+        {
+            let mut budget = PeakBudget::new(MAX_MOUNTINFO_READ + size);
+            let found = direct_layer_candidates_charged(
+                &process_dir,
+                maps_path,
+                MAX_LAYER_CANDIDATES,
+                &mut budget,
+            );
+            if !found.is_empty() {
+                failures.push(format!(
+                    "tight half: budget admitting raw but not copies must refuse, got {} candidates",
+                    found.len()
+                ));
+            }
+            if budget.denials.is_empty() {
+                failures.push(
+                    "tight half: expected a scratch reservation denial, got none".to_string(),
+                );
+            } else {
+                let denied_max = budget.denials.iter().max().copied().unwrap_or(0);
+                if denied_max <= size {
+                    failures.push(format!(
+                        "tight half: denial must exceed the post-raw remainder {size}, got {:?}",
+                        budget.denials
+                    ));
+                }
+            }
+            if budget.reads != size as u64 {
+                failures.push(format!(
+                    "tight half: raw read must be admitted ({size} bytes), got {}",
+                    budget.reads
+                ));
+            }
+            if budget.shared.current.get() != 0 {
+                failures.push(format!(
+                    "tight half: outstanding charge must release on refusal, still {}",
+                    budget.shared.current.get()
+                ));
+            }
+        }
+
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            failures.is_empty(),
+            "layer-discovery peak control RED:\n{}",
+            failures.join("\n")
+        );
+    }
 }
