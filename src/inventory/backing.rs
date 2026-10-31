@@ -265,6 +265,24 @@ fn page_size() -> Result<u64, BackingError> {
     Ok(size as u64)
 }
 
+/// Test-only fault injection for ER-5E-I1: a writable handle of the candidate
+/// plus the witness fault site (1 = candidate page, 2 = re-resolution page)
+/// where the witness truncates the candidate to zero length. The truncation
+/// lands deterministically between the size check and the page touch,
+/// simulating a concurrent truncation. Production builds contain no hook.
+#[cfg(test)]
+static FAULT_TRUNCATE: std::sync::Mutex<Option<(File, u8)>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn fire_fault_hook(site: u8) {
+    let guard = FAULT_TRUNCATE.lock().unwrap();
+    if let Some((file, want)) = guard.as_ref() {
+        if *want == site {
+            let _ = file.set_len(0);
+        }
+    }
+}
+
 /// One guarded read-only private mapping of exactly one candidate page.
 /// Never executable, never mergeable, never retained past verification.
 struct SelfMap {
@@ -470,6 +488,8 @@ impl BackingProcess {
         let index =
             usize::try_from(file_offset - aligned).map_err(|_| BackingError::Unavailable)?;
         let mapping = SelfMap::map(candidate, aligned, page)?;
+        #[cfg(test)]
+        fire_fault_hook(1);
         mapping.fault(index);
         self.check_self_map(&mapping, candidate_fp)?;
         let target_pagemap = open_at(&self.directory, b"pagemap")?;
@@ -495,6 +515,8 @@ impl BackingProcess {
             return Err(BackingError::Changed);
         }
         let fresh_map = SelfMap::map(&fresh, aligned, page)?;
+        #[cfg(test)]
+        fire_fault_hook(2);
         fresh_map.fault(index);
         let fresh_frame = pagemap_frame(&self_pagemap, fresh_map.start() + index as u64, page)?;
         if fresh_frame != own_frame {
@@ -1494,5 +1516,78 @@ mod tests {
         donor.kill().unwrap();
         donor.wait().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// I1 child entry: runs the truncation scenario through the actual
+    /// production caller pair (`BackingProcess::capture` +
+    /// `verify_with_process`) when spawned by
+    /// `truncation_during_verification_refuses_safely` with
+    /// `OSSLSCOPE_BACKING_I1_CHILD=first|second`. No-op otherwise, so
+    /// default suite runs stay fast.
+    #[test]
+    fn i1_truncation_child_entry() {
+        let mode = std::env::var("OSSLSCOPE_BACKING_I1_CHILD").unwrap_or_default();
+        if mode.is_empty() {
+            return;
+        }
+        let site: u8 = match mode.as_str() {
+            "first" => 1,
+            "second" => 2,
+            _ => panic!("unknown I1 child mode"),
+        };
+        // The witness path needs a non-direct pair: overlay mount.
+        let (_guard, base) = mount_overlay();
+        let mut bytes = vec![0x41u8; 4096];
+        bytes.extend_from_slice(&vec![0x42u8; 4096]);
+        std::fs::write(base.join("lower/file"), &bytes).unwrap();
+        let merged = base.join("merged/file");
+        let child = MapChild::spawn(&[merged.clone()]);
+        let range = child.range_of(&merged);
+        let target = child.dir();
+        let candidate = File::open(&merged).unwrap();
+        let writable = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&merged)
+            .unwrap();
+        *FAULT_TRUNCATE.lock().unwrap() = Some((writable, site));
+        let process = BackingProcess::capture(&target).unwrap();
+        match process.verify_with_process(&range, &candidate) {
+            Err(error) => println!("I1-REFUSED:{error:?}"),
+            Ok(_) => panic!("I1 child: verification unexpectedly succeeded after truncation"),
+        }
+    }
+
+    /// I1 RED control (ER-5E-I1): a truncation landing between the witness
+    /// size check and the page touch must yield a typed refusal with
+    /// observer survival, never SIGBUS. Each truncating half runs in a
+    /// spawned child (this same test binary, filtered to
+    /// `i1_truncation_child_entry`) so the RED hazard — the child killed
+    /// by SIGBUS — cannot crash this harness.
+    #[test]
+    #[ignore = "requires privileged overlay mount + map_files/pagemap (5E-I1)"]
+    fn truncation_during_verification_refuses_safely() {
+        for mode in ["first", "second"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .arg("--exact")
+                .arg("inventory::backing::tests::i1_truncation_child_entry")
+                .arg("--nocapture")
+                .env("OSSLSCOPE_BACKING_I1_CHILD", mode)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !output.status.success() {
+                use std::os::unix::process::ExitStatusExt as _;
+                panic!(
+                    "I1 RED (mode={mode}): child did not survive truncation: status={} signal={:?}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                    output.status,
+                    output.status.signal(),
+                );
+            }
+            assert!(
+                stdout.contains("I1-REFUSED:Unavailable"),
+                "I1 (mode={mode}): expected typed Unavailable refusal, got:\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
+            );
+        }
     }
 }
