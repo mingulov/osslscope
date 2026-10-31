@@ -2239,6 +2239,14 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
         .iter()
         .map(|r| (&r.site, r.generation))
         .collect();
+    // ER-5C-I1: when the attribution plane is present (a
+    // certified closed result rode along — bounds, partitions
+    // or both), assets mint exclusively from certified
+    // partitions; unpartitioned calls stay omissions. v2.4
+    // documents carry neither section, so the legacy path below
+    // keeps their exact bytes.
+    let attribution_plane =
+        doc.attribution_bounds.is_some() || !doc.execution_attributions.is_empty();
     let prop = |name: &str, value: String| serde_json::json!({"name": name, "value": value});
     let window_props = || {
         vec![
@@ -2269,6 +2277,11 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
     let mut omitted_ambiguous_calls = 0u64;
     let mut omitted_unknown_sites = 0u64;
     let mut omitted_unknown_calls = 0u64;
+    // ER-5C-I1: would-be-definite sites the attribution plane
+    // kept unpartitioned (unknown/ambiguous sites keep their
+    // buckets on both paths).
+    let mut omitted_unpartitioned_sites = 0u64;
+    let mut omitted_unpartitioned_calls = 0u64;
     let mut omitted_refs: Vec<String> = Vec::new();
     if usable {
         let mut visit = |site: &SiteExecution| {
@@ -2294,6 +2307,17 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
                 omitted_refs.push(omitted_ref(site));
                 return;
             };
+            if attribution_plane {
+                // ER-5C-I1: would-be-definite but unpartitioned —
+                // the candidate plane cannot mint on the
+                // execution plane's watch. The calls stay an
+                // explicit unpartitioned omission.
+                omitted_unpartitioned_sites += 1;
+                omitted_unpartitioned_calls =
+                    omitted_unpartitioned_calls.saturating_add(site.calls);
+                omitted_refs.push(omitted_ref(site));
+                return;
+            }
             let mut props = vec![
                 prop("osslscope:algorithm", asset.algorithm.clone()),
                 prop("osslscope:provider-class", asset.provider_class.clone()),
@@ -2508,6 +2532,19 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
         metadata.push(prop(
             "osslscope:withheld-uncertain-segments",
             bounds.withheld_uncertain.to_string(),
+        ));
+    }
+    // ER-5C-I1: unpartitioned-complete omissions render only
+    // when nonzero (v2.4 documents and fully-covered v2.5
+    // documents keep their exact bytes).
+    if omitted_unpartitioned_sites > 0 || omitted_unpartitioned_calls > 0 {
+        metadata.push(prop(
+            "osslscope:omitted-unpartitioned-sites",
+            omitted_unpartitioned_sites.to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:omitted-unpartitioned-calls",
+            omitted_unpartitioned_calls.to_string(),
         ));
     }
     metadata.extend(window_props());

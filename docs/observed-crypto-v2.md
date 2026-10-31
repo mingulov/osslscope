@@ -457,11 +457,13 @@ cross-build equivalence is implied). The provider definition
 object; identities are labeled `object-bound`, with a
 `canonical-algorithm` property only when the spelling resolved
 (opaque legs name `object-bound:<digest-prefix>` and invent no
-name). Sites carrying partitions suppress the legacy site-rule
-asset (the partition is the finer truth; overlapping calls are
-never double-minted), and the unresolved/withheld counts ride
-as explicit omission metadata. Fetch/query/API rows and hints
-never mint components.
+name). When the attribution plane is present, assets render
+exclusively from certified partitions: the legacy site-rule
+asset is suppressed on every site (partition-covered or not),
+uncovered Complete-coverage calls ride as explicit
+`omitted-unpartitioned-*` omission metadata, and the
+unresolved/withheld counts ride alongside. Fetch/query/API rows
+and hints never mint components.
 
 ## Human report
 
