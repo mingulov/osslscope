@@ -9869,6 +9869,556 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    /// Families-stage closed-collect receipt: the public numbers a
+    /// positive/refusal pin asserts. Mirrors the U5 tail (which stays
+    /// verbatim); only families tests use this helper.
+    struct FamAcquireReceipt {
+        typed_sites: usize,
+        counter_links: usize,
+        sample_sites: usize,
+        sample_calls: u64,
+        joined_sites: usize,
+        joined_calls: u64,
+        definite: usize,
+        unresolved: u64,
+        withheld: u64,
+        next_id: u64,
+        loss: [u64; 8],
+        staged_roles: Vec<u32>,
+        count_roles: Vec<u32>,
+    }
+    /// Families-stage full acquire: pass-1 live-query plan, Enabled
+    /// full-claim lease, typed admit+attach, shared counter at the
+    /// given operational roles, common cut, closed collect. Asserts
+    /// the workload oracle (observed + fresh re-run), ceiling fit at
+    /// every phase, full admission, cut confirmation, and FD release;
+    /// returns the receipt for the caller to pin. `operation` labels
+    /// the counter candidates (observer-side nominal label, as in U5).
+    fn fam_full_acquire(
+        argv: &[String],
+        dir: &std::path::Path,
+        tag: &str,
+        oracle: &str,
+        wanted_roles: &[u32],
+        operation: super::schema::Operation,
+    ) -> FamAcquireReceipt {
+        use crate::capture::ClockPort as _;
+        const CEILING: usize = 67108864;
+        let normalize = |text: &str| {
+            text.trim()
+                .replace([':', '\n', ' '], "")
+                .to_ascii_uppercase()
+        };
+        let (plan, pass1_digest) = fam_pass1_plan_from_live_queries(argv, dir, tag);
+        assert_eq!(pass1_digest, oracle);
+        let baseline = source_native_fd_targets();
+        let stdout_path = dir.join("out2.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            Some(&plan),
+        )
+        .unwrap();
+        eprintln!(
+            "{tag} startup apis={} typed={} copied_skipped={}",
+            startup.apis.len(),
+            startup.typed.len(),
+            startup.copied_skipped,
+        );
+        assert_eq!(
+            startup.copied_skipped, 0,
+            "{tag}: pass-2 rescan agrees with the pass-1 plan on every site"
+        );
+        let spent_discovery = budget.state_spent_test();
+        eprintln!("{tag} spent after-discovery={spent_discovery}");
+        assert!(
+            spent_discovery < CEILING,
+            "{tag}: discovery must fit the ceiling"
+        );
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            ..
+        } = startup;
+        let legacy_sites = apis.len();
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), legacy_sites);
+        let spent_prearm = session.budget.state_spent_test();
+        eprintln!("{tag} spent after-prearm={spent_prearm}");
+        assert!(spent_prearm < CEILING, "{tag}: prearm must fit the ceiling");
+        let mut fds = Vec::new();
+        let mut triples = Vec::new();
+        for attachment in &session.startup[&pid] {
+            let fd = attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .unwrap();
+            triples.push((
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+                attachment.site.file_offset(),
+                pid,
+            ));
+            fds.push(fd);
+        }
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(triples),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(60),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let typed_sites = session.typed_startup.len();
+        let spent_prepare = session.budget.state_spent_test();
+        eprintln!("{tag} spent after-prepare-typed={spent_prepare}");
+        assert!(
+            spent_prepare < CEILING,
+            "{tag}: typed prepare must fit the ceiling"
+        );
+        let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let deadline_ns = start_ns + 15_000_000_000;
+        let borrowed = session.borrowed_producer_maps().expect("producer maps");
+        let mut counter = crate::focused_count::FocusedCounter::open_gated_shared(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns,
+                },
+                ..Default::default()
+            },
+            gate.clone(),
+            &borrowed,
+        )
+        .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "{tag}: full-{legacy_sites} acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        let spent_acquire = session.budget.state_spent_test();
+        eprintln!("{tag} spent after-acquire={spent_acquire}");
+        assert!(
+            spent_acquire < CEILING,
+            "{tag}: full acquire must fit the ceiling"
+        );
+        assert_eq!(
+            receipts.attachments.len(),
+            legacy_sites,
+            "{tag}: every claim acquires"
+        );
+        assert_eq!(
+            session.typed_site_records().len(),
+            typed_sites,
+            "{tag}: every staged typed site must admit"
+        );
+        drop(fds);
+        let mut count_roles: Vec<u32> = session
+            .typed_site_records()
+            .values()
+            .map(|record| record.role_id)
+            .filter(|role| wanted_roles.contains(role))
+            .collect();
+        count_roles.sort_unstable();
+        count_roles.dedup();
+        eprintln!("{tag} count_roles={count_roles:?}");
+        assert_eq!(
+            count_roles, wanted_roles,
+            "{tag}: the wanted operational roles stage"
+        );
+        let mut candidates = Vec::new();
+        for staged in &session.typed_startup {
+            if !count_roles.contains(&staged.role().id()) {
+                continue;
+            }
+            let site = staged.site().clone();
+            let starttime = site.starttime();
+            let record = super::wire::contract::Record {
+                pid: child.pid(),
+                tid: child.pid(),
+                generation: site.generation(),
+                ..super::wire::contract::Record::default()
+            };
+            candidates.push(crate::focused_count::CountCandidate::Learned(
+                VerifiedSiteCandidate {
+                    site,
+                    pid: child.pid(),
+                    starttime,
+                    generation: record.generation,
+                    advertisers: Vec::new(),
+                    operation,
+                    numeric_operation: 0,
+                    dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                        session.typed_startup[0].site().object_hash(),
+                        starttime,
+                        &record,
+                    ),
+                    observed_ns: start_ns,
+                    algorithm: super::schema::AlgorithmId::try_from(u16::MAX).unwrap(),
+                    alias_quality: super::schema::AliasQuality::default(),
+                    function: super::schema::FunctionIdentity::new(operation, 0).unwrap(),
+                },
+            ));
+        }
+        let staged_operational = session
+            .typed_startup
+            .iter()
+            .filter(|staged| count_roles.contains(&staged.role().id()))
+            .count();
+        assert_eq!(
+            candidates.len(),
+            staged_operational,
+            "{tag}: one counter site per staged operational site"
+        );
+        counter
+            .attach_candidates_pinned(
+                candidates,
+                start_ns,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                session.typed_pins(),
+            )
+            .unwrap();
+        let counter_links = counter.active_link_count();
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "{tag}: workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            child.poll_exit().unwrap(),
+            Some(0),
+            "{tag}: workload must exit 0"
+        );
+        child.finish_observation().unwrap();
+        let digest = normalize(&std::fs::read_to_string(&stdout_path).unwrap());
+        assert_eq!(digest, oracle, "{tag}: observed output must verify");
+        let rerun = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(
+            rerun.status.success(),
+            "{tag}: unobserved re-run must exit 0"
+        );
+        let rerun_digest = normalize(&String::from_utf8_lossy(&rerun.stdout));
+        assert_eq!(rerun_digest, oracle, "{tag}: unobserved re-run must agree");
+        assert_eq!(digest, rerun_digest, "{tag}: observed and re-run agree");
+        session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let cpus = counter.cpus();
+        let sample = counter.close(Instant::now() + Duration::from_secs(10));
+        let records: Vec<(u64, TypedSiteRecord)> = session
+            .typed_site_records()
+            .iter()
+            .map(|(cookie, record)| (*cookie, record.clone()))
+            .collect();
+        session
+            .charge_attribution_final(
+                8192usize
+                    .checked_mul(104 + 24 * cpus)
+                    .and_then(|n| n.checked_add(1024 * (16 + 64)))
+                    .and_then(|n| n.checked_add(1024 * (24 + 56)))
+                    .and_then(|n| n.checked_add(8 * 8 * cpus))
+                    .and_then(|n| n.checked_add(64))
+                    .unwrap(),
+            )
+            .unwrap();
+        let spent_collect = session.budget.state_spent_test();
+        eprintln!("{tag} spent after-collect-charge={spent_collect}");
+        assert!(
+            spent_collect < CEILING,
+            "{tag}: collect charge must fit the ceiling"
+        );
+        let maps = session.attribution_maps().expect("attribution maps");
+        let mut admitted = Vec::with_capacity(records.len());
+        for (cookie, record) in &records {
+            admitted.push(crate::attribution::AdmittedTypedSite {
+                cookie: *cookie,
+                site_id: std::num::NonZeroU64::new(record.site_id).unwrap(),
+                role_id: record.role_id,
+                object: record.object.clone(),
+                device: record.device,
+                inode: record.inode,
+                offset: record.offset,
+                object_id: record.object_id,
+                source_epoch: record.source_epoch,
+            });
+        }
+        let end_ns = crate::capture::LiveClock
+            .checked_monotonic_ns()
+            .unwrap()
+            .min(deadline_ns);
+        let admission = crate::evidence::CountAdmissionWindow {
+            start_ns,
+            deadline_ns,
+        };
+        let finalized = crate::attribution::collect_closed_attribution(
+            gate.owned_closed().expect("closed gate"),
+            &gate,
+            &maps,
+            cpus,
+            &sample,
+            &admitted,
+            admission,
+            crate::evidence::CaptureWindow {
+                requested_start_ns: start_ns,
+                requested_end_ns: deadline_ns,
+                effective_start_ns: start_ns,
+                effective_end_ns: end_ns.max(start_ns),
+                signal_cut: false,
+                count_admission: Some(admission),
+            },
+        )
+        .unwrap_or_else(|error| panic!("{tag}: closed collect failed: {error:?}"));
+        let mut joined_sites = 0usize;
+        let mut joined_calls = 0u64;
+        for execution in &sample.sites {
+            if admitted.iter().any(|site| {
+                site.object == execution.site.object
+                    && site.device == execution.site.device
+                    && site.inode == execution.site.inode
+                    && site.offset == execution.site.offset
+            }) {
+                joined_sites += 1;
+                joined_calls += execution.calls;
+            }
+        }
+        let sample_calls: u64 = sample.sites.iter().map(|site| site.calls).sum();
+        let next_producer_id = {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("ATTRIB_CONTROL")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[2], 4, 64).unwrap();
+            let mut value = [0u8; 64];
+            map.lookup(&0u32.to_ne_bytes(), &mut value).unwrap();
+            u64::from_ne_bytes(value[32..40].try_into().unwrap())
+        };
+        let mut loss_cells = [0u64; 8];
+        {
+            let fd = session
+                .source_owner
+                .as_ref()
+                .unwrap()
+                .owned_map("PRODUCER_LOSS")
+                .unwrap();
+            let map = loader::BorrowedMap::new(fd).unwrap();
+            map.shape(&[6], 4, 8).unwrap();
+            for (cell, total) in loss_cells.iter_mut().enumerate() {
+                let mut values = vec![0u8; 8 * cpus];
+                map.lookup(&(cell as u32).to_ne_bytes(), &mut values)
+                    .unwrap();
+                for cpu in 0..cpus {
+                    *total += u64::from_ne_bytes(values[cpu * 8..cpu * 8 + 8].try_into().unwrap());
+                }
+            }
+        }
+        eprintln!(
+            "{tag}: typed={typed_sites} counter_links={counter_links} sample_sites={} sample_calls={sample_calls} joined_sites={joined_sites} joined_calls={joined_calls} definite={} unresolved={} withheld={} next_id={next_producer_id} loss={loss_cells:?}",
+            sample.sites.len(),
+            finalized.definite().len(),
+            finalized.unresolved_calls(),
+            finalized.withheld_uncertain(),
+        );
+        let mut staged_roles: Vec<u32> = records.iter().map(|(_, record)| record.role_id).collect();
+        staged_roles.sort_unstable();
+        eprintln!("{tag} staged_roles={staged_roles:?}");
+        for execution in &sample.sites {
+            if execution.calls == 0 {
+                continue;
+            }
+            let role = admitted
+                .iter()
+                .find(|site| {
+                    site.object == execution.site.object
+                        && site.device == execution.site.device
+                        && site.inode == execution.site.inode
+                        && site.offset == execution.site.offset
+                })
+                .map(|site| site.role_id)
+                .unwrap_or(u32::MAX);
+            eprintln!(
+                "{tag} hit role={role} offset={} calls={} first_ns={} last_ns={}",
+                execution.site.offset, execution.calls, execution.first_ns, execution.last_ns,
+            );
+        }
+        let receipt = FamAcquireReceipt {
+            typed_sites,
+            counter_links,
+            sample_sites: sample.sites.len(),
+            sample_calls,
+            joined_sites,
+            joined_calls,
+            definite: finalized.definite().len(),
+            unresolved: finalized.unresolved_calls(),
+            withheld: finalized.withheld_uncertain(),
+            next_id: next_producer_id,
+            loss: loss_cells,
+            staged_roles,
+            count_roles,
+        };
+        drop(finalized);
+        drop(sample);
+        let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "{tag}: close must confirm the cut");
+        assert!(close.first_error.is_none());
+        assert!(
+            !close.order_refused,
+            "{tag}: the completed order must not refuse"
+        );
+        drop(session);
+        drop(gate);
+        drop(child);
+        drop(receipts);
+        drop(lease);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "{tag}: the full flow must release every fd"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        receipt
+    }
+    /// Families-stage KDF positive pin (host 3.5.5 lane): the U5
+    /// §12.3 shape on the stock HKDF workload with the counter at the
+    /// KDF operational roles (307/308). The derive hit (307)
+    /// attributes into one definite partition; the reset hit (308) is
+    /// the free-path teardown reset — `kdf_hkdf_free` calls the
+    /// dispatch RESET entry directly on 3.0/3.5 (HKDF provider source),
+    /// after the operational interval — and correctly fails closed
+    /// (definite=0 for it even alone, conservation holds either way).
+    /// On 4.0.3 free bypasses the dispatch entry via `reset_ex`, so
+    /// 308 stays dark there (firemap §28). Conservation: 2 known + 3
+    /// loss-bound foreign − 1 assigned = 4 unresolved.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// sudo -n <lib test binary> \
+    ///     kdf_full_acquire_positive_on_stock_hkdf_workload --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "families KDF positive (sudo, pinned BPF objects)"]
+    fn kdf_full_acquire_positive_on_stock_hkdf_workload() {
+        const TAG: &str = "fam-kdf-pos";
+        let openssl = fam_openssl_argv0();
+        assert_eq!(
+            openssl, "/usr/bin/openssl",
+            "the KDF positive pin is host-lane exact"
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-fam-kdf-pos-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let argv = fam_openssl_kdf_argv(&openssl);
+        let receipt = fam_full_acquire(
+            &argv,
+            &dir,
+            TAG,
+            FAM_KDF_OKM,
+            &[307, 308],
+            super::schema::Operation::Kdf,
+        );
+        assert_eq!(receipt.count_roles, vec![307, 308]);
+        assert_eq!(
+            receipt.typed_sites, 130,
+            "17 first-slice + query + 49 MAC + 63 KDF"
+        );
+        assert_eq!(receipt.counter_links, 1);
+        assert_eq!(receipt.sample_sites, 26, "14 derive + 12 reset staged");
+        assert_eq!(receipt.sample_calls, 2, "KDF derive + free-path reset fire");
+        assert_eq!(
+            receipt.joined_sites, 26,
+            "every sample joins an admitted site"
+        );
+        assert_eq!(receipt.joined_calls, 2, "both operational hits join");
+        assert_eq!(
+            receipt.definite, 1,
+            "positive: the derive hit attributes; the teardown reset fails closed"
+        );
+        assert_eq!(
+            receipt.unresolved, 4,
+            "the teardown hit plus the 3 loss-bound foreign calls"
+        );
+        assert_eq!(receipt.withheld, 0);
+        assert_eq!(receipt.next_id, 151);
+        assert_eq!(
+            receipt.loss,
+            [0, 0, 1, 2, 0, 0, 0, 0],
+            "same loss shape as U5 (frame miss + teardown poisons)"
+        );
+        let mut expected_roles = vec![
+            5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 161,
+        ];
+        expected_roles.extend(std::iter::repeat_n(258, 9));
+        expected_roles.extend(std::iter::repeat_n(259, 14));
+        expected_roles.extend(std::iter::repeat_n(274, 8));
+        expected_roles.extend(std::iter::repeat_n(275, 12));
+        expected_roles.extend(std::iter::repeat_n(290, 8));
+        expected_roles.extend(std::iter::repeat_n(291, 11));
+        expected_roles.extend(std::iter::repeat_n(304, 8));
+        expected_roles.extend(std::iter::repeat_n(305, 8));
+        expected_roles.extend(std::iter::repeat_n(306, 8));
+        expected_roles.extend(std::iter::repeat_n(307, 14));
+        expected_roles.extend(std::iter::repeat_n(308, 12));
+        assert_eq!(
+            receipt.staged_roles, expected_roles,
+            "17 first-slice + query + 49 MAC + 63 KDF copied, every one admitted"
+        );
+    }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_return_registration_withholds_ready_and_operands() {
