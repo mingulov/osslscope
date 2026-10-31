@@ -525,7 +525,7 @@ use crate::evidence::CaptureDocument;
 use crate::evidence::{
     CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits, DispositionOutcome,
     EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict,
-    RuleVerdict, SiteExecution,
+    RuleVerdict, SiteExecution, SiteKey,
 };
 
 /// Primary artifact format for [`OutputRequest`].
@@ -1710,6 +1710,49 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         }
         s.push('\n');
     }
+    // v2.5: the execution-attribution plane renders only when
+    // the closed collect certified a result (old-shaped
+    // documents keep their exact bytes). A dangling selector
+    // index marks visibly (validated documents never carry
+    // one); the CBOM renderer refuses such documents outright.
+    if !doc.execution_attributions.is_empty() || doc.attribution_bounds.is_some() {
+        let (unresolved, withheld) = doc
+            .attribution_bounds
+            .map(|b| (b.unresolved_calls, b.withheld_uncertain))
+            .unwrap_or((0, 0));
+        s.push_str(&format!(
+            "execution attributions ({} partitions, {} unresolved calls, {} withheld):\n",
+            doc.execution_attributions.len(),
+            grouped(unresolved),
+            withheld,
+        ));
+        for row in &doc.execution_attributions {
+            let identity = match doc.algorithm_selectors.get(row.selector as usize) {
+                Some(entry) => match &entry.canonical_name {
+                    Some(canonical) => safe_display(canonical),
+                    None => format!("object-bound {}", fp_short(&entry.id)),
+                },
+                None => "(unlisted selector)".to_string(),
+            };
+            let definition = row
+                .provider_definition
+                .as_ref()
+                .map(|o| safe_display(&fp_short(&o.0)))
+                .unwrap_or_else(|| "unknown".to_string());
+            s.push_str(&format!(
+                "  segment {} site {} file-offset={} gen={}: {} calls, {} ({}) [provider-definition {}]\n",
+                row.segment,
+                safe_display(&fp_short(&row.site.object.0)),
+                row.site.offset,
+                row.generation,
+                grouped(row.calls),
+                identity,
+                op_display(row.operation),
+                definition,
+            ));
+        }
+        s.push('\n');
+    }
     // R05: the ENGINE observation plane renders only when observed
     // (old-shaped documents keep their exact bytes). Counts are
     // untimed tripwire evidence with explicit window provenance —
@@ -2132,7 +2175,7 @@ fn gap_reason_human(reason: &GapReason) -> String {
 /// pass/violation/PARTIAL/inconclusive; explicit empty/fatal
 /// artifact when no evidence exists.
 pub fn render_cbom(doc: &CaptureDocument) -> anyhow::Result<Vec<u8>> {
-    let mut out = serde_json::to_vec_pretty(&cbom_json(doc))?;
+    let mut out = serde_json::to_vec_pretty(&cbom_json(doc)?)?;
     out.push(b'\n');
     Ok(out)
 }
@@ -2178,7 +2221,7 @@ fn bom_slug(text: &str) -> String {
         .collect()
 }
 
-fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
+fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
     // Eligibility is the shared fatal-kind distinction
     // (has_usable_evidence): usable fatal docs enumerate definite
     // assets with the same per-site accounting as any usable doc
@@ -2186,6 +2229,17 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
     // sites, so they enumerate none), while evidence-free fatal
     // docs stay empty.
     let usable = doc.has_usable_evidence();
+    // Sites carrying certified partitions: the partition is the
+    // finer truth, so the legacy site-rule asset is suppressed
+    // there (conservation — no double-mint of overlapping calls)
+    // and the unresolved bound absorbs the remainder. v2.4
+    // documents carry no partitions, so their CBOMs keep exact
+    // bytes.
+    let covered: std::collections::BTreeSet<(&SiteKey, u32)> = doc
+        .execution_attributions
+        .iter()
+        .map(|r| (&r.site, r.generation))
+        .collect();
     let prop = |name: &str, value: String| serde_json::json!({"name": name, "value": value});
     let window_props = || {
         vec![
@@ -2220,6 +2274,13 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
     if usable {
         let mut visit = |site: &SiteExecution| {
             if site.calls == 0 {
+                return;
+            }
+            if covered.contains(&(&site.site, site.generation)) {
+                // Partition-covered: assets come from the
+                // partitions below (once each), never from the
+                // site rule — and the remainder is unresolved
+                // bound, not legacy omission.
                 return;
             }
             if site.candidates_coverage == CandidateCoverage::Unknown {
@@ -2281,6 +2342,83 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
             for site in &bucket.sites {
                 visit(site);
             }
+        }
+        // One component per certified partition (v2.5, document
+        // order): the provider definition (often Unknown) stays
+        // separate from the executing code object, identities are
+        // labeled object-bound, and the bom-ref carries the full
+        // site+segment key (never a bare algorithm name — no
+        // cross-build equivalence). A dangling selector index
+        // refuses the render (validated documents never carry
+        // one): an audit artifact drops no partition silently.
+        for row in &doc.execution_attributions {
+            let entry = doc
+                .algorithm_selectors
+                .get(row.selector as usize)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "execution attribution segment {} cites no listed selector",
+                        row.segment
+                    )
+                })?;
+            let name = match &entry.canonical_name {
+                Some(canonical) => format!(
+                    "{} ({}) via object-bound execution",
+                    canonical,
+                    op_display(row.operation)
+                ),
+                None => format!(
+                    "object-bound {} ({})",
+                    fp_short(&entry.id),
+                    op_display(row.operation)
+                ),
+            };
+            let mut props = vec![
+                prop("osslscope:selector-scope", "object-bound".to_string()),
+                prop("osslscope:selector-object", entry.object.0.clone()),
+                prop("osslscope:selector-id", entry.id.clone()),
+                prop(
+                    "osslscope:provider-definition",
+                    row.provider_definition
+                        .as_ref()
+                        .map(|o| o.0.clone())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ),
+                prop("osslscope:code-object", row.site.object.0.clone()),
+                prop("osslscope:op", op_display(row.operation)),
+                prop("osslscope:funcid", row.function.to_string()),
+                prop("osslscope:calls", row.calls.to_string()),
+                prop("osslscope:generation", row.generation.to_string()),
+                prop("osslscope:segment", row.segment.to_string()),
+                prop(
+                    "osslscope:provider-instance",
+                    row.provider_instance.to_string(),
+                ),
+                prop("osslscope:attribution-scope", row.scope.clone()),
+                prop(
+                    "osslscope:execution-evidence-completeness",
+                    status_str(doc).to_string(),
+                ),
+            ];
+            if let Some(canonical) = &entry.canonical_name {
+                props.insert(1, prop("osslscope:canonical-algorithm", canonical.clone()));
+            }
+            props.extend(window_props());
+            components.push(serde_json::json!({
+                "bom-ref": format!(
+                    "urn:osslscope:exec-attr:v2.5:{}:{}:{}:{}:{}:{}",
+                    row.generation,
+                    row.site.device,
+                    row.site.inode,
+                    row.site.offset,
+                    row.site.object.0,
+                    row.segment,
+                ),
+                "type": "cryptographic-asset",
+                "name": name,
+                "cryptoProperties": {"assetType": "algorithm"},
+                "properties": props,
+            }));
         }
     }
     // Omitted refs stay explicit but bounded (16 refs, then a count).
@@ -2355,6 +2493,24 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
             in_window_calls.to_string(),
         ));
     }
+    // v2.5 attribution accounting renders only when the closed
+    // collect certified a result (old-shaped CBOMs keep their
+    // exact bytes). Unresolved calls are explicit omissions, not
+    // absence: absence stays not-observed.
+    if let Some(bounds) = &doc.attribution_bounds {
+        metadata.push(prop(
+            "osslscope:execution-partitions",
+            doc.execution_attributions.len().to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:unresolved-attribution-calls",
+            bounds.unresolved_calls.to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:withheld-uncertain-segments",
+            bounds.withheld_uncertain.to_string(),
+        ));
+    }
     metadata.extend(window_props());
     if let Some(policy) = &doc.policy {
         metadata.push(prop(
@@ -2419,13 +2575,13 @@ fn cbom_json(doc: &CaptureDocument) -> serde_json::Value {
             metadata.push(prop("osslscope:completeness-disclaimer", disclaimer));
         }
     }
-    serde_json::json!({
+    Ok(serde_json::json!({
         "bomFormat": "CycloneDX",
         "specVersion": "1.6",
         "version": 1,
         "metadata": {"properties": metadata},
         "components": components,
-    })
+    }))
 }
 
 /// Bound a diagnostic to one line of at most 200 chars (destinations
