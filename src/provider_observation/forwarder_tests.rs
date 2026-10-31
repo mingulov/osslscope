@@ -120,6 +120,7 @@ fn parsed(f: &ForwarderFixture) -> ElfObject {
     );
     let object = Object {
         stamp: Stamp::of(&file.metadata().unwrap()),
+        page: None,
         file,
         parse_deferred: Cell::new(false),
         anchor: OnceCell::new(),
@@ -520,6 +521,7 @@ fn forwarding_deadlines_stop_in_memory_work_without_caching_partial_parse() {
         let file = fixture.file();
         let object = Object {
             stamp: Stamp::of(&file.metadata().unwrap()),
+            page: None,
             file,
             parse_deferred: Cell::new(false),
             anchor: OnceCell::new(),

@@ -584,6 +584,9 @@ fn unchanged_for_backing(before: &Fingerprint, after: &Fingerprint) -> bool {
 }
 
 /// One-shot verification: capture the process view, then verify.
+/// Canonical entry point; production hot paths share one capture per
+/// process via [`BackingProcess::capture`] instead. Exercised by unit tests.
+#[allow(dead_code)]
 pub(crate) fn verify_mapped_backing(
     target: &File,
     range: &MappedRange,
@@ -623,6 +626,14 @@ impl BackingAssociation {
     /// never share one record.
     pub(crate) fn witness_page(&self) -> Option<u64> {
         self.page
+    }
+
+    /// Verified echo of the matched mapping: start, end, file offset, maps
+    /// inode. Lets owners bind custody to the verified record instead of
+    /// their own possibly stale parse. The rendered device is deliberately
+    /// not echoed: backing identity comes from the approved descriptor.
+    pub(crate) fn mapping_keys(&self) -> (u64, u64, u64, u64) {
+        (self.vma.start, self.vma.end, self.vma.pgoff, self.vma.ino)
     }
 
     /// Re-prove the association against live state. The witness path re-runs

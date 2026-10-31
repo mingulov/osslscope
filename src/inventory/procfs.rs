@@ -5,7 +5,7 @@
 use super::{
     Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, ModuleInfo,
     ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, ProcessRecord, Scope,
-    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, elf,
+    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, backing, elf,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
@@ -213,12 +213,17 @@ struct Cached {
     seen: bool,
 }
 
+/// Cache identity: native fingerprint plus the association's witnessed page
+/// (`None` on the direct path). Two layers sharing one rendered identity
+/// never share one cache entry.
+type CacheKey = (Fingerprint, Option<u64>);
+
 /// Metadata and retained descriptors only; no mapped bytes or history.
 #[derive(Default)]
 pub(super) struct ScanState {
     pub(super) memory: Option<crate::observation_memory::MemoryPool>,
     pub(super) records_memory: Vec<crate::observation_memory::MemoryLease>,
-    cache: BTreeMap<Fingerprint, Cached>,
+    cache: BTreeMap<CacheKey, Cached>,
     cursor: Option<u32>,
 }
 struct Work<'a> {
@@ -229,7 +234,7 @@ struct Work<'a> {
     started: Instant,
     totals: WorkTotals,
     gaps: BTreeSet<Gap>,
-    cache: BTreeMap<Fingerprint, Cached>,
+    cache: BTreeMap<CacheKey, Cached>,
 }
 struct ReadBuffer {
     bytes: Vec<u8>,
@@ -321,12 +326,18 @@ impl Work<'_> {
             bytes.extend_from_slice(&chunk[..read]);
         }
     }
-    fn inspect(&mut self, mut file: File, metadata: &Metadata) -> Result<ModuleInfo, GapReason> {
+    fn inspect(
+        &mut self,
+        mut file: File,
+        metadata: &Metadata,
+        page: Option<u64>,
+    ) -> Result<ModuleInfo, GapReason> {
         let fingerprint = Fingerprint::from(metadata);
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
         }
-        if let Some(cached) = self.cache.get_mut(&fingerprint) {
+        let key = (fingerprint.clone(), page);
+        if let Some(cached) = self.cache.get_mut(&key) {
             cached.seen = true;
             return cached.info.clone();
         }
@@ -379,7 +390,7 @@ impl Work<'_> {
             }
         }
         self.cache.insert(
-            fingerprint,
+            key,
             Cached {
                 _memory: lease,
                 file,
@@ -421,27 +432,58 @@ fn direct_filesystem(file: &File) -> bool {
     )
 }
 fn backing(
+    view: Option<&backing::BackingProcess>,
     process: &Process,
     mapping: &Mapping<'_>,
-) -> Result<(File, Metadata, IdentityStatus), GapReason> {
+) -> Result<(File, Metadata, IdentityStatus, Option<u64>), GapReason> {
     // Acquisition failures must remain distinct from a successfully acquired
     // LocatorCandidate: failure leaves mapping visibility unresolved and can
     // never support a sampled absence claim in watch.
     let name = format!("map_files/{}", mapping.map_name());
+    let mut ordered: Vec<File> = Vec::new();
+    let mut have_direct = false;
     if let Ok(file) = open_at(&process.directory, name.as_bytes()) {
+        ordered.push(file);
+        have_direct = true;
+    }
+    // Common verification first: the range-bound descriptor, then direct
+    // layer resolutions. The first verified candidate wins and its
+    // descriptor is retained through parsing.
+    if let Some(view) = view {
+        let range = backing::MappedRange {
+            start: mapping.start,
+            end: mapping.end,
+        };
+        ordered.extend(backing::direct_layer_candidates(
+            &process.directory,
+            mapping.path,
+            16,
+        ));
+        for index in 0..ordered.len() {
+            if let Ok(association) = view.verify_with_process(&range, &ordered[index]) {
+                let page = association.witness_page();
+                let file = ordered.remove(index);
+                let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
+                return Ok((file, metadata, IdentityStatus::Verified, page));
+            }
+        }
+    }
+    // Legacy fallback: no verified candidate. A mapping-bound descriptor on
+    // a nonstackable filesystem keeps its previous status (reachable only
+    // without a process view, or when verification itself was unavailable).
+    if have_direct {
+        let file = ordered.remove(0);
         let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
-        // A mapping-bound descriptor on a nonstackable filesystem is the
-        // association proof, including Btrfs' distinct anonymous st_dev.
         if direct_filesystem(&file)
             && metadata.ino() == mapping.inode
             && (metadata.dev() == mapping.device || filesystem(&file) == Some(0x9123683e))
         {
-            return Ok((file, metadata, IdentityStatus::Verified));
+            return Ok((file, metadata, IdentityStatus::Verified, None));
         }
         // A locator may still be useful on overlay, but not after obvious
         // replacement by an inode different from the mapping's inode.
         if metadata.ino() == mapping.inode {
-            return Ok((file, metadata, IdentityStatus::LocatorCandidate));
+            return Ok((file, metadata, IdentityStatus::LocatorCandidate, None));
         }
         return Err(GapReason::BackingUnavailable);
     }
@@ -459,7 +501,7 @@ fn backing(
     {
         return Err(GapReason::BackingUnavailable);
     }
-    Ok((file, metadata, IdentityStatus::LocatorCandidate))
+    Ok((file, metadata, IdentityStatus::LocatorCandidate, None))
 }
 
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
@@ -487,6 +529,9 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     let maps_file =
         open_at(&process.directory, b"maps").map_err(|_| GapReason::ProcessUnavailable)?;
     let maps = work.read(maps_file, work.options.limits.max_maps_bytes)?;
+    // One backing view per process; without it every mapping keeps its
+    // previous legacy status (never a new failure).
+    let view = backing::BackingProcess::capture(&process.directory).ok();
     let mut modules = Vec::new();
     let mut verified = BTreeSet::new();
     let mut attempts = 0;
@@ -514,41 +559,44 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         // Bound mapping/open attempts even when locators collide or fail.
         attempts += 1;
         work.totals.objects_attempted += 1;
-        let (file, metadata, identity_status) = match backing(&process, &mapping) {
-            Ok(bound) => bound,
-            Err(reason) => {
-                work.gap(Some(pid), Some(&mapping), reason);
-                continue;
-            }
-        };
+        let (file, metadata, identity_status, page) =
+            match backing(view.as_ref(), &process, &mapping) {
+                Ok(bound) => bound,
+                Err(reason) => {
+                    work.gap(Some(pid), Some(&mapping), reason);
+                    continue;
+                }
+            };
         if identity_status == IdentityStatus::LocatorCandidate {
             work.gap(Some(pid), Some(&mapping), GapReason::IdentityUnverified);
         }
         let fingerprint = Fingerprint::from(&metadata);
+        let key = (fingerprint.clone(), page);
         // A maps superblock device/inode pair is not unique across Btrfs
-        // subvolumes. Only verified associations may share a retained native
-        // backing fingerprint. Uncertain locators remain separate records.
-        if identity_status == IdentityStatus::Verified && verified.contains(&fingerprint) {
+        // subvolumes, and one rendered overlay identity can hide two layers.
+        // Only verified associations may share a retained cache key.
+        // Uncertain locators remain separate records.
+        if identity_status == IdentityStatus::Verified && verified.contains(&key) {
             continue;
         }
         // Charge metadata, vector growth and temporary fingerprint/set copies
         // before cloning cached or newly inspected module metadata.
         work.reserve_record(2048)?;
-        match work.inspect(file, &metadata) {
+        match work.inspect(file, &metadata, page) {
             Ok(info) if work.include_other || info.kind != ObjectKind::Other => modules.push((
                 ModuleRecord {
                     info,
                     identity_status,
                 },
-                fingerprint.clone(),
+                key.clone(),
             )),
             Ok(_) | Err(GapReason::NotElf) => {}
             Err(reason) => work.gap(Some(pid), Some(&mapping), reason),
         }
         // The cache holds the descriptor alive; failed admission alone is
         // not retained identity evidence and must not suppress another VMA.
-        if identity_status == IdentityStatus::Verified && work.cache.contains_key(&fingerprint) {
-            verified.insert(fingerprint);
+        if identity_status == IdentityStatus::Verified && work.cache.contains_key(&key) {
+            verified.insert(key);
         }
     }
     // Recheck maps, the held proc directory's incarnation, and the actual
@@ -571,12 +619,12 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
             }
         }
     }
-    modules.retain(|(module, fingerprint)| {
+    modules.retain(|(module, key)| {
         let unchanged = work
             .cache
-            .get(fingerprint)
+            .get(key)
             .and_then(|cached| cached.file.metadata().ok())
-            .is_some_and(|metadata| Fingerprint::from(&metadata) == *fingerprint);
+            .is_some_and(|metadata| Fingerprint::from(&metadata) == key.0);
         if !unchanged {
             work.gaps.insert(Gap {
                 pid: Some(pid),
@@ -646,7 +694,7 @@ pub(super) fn snapshot_reused(
             && value
                 .file
                 .metadata()
-                .is_ok_and(|m| Fingerprint::from(&m) == *key)
+                .is_ok_and(|m| Fingerprint::from(&m) == key.0)
     });
     while cache.len() > options.limits.max_objects {
         cache.pop_first();
@@ -736,7 +784,7 @@ pub(super) fn snapshot_reused(
             && value
                 .file
                 .metadata()
-                .is_ok_and(|m| Fingerprint::from(&m) == *key)
+                .is_ok_and(|m| Fingerprint::from(&m) == key.0)
     });
     state.cache = std::mem::take(&mut work.cache);
     state.records_memory = std::mem::take(&mut work.records_memory);
@@ -880,7 +928,7 @@ mod tests {
         };
         for _ in 0..3 {
             assert_eq!(
-                work.inspect(File::open("/bin/true").unwrap(), &metadata),
+                work.inspect(File::open("/bin/true").unwrap(), &metadata, None),
                 Err(GapReason::ReadLimit)
             );
             assert_eq!(work.totals.read_bytes, 0);
@@ -888,11 +936,11 @@ mod tests {
             assert!(work.cache.is_empty());
         }
         drop(busy);
-        work.inspect(File::open("/bin/true").unwrap(), &metadata)
+        work.inspect(File::open("/bin/true").unwrap(), &metadata, None)
             .unwrap();
         assert_eq!(work.totals.read_bytes, metadata.len() + 1);
         assert_eq!(work.totals.objects_inspected, 1);
-        work.inspect(File::open("/bin/true").unwrap(), &metadata)
+        work.inspect(File::open("/bin/true").unwrap(), &metadata, None)
             .unwrap();
         assert_eq!(work.totals.read_bytes, metadata.len() + 1);
     }
@@ -917,12 +965,12 @@ mod tests {
             cache: BTreeMap::new(),
         };
         assert_eq!(
-            work.inspect(File::open(&path).unwrap(), &metadata),
+            work.inspect(File::open(&path).unwrap(), &metadata, None),
             Err(GapReason::NotElf)
         );
         writer.write_all(b"grown").unwrap();
         assert_eq!(
-            work.inspect(File::open(&path).unwrap(), &metadata),
+            work.inspect(File::open(&path).unwrap(), &metadata, None),
             Err(GapReason::Changed)
         );
         let mut fresh = Work {
@@ -936,7 +984,7 @@ mod tests {
             cache: BTreeMap::new(),
         };
         assert_eq!(
-            fresh.inspect(File::open(&path).unwrap(), &metadata),
+            fresh.inspect(File::open(&path).unwrap(), &metadata, None),
             Err(GapReason::Changed)
         );
         assert_eq!(fresh.totals.read_bytes, 0);

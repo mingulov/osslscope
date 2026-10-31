@@ -10,6 +10,7 @@ use super::static_tables::{
 use crate::attribution::TypedRoleId;
 use crate::inventory::{
     self, IdentityStatus, ModuleInfo, NamespaceId, NamespaceIds, ProcessRecord,
+    backing::{self, BackingError},
 };
 use std::cell::{Cell, OnceCell, RefCell};
 use std::ffi::CString;
@@ -78,7 +79,6 @@ struct Mapping {
     start: u64,
     end: u64,
     offset: u64,
-    native: u64,
     inode: u64,
 }
 struct Segment {
@@ -123,6 +123,9 @@ struct Object {
     anchor: OnceCell<Rc<source_anchor::SourceAnchor>>,
     file: File,
     stamp: Stamp,
+    /// Witnessed page frame (`None` on the direct path): part of the
+    /// deduplication identity so two layers never share one object.
+    page: Option<u64>,
     expected: Option<ModuleInfo>,
     parsed: OnceCell<Result<ElfObject, ObservationGap>>,
     tables: OnceCell<Result<TableDiscovery, ObservationGap>>,
@@ -353,6 +356,7 @@ pub(crate) fn startup_candidates(
         anchor: OnceCell::new(),
         file,
         stamp: Stamp::of(&metadata),
+        page: None,
         expected: None,
         parsed: OnceCell::new(),
         tables: OnceCell::new(),
@@ -773,9 +777,19 @@ struct StaticDiscovery {
     emitted: bool,
     candidates: Vec<VerifiedStaticCandidate>,
 }
+/// One verified executable mapping: the verified VMA record, the retained
+/// object parsed from the verifying descriptor, and the live association
+/// witness re-proven on every revalidation. Production acquisition always
+/// carries a witness; fixture processes (which cannot reach `map_files`
+/// unprivileged) explicitly carry none, and skip the witness check.
+struct BoundMapping {
+    map: Mapping,
+    object: Rc<Object>,
+    backing: Option<backing::BackingAssociation>,
+}
 pub struct VerifiedProcess {
     process: Rc<Process>,
-    mappings: Vec<(Mapping, Rc<Object>)>,
+    mappings: Vec<BoundMapping>,
     maps: Rc<Vec<u8>>,
     generation: u64,
     budget: ObservationBudget,
@@ -832,13 +846,14 @@ impl VerifiedProcess {
         Ok(self
             .mappings
             .iter()
-            .map(|(m, _)| (m.start, m.end))
+            .map(|bound| (bound.map.start, bound.map.end))
             .collect())
     }
     pub(crate) fn api_discovery_deferred(&self) -> bool {
-        self.mappings.iter().any(|(_, object)| {
-            object.parse_deferred.get()
-                && object
+        self.mappings.iter().any(|bound| {
+            bound.object.parse_deferred.get()
+                && bound
+                    .object
                     .expected
                     .as_ref()
                     .is_some_and(|info| !info.exports.is_empty())
@@ -846,8 +861,8 @@ impl VerifiedProcess {
     }
     pub fn retained_objects(&self) -> usize {
         let mut identities = std::collections::BTreeSet::new();
-        for (_, object) in &self.mappings {
-            identities.insert((object.stamp.native, object.stamp.inode));
+        for bound in &self.mappings {
+            identities.insert((bound.object.stamp.native, bound.object.stamp.inode));
         }
         identities.len()
     }
@@ -879,8 +894,17 @@ impl VerifiedProcess {
         )? {
             return Err(ObservationGap::ProcessChanged);
         }
-        for (_, object) in &self.mappings {
-            object.unchanged()?;
+        for bound in &self.mappings {
+            bound.object.unchanged()?;
+            if let Some(backing) = &bound.backing {
+                backing.revalidate().map_err(|error| match error {
+                    BackingError::Denied | BackingError::Unavailable => {
+                        ObservationGap::BackingUnavailable
+                    }
+                    BackingError::Changed => ObservationGap::ObjectChanged,
+                    BackingError::Unsupported => ObservationGap::IdentityUnverified,
+                })?;
+            }
         }
         self.process.validate()
     }
@@ -894,7 +918,9 @@ impl VerifiedProcess {
         }
         let mut sites = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        for (mapping, object) in &self.mappings {
+        for bound in &self.mappings {
+            let mapping = &bound.map;
+            let object = &bound.object;
             // Eager resolution is limited to inventoried API sources; unknown
             // code is parsed only when a learned address identifies its VMA.
             if object
@@ -919,7 +945,9 @@ impl VerifiedProcess {
                     self.gaps.borrow_mut().insert(ObservationGap::AmbiguousSite);
                     continue;
                 }
-                if seen.insert((object.stamp.native, object.stamp.inode, offset)) {
+                // The witnessed page keeps two layers sharing one rendered
+                // identity from collapsing into one site.
+                if seen.insert((object.stamp.native, object.stamp.inode, object.page, offset)) {
                     sites.push(ApiSite {
                         api,
                         site: VerifiedSite {
@@ -950,7 +978,9 @@ impl VerifiedProcess {
         }
         let mut sites = Vec::new();
         let mut seen = std::collections::BTreeSet::new();
-        for (mapping, object) in &self.mappings {
+        for bound in &self.mappings {
+            let mapping = &bound.map;
+            let object = &bound.object;
             let parsed = match object.parsed(&self.budget) {
                 Ok(parsed) => parsed,
                 Err(gap) => {
@@ -965,7 +995,7 @@ impl VerifiedProcess {
                 if found != role || !mapping_contains_offset(mapping, offset) {
                     continue;
                 }
-                let identity = (object.stamp.native, object.stamp.inode, offset);
+                let identity = (object.stamp.native, object.stamp.inode, object.page, offset);
                 if !seen.contains(&identity) {
                     // Covers the returned capability, vector growth and bounded
                     // deduplication node; charge before either allocation.
@@ -1014,10 +1044,10 @@ impl VerifiedProcess {
         let mut discovery = self.static_discovery.borrow_mut();
         while discovery.mapping < self.mappings.len() {
             let index = discovery.mapping;
-            let object = &self.mappings[index].1;
+            let object = &self.mappings[index].object;
             if self.mappings[..index]
                 .iter()
-                .any(|(_, prior)| Rc::ptr_eq(prior, object))
+                .any(|prior| Rc::ptr_eq(&prior.object, object))
             {
                 discovery.mapping += 1;
                 continue;
@@ -1051,8 +1081,9 @@ impl VerifiedProcess {
                 }
             };
             for locator in tables.candidates().skip(discovery.locator) {
-                if !self.mappings.iter().any(|(m, o)| {
-                    Rc::ptr_eq(o, object) && mapping_contains_offset(m, locator.file_offset)
+                if !self.mappings.iter().any(|bound| {
+                    Rc::ptr_eq(&bound.object, object)
+                        && mapping_contains_offset(&bound.map, locator.file_offset)
                 }) {
                     discovery.locator += 1;
                     continue;
@@ -1106,8 +1137,9 @@ impl VerifiedProcess {
         let mut matches = self
             .mappings
             .iter()
-            .filter(|(map, _)| address.0 >= map.start && address.0 < map.end);
-        let (map, object) = matches.next().ok_or(ObservationGap::SymbolUnavailable)?;
+            .filter(|bound| address.0 >= bound.map.start && address.0 < bound.map.end);
+        let bound = matches.next().ok_or(ObservationGap::SymbolUnavailable)?;
+        let (map, object) = (&bound.map, &bound.object);
         if matches.next().is_some() {
             return Err(ObservationGap::AmbiguousSite);
         }
@@ -1283,70 +1315,128 @@ pub(crate) fn acquire_with_incarnation(
             selected.push(map);
         }
     }
+    // One backing view per acquisition; the same authority inventory uses.
+    let view =
+        backing::BackingProcess::capture(&process.directory).map_err(|error| match error {
+            BackingError::Denied | BackingError::Unavailable => ObservationGap::BackingUnavailable,
+            BackingError::Changed | BackingError::Unsupported => ObservationGap::IdentityUnverified,
+        })?;
+    let paths = maps_path_index(&maps);
     for map in selected {
         // Association is established before native-device deduplication.
+        // The range-bound descriptor comes first, then direct layer
+        // resolutions; the first verified candidate wins.
+        let range = backing::MappedRange {
+            start: map.start,
+            end: map.end,
+        };
         let name = format!("map_files/{:x}-{:x}", map.start, map.end);
-        let file = match open_at(&process.directory, name.as_bytes()) {
-            Ok(file) => file,
-            Err(_) => {
-                refused = Some(ObservationGap::BackingUnavailable);
-                gaps.insert(ObservationGap::BackingUnavailable);
+        let mut ordered: Vec<File> = Vec::new();
+        let mut have_direct = false;
+        if let Ok(file) = open_at(&process.directory, name.as_bytes()) {
+            ordered.push(file);
+            have_direct = true;
+        }
+        if let Some(path) = paths.get(&(map.start, map.end)) {
+            ordered.extend(backing::direct_layer_candidates(
+                &process.directory,
+                path,
+                16,
+            ));
+        }
+        let mut bound: Option<(File, backing::BackingAssociation)> = None;
+        for index in 0..ordered.len() {
+            if let Ok(association) = view.verify_with_process(&range, &ordered[index]) {
+                bound = Some((ordered.remove(index), association));
+                break;
+            }
+        }
+        let (file, association) = match bound {
+            Some(bound) => bound,
+            None => {
+                let gap = if have_direct {
+                    ObservationGap::IdentityUnverified
+                } else {
+                    ObservationGap::BackingUnavailable
+                };
+                refused = Some(gap);
+                gaps.insert(gap);
                 continue;
             }
         };
         let metadata = file
             .metadata()
             .map_err(|_| ObservationGap::BackingUnavailable)?;
-        if !metadata.is_file() || !association(&file, &metadata, &map) {
+        if !metadata.is_file() {
             refused = Some(ObservationGap::IdentityUnverified);
             gaps.insert(ObservationGap::IdentityUnverified);
             continue;
         }
-        let stamp = Stamp::of(&metadata);
-        let object = if let Some(existing) = objects.iter().find(|o| o.stamp == stamp) {
-            existing.clone()
-        } else {
-            if let Err(gap) = limits.object() {
-                if gap == ObservationGap::SnapshotLag {
-                    return Err(gap);
-                }
-                gaps.insert(gap);
-                break;
-            }
-            limits.state(4096)?;
-            let expected = record
-                .modules
-                .iter()
-                .find(|m| {
-                    m.identity_status == IdentityStatus::Verified
-                        && m.info.device == stamp.native
-                        && m.info.inode == stamp.inode
-                })
-                .map(|m| m.info.clone());
-            // Explicit inventory candidates must never become attachable.
-            if record.modules.iter().any(|m| {
-                m.identity_status == IdentityStatus::LocatorCandidate
-                    && m.info.device == stamp.native
-                    && m.info.inode == stamp.inode
-            }) {
-                refused = Some(ObservationGap::IdentityUnverified);
-                gaps.insert(ObservationGap::IdentityUnverified);
-                continue;
-            }
-            let object = Rc::new(Object {
-                parse_deferred: Cell::new(false),
-                anchor: OnceCell::new(),
-                file,
-                stamp,
-                expected,
-                parsed: OnceCell::new(),
-                tables: OnceCell::new(),
-            });
-            objects.push(object.clone());
-            object
+        // Bind custody to the verified record, not our own possibly stale
+        // parse of the same range.
+        let (start, end, offset, inode) = association.mapping_keys();
+        let map = Mapping {
+            start,
+            end,
+            offset,
+            inode,
         };
-        limits.state(std::mem::size_of::<Mapping>() + 32)?;
-        mappings.push((map, object));
+        let stamp = Stamp::of(&metadata);
+        let page = association.witness_page();
+        // Record comparisons use the approved identity, not a re-read.
+        let (approved_native, approved_inode) = association.object_identity();
+        let object =
+            if let Some(existing) = objects.iter().find(|o| o.stamp == stamp && o.page == page) {
+                existing.clone()
+            } else {
+                if let Err(gap) = limits.object() {
+                    if gap == ObservationGap::SnapshotLag {
+                        return Err(gap);
+                    }
+                    gaps.insert(gap);
+                    break;
+                }
+                limits.state(4096)?;
+                let expected = record
+                    .modules
+                    .iter()
+                    .find(|m| {
+                        m.identity_status == IdentityStatus::Verified
+                            && m.info.device == approved_native
+                            && m.info.inode == approved_inode
+                    })
+                    .map(|m| m.info.clone());
+                // Explicit inventory candidates must never become attachable.
+                if record.modules.iter().any(|m| {
+                    m.identity_status == IdentityStatus::LocatorCandidate
+                        && m.info.device == approved_native
+                        && m.info.inode == approved_inode
+                }) {
+                    refused = Some(ObservationGap::IdentityUnverified);
+                    gaps.insert(ObservationGap::IdentityUnverified);
+                    continue;
+                }
+                let object = Rc::new(Object {
+                    parse_deferred: Cell::new(false),
+                    anchor: OnceCell::new(),
+                    file,
+                    stamp,
+                    page,
+                    expected,
+                    parsed: OnceCell::new(),
+                    tables: OnceCell::new(),
+                });
+                objects.push(object.clone());
+                object
+            };
+        // Covers the mapping record plus the retained association witness
+        // (two descriptors and the verified fingerprints).
+        limits.state(std::mem::size_of::<Mapping>() + 512)?;
+        mappings.push(BoundMapping {
+            map,
+            object,
+            backing: Some(association),
+        });
     }
     if mappings.is_empty() {
         return Err(refused.unwrap_or(ObservationGap::BackingUnavailable));
@@ -1385,27 +1475,32 @@ pub(crate) fn acquire_with_incarnation(
     }
     Ok(verified)
 }
-fn association(file: &File, metadata: &Metadata, map: &Mapping) -> bool {
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: borrowed descriptor and properly sized output; read on success.
-    if unsafe { libc::fstatfs(file.as_raw_fd(), stat.as_mut_ptr()) } != 0 {
-        return false;
+/// Index of maps path text by VMA bounds, for layer-candidate hints only.
+/// Paths never carry authority; every candidate is verified independently.
+fn maps_path_index(maps: &[u8]) -> std::collections::BTreeMap<(u64, u64), &[u8]> {
+    let mut index = std::collections::BTreeMap::new();
+    for line in maps.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
+        let Ok(Some(map)) = parse_mapping(line) else {
+            continue;
+        };
+        // The path is the remainder after the five fixed fields; it may
+        // itself contain spaces (notably the " (deleted)" suffix).
+        let mut rest = line;
+        for _ in 0..5 {
+            rest = rest.trim_ascii_start();
+            let end = rest
+                .iter()
+                .position(u8::is_ascii_whitespace)
+                .unwrap_or(rest.len());
+            rest = &rest[end..];
+        }
+        let path = rest.trim_ascii_start();
+        if path.is_empty() {
+            continue;
+        }
+        index.insert((map.start, map.end), path);
     }
-    let filesystem = unsafe { stat.assume_init() }.f_type;
-    matches!(
-        filesystem,
-        0xef53
-            | 0x58465342
-            | 0x9123683e
-            | 0x01021994
-            | 0x858458f6
-            | 0x958458f6
-            | 0x73717368
-            | 0xf2f52010
-            | 0x3153464a
-            | 0x2fc12fc1
-    ) && metadata.ino() == map.inode
-        && (metadata.dev() == map.native || filesystem == 0x9123683e)
+    index
 }
 fn open_at(directory: &File, name: &[u8]) -> Result<File, ObservationGap> {
     let name = CString::new(name).map_err(|_| ObservationGap::ProcessUnavailable)?;
@@ -1544,9 +1639,11 @@ fn parse_mapping(line: &[u8]) -> Result<Option<Mapping>, ObservationGap> {
     let start = number(&range[..at], 16)?;
     let end = number(&range[at + 1..], 16)?;
     let at = split(dev, b':')?;
-    let major =
+    // The rendered device is validated but not retained: backing identity
+    // comes from the verified descriptor, never the maps text.
+    let _major =
         u32::try_from(number(&dev[..at], 16)?).map_err(|_| ObservationGap::MalformedMaps)?;
-    let minor =
+    let _minor =
         u32::try_from(number(&dev[at + 1..], 16)?).map_err(|_| ObservationGap::MalformedMaps)?;
     if start >= end
         || perms.len() != 4
@@ -1565,7 +1662,6 @@ fn parse_mapping(line: &[u8]) -> Result<Option<Mapping>, ObservationGap> {
         start,
         end,
         offset,
-        native: libc::makedev(major, minor),
         inode,
     }))
 }
@@ -2310,6 +2406,7 @@ mod tests {
                 parse_deferred: Cell::new(false),
                 anchor: OnceCell::new(),
                 stamp: Stamp::of(&file.metadata().unwrap()),
+                page: None,
                 file,
                 expected: None,
                 parsed: OnceCell::new(),
@@ -2359,6 +2456,7 @@ mod tests {
                 parse_deferred: Cell::new(false),
                 anchor: OnceCell::new(),
                 stamp: Stamp::of(&file.metadata().unwrap()),
+                page: None,
                 file,
                 expected: None,
                 parsed: OnceCell::new(),
@@ -2417,6 +2515,7 @@ mod tests {
                 parse_deferred: Cell::new(false),
                 anchor: OnceCell::new(),
                 stamp: Stamp::of(&file.metadata().unwrap()),
+                page: None,
                 file,
                 expected: None,
                 parsed: OnceCell::new(),
@@ -2452,6 +2551,7 @@ mod tests {
             parse_deferred: Cell::new(false),
             anchor: OnceCell::new(),
             stamp: Stamp::of(&file.metadata().unwrap()),
+            page: None,
             file,
             expected: None,
             parsed: OnceCell::new(),
@@ -2665,18 +2765,44 @@ pub(super) mod fixture_support {
         let object = Rc::new(Object {
             file,
             stamp: Stamp::of(&metadata),
+            page: None,
             expected: Some(expected),
             parsed: OnceCell::new(),
             tables: OnceCell::new(),
             parse_deferred: Cell::new(false),
             anchor: OnceCell::new(),
         });
+        // Fixture binding is explicit and unwitnessed: fixtures cannot reach
+        // `map_files` unprivileged, so the shared object carries no witness
+        // page and mappings bind by direct inode identity only. Fixture
+        // processes map distinct files, so subvolume collisions are out of
+        // scope here. Production acquisition never takes this path.
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: borrowed descriptor and properly sized output; read on success.
+        let direct = unsafe { libc::fstatfs(object.file.as_raw_fd(), stat.as_mut_ptr()) } == 0
+            && matches!(
+                unsafe { stat.assume_init() }.f_type,
+                0xef53
+                    | 0x58465342
+                    | 0x9123683e
+                    | 0x01021994
+                    | 0x858458f6
+                    | 0x958458f6
+                    | 0x73717368
+                    | 0xf2f52010
+                    | 0x3153464a
+                    | 0x2fc12fc1
+            );
         let mappings: Vec<_> = maps
             .split(|&b| b == b'\n')
             .filter(|line| !line.is_empty())
             .filter_map(|line| parse_mapping(line).unwrap())
-            .filter(|map| association(&object.file, &metadata, map))
-            .map(|map| (map, object.clone()))
+            .filter(|map| direct && metadata.ino() == map.inode)
+            .map(|map| BoundMapping {
+                map,
+                object: object.clone(),
+                backing: None,
+            })
             .collect();
         assert!(
             !mappings.is_empty(),
