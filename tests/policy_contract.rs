@@ -3169,3 +3169,174 @@ fn object_bound_selector_does_not_match_other_build() {
         assert_eq!(verdict.rules[0].bounds.definite, 0);
     }
 }
+
+#[test]
+fn understated_unresolved_bound_cannot_pass_deny() {
+    // ER-5C-I2: COMPLETE window, 100 physical calls, certified
+    // 37 + 11, STATED unresolved 0 — a collect that skipped 52
+    // non-admitted calls, or a hand-written understatement. The
+    // 52 unassigned calls keep every unmatched selector rule
+    // inconclusive (never a pass) with possible=Some(52);
+    // matching rules still decide on the partitions.
+    use osslscope::evidence::AttributionBounds;
+    let mut document = execution_doc(CandidateCoverage::Complete, exact_window());
+    assert_eq!(document.status, Completeness::Complete);
+    document.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 0,
+        withheld_uncertain: 0,
+    });
+    let denied = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_OTHER)],
+        &document,
+    );
+    assert_eq!(denied.overall(), PolicyOutcome::Inconclusive);
+    assert_eq!(denied.rules[0].bounds.definite, 0);
+    assert_eq!(denied.rules[0].bounds.possible, Some(52));
+    let required = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, SEL_ID_OTHER)],
+        &document,
+    );
+    assert_eq!(required.overall(), PolicyOutcome::Inconclusive);
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 48);
+    assert_eq!(violated.rules[0].bounds.possible, Some(100));
+}
+
+#[test]
+fn swapped_selector_reference_matches_no_policy() {
+    // ER-5C-I3: rows citing a selector bound to another object
+    // or another operation match no policy — the swapped
+    // identity accrues zero definite calls, and the unbound
+    // partitions widen the unknown upper instead of relieving
+    // it. Current and fenced sites alike; the unswapped control
+    // still violates on the same evidence.
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const SEL_ID_KDF: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+    fn site(object: &str, inode: u64, offset: u64, calls: u64) -> SiteExecution {
+        SiteExecution {
+            site: SiteKey {
+                object: obj(object),
+                device: 7,
+                inode,
+                offset,
+            },
+            generation: 3,
+            candidates: Vec::new(),
+            candidates_coverage: CandidateCoverage::Complete,
+            calls,
+            first_ns: 1000,
+            last_ns: 2000,
+            installed_at: None,
+        }
+    }
+    let mut document = doc(
+        vec![site(SEL_OBJECT, 9, 0x1000, 37)],
+        vec![FencedGeneration {
+            generation: 3,
+            sites: vec![site(SEL_OBJECT, 9, 0x2000, 11)],
+        }],
+        Vec::new(),
+        Vec::new(),
+        exact_window(),
+        None,
+    );
+    assert_eq!(document.status, Completeness::Complete);
+    document.objects = vec![
+        ObjectRecord {
+            id: obj(SEL_OBJECT),
+            device: 7,
+            inode: 9,
+            display_locator: "libcrypto-a.so".to_string(),
+        },
+        ObjectRecord {
+            id: obj(SEL_OBJECT_2),
+            device: 7,
+            inode: 10,
+            display_locator: "libcrypto-b.so".to_string(),
+        },
+    ];
+    document.algorithm_selectors = vec![
+        AlgorithmSelectorEntry {
+            object: obj(SEL_OBJECT),
+            operation: 3,
+            id: SEL_ID_HMAC.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+        AlgorithmSelectorEntry {
+            object: obj(SEL_OBJECT_2),
+            operation: 3,
+            id: SEL_ID_HMAC_2.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+        AlgorithmSelectorEntry {
+            object: obj(SEL_OBJECT),
+            operation: 4,
+            id: SEL_ID_KDF.to_string(),
+            canonical_name: Some("HKDF".to_string()),
+        },
+    ];
+    let row = |offset: u64, segment: u64, calls: u64, selector: u32| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(SEL_OBJECT),
+            device: 7,
+            inode: 9,
+            offset,
+        },
+        generation: 3,
+        segment,
+        start_ns: 1100,
+        end_ns: 1900,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    document.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 0,
+        withheld_uncertain: 0,
+    });
+    document.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    // Swapped: the current row cites B's selector (cross-object),
+    // the fenced row cites the op-4 selector (cross-operation).
+    document.execution_attributions = vec![row(0x1000, 1, 37, 1), row(0x2000, 2, 11, 2)];
+    for (object, id) in [
+        (SEL_OBJECT_2, SEL_ID_HMAC_2),
+        (SEL_OBJECT, SEL_ID_KDF),
+        (SEL_OBJECT, SEL_ID_HMAC),
+    ] {
+        let verdict = evaluate_document(&[PolicyRule::deny_selector(object, id)], &document);
+        assert_eq!(
+            verdict.rules[0].bounds.definite, 0,
+            "swapped rows match no policy: {object}/{id}"
+        );
+        assert!(
+            verdict.rules[0].hits.is_empty(),
+            "swapped rows cite no evidence: {object}/{id}"
+        );
+        assert_eq!(
+            verdict.overall(),
+            PolicyOutcome::Inconclusive,
+            "unbound partitions keep absence unproven: {object}/{id}"
+        );
+        assert_eq!(verdict.rules[0].bounds.possible, Some(48));
+    }
+    // Control: the same rows citing A's own op-3 selector prove
+    // the violation on the same evidence.
+    document.execution_attributions = vec![row(0x1000, 1, 37, 0), row(0x2000, 2, 11, 0)];
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 48);
+}

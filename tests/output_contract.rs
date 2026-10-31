@@ -5462,6 +5462,492 @@ fn strict_old_reader_rejects_v25() {
 }
 
 #[test]
+fn certified_empty_mints_no_legacy_asset() {
+    // ER-5C-I1: a v2.5 certified-empty document — 40 physical
+    // calls, a complete singleton HMAC candidate set, zero
+    // partitions, unresolved_calls=40 — must mint no CBOM
+    // asset from the unresolved calls; the 40 calls stay
+    // omissions (unpartitioned + the unresolved bound).
+    use osslscope::evidence::{AttributionBounds, CAPTURE_SCHEMA_V2_5};
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        40,
+        vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+        CandidateCoverage::Complete,
+    )];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 40,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    let rendered = json_of(&doc);
+    validate_v2(&rendered).expect("certified-empty validates");
+    check_v2_semantics(&rendered).expect("certified-empty is semantic-clean");
+    let cbom = cbom_of(&doc);
+    assert_eq!(
+        cbom["components"],
+        json!([]),
+        "no CBOM asset from unresolved calls"
+    );
+    assert!(
+        !cbom.to_string().contains("urn:osslscope:exec:v2:"),
+        "the legacy site asset stays suppressed without partitions"
+    );
+    let metadata = cbom["metadata"]["properties"].as_array().unwrap();
+    let get_meta = |name: &str| {
+        metadata
+            .iter()
+            .find(|p| p["name"] == json!(name))
+            .unwrap_or_else(|| panic!("missing metadata {name}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get_meta("osslscope:unresolved-attribution-calls"), "40");
+    assert_eq!(get_meta("osslscope:omitted-unpartitioned-sites"), "1");
+    assert_eq!(get_meta("osslscope:omitted-unpartitioned-calls"), "40");
+}
+
+#[test]
+fn unpartitioned_complete_site_mints_no_legacy_asset() {
+    // ER-5C-I1 mixed-site control: site A is partition-covered
+    // (37 of 40 calls), site B is uncovered with a Complete
+    // singleton HMAC set (11 calls). Only the partition asset
+    // mints; site B's 11 calls stay omissions.
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut input = input_base();
+    input.sites = vec![
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x1000,
+            0,
+            40,
+            vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+            CandidateCoverage::Complete,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+            CandidateCoverage::Complete,
+        ),
+    ];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: Some("HMAC".to_string()),
+    }];
+    doc.execution_attributions = vec![ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset: 0x1000,
+        },
+        generation: 0,
+        segment: 1,
+        start_ns: 20,
+        end_ns: 80,
+        calls: 37,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    }];
+    // 3 covered-remainder + 11 unpartitioned calls.
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 14,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    let rendered = json_of(&doc);
+    validate_v2(&rendered).expect("mixed-site v2.5 validates");
+    check_v2_semantics(&rendered).expect("mixed-site v2.5 is semantic-clean");
+    let cbom = cbom_of(&doc);
+    let components = cbom["components"].as_array().unwrap();
+    assert_eq!(components.len(), 1, "only the partition asset mints");
+    assert!(
+        components[0]["bom-ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:osslscope:exec-attr:v2.5:")
+    );
+    assert!(
+        !cbom.to_string().contains("urn:osslscope:exec:v2:"),
+        "no legacy asset for the uncovered site"
+    );
+    let metadata = cbom["metadata"]["properties"].as_array().unwrap();
+    let get_meta = |name: &str| {
+        metadata
+            .iter()
+            .find(|p| p["name"] == json!(name))
+            .unwrap_or_else(|| panic!("missing metadata {name}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get_meta("osslscope:unresolved-attribution-calls"), "14");
+    assert_eq!(get_meta("osslscope:omitted-unpartitioned-sites"), "1");
+    assert_eq!(get_meta("osslscope:omitted-unpartitioned-calls"), "11");
+}
+
+#[test]
+fn understated_unresolved_bound_fails_semantics() {
+    // ER-5C-I2: 100 physical calls, certified 37 + 11, STATED
+    // unresolved 0 — 52 unassigned calls missing from the
+    // bound. Semantics must reject the understatement; the
+    // honest bound (52) validates as the control. The
+    // structural layer still accepts the u64 in both legs
+    // (the minimum-remainder rule is semantic).
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut input = input_base();
+    input.sites = vec![
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x1000,
+            0,
+            40,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x3000,
+            0,
+            49,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+    ];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: Some("HMAC".to_string()),
+    }];
+    let row = |offset: u64, segment: u64, calls: u64| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation: 0,
+        segment,
+        start_ns: 20,
+        end_ns: 80,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    doc.execution_attributions = vec![row(0x1000, 1, 37), row(0x2000, 2, 11)];
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 0,
+        withheld_uncertain: 0,
+    });
+    let understated = json_of(&doc);
+    validate_v2(&understated).expect("structural layer accepts the u64");
+    let error = check_v2_semantics(&understated).expect_err("understated bound accepted");
+    assert!(
+        error.contains("unresolved"),
+        "the rejection names the bound: {error}"
+    );
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 52,
+        withheld_uncertain: 0,
+    });
+    let honest = json_of(&doc);
+    validate_v2(&honest).expect("honest bound validates");
+    check_v2_semantics(&honest).expect("honest bound is semantic-clean");
+}
+
+#[test]
+fn cross_object_selector_reference_is_rejected() {
+    // ER-5C-I3: execution rows on object A citing object B's
+    // listed selector must fail validation and refuse the CBOM
+    // render — on current and fenced sites alike. The unswapped
+    // document validates and renders as the control.
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const OBJ_B: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+    const DIGEST_A: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const DIGEST_B: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ_A,
+        8,
+        100,
+        0x1000,
+        0,
+        40,
+        Vec::new(),
+        CandidateCoverage::Unknown,
+    )];
+    input.fenced = vec![FencedGeneration {
+        generation: 0,
+        sites: vec![site_at(
+            OBJ_A,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        )],
+    }];
+    input.objects = vec![
+        ObjectRecord {
+            id: obj(OBJ_A),
+            device: 8,
+            inode: 100,
+            display_locator: "libcrypto-a.so".to_string(),
+        },
+        ObjectRecord {
+            id: obj(OBJ_B),
+            device: 8,
+            inode: 200,
+            display_locator: "libcrypto-b.so".to_string(),
+        },
+    ];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![
+        AlgorithmSelectorEntry {
+            object: obj(OBJ_A),
+            operation: 3,
+            id: DIGEST_A.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+        AlgorithmSelectorEntry {
+            object: obj(OBJ_B),
+            operation: 3,
+            id: DIGEST_B.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+    ];
+    let row = |offset: u64, segment: u64, calls: u64, selector: u32| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ_A),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation: 0,
+        segment,
+        start_ns: 20,
+        end_ns: 80,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    // 51 physical, 48 partitioned: the bound is honest, so only
+    // the swapped citations are under test.
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 3,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    // Swapped: both rows execute on A but cite B's selector.
+    doc.execution_attributions = vec![row(0x1000, 1, 37, 1), row(0x2000, 2, 11, 1)];
+    let swapped = json_of(&doc);
+    validate_v2(&swapped).expect("swapped citations are structurally valid");
+    let error = check_v2_semantics(&swapped).expect_err("cross-object citation accepted");
+    assert!(
+        error.contains("object"),
+        "the rejection names the binding: {error}"
+    );
+    assert!(
+        render_cbom(&doc).is_err(),
+        "the CBOM render must refuse the swapped citations"
+    );
+    // Control: the same rows citing A's own selector validate
+    // and render two partition assets.
+    doc.execution_attributions = vec![row(0x1000, 1, 37, 0), row(0x2000, 2, 11, 0)];
+    let honest = json_of(&doc);
+    validate_v2(&honest).expect("control validates");
+    check_v2_semantics(&honest).expect("control is semantic-clean");
+    let cbom = cbom_of(&doc);
+    assert_eq!(cbom["components"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn cross_operation_selector_reference_is_rejected() {
+    // ER-5C-I3: op-3 execution rows citing an op-4 listed
+    // selector must fail validation and refuse the CBOM
+    // render — on current and fenced sites alike. The unswapped
+    // document validates and renders as the control.
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST_MAC: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const DIGEST_KDF: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        40,
+        Vec::new(),
+        CandidateCoverage::Unknown,
+    )];
+    input.fenced = vec![FencedGeneration {
+        generation: 0,
+        sites: vec![site_at(
+            OBJ,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        )],
+    }];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![
+        AlgorithmSelectorEntry {
+            object: obj(OBJ),
+            operation: 3,
+            id: DIGEST_MAC.to_string(),
+            canonical_name: Some("HMAC".to_string()),
+        },
+        AlgorithmSelectorEntry {
+            object: obj(OBJ),
+            operation: 4,
+            id: DIGEST_KDF.to_string(),
+            canonical_name: Some("HKDF".to_string()),
+        },
+    ];
+    let row = |offset: u64, segment: u64, calls: u64, selector: u32| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation: 0,
+        segment,
+        start_ns: 20,
+        end_ns: 80,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 3,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    // Swapped: op-3 rows cite the op-4 selector.
+    doc.execution_attributions = vec![row(0x1000, 1, 37, 1), row(0x2000, 2, 11, 1)];
+    let swapped = json_of(&doc);
+    validate_v2(&swapped).expect("swapped citations are structurally valid");
+    let error = check_v2_semantics(&swapped).expect_err("cross-operation citation accepted");
+    assert!(
+        error.contains("operation"),
+        "the rejection names the binding: {error}"
+    );
+    assert!(
+        render_cbom(&doc).is_err(),
+        "the CBOM render must refuse the swapped citations"
+    );
+    // Control: the same rows citing the op-3 selector validate
+    // and render two partition assets.
+    doc.execution_attributions = vec![row(0x1000, 1, 37, 0), row(0x2000, 2, 11, 0)];
+    let honest = json_of(&doc);
+    validate_v2(&honest).expect("control validates");
+    check_v2_semantics(&honest).expect("control is semantic-clean");
+    let cbom = cbom_of(&doc);
+    assert_eq!(cbom["components"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn v24_api_failure_subsets_are_disjoint_and_cannot_overflow() {
     for (failures, mismatch, unsupported) in [(1u64, 1u64, 1u64), (u64::MAX, u64::MAX, 1)] {
         let mut value = serde_json::to_value(finalize_honest(input_base())).unwrap();

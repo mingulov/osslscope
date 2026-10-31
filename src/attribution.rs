@@ -2031,6 +2031,64 @@ mod tests {
     }
 
     #[test]
+    fn projection_reconciles_unadmitted_physical_calls() {
+        // ER-5C-I2 mixed admission: the fold certified 37 + 11
+        // calls over admitted sites with unresolved 0 (the
+        // collect skipped 52 non-admitted physical calls), but
+        // the document carries all 100 physical calls. The
+        // projection must publish the full 52-call remainder,
+        // never the understated collect count.
+        let obj = object();
+        let hmac = request_digest(&obj.0, 3, "HMAC");
+        let rows = vec![
+            definite_row(
+                1,
+                37,
+                3,
+                5,
+                AlgorithmSelector::ObjectBound {
+                    object: obj.clone(),
+                    id: hmac,
+                },
+            ),
+            definite_row(
+                2,
+                11,
+                3,
+                5,
+                AlgorithmSelector::ObjectBound {
+                    object: obj.clone(),
+                    id: hmac,
+                },
+            ),
+        ];
+        let mut doc = empty_doc();
+        // 100 physical calls: 48 admitted-shape plus 52 the
+        // collect skipped (projection reconciles sums only —
+        // site resolution stays the schema validator's job).
+        let mut admitted = execution(48, 10, 100);
+        admitted.site = site();
+        admitted.generation = 3;
+        let mut skipped = execution(52, 10, 100);
+        skipped.site = SiteKey {
+            object: obj.clone(),
+            device: 7,
+            inode: 9,
+            offset: 32,
+        };
+        skipped.generation = 3;
+        doc.sites = vec![admitted, skipped];
+        finalized(rows, 0, 0)
+            .project_into_document(&mut doc)
+            .unwrap();
+        assert_eq!(
+            doc.attribution_bounds
+                .map(|b| (b.unresolved_calls, b.withheld_uncertain)),
+            Some((52, 0))
+        );
+    }
+
+    #[test]
     fn projection_rejects_non_object_bound_rows_without_touching_the_document() {
         let mut doc = empty_doc();
         let before = doc.clone();
