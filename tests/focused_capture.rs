@@ -511,6 +511,186 @@ fn advertisement_invalidation_alone_preserves_physical_lifetime_but_identity_los
     }
 }
 
+fn usite(calls: u64, offset: u64) -> SiteExecution {
+    let mut row = site(calls, &[]);
+    row.site.offset = offset;
+    row
+}
+
+fn static_assoc() -> osslscope::focused_count::CandidateAssociation {
+    use osslscope::focused_count::MetadataOrigin;
+    osslscope::focused_count::CandidateAssociation {
+        origin: MetadataOrigin::StaticPublicTableCandidate,
+        algorithm: None,
+        known_algorithm: None,
+        alias_quality: Default::default(),
+        operation: None,
+        function_id: 7,
+        advertisers: Vec::new(),
+        static_provenance: Some(
+            osslscope::provider_observation::static_tables::StaticTableProvenance::DispatchTableShape,
+        ),
+        storage: Some(
+            osslscope::provider_observation::static_tables::TableStorage::ReadOnly,
+        ),
+        partial: true,
+        observed_ns: 20,
+        observation_generation: 9,
+    }
+}
+
+#[test]
+fn bounded_projection_retains_used_site_metadata_under_pressure() {
+    use osslscope::focused_count::SiteAssociations;
+    // One executed (positive) site plus huge unknown candidate sets that
+    // overflow the frozen 64MiB ceiling: bounded projection must retain
+    // the used site's metadata, conserve physical calls, and emit
+    // explicit omission counts instead of dropping everything.
+    let used = usite(37, 100);
+    let used_row = SiteAssociations {
+        site: used.site.clone(),
+        count_generation: 1,
+        associations: vec![static_assoc()],
+    };
+    let mut sites = vec![used];
+    let mut rows = vec![used_row];
+    for offset in [200, 300, 400] {
+        let idle = usite(0, offset);
+        rows.push(SiteAssociations {
+            site: idle.site.clone(),
+            count_generation: 1,
+            associations: vec![static_assoc(); 8000],
+        });
+        sites.push(idle);
+    }
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            sites,
+            associations: rows,
+            ..Default::default()
+        },
+        &[],
+    );
+    assert_eq!(doc.total_calls(), 37);
+    assert!(
+        doc.site_provenance.iter().any(|row| row.site.offset == 100),
+        "used site metadata must be retained under pressure"
+    );
+    assert!(
+        doc.counters
+            .iter()
+            .any(|c| c.name == "focused.metadata_output_limit" && c.value == 1)
+    );
+    let omitted_sites = doc
+        .counters
+        .iter()
+        .find(|c| c.name == "focused.metadata_omitted_sites")
+        .map(|c| c.value)
+        .unwrap_or(0);
+    let omitted_associations = doc
+        .counters
+        .iter()
+        .find(|c| c.name == "focused.metadata_omitted_associations")
+        .map(|c| c.value)
+        .unwrap_or(0);
+    assert!(omitted_sites > 0, "omitted site rows must be counted");
+    assert!(
+        omitted_associations > 0,
+        "omitted association rows must be counted"
+    );
+    check_open(&doc);
+}
+
+#[test]
+fn bounded_projection_counts_omitted_rows_exactly() {
+    use osslscope::focused_count::SiteAssociations;
+    // Frozen byte model: each row costs 2048 + 64 (object hex) plus
+    // 4096 per advertiser-free association. Three 8000-association
+    // rows cost 3 * 32_770_112 bytes; the 64MiB ceiling retains the
+    // first two in stable input order and omits exactly the third.
+    let mut sites = Vec::new();
+    let mut rows = Vec::new();
+    for offset in [11, 22, 33] {
+        let idle = usite(0, offset);
+        rows.push(SiteAssociations {
+            site: idle.site.clone(),
+            count_generation: 1,
+            associations: vec![static_assoc(); 8000],
+        });
+        sites.push(idle);
+    }
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            sites,
+            associations: rows,
+            ..Default::default()
+        },
+        &[],
+    );
+    assert_eq!(doc.total_calls(), 0);
+    assert_eq!(doc.site_provenance.len(), 2);
+    assert_eq!(doc.site_provenance[0].site.offset, 11);
+    assert_eq!(doc.site_provenance[1].site.offset, 22);
+    for (name, expected) in [
+        ("focused.metadata_omitted_sites", 1),
+        ("focused.metadata_omitted_associations", 8000),
+    ] {
+        let value = doc
+            .counters
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("{name} must be emitted"))
+            .value;
+        assert_eq!(value, expected, "{name}");
+    }
+    check_open(&doc);
+}
+
+#[test]
+fn bounded_projection_keeps_stable_input_order_when_everything_fits() {
+    use osslscope::focused_count::SiteAssociations;
+    // Characterization pin (passes before and after): fitting rows
+    // project in stable input order, never sorted or dropped.
+    let mut sites = Vec::new();
+    let mut rows = Vec::new();
+    for offset in [30, 10, 20] {
+        let row = usite(3, offset);
+        rows.push(SiteAssociations {
+            site: row.site.clone(),
+            count_generation: 1,
+            associations: vec![static_assoc()],
+        });
+        sites.push(row);
+    }
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            sites,
+            associations: rows,
+            ..Default::default()
+        },
+        &[],
+    );
+    assert_eq!(doc.total_calls(), 9);
+    let offsets: Vec<u64> = doc
+        .site_provenance
+        .iter()
+        .map(|row| row.site.offset)
+        .collect();
+    assert_eq!(offsets, vec![30, 10, 20]);
+    assert!(
+        !doc.counters
+            .iter()
+            .any(|c| c.name == "focused.metadata_output_limit")
+    );
+    check_open(&doc);
+}
+
 #[test]
 fn candidate_output_budget_refuses_metadata_without_losing_physical_counts() {
     use osslscope::focused_count::{CandidateAssociation, MetadataOrigin, SiteAssociations};
