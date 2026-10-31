@@ -496,7 +496,16 @@ fn backing(
     process: &Process,
     mapping: &Mapping<'_>,
     work: &mut Work<'_>,
-) -> Result<(File, Metadata, IdentityStatus, Option<u64>), GapReason> {
+) -> Result<
+    (
+        File,
+        Metadata,
+        IdentityStatus,
+        Option<u64>,
+        Option<backing::BackingAssociation>,
+    ),
+    GapReason,
+> {
     // Acquisition failures must remain distinct from a successfully acquired
     // LocatorCandidate: failure leaves mapping visibility unresolved and can
     // never support a sampled absence claim in watch.
@@ -537,7 +546,13 @@ fn backing(
                     let page = association.witness_page();
                     let file = ordered.remove(index);
                     let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
-                    return Ok((file, metadata, IdentityStatus::Verified, page));
+                    return Ok((
+                        file,
+                        metadata,
+                        IdentityStatus::Verified,
+                        page,
+                        Some(association),
+                    ));
                 }
                 Err(_) => {
                     if let Some(limit) = work.backing_limit.take() {
@@ -557,12 +572,12 @@ fn backing(
             && metadata.ino() == mapping.inode
             && (metadata.dev() == mapping.device || filesystem(&file) == Some(0x9123683e))
         {
-            return Ok((file, metadata, IdentityStatus::Verified, None));
+            return Ok((file, metadata, IdentityStatus::Verified, None, None));
         }
         // A locator may still be useful on overlay, but not after obvious
         // replacement by an inode different from the mapping's inode.
         if metadata.ino() == mapping.inode {
-            return Ok((file, metadata, IdentityStatus::LocatorCandidate, None));
+            return Ok((file, metadata, IdentityStatus::LocatorCandidate, None, None));
         }
         return Err(GapReason::BackingUnavailable);
     }
@@ -580,7 +595,7 @@ fn backing(
     {
         return Err(GapReason::BackingUnavailable);
     }
-    Ok((file, metadata, IdentityStatus::LocatorCandidate, None))
+    Ok((file, metadata, IdentityStatus::LocatorCandidate, None, None))
 }
 
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
@@ -641,7 +656,7 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         // Bound mapping/open attempts even when locators collide or fail.
         attempts += 1;
         work.totals.objects_attempted += 1;
-        let (file, metadata, identity_status, page) =
+        let (file, metadata, identity_status, page, association) =
             match backing(view.as_ref(), &process, &mapping, work) {
                 Ok(bound) => bound,
                 Err(reason) => {
@@ -664,20 +679,46 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         // Charge metadata, vector growth and temporary fingerprint/set copies
         // before cloning cached or newly inspected module metadata.
         work.reserve_record(2048)?;
+        let mut status = identity_status;
         match work.inspect(file, &metadata, page) {
-            Ok(info) if work.include_other || info.kind != ObjectKind::Other => modules.push((
-                ModuleRecord {
-                    info,
-                    identity_status,
-                },
-                key.clone(),
-            )),
-            Ok(_) | Err(GapReason::NotElf) => {}
+            Ok(info) => {
+                if work.include_other || info.kind != ObjectKind::Other {
+                    // ER-5E-I3: the association is retained through parsing
+                    // and re-proven before publication — for fresh parses
+                    // and cache hits alike, since both return here. The
+                    // parsed bytes come from the retained verifying
+                    // descriptor, and this revalidation brackets the parse:
+                    // a copy-up (or any backing change) inside the
+                    // verify→parse window downgrades to a locator
+                    // candidate instead of publishing post-window bytes
+                    // as Verified.
+                    if status == IdentityStatus::Verified {
+                        if let Some(association) = &association {
+                            if association.revalidate_charged(work).is_err() {
+                                status = IdentityStatus::LocatorCandidate;
+                                let cause = work
+                                    .backing_limit
+                                    .take()
+                                    .unwrap_or(GapReason::IdentityUnverified);
+                                work.gap(Some(pid), Some(&mapping), cause);
+                            }
+                        }
+                    }
+                    modules.push((
+                        ModuleRecord {
+                            info,
+                            identity_status: status,
+                        },
+                        key.clone(),
+                    ));
+                }
+            }
+            Err(GapReason::NotElf) => {}
             Err(reason) => work.gap(Some(pid), Some(&mapping), reason),
         }
         // The cache holds the descriptor alive; failed admission alone is
         // not retained identity evidence and must not suppress another VMA.
-        if identity_status == IdentityStatus::Verified && work.cache.contains_key(&key) {
+        if status == IdentityStatus::Verified && work.cache.contains_key(&key) {
             verified.insert(key);
         }
     }
