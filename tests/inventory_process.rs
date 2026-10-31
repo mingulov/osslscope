@@ -73,7 +73,9 @@ impl Fixture {
                 for (int i = 1; i < argc; ++i) {
                     int fd = open(argv[i], O_RDONLY); struct stat st;
                     if (fd < 0 || fstat(fd, &st)) return 2;
-                    if (mmap(0, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 3;
+                    void *at = mmap(0, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+                    if (at == MAP_FAILED) return 3;
+                    { volatile char touch = ((char *)at)[0]; (void)touch; }
                     close(fd);
                 }
                 puts("ready"); fflush(stdout);

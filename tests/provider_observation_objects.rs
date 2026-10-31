@@ -44,7 +44,7 @@ impl OwnedChild {
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
-int main(int argc,char **argv){for(int i=1;i<argc;i++){int fd=open(argv[i],O_RDONLY);struct stat st;if(fd<0||fstat(fd,&st))return 2;if(mmap(0,st.st_size,PROT_READ|PROT_EXEC,MAP_PRIVATE,fd,0)==MAP_FAILED)return 3;close(fd);}puts("ready");fflush(stdout);int command=getchar();if(command==101){execl("/bin/cat","cat",(char*)0);return 4;}return 0;}
+int main(int argc,char **argv){for(int i=1;i<argc;i++){int fd=open(argv[i],O_RDONLY);struct stat st;if(fd<0||fstat(fd,&st))return 2;void *at=mmap(0,st.st_size,PROT_READ|PROT_EXEC,MAP_PRIVATE,fd,0);if(at==MAP_FAILED)return 3;{volatile char t=((char*)at)[0];(void)t;}close(fd);}puts("ready");fflush(stdout);int command=getchar();if(command==101){execl("/bin/cat","cat",(char*)0);return 4;}return 0;}
 "#).unwrap();
         assert!(
             Command::new("cc")
