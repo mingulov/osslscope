@@ -2714,6 +2714,39 @@ mod tests {
             assert_eq!(export_api_at(|index| exact.get(index).copied()), None);
         }
     }
+
+    // Catches association revalidation running outside the acquisition
+    // budget: with an expired deadline GREEN refuses before any
+    // revalidation IO, RED revalidates successfully. (Size-based
+    // revalidation refusal shares the capture path's charged reads; the
+    // backing-level control covers refusal with an exhausted budget.)
+    #[test]
+    #[ignore = "requires privileged map_files (5E-I2)"]
+    fn revalidation_enforces_the_acquisition_deadline() {
+        let mut sleep = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = sleep.id();
+        let mut snapshot = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        });
+        assert!(!snapshot.processes.is_empty(), "sleep must be inventoried");
+        let record = snapshot.processes.remove(0);
+        let mut budget = ObservationBudget::default();
+        let process = acquire(&record, &mut budget).unwrap();
+        let reads = budget.elf_read_bytes();
+        budget.set_deadline(std::time::Instant::now());
+        assert_eq!(process.revalidate(), Err(ObservationGap::SnapshotLag));
+        assert_eq!(
+            budget.elf_read_bytes(),
+            reads,
+            "deadline refusal must precede revalidation IO"
+        );
+        sleep.kill().unwrap();
+        sleep.wait().unwrap();
+    }
 }
 
 #[cfg(all(test, target_arch = "x86_64"))]

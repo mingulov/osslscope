@@ -607,3 +607,71 @@ fn btrfs_equal_maps_identity_preserves_distinct_native_backings() {
     assert!(result.totals.objects_attempted <= result.limits.max_objects);
     assert!(result.totals.objects_attempted <= result.limits.max_objects_per_process);
 }
+
+// Catches backing IO operating outside the inventory read budget. The budget
+// admits every procfs-owned read plus half of backing's duplicate reads
+// (all sizes measured independently below, never from production
+// accounting): GREEN refuses with ReadLimit before exceeding it, RED
+// (uncharged backing) fits and reports no ReadLimit.
+#[test]
+fn backing_reads_are_charged_to_the_inventory_budget() {
+    let fixture = Fixture::new();
+    let modules = fixture.modules();
+    let child = fixture.child(&modules);
+    let pid = child.pid();
+    let generous = snap(vec![pid], Limits::default());
+    assert!(
+        !has_gap(&generous, GapReason::ReadLimit),
+        "sanity: generous snapshot must not hit ReadLimit: {generous:?}"
+    );
+    // Independent measurements (not production accounting).
+    let stat_len = fs::read(format!("/proc/{pid}/stat")).unwrap().len() as u64;
+    let maps_bytes = fs::read(format!("/proc/{pid}/maps")).unwrap();
+    let maps_len = maps_bytes.len() as u64;
+    let mountinfo_len = fs::read(format!("/proc/{pid}/mountinfo")).unwrap().len() as u64;
+    // Every executable file-backed row is inspected (module_len + 1) and
+    // triggers one layer-discovery mountinfo read.
+    let mut inspected: u64 = 0;
+    let mut rows: u64 = 0;
+    for line in maps_bytes.split(|b| *b == b'\n').filter(|l| !l.is_empty()) {
+        let text = String::from_utf8_lossy(line);
+        let mut fields = text.split_whitespace();
+        let (Some(_range), Some(perms), Some(_offset), Some(_dev), Some(ino)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        if perms.len() != 4 || perms.as_bytes()[2] != b'x' || ino == "0" {
+            continue;
+        }
+        let path = fields.next().unwrap_or("");
+        if path.is_empty() || path.starts_with('[') {
+            continue;
+        }
+        inspected += fs::metadata(path).unwrap().len() + 1;
+        rows += 1;
+    }
+    assert!(rows > 0, "fixture child must map executables");
+    // Procfs-owned reads: open-stat + maps + inspections + final maps +
+    // validation stat. Backing duplicates: capture stat + maps plus one
+    // mountinfo read per mapping.
+    let owned = 2 * stat_len + 2 * maps_len + inspected;
+    let backing = stat_len + maps_len + rows * mountinfo_len;
+    let max = owned + backing / 2;
+    let result = snap(
+        vec![pid],
+        Limits {
+            max_read_bytes: max,
+            ..Limits::default()
+        },
+    );
+    assert!(
+        has_gap(&result, GapReason::ReadLimit),
+        "backing reads must be charged (owned={owned} backing={backing} max={max}): {result:?}"
+    );
+    assert!(result.totals.read_bytes <= max);
+}

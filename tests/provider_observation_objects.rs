@@ -836,3 +836,24 @@ fn changed_executable_invalidates_acquired_process() {
         "exec must invalidate custody"
     );
 }
+
+// Catches backing buffers operating outside the acquisition state budget.
+// 5MiB admits the maps/attempt/object charges but not backing's maps-buffer
+// reservation: GREEN refuses with StateLimit before allocating it, RED acquires.
+#[test]
+#[ignore = "requires privileged map_files (5E-I2)"]
+fn backing_buffers_are_charged_to_the_acquisition_budget() {
+    let fixture = Fixture::new();
+    let path = fixture.0.join("renamed.so");
+    let child = OwnedChild::spawn(&fixture, &[path]);
+    let record = snapshot_pid(child.pid());
+    let mut budget = ObservationBudget::new(ObservationLimits {
+        max_state_bytes: 5 * 1024 * 1024,
+        ..Default::default()
+    });
+    assert_eq!(
+        acquire(&record, &mut budget).map(|_| ()),
+        Err(ObservationGap::StateLimit)
+    );
+    assert!(budget.elf_read_bytes() <= budget.limits.max_elf_read_bytes);
+}
