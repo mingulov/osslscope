@@ -800,13 +800,11 @@ fn x_offset(bytes: &[u8]) -> u64 {
     ph.p_offset + 8
 }
 
-/// Minimal valid ELF64 (~200 bytes) with a GNU build-id note, for
-/// multi-file fixtures: staging the 70MB+ test binary twice
-/// overflows the 128MiB round budget (R14 refuses the second read
-/// loud), so tests that need every staged file READ use these for
-/// their companion files. Distinct seeds give distinct build-ids
-/// (distinct fingerprints); parse/build-id/flip behavior matches
-/// the real binary (pinned by `small_elf_fixture_is_valid`).
+/// Bounded ELF64 provider fixture with executable file bytes and a
+/// GNU build-id. Its size is independent of the compiled test binary,
+/// so nominal providers fit both per-object and round read budgets.
+/// Distinct seeds give distinct fingerprints; parse/build-id/flip
+/// behavior is pinned by `small_elf_fixture_is_valid`.
 fn small_elf(seed: u8) -> Vec<u8> {
     let mut v = vec![0u8; 212];
     // ELF header.
@@ -1035,7 +1033,7 @@ struct Harness {
 impl Harness {
     fn fresh(test: &str) -> Self {
         let stage = Stage::fresh(test);
-        let bytes = self_bytes();
+        let bytes = small_elf(0xA1);
         let off = x_offset(&bytes);
         let staged = stage.write("prov.so", &bytes);
         let clock = FakeClock::new();
@@ -1263,6 +1261,32 @@ fn burst(delta: DiscoveryDelta, n: usize) -> VecDeque<DiscoveryDelta> {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn harness_provider_fixture_is_bounded_valid_elf() {
+    use goblin::elf::program_header::{PF_X, PT_LOAD};
+    let h = Harness::fresh("bounded-provider");
+    assert!(h.bytes.len() <= 4096, "provider fixture must stay small");
+    let elf = goblin::elf::Elf::parse(&h.bytes).unwrap();
+    for off in [h.off, h.off + 16, h.off + 0x40, h.off + 0x80] {
+        assert!(
+            elf.program_headers.iter().any(|ph| {
+                ph.p_type == PT_LOAD
+                    && ph.p_flags & PF_X != 0
+                    && off >= ph.p_offset
+                    && off < ph.p_offset + ph.p_filesz
+                    && off < h.bytes.len() as u64
+            }),
+            "fixture offset {off} must have executable file bytes"
+        );
+    }
+    let id = osslscope::discovery::elf::read_build_id(&h.bytes).unwrap();
+    assert_eq!(id.len(), 40);
+    assert_eq!(std::fs::read(&h.staged.path).unwrap(), h.bytes);
+    let bound = &h.files[&h.staged.path];
+    assert_eq!(&*bound.bytes, h.bytes.as_slice());
+    assert_eq!((bound.dev, bound.ino), (h.staged.device, h.staged.ino));
+}
+
+#[test]
 fn clean_exit_yields_complete() {
     // Happy path: terminated table, attached site, executed calls, a
     // mid-window exit (no over-budget, no tail gap) — COMPLETE with
@@ -1297,9 +1321,16 @@ fn clean_exit_yields_complete() {
     );
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
     h.exit_code = 0;
+    let provider_path = h.staged.path.clone();
     let (out, post) = h.run();
     let c = out.unwrap();
     assert!(matches!(c.outcome, Outcome::Complete), "{c:?}");
+    assert!(!has_counter(&c, "discovery.relevance_capped"));
+    assert!(c.document.refusal_diagnostics.is_empty());
+    assert_eq!(
+        post.proc_log.borrow().read_allowances,
+        vec![(provider_path, 128 * 1024 * 1024)]
+    );
     assert!(c.reasons.is_empty(), "{:?}", c.reasons);
     assert!(matches!(c.document.status, Completeness::Complete));
     assert_eq!(c.child_exit, Some(0));

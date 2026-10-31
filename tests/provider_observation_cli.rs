@@ -285,26 +285,77 @@ fn build_dev_copies_the_emitted_companion_beside_the_actual_host_artifact() {
         root.join("scripts/build-dev.sh"),
     )
     .unwrap();
+    // Exercise the real source snapshot helper against a tiny owned sysroot.
+    // These are fake compiler outputs; no Rust or BPF compilation runs here.
+    fs::create_dir(root.join("packaging")).unwrap();
+    fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("packaging/source_payload.py"),
+        root.join("packaging/source_payload.py"),
+    )
+    .unwrap();
+    let library = f.0.join("sysroot/lib/rustlib/src/rust/library/core/src");
+    fs::create_dir_all(&library).unwrap();
+    fs::write(library.join("lib.rs"), b"// fixed fake runtime source\n").unwrap();
     let tools = f.0.join("tools");
     fs::create_dir(&tools).unwrap();
     let cargo = r#"#!/usr/bin/python3
 import json,os,pathlib,sys
 args=sys.argv[1:]
 root=pathlib.Path(os.environ['PROVIDER_BUILD_FIXTURE'])
-if '--version' in args: print('cargo 1.88.0'); sys.exit(0)
+pin=args[0]
+assert pin in ('+1.88.0', '+nightly-2026-05-20'), args
+compiler=str(root/'tools'/pin[1:]/'rustc')
+assert os.environ['RUSTC'] == compiler
+assert os.environ['CARGO_BUILD_RUSTC'] == compiler
+assert os.environ['CARGO_ENCODED_RUSTFLAGS'] == ''
+if '--version' in args: print('cargo '+('1.88.0' if pin=='+1.88.0' else '1.91.0-nightly')); sys.exit(0)
 if 'metadata' in args: print(json.dumps({'target_directory': str(root/'custom target')})); sys.exit(0)
 assert 'build' in args and '--locked' in args and '--offline' in args
 bins=[args[i+1] for i,a in enumerate(args) if a=='--bin'] or ['osslscope']
+assert (pin=='+1.88.0') == (bins==['osslscope'])
 for name in bins:
     p=root/'custom target'/('bpfel-unknown-none/release' if name!='osslscope' else 'custom-triple/debug')/name
     p.parent.mkdir(parents=True,exist_ok=True)
     p.write_bytes(('fresh '+name).encode()); p.chmod(0o755)
     print(json.dumps({'reason':'compiler-artifact','target':{'name':name,'kind':['bin']},'executable':str(p)}))
 "#;
+    let rustup = r#"#!/usr/bin/python3
+import os,pathlib,sys
+root=pathlib.Path(os.environ['PROVIDER_BUILD_FIXTURE'])
+args=sys.argv[1:]
+if len(args)==4 and args[:2]==['which','--toolchain'] and args[3]=='rustc':
+    assert args[2] in ('1.88.0','nightly-2026-05-20')
+    print(root/'tools'/args[2]/'rustc')
+elif args==['component','list','--toolchain','nightly-2026-05-20','--installed']:
+    print('rust-src')
+else:
+    raise AssertionError(args)
+"#;
+    let rustc = r#"#!/usr/bin/python3
+import os,pathlib,sys
+root=pathlib.Path(os.environ['PROVIDER_BUILD_FIXTURE'])
+pin=pathlib.Path(sys.argv[0]).parent.name
+if sys.argv[1:]==['--version']:
+    print('rustc '+('1.88.0 (fake-host)' if pin=='1.88.0' else '1.91.0-nightly (fake-bpf)'))
+elif sys.argv[1:]==['--print','sysroot']:
+    assert pin=='nightly-2026-05-20'
+    print(root/'sysroot')
+else:
+    raise AssertionError(sys.argv[1:])
+"#;
+    for pin in ["1.88.0", "nightly-2026-05-20"] {
+        fs::create_dir(tools.join(pin)).unwrap();
+        fs::write(tools.join(pin).join("rustc"), rustc).unwrap();
+        fs::set_permissions(
+            tools.join(pin).join("rustc"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
     for (name, source) in [
         ("cargo", cargo),
-        ("rustc", "#!/bin/sh\necho 'rustc 1.88.0'\n"),
-        ("rustup", "#!/bin/sh\necho 'rust-src'\n"),
+        ("rustc", rustc),
+        ("rustup", rustup),
         ("bpf-linker", "#!/bin/sh\necho 'bpf-linker 0.10.4'\n"),
     ] {
         fs::write(tools.join(name), source).unwrap();
@@ -326,8 +377,22 @@ for name in bins:
     let copied =
         f.0.join("custom target/custom-triple/debug/osslscope-provider-observation");
     assert_eq!(
-        fs::read(copied).expect("automatic sibling companion"),
+        fs::read(&copied).expect("automatic sibling companion"),
         b"fresh osslscope-provider-observation"
+    );
+    assert_ne!(
+        fs::metadata(&copied).unwrap().permissions().mode() & 0o111,
+        0
+    );
+    let focused =
+        f.0.join("custom target/custom-triple/debug/osslscope-focused-count");
+    assert_eq!(
+        fs::read(&focused).unwrap(),
+        b"fresh osslscope-focused-count"
+    );
+    assert_ne!(
+        fs::metadata(&focused).unwrap().permissions().mode() & 0o111,
+        0
     );
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(root.join("target/dev-build-manifest.json")).unwrap())

@@ -2331,64 +2331,186 @@ mod tests {
         assert_eq!(e.message, "value forbidden here");
     }
 
-    #[test]
-    fn no_v1_report_goldens_remain() {
-        // T14r4: the v1 report renderer is deleted (PRD §14.1 v2-only
-        // live producer), so no v1 report golden may exist — any
-        // checked-in one is v1 rot. (The v1 READER stays tested by
-        // the check_version unit tests; the frozen v1 auditor golden
-        // lives at tests/auditor_golden.json, outside goldens/.)
-        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
-        let entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
-            .filter(|f| {
-                f.starts_with("report-") && !f.starts_with("report-v2-") && f.ends_with(".json")
-            })
+    fn report_golden_names(names: impl Iterator<Item = String>) -> Vec<String> {
+        let mut names: Vec<_> = names
+            .filter(|f| f.starts_with("report-") && f.ends_with(".json"))
             .collect();
+        names.sort();
+        names
+    }
+
+    fn report_goldens() -> Vec<(String, serde_json::Value)> {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/goldens");
+        let names = report_golden_names(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap()),
+        );
         assert!(
-            entries.is_empty(),
-            "v1 report goldens rot: {entries:?} (v1 is unproduced)"
+            names.len() >= 5,
+            "expected report goldens, found {}",
+            names.len()
+        );
+        names
+            .into_iter()
+            .map(|name| {
+                let text = std::fs::read_to_string(dir.join(&name))
+                    .unwrap_or_else(|e| panic!("{name}: read: {e}"));
+                let doc =
+                    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{name}: JSON: {e}"));
+                (name, doc)
+            })
+            .collect()
+    }
+
+    fn validate_report_golden(name: &str, doc: &serde_json::Value) -> Result<(), String> {
+        let version = doc
+            .get("schema_version")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("{name}: schema_version must be a string"))?;
+        if !check_version_v2(version) || check_version(version) {
+            return Err(format!("{name}: live report requires v2, got {version:?}"));
+        }
+        validate_v2(doc).map_err(|e| format!("{name}: schema: {e}"))?;
+        check_v2_semantics(doc).map_err(|e| format!("{name}: semantics: {e}"))
+    }
+
+    fn execution_golden() -> serde_json::Value {
+        serde_json::from_str(include_str!("../tests/goldens/report-v2_5-execution.json")).unwrap()
+    }
+
+    #[test]
+    fn report_golden_enumeration_includes_all_version_names() {
+        // A filename may neither hide a document from validation nor declare its version.
+        let names = report_golden_names(
+            [
+                "report-v2_5-execution.json",
+                "other.json",
+                "report-v1-old.json",
+                "report-neutral.json",
+                "report-v2-complete.json",
+                "report-v2.json.bak",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        assert_eq!(
+            names,
+            [
+                "report-neutral.json",
+                "report-v1-old.json",
+                "report-v2-complete.json",
+                "report-v2_5-execution.json",
+            ]
         );
     }
 
     #[test]
-    fn goldens_v2_conform_to_schema() {
-        // Every checked-in v2 artifact validates (schema +
-        // semantics) on every run: goldens cannot rot into
-        // non-conforming bytes unnoticed.
-        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
-        let mut entries: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_str().unwrap().to_string())
-            .filter(|f| f.starts_with("report-v2-") && f.ends_with(".json"))
-            .collect();
-        entries.sort();
-        for f in &entries {
-            let doc: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{f}")).unwrap())
-                    .unwrap();
-            let v = doc["schema_version"].as_str().unwrap();
-            assert!(check_version_v2(v), "{f}: v2 reader rejects {v}");
-            assert!(!check_version(v), "{f}: v2 file accepted by v1 reader");
-            validate_v2(&doc).unwrap_or_else(|e| panic!("{f}: schema: {e}"));
-            check_v2_semantics(&doc).unwrap_or_else(|e| panic!("{f}: semantics: {e}"));
+    fn report_golden_version_comes_from_document() {
+        use serde_json::json;
+        let good = execution_golden();
+        for name in [
+            "report-v2_5-execution.json",
+            "report-v2-complete.json",
+            "report-v1-misleading.json",
+        ] {
+            validate_report_golden(name, &good).unwrap();
         }
+        for version in [
+            json!(null),
+            json!(2),
+            json!("observed-crypto-v1"),
+            json!("observed-crypto-v1.9"),
+            json!("observed-crypto-v3.0"),
+            json!("observed-crypto-v2.x"),
+            json!("observed-crypto-v2."),
+            json!(""),
+        ] {
+            let mut doc = good.clone();
+            doc["schema_version"] = version;
+            let error = validate_report_golden("report-v2-misleading.json", &doc).unwrap_err();
+            assert!(error.starts_with("report-v2-misleading.json:"), "{error}");
+        }
+        let mut missing = good;
+        missing.as_object_mut().unwrap().remove("schema_version");
+        assert!(validate_report_golden("report-v2-missing.json", &missing).is_err());
+    }
+
+    #[test]
+    fn report_golden_validation_keeps_schema_and_attribution_strict() {
+        use serde_json::json;
+        let good = execution_golden();
+        validate_report_golden("report-v2_5-execution.json", &good).unwrap();
+        let cases = [
+            (
+                "/schema_version",
+                json!("observed-crypto-v2.4"),
+                "minor >= 5",
+            ),
+            (
+                "/execution_attributions/0/selector",
+                json!(1),
+                "indexes no listed selector",
+            ),
+            (
+                "/execution_attributions/0/offset",
+                json!(9999),
+                "no listed site",
+            ),
+            (
+                "/execution_attributions/0/calls",
+                json!(41),
+                "site executed 40",
+            ),
+            (
+                "/execution_attributions/0/end_ns",
+                json!(91),
+                "escape the site activity",
+            ),
+            (
+                "/attribution_bounds/unresolved_calls",
+                json!(51),
+                "understates the 52-call",
+            ),
+        ];
+        for (pointer, value, reason) in cases {
+            let mut bad = good.clone();
+            *bad.pointer_mut(pointer).unwrap() = value;
+            // These shapes are legal JSON Schema; the cross-field checker must reject them.
+            validate_v2(&bad).unwrap();
+            let error = validate_report_golden("report-v2_5-execution.json", &bad).unwrap_err();
+            assert!(error.contains(reason), "{pointer}: {error}");
+        }
+        let mut unknown = good;
+        unknown["unexpected"] = json!(true);
+        let error = validate_report_golden("report-v2_5-execution.json", &unknown).unwrap_err();
         assert!(
-            entries.len() >= 5,
-            "expected v2 report goldens, found {}",
-            entries.len()
+            error.contains("schema:") && error.contains("unexpected"),
+            "{error}"
         );
-        // The v2 auditor golden conforms too (same checker the
-        // auditor suite uses).
+    }
+
+    #[test]
+    fn no_v1_report_goldens_remain() {
+        // Live producers are v2-only; historical v1 reader/auditor tests remain separate.
+        for (name, doc) in report_goldens() {
+            validate_report_golden(&name, &doc).unwrap_or_else(|e| panic!("{e}"));
+        }
+    }
+
+    #[test]
+    fn goldens_v2_conform_to_schema() {
+        for (name, doc) in report_goldens() {
+            validate_report_golden(&name, &doc).unwrap_or_else(|e| panic!("{e}"));
+        }
+        // The v2 auditor golden conforms too; the historical v1 auditor stays supported.
         let text = std::fs::read_to_string(format!(
             "{}/tests/auditor_golden_v2.json",
             env!("CARGO_MANIFEST_DIR")
         ))
         .unwrap();
         let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
-        validate_v2(&doc).expect("auditor golden v2: schema");
-        check_v2_semantics(&doc).expect("auditor golden v2: semantics");
+        validate_report_golden("auditor_golden_v2.json", &doc).unwrap();
     }
 }
 
