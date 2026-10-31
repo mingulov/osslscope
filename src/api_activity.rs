@@ -8,7 +8,7 @@ pub struct ApiId(u32);
 impl TryFrom<u32> for ApiId {
     type Error = &'static str;
     fn try_from(value: u32) -> Result<Self, Self::Error> {
-        if (20..=48).contains(&value) {
+        if (20..=72).contains(&value) {
             Ok(Self(value))
         } else {
             Err("unsupported_public_api")
@@ -22,17 +22,17 @@ impl From<ApiId> for u32 {
 }
 impl ApiId {
     pub(crate) const fn constant(value: u32) -> Self {
-        assert!(value >= 20 && value <= 48);
+        assert!(value >= 20 && value <= 72);
         Self(value)
     }
     pub fn export_name(self) -> &'static str {
         API_NAMES[(self.0 - 20) as usize]
     }
     pub fn all() -> impl Iterator<Item = Self> {
-        (20..=48).map(Self)
+        (20..=72).map(Self)
     }
 }
-pub const API_NAMES: [&str; 29] = [
+pub const API_NAMES: [&str; 53] = [
     "EVP_DigestInit_ex",
     "EVP_DigestInit_ex2",
     "EVP_DigestUpdate",
@@ -62,6 +62,30 @@ pub const API_NAMES: [&str; 29] = [
     "EVP_DigestSign",
     "EVP_DigestVerify",
     "EVP_RAND_generate",
+    "EVP_PKEY_encapsulate",
+    "EVP_PKEY_decapsulate",
+    "EVP_PKEY_keygen_init",
+    "EVP_PKEY_keygen",
+    "EVP_PKEY_paramgen_init",
+    "EVP_PKEY_paramgen",
+    "EVP_PKEY_derive_init",
+    "EVP_PKEY_check",
+    "EVP_PKEY_public_check",
+    "EVP_PKEY_param_check",
+    "EVP_PKEY_copy_parameters",
+    "EVP_DigestSignInit",
+    "EVP_DigestSignUpdate",
+    "EVP_DigestVerifyInit",
+    "EVP_DigestVerifyUpdate",
+    "EVP_Q_digest",
+    "EVP_Q_mac",
+    "EVP_RAND_nonce",
+    "EVP_RAND_CTX_new",
+    "EVP_RAND_CTX_free",
+    "EVP_MD_CTX_new",
+    "EVP_MD_CTX_free",
+    "EVP_CIPHER_CTX_new",
+    "EVP_CIPHER_CTX_free",
 ];
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

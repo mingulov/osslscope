@@ -292,7 +292,7 @@ impl ObservationApi {
         })
     }
 }
-pub(crate) const APIS: [ObservationApi; 45] = [
+pub(crate) const APIS: [ObservationApi; 69] = [
     ObservationApi::Inventoried(inventory::Api::OsslProviderInit),
     ObservationApi::Inventoried(inventory::Api::OsslProviderLoad),
     ObservationApi::Inventoried(inventory::Api::OsslProviderTryLoad),
@@ -338,6 +338,30 @@ pub(crate) const APIS: [ObservationApi; 45] = [
     ObservationApi::Operational(crate::api_activity::ApiId::constant(46)),
     ObservationApi::Operational(crate::api_activity::ApiId::constant(47)),
     ObservationApi::Operational(crate::api_activity::ApiId::constant(48)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(49)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(50)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(51)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(52)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(53)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(54)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(55)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(56)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(57)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(58)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(59)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(60)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(61)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(62)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(63)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(64)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(65)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(66)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(67)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(68)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(69)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(70)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(71)),
+    ObservationApi::Operational(crate::api_activity::ApiId::constant(72)),
 ];
 /// Content fingerprint validated on construction and deserialization.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

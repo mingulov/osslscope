@@ -39,7 +39,7 @@ pub(crate) fn api(id: u32) -> Result<ObservationApi, ObservationGap> {
         17 => ObservationApi::ProviderQueryCallback,
         18 => ObservationApi::ProviderTeardownCallback,
         19 => ObservationApi::ProviderUnqueryCallback,
-        20..=48 => ObservationApi::Operational(
+        20..=72 => ObservationApi::Operational(
             crate::api_activity::ApiId::try_from(id).map_err(|_| ObservationGap::InvalidWire)?,
         ),
         _ => return Err(ObservationGap::InvalidWire),
@@ -325,7 +325,7 @@ pub(crate) fn activity(
     if paired > v.entries
         || failure_subsets > v.failure
         || v.mismatch > 0 && !matches!(api, 40 | 45 | 47)
-        || v.unsupported > 0 && !(39..=43).contains(&api)
+        || v.unsupported > 0 && !matches!(api, 39..=43 | 49..=58)
     {
         return Err(ObservationGap::InvalidWire);
     }

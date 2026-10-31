@@ -1291,7 +1291,7 @@ impl ProviderSession {
             // accounting on every early return as well as the normal path.
             let mut staging = Vec::new();
             let mut public_sites = Vec::new();
-            for id in (1..=16).chain(20..=48) {
+            for id in (1..=16).chain(20..=72) {
                 for resolved in target.process.resolve_api(wire::api(id)?) {
                     self.roles.observe(
                         role_site(pid, record.starttime, &resolved.site),
@@ -2656,7 +2656,7 @@ impl ProviderSession {
         for site in sites {
             let (api, site) = site.into_parts();
             let id = (1..=16)
-                .chain(20..=48)
+                .chain(20..=72)
                 .find(|&id| wire::api(id) == Ok(api))
                 .ok_or(ObservationGap::InvalidWire)?;
             let key = role_site(site.pid(), site.starttime(), &site);
@@ -13467,8 +13467,12 @@ mod startup_api_controls {
         }
         for id in [0, 19, 73, 127, 128, 256, u32::MAX] {
             assert!(ApiId::try_from(id).is_err(), "ApiId {id} must refuse");
+        }
+        // wire::api also serves the inventoried 1-19 plane; 19 is valid wire.
+        for id in [0, 73, 127, 128, 256, u32::MAX] {
             assert!(wire::api(id).is_err(), "wire {id} must refuse");
         }
+        assert!(wire::api(19).is_ok());
         assert_eq!(ApiId::all().count(), 53);
     }
     #[test]
@@ -13602,8 +13606,8 @@ mod startup_api_controls {
             1,
             "successful source prefix must remain retained"
         );
-        assert_eq!(startup[&child.pid()].len(), 29);
-        assert_eq!(armed.len(), 29);
+        assert_eq!(startup[&child.pid()].len(), 53);
+        assert_eq!(armed.len(), 53);
         for a in &startup[&child.pid()] {
             assert!(roles.accepts(role_site(a.site.pid(), a.site.starttime(), &a.site), a.api));
             assert_eq!(a.links.len(), 2);

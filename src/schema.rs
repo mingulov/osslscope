@@ -2729,7 +2729,7 @@ fn check_dynamic_sections(root: &serde_json::Map<String, serde_json::Value>) -> 
             || row.gaps.tail != row.entries - paired
             || failure_subsets > row.observed_failure
             || row.verification_mismatch > 0 && !matches!(api, 40 | 45 | 47)
-            || row.unsupported > 0 && !(39..=43).contains(&api)
+            || row.unsupported > 0 && !matches!(api, 39..=43 | 49..=58)
         {
             return Err("inconsistent API activity".into());
         }

@@ -5302,23 +5302,28 @@ fn additive_api_totals_never_create_cbom_assets_or_physical_execution() {
         display_locator: "libcrypto.so.3".to_string(),
     }];
     let mut doc = finalize_honest(input);
-    // One success row per new ID; the CHECK IDs also carry a failure row
-    // and one documented-unsupported row to pin the subset vocabulary.
-    doc.api_activity = (49..=72u32).map(|api| row(api, 5, 0)).collect();
-    doc.api_activity.push(row(56, 0, 3));
-    doc.api_activity.push(osslscope::api_activity::ApiActivityRow {
-        api: 49u32.try_into().unwrap(),
-        entries: 1,
-        observed_success: 0,
-        observed_failure: 1,
-        verification_mismatch: 0,
-        unsupported: 1,
-        gaps: osslscope::api_activity::ApiActivityGaps::default(),
-    });
+    // One row per new ID; 49 also carries a documented-unsupported return
+    // and 56 a CHECK failure to pin the subset vocabulary (rows are unique
+    // per API, so the subsets fold into the same rows).
+    doc.api_activity = (49..=72u32)
+        .map(|api| match api {
+            49 => osslscope::api_activity::ApiActivityRow {
+                api: api.try_into().unwrap(),
+                entries: 6,
+                observed_success: 5,
+                observed_failure: 1,
+                verification_mismatch: 0,
+                unsupported: 1,
+                gaps: osslscope::api_activity::ApiActivityGaps::default(),
+            },
+            56 => row(api, 5, 3),
+            _ => row(api, 5, 0),
+        })
+        .collect();
     let rendered = json_of(&doc);
     validate_v2(&rendered).expect("v2.5 producer shape validates");
     check_v2_semantics(&rendered).expect("v2.5 producer shape is semantic-clean");
-    assert_eq!(rendered["api_activity"].as_array().unwrap().len(), 26);
+    assert_eq!(rendered["api_activity"].as_array().unwrap().len(), 24);
     assert_eq!(rendered["sites"][0]["calls"], json!(0));
     let cbom = cbom_of(&doc);
     assert_eq!(cbom["components"], json!([]));

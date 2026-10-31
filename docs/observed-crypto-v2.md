@@ -674,10 +674,17 @@ observations without changing attribution, completeness, policy or CBOM:
   A late association never reallocates earlier calls. There is no second count
   in this section.
 - `api_activity` contains per-export entries and paired observed-success/failure
-  integer returns. IDs 20–48 cover reviewed digest, cipher, MAC, KDF, PKEY and
+  scalar returns. IDs 20–72 cover reviewed digest, cipher, MAC, KDF, PKEY and
   RAND operations; IDs 1–19 in the observation ABI remain unchanged. The exact
   operational registry is `src/api_activity.rs`. It includes generic cipher and
-  one-shot DigestSign/Verify APIs, independently of algorithm names.
+  one-shot DigestSign/Verify APIs, independently of algorithm names. IDs 49–72
+  add KEM/keygen/paramgen/derive/check, DigestSign/Verify setup, one-shot
+  Q_digest/Q_mac, RAND nonce/context and MD/CIPHER context constructor/
+  destructor coverage. Pointer-returning exports classify NULL as failure and
+  any nonzero pointer as success; void-returning destructor exports record a
+  paired return as success (completed teardown call — failures are
+  unobservable for void); check-family exports classify every non-1 return
+  except documented −2 (unsupported) as failure, per the pinned docs.
 
 API entries are not unique cryptographic operations. Nested wrappers may produce
 several rows; a successful size query may produce no cryptographic output. No
