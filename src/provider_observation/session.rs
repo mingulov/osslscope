@@ -9332,13 +9332,62 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "HKDF".to_string(),
         ]
     }
+    /// Families-stage canary needles: the KDF workload's input
+    /// key material in the byte shapes that must never cross the
+    /// observer boundary — the raw 22-octet 0x0b key and its exact
+    /// `hexkey:` argv spelling. Public algorithm names ("HKDF",
+    /// "HMAC", "SHA2-256") are expected in ring records and are NOT
+    /// needles.
+    fn fam_canary_needles() -> Vec<Vec<u8>> {
+        vec![
+            vec![0x0bu8; 22],
+            format!("hexkey:{}", "0b".repeat(22)).into_bytes(),
+        ]
+    }
+    /// Families-stage canary scan: returns the index of the first
+    /// needle found in `haystack`, or `None` when clean. Every
+    /// families pass-1 run scans its raw ring bytes (the negative
+    /// leg); the unit tests below pin the positive leg (a planted
+    /// needle is caught) and the negative leg (clean input passes).
+    fn fam_canary_scan(haystack: &[u8], needles: &[Vec<u8>]) -> Option<usize> {
+        needles.iter().position(|needle| {
+            !needle.is_empty()
+                && haystack
+                    .windows(needle.len())
+                    .any(|window| window == needle.as_slice())
+        })
+    }
+    #[test]
+    fn fam_canary_scan_finds_planted_key_material() {
+        let needles = fam_canary_needles();
+        assert_eq!(needles.len(), 2);
+        // Positive leg: each needle planted in noise is caught.
+        for (index, needle) in needles.iter().enumerate() {
+            let mut haystack = vec![0xAAu8; 64];
+            haystack.extend_from_slice(needle);
+            haystack.extend_from_slice(&[0x55u8; 64]);
+            assert_eq!(
+                fam_canary_scan(&haystack, &needles),
+                Some(index),
+                "planted needle {index} must be caught"
+            );
+        }
+        // Public algorithm names are not secrets: never flagged.
+        let names = b"HKDF\0HMAC\0SHA2-256\0query-result-ok";
+        assert_eq!(fam_canary_scan(names, &needles), None);
+        // Empty haystack and empty needle set stay clean.
+        assert_eq!(fam_canary_scan(&[], &needles), None);
+        assert_eq!(fam_canary_scan(names, &[]), None);
+    }
     /// Families-stage pass 1: legacy-only observation of a stock
     /// workload drained for live query observations, exact-matched to
     /// the retained arrays into a copied-role staging plan. Mirrors
     /// `u5_pass1_plan_from_live_queries` (which stays verbatim) but
     /// asserts lane-independent invariants only — exact discovery
     /// counts differ per libcrypto build and are printed, not pinned.
-    /// Returns the plan plus the observed workload stdout digest.
+    /// Every run also scans its raw ring bytes for key material (the
+    /// canary negative leg). Returns the plan plus the observed
+    /// workload stdout digest.
     fn fam_pass1_plan_from_live_queries(
         argv: &[String],
         dir: &std::path::Path,
@@ -9429,18 +9478,29 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         let mut records = Vec::new();
         let mut decode_failures = 0usize;
+        let mut ring_bytes = Vec::new();
         while let Some(bytes) = session.events.next() {
+            ring_bytes.extend_from_slice(&bytes);
             match super::wire::decode_transport(&bytes) {
                 Ok(transport) => records.push(transport.record()),
                 Err(_) => decode_failures += 1,
             }
         }
         eprintln!(
-            "{tag} pass1 records={} decode_failures={}",
+            "{tag} pass1 records={} decode_failures={} ring_bytes={}",
             records.len(),
-            decode_failures
+            decode_failures,
+            ring_bytes.len(),
         );
         assert_eq!(decode_failures, 0, "{tag}: every ring record must validate");
+        // Canary negative leg: no input key material in the raw ring.
+        let needles = fam_canary_needles();
+        assert_eq!(
+            fam_canary_scan(&ring_bytes, &needles),
+            None,
+            "{tag}: raw ring bytes must carry no key material"
+        );
+        eprintln!("{tag} pass1 canary=clean ring_bytes={}", ring_bytes.len());
         assert!(
             !records.is_empty(),
             "{tag}: pass-1 must observe ring records"
