@@ -1270,7 +1270,13 @@ fn additive_api_activity_decodes_with_per_api_subset_guards() {
     // Task 7 (5G) round 2: IDs 49-72 decode; 73+ refuses; the -2 subset is
     // admitted exactly on the ten documented -2-capable IDs; mismatch stays
     // confined to the three signature-verification finals.
-    fn aggregate(entries: u64, success: u64, failure: u64, mismatch: u64, unsupported: u64) -> Vec<u8> {
+    fn aggregate(
+        entries: u64,
+        success: u64,
+        failure: u64,
+        mismatch: u64,
+        unsupported: u64,
+    ) -> Vec<u8> {
         let mut bytes = vec![0; 72];
         for (at, n) in [
             (0, entries),
@@ -1287,7 +1293,10 @@ fn additive_api_activity_decodes_with_per_api_subset_guards() {
         let row = wire::decode_activity(api, &aggregate(2, 1, 1, 0, 0))
             .unwrap_or_else(|_| panic!("api {api} must decode"));
         assert_eq!(u32::from(row.api), api);
-        assert_eq!((row.entries, row.observed_success, row.observed_failure), (2, 1, 1));
+        assert_eq!(
+            (row.entries, row.observed_success, row.observed_failure),
+            (2, 1, 1)
+        );
         assert_eq!(row.gaps.tail, 0);
     }
     for api in [0, 19, 73, 127, 128, 256, u32::MAX] {
@@ -1422,8 +1431,14 @@ int main(void) {
     assert_eq!(line, "done\n");
     for _ in 0..3 {
         let batch = session.drain(Instant::now() + Duration::from_millis(100));
-        assert!(batch.facts.is_empty(), "operational hot calls entered cold ring");
-        assert!(batch.api_activity.is_empty(), "interim snapshot must not be accumulated");
+        assert!(
+            batch.facts.is_empty(),
+            "operational hot calls entered cold ring"
+        );
+        assert!(
+            batch.api_activity.is_empty(),
+            "interim snapshot must not be accumulated"
+        );
     }
     let batch = session.close();
     let totals = |api: u32| {
@@ -1448,9 +1463,18 @@ int main(void) {
     assert_eq!(totals(56), (1, 0, 1, 0, 0, 0), "{:?}", batch.gaps);
     assert_eq!(totals(64), (1, 0, 0, 0, 0, 1), "{:?}", batch.gaps);
     for api in [49, 56, 64, 65, 70] {
-        for a in batch.api_activity.iter().filter(|a| u32::from(a.row.api) == api) {
+        for a in batch
+            .api_activity
+            .iter()
+            .filter(|a| u32::from(a.row.api) == api)
+        {
             assert_eq!(
-                (a.row.gaps.tail, a.row.gaps.unpaired, a.row.gaps.map, a.row.gaps.depth),
+                (
+                    a.row.gaps.tail,
+                    a.row.gaps.unpaired,
+                    a.row.gaps.map,
+                    a.row.gaps.depth
+                ),
                 (0, 0, 0, 0),
                 "api {api}"
             );
