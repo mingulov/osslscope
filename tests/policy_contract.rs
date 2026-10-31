@@ -3207,6 +3207,42 @@ fn understated_unresolved_bound_cannot_pass_deny() {
 }
 
 #[test]
+fn foreign_and_skipped_calls_combine_into_conservative_bound() {
+    // ER-5C-I2 remainder: 48 certified + 52 skipped physical + 3
+    // foreign calls publish the additive 55-call bound (consumer
+    // flow-through for the fold-to-projection regression).
+    // Unmatched selector rules stay inconclusive with
+    // possible=Some(55) — never a pass; matching rules still
+    // decide on the partitions (definite=48, upper 48 + 55 —
+    // the foreign 3 ride outside the physical 100).
+    use osslscope::evidence::AttributionBounds;
+    let mut document = execution_doc(CandidateCoverage::Complete, exact_window());
+    document.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 55,
+        withheld_uncertain: 0,
+    });
+    let denied = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_OTHER)],
+        &document,
+    );
+    assert_eq!(denied.overall(), PolicyOutcome::Inconclusive);
+    assert_eq!(denied.rules[0].bounds.definite, 0);
+    assert_eq!(denied.rules[0].bounds.possible, Some(55));
+    let required = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, SEL_ID_OTHER)],
+        &document,
+    );
+    assert_eq!(required.overall(), PolicyOutcome::Inconclusive);
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 48);
+    assert_eq!(violated.rules[0].bounds.possible, Some(103));
+}
+
+#[test]
 fn swapped_selector_reference_matches_no_policy() {
     // ER-5C-I3: rows citing a selector bound to another object
     // or another operation match no policy — the swapped

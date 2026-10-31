@@ -5727,6 +5727,121 @@ fn understated_unresolved_bound_fails_semantics() {
 }
 
 #[test]
+fn additive_unresolved_bound_validates_and_renders_as_omissions() {
+    // ER-5C-I2 remainder: 48 certified + 52 skipped physical + 3
+    // foreign calls publish the additive 55-call bound (consumer
+    // flow-through for the fold-to-projection regression). The
+    // conservative bound validates (55 covers the 52-call
+    // unassigned remainder — overstated stays accepted) and
+    // renders as CBOM omissions: one asset per certified
+    // partition, no legacy site asset, unresolved metadata 55.
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const DIGEST: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    let mut input = input_base();
+    input.sites = vec![
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x1000,
+            0,
+            40,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x2000,
+            0,
+            11,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+        site_at(
+            OBJ,
+            8,
+            100,
+            0x3000,
+            0,
+            49,
+            Vec::new(),
+            CandidateCoverage::Unknown,
+        ),
+    ];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: Some("HMAC".to_string()),
+    }];
+    let row = |offset: u64, segment: u64, calls: u64| ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset,
+        },
+        generation: 0,
+        segment,
+        start_ns: 20,
+        end_ns: 80,
+        calls,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    };
+    doc.execution_attributions = vec![row(0x1000, 1, 37), row(0x2000, 2, 11)];
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 55,
+        withheld_uncertain: 0,
+    });
+    let conserved = json_of(&doc);
+    validate_v2(&conserved).expect("conserved bound validates");
+    check_v2_semantics(&conserved).expect("conserved bound is semantic-clean");
+    let cbom = cbom_of(&doc);
+    let components = cbom["components"].as_array().unwrap();
+    assert_eq!(components.len(), 2, "one asset per certified partition");
+    assert!(
+        components[0]["bom-ref"]
+            .as_str()
+            .unwrap()
+            .starts_with("urn:osslscope:exec-attr:v2.5:")
+    );
+    assert!(
+        !cbom.to_string().contains("urn:osslscope:exec:v2:"),
+        "no legacy site asset"
+    );
+    let metadata = cbom["metadata"]["properties"].as_array().unwrap();
+    let get_meta = |name: &str| {
+        metadata
+            .iter()
+            .find(|p| p["name"] == json!(name))
+            .unwrap_or_else(|| panic!("missing metadata {name}"))["value"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(get_meta("osslscope:unresolved-attribution-calls"), "55");
+}
+
+#[test]
 fn cross_object_selector_reference_is_rejected() {
     // ER-5C-I3: execution rows on object A citing object B's
     // listed selector must fail validation and refuse the CBOM

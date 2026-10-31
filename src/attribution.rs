@@ -2118,6 +2118,117 @@ mod tests {
     }
 
     #[test]
+    fn fold_to_projection_conserves_foreign_and_skipped_calls() {
+        // ER-5C-I2 remainder: 48 fully certified admitted calls,
+        // 52 skipped physical calls and 3 foreign/unknown-cookie
+        // calls must publish the ADDITIVE 55-call bound. The fold
+        // already carries the foreign component in its unresolved
+        // count (48 + 3 − 48 = 3); the document remainder adds the
+        // skipped physical calls — taking their maximum would lose
+        // one contribution and publish 52. The conservative bound
+        // then flows through to the policy upper and the CBOM
+        // omissions (consumer assertions below).
+        let (_, closed) = closed_pair();
+        let receipt = closed.receipt();
+        drop(closed);
+        let mut admitted_row = row();
+        admitted_row.execution.calls = 48;
+        let finalized = fold_attribution(snapshot(
+            window(receipt.close_before_ns, receipt.close_after_ns),
+            vec![admitted_row],
+            vec![reduced(1, 37, 20, 80), reduced(2, 11, 25, 70)],
+            vec![selector()],
+            ClosedAttributionLosses { foreign_calls: 3 },
+        ))
+        .unwrap();
+        assert_eq!(finalized.definite().len(), 2);
+        assert_eq!(finalized.unresolved_calls(), 48 + 3 - 48);
+        assert_eq!(finalized.withheld_uncertain(), 0);
+        let mut doc = empty_doc();
+        // 100 physical calls: the 48 admitted plus 52 the collect
+        // skipped (projection reconciles sums only — site
+        // resolution stays the schema validator's job).
+        let mut admitted = execution(48, 10, 100);
+        admitted.site = site();
+        admitted.generation = 3;
+        let mut skipped = execution(52, 10, 100);
+        skipped.site = SiteKey {
+            object: object(),
+            device: 7,
+            inode: 9,
+            offset: 32,
+        };
+        skipped.generation = 3;
+        doc.sites = vec![admitted, skipped];
+        finalized.project_into_document(&mut doc).unwrap();
+        assert_eq!(
+            doc.attribution_bounds
+                .map(|b| (b.unresolved_calls, b.withheld_uncertain)),
+            Some((55, 0))
+        );
+        // Policy flow-through: the matching identity decides on
+        // the partitions (definite 48, upper 48 + 55 — the foreign
+        // 3 ride outside the physical 100); the unmatched identity
+        // stays inconclusive with the conservative upper, never a
+        // pass.
+        let obj = object();
+        let matched_id = hex32(&[7u8; 32]);
+        let other_id = hex32(&[9u8; 32]);
+        let matched = crate::policy::selector_match_bounds(&doc, &obj.0, &matched_id);
+        assert_eq!(matched.definite, 48);
+        assert_eq!(matched.possible, Some(48 + 55));
+        let unmatched = crate::policy::selector_match_bounds(&doc, &obj.0, &other_id);
+        assert_eq!(unmatched.definite, 0);
+        assert_eq!(unmatched.possible, Some(55));
+        let denied = crate::policy::evaluate_document(
+            &[crate::policy::PolicyRule::deny_selector(&obj.0, &other_id)],
+            &doc,
+        );
+        assert_eq!(denied.overall(), crate::policy::PolicyOutcome::Inconclusive);
+        assert_eq!(denied.rules[0].bounds.definite, 0);
+        assert_eq!(denied.rules[0].bounds.possible, Some(55));
+        let violated = crate::policy::evaluate_document(
+            &[crate::policy::PolicyRule::deny_selector(
+                &obj.0,
+                &matched_id,
+            )],
+            &doc,
+        );
+        assert_eq!(violated.overall(), crate::policy::PolicyOutcome::Violation);
+        assert_eq!(violated.rules[0].bounds.definite, 48);
+        assert_eq!(violated.rules[0].bounds.possible, Some(103));
+        // CBOM flow-through: one asset per certified partition, no
+        // legacy site asset, and the conserved bound as explicit
+        // omissions.
+        let cbom_bytes = crate::report::render_cbom(&doc).expect("cbom renders");
+        let cbom: serde_json::Value = serde_json::from_slice(&cbom_bytes).unwrap();
+        let components = cbom["components"].as_array().unwrap();
+        assert_eq!(components.len(), 2, "one asset per certified partition");
+        assert!(
+            components.iter().all(|c| c["bom-ref"]
+                .as_str()
+                .unwrap()
+                .starts_with("urn:osslscope:exec-attr:v2.5:")),
+            "partition assets only"
+        );
+        assert!(
+            !cbom.to_string().contains("urn:osslscope:exec:v2:"),
+            "no legacy site asset"
+        );
+        let metadata = cbom["metadata"]["properties"].as_array().unwrap();
+        let get_meta = |name: &str| {
+            metadata
+                .iter()
+                .find(|p| p["name"] == serde_json::json!(name))
+                .unwrap_or_else(|| panic!("missing metadata {name}"))["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(get_meta("osslscope:unresolved-attribution-calls"), "55");
+    }
+
+    #[test]
     fn projection_rejects_non_object_bound_rows_without_touching_the_document() {
         let mut doc = empty_doc();
         let before = doc.clone();
