@@ -845,6 +845,68 @@ fn operational_scalar_contracts_do_not_guess_success_or_read_contexts() {
     assert_eq!(operational_outcome(48, (-1i64) as u64), 2);
     assert_eq!(operational_outcome(20, (-1i64) as u64), 0);
     assert_eq!(operational_outcome(46, 2), 0);
-    assert_eq!(operational_outcome(49, 1), 0);
     assert_eq!(operational_outcome(20, 0xffff_ffff_0000_0001), 1);
+}
+
+#[test]
+fn operational_outcome_covers_additive_apis_49_to_72_per_pinned_semantics() {
+    use provider_observation::{operational_api, operational_outcome};
+    // Task 7 (5G) round 2: additive IDs only, 20-48 behavior locked above.
+    for api in 49..=72 {
+        assert!(operational_api(api), "api {api} must be operational");
+    }
+    for api in [0, 1, 19, 73, 127, 128, 256, u32::MAX] {
+        assert!(!operational_api(api), "api {api} must stay non-operational");
+        assert_eq!(operational_outcome(api, 1), 0);
+    }
+    // INT2N: 1 ok; 0/other-negative fail; -2 unsupported; positive >= 2 unknown.
+    for api in [49, 50, 51, 52, 53, 54, 55] {
+        assert_eq!(operational_outcome(api, 1), 1, "api {api}");
+        assert_eq!(operational_outcome(api, 0), 2, "api {api}");
+        assert_eq!(operational_outcome(api, (-2i64) as u64), 4, "api {api}");
+        assert_eq!(operational_outcome(api, (-1i64) as u64), 2, "api {api}");
+        assert_eq!(operational_outcome(api, 2), 0, "api {api}");
+    }
+    // CHECK: doc-literal "1 success, others failure", -2 unsupported.
+    for api in [56, 57, 58] {
+        assert_eq!(operational_outcome(api, 1), 1, "api {api}");
+        assert_eq!(operational_outcome(api, 0), 2, "api {api}");
+        assert_eq!(operational_outcome(api, (-2i64) as u64), 4, "api {api}");
+        assert_eq!(operational_outcome(api, (-1i64) as u64), 2, "api {api}");
+        assert_eq!(operational_outcome(api, 2), 2, "api {api}");
+    }
+    // INT01: 1 ok; 0 fail; everything else unknown.
+    for api in [59, 60, 61, 62, 63, 64, 66] {
+        assert_eq!(operational_outcome(api, 1), 1, "api {api}");
+        assert_eq!(operational_outcome(api, 0), 2, "api {api}");
+        assert_eq!(operational_outcome(api, (-2i64) as u64), 0, "api {api}");
+        assert_eq!(operational_outcome(api, (-1i64) as u64), 0, "api {api}");
+        assert_eq!(operational_outcome(api, 2), 0, "api {api}");
+    }
+    // PTR: full-u64 NULL check; a nonzero pointer with zero low 32 bits
+    // must NOT truncate to NULL.
+    for api in [65, 67, 69, 71] {
+        assert_eq!(operational_outcome(api, 0), 2, "api {api}");
+        assert_eq!(operational_outcome(api, 1), 1, "api {api}");
+        assert_eq!(
+            operational_outcome(api, 0x7fff_ffff_0000_0000),
+            1,
+            "api {api}"
+        );
+        assert_eq!(operational_outcome(api, u64::MAX), 1, "api {api}");
+    }
+    // VOID: success-on-return; rv is caller garbage and must be ignored.
+    for api in [68, 70, 72] {
+        assert_eq!(operational_outcome(api, 0), 1, "api {api}");
+        assert_eq!(operational_outcome(api, 1), 1, "api {api}");
+        assert_eq!(
+            operational_outcome(api, 0xdead_beef_dead_beef),
+            1,
+            "api {api}"
+        );
+    }
+    // No new mismatch arms: only the signature-verification finals keep 3.
+    for api in 49..=72 {
+        assert_ne!(operational_outcome(api, 0), 3, "api {api}");
+    }
 }
