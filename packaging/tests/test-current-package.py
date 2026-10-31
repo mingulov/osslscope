@@ -53,6 +53,16 @@ class CurrentPackage(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'six|five|role'):
             self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)
 
+    def test_stale_three_role_manifest_refuses_without_new_roles(self):
+        # The historical three-role set (CLI + harvest/count/members)
+        # predates the five-role contract; it cannot construct current
+        # packages even when every present artifact verifies.
+        names = {'osslscope', 'osslscope-harvest', 'osslscope-count', 'osslscope-members'}
+        three = [entry for entry in self.arts if entry.get('bin', 'osslscope') in names]
+        self.assertEqual(len(three), 4)
+        with self.assertRaisesRegex(ValueError, 'six|five|role'):
+            self.builder.select_artifacts(dict(self.manifest, artifacts=three), 'a'*40, 'b'*40)
+
     def test_rejects_each_stale_mixed_duplicate_empty_or_wrong_elf_role(self):
         for i in range(6):
             for mutation in ('hash', 'source', 'missing', 'duplicate', 'empty', 'elf', 'symlink'):
