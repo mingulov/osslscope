@@ -49,6 +49,12 @@ fn policy_rules(rules: &RuleSet) -> Vec<PolicyRule> {
     for x in &rules.require_executed {
         out.push(PolicyRule::require_executed(x));
     }
+    for s in &rules.deny_selector {
+        out.push(PolicyRule::deny_selector(&s.object, &s.id));
+    }
+    for s in &rules.require_selector {
+        out.push(PolicyRule::require_selector(&s.object, &s.id));
+    }
     out
 }
 

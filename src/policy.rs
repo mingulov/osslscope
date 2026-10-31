@@ -42,6 +42,16 @@ pub enum Predicate {
     ProviderObject(String),
     Op(u32),
     FuncId(u32),
+    /// Object-bound execution selector (policy v2): matches
+    /// certified execution partitions behind the exact
+    /// (code-object, digest) identity — never candidates,
+    /// API-success rows or hints. Candidate-plane [`Predicate::eval`]
+    /// is `Unknown` (a selector says nothing about a candidate);
+    /// the execution plane lives in [`selector_match_bounds`].
+    Selector {
+        object: String,
+        id: String,
+    },
     WeakAlias,
     /// Weak-or-possibly-weak (T10/R06): `Yes` iff the alias is weak,
     /// `Unknown` iff the class list is empty or carries an unresolved
@@ -145,6 +155,11 @@ impl Predicate {
                     PredicateMatch::No
                 }
             }
+            // A selector predicate says nothing about a
+            // candidate: execution-plane matching lives in
+            // selector_match_bounds, and the candidate plane
+            // stays silent (fail closed) here.
+            Predicate::Selector { .. } => PredicateMatch::Unknown,
             Predicate::WeakAlias => {
                 if c.weak_alias {
                     PredicateMatch::Yes
@@ -435,6 +450,31 @@ impl PolicyRule {
         }
     }
 
+    /// Object-bound execution rule (policy v2): the matcher
+    /// carries the full pinned identity (never a truncation —
+    /// the document's policy section is the audit surface).
+    pub fn deny_selector(object: &str, id: &str) -> Self {
+        Self {
+            name: "deny-selector",
+            matcher: format!("object-bound:{object}:{id}"),
+            rule: Rule::Deny(Predicate::Selector {
+                object: object.to_string(),
+                id: id.to_string(),
+            }),
+        }
+    }
+
+    pub fn require_selector(object: &str, id: &str) -> Self {
+        Self {
+            name: "require-selector",
+            matcher: format!("object-bound:{object}:{id}"),
+            rule: Rule::Require(Predicate::Selector {
+                object: object.to_string(),
+                id: id.to_string(),
+            }),
+        }
+    }
+
     fn predicate(&self) -> &Predicate {
         match &self.rule {
             Rule::Require(p) | Rule::Deny(p) => p,
@@ -563,6 +603,79 @@ pub fn engine_match_bounds(doc: &CaptureDocument) -> MatchBounds {
     }
 }
 
+/// Conserved execution-plane bounds for one object-bound
+/// selector (v2.5): definite sums the certified partition calls
+/// behind the exact (code-object, digest) identity; the upper
+/// adds the document's certified unresolved bound. A dangling
+/// selector index matches nothing (validated documents never
+/// carry one — fail closed). API-success rows, candidate hints
+/// and merely-unresolved calls NEVER satisfy execution rules:
+/// without the attribution plane the upper is unknown, and
+/// unresolved calls can never prove absence.
+pub fn selector_match_bounds(doc: &CaptureDocument, object: &str, id: &str) -> MatchBounds {
+    let mut definite = 0u64;
+    for row in &doc.execution_attributions {
+        let entry = match doc.algorithm_selectors.get(row.selector as usize) {
+            Some(entry) => entry,
+            None => continue,
+        };
+        if entry.object.0 == object && entry.id == id {
+            definite = definite.saturating_add(row.calls);
+        }
+    }
+    MatchBounds {
+        definite,
+        possible: doc
+            .attribution_bounds
+            .map(|bounds| definite.saturating_add(bounds.unresolved_calls)),
+    }
+}
+
+/// One definitely matching execution partition (R02 provenance
+/// for selector rules): the partition's site, its generation,
+/// whether fenced, the partition's own calls and hit extrema,
+/// plus the site's candidates as listed context (the match is
+/// the partition's selector — candidates are context, never
+/// the predicate).
+fn selector_partition_hits(doc: &CaptureDocument, object: &str, id: &str) -> Vec<DefiniteHit> {
+    let mut hits = Vec::new();
+    for row in &doc.execution_attributions {
+        let entry = match doc.algorithm_selectors.get(row.selector as usize) {
+            Some(entry) => entry,
+            None => continue,
+        };
+        if entry.object.0 != object || entry.id != id {
+            continue;
+        }
+        let current = doc
+            .sites
+            .iter()
+            .find(|s| s.site == row.site && s.generation == row.generation);
+        let (site, fenced) = match current {
+            Some(site) => (site, false),
+            None => match doc.fenced.iter().find_map(|bucket| {
+                bucket
+                    .sites
+                    .iter()
+                    .find(|s| s.site == row.site && s.generation == row.generation)
+            }) {
+                Some(site) => (site, true),
+                None => continue,
+            },
+        };
+        hits.push(DefiniteHit {
+            site: row.site.clone(),
+            generation: row.generation,
+            fenced,
+            calls: row.calls,
+            first_ns: row.start_ns,
+            last_ns: row.end_ns,
+            candidates: site.candidates.clone(),
+        });
+    }
+    hits
+}
+
 /// Evaluate every rule over a finalized document (current plus fenced
 /// sites, conserved — no site counted twice; engine-area rules also
 /// evaluate the typed ENGINE observation plane, R05). Documents
@@ -597,7 +710,13 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
         .iter()
         .map(|r| {
             let predicate = r.predicate();
-            let mut bounds = match_bounds(&all, &predicate.as_fn());
+            // Selector rules evaluate the execution plane
+            // (certified partitions plus the unresolved bound);
+            // every other rule keeps its candidate-plane bounds.
+            let mut bounds = match predicate {
+                Predicate::Selector { object, id } => selector_match_bounds(doc, object, id),
+                _ => match_bounds(&all, &predicate.as_fn()),
+            };
             let area = rule_area(&r.rule);
             let complete = relevant_complete(area, doc);
             // R05: engine-area rules evaluate the typed ENGINE
@@ -622,6 +741,9 @@ pub fn evaluate_document(rules: &[PolicyRule], doc: &CaptureDocument) -> PolicyV
             }
             let verdict = evaluate_rule(&r.rule, &bounds, complete);
             let hits = match (&r.rule, verdict) {
+                (Rule::Deny(Predicate::Selector { object, id }), RuleVerdict::Violation) => {
+                    selector_partition_hits(doc, object, id)
+                }
                 (Rule::Deny(_), RuleVerdict::Violation) => {
                     let mut hits: Vec<DefiniteHit> = doc
                         .sites
@@ -838,6 +960,8 @@ mod tests {
             PolicyRule::deny_algorithm("SHA2-256"),
             PolicyRule::deny_weak(),
             PolicyRule::require_executed("SHA2-256"),
+            PolicyRule::deny_selector("object", "id"),
+            PolicyRule::require_selector("object", "id"),
         ] {
             assert_eq!(rule_area(&rule.rule), RuleArea::Provider, "{}", rule.name);
         }
