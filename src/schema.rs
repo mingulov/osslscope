@@ -883,7 +883,7 @@ fn check_execution_attributions(
         // arithmetic — mixed-admission collects and hand-written
         // documents understate it).
         let mut total = 0u64;
-        for (_, (calls, _, _)) in &sites {
+        for (calls, _, _) in sites.values() {
             total = total
                 .checked_add(*calls)
                 .ok_or_else(|| "doc.sites: physical call sums overflow".to_string())?;
