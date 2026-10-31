@@ -13019,6 +13019,178 @@ mod startup_api_controls {
             );
         }
     }
+    /// Families-stage legacy-provider lane: stock `openssl dgst -md4
+    /// -provider legacy` (MD4 ships only in the legacy provider)
+    /// through legacy-only observation. Asserts exit 0, the
+    /// independent MD4("abc") oracle, and observed successful queries
+    /// plus advertisements — discovery-level evidence for the second
+    /// configured provider. A no-legacy re-run must fail, proving the
+    /// oracle depends on the legacy provider. Digest has no typed
+    /// first-slice roles, so no attribution pin is claimed here.
+    /// Lane env: `OSSLSCOPE_TEST_OPENSSL` selects the CLI;
+    /// `OSSLSCOPE_TEST_PROVIDER_PATH` adds `-provider-path` when the
+    /// lane module dir is not the compiled-in default (private
+    /// 3.0.22/4.0.3 build trees).
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// [OSSLSCOPE_TEST_OPENSSL=<lane CLI> LD_LIBRARY_PATH=<lane lib> \
+    ///  OSSLSCOPE_TEST_PROVIDER_PATH=<lane providers dir>] \
+    /// sudo -n <lib test binary> \
+    ///     legacy_provider_md4_queries_are_observed --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "families legacy-provider lane (sudo, pinned BPF objects)"]
+    fn legacy_provider_md4_queries_are_observed() {
+        const TAG: &str = "fam-legacy";
+        const MD4_ABC: &str = "a448017aaf21d8525fc10ae87aa6729d";
+        // This module is a top-level sibling of `tests`, so the lane
+        // env parses inline (same as the neighboring startup test).
+        let openssl = std::env::var_os("OSSLSCOPE_TEST_OPENSSL")
+            .map(|path| {
+                path.into_string()
+                    .expect("OSSLSCOPE_TEST_OPENSSL must be a UTF-8 executable path")
+            })
+            .unwrap_or_else(|| "/usr/bin/openssl".into());
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-fam-legacy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("abc.txt"), b"abc").unwrap();
+        let mut argv = vec![openssl.clone(), "dgst".to_string(), "-md4".to_string()];
+        if let Some(path) = std::env::var_os("OSSLSCOPE_TEST_PROVIDER_PATH") {
+            argv.push("-provider-path".to_string());
+            argv.push(
+                path.into_string()
+                    .expect("OSSLSCOPE_TEST_PROVIDER_PATH must be UTF-8"),
+            );
+        }
+        argv.push("-provider".to_string());
+        argv.push("legacy".to_string());
+        argv.push(dir.join("abc.txt").to_string_lossy().into_owned());
+        eprintln!("{TAG} argv={argv:?}");
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let stdout_path = dir.join("out.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            &argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        let mut session = ProviderSession::open_budgeted(budget, &object).unwrap();
+        session
+            .prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                PrearmLinks::Create,
+            )
+            .unwrap();
+        let rows = &session.startup[&child.pid()];
+        let query = rows
+            .iter()
+            .find(|a| a.api == c::PUBLIC_QUERY)
+            .expect("typed natural public query site");
+        let identity = (
+            query.site.starttime(),
+            query.generation,
+            query.site.object_hash().clone(),
+        );
+        assert!(session.targets.is_empty());
+        child.release_retaining_exit().unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "{TAG}: workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(child.peek_exit().unwrap(), Some(0), "{TAG}: public oracle");
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        });
+        let reconciliation = session.reconcile(&snapshot);
+        let mut batch = session.close_until(Instant::now() + Duration::from_secs(2));
+        for gap in reconciliation.gaps {
+            batch.gap(gap);
+        }
+        let facts: Vec<_> = batch
+            .facts
+            .iter()
+            .filter(|f| f.api == wire::api(c::PUBLIC_QUERY).unwrap())
+            .collect();
+        let queries = facts
+            .iter()
+            .filter(|f| {
+                matches!(
+                    f.payload,
+                    ObservationPayload::QueryResult {
+                        outcome: ApiOutcome::Success,
+                        ..
+                    }
+                )
+            })
+            .count();
+        let advertisements = facts
+            .iter()
+            .filter(|f| matches!(f.payload, ObservationPayload::Algorithm { .. }))
+            .count();
+        eprintln!(
+            "{TAG} queries={queries} advertisements={advertisements} gaps={:?}",
+            batch.gaps
+        );
+        assert!(
+            queries > 0 && advertisements > 0,
+            "{TAG}: natural query={queries}, advertisements={advertisements}, gaps={:?}",
+            batch.gaps
+        );
+        assert!(facts.iter().all(|f| f.pid == child.pid()
+            && f.starttime == identity.0
+            && f.generation == identity.1
+            && f.object_sha256 == identity.2));
+        assert!(
+            batch.learned_sites.is_empty(),
+            "{TAG}: unmapped startup grants no learned callback authority"
+        );
+        child.finish_observation().unwrap();
+        let output = std::fs::read_to_string(&stdout_path).unwrap();
+        assert!(
+            output.to_ascii_lowercase().contains(MD4_ABC),
+            "{TAG}: observed output must carry the MD4 oracle, got {output:?}"
+        );
+        // The oracle depends on the legacy provider: the same digest
+        // without `-provider legacy` must fail (default has no MD4).
+        let mut bare = vec![openssl, "dgst".to_string(), "-md4".to_string()];
+        bare.push(dir.join("abc.txt").to_string_lossy().into_owned());
+        let rerun = std::process::Command::new(&bare[0])
+            .args(&bare[1..])
+            .output()
+            .unwrap();
+        assert!(
+            !rerun.status.success()
+                || !String::from_utf8_lossy(&rerun.stdout)
+                    .to_ascii_lowercase()
+                    .contains(MD4_ABC),
+            "{TAG}: MD4 without the legacy provider must not verify"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     fn startup_pending_aliases_and_cookie_survive_first_mapped_authority() {
         let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
