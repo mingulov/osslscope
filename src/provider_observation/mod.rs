@@ -7,6 +7,9 @@ pub mod cli;
 pub mod copied_plan;
 pub mod objects;
 pub mod schema;
+#[cfg(test)]
+pub(crate) mod source_acquire;
+#[cfg(not(test))]
 mod source_acquire;
 mod source_owner;
 pub(crate) use source_owner::SourceAcquisitionLease;

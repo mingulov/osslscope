@@ -2956,7 +2956,7 @@ mod tests {
 /// high-water), matching the accounted-reserve semantics: reservations,
 /// not kernel allocation or RSS.
 #[cfg(test)]
-mod heap_measure {
+pub(crate) mod heap_measure {
     use std::{
         alloc::{GlobalAlloc, Layout, System},
         cell::Cell,
@@ -2967,6 +2967,11 @@ mod heap_measure {
     }
     static LIVE: AtomicUsize = AtomicUsize::new(0);
     static PEAK: AtomicUsize = AtomicUsize::new(0);
+    /// Threshold separating declared small test allocations from joined-path
+    /// buffers: controls size joined paths above it, so every counted
+    /// allocation is a joined path or an uncovered conversion copy.
+    pub(crate) const LARGE_ALLOC_THRESHOLD: usize = 1024;
+    static LARGE: AtomicUsize = AtomicUsize::new(0);
     struct Counting;
     #[global_allocator]
     static COUNTING: Counting = Counting;
@@ -2976,6 +2981,9 @@ mod heap_measure {
             if !ptr.is_null() && ARMED.try_with(|armed| armed.get()).unwrap_or(false) {
                 let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
                 PEAK.fetch_max(live, Ordering::Relaxed);
+                if layout.size() >= LARGE_ALLOC_THRESHOLD {
+                    LARGE.fetch_add(1, Ordering::Relaxed);
+                }
             }
             ptr
         }
@@ -2996,5 +3004,16 @@ mod heap_measure {
         fill();
         ARMED.with(|armed| armed.set(false));
         PEAK.load(Ordering::Relaxed)
+    }
+    /// Run `fill` with counting armed on this thread and return the number of
+    /// heap allocations at or above [`LARGE_ALLOC_THRESHOLD`] requested
+    /// inside it. Sequential use only: one measurement at a time across the
+    /// test binary.
+    pub(crate) fn count_large_of(fill: impl FnOnce()) -> usize {
+        LARGE.store(0, Ordering::Relaxed);
+        ARMED.with(|armed| armed.set(true));
+        fill();
+        ARMED.with(|armed| armed.set(false));
+        LARGE.load(Ordering::Relaxed)
     }
 }

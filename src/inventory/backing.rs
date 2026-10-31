@@ -2278,4 +2278,231 @@ mod tests {
             failures.join("\n")
         );
     }
+
+    /// Rust 1.88 path-to-C-string conversion behavior, verified first-hand
+    /// from the pinned sources (`library/std/src/sys/pal/common/
+    /// small_c_string.rs`, reached from `File::open` via `run_path_with_cstr`
+    /// in `library/std/src/sys/fs/unix.rs`): paths with `len >=
+    /// MAX_STACK_ALLOCATION` (384 on non-espidf) are heap-copied with
+    /// `CString::new` while the caller's buffer stays live; shorter paths
+    /// convert in a stack buffer with no heap allocation.
+    const STD_PATH_STACK_COPY_LIMIT: usize = 384;
+
+    /// Long relative path of exactly `total` bytes (`total >= 13`), every
+    /// component below NAME_MAX and ending in a real filename, so the
+    /// control sizes joined paths from the measured layer length whatever
+    /// TMPDIR contributes.
+    fn long_relative(total: usize) -> Vec<u8> {
+        let tail = b"/libtest.so";
+        let full = total.saturating_sub(tail.len() + 1) / 201;
+        let mut out = Vec::with_capacity(total);
+        for _ in 0..full {
+            out.extend_from_slice(&[b'd'; 200]);
+            out.push(b'/');
+        }
+        let rest = total - tail.len() - full * 201;
+        out.resize(out.len() + rest, b'z');
+        out.extend_from_slice(tail);
+        assert_eq!(out.len(), total);
+        out
+    }
+
+    /// I2-remainder long-path control (ER-5E-I2): layer discovery over a LONG
+    /// mapped path — joined length at/above the std conversion threshold —
+    /// must perform no heap allocation beyond the charged reservation (in
+    /// particular no path-conversion copy), and a budget admitting the raw
+    /// read but not the scratch must refuse before any joined-path
+    /// allocation. Drives the real `direct_layer_candidates_charged` shared
+    /// by both production callers; heap allocations are COUNTED through the
+    /// shared test allocator, not inferred from requested charges, so an
+    /// uncovered copy fails the control even though discovery succeeds.
+    #[test]
+    fn layer_discovery_opens_long_paths_without_conversion_copy() {
+        use crate::provider_observation::source_acquire::heap_measure::{
+            LARGE_ALLOC_THRESHOLD, count_large_of,
+        };
+        let base = scratch("lp");
+        let layer_len = base.join("upper").to_string_lossy().len();
+        // Joined capacity (layer + '/' + relative + NUL) must clear the
+        // counting threshold with margin; the conversion-copy trigger (384)
+        // then follows. Sized from the measured layer length, not TMPDIR.
+        let relative_len = (LARGE_ALLOC_THRESHOLD + 64).saturating_sub(layer_len + 2);
+        assert!(
+            relative_len >= STD_PATH_STACK_COPY_LIMIT,
+            "TMPDIR too long to size a separating relative path"
+        );
+        let relative = long_relative(relative_len);
+        assert!(
+            layer_len + 1 + relative.len() >= STD_PATH_STACK_COPY_LIMIT + 64
+                && layer_len + 1 + relative.len() + 1 >= LARGE_ALLOC_THRESHOLD + 64,
+            "joined path must trigger the std copy and clear the counter"
+        );
+        for name in ["upper", "lower1"] {
+            let file = base
+                .join(name)
+                .join(std::str::from_utf8(&relative).unwrap());
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"layer-bytes").unwrap();
+        }
+        let dir = |name: &str| base.join(name).to_string_lossy().into_owned();
+        let mountinfo = format!(
+            "100 1 0:100 / /t rw - overlay overlay rw,lowerdir={},upperdir={}\n",
+            dir("lower1"),
+            dir("upper")
+        )
+        .into_bytes();
+        let size = mountinfo.len();
+        assert!(
+            size < LARGE_ALLOC_THRESHOLD / 2,
+            "raw/working buffers must stay below the counting threshold, got {size}"
+        );
+        std::fs::write(base.join("mountinfo"), &mountinfo).unwrap();
+        let process_dir = File::open(&base).unwrap();
+        let mut maps_path = b"/t/".to_vec();
+        maps_path.extend_from_slice(&relative);
+        let expected: Vec<(u64, u64)> = ["upper", "lower1"]
+            .iter()
+            .map(|name| {
+                let file = base
+                    .join(name)
+                    .join(std::str::from_utf8(&relative).unwrap());
+                let meta = std::fs::metadata(&file).unwrap();
+                (meta.dev(), meta.ino())
+            })
+            .collect();
+
+        let mut failures: Vec<String> = Vec::new();
+
+        // Warmup absorbs any one-time lazy allocation before measuring.
+        {
+            let mut budget = PeakBudget::new(usize::MAX);
+            let warm = direct_layer_candidates_charged(
+                &process_dir,
+                &maps_path,
+                MAX_LAYER_CANDIDATES,
+                &mut budget,
+            );
+            if warm.len() != expected.len() {
+                failures.push(format!(
+                    "warmup: expected {} candidates, got {}",
+                    expected.len(),
+                    warm.len()
+                ));
+            }
+        }
+
+        // Success half: long-path discovery succeeds with exactly the two
+        // joined buffers allocated — no conversion copy — while the peak
+        // live charge covers the raw reservation plus the scratch
+        // reservation (including the NUL terminator byte).
+        {
+            let mut budget = PeakBudget::new(usize::MAX);
+            let mut found = Vec::new();
+            let large = count_large_of(|| {
+                found = direct_layer_candidates_charged(
+                    &process_dir,
+                    &maps_path,
+                    MAX_LAYER_CANDIDATES,
+                    &mut budget,
+                );
+            });
+            let identities: Vec<(u64, u64)> = found
+                .iter()
+                .map(|f| {
+                    let meta = f.metadata().unwrap();
+                    (meta.dev(), meta.ino())
+                })
+                .collect();
+            if identities != expected {
+                failures.push(format!(
+                    "success half: expected upper+lower in order {expected:?}, got {identities:?}"
+                ));
+            }
+            if large != expected.len() {
+                failures.push(format!(
+                    "success half: {large} large heap allocations during long-path discovery, expected exactly {} joined buffers (an extra copy per open is the uncovered path-conversion allocation)",
+                    expected.len()
+                ));
+            }
+            let scratch = size + size + maps_path.len() + 2 + LAYER_SCRATCH_SLOP;
+            let peak = budget.shared.peak.get();
+            if peak != MAX_MOUNTINFO_READ + scratch {
+                failures.push(format!(
+                    "success half: peak live charge {peak} must equal raw {} + scratch {scratch} (lease dropped early, scratch unreserved, or terminator unaccounted)",
+                    MAX_MOUNTINFO_READ
+                ));
+            }
+            if budget.reads != size as u64 {
+                failures.push(format!(
+                    "success half: raw read must charge exactly {size} bytes, got {}",
+                    budget.reads
+                ));
+            }
+            if budget.shared.current.get() != 0 {
+                failures.push(format!(
+                    "success half: outstanding charge must release, still {}",
+                    budget.shared.current.get()
+                ));
+            }
+        }
+
+        // Tight half: admits the raw read plus one input of scratch, but not
+        // the raw-plus-scratch peak — must refuse fail-closed with no
+        // candidates and no joined-path allocation at all.
+        {
+            let mut budget = PeakBudget::new(MAX_MOUNTINFO_READ + size);
+            let mut found = Vec::new();
+            let large = count_large_of(|| {
+                found = direct_layer_candidates_charged(
+                    &process_dir,
+                    &maps_path,
+                    MAX_LAYER_CANDIDATES,
+                    &mut budget,
+                );
+            });
+            if !found.is_empty() {
+                failures.push(format!(
+                    "tight half: budget admitting raw but not scratch must refuse, got {} candidates",
+                    found.len()
+                ));
+            }
+            if large != 0 {
+                failures.push(format!(
+                    "tight half: refusal must precede any joined-path allocation, got {large} large allocations"
+                ));
+            }
+            if budget.denials.is_empty() {
+                failures.push(
+                    "tight half: expected a scratch reservation denial, got none".to_string(),
+                );
+            } else {
+                let denied_max = budget.denials.iter().max().copied().unwrap_or(0);
+                if denied_max <= size {
+                    failures.push(format!(
+                        "tight half: denial must exceed the post-raw remainder {size}, got {:?}",
+                        budget.denials
+                    ));
+                }
+            }
+            if budget.reads != size as u64 {
+                failures.push(format!(
+                    "tight half: raw read must be admitted ({size} bytes), got {}",
+                    budget.reads
+                ));
+            }
+            if budget.shared.current.get() != 0 {
+                failures.push(format!(
+                    "tight half: outstanding charge must release on refusal, still {}",
+                    budget.shared.current.get()
+                ));
+            }
+        }
+
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            failures.is_empty(),
+            "long-path control RED:\n{}",
+            failures.join("\n")
+        );
+    }
 }
