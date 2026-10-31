@@ -95,5 +95,5 @@ exit 0
 /usr/share/doc/%{name}/
 
 %changelog
-* Sat Sep 19 2026 Denis Mingulov <denis@mingulov.com> - 1.0.0-1
-- 1.0.0 release: GPL-3.0-or-later, deb/rpm file-caps install.
+* Sat Oct 31 2026 Denis Mingulov <denis@mingulov.com> - 0.4.0-1
+- 0.4.0 development package: CLI plus five BPF roles with file-caps install.
