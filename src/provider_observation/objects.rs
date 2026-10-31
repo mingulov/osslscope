@@ -48,6 +48,77 @@ thread_local! {
 }
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Acquisition half of ER-5E-I2: charges backing IO and buffers to the
+/// acquisition budget and remembers the precise refusal cause, so callers
+/// map budget exhaustion to limit gaps instead of evidence gaps.
+struct BudgetAdapter<'a> {
+    budget: &'a ObservationBudget,
+    refused: Option<ObservationGap>,
+}
+
+impl backing::BackingBudget for BudgetAdapter<'_> {
+    fn checkpoint(&mut self) -> Result<(), BackingError> {
+        self.budget.checkpoint().map_err(|gap| {
+            self.refused = Some(gap);
+            BackingError::Unavailable
+        })
+    }
+    fn allow_read(&mut self, want: usize) -> Result<usize, BackingError> {
+        let spent = self.budget.elf_read_bytes();
+        let remaining = self.budget.limits.max_elf_read_bytes.saturating_sub(spent);
+        if remaining == 0 {
+            self.refused = Some(ObservationGap::ReadLimit);
+            return Err(BackingError::Unavailable);
+        }
+        Ok(want
+            .max(1)
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX)))
+    }
+    fn commit_read(&mut self, bytes: u64) -> Result<(), BackingError> {
+        self.budget.read(bytes).map_err(|gap| {
+            self.refused = Some(gap);
+            BackingError::Unavailable
+        })
+    }
+    fn reserve_state(&mut self, bytes: usize) -> Result<backing::BackingLease, BackingError> {
+        self.budget
+            .reserve_state(bytes)
+            .map(backing::BackingLease::held)
+            .map_err(|gap| {
+                self.refused = Some(gap);
+                BackingError::Unavailable
+            })
+    }
+}
+
+impl backing::HeldCapacity for super::schema::StateReservation {}
+
+impl BudgetAdapter<'_> {
+    /// Map a backing failure after a verification-family call. A recorded
+    /// budget refusal wins over the evidence mapping.
+    fn map(&mut self, error: BackingError) -> ObservationGap {
+        if let Some(gap) = self.refused.take() {
+            return gap;
+        }
+        match error {
+            BackingError::Denied | BackingError::Unavailable => ObservationGap::BackingUnavailable,
+            BackingError::Changed | BackingError::Unsupported => ObservationGap::IdentityUnverified,
+        }
+    }
+    /// Map a backing failure after a revalidation call. Same budget-first
+    /// rule with the revalidation evidence mapping.
+    fn map_revalidate(&mut self, error: BackingError) -> ObservationGap {
+        if let Some(gap) = self.refused.take() {
+            return gap;
+        }
+        match error {
+            BackingError::Denied | BackingError::Unavailable => ObservationGap::BackingUnavailable,
+            BackingError::Changed => ObservationGap::ObjectChanged,
+            BackingError::Unsupported => ObservationGap::IdentityUnverified,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Stamp {
     native: u64,
@@ -897,13 +968,13 @@ impl VerifiedProcess {
         for bound in &self.mappings {
             bound.object.unchanged()?;
             if let Some(backing) = &bound.backing {
-                backing.revalidate().map_err(|error| match error {
-                    BackingError::Denied | BackingError::Unavailable => {
-                        ObservationGap::BackingUnavailable
-                    }
-                    BackingError::Changed => ObservationGap::ObjectChanged,
-                    BackingError::Unsupported => ObservationGap::IdentityUnverified,
-                })?;
+                let mut adapter = BudgetAdapter {
+                    budget: &self.budget,
+                    refused: None,
+                };
+                backing
+                    .revalidate_charged(&mut adapter)
+                    .map_err(|error| adapter.map_revalidate(error))?;
             }
         }
         self.process.validate()
@@ -1316,13 +1387,16 @@ pub(crate) fn acquire_with_incarnation(
         }
     }
     // One backing view per acquisition; the same authority inventory uses.
-    let view =
-        backing::BackingProcess::capture(&process.directory).map_err(|error| match error {
-            BackingError::Denied | BackingError::Unavailable => ObservationGap::BackingUnavailable,
-            BackingError::Changed | BackingError::Unsupported => ObservationGap::IdentityUnverified,
-        })?;
+    // Capture, layer discovery and verification charge this acquisition's
+    // budget; budget exhaustion stops with a precise limit gap.
+    let mut adapter = BudgetAdapter {
+        budget: &*limits,
+        refused: None,
+    };
+    let view = backing::BackingProcess::capture_charged(&process.directory, &mut adapter)
+        .map_err(|error| adapter.map(error))?;
     let paths = maps_path_index(&maps);
-    for map in selected {
+    'maps: for map in selected {
         // Association is established before native-device deduplication.
         // The range-bound descriptor comes first, then direct layer
         // resolutions; the first verified candidate wins.
@@ -1338,17 +1412,38 @@ pub(crate) fn acquire_with_incarnation(
             have_direct = true;
         }
         if let Some(path) = paths.get(&(map.start, map.end)) {
-            ordered.extend(backing::direct_layer_candidates(
+            let mut adapter = BudgetAdapter {
+                budget: &*limits,
+                refused: None,
+            };
+            // Hints only: a budget refusal here yields fewer candidates,
+            // and the verification below re-derives the precise gap.
+            ordered.extend(backing::direct_layer_candidates_charged(
                 &process.directory,
                 path,
                 16,
+                &mut adapter,
             ));
         }
         let mut bound: Option<(File, backing::BackingAssociation)> = None;
         for index in 0..ordered.len() {
-            if let Ok(association) = view.verify_with_process(&range, &ordered[index]) {
-                bound = Some((ordered.remove(index), association));
-                break;
+            let mut adapter = BudgetAdapter {
+                budget: &*limits,
+                refused: None,
+            };
+            match view.verify_with_process_charged(&range, &ordered[index], &mut adapter) {
+                Ok(association) => {
+                    bound = Some((ordered.remove(index), association));
+                    break;
+                }
+                Err(error) => {
+                    if adapter.refused.is_some() {
+                        let gap = adapter.map(error);
+                        refused = Some(gap);
+                        gaps.insert(gap);
+                        break 'maps;
+                    }
+                }
             }
         }
         let (file, association) = match bound {

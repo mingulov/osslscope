@@ -235,6 +235,50 @@ struct Work<'a> {
     totals: WorkTotals,
     gaps: BTreeSet<Gap>,
     cache: BTreeMap<CacheKey, Cached>,
+    /// Precise limit cause of the most recent backing-budget refusal, if any.
+    /// Lets the backing caller report Deadline/ReadLimit instead of a generic
+    /// evidence gap. Taken (cleared) by the caller after each backing call.
+    backing_limit: Option<GapReason>,
+}
+
+/// Inventory half of ER-5E-I2: backing IO and buffers charge the same read
+/// totals, shared pool and deadline the procfs reads use.
+impl backing::BackingBudget for Work<'_> {
+    fn checkpoint(&mut self) -> Result<(), backing::BackingError> {
+        self.deadline().map_err(|_| {
+            self.backing_limit = Some(GapReason::Deadline);
+            backing::BackingError::Unavailable
+        })
+    }
+    fn allow_read(&mut self, want: usize) -> Result<usize, backing::BackingError> {
+        let remaining = self.remaining();
+        if remaining == 0 {
+            self.backing_limit = Some(GapReason::ReadLimit);
+            return Err(backing::BackingError::Unavailable);
+        }
+        Ok(want
+            .max(1)
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX)))
+    }
+    fn commit_read(&mut self, bytes: u64) -> Result<(), backing::BackingError> {
+        self.totals.read_bytes += bytes;
+        Ok(())
+    }
+    fn reserve_state(
+        &mut self,
+        bytes: usize,
+    ) -> Result<backing::BackingLease, backing::BackingError> {
+        match &self.memory {
+            Some(pool) => pool
+                .reserve(bytes)
+                .map(backing::BackingLease::Pool)
+                .ok_or_else(|| {
+                    self.backing_limit = Some(GapReason::ReadLimit);
+                    backing::BackingError::Unavailable
+                }),
+            None => Ok(backing::BackingLease::Uncharged),
+        }
+    }
 }
 struct ReadBuffer {
     bytes: Vec<u8>,
@@ -435,6 +479,7 @@ fn backing(
     view: Option<&backing::BackingProcess>,
     process: &Process,
     mapping: &Mapping<'_>,
+    work: &mut Work<'_>,
 ) -> Result<(File, Metadata, IdentityStatus, Option<u64>), GapReason> {
     // Acquisition failures must remain distinct from a successfully acquired
     // LocatorCandidate: failure leaves mapping visibility unresolved and can
@@ -448,23 +493,33 @@ fn backing(
     }
     // Common verification first: the range-bound descriptor, then direct
     // layer resolutions. The first verified candidate wins and its
-    // descriptor is retained through parsing.
+    // descriptor is retained through parsing. Layer discovery and
+    // verification charge the inventory budget; a budget refusal reports
+    // its precise limit gap instead of falling through to weaker proof.
     if let Some(view) = view {
         let range = backing::MappedRange {
             start: mapping.start,
             end: mapping.end,
         };
-        ordered.extend(backing::direct_layer_candidates(
+        ordered.extend(backing::direct_layer_candidates_charged(
             &process.directory,
             mapping.path,
             16,
+            work,
         ));
         for index in 0..ordered.len() {
-            if let Ok(association) = view.verify_with_process(&range, &ordered[index]) {
-                let page = association.witness_page();
-                let file = ordered.remove(index);
-                let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
-                return Ok((file, metadata, IdentityStatus::Verified, page));
+            match view.verify_with_process_charged(&range, &ordered[index], work) {
+                Ok(association) => {
+                    let page = association.witness_page();
+                    let file = ordered.remove(index);
+                    let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
+                    return Ok((file, metadata, IdentityStatus::Verified, page));
+                }
+                Err(_) => {
+                    if let Some(limit) = work.backing_limit.take() {
+                        return Err(limit);
+                    }
+                }
             }
         }
     }
@@ -530,8 +585,11 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         open_at(&process.directory, b"maps").map_err(|_| GapReason::ProcessUnavailable)?;
     let maps = work.read(maps_file, work.options.limits.max_maps_bytes)?;
     // One backing view per process; without it every mapping keeps its
-    // previous legacy status (never a new failure).
-    let view = backing::BackingProcess::capture(&process.directory).ok();
+    // previous legacy status (never a new failure). A budget refusal here
+    // degrades the same approved way an unreadable view does; the charges
+    // below re-derive the precise limit gap honestly.
+    let view = backing::BackingProcess::capture_charged(&process.directory, work).ok();
+    work.backing_limit.take();
     let mut modules = Vec::new();
     let mut verified = BTreeSet::new();
     let mut attempts = 0;
@@ -560,7 +618,7 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         attempts += 1;
         work.totals.objects_attempted += 1;
         let (file, metadata, identity_status, page) =
-            match backing(view.as_ref(), &process, &mapping) {
+            match backing(view.as_ref(), &process, &mapping, work) {
                 Ok(bound) => bound,
                 Err(reason) => {
                     work.gap(Some(pid), Some(&mapping), reason);
@@ -708,6 +766,7 @@ pub(super) fn snapshot_reused(
         totals: WorkTotals::default(),
         gaps: BTreeSet::new(),
         cache,
+        backing_limit: None,
     };
     // Keep at most two bounded prefixes while enumerating: the next PIDs
     // above the previous cursor, then wrap. Enumerating itself is deadline
@@ -875,6 +934,7 @@ mod tests {
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
+            backing_limit: None,
         };
         let mut state = ScanState::default();
         assert!(sample_order(&options.pids, &mut work, &mut state).is_empty());
@@ -925,6 +985,7 @@ mod tests {
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
+            backing_limit: None,
         };
         for _ in 0..3 {
             assert_eq!(
@@ -963,6 +1024,7 @@ mod tests {
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
+            backing_limit: None,
         };
         assert_eq!(
             work.inspect(File::open(&path).unwrap(), &metadata, None),
@@ -982,6 +1044,7 @@ mod tests {
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
+            backing_limit: None,
         };
         assert_eq!(
             fresh.inspect(File::open(&path).unwrap(), &metadata, None),

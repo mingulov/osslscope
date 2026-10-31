@@ -83,6 +83,64 @@ fn io_error(error: std::io::Error) -> BackingError {
     }
 }
 
+/// Caller-owned budget for backing IO and buffers (ER-5E-I2). Both production
+/// callers implement this — inventory `Work` and the acquisition budget
+/// adapter — so every backing allocation is reserved before it happens,
+/// every read is accounted to the shared ceilings, and deadlines are
+/// enforced between reads. Refusal surfaces as [`BackingError`]; the caller
+/// maps it to its own precise limit gap.
+pub(crate) trait BackingBudget {
+    /// Enforce the caller deadline. Called before allocation and between reads.
+    fn checkpoint(&mut self) -> Result<(), BackingError>;
+    /// Clamp a planned read to the remaining read allowance; refuse when
+    /// exhausted. Never returns 0 on success.
+    fn allow_read(&mut self, want: usize) -> Result<usize, BackingError>;
+    /// Account bytes just read. Called only for amounts `allow_read` admitted.
+    fn commit_read(&mut self, bytes: u64) -> Result<(), BackingError>;
+    /// Reserve buffer/state capacity before allocation. The returned lease is
+    /// held by the buffer owner: retained buffers keep it for their lifetime
+    /// while transient buffers drop it after use, releasing shared capacity.
+    fn reserve_state(&mut self, bytes: usize) -> Result<BackingLease, BackingError>;
+}
+
+/// Shared-capacity lease held by backing buffers. Dropping a lease releases
+/// its reservation; read charges are cumulative and never released.
+pub(crate) enum BackingLease {
+    Pool(crate::observation_memory::MemoryLease),
+    Held(Box<dyn HeldCapacity>),
+    /// No state budget exists on this path (reads are still charged).
+    Uncharged,
+}
+
+impl BackingLease {
+    pub(crate) fn held(capacity: impl HeldCapacity + 'static) -> Self {
+        Self::Held(Box::new(capacity))
+    }
+}
+
+/// Marker for caller-owned capacity reservations backing can retain without
+/// naming the caller's budget types. Implemented by the acquisition side for
+/// its state reservations.
+pub(crate) trait HeldCapacity {}
+
+/// Unbounded budget for the plan-pinned one-shot entry point and unit tests.
+/// Production callers use the charged variants with real caller budgets.
+struct UnboundedBudget;
+impl BackingBudget for UnboundedBudget {
+    fn checkpoint(&mut self) -> Result<(), BackingError> {
+        Ok(())
+    }
+    fn allow_read(&mut self, want: usize) -> Result<usize, BackingError> {
+        Ok(want.max(1))
+    }
+    fn commit_read(&mut self, _bytes: u64) -> Result<(), BackingError> {
+        Ok(())
+    }
+    fn reserve_state(&mut self, _bytes: usize) -> Result<BackingLease, BackingError> {
+        Ok(BackingLease::Uncharged)
+    }
+}
+
 const MAX_MAPS_READ: usize = 4_194_304;
 const MAX_MOUNTINFO_READ: usize = 1_048_576;
 const MAX_STAT_READ: usize = 65_536;
@@ -166,17 +224,38 @@ fn open_at(directory: &File, name: &[u8]) -> Result<File, BackingError> {
     Ok(unsafe { File::from_raw_fd(raw) })
 }
 
-fn read_at(directory: &File, name: &[u8], max: usize) -> Result<Vec<u8>, BackingError> {
+const READ_CHUNK: usize = 8192;
+
+/// Budget-charged procfs read: the buffer reservation precedes allocation,
+/// each chunk is deadline-checked, clamped to the remaining read allowance
+/// and committed after the syscall, and the per-file cap keeps its probe
+/// byte. The caller holds the lease for as long as it keeps the bytes.
+fn read_at_charged<B: BackingBudget>(
+    directory: &File,
+    name: &[u8],
+    max: usize,
+    budget: &mut B,
+) -> Result<(Vec<u8>, BackingLease), BackingError> {
+    budget.checkpoint()?;
     let mut file = open_at(directory, name)?;
+    let lease = budget.reserve_state(max)?;
     let mut bytes = Vec::new();
-    file.by_ref()
-        .take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(io_error)?;
-    if bytes.len() > max {
-        return Err(BackingError::Unavailable);
+    let mut chunk = [0u8; READ_CHUNK];
+    loop {
+        budget.checkpoint()?;
+        // Probe one byte beyond the per-file cap, without over-allocation.
+        let allowed = max.saturating_sub(bytes.len()).saturating_add(1);
+        let count = budget.allow_read(allowed.min(chunk.len()))?;
+        let read = file.read(&mut chunk[..count]).map_err(io_error)?;
+        budget.commit_read(read as u64)?;
+        if read == 0 {
+            return Ok((bytes, lease));
+        }
+        if read > max.saturating_sub(bytes.len()) {
+            return Err(BackingError::Unavailable);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
     }
-    Ok(bytes)
 }
 
 fn number(bytes: &[u8], radix: u32) -> Option<u64> {
@@ -234,8 +313,11 @@ fn find_vma(maps: &[u8], range: &MappedRange) -> Option<VmaRecord> {
         .find(|vma| vma.start <= range.start && range.end <= vma.end)
 }
 
-fn starttime(directory: &File) -> Result<u64, BackingError> {
-    let bytes = read_at(directory, b"stat", MAX_STAT_READ)?;
+fn starttime_charged<B: BackingBudget>(
+    directory: &File,
+    budget: &mut B,
+) -> Result<u64, BackingError> {
+    let bytes = read_at_charged(directory, b"stat", MAX_STAT_READ, budget)?.0;
     let end = bytes
         .iter()
         .rposition(|b| *b == b')')
@@ -383,10 +465,17 @@ fn pread_exact(file: &File, offset: u64) -> Result<[u8; 8], BackingError> {
 
 /// Read one pagemap frame number. A present page with a zero frame means the
 /// kernel withheld the number (privilege), which is denial, not absence.
-fn pagemap_frame(pagemap: &File, address: u64, page: u64) -> Result<u64, BackingError> {
+fn pagemap_frame<B: BackingBudget>(
+    pagemap: &File,
+    address: u64,
+    page: u64,
+    budget: &mut B,
+) -> Result<u64, BackingError> {
     let index = address / page;
     let offset = index.checked_mul(8).ok_or(BackingError::Unavailable)?;
+    budget.allow_read(8)?;
     let entry = u64::from_le_bytes(pread_exact(pagemap, offset)?);
+    budget.commit_read(8)?;
     if entry & PAGEMAP_PRESENT == 0 {
         return Err(BackingError::Unavailable);
     }
@@ -410,20 +499,36 @@ pub(crate) struct BackingProcess {
     mount_namespace: NamespaceId,
     executable: Fingerprint,
     maps: Vec<u8>,
+    /// Caller-budget leases for the retained maps buffer: the reservation
+    /// lives exactly as long as the buffer it accounts for.
+    leases: Vec<BackingLease>,
 }
 
 impl BackingProcess {
     pub(crate) fn capture(target: &File) -> Result<Self, BackingError> {
+        Self::capture_charged(target, &mut UnboundedBudget)
+    }
+
+    pub(crate) fn capture_charged<B: BackingBudget>(
+        target: &File,
+        budget: &mut B,
+    ) -> Result<Self, BackingError> {
+        budget.checkpoint()?;
         let directory = target.try_clone().map_err(io_error)?;
+        let starttime = starttime_charged(&directory, budget)?;
+        let pid_namespace = namespace_id(&directory, b"ns/pid")?;
+        let mount_namespace = namespace_id(&directory, b"ns/mnt")?;
+        let executable =
+            Fingerprint::from(&open_at(&directory, b"exe")?.metadata().map_err(io_error)?);
+        let (maps, lease) = read_at_charged(&directory, b"maps", MAX_MAPS_READ, budget)?;
         Ok(Self {
-            starttime: starttime(&directory)?,
-            pid_namespace: namespace_id(&directory, b"ns/pid")?,
-            mount_namespace: namespace_id(&directory, b"ns/mnt")?,
-            executable: Fingerprint::from(
-                &open_at(&directory, b"exe")?.metadata().map_err(io_error)?,
-            ),
-            maps: read_at(&directory, b"maps", MAX_MAPS_READ)?,
             directory,
+            starttime,
+            pid_namespace,
+            mount_namespace,
+            executable,
+            maps,
+            leases: vec![lease],
         })
     }
 
@@ -491,13 +596,17 @@ impl BackingProcess {
     /// page must be the target range's page, and a fresh re-resolution of
     /// the candidate (the same `/proc/self/fd/N` path a later attach
     /// resolves) must serve the same page. Returns the witnessed frame.
-    fn verify_witness(
+    /// Both witness pages are reserved against the caller budget before
+    /// either mapping is created; pagemap reads are charged as they happen.
+    fn verify_witness<B: BackingBudget>(
         &self,
         range: &MappedRange,
         candidate: &File,
         candidate_fp: &Fingerprint,
         vma: &VmaRecord,
+        budget: &mut B,
     ) -> Result<u64, BackingError> {
+        budget.checkpoint()?;
         let page = page_size()?;
         let file_offset = vma
             .pgoff
@@ -509,6 +618,9 @@ impl BackingProcess {
         let aligned = file_offset & !(page - 1);
         let index =
             usize::try_from(file_offset - aligned).map_err(|_| BackingError::Unavailable)?;
+        let page_bytes = usize::try_from(page).map_err(|_| BackingError::Unavailable)?;
+        let _witness_pages =
+            budget.reserve_state(page_bytes.checked_mul(2).ok_or(BackingError::Unavailable)?)?;
         let mapping = SelfMap::map(candidate, aligned, page)?;
         #[cfg(test)]
         fire_fault_hook(1);
@@ -516,20 +628,22 @@ impl BackingProcess {
         self.check_self_map(&mapping, candidate_fp)?;
         let target_pagemap = open_at(&self.directory, b"pagemap")?;
         let self_pagemap = File::open("/proc/self/pagemap").map_err(io_error)?;
-        let target_frame = pagemap_frame(&target_pagemap, range.start, page)?;
-        let own_frame = pagemap_frame(&self_pagemap, mapping.start() + index as u64, page)?;
+        let target_frame = pagemap_frame(&target_pagemap, range.start, page, budget)?;
+        let own_frame = pagemap_frame(&self_pagemap, mapping.start() + index as u64, page, budget)?;
         let target_frame = if target_frame == own_frame {
             target_frame
         } else {
             // One confirmation pass: a page migration between the two reads
             // must not become a permanent change verdict.
-            let retry_target = pagemap_frame(&target_pagemap, range.start, page)?;
-            let retry_own = pagemap_frame(&self_pagemap, mapping.start() + index as u64, page)?;
+            let retry_target = pagemap_frame(&target_pagemap, range.start, page, budget)?;
+            let retry_own =
+                pagemap_frame(&self_pagemap, mapping.start() + index as u64, page, budget)?;
             if retry_target != retry_own {
                 return Err(BackingError::Changed);
             }
             retry_target
         };
+        budget.checkpoint()?;
         let fresh =
             File::open(format!("/proc/self/fd/{}", candidate.as_raw_fd())).map_err(io_error)?;
         let fresh_metadata = fresh.metadata().map_err(io_error)?;
@@ -540,7 +654,12 @@ impl BackingProcess {
         #[cfg(test)]
         fire_fault_hook(2);
         fresh_map.fault(index)?;
-        let fresh_frame = pagemap_frame(&self_pagemap, fresh_map.start() + index as u64, page)?;
+        let fresh_frame = pagemap_frame(
+            &self_pagemap,
+            fresh_map.start() + index as u64,
+            page,
+            budget,
+        )?;
         if fresh_frame != own_frame {
             return Err(BackingError::Changed);
         }
@@ -572,6 +691,16 @@ impl BackingProcess {
         range: &MappedRange,
         candidate: &File,
     ) -> Result<BackingAssociation, BackingError> {
+        self.verify_with_process_charged(range, candidate, &mut UnboundedBudget)
+    }
+
+    pub(crate) fn verify_with_process_charged<B: BackingBudget>(
+        &self,
+        range: &MappedRange,
+        candidate: &File,
+        budget: &mut B,
+    ) -> Result<BackingAssociation, BackingError> {
+        budget.checkpoint()?;
         if range.start >= range.end {
             return Err(BackingError::Unsupported);
         }
@@ -587,7 +716,7 @@ impl BackingProcess {
             (Some(left), Some(right)) if direct_semantics(left) && direct_semantics(right) => {
                 self.verify_fast(&candidate_fp, &target_fp)?
             }
-            _ => Some(self.verify_witness(range, candidate, &candidate_fp, &vma)?),
+            _ => Some(self.verify_witness(range, candidate, &candidate_fp, &vma, budget)?),
         };
         Ok(BackingAssociation {
             directory: self.directory.try_clone().map_err(io_error)?,
@@ -684,7 +813,18 @@ impl BackingAssociation {
     /// the full page witness (a copy-up after verification changes the
     /// re-resolution leg); the direct path re-checks fingerprints and keys.
     pub(crate) fn revalidate(&self) -> Result<(), BackingError> {
-        if starttime(&self.directory)? != self.starttime {
+        self.revalidate_charged(&mut UnboundedBudget)
+    }
+
+    /// Budget-charged revalidation: the deadline is enforced before any IO,
+    /// the maps re-read is reserved and charged, and the witness re-run is
+    /// charged like verification.
+    pub(crate) fn revalidate_charged<B: BackingBudget>(
+        &self,
+        budget: &mut B,
+    ) -> Result<(), BackingError> {
+        budget.checkpoint()?;
+        if starttime_charged(&self.directory, budget)? != self.starttime {
             return Err(BackingError::Changed);
         }
         if namespace_id(&self.directory, b"ns/pid")? != self.pid_namespace
@@ -700,7 +840,7 @@ impl BackingAssociation {
         if !unchanged_for_backing(&self.executable, &executable) {
             return Err(BackingError::Changed);
         }
-        let maps = read_at(&self.directory, b"maps", MAX_MAPS_READ)?;
+        let (maps, maps_lease) = read_at_charged(&self.directory, b"maps", MAX_MAPS_READ, budget)?;
         let current = find_vma(&maps, &self.range).ok_or(BackingError::Changed)?;
         if current != self.vma {
             return Err(BackingError::Changed);
@@ -730,9 +870,15 @@ impl BackingAssociation {
                 mount_namespace: self.mount_namespace,
                 executable: self.executable.clone(),
                 maps,
+                leases: vec![maps_lease],
             };
-            let frame =
-                view.verify_witness(&self.range, &self.candidate, &self.candidate_fp, &self.vma)?;
+            let frame = view.verify_witness(
+                &self.range,
+                &self.candidate,
+                &self.candidate_fp,
+                &self.vma,
+                budget,
+            )?;
             if Some(frame) != self.page {
                 // The page binding moved (migration settled elsewhere or the
                 // backing changed); the stored witness no longer describes
@@ -879,12 +1025,23 @@ pub(crate) fn direct_layer_candidates(
     maps_path: &[u8],
     max: usize,
 ) -> Vec<File> {
+    direct_layer_candidates_charged(process_dir, maps_path, max, &mut UnboundedBudget)
+}
+
+pub(crate) fn direct_layer_candidates_charged<B: BackingBudget>(
+    process_dir: &File,
+    maps_path: &[u8],
+    max: usize,
+    budget: &mut B,
+) -> Vec<File> {
     let mut candidates = Vec::new();
     if maps_path.is_empty() || !maps_path.starts_with(b"/") || maps_path.ends_with(b" (deleted)") {
         return candidates;
     }
-    let mountinfo = match read_at(process_dir, b"mountinfo", MAX_MOUNTINFO_READ) {
-        Ok(bytes) => bytes,
+    // The mountinfo buffer is transient: reserved before the read, released
+    // once the layer hints are extracted.
+    let mountinfo = match read_at_charged(process_dir, b"mountinfo", MAX_MOUNTINFO_READ, budget) {
+        Ok((bytes, _lease)) => bytes,
         Err(_) => return candidates,
     };
     let layers = parse_overlay_layers(&mountinfo);
@@ -1538,6 +1695,132 @@ mod tests {
         donor.kill().unwrap();
         donor.wait().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Minimal caller budget for GREEN-only supplement controls (the
+    /// path-level I2 controls carry RED; these pin the refusal mechanics of
+    /// the new charged entry points directly).
+    struct TinyBudget {
+        max_state: usize,
+        max_reads: u64,
+        reads: u64,
+        expired: bool,
+    }
+    impl BackingBudget for TinyBudget {
+        fn checkpoint(&mut self) -> Result<(), BackingError> {
+            if self.expired {
+                Err(BackingError::Unavailable)
+            } else {
+                Ok(())
+            }
+        }
+        fn allow_read(&mut self, want: usize) -> Result<usize, BackingError> {
+            let remaining = self.max_reads.saturating_sub(self.reads);
+            if remaining == 0 {
+                return Err(BackingError::Unavailable);
+            }
+            Ok(want
+                .max(1)
+                .min(usize::try_from(remaining).unwrap_or(usize::MAX)))
+        }
+        fn commit_read(&mut self, bytes: u64) -> Result<(), BackingError> {
+            self.reads += bytes;
+            if self.reads > self.max_reads {
+                return Err(BackingError::Unavailable);
+            }
+            Ok(())
+        }
+        fn reserve_state(&mut self, bytes: usize) -> Result<BackingLease, BackingError> {
+            if bytes > self.max_state {
+                return Err(BackingError::Unavailable);
+            }
+            Ok(BackingLease::Uncharged)
+        }
+    }
+
+    #[test]
+    fn charged_capture_refuses_before_allocating_on_exhausted_budget() {
+        let dir = File::open("/proc/self").unwrap();
+        // The stat reservation does not fit: refuse before any read.
+        let mut budget = TinyBudget {
+            max_state: MAX_STAT_READ - 1,
+            max_reads: u64::MAX,
+            reads: 0,
+            expired: false,
+        };
+        assert_eq!(
+            BackingProcess::capture_charged(&dir, &mut budget).map(|_| ()),
+            Err(BackingError::Unavailable)
+        );
+        assert_eq!(budget.reads, 0);
+        // The stat read fits but the maps reservation does not: refuse
+        // after the stat read, before allocating the maps buffer.
+        let mut budget = TinyBudget {
+            max_state: MAX_STAT_READ,
+            max_reads: u64::MAX,
+            reads: 0,
+            expired: false,
+        };
+        assert_eq!(
+            BackingProcess::capture_charged(&dir, &mut budget).map(|_| ()),
+            Err(BackingError::Unavailable)
+        );
+        assert!(budget.reads > 0 && budget.reads <= MAX_STAT_READ as u64);
+    }
+
+    #[test]
+    fn charged_revalidate_enforces_deadline_before_any_io() {
+        let dir = File::open("/proc/self").unwrap();
+        // Synthetic association: never valid, never reached — the expired
+        // deadline must refuse before any field is consulted or any IO happens.
+        let zero = Fingerprint {
+            dev: 0,
+            ino: 0,
+            size: 0,
+            mode: 0,
+            nlink: 0,
+            mtime: 0,
+            mtime_nsec: 0,
+            ctime: 0,
+            ctime_nsec: 0,
+        };
+        let assoc = BackingAssociation {
+            directory: dir.try_clone().unwrap(),
+            candidate: dir.try_clone().unwrap(),
+            range: MappedRange { start: 0, end: 1 },
+            vma: VmaRecord {
+                start: 0,
+                end: 1,
+                pgoff: 0,
+                dev: 0,
+                ino: 0,
+                executable: false,
+            },
+            candidate_fp: zero.clone(),
+            target_fp: zero.clone(),
+            page: None,
+            starttime: 0,
+            pid_namespace: NamespaceId {
+                device: 0,
+                inode: 0,
+            },
+            mount_namespace: NamespaceId {
+                device: 0,
+                inode: 0,
+            },
+            executable: zero,
+        };
+        let mut budget = TinyBudget {
+            max_state: usize::MAX,
+            max_reads: u64::MAX,
+            reads: 0,
+            expired: true,
+        };
+        assert_eq!(
+            assoc.revalidate_charged(&mut budget).map(|_| ()),
+            Err(BackingError::Unavailable)
+        );
+        assert_eq!(budget.reads, 0);
     }
 
     /// I1 child entry: runs the truncation scenario through the actual
