@@ -9332,6 +9332,35 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             "HKDF".to_string(),
         ]
     }
+    /// Families-stage stock PBKDF2 argv (the Task-3 migration
+    /// post-leg): ordinary unmodified PBKDF2-HMAC-SHA256, password
+    /// `password`, salt bytes 0x00..=0x0c, 4096 iterations, 42
+    /// output bytes. Oracle is [`FAM_PBKDF2_OKM`] (agrees with
+    /// Python `hashlib.pbkdf2_hmac`, an independent
+    /// implementation).
+    fn fam_openssl_pbkdf2_argv(openssl: &str) -> Vec<String> {
+        vec![
+            openssl.to_string(),
+            "kdf".to_string(),
+            "-keylen".to_string(),
+            "42".to_string(),
+            "-kdfopt".to_string(),
+            "digest:SHA256".to_string(),
+            "-kdfopt".to_string(),
+            "pass:password".to_string(),
+            "-kdfopt".to_string(),
+            "hexsalt:000102030405060708090a0b0c".to_string(),
+            "-kdfopt".to_string(),
+            "iter:4096".to_string(),
+            "PBKDF2".to_string(),
+        ]
+    }
+    /// PBKDF2-HMAC-SHA256(`password`, 0x00..=0x0c, 4096, 42):
+    /// stock-CLI output, verified byte-identical against Python
+    /// `hashlib.pbkdf2_hmac` (independent implementation) before
+    /// the Task-3 migration test pinned it.
+    const FAM_PBKDF2_OKM: &str =
+        "D8A20D7F14C762FF946EB9F73901B2DFD51AEB70CF471ECA573DC7842A563522DB75E1F374020548B681";
     /// Families-stage stock MAC argv (U5 §13.1 shape, lane-aware
     /// argv[0]): ordinary unmodified HMAC-SHA256 over the `abc.txt`
     /// input in `dir` (the caller creates it before pass 1 spawns
@@ -9363,15 +9392,22 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     }
     /// Families-stage MAC canary needles: the MAC workload's input
     /// key material — the raw 20-octet 0x0b key and its exact
-    /// `hexkey:` argv spelling. Pass 1 scans the union of both
-    /// workloads' needles on every lane (strictly stronger than
-    /// either alone; the two key lengths cannot cross-match a
-    /// honest ring).
+    /// `hexkey:` argv spelling. Pass 1 scans the union of all
+    /// stock workloads' needles on every lane (strictly stronger
+    /// than any one alone; distinct key shapes cannot
+    /// cross-match an honest ring).
     fn fam_canary_needles_mac() -> Vec<Vec<u8>> {
         vec![
             vec![0x0bu8; 20],
             format!("hexkey:{}", "0b".repeat(20)).into_bytes(),
         ]
+    }
+    /// Families-stage PBKDF2 canary needles: the migration
+    /// post-leg password in its raw and `pass:` argv shapes. The
+    /// salt is public (never a needle); the password is key
+    /// material and must never cross the observer boundary.
+    fn fam_canary_needles_pbkdf2() -> Vec<Vec<u8>> {
+        vec![b"password".to_vec(), b"pass:password".to_vec()]
     }
     /// Families-stage canary scan: returns the index of the first
     /// needle found in `haystack`, or `None` when clean. Every
@@ -9525,9 +9561,10 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         assert_eq!(decode_failures, 0, "{tag}: every ring record must validate");
         // Canary negative leg: no input key material in the raw ring
-        // (union of both stock workloads' needles on every lane).
+        // (union of all stock workloads' needles on every lane).
         let mut needles = fam_canary_needles();
         needles.extend(fam_canary_needles_mac());
+        needles.extend(fam_canary_needles_pbkdf2());
         assert_eq!(
             fam_canary_scan(&ring_bytes, &needles),
             None,
@@ -9965,7 +10002,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     }
     /// Families-stage closed-collect receipt: the public numbers a
     /// positive/refusal pin asserts. Mirrors the U5 tail (which stays
-    /// verbatim); only families tests use this helper.
+    /// verbatim); only families tests use this helper. Task 3 also
+    /// retains the certified result itself (`finalized`), the joined
+    /// physical sample (`sample`), and the real report window/pid —
+    /// the actual producer records the v2.5 document flows project
+    /// (never copies or re-derivations).
     struct FamAcquireReceipt {
         typed_sites: usize,
         counter_links: usize,
@@ -9980,6 +10021,10 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         loss: [u64; 8],
         staged_roles: Vec<u32>,
         count_roles: Vec<u32>,
+        finalized: crate::attribution::FinalizedAttribution,
+        sample: crate::focused_count::CountSample,
+        pid: u32,
+        window: crate::evidence::CaptureWindow,
     }
     /// Families-stage full acquire: pass-1 live-query plan, Enabled
     /// full-claim lease, typed admit+attach, shared counter at the
@@ -10299,6 +10344,14 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             start_ns,
             deadline_ns,
         };
+        let report_window = crate::evidence::CaptureWindow {
+            requested_start_ns: start_ns,
+            requested_end_ns: deadline_ns,
+            effective_start_ns: start_ns,
+            effective_end_ns: end_ns.max(start_ns),
+            signal_cut: false,
+            count_admission: Some(admission),
+        };
         let finalized = crate::attribution::collect_closed_attribution(
             gate.owned_closed().expect("closed gate"),
             &gate,
@@ -10307,14 +10360,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             &sample,
             &admitted,
             admission,
-            crate::evidence::CaptureWindow {
-                requested_start_ns: start_ns,
-                requested_end_ns: deadline_ns,
-                effective_start_ns: start_ns,
-                effective_end_ns: end_ns.max(start_ns),
-                signal_cut: false,
-                count_admission: Some(admission),
-            },
+            report_window,
         )
         .unwrap_or_else(|error| panic!("{tag}: closed collect failed: {error:?}"));
         let mut joined_sites = 0usize;
@@ -10406,9 +10452,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             loss: loss_cells,
             staged_roles,
             count_roles,
+            finalized,
+            sample,
+            pid,
+            window: report_window,
         };
-        drop(finalized);
-        drop(sample);
         let close = session.close_source_explicit().expect("source close");
         assert!(close.cut_confirmed, "{tag}: close must confirm the cut");
         assert!(close.first_error.is_none());
@@ -10750,6 +10798,425 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             receipt.staged_roles, expected_roles,
             "17 first-slice + query + 49 MAC copied, every one admitted"
         );
+    }
+    // ---- Task 3 (5C): v2.5 flows over actual producer records ----
+    //
+    // Production capture keeps the Disabled source lease (the
+    // test-only `Enabled` hardening stands), so installed binaries
+    // emit v2.4. The execution flows below run the REAL producer
+    // session (sudo, pinned objects), the REAL closed collect, the
+    // REAL production project() + projection, and the REAL
+    // report/check delivery the installed binaries call
+    // (consume_document), plus a real consumer import of the CBOM
+    // — before/after an HKDF→PBKDF2 migration, compared against
+    // independent workload truth.
+
+    /// Task-3 native document: the REAL production `project()`
+    /// over the retained physical sample plus the REAL
+    /// projection of the retained certified result. No copies,
+    /// no re-derivations, no hand-built partitions.
+    fn task3_native_doc(receipt: FamAcquireReceipt) -> crate::evidence::CaptureDocument {
+        let FamAcquireReceipt {
+            finalized,
+            mut sample,
+            pid,
+            window,
+            ..
+        } = receipt;
+        // The native counter candidates are nominal counting labels
+        // (function 0, operation 0, unknown algorithm) —
+        // placeholders for the counting plane, never observed ABI
+        // metadata. project() would render them as ObservedPublicAbi
+        // provenance (which the semantic check rightly rejects:
+        // a 0-function observed association is invalid); clearing
+        // them refuses to mislabel placeholders as observations.
+        // Physical sites (counts plus Unknown-coverage hints)
+        // still project verbatim.
+        sample.associations.clear();
+        let mut doc = crate::focused_capture::project(pid, window, sample, &[]);
+        finalized
+            .project_into_document(&mut doc)
+            .expect("a certified closed result projects");
+        doc
+    }
+
+    /// Independent libcrypto identity: resolve argv[0]'s libcrypto
+    /// through the LOADER (`ldd`, inheriting the lane env) and
+    /// hash the file bytes with the frozen whole-file
+    /// construction. Independent of every observer-admitted
+    /// identity — the workload-truth leg for selector objects.
+    fn task3_libcrypto_sha256(openssl_argv0: &str) -> String {
+        let ldd = std::process::Command::new("ldd")
+            .arg(openssl_argv0)
+            .output()
+            .expect("ldd runs");
+        assert!(ldd.status.success(), "ldd must resolve {openssl_argv0}");
+        let text = String::from_utf8(ldd.stdout).expect("ldd output is UTF-8");
+        let path = text
+            .lines()
+            .find_map(|line| {
+                let (lib, rest) = line.trim().split_once("=>")?;
+                if !lib.trim().starts_with("libcrypto.so") {
+                    return None;
+                }
+                Some(rest.split_whitespace().next()?.to_string())
+            })
+            .unwrap_or_else(|| panic!("ldd resolves no libcrypto for {openssl_argv0}"));
+        let bytes = std::fs::read(&path).expect("libcrypto file reads");
+        crate::kinds::prov_hash(&bytes)
+    }
+
+    /// Independent PBKDF2 recomputation (stdlib `hashlib` only —
+    /// no third-party oracle dependency): the exact migration
+    /// post-leg parameters.
+    fn task3_hashlib_pbkdf2() -> String {
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import hashlib; print(hashlib.pbkdf2_hmac('sha256', b'password', bytes(range(13)), 4096, 42).hex().upper())")
+            .output()
+            .expect("python3 runs");
+        assert!(out.status.success(), "hashlib recomputation runs");
+        String::from_utf8(out.stdout)
+            .expect("hashlib output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    /// Independent HKDF recomputation (RFC 5869 extract+expand
+    /// via stdlib `hmac`): the exact families-stage parameters
+    /// (22-octet 0x0b IKM, salt 0x00..=0x0c, info 0xf0..=0xf9,
+    /// 42 bytes).
+    fn task3_hmac_hkdf() -> String {
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import hmac, hashlib; ikm = bytes([0x0b]*22); salt = bytes(range(13)); info = bytes(range(0xf0, 0xfa)); prk = hmac.new(salt, ikm, hashlib.sha256).digest(); okm = b''; t = b''; i = 1\nwhile len(okm) < 42:\n    t = hmac.new(prk, t + info + bytes([i]), hashlib.sha256).digest(); okm += t; i += 1\nprint(okm[:42].hex().upper())")
+            .output()
+            .expect("python3 runs");
+        assert!(out.status.success(), "hmac recomputation runs");
+        String::from_utf8(out.stdout)
+            .expect("hmac output is UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    /// Real-consumer CBOM import: the official CycloneDX library
+    /// deserializes our CBOM and must find every expected
+    /// component name (exact match). `TASK3_CDX_PYTHON` (the
+    /// consumer interpreter) and `TASK3_CDX_SCRIPT` (the import
+    /// script) are both required — a missing consumer fails the
+    /// test, never skips it.
+    fn task3_consumer_import(tag: &str, cbom_path: &std::path::Path, expected: &[&str]) {
+        let python = std::env::var("TASK3_CDX_PYTHON")
+            .expect("TASK3_CDX_PYTHON selects the consumer interpreter");
+        let script =
+            std::env::var("TASK3_CDX_SCRIPT").expect("TASK3_CDX_SCRIPT selects the import script");
+        let out = std::process::Command::new(&python)
+            .arg(&script)
+            .arg(cbom_path)
+            .args(expected)
+            .output()
+            .unwrap_or_else(|error| panic!("{tag}: consumer import spawns: {error:?}"));
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        eprintln!("{tag} consumer import:\n{stdout}");
+        assert!(
+            out.status.success(),
+            "{tag}: consumer import must accept the CBOM: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn task3_focused_result(
+        document: crate::evidence::CaptureDocument,
+    ) -> crate::focused_capture::FocusedResult {
+        // child_exit Some(0): fam_full_acquire asserts the
+        // observed workload exits 0 in-flow — truthful, not a
+        // default. The document already carries the projection
+        // (the production finish() shape); the seam field stays
+        // None exactly as consume_document expects.
+        crate::focused_capture::FocusedResult {
+            document,
+            child_exit: Some(0),
+            workload_discarded: false,
+            _reservation: None,
+            finalized_attribution: None,
+        }
+    }
+
+    /// Task-3 item 5: the HKDF→PBKDF2 migration through the REAL
+    /// v2.5 flows. Both legs run the actual producer session on
+    /// the host lane (sudo, pinned objects); each leg's retained
+    /// certified result projects through the real production
+    /// assembly; policy (violation/pass/inconclusive), the real
+    /// report/check delivery, and a real consumer import run on
+    /// each leg's document; the migration comparison asserts the
+    /// pre selector stops matching post-migration while the post
+    /// selector starts. Workload truth is independent throughout
+    /// (stdlib oracle recomputation, loader-resolved libcrypto
+    /// identity). Requires `TASK3_CDX_PYTHON` +
+    /// `TASK3_CDX_SCRIPT` for the consumer leg.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// TASK3_CDX_PYTHON=<consumer venv python> \
+    /// TASK3_CDX_SCRIPT=<import script> \
+    /// sudo -n <lib test binary> \
+    ///     task3_kdf_migration_flows --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "task-3 item 5: KDF migration flows (sudo, pinned BPF, cdx consumer)"]
+    fn task3_kdf_migration_flows_through_report_check_and_consumer() {
+        const TAG: &str = "task3-migrate";
+        let openssl = fam_openssl_argv0();
+        assert_eq!(
+            openssl, "/usr/bin/openssl",
+            "the migration flows pin the host lane"
+        );
+        let base = std::env::temp_dir().join(format!(
+            "osslscope-task3-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&base).unwrap();
+        // Pre leg (HKDF): the pinned KDF positive shape.
+        let pre_dir = base.join("pre");
+        std::fs::create_dir(&pre_dir).unwrap();
+        let pre_argv = fam_openssl_kdf_argv(&openssl);
+        let pre = fam_full_acquire(
+            &pre_argv,
+            &pre_dir,
+            "task3-migrate-pre",
+            FAM_KDF_OKM,
+            &[307, 308],
+            super::schema::Operation::Kdf,
+        );
+        assert_eq!(pre.typed_sites, 130, "the KDF positive shape");
+        assert_eq!(pre.definite, 1, "the derive hit attributes");
+        assert_eq!(pre.unresolved, 4);
+        assert_eq!(pre.withheld, 0);
+        assert_eq!(pre.next_id, 151);
+        assert_eq!(pre.loss, [0, 0, 1, 2, 0, 0, 0, 0]);
+        assert_eq!(task3_hmac_hkdf(), FAM_KDF_OKM, "independent HKDF oracle");
+        // Post leg (PBKDF2): no nested-HMAC query (PBKDF2 never
+        // queries op 3), so 63 copied sites (typed=81); only the
+        // derive hit fires (308 stays dark — no dispatch RESET on
+        // the free path) and attributes into one definite
+        // partition. Two illegible events (POISON=2) stay bounded
+        // inside unresolved=4 — the same accounting as the KDF
+        // pin's single poison.
+        let post_dir = base.join("post");
+        std::fs::create_dir(&post_dir).unwrap();
+        let post_argv = fam_openssl_pbkdf2_argv(&openssl);
+        let post = fam_full_acquire(
+            &post_argv,
+            &post_dir,
+            "task3-migrate-post",
+            FAM_PBKDF2_OKM,
+            &[307, 308],
+            super::schema::Operation::Kdf,
+        );
+        assert_eq!(
+            task3_hashlib_pbkdf2(),
+            FAM_PBKDF2_OKM,
+            "independent PBKDF2 oracle"
+        );
+        assert_eq!(post.count_roles, vec![307, 308]);
+        assert_eq!(post.typed_sites, 81, "17 first-slice + query + 63 copied");
+        assert_eq!(post.counter_links, 1);
+        assert_eq!(post.sample_sites, 26);
+        assert_eq!(post.sample_calls, 1, "only the derive hit fires");
+        assert_eq!(post.joined_sites, 26);
+        assert_eq!(post.joined_calls, 1);
+        assert_eq!(post.definite, 1, "positive: the derive hit attributes");
+        assert_eq!(post.unresolved, 4);
+        assert_eq!(post.withheld, 0);
+        assert_eq!(post.next_id, 84);
+        assert_eq!(
+            post.loss,
+            [0, 0, 2, 2, 0, 0, 0, 0],
+            "two illegible events, both bounded into unresolved"
+        );
+        let mut expected_roles = vec![
+            5, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155, 161,
+        ];
+        expected_roles.extend(std::iter::repeat_n(259, 14));
+        expected_roles.extend(std::iter::repeat_n(275, 12));
+        expected_roles.extend(std::iter::repeat_n(291, 11));
+        expected_roles.extend(std::iter::repeat_n(307, 14));
+        expected_roles.extend(std::iter::repeat_n(308, 12));
+        assert_eq!(
+            post.staged_roles, expected_roles,
+            "17 first-slice + query + 63 PBKDF2 copied, every one admitted"
+        );
+        // Native documents from the actual producer records.
+        let pre_doc = task3_native_doc(pre);
+        let post_doc = task3_native_doc(post);
+        for (name, doc) in [("pre", &pre_doc), ("post", &post_doc)] {
+            assert_eq!(
+                doc.schema,
+                crate::evidence::CAPTURE_SCHEMA_V2_5,
+                "{TAG}-{name}: projection upgrades the schema"
+            );
+            let bytes = crate::report::render_json(doc).expect("report renders");
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            crate::schema::validate_v2(&json).expect("v2.5 validates");
+            crate::schema::check_v2_semantics(&json).expect("v2.5 is semantic-clean");
+            assert!(!doc.execution_attributions.is_empty());
+            assert_eq!(doc.algorithm_selectors.len(), 1);
+        }
+        // Workload truth: canonical names equal the workloads'
+        // algorithms, both legs' selector objects equal the
+        // loader-resolved libcrypto, and the migration changes
+        // the object-bound identity.
+        let lib = task3_libcrypto_sha256(&openssl);
+        eprintln!("{TAG} loader libcrypto sha256={lib}");
+        let pre_sel = &pre_doc.algorithm_selectors[0];
+        let post_sel = &post_doc.algorithm_selectors[0];
+        eprintln!(
+            "{TAG}-pre selector object={} operation={} id={}",
+            pre_sel.object.0, pre_sel.operation, pre_sel.id
+        );
+        eprintln!(
+            "{TAG}-post selector object={} operation={} id={}",
+            post_sel.object.0, post_sel.operation, post_sel.id
+        );
+        assert_eq!(pre_sel.canonical_name.as_deref(), Some("HKDF"));
+        assert_eq!(post_sel.canonical_name.as_deref(), Some("PBKDF2"));
+        assert_eq!(pre_sel.object.0, lib);
+        assert_eq!(post_sel.object.0, lib);
+        assert_ne!(
+            pre_sel.id, post_sel.id,
+            "the migration changes the identity"
+        );
+        for (name, doc, sel) in [("pre", &pre_doc, pre_sel), ("post", &post_doc, post_sel)] {
+            let bound = doc.attribution_bounds.expect("bounds ride");
+            eprintln!(
+                "{TAG}-{name}: definite={} unresolved={} withheld={} selector={}:{}",
+                doc.execution_attributions
+                    .iter()
+                    .map(|r| r.calls)
+                    .sum::<u64>(),
+                bound.unresolved_calls,
+                bound.withheld_uncertain,
+                sel.object.0.chars().take(16).collect::<String>(),
+                sel.id.chars().take(16).collect::<String>(),
+            );
+            // Execution policy on the real records: the matching
+            // deny violates, the matching require passes, and an
+            // unmatched selector stays inconclusive (absence
+            // unprovable while calls are unresolved).
+            let violated = crate::policy::evaluate_document(
+                &[crate::policy::PolicyRule::deny_selector(
+                    &sel.object.0,
+                    &sel.id,
+                )],
+                doc,
+            );
+            assert_eq!(
+                violated.overall(),
+                crate::policy::PolicyOutcome::Violation,
+                "{TAG}-{name}: matching deny violates"
+            );
+            let passed = crate::policy::evaluate_document(
+                &[crate::policy::PolicyRule::require_selector(
+                    &sel.object.0,
+                    &sel.id,
+                )],
+                doc,
+            );
+            assert_eq!(
+                passed.overall(),
+                crate::policy::PolicyOutcome::Pass,
+                "{TAG}-{name}: matching require passes"
+            );
+            let open = crate::policy::evaluate_document(
+                &[crate::policy::PolicyRule::require_selector(
+                    &sel.object.0,
+                    &"f".repeat(64),
+                )],
+                doc,
+            );
+            assert_eq!(
+                open.overall(),
+                crate::policy::PolicyOutcome::Inconclusive,
+                "{TAG}-{name}: unmatched require stays inconclusive"
+            );
+        }
+        // Migration comparison: the pre identity stops matching
+        // post-migration (absence unprovable → inconclusive, never
+        // a pass), while the post identity starts violating.
+        let gone = crate::policy::evaluate_document(
+            &[crate::policy::PolicyRule::deny_selector(
+                &pre_sel.object.0,
+                &pre_sel.id,
+            )],
+            &post_doc,
+        );
+        assert_eq!(gone.overall(), crate::policy::PolicyOutcome::Inconclusive);
+        let arrived = crate::policy::evaluate_document(
+            &[crate::policy::PolicyRule::deny_selector(
+                &post_sel.object.0,
+                &post_sel.id,
+            )],
+            &post_doc,
+        );
+        assert_eq!(arrived.overall(), crate::policy::PolicyOutcome::Violation);
+        // The REAL report/check delivery on each leg's document
+        // (the functions the installed binaries call), with real
+        // artifacts and a real consumer import of each CBOM.
+        for (name, doc, algorithm) in [("pre", pre_doc, "HKDF"), ("post", post_doc, "PBKDF2")] {
+            let out = base.join(format!("{name}.json"));
+            let cbom = base.join(format!("{name}.cbom.json"));
+            let request = crate::report::OutputRequest {
+                format: crate::report::OutputFormat::Json,
+                primary: crate::report::OutputDest::File(out),
+                cbom: Some(crate::report::OutputDest::File(cbom.clone())),
+            };
+            let report = crate::report::consume_document(
+                task3_focused_result(doc.clone()),
+                crate::report::CaptureCommand::Report,
+                &request,
+            );
+            assert!(report.delivery.primary.ok, "{TAG}-{name}: report delivers");
+            assert_eq!(
+                report.exit_code, 3,
+                "{TAG}-{name}: report exits pass+partial"
+            );
+            let sel = &report.document.algorithm_selectors[0];
+            let rules = vec![crate::policy::PolicyRule::deny_selector(
+                &sel.object.0,
+                &sel.id,
+            )];
+            let checked = crate::report::consume_document(
+                task3_focused_result(report.document.clone()),
+                crate::report::CaptureCommand::Check { rules: &rules },
+                &request,
+            );
+            assert_eq!(checked.exit_code, 10, "{TAG}-{name}: check exits violation");
+            assert!(
+                checked.document.policy.is_some(),
+                "{TAG}-{name}: the checked document carries policy"
+            );
+            let open_rules = vec![crate::policy::PolicyRule::require_selector(
+                &sel.object.0,
+                &"f".repeat(64),
+            )];
+            let open = crate::report::consume_document(
+                task3_focused_result(doc),
+                crate::report::CaptureCommand::Check { rules: &open_rules },
+                &request,
+            );
+            assert_eq!(open.exit_code, 11, "{TAG}-{name}: check exits inconclusive");
+            task3_consumer_import(
+                &format!("{TAG}-{name}"),
+                &cbom,
+                &[&format!("{algorithm} (KDF) via object-bound execution")],
+            );
+        }
+        std::fs::remove_dir_all(&base).unwrap();
     }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
