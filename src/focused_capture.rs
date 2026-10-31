@@ -209,6 +209,9 @@ pub fn project(
     }
     let attached = sample.sites.len() as u64;
     let discovered = attached.saturating_add(sample.fenced.len() as u64);
+    // Executed-site set for the bounded metadata pre-scan below; read
+    // before the fenced rows drain into generation buckets.
+    let used = used_site_generations(sample.sites.iter().chain(sample.fenced.iter()));
     let mut fenced: BTreeMap<u32, Vec<SiteExecution>> = BTreeMap::new();
     for site in sample.fenced {
         fenced.entry(site.generation).or_default().push(site);
@@ -233,13 +236,36 @@ pub fn project(
         sample.gaps.push(counter);
     }
     let associations = std::mem::take(&mut sample.associations);
-    let metadata_fits = candidate_projection_fits(&associations);
-    if !metadata_fits {
+    // Bounded metadata projection (5D) is pre-scanned so omission
+    // counts record their gaps here, before finalization — the
+    // post-finalize projection below applies the same selection.
+    let selection = select_metadata_rows(&associations, &used, METADATA_PROJECTION_BUDGET_BYTES);
+    if selection.omitted_sites > 0 || selection.omitted_associations > 0 {
         sample.gaps.push(loss(
             "focused.metadata_output_limit",
             CounterSource::Discovery,
             1,
         ));
+        for (name, value, units) in [
+            (
+                "focused.metadata_omitted_sites",
+                selection.omitted_sites,
+                CounterUnits::Sites,
+            ),
+            (
+                "focused.metadata_omitted_associations",
+                selection.omitted_associations,
+                CounterUnits::TableRows,
+            ),
+        ] {
+            sample.gaps.push(GapCounter {
+                name: name.into(),
+                source: CounterSource::Discovery,
+                value: u64::try_from(value).unwrap_or(u64::MAX),
+                kind: CounterKind::Activity,
+                units,
+            });
+        }
     }
     let mut document = crate::evidence::finalize(FinalizeInput {
         window,
@@ -274,9 +300,14 @@ pub fn project(
         traversal: None,
     });
     document.candidate_associations = associations;
-    if metadata_fits {
-        document.project_candidate_metadata();
-    }
+    let projection = project_metadata_bounded(&document, METADATA_PROJECTION_BUDGET_BYTES);
+    debug_assert_eq!(projection.omitted_sites, selection.omitted_sites);
+    debug_assert_eq!(
+        projection.omitted_associations,
+        selection.omitted_associations
+    );
+    document.algorithm_identities = projection.algorithm_identities;
+    document.site_provenance = projection.site_provenance;
     document
 }
 fn now_ns() -> anyhow::Result<u64> {

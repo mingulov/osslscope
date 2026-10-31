@@ -1283,80 +1283,482 @@ pub struct CandidateProvenance {
     pub observed_ns: u64,
     pub observation_generation: u64,
 }
-impl CaptureDocument {
-    /// Project metadata without modifying frozen attribution or physical counts.
-    pub(crate) fn project_candidate_metadata(&mut self) {
-        let mut identities = std::collections::BTreeMap::new();
-        self.site_provenance = self
-            .candidate_associations
-            .iter()
-            .map(|row| SiteProvenance {
-                site: row.site.clone(),
-                count_generation: row.count_generation,
-                associations: row
-                    .associations
-                    .iter()
-                    .map(|a| {
-                        let algorithm_id = a.algorithm.map(|id| id.to_string());
-                        if let Some(id) = &algorithm_id {
-                            identities
-                                .entry(id.clone())
-                                .or_insert(a.known_algorithm.filter(|n| *n != u16::MAX));
-                        }
-                        CandidateProvenance {
-                            algorithm_id,
-                            origin: a.origin,
-                            operation: a.operation,
-                            function_id: a.function_id,
-                            advertisers: a.advertisers.clone(),
-                            static_provenance: a.static_provenance,
-                            storage: a.storage,
-                            partial: a.partial,
-                            alias_quality: a.alias_quality,
-                            observed_ns: a.observed_ns,
-                            observation_generation: a.observation_generation,
-                        }
-                    })
-                    .collect(),
-            })
-            .collect();
-        self.algorithm_identities = identities
+/// Frozen metadata-projection budget in bytes (5D): projection runs
+/// after native session/counter destruction and reuses the released
+/// 64 MiB observation-host allowance. Account growth/temporary IDs,
+/// tree nodes, vector cells, advertiser strings, JSON Value/key copies
+/// and pretty-printed output growth before cloning output. The
+/// allowance includes both retained metadata and rendering; it is not
+/// just Rust struct sizes. Never raised as a fix for over-budget
+/// metadata — over-budget rows are omitted with explicit counts.
+pub const METADATA_PROJECTION_BUDGET_BYTES: usize = 64 << 20;
+
+/// Why a bounded metadata projection omitted rows (or omitted none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetadataProjectionReason {
+    /// Every candidate row fit the budget; omitted counts are zero.
+    Complete,
+    /// One or more rows exceeded the remaining budget; the omitted
+    /// counts name exactly what was left out. Physical evidence is
+    /// never dropped by projection.
+    OverBudget,
+}
+
+/// Bounded candidate-metadata projection (5D): the retained public
+/// sections plus explicit omitted row counts. Retained rows keep
+/// stable input order; selection prefers executed (positive) sites
+/// first, then remaining rows in input order. Identity interning is
+/// deterministic (sorted by identity string); every retained
+/// association reference resolves to a retained identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataProjection {
+    pub algorithm_identities: Vec<AlgorithmIdentity>,
+    pub site_provenance: Vec<SiteProvenance>,
+    /// Candidate site rows left out of the projection.
+    pub omitted_sites: usize,
+    /// Association rows inside omitted site rows.
+    pub omitted_associations: usize,
+    pub reason: MetadataProjectionReason,
+}
+
+/// Charged cost of one candidate site row under the frozen byte
+/// model: 2048 bytes plus the object identity length per row, 4096
+/// bytes plus 1024 per advertiser per association. Saturates; a
+/// saturated cost never fits any finite budget.
+pub(crate) fn metadata_row_cost_bytes(row: &crate::focused_count::SiteAssociations) -> usize {
+    let mut bytes = 2048usize.saturating_add(row.site.object.0.len());
+    for association in &row.associations {
+        bytes = bytes.saturating_add(
+            association
+                .advertisers
+                .len()
+                .saturating_mul(1024)
+                .saturating_add(4096),
+        );
+    }
+    bytes
+}
+
+/// Executed (positive) site generations: `(site, generation)` pairs
+/// carrying at least one physical call. Projection prefers these
+/// rows; zero-call and unmatched rows fill the remaining budget.
+pub(crate) fn used_site_generations<'a>(
+    sites: impl Iterator<Item = &'a SiteExecution>,
+) -> std::collections::BTreeSet<(SiteKey, u32)> {
+    sites
+        .filter(|site| site.calls > 0)
+        .map(|site| (site.site.clone(), site.generation))
+        .collect()
+}
+
+/// Row-granularity selection: whole site rows are retained or
+/// omitted, so every retained site's metadata is complete. Greedy in
+/// priority order (used rows in input order, then remaining rows in
+/// input order); a row that does not fit is omitted but selection
+/// continues, so a later small row can still be retained. Fully
+/// deterministic for a given input order.
+pub(crate) struct MetadataRowSelection {
+    pub retained: Vec<bool>,
+    pub omitted_sites: usize,
+    pub omitted_associations: usize,
+}
+
+pub(crate) fn select_metadata_rows(
+    rows: &[crate::focused_count::SiteAssociations],
+    used: &std::collections::BTreeSet<(SiteKey, u32)>,
+    budget: usize,
+) -> MetadataRowSelection {
+    let is_used: Vec<bool> = rows
+        .iter()
+        .map(|row| used.contains(&(row.site.clone(), row.count_generation)))
+        .collect();
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by_key(|&index| (!is_used[index], index));
+    let mut retained = vec![false; rows.len()];
+    let mut bytes = 0usize;
+    let mut omitted_sites = 0usize;
+    let mut omitted_associations = 0usize;
+    for index in order {
+        let cost = metadata_row_cost_bytes(&rows[index]);
+        match bytes.checked_add(cost) {
+            Some(next) if next <= budget => {
+                bytes = next;
+                retained[index] = true;
+            }
+            _ => {
+                omitted_sites += 1;
+                omitted_associations += rows[index].associations.len();
+            }
+        }
+    }
+    MetadataRowSelection {
+        retained,
+        omitted_sites,
+        omitted_associations,
+    }
+}
+
+fn build_metadata_projection(
+    rows: &[crate::focused_count::SiteAssociations],
+    selection: &MetadataRowSelection,
+) -> MetadataProjection {
+    let mut identities = std::collections::BTreeMap::new();
+    let mut site_provenance = Vec::new();
+    for (row, keep) in rows.iter().zip(selection.retained.iter()) {
+        if !keep {
+            continue;
+        }
+        site_provenance.push(SiteProvenance {
+            site: row.site.clone(),
+            count_generation: row.count_generation,
+            associations: row
+                .associations
+                .iter()
+                .map(|a| {
+                    let algorithm_id = a.algorithm.map(|id| id.to_string());
+                    if let Some(id) = &algorithm_id {
+                        identities
+                            .entry(id.clone())
+                            .or_insert(a.known_algorithm.filter(|n| *n != u16::MAX));
+                    }
+                    CandidateProvenance {
+                        algorithm_id,
+                        origin: a.origin,
+                        operation: a.operation,
+                        function_id: a.function_id,
+                        advertisers: a.advertisers.clone(),
+                        static_provenance: a.static_provenance,
+                        storage: a.storage,
+                        partial: a.partial,
+                        alias_quality: a.alias_quality,
+                        observed_ns: a.observed_ns,
+                        observation_generation: a.observation_generation,
+                    }
+                })
+                .collect(),
+        });
+    }
+    let reason = if selection.omitted_sites == 0 && selection.omitted_associations == 0 {
+        MetadataProjectionReason::Complete
+    } else {
+        MetadataProjectionReason::OverBudget
+    };
+    MetadataProjection {
+        algorithm_identities: identities
             .into_iter()
             .map(|(id, known_algorithm)| AlgorithmIdentity {
                 id,
                 known_algorithm,
             })
-            .collect();
+            .collect(),
+        site_provenance,
+        omitted_sites: selection.omitted_sites,
+        omitted_associations: selection.omitted_associations,
+        reason,
     }
 }
 
-/// Projection runs after native session/counter destruction and reuses the
-/// released 64 MiB observation-host allowance. Account growth/temporary IDs,
-/// tree nodes, vector cells, advertiser strings, JSON Value/key copies and
-/// pretty-printed output growth before cloning output. The allowance includes
-/// both retained metadata and rendering; it is not just Rust struct sizes.
-pub(crate) fn candidate_projection_fits(rows: &[crate::focused_count::SiteAssociations]) -> bool {
-    let mut bytes = 0usize;
-    for row in rows {
-        let Some(next) = bytes.checked_add(2048 + row.site.object.0.len()) else {
-            return false;
+/// Project bounded candidate metadata from a finalized document's
+/// internal association handoff. Used (executed) site rows are
+/// preferred; remaining rows fill the budget in stable input order;
+/// omitted rows are counted explicitly with the reason. Physical
+/// sites, counts, attribution and policy inputs are never modified —
+/// the caller applies the retained sections. When every row fits,
+/// the retained sections equal the unbounded projection exactly.
+pub fn project_metadata_bounded(doc: &CaptureDocument, budget: usize) -> MetadataProjection {
+    let used = used_site_generations(
+        doc.sites
+            .iter()
+            .chain(doc.fenced.iter().flat_map(|bucket| bucket.sites.iter())),
+    );
+    let selection = select_metadata_rows(&doc.candidate_associations, &used, budget);
+    build_metadata_projection(&doc.candidate_associations, &selection)
+}
+
+#[cfg(test)]
+mod bounded_projection_tests {
+    use super::*;
+    use crate::focused_count::{CandidateAssociation, SiteAssociations};
+    use crate::provider_observation::static_tables::{
+        DynamicAlgorithmId, StaticTableProvenance, TableStorage,
+    };
+    use crate::provider_observation::wire::contract::Record;
+    use crate::provider_observation::{AliasQuality, MetadataOrigin, ObjectHash};
+
+    fn alg_id(invocation: u64) -> DynamicAlgorithmId {
+        let object = ObjectHash::try_from("c".repeat(64)).unwrap();
+        let record = Record {
+            invocation,
+            ..Default::default()
         };
-        bytes = next;
-        for association in &row.associations {
-            let Some(next) = association
-                .advertisers
-                .len()
-                .checked_mul(1024)
-                .and_then(|n| n.checked_add(4096))
-                .and_then(|n| bytes.checked_add(n))
-            else {
-                return false;
-            };
-            bytes = next;
-            if bytes > 64 << 20 {
-                return false;
+        DynamicAlgorithmId::observed(&object, 99, &record)
+    }
+
+    fn assoc(algorithm: Option<DynamicAlgorithmId>, known: Option<u16>) -> CandidateAssociation {
+        CandidateAssociation {
+            origin: MetadataOrigin::StaticPublicTableCandidate,
+            algorithm,
+            known_algorithm: known,
+            alias_quality: AliasQuality::default(),
+            operation: None,
+            function_id: 7,
+            advertisers: Vec::new(),
+            static_provenance: Some(StaticTableProvenance::DispatchTableShape),
+            storage: Some(TableStorage::ReadOnly),
+            partial: false,
+            observed_ns: 20,
+            observation_generation: 9,
+        }
+    }
+
+    fn exec_site(calls: u64, offset: u64) -> SiteExecution {
+        SiteExecution {
+            site: SiteKey {
+                object: ObjectId("a".repeat(64)),
+                device: 1,
+                inode: 2,
+                offset,
+            },
+            generation: 1,
+            candidates: Vec::new(),
+            candidates_coverage: CandidateCoverage::Unknown,
+            calls,
+            first_ns: if calls == 0 { 0 } else { 30 },
+            last_ns: if calls == 0 { 0 } else { 40 },
+            installed_at: Some(20),
+        }
+    }
+
+    fn row(offset: u64, associations: Vec<CandidateAssociation>) -> SiteAssociations {
+        SiteAssociations {
+            site: SiteKey {
+                object: ObjectId("a".repeat(64)),
+                device: 1,
+                inode: 2,
+                offset,
+            },
+            count_generation: 1,
+            associations,
+        }
+    }
+
+    fn doc_with(sites: Vec<SiteExecution>, rows: Vec<SiteAssociations>) -> CaptureDocument {
+        let mut doc = finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 10,
+                requested_end_ns: 100,
+                effective_start_ns: 10,
+                effective_end_ns: 100,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites,
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: TargetRecord::new(42, "unknown".into(), String::new(), String::new()),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        });
+        doc.candidate_associations = rows;
+        doc
+    }
+
+    #[test]
+    fn zero_budget_omits_everything_without_touching_physical() {
+        let sites = vec![exec_site(37, 5), exec_site(0, 6)];
+        let rows = vec![
+            row(5, vec![assoc(None, None)]),
+            row(6, vec![assoc(None, None), assoc(None, None)]),
+        ];
+        let doc = doc_with(sites, rows);
+        let before = doc.clone();
+        let projection = project_metadata_bounded(&doc, 0);
+        assert!(projection.algorithm_identities.is_empty());
+        assert!(projection.site_provenance.is_empty());
+        assert_eq!(projection.omitted_sites, 2);
+        assert_eq!(projection.omitted_associations, 3);
+        assert_eq!(projection.reason, MetadataProjectionReason::OverBudget);
+        assert_eq!(doc, before);
+        assert_eq!(doc.total_calls(), 37);
+    }
+
+    #[test]
+    fn one_over_budget_omits_exactly_one_row_in_stable_order() {
+        let single = row(7, vec![assoc(None, None)]);
+        let cost = metadata_row_cost_bytes(&single);
+        let sites = vec![exec_site(0, 7), exec_site(0, 8)];
+        let rows = vec![single, row(8, vec![assoc(None, None)])];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, 2 * cost - 1);
+        assert_eq!(projection.site_provenance.len(), 1);
+        assert_eq!(projection.site_provenance[0].site.offset, 7);
+        assert_eq!(projection.omitted_sites, 1);
+        assert_eq!(projection.omitted_associations, 1);
+        assert_eq!(projection.reason, MetadataProjectionReason::OverBudget);
+        let exact = project_metadata_bounded(&doc, 2 * cost);
+        assert_eq!(exact.site_provenance.len(), 2);
+        assert_eq!(exact.reason, MetadataProjectionReason::Complete);
+    }
+
+    #[test]
+    fn used_rows_win_over_earlier_unused_rows() {
+        let used = row(9, vec![assoc(None, None)]);
+        let cost = metadata_row_cost_bytes(&used);
+        let sites = vec![exec_site(11, 9), exec_site(0, 10)];
+        // Unused row first in input order; the used row must still win
+        // the single-row budget, and output keeps input order.
+        let rows = vec![row(10, vec![assoc(None, None)]), used];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, cost);
+        assert_eq!(projection.site_provenance.len(), 1);
+        assert_eq!(projection.site_provenance[0].site.offset, 9);
+        assert_eq!(projection.omitted_sites, 1);
+        assert_eq!(projection.reason, MetadataProjectionReason::OverBudget);
+    }
+
+    #[test]
+    fn unmatched_rows_are_lowest_priority() {
+        let used = row(12, vec![assoc(None, None)]);
+        let cost = metadata_row_cost_bytes(&used);
+        let sites = vec![exec_site(5, 12)];
+        let rows = vec![row(13, vec![assoc(None, None)]), used];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, cost);
+        assert_eq!(projection.site_provenance.len(), 1);
+        assert_eq!(projection.site_provenance[0].site.offset, 12);
+        assert_eq!(projection.omitted_sites, 1);
+    }
+
+    #[test]
+    fn small_rows_after_an_over_budget_row_are_still_retained() {
+        let huge = row(14, vec![assoc(None, None); 10_000]);
+        let small = row(15, vec![assoc(None, None)]);
+        let small_cost = metadata_row_cost_bytes(&small);
+        assert!(metadata_row_cost_bytes(&huge) > small_cost);
+        let sites = vec![exec_site(0, 14), exec_site(0, 15)];
+        let doc = doc_with(sites, vec![huge, small]);
+        let projection = project_metadata_bounded(&doc, small_cost);
+        assert_eq!(projection.site_provenance.len(), 1);
+        assert_eq!(projection.site_provenance[0].site.offset, 15);
+        assert_eq!(projection.omitted_sites, 1);
+        assert_eq!(projection.omitted_associations, 10_000);
+    }
+
+    #[test]
+    fn interning_is_deterministic_across_input_orders() {
+        let first = alg_id(1);
+        let second = alg_id(2);
+        assert_ne!(first.to_string(), second.to_string());
+        let sites = vec![exec_site(3, 16), exec_site(4, 17)];
+        let forward = doc_with(
+            sites.clone(),
+            vec![
+                row(16, vec![assoc(Some(first), Some(9))]),
+                row(17, vec![assoc(Some(second), None)]),
+            ],
+        );
+        let backward = doc_with(
+            sites,
+            vec![
+                row(17, vec![assoc(Some(second), None)]),
+                row(16, vec![assoc(Some(first), Some(9))]),
+            ],
+        );
+        let budget = METADATA_PROJECTION_BUDGET_BYTES;
+        let a = project_metadata_bounded(&forward, budget);
+        let b = project_metadata_bounded(&backward, budget);
+        assert_eq!(a.algorithm_identities, b.algorithm_identities);
+        assert_eq!(a.algorithm_identities.len(), 2);
+        let mut sorted = a.algorithm_identities.clone();
+        sorted.sort_by(|x, y| x.id.cmp(&y.id));
+        assert_eq!(a.algorithm_identities, sorted);
+        // Same input projects identically on repeat (provenance keeps
+        // input order, so only the identities are order-independent).
+        assert_eq!(a, project_metadata_bounded(&forward, budget));
+    }
+
+    #[test]
+    fn retained_references_resolve_and_max_is_filtered() {
+        let id = alg_id(3);
+        let sites = vec![exec_site(2, 18)];
+        let rows = vec![row(
+            18,
+            vec![
+                assoc(Some(id), Some(u16::MAX)),
+                assoc(Some(id), Some(9)),
+                assoc(None, None),
+            ],
+        )];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, METADATA_PROJECTION_BUDGET_BYTES);
+        assert_eq!(projection.reason, MetadataProjectionReason::Complete);
+        assert_eq!(projection.algorithm_identities.len(), 1);
+        // u16::MAX is filtered at first sight; the first-seen entry wins.
+        assert_eq!(projection.algorithm_identities[0].known_algorithm, None);
+        let ids: std::collections::BTreeSet<&str> = projection
+            .algorithm_identities
+            .iter()
+            .map(|identity| identity.id.as_str())
+            .collect();
+        for row in &projection.site_provenance {
+            for association in &row.associations {
+                if let Some(name) = &association.algorithm_id {
+                    assert!(ids.contains(name.as_str()), "dangling {name}");
+                }
             }
         }
     }
-    bytes <= 64 << 20
+
+    #[test]
+    fn fits_case_retains_everything_complete_in_input_order() {
+        let sites = vec![exec_site(1, 21), exec_site(0, 19), exec_site(7, 20)];
+        let rows = vec![
+            row(21, vec![assoc(None, None)]),
+            row(19, vec![assoc(None, None)]),
+            row(20, vec![assoc(None, None), assoc(None, None)]),
+        ];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, METADATA_PROJECTION_BUDGET_BYTES);
+        assert_eq!(projection.reason, MetadataProjectionReason::Complete);
+        assert_eq!(projection.omitted_sites, 0);
+        assert_eq!(projection.omitted_associations, 0);
+        let offsets: Vec<u64> = projection
+            .site_provenance
+            .iter()
+            .map(|row| row.site.offset)
+            .collect();
+        assert_eq!(offsets, vec![21, 19, 20]);
+    }
+
+    #[test]
+    fn huge_unknown_sets_stay_bounded_and_counted() {
+        let mut sites = Vec::new();
+        let mut rows = Vec::new();
+        for offset in 0..50_000u64 {
+            sites.push(exec_site(0, offset));
+            rows.push(row(offset, vec![assoc(None, None)]));
+        }
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, METADATA_PROJECTION_BUDGET_BYTES);
+        assert_eq!(projection.reason, MetadataProjectionReason::OverBudget);
+        assert_eq!(
+            projection.site_provenance.len() + projection.omitted_sites,
+            50_000
+        );
+        assert_eq!(
+            projection.omitted_associations, projection.omitted_sites,
+            "one association per row"
+        );
+        assert!(
+            projection.site_provenance.len() > 1_000,
+            "bounded output must retain a useful prefix"
+        );
+    }
 }
