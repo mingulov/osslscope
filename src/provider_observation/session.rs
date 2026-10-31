@@ -13451,11 +13451,32 @@ mod startup_api_controls {
         assert!(record_binding(&targets, &startup, &stale).is_err());
     }
     #[test]
+    fn additive_operational_api_identities_round_trip_through_wire_and_spellings() {
+        use crate::api_activity::{API_NAMES, ApiId};
+        // Task 7 (5G) round 2: 49-72 are first-class operational identities;
+        // 73+ refuses; every export spelling resolves exactly once.
+        assert_eq!(API_NAMES.len(), 53);
+        let mut seen = std::collections::BTreeSet::new();
+        for id in 20..=72u32 {
+            let api = ApiId::try_from(id).unwrap_or_else(|_| panic!("ApiId {id}"));
+            assert_eq!(u32::from(api), id);
+            let name = api.export_name();
+            assert!(seen.insert(name), "duplicate spelling {name}");
+            let wired = wire::api(id).expect("wire identity");
+            assert_eq!(wired.export_name(), Some(name));
+        }
+        for id in [0, 19, 73, 127, 128, 256, u32::MAX] {
+            assert!(ApiId::try_from(id).is_err(), "ApiId {id} must refuse");
+            assert!(wire::api(id).is_err(), "wire {id} must refuse");
+        }
+        assert_eq!(ApiId::all().count(), 53);
+    }
+    #[test]
     fn legacy_startup_acquisition_survives_retained_typed_prefix_then_refusal() {
         use crate::startup_objects::{StartupAcquisition, acquire_startup};
         // Three real, distinct retained ELF files. No fixture function executes.
         let mut body = String::from("ret\n");
-        for id in 20..=48 {
+        for id in 20..=72 {
             let name = wire::api(id).unwrap().export_name().unwrap();
             body.push_str(&format!(
                 ".globl {name}\n.type {name},@function\n{name}: mov $1,%eax\nret\n.size {name},.-{name}\n"
@@ -13492,12 +13513,12 @@ mod startup_api_controls {
                 legacy = sources.apis;
             }
         }
-        assert_eq!(legacy.len(), 31); // 29 operational exports plus query/unquery
+        assert_eq!(legacy.len(), 55); // 53 operational exports plus query/unquery
         let anchor = 240 * (page + 64) + 4096;
         // This models remaining acquisition headroom after discovery. BOTH
         // stages share this account, including every retained anchor prefix.
         let budget = ObservationBudget::new(ObservationLimits {
-            max_state_bytes: anchor + 29 * (96 + 512 + 256) + (16 << 10) + 4096,
+            max_state_bytes: anchor + 53 * (96 + 512 + 256) + (16 << 10) + 4096,
             ..Default::default()
         });
         let mut roles = Roles::default();
@@ -13514,7 +13535,7 @@ mod startup_api_controls {
                     let mut resolved = Vec::new();
                     for source in std::mem::take(&mut legacy) {
                         let (api, site) = source.into_parts();
-                        let Some(id) = (20..=48).find(|&id| wire::api(id) == Ok(api)) else {
+                        let Some(id) = (20..=72).find(|&id| wire::api(id) == Ok(api)) else {
                             continue;
                         };
                         roles.observe(

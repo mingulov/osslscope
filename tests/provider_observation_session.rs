@@ -1264,3 +1264,65 @@ fn scalar_failure_subsets_are_disjoint_and_cannot_overflow() {
         );
     }
 }
+
+#[test]
+fn additive_api_activity_decodes_with_per_api_subset_guards() {
+    // Task 7 (5G) round 2: IDs 49-72 decode; 73+ refuses; the -2 subset is
+    // admitted exactly on the ten documented -2-capable IDs; mismatch stays
+    // confined to the three signature-verification finals.
+    fn aggregate(entries: u64, success: u64, failure: u64, mismatch: u64, unsupported: u64) -> Vec<u8> {
+        let mut bytes = vec![0; 72];
+        for (at, n) in [
+            (0, entries),
+            (8, success),
+            (16, failure),
+            (24, mismatch),
+            (32, unsupported),
+        ] {
+            bytes[at..at + 8].copy_from_slice(&n.to_ne_bytes());
+        }
+        bytes
+    }
+    for api in 49..=72u32 {
+        let row = wire::decode_activity(api, &aggregate(2, 1, 1, 0, 0))
+            .unwrap_or_else(|_| panic!("api {api} must decode"));
+        assert_eq!(u32::from(row.api), api);
+        assert_eq!((row.entries, row.observed_success, row.observed_failure), (2, 1, 1));
+        assert_eq!(row.gaps.tail, 0);
+    }
+    for api in [0, 19, 73, 127, 128, 256, u32::MAX] {
+        assert!(
+            wire::decode_activity(api, &aggregate(2, 1, 1, 0, 0)).is_err(),
+            "api {api} must refuse"
+        );
+    }
+    // Unsupported subset: admitted on INT2N + CHECK, refused elsewhere.
+    for api in [49, 50, 51, 52, 53, 54, 55, 56, 57, 58] {
+        let row = wire::decode_activity(api, &aggregate(3, 1, 2, 0, 1))
+            .unwrap_or_else(|_| panic!("api {api} must admit unsupported"));
+        assert_eq!(row.unsupported, 1);
+    }
+    for api in [20u32, 44, 46, 48]
+        .into_iter()
+        .chain([59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 69, 70, 71, 72])
+    {
+        assert!(
+            wire::decode_activity(api, &aggregate(3, 1, 2, 0, 1)).is_err(),
+            "api {api} must refuse unsupported"
+        );
+    }
+    // Mismatch subset: still only 40/45/47; every new ID refuses it.
+    for api in 49..=72u32 {
+        assert!(
+            wire::decode_activity(api, &aggregate(3, 1, 2, 1, 0)).is_err(),
+            "api {api} must refuse mismatch"
+        );
+    }
+    for api in [40, 45, 47] {
+        wire::decode_activity(api, &aggregate(3, 1, 2, 1, 0))
+            .unwrap_or_else(|_| panic!("api {api} must keep admitting mismatch"));
+    }
+    // Conservation still binds on the new IDs.
+    assert!(wire::decode_activity(49, &aggregate(1, 1, 1, 0, 0)).is_err());
+    assert!(wire::decode_activity(72, &aggregate(2, 0, 1, 1, 1)).is_err());
+}

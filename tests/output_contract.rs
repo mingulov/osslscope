@@ -5268,6 +5268,74 @@ fn unused_fetch_never_creates_cbom_asset() {
 }
 
 #[test]
+fn additive_api_totals_never_create_cbom_assets_or_physical_execution() {
+    // Task 7 (5G) round 2, plan item 1: success rows on every new ID —
+    // including void success-on-return and pointer non-NULL rows — must
+    // neither mint CBOM assets nor populate physical site execution.
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    fn row(api: u32, success: u64, failure: u64) -> osslscope::api_activity::ApiActivityRow {
+        osslscope::api_activity::ApiActivityRow {
+            api: api.try_into().unwrap(),
+            entries: success + failure,
+            observed_success: success,
+            observed_failure: failure,
+            verification_mismatch: 0,
+            unsupported: 0,
+            gaps: osslscope::api_activity::ApiActivityGaps::default(),
+        }
+    }
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        0,
+        vec![cand(OBJ, "default", 3, 5, &["HMAC"], false)],
+        CandidateCoverage::Complete,
+    )];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    // One success row per new ID; the CHECK IDs also carry a failure row
+    // and one documented-unsupported row to pin the subset vocabulary.
+    doc.api_activity = (49..=72u32).map(|api| row(api, 5, 0)).collect();
+    doc.api_activity.push(row(56, 0, 3));
+    doc.api_activity.push(osslscope::api_activity::ApiActivityRow {
+        api: 49u32.try_into().unwrap(),
+        entries: 1,
+        observed_success: 0,
+        observed_failure: 1,
+        verification_mismatch: 0,
+        unsupported: 1,
+        gaps: osslscope::api_activity::ApiActivityGaps::default(),
+    });
+    let rendered = json_of(&doc);
+    validate_v2(&rendered).expect("v2.5 producer shape validates");
+    check_v2_semantics(&rendered).expect("v2.5 producer shape is semantic-clean");
+    assert_eq!(rendered["api_activity"].as_array().unwrap().len(), 26);
+    assert_eq!(rendered["sites"][0]["calls"], json!(0));
+    let cbom = cbom_of(&doc);
+    assert_eq!(cbom["components"], json!([]));
+    assert!(
+        cbom["metadata"]["properties"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| !p["name"]
+                .as_str()
+                .unwrap()
+                .starts_with("osslscope:unresolved-attribution")),
+        "no attribution accounting without a certified result"
+    );
+}
+
+#[test]
 fn opaque_selector_renders_without_canonical_name() {
     use osslscope::evidence::{
         ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
