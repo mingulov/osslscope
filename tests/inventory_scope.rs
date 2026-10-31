@@ -440,10 +440,40 @@ impl Drop for Container {
             .output();
     }
 }
+fn ensure_workload_image() -> &'static str {
+    // Ordinary image: stock Debian openssl in its own layer over slim.
+    let image = "ossl5e-workload:local";
+    let have = Command::new("docker")
+        .args(["images", "-q", image])
+        .output()
+        .unwrap();
+    if String::from_utf8(have.stdout).unwrap().trim().is_empty() {
+        let dir = std::env::temp_dir().join(format!("ossl5e-image-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        fs::write(
+            dir.join("Dockerfile"),
+            "FROM debian:trixie-slim\nRUN apt-get update && apt-get install -y --no-install-recommends openssl && rm -rf /var/lib/apt/lists/*\n",
+        )
+        .unwrap();
+        let build = Command::new("docker")
+            .args(["build", "-t", image])
+            .arg(&dir)
+            .output()
+            .unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            build.status.success(),
+            "image build: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+    }
+    image
+}
 #[test]
 #[ignore = "requires docker + privileged map_files/pagemap (5E)"]
 fn container_pid_snapshot_reports_verified_overlay_module() {
-    let container = Container::run("debian:trixie-slim", &["sleep", "120"]);
+    let image = ensure_workload_image();
+    let container = Container::run(image, &["openssl", "speed", "-seconds", "120"]);
     let pid = container.pid();
     assert!(pid > 1, "container PID required");
     // Independent process + cgroup identification, outside the snapshot.
@@ -453,7 +483,7 @@ fn container_pid_snapshot_reports_verified_overlay_module() {
         "expected a docker cgroup: {cgroup}"
     );
     let exe = fs::read_link(format!("/proc/{pid}/exe")).unwrap();
-    assert!(exe.to_string_lossy().contains("sleep"));
+    assert!(exe.to_string_lossy().contains("openssl"));
     let mut scanner = ScopedScanner::new(
         Selection {
             pids: vec![pid],
