@@ -5174,6 +5174,92 @@ fn unused_fetch_never_creates_cbom_asset() {
 }
 
 #[test]
+fn opaque_selector_renders_without_canonical_name() {
+    use osslscope::evidence::{
+        ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+        ExecutionAttribution,
+    };
+    const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    // Registered nowhere: the first 24 bytes match no frozen
+    // spelling, the zero tail marks the known-producer shape —
+    // opaque but observable.
+    const DIGEST: &str = "ffffffffffffffffffffffffffffffffffffffffffffffff0000000000000000";
+    let mut input = input_base();
+    input.sites = vec![site_at(
+        OBJ,
+        8,
+        100,
+        0x1000,
+        0,
+        40,
+        Vec::new(),
+        CandidateCoverage::Unknown,
+    )];
+    input.objects = vec![ObjectRecord {
+        id: obj(OBJ),
+        device: 8,
+        inode: 100,
+        display_locator: "libcrypto.so.3".to_string(),
+    }];
+    let mut doc = finalize_honest(input);
+    doc.algorithm_selectors = vec![AlgorithmSelectorEntry {
+        object: obj(OBJ),
+        operation: 3,
+        id: DIGEST.to_string(),
+        canonical_name: None,
+    }];
+    doc.execution_attributions = vec![ExecutionAttribution {
+        site: SiteKey {
+            object: obj(OBJ),
+            device: 8,
+            inode: 100,
+            offset: 0x1000,
+        },
+        generation: 0,
+        segment: 1,
+        start_ns: 20,
+        end_ns: 80,
+        calls: 37,
+        provider_definition: None,
+        provider_instance: 9,
+        operation: 3,
+        function: 5,
+        selector: 0,
+        scope: ATTRIBUTION_SCOPE_V1.to_string(),
+    }];
+    doc.attribution_bounds = Some(AttributionBounds {
+        unresolved_calls: 3,
+        withheld_uncertain: 0,
+    });
+    doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
+    let rendered = json_of(&doc);
+    validate_v2(&rendered).expect("opaque v2.5 validates");
+    check_v2_semantics(&rendered).expect("opaque v2.5 is semantic-clean");
+    let cbom = cbom_of(&doc);
+    let components = cbom["components"].as_array().unwrap();
+    assert_eq!(components.len(), 1);
+    assert_eq!(
+        components[0]["name"],
+        json!("object-bound ffffffffffff (MAC)")
+    );
+    let props = components[0]["properties"].as_array().unwrap();
+    assert!(
+        props
+            .iter()
+            .any(|p| p["name"] == json!("osslscope:selector-scope")
+                && p["value"] == json!("object-bound"))
+    );
+    assert!(
+        props
+            .iter()
+            .all(|p| p["name"] != json!("osslscope:canonical-algorithm")),
+        "no invented names on the opaque leg"
+    );
+    let human = render_human(&doc);
+    assert!(human.contains("object-bound ffffffffffff (MAC)"), "{human}");
+}
+
+#[test]
 fn v24_documents_remain_readable() {
     // The current producer's v2.4 output (no attribution plane)
     // reads end to end under the new code: schema, semantics,
