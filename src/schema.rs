@@ -748,6 +748,9 @@ fn check_execution_attributions(
     let mut segments = std::collections::BTreeSet::new();
     let mut spent: std::collections::BTreeMap<(String, u64, u64, u64, u64), u64> =
         std::collections::BTreeMap::new();
+    // ER-5C-I2: document-wide assigned sum for the minimum
+    // unresolved-remainder check below (checked arithmetic).
+    let mut assigned = 0u64;
     for (index, item) in rows.iter().enumerate() {
         let ctx = format!("doc.execution_attributions[{index}]");
         let record = item
@@ -780,6 +783,9 @@ fn check_execution_attributions(
         if part_calls == 0 {
             return Err(format!("{ctx}.calls: a partition proves at least one call"));
         }
+        assigned = assigned
+            .checked_add(part_calls)
+            .ok_or_else(|| format!("{ctx}: partition sums overflow"))?;
         if get_u64(record, "provider_instance", &ctx)? == 0
             || get_u64(record, "operation", &ctx)? == 0
             || get_u64(record, "function", &ctx)? == 0
@@ -848,8 +854,28 @@ fn check_execution_attributions(
             .get("attribution_bounds")
             .and_then(|v| v.as_object())
             .ok_or_else(|| "doc.attribution_bounds: expected object".to_string())?;
-        get_u64(bounds_obj, "unresolved_calls", "doc.attribution_bounds")?;
+        let unresolved = get_u64(bounds_obj, "unresolved_calls", "doc.attribution_bounds")?;
         get_u64(bounds_obj, "withheld_uncertain", "doc.attribution_bounds")?;
+        // ER-5C-I2: the stated bound must cover at least the
+        // document-wide unassigned remainder (checked
+        // arithmetic — mixed-admission collects and hand-written
+        // documents understate it).
+        let mut total = 0u64;
+        for (_, (calls, _, _)) in &sites {
+            total = total
+                .checked_add(*calls)
+                .ok_or_else(|| "doc.sites: physical call sums overflow".to_string())?;
+        }
+        let minimum = total.checked_sub(assigned).ok_or_else(|| {
+            format!(
+                "doc.attribution_bounds: partitions claim {assigned} calls, document carries {total}"
+            )
+        })?;
+        if unresolved < minimum {
+            return Err(format!(
+                "doc.attribution_bounds: unresolved_calls {unresolved} understates the {minimum}-call unassigned remainder"
+            ));
+        }
     }
     Ok(())
 }

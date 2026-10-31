@@ -606,29 +606,63 @@ pub fn engine_match_bounds(doc: &CaptureDocument) -> MatchBounds {
 /// Conserved execution-plane bounds for one object-bound
 /// selector (v2.5): definite sums the certified partition calls
 /// behind the exact (code-object, digest) identity; the upper
-/// adds the document's certified unresolved bound. A dangling
-/// selector index matches nothing (validated documents never
-/// carry one — fail closed). API-success rows, candidate hints
-/// and merely-unresolved calls NEVER satisfy execution rules:
+/// adds the effective unresolved bound. A dangling selector
+/// index matches nothing (validated documents never carry one —
+/// fail closed). The stated bound is raised to at least the
+/// document-wide unassigned remainder (ER-5C-I2: mixed-admission
+/// collects and hand-written documents understate it), computed
+/// with checked arithmetic — any overflow, or partitions
+/// claiming more than the document carries, leaves the upper
+/// unknown. API-success rows, candidate hints and
+/// merely-unresolved calls NEVER satisfy execution rules:
 /// without the attribution plane the upper is unknown, and
 /// unresolved calls can never prove absence.
 pub fn selector_match_bounds(doc: &CaptureDocument, object: &str, id: &str) -> MatchBounds {
     let mut definite = 0u64;
+    let mut consumed = 0u64;
+    let mut consumed_overflow = false;
     for row in &doc.execution_attributions {
         let entry = match doc.algorithm_selectors.get(row.selector as usize) {
             Some(entry) => entry,
             None => continue,
         };
+        match consumed.checked_add(row.calls) {
+            Some(sum) => consumed = sum,
+            None => consumed_overflow = true,
+        }
         if entry.object.0 == object && entry.id == id {
             definite = definite.saturating_add(row.calls);
         }
     }
-    MatchBounds {
-        definite,
-        possible: doc
-            .attribution_bounds
-            .map(|bounds| definite.saturating_add(bounds.unresolved_calls)),
-    }
+    let possible = match doc.attribution_bounds {
+        None => None,
+        Some(bounds) => {
+            let mut total = 0u64;
+            let mut total_overflow = false;
+            for site in doc
+                .sites
+                .iter()
+                .chain(doc.fenced.iter().flat_map(|g| g.sites.iter()))
+            {
+                match total.checked_add(site.calls) {
+                    Some(sum) => total = sum,
+                    None => {
+                        total_overflow = true;
+                        break;
+                    }
+                }
+            }
+            if consumed_overflow || total_overflow {
+                None
+            } else {
+                match total.checked_sub(consumed) {
+                    Some(minimum) => definite.checked_add(bounds.unresolved_calls.max(minimum)),
+                    None => None,
+                }
+            }
+        }
+    };
+    MatchBounds { definite, possible }
 }
 
 /// One definitely matching execution partition (R02 provenance

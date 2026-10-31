@@ -592,7 +592,9 @@ impl FinalizedAttribution {
     /// [`crate::evidence::ExecutionAttribution`] records, their
     /// selectors dedupe by (object, operation, digest) into the
     /// doc-scoped dictionary (first-seen over the sorted definite
-    /// rows, so deterministic), the unresolved bound rides along,
+    /// rows, so deterministic), the unresolved bound rides along
+    /// raised to at least the document-wide unassigned remainder
+    /// (ER-5C-I2: the collect skips non-admitted physical sites),
     /// and the schema identity upgrades to v2.5 — including for a
     /// certified EMPTY definite set (an explicit certified zero,
     /// never an absent plane). A non-object-bound row fails
@@ -648,10 +650,37 @@ impl FinalizedAttribution {
                 scope: ATTRIBUTION_SCOPE_V1.to_string(),
             });
         }
+        // ER-5C-I2: the collect skips non-admitted physical
+        // sites, so its unresolved count can understate the
+        // document-wide remainder. Reconcile against every
+        // physical call the document carries (checked sums fail
+        // closed on overflow); the published bound is the
+        // collect's count raised to at least the unassigned
+        // remainder. An over-assigned document (partitions
+        // citing calls the document does not carry) keeps the
+        // collect's count here — site resolution stays the
+        // schema validator's job.
+        let mut assigned = 0u64;
+        for row in &rows {
+            assigned = assigned
+                .checked_add(row.calls)
+                .ok_or(AttributionError::Resource)?;
+        }
+        let mut total = 0u64;
+        for site in doc
+            .sites
+            .iter()
+            .chain(doc.fenced.iter().flat_map(|bucket| bucket.sites.iter()))
+        {
+            total = total
+                .checked_add(site.calls)
+                .ok_or(AttributionError::Resource)?;
+        }
+        let unresolved = self.unresolved_calls.max(total.saturating_sub(assigned));
         doc.execution_attributions = rows;
         doc.algorithm_selectors = selectors;
         doc.attribution_bounds = Some(AttributionBounds {
-            unresolved_calls: self.unresolved_calls,
+            unresolved_calls: unresolved,
             withheld_uncertain: self.withheld_uncertain,
         });
         doc.schema = CAPTURE_SCHEMA_V2_5.to_string();
