@@ -9291,6 +9291,584 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
+    /// Families-stage KDF oracle: stock `openssl kdf` HKDF over RFC
+    /// 5869 Test Case 1 (SHA-256, 22-octet 0x0b key, 13-octet salt,
+    /// 10-octet info, L=42). Colon-stripped uppercase stdout. Both the
+    /// host 3.5.5 CLI and the private 3.0.22/4.0.3 builds emit this
+    /// exact output unobserved; the probe asserts the observed run and
+    /// a fresh unobserved re-run agree with it independently.
+    const FAM_KDF_OKM: &str =
+        "3CB25F25FAACD57A90434F64D0362F2A2D2D0A90CF1A5A4C5DB02D56ECC4C5BF34007208D5B887185865";
+    /// Families-stage openssl argv[0]: `OSSLSCOPE_TEST_OPENSSL` selects
+    /// the library lane (host 3.5.5 default; private 3.0.22/4.0.3 CLI
+    /// paths with a matching `LD_LIBRARY_PATH` for those lanes). The
+    /// test binary links no libcrypto, so the lane env only affects
+    /// the spawned workload. Every probe prints the resolved binary
+    /// plus a deterministic FNV-1a/64 for run provenance.
+    fn fam_openssl_argv0() -> String {
+        std::env::var_os("OSSLSCOPE_TEST_OPENSSL")
+            .map(|path| {
+                path.into_string()
+                    .expect("OSSLSCOPE_TEST_OPENSSL must be a UTF-8 executable path")
+            })
+            .unwrap_or_else(|| "/usr/bin/openssl".into())
+    }
+    /// Families-stage stock KDF argv (P4 lane shape): ordinary
+    /// unmodified HKDF, no added getter/query calls.
+    fn fam_openssl_kdf_argv(openssl: &str) -> Vec<String> {
+        vec![
+            openssl.to_string(),
+            "kdf".to_string(),
+            "-keylen".to_string(),
+            "42".to_string(),
+            "-kdfopt".to_string(),
+            "digest:SHA256".to_string(),
+            "-kdfopt".to_string(),
+            format!("hexkey:{}", "0b".repeat(22)),
+            "-kdfopt".to_string(),
+            "hexsalt:000102030405060708090a0b0c".to_string(),
+            "-kdfopt".to_string(),
+            "hexinfo:f0f1f2f3f4f5f6f7f8f9".to_string(),
+            "HKDF".to_string(),
+        ]
+    }
+    /// Families-stage pass 1: legacy-only observation of a stock
+    /// workload drained for live query observations, exact-matched to
+    /// the retained arrays into a copied-role staging plan. Mirrors
+    /// `u5_pass1_plan_from_live_queries` (which stays verbatim) but
+    /// asserts lane-independent invariants only — exact discovery
+    /// counts differ per libcrypto build and are printed, not pinned.
+    /// Returns the plan plus the observed workload stdout digest.
+    fn fam_pass1_plan_from_live_queries(
+        argv: &[String],
+        dir: &std::path::Path,
+        tag: &str,
+    ) -> (super::copied_plan::CopiedPlan, String) {
+        let stdout_path = dir.join(format!("{tag}-out1.txt"));
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        eprintln!(
+            "{tag} pass1 startup apis={} typed={} candidates={} gaps={:?} files={}",
+            startup.apis.len(),
+            startup.typed.len(),
+            startup.candidates.len(),
+            startup.gaps,
+            startup.plan_arrays.len(),
+        );
+        assert!(
+            !startup.apis.is_empty(),
+            "{tag}: pass-1 discovery must stage legacy sites"
+        );
+        assert!(
+            !startup.typed.is_empty(),
+            "{tag}: pass-1 discovery must stage typed exports"
+        );
+        assert!(
+            !startup.plan_arrays.is_empty(),
+            "{tag}: pass-1 discovery must retain plan arrays"
+        );
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            plan_arrays,
+            ..
+        } = startup;
+        drop(typed);
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let fds_before = source_native_fd_targets();
+        let mut session = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Create,
+            )
+            .unwrap();
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(
+                Instant::now() < until,
+                "{tag}: pass-1 workload never exited"
+            );
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            child.poll_exit().unwrap(),
+            Some(0),
+            "{tag}: pass-1 public oracle"
+        );
+        child.finish_observation().unwrap();
+        let digest = std::fs::read_to_string(&stdout_path).unwrap();
+        let digest = digest
+            .trim()
+            .replace([':', '\n', ' '], "")
+            .to_ascii_uppercase();
+        assert_eq!(
+            digest, FAM_KDF_OKM,
+            "{tag}: pass-1 observed KDF output must verify"
+        );
+        let mut records = Vec::new();
+        let mut decode_failures = 0usize;
+        while let Some(bytes) = session.events.next() {
+            match super::wire::decode_transport(&bytes) {
+                Ok(transport) => records.push(transport.record()),
+                Err(_) => decode_failures += 1,
+            }
+        }
+        eprintln!(
+            "{tag} pass1 records={} decode_failures={}",
+            records.len(),
+            decode_failures
+        );
+        assert_eq!(decode_failures, 0, "{tag}: every ring record must validate");
+        assert!(
+            !records.is_empty(),
+            "{tag}: pass-1 must observe ring records"
+        );
+        drop(session);
+        drop(child);
+        let after = source_native_fd_targets();
+        let bpf = |fds: &[String]| {
+            fds.iter()
+                .filter(|fd| {
+                    fd.contains("bpf-map") || fd.contains("bpf-prog") || fd.contains("bpf_link")
+                })
+                .count()
+        };
+        assert_eq!(
+            bpf(&after),
+            bpf(&fds_before),
+            "{tag}: pass-1 BPF FDs must return"
+        );
+        let live = super::copied_plan::collect_live_queries(&records);
+        eprintln!("{tag} pass1 live_queries={live:?}");
+        assert!(
+            !live.is_empty(),
+            "{tag}: at least one live query must survive agreement"
+        );
+        assert!(
+            live.iter()
+                .all(|query| query.operation == 3 || query.operation == 4),
+            "{tag}: live queries stay in the MAC/KDF first slice"
+        );
+        assert!(
+            live.iter().any(|query| query.operation == 4),
+            "{tag}: the KDF workload must produce a live KDF query"
+        );
+        let plan_budget = ObservationBudget::default();
+        let plan = super::copied_plan::generate_plan(&plan_arrays, &live, &plan_budget).unwrap();
+        let mut plan_roles: Vec<u32> = plan.sites.iter().map(|site| site.role_id).collect();
+        plan_roles.sort_unstable();
+        eprintln!("{tag} pass1 plan roles={plan_roles:?}");
+        assert!(
+            !plan.sites.is_empty(),
+            "{tag}: the live queries must stage copied-role sites"
+        );
+        (plan, digest)
+    }
+    /// Families-stage KDF firemap: the full §12.3 session shape on the
+    /// stock HKDF workload with a shared counter at EVERY staged typed
+    /// site. Prints the per-role fire table (role, offset, calls) —
+    /// the behavioral firing evidence for the KDF lane (131/137/143/
+    /// 148/150/152/153, copied 259/275/291/307/308), the dup lane
+    /// (151/152), the unload lane and role-5 re-verification (role 5),
+    /// plus teardown (154/155) — and asserts the oracle, the staging
+    /// census, and KDF fetch/constructor/operational firing.
+    ///
+    /// ```sh
+    /// OSSL_PROVIDER_OBSERVATION_TEST_BPF=<provider object> \
+    /// OSSLSCOPE_FOCUSED_COUNT_OBJECT=<count object> \
+    /// [OSSLSCOPE_TEST_OPENSSL=<lane CLI> LD_LIBRARY_PATH=<lane lib>] \
+    /// sudo -n <lib test binary> \
+    ///     kdf_typed_roles_fire_on_stock_hkdf_workload --test-threads=1
+    /// ```
+    #[test]
+    #[ignore = "families KDF firemap (sudo, pinned BPF objects)"]
+    fn kdf_typed_roles_fire_on_stock_hkdf_workload() {
+        use crate::capture::ClockPort as _;
+        const CEILING: usize = 67108864;
+        const TAG: &str = "fam-kdf";
+        let openssl = fam_openssl_argv0();
+        let cli_bytes = std::fs::read(&openssl).unwrap();
+        // Deterministic FNV-1a/64 over the CLI bytes: lane provenance
+        // without a new dependency (exact sha256 lives in the lane
+        // receipts, not the observer).
+        let mut h64: u64 = 0xcbf29ce484222325;
+        for byte in &cli_bytes {
+            h64 ^= *byte as u64;
+            h64 = h64.wrapping_mul(0x100000001b3);
+        }
+        eprintln!(
+            "{TAG} openssl={openssl} bytes={} fnv1a64={h64:016x}",
+            cli_bytes.len(),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-fam-kdf-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let argv = fam_openssl_kdf_argv(&openssl);
+        let (plan, pass1_digest) = fam_pass1_plan_from_live_queries(&argv, &dir, TAG);
+        assert_eq!(pass1_digest, FAM_KDF_OKM);
+        let baseline = source_native_fd_targets();
+        let stdout_path = dir.join("out2.txt");
+        std::fs::write(&stdout_path, b"").unwrap();
+        let mut child = crate::target::OwnedTarget::spawn_stopped(
+            &argv,
+            crate::target::WorkloadDest::File(stdout_path.clone()),
+        )
+        .unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let mut budget = ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(120),
+            &cancel,
+            Some(&plan),
+        )
+        .unwrap();
+        eprintln!(
+            "{TAG} startup apis={} typed={} copied_skipped={}",
+            startup.apis.len(),
+            startup.typed.len(),
+            startup.copied_skipped,
+        );
+        assert_eq!(
+            startup.copied_skipped, 0,
+            "{TAG}: pass-2 rescan agrees with the pass-1 plan on every site"
+        );
+        let spent_discovery = budget.state_spent_test();
+        eprintln!("{TAG} spent after-discovery={spent_discovery}");
+        assert!(
+            spent_discovery < CEILING,
+            "{TAG}: discovery must fit the ceiling"
+        );
+        let crate::startup_objects::PreExecSites {
+            apis,
+            typed,
+            candidates,
+            ..
+        } = startup;
+        let legacy_sites = apis.len();
+        drop(candidates);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let count_object =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        budget.state(crate::writer_gate::RESERVATION_BYTES).unwrap();
+        let pool = budget.memory.clone().unwrap_or_else(|| {
+            crate::observation_memory::MemoryPool::new(budget.limits.max_state_bytes)
+        });
+        let gate = crate::writer_gate::WriterGate::create(&pool).unwrap();
+        let mut session = ProviderSession::open_gated(budget, &object, gate.clone()).unwrap();
+        session
+            .prearm_startup(
+                apis,
+                Instant::now() + Duration::from_secs(30),
+                &cancel,
+                PrearmLinks::Reserve,
+            )
+            .unwrap();
+        let pid = child.pid();
+        assert_eq!(session.startup[&pid].len(), legacy_sites);
+        let spent_prearm = session.budget.state_spent_test();
+        eprintln!("{TAG} spent after-prearm={spent_prearm}");
+        assert!(spent_prearm < CEILING, "{TAG}: prearm must fit the ceiling");
+        let mut fds = Vec::new();
+        let mut triples = Vec::new();
+        for attachment in &session.startup[&pid] {
+            let fd = attachment
+                .site
+                .attachment_fd()
+                .try_clone_to_owned()
+                .unwrap();
+            triples.push((
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())),
+                attachment.site.file_offset(),
+                pid,
+            ));
+            fds.push(fd);
+        }
+        let lease = super::source_owner::SourceAcquisitionLease::Enabled(
+            super::source_owner::NativeSourceParams::for_test_multi(triples),
+        );
+        session
+            .prepare_typed_startup(
+                typed,
+                Instant::now() + Duration::from_secs(60),
+                &cancel,
+                &lease,
+            )
+            .unwrap();
+        let typed_sites = session.typed_startup.len();
+        let spent_prepare = session.budget.state_spent_test();
+        eprintln!("{TAG} spent after-prepare-typed={spent_prepare}");
+        assert!(
+            spent_prepare < CEILING,
+            "{TAG}: typed prepare must fit the ceiling"
+        );
+        let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let deadline_ns = start_ns + 15_000_000_000;
+        let borrowed = session.borrowed_producer_maps().expect("producer maps");
+        let mut counter = crate::focused_count::FocusedCounter::open_gated_shared(
+            &count_object,
+            child.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            crate::focused_count::CountLimits {
+                window: crate::evidence::CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns,
+                },
+                ..Default::default()
+            },
+            gate.clone(),
+            &borrowed,
+        )
+        .unwrap();
+        gate.open().unwrap();
+        let receipts = session
+            .acquire_source_after_open(&lease, Instant::now() + Duration::from_secs(60), &cancel)
+            .unwrap_or_else(|gap| {
+                panic!(
+                    "{TAG}: full-{legacy_sites} acquire failed: {gap:?} owner: {:?}",
+                    session.source_error()
+                )
+            });
+        let spent_acquire = session.budget.state_spent_test();
+        eprintln!("{TAG} spent after-acquire={spent_acquire}");
+        assert!(
+            spent_acquire < CEILING,
+            "{TAG}: full acquire must fit the ceiling"
+        );
+        assert_eq!(
+            receipts.attachments.len(),
+            legacy_sites,
+            "{TAG}: every claim acquires"
+        );
+        assert_eq!(
+            session.typed_site_records().len(),
+            typed_sites,
+            "{TAG}: every staged typed site must admit"
+        );
+        drop(fds);
+        // Firemap: the counter watches every staged typed site.
+        let mut staged_roles: Vec<u32> = session
+            .typed_site_records()
+            .values()
+            .map(|record| record.role_id)
+            .collect();
+        staged_roles.sort_unstable();
+        eprintln!("{TAG} staged_roles={staged_roles:?}");
+        for role in [
+            5u32, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
+            161,
+        ] {
+            assert!(
+                staged_roles.contains(&role),
+                "{TAG}: first-slice role {role} must stage"
+            );
+        }
+        let mut candidates = Vec::new();
+        for staged in &session.typed_startup {
+            let site = staged.site().clone();
+            let starttime = site.starttime();
+            let record = super::wire::contract::Record {
+                pid: child.pid(),
+                tid: child.pid(),
+                generation: site.generation(),
+                ..super::wire::contract::Record::default()
+            };
+            let operation = match staged.role().id() {
+                131 | 137 | 143 | 148 | 150 | 152 | 153 | 259 | 275 | 291 | 307 | 308 => {
+                    super::schema::Operation::Kdf
+                }
+                _ => super::schema::Operation::Mac,
+            };
+            candidates.push(crate::focused_count::CountCandidate::Learned(
+                VerifiedSiteCandidate {
+                    site,
+                    pid: child.pid(),
+                    starttime,
+                    generation: record.generation,
+                    advertisers: Vec::new(),
+                    operation,
+                    numeric_operation: 0,
+                    dynamic_algorithm: super::static_tables::DynamicAlgorithmId::observed(
+                        session.typed_startup[0].site().object_hash(),
+                        starttime,
+                        &record,
+                    ),
+                    observed_ns: start_ns,
+                    algorithm: super::schema::AlgorithmId::try_from(u16::MAX).unwrap(),
+                    alias_quality: super::schema::AliasQuality::default(),
+                    function: super::schema::FunctionIdentity::new(operation, 0).unwrap(),
+                },
+            ));
+        }
+        assert_eq!(
+            candidates.len(),
+            typed_sites,
+            "{TAG}: one counter site per staged typed site"
+        );
+        counter
+            .attach_candidates_pinned(
+                candidates,
+                start_ns,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                session.typed_pins(),
+            )
+            .unwrap();
+        let counter_links = counter.active_link_count();
+        child.release().unwrap();
+        let until = Instant::now() + Duration::from_secs(30);
+        while child.peek_exit().unwrap().is_none() {
+            assert!(Instant::now() < until, "{TAG}: workload never exited");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            child.poll_exit().unwrap(),
+            Some(0),
+            "{TAG}: workload must exit 0"
+        );
+        child.finish_observation().unwrap();
+        let digest = std::fs::read_to_string(&stdout_path).unwrap();
+        let digest = digest
+            .trim()
+            .replace([':', '\n', ' '], "")
+            .to_ascii_uppercase();
+        assert_eq!(
+            digest, FAM_KDF_OKM,
+            "{TAG}: observed KDF output must verify"
+        );
+        let rerun = std::process::Command::new(&argv[0])
+            .args(&argv[1..])
+            .output()
+            .unwrap();
+        assert!(
+            rerun.status.success(),
+            "{TAG}: unobserved re-run must exit 0"
+        );
+        let rerun_digest = String::from_utf8_lossy(&rerun.stdout);
+        let rerun_digest = rerun_digest
+            .trim()
+            .replace([':', '\n', ' '], "")
+            .to_ascii_uppercase();
+        assert_eq!(
+            rerun_digest, FAM_KDF_OKM,
+            "{TAG}: unobserved re-run must agree"
+        );
+        session
+            .note_source_exec(&lease, child.pid(), receipts.domain.planned)
+            .unwrap();
+        session.finalize_until(Instant::now() + Duration::from_secs(10));
+        let sample = counter.close(Instant::now() + Duration::from_secs(10));
+        // Join samples to staged roles by (object, device, inode, offset).
+        let admitted: Vec<(u32, crate::evidence::ObjectId, u64, u64, u64)> = session
+            .typed_site_records()
+            .values()
+            .map(|record| {
+                (
+                    record.role_id,
+                    record.object.clone(),
+                    record.device,
+                    record.inode,
+                    record.offset,
+                )
+            })
+            .collect();
+        let mut fire: Vec<(u32, u64, u64)> = Vec::new();
+        for execution in &sample.sites {
+            let role = admitted
+                .iter()
+                .find(|(_, object, device, inode, offset)| {
+                    *object == execution.site.object
+                        && *device == execution.site.device
+                        && *inode == execution.site.inode
+                        && *offset == execution.site.offset
+                })
+                .map(|(role, ..)| *role)
+                .unwrap_or(u32::MAX);
+            fire.push((role, execution.site.offset, execution.calls));
+        }
+        fire.sort_unstable();
+        for (role, offset, calls) in &fire {
+            eprintln!("{TAG} fire role={role} offset={offset} calls={calls}");
+        }
+        eprintln!(
+            "{TAG}: typed={typed_sites} counter_links={counter_links} sample_sites={}",
+            sample.sites.len(),
+        );
+        assert_eq!(
+            sample.sites.len(),
+            typed_sites,
+            "{TAG}: every staged site sampled"
+        );
+        let calls_of = |role: u32| -> u64 {
+            fire.iter()
+                .filter(|(r, ..)| *r == role)
+                .map(|(_, _, calls)| *calls)
+                .sum()
+        };
+        // RED-first behavioral pins: the KDF workload must fetch, bind
+        // the provider, construct the context, and drive the provider's
+        // derive entry through the staged sites.
+        assert!(calls_of(131) > 0, "{TAG}: EVP_KDF_fetch (131) must fire");
+        assert!(calls_of(148) > 0, "{TAG}: EVP_KDF_CTX_new (148) must fire");
+        assert!(
+            calls_of(143) > 0,
+            "{TAG}: EVP_KDF_get0_provider (143) must fire"
+        );
+        assert!(
+            calls_of(307) + calls_of(308) > 0,
+            "{TAG}: KDF operational derive (307/308) must fire"
+        );
+        drop(sample);
+        let close = session.close_source_explicit().expect("source close");
+        assert!(close.cut_confirmed, "{TAG}: close must confirm the cut");
+        assert!(close.first_error.is_none());
+        assert!(
+            !close.order_refused,
+            "{TAG}: the completed order must not refuse"
+        );
+        drop(session);
+        drop(gate);
+        drop(child);
+        drop(receipts);
+        drop(lease);
+        assert_eq!(
+            source_native_fd_targets(),
+            baseline,
+            "{TAG}: the full flow must release every fd"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
     #[test]
     #[ignore = "requires OSSL_PROVIDER_OBSERVATION_TEST_BPF, native BPF privileges, cc"]
     fn typed_failed_return_registration_withholds_ready_and_operands() {
