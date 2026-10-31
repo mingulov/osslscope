@@ -52,6 +52,69 @@ describe those samples, exclude the uprobe trap cost, and do not measure
 per-callback overhead across the window. Preview performance claims need
 matched workload timings and count-loss checks with these limits recorded.
 
+## v0.5 development measurement (5D, 2026-10-31)
+
+Current-tree paired measurements on Ubuntu 26.04.1 amd64, kernel
+`7.0.0-38-generic`, stock OpenSSL `3.5.5`, 16 CPUs: debug host
+binary (the `build-dev.sh` default) plus the pinned release BPF
+companions (`fabbe7db…`/`ea30da6c…`). Five pairs per cell after a
+discarded warmup pair, alternating baseline/observed order; every
+observed leg exited PARTIAL/exit 3 with conserved counts
+(legacy buckets sum to the current+fenced total on all 36 legs).
+Medians below; per-pair tables are in the 5D work records. This is
+a development receipt on one host and profile, not qualification:
+no release, multi-host, or production-window claim follows.
+
+Fixed session cost dominates short legs: the quiet cell (2s sleep,
+zero callbacks) measures 6.64s median added wall (3.73s user +
+1.83s sys) for BPF load/verify, 2852 uprobe attaches (6263 `bpf()`
+calls), inventory/hash/BTF work, and drain/render. Per intercepted
+call is therefore reported two ways: raw pair delta over callbacks
+(which carries the fixed cost) and fixed-adjusted (quiet median
+subtracted). Callback totals always sum current + fenced sites.
+
+| Cell | Baseline | Observed | Ratio | Callbacks | Raw/call | Adjusted/call |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hot-loop stress (`sha` 100k, 10M op/s) | 0.01s | 9.45s | 945x | 1,511,153 | 6.25 us | 1.85 us |
+| Hot-loop paced (`sha` 100k, 15.4k op/s) | 6.48s | 16.18s | 2.49x | 1,511,153 | 6.40 us | 2.01 us |
+| Mixed stress (`both` 100k, 3.3M op/s) | 0.06s | 14.21s | 237x | 3,216,611 | 4.40 us | 2.33 us |
+| Mixed paced (`both` 50k, 15.2k op/s) | 6.57s | 17.40s | 2.66x | 1,616,611 | 6.74 us | 2.63 us |
+
+Paced cells use the workload's `OSSL_PREVIEW_PACE_US=10` knob
+(achieved sleeps run ~65 us, hence ~15k op/s). Counts are
+bit-deterministic: identical callback totals on all 6 legs of
+every preview cell, and across hot pacing. Per-call baselines are
+sub-microsecond (hot-loop: ~7 ns/call derived from 0.01s over
+1.51M calls), so only the absolute added latency is meaningful.
+
+TLS client cell (`openssl s_time -new -time 8`, fixed 8s window):
+baseline 1670 conn/s vs observed 85 conn/s, a 19.8x throughput
+collapse; +6.4 ms per handshake at 5275 callbacks/handshake, i.e.
+1.21 us per callback with no fixed-cost adjustment needed (attach
+sits outside the workload window). Sites stay 2852 (2857 for the
+libssl-linked client).
+
+Against the historical broader-product budgets: per-call added
+latency 1.2–2.7 us across cells passes the 4.0 us budget, while
+paced wall 2.49x/2.66x fails the 2.0x budget on fixed session cost
+alone. No code optimization cleared the unchanged-default gate
+(BPF frozen, attach coverage unchanged, profile owned by
+packaging), so the measured improvement is zero; the numbers above
+are the 5D result. A release-host diagnostic (quiet, same BPF)
+runs 6.12s wall (0.34s user + 1.85s sys) versus 8.64s debug,
+isolating ~3.4s of user-space debug tax per session; the shipped
+profile decision stays with packaging.
+
+Watch capacity from charged memory: one maximal session reserves
+115.84 MiB (104 MiB base + 264 KiB objects + 11.59 MiB maps, exact
+at 16 CPUs) against the 256 MiB watch pool, so at most two maximal
+sessions run concurrently — four slots is not four maximal
+sessions, and the reservation grows with CPU count (percpu maps).
+Measured kernel cost per session is 20.64 MiB map memlock over 44
+maps (28.33 MiB under the conservative contract formula) plus
+57 KiB of programs; host RSS runs 55–68 MiB per observed process.
+CPU contention between concurrent setup storms is unbudgeted.
+
 The tables below preserve historical fixture-era results, separate
 from current integrated v2 qualification. They are source/kernel/
 workload-specific medians from repeated fixture-provider runs on

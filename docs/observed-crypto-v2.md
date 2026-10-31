@@ -115,6 +115,18 @@ sections contain no target strings or runtime addresses;
 refusal entries contain no paths. Selection paths identify
 observer BPF objects, not target memory.
 
+`algorithm_identities` and `site_provenance` (both omitted when
+no candidate metadata was retained) carry the bounded
+candidate-metadata projection: executed-site rows first, then
+remaining rows in stable input order, whole rows only, under the
+frozen 64MiB projection budget. When rows are omitted,
+`completeness.counters` carries `focused.metadata_output_limit`
+(kind `loss`, value 1) plus the exact
+`focused.metadata_omitted_sites` (units `sites`) and
+`focused.metadata_omitted_associations` (units `table-rows`)
+activity counts. Physical sites, counts, attribution and policy
+inputs are never reduced by projection.
+
 Target, OpenSSL version, window and disposition, values verbatim
 from `tests/goldens/report-v2-violation.json` (whitespace
 compressed):
