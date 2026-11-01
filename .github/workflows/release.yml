@@ -1,0 +1,188 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and upload
+        required: true
+        type: string
+      prerelease:
+        description: Mark a newly created release as a prerelease
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  packages:
+    name: Build and publish packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+          fetch-depth: 0
+
+      - name: Resolve and validate release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            tag="$INPUT_TAG"
+          else
+            tag="$GITHUB_REF_NAME"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::invalid release tag: $tag"
+            exit 1
+          fi
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')"
+          if [[ "$tag" != "v$version" && "$tag" != "v$version-"* && "$tag" != "v$version+"* ]]; then
+            echo "::error::tag $tag does not match Cargo package version $version"
+            exit 1
+          fi
+          target="$(git rev-parse "$tag^{commit}")"
+          head="$(git rev-parse HEAD)"
+          if [[ "$target" != "$head" ]]; then
+            echo "::error::checkout HEAD $head is not tag target $target"
+            exit 1
+          fi
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "commit=$head"
+            echo "package-dir=dist/release-$tag"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install package builders
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y file rpm
+
+      - name: Install pinned BPF toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-20
+          components: rust-src
+
+      - name: Install pinned BPF linker
+        run: cargo install bpf-linker --locked --version 0.10.4
+
+      - name: Install pinned host toolchain
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          components: rust-src
+
+      - name: Check pinned build prerequisites
+        run: ./scripts/build-dev.sh --check-only
+
+      - name: Build release artifacts
+        run: ./scripts/build-dev.sh --release
+
+      - name: Prepare pinned source archives
+        run: >-
+          python3 packaging/prepare-source-archives.py
+          --output "$RUNNER_TEMP/osslscope-source-archives"
+
+      - name: Build downloadable packages
+        env:
+          PACKAGE_DIR: ${{ steps.release.outputs.package-dir }}
+        run: >-
+          python3 packaging/build-package.py
+          --source-archives "$RUNNER_TEMP/osslscope-source-archives"
+          --output "$PACKAGE_DIR"
+
+      - name: Validate packages and smoke-test the prefix tarball
+        env:
+          PACKAGE_DIR: ${{ steps.release.outputs.package-dir }}
+          VERSION: ${{ steps.release.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 packaging/tests/test-rpm-metadata.py "$PACKAGE_DIR"/osslscope-*.x86_64.rpm
+          python3 - "$PACKAGE_DIR" <<'PY'
+          import hashlib, json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          manifest = json.loads((root / "package-manifest.json").read_text())
+          for artifact in manifest["artifacts"]:
+              path = root / artifact["file"]
+              data = path.read_bytes()
+              if len(data) != artifact["bytes"] or hashlib.sha256(data).hexdigest() != artifact["sha256"]:
+                  raise SystemExit(f"package manifest mismatch: {path}")
+          print(f"verified {len(manifest['artifacts'])} package artifacts")
+          PY
+          smoke="$RUNNER_TEMP/osslscope-smoke"
+          mkdir "$smoke"
+          tar -xzf "$PACKAGE_DIR"/osslscope-*-prefix.tar.gz -C "$smoke"
+          test "$("$smoke/bin/osslscope" --version)" = "osslscope $VERSION"
+          "$smoke/bin/osslscope" --help >/dev/null
+          (
+            cd "$PACKAGE_DIR"
+            sha256sum -- * > SHA256SUMS
+          )
+
+      - name: Retain workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: osslscope-${{ steps.release.outputs.tag }}-packages
+          path: ${{ steps.release.outputs.package-dir }}/*
+          if-no-files-found: error
+
+      - name: Publish assets to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          PACKAGE_DIR: ${{ steps.release.outputs.package-dir }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          COMMIT: ${{ steps.release.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find "$PACKAGE_DIR" -maxdepth 1 -type f -print | sort)
+          if [[ "${#assets[@]}" -eq 0 ]]; then
+            echo "::error::no package assets found in $PACKAGE_DIR"
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+          else
+            prerelease=false
+            if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+              [[ "$INPUT_PRERELEASE" == "true" ]] && prerelease=true
+            elif [[ "$TAG" == *-* ]]; then
+              prerelease=true
+            fi
+            notes="$RUNNER_TEMP/release-notes.md"
+            {
+              echo "Downloadable osslscope $VERSION development packages built from commit $COMMIT."
+              echo
+              echo "Assets include prefix, DEB and RPM packages plus the exact product source and accompanying source bundle. Verify downloads with SHA256SUMS and package-manifest.json."
+              echo
+              echo "These are development packages; final installed-platform and live BPF qualification remains separate."
+            } > "$notes"
+            args=(--verify-tag --title "osslscope $TAG" --notes-file "$notes")
+            [[ "$prerelease" == "true" ]] && args+=(--prerelease)
+            gh release create "$TAG" "${assets[@]}" "${args[@]}"
+          fi
+          uploaded="$(gh release view "$TAG" --json assets --jq '.assets | length')"
+          if [[ "$uploaded" -lt "${#assets[@]}" ]]; then
+            echo "::error::release $TAG has $uploaded assets; expected at least ${#assets[@]}"
+            exit 1
+          fi
+          gh release view "$TAG" --json url --jq .url

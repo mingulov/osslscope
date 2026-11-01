@@ -10,9 +10,18 @@ Build from a reviewed clean product checkout:
 
 ```sh
 ./scripts/build-dev.sh --release --offline
+python3 packaging/prepare-source-archives.py --output /path/to/source-archives
 python3 packaging/build-package.py --source-archives /path/to/source-archives --output dist/current
 # dist/current: prefix tarball, DEB, RPM, product source tar, accompanying-source bundle, package-manifest.json
 ```
+
+The preparation helper is a separate acquisition step: it copies verified
+archives from the local Cargo cache or downloads only the exact official
+archives pinned by the lockfiles and runtime index, checking every SHA-256
+(and pinned size) before staging them. The `release` GitHub workflow runs this
+same recipe for version tags or manual dispatch, validates the package
+manifest and RPM header, smoke-tests the extracted CLI, and uploads the
+packages plus `SHA256SUMS` to the GitHub release.
 
 The output directory must be new; existing output is refused. The builder never
 installs software, changes privileges, acquires dependencies or starts workloads.
@@ -76,7 +85,10 @@ published VCS revision to both upstream license texts. The MIT distribution
 option is recorded explicitly, retaining the upstream dual-license declaration.
 Package construction validates these pins without network access.
 
-`--source-archives` is required. Supply the original `.crate` files selected by
+`--source-archives` is required. `prepare-source-archives.py` can stage that
+directory from the local Cargo cache and the pinned official archive URLs;
+package construction itself remains offline and independently revalidates
+every byte. Supply the original `.crate` files selected by
 both **current** locked resolved graphs and the reviewed runtime inputs in
 [runtime-sources.json](runtime-sources.json): two official rust-src components
 and the bounded host standard-library crate superset. Filenames are the official
