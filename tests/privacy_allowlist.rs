@@ -404,6 +404,20 @@ fn privacy_tokens(source: &str) -> Result<Vec<String>, String> {
                 continue;
             }
         }
+        // Raw identifiers denote the same capability/method as ordinary
+        // identifiers. Raw strings have already been consumed above.
+        if b[i..].starts_with(b"r#")
+            && b.get(i + 2)
+                .is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_')
+        {
+            i += 2;
+            let identifier = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+            out.push(source[identifier..i].to_string());
+            continue;
+        }
         if b[i] == b'"' {
             i += 1;
             loop {
@@ -448,7 +462,10 @@ fn privacy_tokens(source: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
-fn reviewed_region(tokens: &[String], marker: &str) -> Result<Vec<String>, String> {
+fn reviewed_region_range(
+    tokens: &[String],
+    marker: &str,
+) -> Result<std::ops::Range<usize>, String> {
     let needle = privacy_tokens(marker)?;
     let starts: Vec<_> = tokens
         .windows(needle.len())
@@ -459,11 +476,11 @@ fn reviewed_region(tokens: &[String], marker: &str) -> Result<Vec<String>, Strin
         return Err(format!("ambiguous/missing owner: {marker}"));
     }
     let start = starts[0];
-    if marker.starts_with("const ") {
+    if marker.starts_with("const ") || marker.contains("mod source_anchor") {
         let end = (start..tokens.len())
             .find(|i| tokens[*i] == ";")
             .ok_or_else(|| format!("unterminated constant: {marker}"))?;
-        return Ok(tokens[start..=end].to_vec());
+        return Ok(start..end + 1);
     }
     let open = (start..tokens.len())
         .find(|i| tokens[*i] == "{")
@@ -477,10 +494,14 @@ fn reviewed_region(tokens: &[String], marker: &str) -> Result<Vec<String>, Strin
             depth -= 1;
         }
         if depth == 0 {
-            return Ok(tokens[start..=i].to_vec());
+            return Ok(start..i + 1);
         }
     }
     Err(format!("unclosed body: {marker}"))
+}
+
+fn reviewed_region(tokens: &[String], marker: &str) -> Result<Vec<String>, String> {
+    Ok(tokens[reviewed_region_range(tokens, marker)?].to_vec())
 }
 
 // Frozen SHA256 of token sequences reviewed with their caller provenance.
@@ -575,6 +596,82 @@ const SELF_READ_PINS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+// Additional existing reference locations, including the import that grants
+// capture authority and test callers. These do not grant whole-file permission:
+// every protected reference must occur inside a uniquely extracted pinned region.
+const SELF_REFERENCE_PINS: &[(&str, &str, &str)] = &[
+    (
+        "src/inventory/backing.rs",
+        "unsafe impl Send for SelfMap",
+        "820c0a9fc79f208d1494c8894de0486cb9a5a311b64130b8cc5e0a46b424336c",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn check_self_map",
+        "45485a41f0dcb642b700afee152c0ffa7e3c821861cc8232668d099ba027d40f",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "fn mapped_anchor_hashes_its_own_backing_and_faults_return_errors",
+        "df1adb92429ac640791774cebce37dfebd47dd8e8d583e0f35d0933f2d512286",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "fn anchor_reuse_proof_requires_same_backing_stamp_and_hash",
+        "a6e63a14ce9ff9dcc66e20e77393947f92688ef1b90fdbf69a0a863411f83fbf",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "fn anchor_refuses_wrong_artifact_and_capacity_before_mapping",
+        "fb0d974989bfb8205f0b097a54ca3d815bc6fe4f6f7decab42848171639417c7",
+    ),
+    (
+        "src/provider_observation/objects.rs",
+        "#[path = \"source_anchor.rs\"] pub(super) mod source_anchor",
+        "e42882bdf5b0a88b507f7c9c0b7232c7a7db08f1011b788b94ed0d5d8c1bb802",
+    ),
+    (
+        "src/provider_observation/objects.rs",
+        "struct Object {",
+        "5afc37bf403c2599aaee85f36dbe884a182e503e93edfedfadf379ad9071de33",
+    ),
+    (
+        "src/provider_observation/objects.rs",
+        "struct TypedPublicSite",
+        "4e1a822fee9a3667da9c42dc8235557d19ca900049d1276746dc612bf999ed43",
+    ),
+    (
+        "src/provider_observation/objects.rs",
+        "fn anchor ( & self )",
+        "f0cd0a6576bd7eb510ab6757f758ea480a9b26fd9ddc0613e1f9cfa97f7bd2c5",
+    ),
+    (
+        "src/provider_observation/source_owner.rs",
+        "use super :: {",
+        "bb4bd45bc90a92a9f89e181792e5886585ffdcc54feb6c14a2c9ae24096397c9",
+    ),
+    (
+        "src/provider_observation/source_owner.rs",
+        "struct SourceOwner",
+        "e92ea7f40fd68ad1ef12782f4264da2c4aea681ef9e6c567a92d8b691bdc8cc6",
+    ),
+    (
+        "src/provider_observation/source_owner.rs",
+        "fn anchor_rc_test",
+        "dd1a874db1971d4a8d0e21828dff4bcbfd73ff503307b3ce8986c856ae487788",
+    ),
+    (
+        "src/provider_observation/source_owner.rs",
+        "fn anchor_source_reuses_verified_candidate_without_recapture",
+        "fb5e32f9bb5ed74792a709e21344ae2a043b55d938f29a3ae6123c6dca5ea836",
+    ),
+    (
+        "src/provider_observation/source_owner.rs",
+        "fn anchor_source_recaptures_when_candidate_mismatches",
+        "5c26c7fa21d91ee051f84a72cd09b2c7b914f3848a84f593729e311bfa5bdb8f",
+    ),
+];
+
 fn self_read_policy(files: &[(String, String)]) -> Result<(), String> {
     use sha2::Digest;
     let mut census = Vec::new();
@@ -585,39 +682,32 @@ fn self_read_policy(files: &[(String, String)]) -> Result<(), String> {
             }
         }
         let tokens = privacy_tokens(source)?;
-        // Freeze capability references as well as syscall occurrences. A new
-        // caller of an unchanged fault method is not implicitly approved.
-        for (name, expected) in [
-            (
-                "SelfMap",
-                if path == "src/inventory/backing.rs" {
-                    7
-                } else {
-                    0
-                },
-            ),
-            (
-                "SourceAnchor",
-                match path.as_str() {
-                    "src/provider_observation/source_anchor.rs" => 7,
-                    "src/provider_observation/objects.rs" => 5,
-                    "src/provider_observation/source_owner.rs" => 7,
-                    _ => 0,
-                },
-            ),
-        ] {
-            if tokens.iter().filter(|s| *s == name).count() != expected {
-                return Err(format!("{path}: unreviewed {name} capability reference"));
-            }
-        }
-        let local_uses: &[(&str, usize)] = match path.as_str() {
-            "src/inventory/backing.rs" => &[("fault", 3), ("verify_witness", 3)],
-            "src/provider_observation/source_anchor.rs" => &[("digest", 6), ("capture", 5)],
-            _ => &[],
-        };
-        for &(name, expected) in local_uses {
-            if tokens.iter().filter(|s| *s == name).count() != expected {
-                return Err(format!("{path}: unreviewed {name} caller"));
+        let regions: Vec<_> = SELF_READ_PINS
+            .iter()
+            .chain(SELF_REFERENCE_PINS)
+            .filter(|(owner, _, _)| *owner == path)
+            .map(|(_, marker, _)| reviewed_region_range(&tokens, marker))
+            .collect::<Result<_, _>>()?;
+        for (i, token) in tokens.iter().enumerate() {
+            let protected = matches!(token.as_str(), "SelfMap" | "SourceAnchor" | "source_anchor")
+                || match path.as_str() {
+                    "src/inventory/backing.rs" => {
+                        matches!(token.as_str(), "fault" | "verify_witness")
+                    }
+                    "src/provider_observation/source_anchor.rs" => {
+                        matches!(token.as_str(), "capture" | "digest")
+                    }
+                    "src/provider_observation/objects.rs"
+                    | "src/provider_observation/source_owner.rs" => token == "capture",
+                    _ => false,
+                };
+            // This covers imports, aliases, type mentions and function items;
+            // no following '(' is required. Aggregate counts cannot authorize
+            // moving a reference into a new caller or adding an aliased import.
+            if protected && !regions.iter().any(|range| range.contains(&i)) {
+                return Err(format!(
+                    "{path}: {token} outside reviewed reference locations"
+                ));
             }
         }
         for (i, token) in tokens.iter().enumerate() {
@@ -644,7 +734,7 @@ fn self_read_policy(files: &[(String, String)]) -> Result<(), String> {
             "exactly two reviewed self-read occurrences required: {census:?}"
         ));
     }
-    for &(path, marker, expected) in SELF_READ_PINS {
+    for &(path, marker, expected) in SELF_READ_PINS.iter().chain(SELF_REFERENCE_PINS) {
         let sources: Vec<_> = files.iter().filter(|(p, _)| p == path).collect();
         if sources.len() != 1 {
             return Err(format!("ambiguous/missing source: {path}"));
@@ -1021,6 +1111,92 @@ fn self_read_census_rejects_duplicates_aliases_and_literal_camouflage() {
         .1
         .replace("libc::process_vm_readv(", "libc :: process_vm_readv \n (");
     self_read_policy(&spaced).unwrap();
+}
+
+#[test]
+fn self_read_policy_rejects_aliased_capture_authority() {
+    let clean = reviewed_self_sources();
+    self_read_policy(&clean).unwrap();
+    let import = "objects::source_anchor::SourceAnchor,";
+    assert_eq!(clean[3].1.matches(import).count(), 1);
+    let mut accepted = Vec::new();
+    for (label, function) in [
+        (
+            "raw identifier call",
+            "fn extra_read(file: &File, expected: &ObjectHash, budget: &ObservationBudget) { let _ = Alias::r#capture(file, expected, budget); }",
+        ),
+        (
+            "function item",
+            "fn extra_read(file: &File, expected: &ObjectHash, budget: &ObservationBudget) { let read = Alias::capture; let _ = read(file, expected, budget); }",
+        ),
+    ] {
+        let mut changed = clean.clone();
+        changed[3].1 = changed[3].1.replacen(
+            import,
+            "objects::source_anchor::{SourceAnchor as Alias, *},",
+            1,
+        );
+        changed[3].1.push_str(function);
+        let rejected = self_read_policy(&changed).is_err();
+        eprintln!("aliased capture mutation {label}: rejected={rejected}");
+        if !rejected {
+            accepted.push(label);
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted unreviewed capture authority: {accepted:?}"
+    );
+}
+
+#[test]
+fn self_read_references_are_location_bound_and_raw_identifiers_are_normalized() {
+    let clean = reviewed_self_sources();
+    // Equivalent raw spelling in existing reviewed callers remains valid. This
+    // also proves r#capture is treated as a method identifier, not a raw string.
+    let mut raw = clean.clone();
+    raw[3].1 = raw[3]
+        .1
+        .replace("SourceAnchor::capture", "r#SourceAnchor::r#capture");
+    self_read_policy(&raw).unwrap();
+    assert_eq!(
+        privacy_tokens("Alias::r#capture").unwrap(),
+        privacy_tokens("Alias::capture").unwrap()
+    );
+
+    for (index, extra) in [
+        (3, "fn extra() { let read = SourceAnchor::capture; }"),
+        (3, "fn extra() { let read = SourceAnchor::r#capture; }"),
+        (
+            3,
+            "use super::objects::source_anchor::*; fn extra() { let read = SourceAnchor::capture; }",
+        ),
+        (
+            3,
+            "use super::objects::r#source_anchor as renamed; fn extra() { let read = renamed::SourceAnchor::r#capture; }",
+        ),
+        (0, "fn extra() { let read = SelfMap::r#fault; }"),
+    ] {
+        let mut changed = clean.clone();
+        changed[index].1.push_str(extra);
+        let error = self_read_policy(&changed).unwrap_err();
+        assert!(
+            error.contains("outside reviewed reference locations"),
+            "location guard did not reject {extra}: {error}"
+        );
+    }
+    // Pin the actual import's entire syntax, not just a SourceAnchor token
+    // count. An unrelated alias name must not receive permission either.
+    let mut changed = clean.clone();
+    changed[3].1 = changed[3].1.replacen(
+        "objects::source_anchor::SourceAnchor,",
+        "objects::source_anchor::{SourceAnchor as DifferentName, *},",
+        1,
+    );
+    changed[3]
+        .1
+        .push_str("fn extra() { let read = DifferentName::r#capture; }");
+    assert!(self_read_policy(&changed).is_err());
 }
 
 #[test]
