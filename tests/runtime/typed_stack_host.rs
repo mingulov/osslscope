@@ -4,9 +4,10 @@
 use std::{
     any::Any,
     borrow::Borrow,
-    cell::RefCell,
+    cell::{RefCell, UnsafeCell},
     collections::{BTreeMap, BTreeSet},
     marker::PhantomData,
+    rc::Rc,
 };
 const BPF_NOEXIST: u64 = 1;
 const LOSS_CHARGE: u32 = 0;
@@ -24,7 +25,14 @@ const COOKIE: u64 = 0x8000_0001;
 type CellKey = (&'static str, Vec<u8>);
 #[derive(Default)]
 struct State {
-    rows: BTreeMap<CellKey, Box<dyn Any>>,
+    // Shared ownership keeps moving map entries from reborrowing their values
+    // exclusively. Every row is an UnsafeCell<V>; access uses only its raw
+    // pointer, never an &mut V that could invalidate another live handle.
+    rows: BTreeMap<CellKey, Rc<dyn Any>>,
+    // Model deferred map reclamation: removed/replaced rows lose visibility
+    // immediately but live until reset, after the previous case's handles have
+    // expired. No handle or reference may be used across reset.
+    retired: Vec<Rc<dyn Any>>,
     events: Vec<String>,
     gets: BTreeMap<&'static str, usize>,
     gate: bool,
@@ -64,14 +72,19 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
     }
     fn set(&self, key: K, value: V) {
         edit(|s| {
-            s.rows.insert((self.name, bytes(&key)), Box::new(value));
+            if let Some(previous) = s
+                .rows
+                .insert((self.name, bytes(&key)), Rc::new(UnsafeCell::new(value)))
+            {
+                s.retired.push(previous);
+            }
         });
     }
     fn peek(&self, key: K) -> Option<V> {
         edit(|s| {
             s.rows
                 .get(&(self.name, bytes(&key)))
-                .map(|v| *v.downcast_ref::<V>().unwrap())
+                .map(|v| unsafe { *v.downcast_ref::<UnsafeCell<V>>().unwrap().get() })
         })
     }
     fn get_ptr_mut(&self, key: impl Borrow<K>) -> Option<*mut V> {
@@ -88,16 +101,24 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
             s.events.push(event);
             if self.name == "domain" && count == 2 {
                 if s.retire_on_second_resolution {
-                    row_mut::<SourceDomain>(s, "domain", bytes(&77u32)).state = DOMAIN_RETIRED;
+                    unsafe {
+                        (*row_ptr::<SourceDomain>(s, "domain", bytes(&77u32))).state =
+                            DOMAIN_RETIRED;
+                    }
                 }
                 if let Some(mode) = s.mode_on_second_resolution {
-                    row_mut::<ProducerControl>(s, "control", bytes(&0u32)).producer_mode = mode;
+                    unsafe {
+                        (*row_ptr::<ProducerControl>(s, "control", bytes(&0u32))).producer_mode =
+                            mode;
+                    }
                 }
             }
             if self.name == "control" && count == 2 && s.advance_code_on_second_resolution {
                 // Publication happens after root READY, before the handler
                 // can accidentally take a fresh sequence for re-resolution.
-                row_mut::<SourceControl>(s, "state", bytes(&0u32)).published_sequence = 20;
+                unsafe {
+                    (*row_ptr::<SourceControl>(s, "state", bytes(&0u32))).published_sequence = 20;
+                }
                 let mut code = blank_rel();
                 code.state = REL_CERTIFIED;
                 code.witness_id = 53;
@@ -108,38 +129,49 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
                 code.data[6] = 20;
                 assert!(s
                     .rows
-                    .insert(("rel", bytes(&late_code_key())), Box::new(code))
+                    .insert(
+                        ("rel", bytes(&late_code_key())),
+                        Rc::new(UnsafeCell::new(code))
+                    )
                     .is_none());
             }
             if self.name == "thread" && s.mutate_admission_on_thread {
                 // Deliberately stronger than immutable configuration: a
                 // differential probe for accidental post-helper rereads.
-                row_mut::<TypedAdmission>(s, "admission", bytes(&site_key())).role_id = 308;
+                unsafe {
+                    (*row_ptr::<TypedAdmission>(s, "admission", bytes(&site_key()))).role_id = 308;
+                }
             }
             if self.name == "bind" && s.mutate_admission_on_bind {
                 // A stronger immutable-row mutation probe: root must retain
                 // the role/operation/function snapshot taken before this call.
-                let row = row_mut::<TypedAdmission>(s, "admission", bytes(&site_key()));
-                row.role_id = 308;
-                row.operation = 99;
-                row.function = 99;
+                let row = row_ptr::<TypedAdmission>(s, "admission", bytes(&site_key()));
+                unsafe {
+                    (*row).role_id = 308;
+                    (*row).operation = 99;
+                    (*row).function = 99;
+                }
             }
             if self.name == "thread" && s.mutate_method_on_thread {
                 // Stronger than immutable witness fields; tests that callers
                 // use validated scalar snapshots rather than deferred rereads.
-                let row = row_mut::<RelValue>(s, "rel", bytes(&literal_method_key()));
-                row.witness_id = 91;
-                row.parent_id = 92;
+                let row = row_ptr::<RelValue>(s, "rel", bytes(&literal_method_key()));
+                unsafe {
+                    (*row).witness_id = 91;
+                    (*row).parent_id = 92;
+                }
             }
             if s.miss == Some((self.name, count)) {
                 return None;
             }
             s.rows
-                .get_mut(&(self.name, bytes(key)))
-                .map(|v| v.downcast_mut::<V>().unwrap() as *mut V)
+                .get(&(self.name, bytes(key)))
+                .map(|v| v.downcast_ref::<UnsafeCell<V>>().unwrap().get())
         })
     }
     unsafe fn get(&self, key: impl Borrow<K>) -> Option<&'static V> {
+        // Like the production unsafe map API, the caller must not retain this
+        // reference across a mutation of the value or the case's reset.
         self.get_ptr_mut(key).map(|p| unsafe { &*p })
     }
     fn insert(&self, key: impl Borrow<K>, value: impl Borrow<V>, flags: u64) -> Result<(), i64> {
@@ -173,26 +205,26 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
             if s.rows.contains_key(&key) {
                 return Err(-17);
             }
-            s.rows.insert(key, Box::new(*value));
+            s.rows.insert(key, Rc::new(UnsafeCell::new(*value)));
             Ok(())
         })
     }
     fn remove(&self, key: impl Borrow<K>) -> Result<(), i64> {
         edit(|s| {
             s.events.push(format!("remove:{}", self.name));
-            s.rows
-                .remove(&(self.name, bytes(key.borrow())))
-                .ok_or(-1)
-                .map(|_| ())
+            let removed = s.rows.remove(&(self.name, bytes(key.borrow()))).ok_or(-1)?;
+            s.retired.push(removed);
+            Ok(())
         })
     }
 }
-fn row_mut<'a, V: 'static>(s: &'a mut State, name: &'static str, key: Vec<u8>) -> &'a mut V {
+fn row_ptr<V: 'static>(s: &State, name: &'static str, key: Vec<u8>) -> *mut V {
     s.rows
-        .get_mut(&(name, key))
+        .get(&(name, key))
         .unwrap()
-        .downcast_mut()
+        .downcast_ref::<UnsafeCell<V>>()
         .unwrap()
+        .get()
 }
 static ATTRIB_CONTROL: Map<u32, ProducerControl> = Map::new("control");
 static ATTR_STATE: Map<u32, SourceControl> = Map::new("state");
@@ -234,9 +266,8 @@ unsafe fn exchange(p: *mut u64, v: u64) {
 }
 unsafe fn host_cxchg(p: *mut u64, old: u64, new: u64) -> (u64, bool) {
     let failed = edit(|s| {
-        let state = row_mut::<SourceControl>(s, "state", bytes(&0u32)) as *mut SourceControl;
-        let control =
-            row_mut::<ProducerControl>(s, "control", bytes(&0u32)) as *mut ProducerControl;
+        let state = row_ptr::<SourceControl>(s, "state", bytes(&0u32));
+        let control = row_ptr::<ProducerControl>(s, "control", bytes(&0u32));
         if p == unsafe { addr_of_mut!((*state).pending_claims) } {
             let claim = new > old;
             s.events.push(if claim { "claim" } else { "refund" }.into());
@@ -1009,6 +1040,9 @@ fn initialization_controls() {
     case("poisoned 304 bytes and actual key-only NOEXIST leaf");
 }
 fn main() {
+    retained_helper_handles();
+    retained_lookup_handles();
+    retired_row_handles();
     initialization_controls();
     packed_role_controls();
     staging_controls();
@@ -1016,6 +1050,80 @@ fn main() {
     parent_controls();
     method_and_failure_controls();
     println!("ALL PRODUCTION ENTRY CONTROLS PASSED");
+}
+
+fn retained_helper_handles() {
+    reset(130, 3, 0, 12);
+    clear_events();
+    let state = ATTR_STATE.get_ptr_mut(0).unwrap();
+    let control = ATTRIB_CONTROL.get_ptr_mut(0).unwrap();
+    unsafe {
+        assert_eq!(
+            host_cxchg(addr_of_mut!((*state).pending_claims), 2, 3),
+            (2, true)
+        );
+        assert_eq!((*state).pending_claims, 3);
+        assert_eq!(
+            host_cxchg(addr_of_mut!((*control).next_producer_id), 41, 42),
+            (41, true)
+        );
+        assert_eq!((*control).next_producer_id, 42);
+        // Use both retained handles after both helpers have looked up both rows.
+        (*state).pending_claims = 4;
+        (*control).next_producer_id = 43;
+    }
+    assert_eq!(claims(), 4);
+    assert_eq!(ATTRIB_CONTROL.peek(0).unwrap().next_producer_id, 43);
+    assert_eq!(events(), ["get:state", "get:control", "claim", "id"]);
+    case("retained state/control handles survive actual atomic helper lookups");
+}
+
+fn retained_lookup_handles() {
+    reset(130, 3, 0, 12);
+    clear_events();
+    let first = ATTR_STATE.get_ptr_mut(0).unwrap();
+    let second = ATTR_STATE.get_ptr_mut(0).unwrap();
+    unsafe {
+        (*second).pending_claims = 3;
+        assert_eq!((*first).pending_claims, 3);
+        (*first).pending_claims = 4;
+        assert_eq!((*second).pending_claims, 4);
+    }
+    assert_eq!(claims(), 4);
+    assert_eq!(events(), ["get:state", "get:state"]);
+    case("repeated map lookup preserves both raw handles for reads and writes");
+}
+
+fn retired_row_handles() {
+    reset(130, 3, 0, 12);
+    let mut value = blank_frame();
+    value.occurrence_id = 111;
+    BIND_PENDING.set(pending_key(0), value);
+    let replaced = BIND_PENDING.get_ptr_mut(pending_key(0)).unwrap();
+    value.occurrence_id = 222;
+    BIND_PENDING.set(pending_key(0), value);
+    let removed = BIND_PENDING.get_ptr_mut(pending_key(0)).unwrap();
+    unsafe {
+        assert_eq!((*replaced).occurrence_id, 111);
+        (*replaced).occurrence_id = 333;
+        assert_eq!((*removed).occurrence_id, 222);
+    }
+    BIND_PENDING.remove(pending_key(0)).unwrap();
+    assert!(BIND_PENDING.get_ptr_mut(pending_key(0)).is_none());
+    value.occurrence_id = 666;
+    BIND_PENDING.set(pending_key(0), value);
+    unsafe {
+        (*replaced).occurrence_id = 444;
+        (*removed).occurrence_id = 555;
+        assert_eq!((*replaced).occurrence_id, 444);
+        assert_eq!((*removed).occurrence_id, 555);
+    }
+    assert_eq!(
+        BIND_PENDING.peek(pending_key(0)).unwrap().occurrence_id,
+        666
+    );
+    assert_eq!(count_frames(), 1);
+    case("replaced and removed rows stay allocated without remaining map-visible");
 }
 
 fn late_code_key() -> RelKey {
