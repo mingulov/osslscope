@@ -332,11 +332,339 @@ fn rust_sources(root: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn userspace_target_memory_reads_are_pinned() {
+// These source pins are review boundaries, not a general static analyzer. Every
+// new read, alias or changed owner/caller requires a fresh privacy review.
+// Literals are atomic tokens: comments and raw strings cannot impersonate code.
+fn privacy_tokens(source: &str) -> Result<Vec<String>, String> {
+    let b = source.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        if b[i..].starts_with(b"//") {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if b[i..].starts_with(b"/*") {
+            i += 2;
+            let mut depth = 1;
+            while i < b.len() && depth > 0 {
+                if b[i..].starts_with(b"/*") {
+                    depth += 1;
+                    i += 2;
+                } else if b[i..].starts_with(b"*/") {
+                    depth -= 1;
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            if depth != 0 {
+                return Err("unclosed comment".into());
+            }
+            continue;
+        }
+        let start = i;
+        // Raw strings, including byte/C prefixes. Preserve the literal as one
+        // token, including hashes and its contents; never extract code from it.
+        let raw = if b[i..].starts_with(b"br") || b[i..].starts_with(b"cr") {
+            Some(i + 2)
+        } else if b[i] == b'r' {
+            Some(i + 1)
+        } else {
+            None
+        };
+        if let Some(mut quote) = raw {
+            let hashes_start = quote;
+            while quote < b.len() && b[quote] == b'#' {
+                quote += 1;
+            }
+            if quote < b.len() && b[quote] == b'"' {
+                let hashes = quote - hashes_start;
+                i = quote + 1;
+                loop {
+                    if i >= b.len() {
+                        return Err("unclosed raw string".into());
+                    }
+                    if b[i] == b'"'
+                        && b.get(i + 1..i + 1 + hashes)
+                            .is_some_and(|s| s.iter().all(|x| *x == b'#'))
+                    {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.push(source[start..i].to_string());
+                continue;
+            }
+        }
+        if b[i] == b'"' {
+            i += 1;
+            loop {
+                if i >= b.len() {
+                    return Err("unclosed string".into());
+                }
+                if b[i] == b'"' {
+                    i += 1;
+                    break;
+                }
+                if b[i] == b'\\' {
+                    i += 1;
+                }
+                i += 1;
+            }
+        } else if b[i] == b'\'' && b.get(i + 1) == Some(&b'\\') {
+            i += 2;
+            while i < b.len() && b[i] != b'\'' {
+                i += 1;
+            }
+            if i == b.len() {
+                return Err("unclosed character".into());
+            }
+            i += 1;
+        } else if b[i] == b'\''
+            && source[i + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| b.get(i + 1 + c.len_utf8()) == Some(&b'\''))
+        {
+            i += 2 + source[i + 1..].chars().next().unwrap().len_utf8();
+        } else if b[i].is_ascii_alphanumeric() || b[i] == b'_' {
+            i += 1;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                i += 1;
+            }
+        } else {
+            i += source[i..].chars().next().unwrap().len_utf8();
+        }
+        out.push(source[start..i].to_string());
+    }
+    Ok(out)
+}
+
+fn reviewed_region(tokens: &[String], marker: &str) -> Result<Vec<String>, String> {
+    let needle = privacy_tokens(marker)?;
+    let starts: Vec<_> = tokens
+        .windows(needle.len())
+        .enumerate()
+        .filter_map(|(i, w)| (w == needle).then_some(i))
+        .collect();
+    if starts.len() != 1 {
+        return Err(format!("ambiguous/missing owner: {marker}"));
+    }
+    let start = starts[0];
+    if marker.starts_with("const ") {
+        let end = (start..tokens.len())
+            .find(|i| tokens[*i] == ";")
+            .ok_or_else(|| format!("unterminated constant: {marker}"))?;
+        return Ok(tokens[start..=end].to_vec());
+    }
+    let open = (start..tokens.len())
+        .find(|i| tokens[*i] == "{")
+        .ok_or_else(|| format!("missing body: {marker}"))?;
+    let mut depth = 0;
+    for i in open..tokens.len() {
+        if tokens[i] == "{" {
+            depth += 1;
+        }
+        if tokens[i] == "}" {
+            depth -= 1;
+        }
+        if depth == 0 {
+            return Ok(tokens[start..=i].to_vec());
+        }
+    }
+    Err(format!("unclosed body: {marker}"))
+}
+
+// Frozen SHA256 of token sequences reviewed with their caller provenance.
+// Deliberately literal, never derived from the source being checked at runtime.
+// Backing fault has a caller-derived within-page index, not a local bounds
+// guard. Its two one-byte copies are finite but not separately read-charged.
+const SELF_READ_PINS: &[(&str, &str, &str)] = &[
+    (
+        "src/inventory/backing.rs",
+        "struct SelfMap",
+        "67d0184be0bb4266a25b5f84a963cc51eb4038671202a3ae7e5795b8d717e47e",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "impl SelfMap",
+        "0232b59cbdb68ac025c565559890e42ecca0125a94b93eb098ad5d4ea78c1691",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "impl Drop for SelfMap",
+        "cd691481f1c3696f92eb7f9fa0f39c731e12e6b838d61771bd001045c3797e11",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn page_size",
+        "f2aac211ff7ae948c50aa39714b9e762cd7809e2a7bf2546691d9f636d19bf1e",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn candidate_identity",
+        "b09c2d188e4eaa927868effe342ee960cecc9cd93e0ac1c7c4beb24b784efe53",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn verify_witness",
+        "e4b4015aa4af6ee0f1153875c98f14552d3ba0edca83bc481f08b4c87ec25a71",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn verify_with_process_charged",
+        "eb47758cbfe8813705bc88585c6116231adea71abd1c940ab9516e5b5eb2dd67",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn revalidate_charged",
+        "a300636e003120b1c78cac817eb06c330396dcbd6b9c61fab1109e4f4a330c34",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn open_at",
+        "db9ab11c9f88b7eb0af15d66feaed3cc16413d9827e97fd019223b72635096e2",
+    ),
+    (
+        "src/inventory/backing.rs",
+        "fn open_layer_candidate",
+        "442d07747272a31fb88c6b6f939c27e3c6d70afd21e990e84645bcd1c2348c91",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "const HASH_CHUNK",
+        "d5851480744c8b8ccb43555d7b90ad1bdc9ac1c9b470c57df7b18e8bba990b98",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "struct SourceAnchor",
+        "24bbedb6c43ff9de54fc0a2cba0d2f5672b21bb439af499878bfc60d9e239384",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "impl SourceAnchor",
+        "27b0353d8345d13ea8db8bffd18075a647149b2ad4a0f6ff7c4d4d04d7bfdcd2",
+    ),
+    (
+        "src/provider_observation/source_anchor.rs",
+        "impl Drop for SourceAnchor",
+        "1feba8863aa1365fec54e010bac1af4fc1409d31c34f814a7ed705dc532f32eb",
+    ),
+    (
+        "src/provider_observation/objects.rs",
+        "const MAX_OBJECT",
+        "eda1bf857f603f80c7c7616414be9fe6baae93f5fceb58e9af8a04e6171d708f",
+    ),
+    (
+        "src/provider_observation/objects.rs",
+        "fn anchor ( & self , budget",
+        "fba73afbb672c74948d45d119b3a7a2cccb380175dd76856178f0b29fe8b613d",
+    ),
+    (
+        "src/provider_observation/source_owner.rs",
+        "fn anchor_source",
+        "1adf2a02cde1be073ac627ef78b9ef10d9a7562694bb6f66223e228b8529d652",
+    ),
+];
+
+fn self_read_policy(files: &[(String, String)]) -> Result<(), String> {
+    use sha2::Digest;
+    let mut census = Vec::new();
+    for (path, source) in files {
+        for forbidden in ["process_vm_writev", "PTRACE_PEEK", "pidfd_getfd"] {
+            if source.contains(forbidden) {
+                return Err(format!("{path}: forbidden {forbidden}"));
+            }
+        }
+        let tokens = privacy_tokens(source)?;
+        // Freeze capability references as well as syscall occurrences. A new
+        // caller of an unchanged fault method is not implicitly approved.
+        for (name, expected) in [
+            (
+                "SelfMap",
+                if path == "src/inventory/backing.rs" {
+                    7
+                } else {
+                    0
+                },
+            ),
+            (
+                "SourceAnchor",
+                match path.as_str() {
+                    "src/provider_observation/source_anchor.rs" => 7,
+                    "src/provider_observation/objects.rs" => 5,
+                    "src/provider_observation/source_owner.rs" => 7,
+                    _ => 0,
+                },
+            ),
+        ] {
+            if tokens.iter().filter(|s| *s == name).count() != expected {
+                return Err(format!("{path}: unreviewed {name} capability reference"));
+            }
+        }
+        let local_uses: &[(&str, usize)] = match path.as_str() {
+            "src/inventory/backing.rs" => &[("fault", 3), ("verify_witness", 3)],
+            "src/provider_observation/source_anchor.rs" => &[("digest", 6), ("capture", 5)],
+            _ => &[],
+        };
+        for &(name, expected) in local_uses {
+            if tokens.iter().filter(|s| *s == name).count() != expected {
+                return Err(format!("{path}: unreviewed {name} caller"));
+            }
+        }
+        for (i, token) in tokens.iter().enumerate() {
+            // All identifier uses count, including alias/import declarations.
+            if token == "process_vm_readv" {
+                let direct = i >= 3
+                    && tokens[i - 3..i] == ["libc", ":", ":"]
+                    && tokens.get(i + 1).is_some_and(|s| s == "(");
+                if !direct {
+                    return Err(format!("{path}: unreviewed read alias"));
+                }
+                census.push(path.as_str());
+            }
+        }
+    }
+    census.sort_unstable();
+    if census
+        != [
+            "src/inventory/backing.rs",
+            "src/provider_observation/source_anchor.rs",
+        ]
+    {
+        return Err(format!(
+            "exactly two reviewed self-read occurrences required: {census:?}"
+        ));
+    }
+    for &(path, marker, expected) in SELF_READ_PINS {
+        let sources: Vec<_> = files.iter().filter(|(p, _)| p == path).collect();
+        if sources.len() != 1 {
+            return Err(format!("ambiguous/missing source: {path}"));
+        }
+        let region = reviewed_region(&privacy_tokens(&sources[0].1)?, marker)?;
+        let actual = sha2::Sha256::digest(region.join("\n"))
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        if actual != expected {
+            return Err(format!("{path}: reviewed boundary changed: {marker}"));
+        }
+    }
+    Ok(())
+}
+
+fn privacy_sources() -> Vec<(String, String)> {
     let root = manifest_dir();
-    let mut files = Vec::new();
-    rust_sources(&root.join("src"), &mut files);
+    let mut paths = Vec::new();
+    rust_sources(&root.join("src"), &mut paths);
     for member in [
         "ossl-discover",
         "manifest",
@@ -346,40 +674,353 @@ fn userspace_target_memory_reads_are_pinned() {
     ] {
         let dir = root.join("crates").join(member).join("src");
         if dir.is_dir() {
-            rust_sources(&dir, &mut files);
+            rust_sources(&dir, &mut paths);
         }
     }
-    let mut readers = Vec::new();
-    for path in &files {
-        let text = fs::read_to_string(path).unwrap();
-        assert!(
-            !text.contains("process_vm_writev"),
-            "{}: target-memory writes forbidden",
-            path.display()
-        );
-        assert!(
-            !text.contains("PTRACE_PEEK") && !text.contains("pidfd_getfd"),
-            "{}: exotic target-memory reads forbidden",
-            path.display()
-        );
-        if text.contains("process_vm_readv(") {
-            readers.push(path.clone());
-        }
-    }
-    assert_eq!(
-        readers.len(),
-        1,
-        "exactly one userspace target-memory read site, found {readers:?}"
-    );
-    // T06 moved the single `pretouch_mappings` site from
-    // `harvest.rs` to `session.rs` with the live environment; the
-    // count stays exactly one and the documented behavior (fault
-    // pages in, sink the bytes) is unchanged.
+    paths
+        .into_iter()
+        .map(|p| {
+            (
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                fs::read_to_string(p).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn userspace_target_memory_reads_are_pinned() {
+    self_read_policy(&privacy_sources()).unwrap();
+}
+
+#[test]
+fn discovery_never_reads_target_environment_or_requests_pretouch() {
+    let text = fs::read_to_string(manifest_dir().join("src/discovery/session.rs")).unwrap();
+    let tokens = privacy_tokens(&text).unwrap();
     assert!(
-        readers[0].ends_with("src/discovery/session.rs"),
-        "unexpected read site: {}",
-        readers[0].display()
+        !tokens.iter().any(|s| s.contains("/environ")),
+        "target environ discovery is forbidden"
     );
+    assert!(
+        !tokens
+            .iter()
+            .any(|s| s == "pretouch" || s == "pretouch_mappings"),
+        "foreign pretouch capability must be removed"
+    );
+    let helper = reviewed_region(&tokens, "fn legacy_candidates").unwrap();
+    // Independently authored permitted dependency set: no target PID, ambient
+    // environment lookup, alternate helper or directory traversal can enter.
+    let expected = privacy_tokens(
+        r#"
+        fn legacy_candidates(libcrypto: &str) -> Vec<PathBuf> {
+            let mut out: Vec<PathBuf> = Vec::new();
+            let mut consider = |p: PathBuf| {
+                if p.is_file() && !out.contains(&p) { out.push(p); }
+            };
+            if let Some(dir) = Path::new(libcrypto).parent() {
+                consider(dir.join("ossl-modules").join("legacy.so"));
+            }
+            out
+        }
+    "#,
+    )
+    .unwrap();
+    assert_eq!(
+        helper, expected,
+        "candidate helper has unreviewed dependencies"
+    );
+    assert!(
+        !helper
+            .iter()
+            .any(|s| s == "env" || s == "var" || s == "var_os" || s.contains("OPENSSL_MODULES")),
+        "candidate discovery must not consult process environment"
+    );
+}
+
+fn reviewed_self_sources() -> Vec<(String, String)> {
+    [
+        "src/inventory/backing.rs",
+        "src/provider_observation/source_anchor.rs",
+        "src/provider_observation/objects.rs",
+        "src/provider_observation/source_owner.rs",
+    ]
+    .into_iter()
+    .map(|p| {
+        (
+            p.into(),
+            fs::read_to_string(manifest_dir().join(p)).unwrap(),
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn self_read_policy_rejects_provenance_bounds_lifetime_and_output_mutations() {
+    let clean = reviewed_self_sources();
+    self_read_policy(&clean).expect("independently pinned reviewed owners");
+    // Each stimulus changes one approved boundary; expected refusal is authored
+    // here, never computed by a second copy of the production read operation.
+    let cases = [
+        (0, "foreign PID", "libc::getpid()", "12345"),
+        (
+            0,
+            "foreign pointer",
+            "(self.address as *mut u8).add(index)",
+            "(target_address as *mut u8).add(index)",
+        ),
+        (
+            0,
+            "arbitrary self pointer",
+            "(self.address as *mut u8).add(index)",
+            "local_buffer.as_mut_ptr()",
+        ),
+        (0, "shared map", "libc::MAP_PRIVATE", "libc::MAP_SHARED"),
+        (0, "writable map", "libc::PROT_READ", "libc::PROT_WRITE"),
+        (0, "executable map", "libc::PROT_READ", "libc::PROT_EXEC"),
+        (
+            0,
+            "missing regular file check",
+            "if !metadata.is_file()",
+            "if false",
+        ),
+        (
+            0,
+            "unretained mapping source",
+            "candidate.as_raw_fd(),\n                offset",
+            "foreign_fd,\n                offset",
+        ),
+        (
+            0,
+            "offset bound",
+            "file_offset >= candidate_fp.size",
+            "false",
+        ),
+        (
+            0,
+            "within-page bound",
+            "file_offset - aligned",
+            "file_offset",
+        ),
+        (0, "larger fault", "iov_len: 1,", "iov_len: 2,"),
+        (0, "short copy accepted", "if copied == 1", "if copied >= 0"),
+        (
+            0,
+            "capacity reduced",
+            "page_bytes.checked_mul(2)",
+            "page_bytes.checked_mul(0)",
+        ),
+        (
+            0,
+            "checkpoint removed",
+            "budget.checkpoint()?;\n        let page = page_size()?;",
+            "let page = page_size()?;",
+        ),
+        (
+            0,
+            "fault byte output",
+            "if copied == 1",
+            "eprintln!(\"{}\", byte); if copied == 1",
+        ),
+        (
+            0,
+            "mapping cleanup removed",
+            "libc::munmap(self.address, self.length);",
+            "",
+        ),
+        (1, "anchor foreign PID", "libc::getpid()", "12345"),
+        (
+            1,
+            "anchor pointer",
+            "self.address.as_ptr() as usize",
+            "target_address as usize",
+        ),
+        (
+            1,
+            "anchor shared map",
+            "libc::MAP_PRIVATE",
+            "libc::MAP_SHARED",
+        ),
+        (
+            1,
+            "anchor writable map",
+            "libc::PROT_READ",
+            "libc::PROT_WRITE",
+        ),
+        (
+            1,
+            "anchor executable map",
+            "libc::PROT_READ",
+            "libc::PROT_EXEC",
+        ),
+        (1, "anchor regular file", "!metadata.is_file()", "false"),
+        (
+            1,
+            "anchor remaining bound",
+            "HASH_CHUNK.min(self.length - offset)",
+            "HASH_CHUNK",
+        ),
+        (
+            1,
+            "anchor overflow bound",
+            ".checked_add(offset)",
+            ".checked_add(0)",
+        ),
+        (1, "anchor chunk enlarged", "16 << 10", "32 << 10"),
+        (
+            1,
+            "anchor state reservation",
+            "budget.reserve_state(capacity)?",
+            "budget.reserve_state(0)?",
+        ),
+        (
+            1,
+            "anchor scratch reservation",
+            "budget.reserve_state(HASH_CHUNK)?",
+            "budget.reserve_state(0)?",
+        ),
+        (
+            1,
+            "anchor read charge",
+            "budget.read(self.length as u64)?;",
+            "",
+        ),
+        (
+            1,
+            "anchor checkpoint",
+            "while offset < self.length {\n            budget.checkpoint()?;",
+            "while offset < self.length {",
+        ),
+        (
+            1,
+            "anchor short read",
+            "if copied != length as isize",
+            "if copied < 0",
+        ),
+        (
+            1,
+            "anchor bytes output",
+            "hash.update(&bytes[..length]);",
+            "eprintln!(\"{:?}\", bytes); hash.update(&bytes[..length]);",
+        ),
+        (
+            1,
+            "anchor hash acceptance",
+            "if &anchor.digest(budget, &scratch)? != expected",
+            "if false",
+        ),
+        (
+            1,
+            "anchor retained fd",
+            "_file: owned,",
+            "_file: other_file,",
+        ),
+        (
+            1,
+            "anchor cleanup",
+            "libc::munmap(self.address.as_ptr(), self.length);",
+            "",
+        ),
+        (
+            1,
+            "anchor reuse stamp",
+            "Stamp::of(&current) == self.stamp",
+            "true",
+        ),
+        (2, "object length cap", "134_217_728", "268_435_456"),
+        (2, "admission unchanged check", "self.unchanged()?;", ""),
+        (
+            3,
+            "reuse proof",
+            "shared.verifies_against(&scope.target, &scope.expected_artifact)",
+            "true",
+        ),
+        (
+            3,
+            "admitted artifact",
+            "&scope.expected_artifact,\n                budget",
+            "&other_artifact,\n                budget",
+        ),
+    ];
+    for (index, label, from, to) in cases {
+        let mut changed = clean.clone();
+        assert!(changed[index].1.contains(from), "fixture missing {label}");
+        changed[index].1 = changed[index].1.replacen(from, to, 1);
+        assert!(self_read_policy(&changed).is_err(), "accepted {label}");
+    }
+    assert_eq!(cases.len(), 39);
+}
+
+#[test]
+fn self_read_census_rejects_duplicates_aliases_and_literal_camouflage() {
+    let clean = reviewed_self_sources();
+    self_read_policy(&clean).unwrap();
+    for extra in [
+        "fn extra() { libc::process_vm_readv(libc::getpid(), &local, 1, &remote, 1, 0); }",
+        "use libc::process_vm_readv as read_memory; fn extra() { read_memory(42, p); }",
+        "fn extra() { libc :: process_vm_readv \n (42, p); }",
+    ] {
+        for index in [0, 1] {
+            let mut changed = clean.clone();
+            changed[index].1.push_str(extra);
+            assert!(
+                self_read_policy(&changed).is_err(),
+                "extra call/alias in allowed owner"
+            );
+        }
+        let mut changed = clean.clone();
+        changed.push(("src/extra.rs".into(), extra.into()));
+        assert!(self_read_policy(&changed).is_err(), "extra file");
+    }
+    // Literal/comment mentions neither add calls nor impersonate reviewed
+    // definitions. The clean owners are still required for this positive.
+    let mut mentions = clean.clone();
+    mentions[0].1.push_str("\n/* outer /* libc::process_vm_readv() */ comment */\nconst TEXT: &str = r###\"libc::process_vm_readv() { impl SelfMap {} }\"###;\n");
+    self_read_policy(&mentions).unwrap();
+    for wrap in [0, 1] {
+        let mut changed = clean.clone();
+        changed[0].1 = if wrap == 0 {
+            format!("/* {} */", changed[0].1)
+        } else {
+            format!("const TEXT: &str = r########\"{}\"########;", changed[0].1)
+        };
+        assert!(
+            self_read_policy(&changed).is_err(),
+            "comment/raw string grants no permission"
+        );
+    }
+    for alias in ["read_memory", "process_vm_ readv"] {
+        let mut changed = clean.clone();
+        changed[0].1 = changed[0].1.replace("process_vm_readv", alias);
+        assert!(
+            self_read_policy(&changed).is_err(),
+            "renamed/split read must fail closed"
+        );
+    }
+    for (index, extra) in [
+        (0, "fn extra(mapping: &SelfMap) { mapping.fault(4096); }"),
+        (0, "fn extra(mapping: &impl Trait) { mapping.fault(4096); }"),
+        (
+            1,
+            "fn extra(anchor: &impl Trait) { anchor.digest(budget, scratch); }",
+        ),
+        (
+            3,
+            "fn extra() { SourceAnchor::capture(file, expected, budget); }",
+        ),
+    ] {
+        let mut changed = clean.clone();
+        changed[index].1.push_str(extra);
+        assert!(self_read_policy(&changed).is_err(), "unreviewed caller");
+    }
+    // Whitespace around punctuation is harmless when provenance is unchanged.
+    let mut spaced = clean.clone();
+    spaced[0].1 = spaced[0]
+        .1
+        .replace("libc::process_vm_readv(", "libc :: process_vm_readv \n (");
+    self_read_policy(&spaced).unwrap();
 }
 
 #[test]

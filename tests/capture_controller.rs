@@ -8368,8 +8368,6 @@ impl SessionEnv for LiveMapsNoBpfEnv {
         );
     }
 
-    fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
-
     fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
         Ok(())
     }

@@ -587,9 +587,6 @@ pub trait SessionEnv {
     /// libcrypto is not mapped (blind — the core retries on later
     /// polls as mappings appear).
     fn plan_trips(&mut self, maps: &[maps::Mapping]) -> anyhow::Result<Option<legacy::ProbeSet>>;
-    /// Best-effort page fault-in after a repeat init (cold reload
-    /// pages make nofault BPF reads abort the walk).
-    fn pretouch(&mut self, cookie: u64, addr: u64);
     /// Evict one array's kernel walker state (`TERMD` proof and
     /// `QUERY_NEXT` cursors) after its incarnation retired, so stale
     /// proofs and mid-array cursors cannot satisfy the next
@@ -2622,10 +2619,8 @@ impl SessionCore {
                     if self.attached_queries.contains(&cookie)
                         && self.attached_targets.get(&cookie) == Some(&target)
                     {
-                        // Same callback on the same bytes: the
-                        // install stands; fault the cold pages back
-                        // in (best-effort).
-                        env.pretouch(cookie, addr);
+                        // Same callback on the same bytes: the install
+                        // stands. Nofault read failures remain explicit gaps.
                         continue;
                     }
                     // F-D/A11: superseding install — the same
@@ -2656,7 +2651,6 @@ impl SessionCore {
                             self.attached_queries.insert(cookie);
                             self.attached_targets.insert(cookie, target);
                             self.attach_failures.remove(&cookie);
-                            env.pretouch(cookie, addr);
                             delta.attaches.push(AttachEvent {
                                 kind: AttachKind::Stage2 { cookie },
                                 failed: None,
@@ -2743,7 +2737,6 @@ impl SessionCore {
                             self.attached_queries.insert(cookie);
                             self.attached_targets.insert(cookie, target);
                             self.attach_failures.remove(&cookie);
-                            env.pretouch(cookie, queued.addr);
                             delta.attaches.push(AttachEvent {
                                 kind: AttachKind::Stage2 { cookie },
                                 failed: None,
@@ -4339,87 +4332,16 @@ fn populate_jump_table(loaded: &Loaded) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Fault in the provider file's mapped pages (best-effort, one byte
-/// per page via process_vm_readv). BPF probe reads are nofault: a
-/// query whose alg tables were never touched aborts the walk even
-/// though the table is valid. Failures only degrade to abort-retry
-/// + loud TRUNC, never to silence.
-fn pretouch_mappings(pid: u32, live: &[maps::Mapping], path: &Path, canon: &str) {
-    let arg = path.to_string_lossy();
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
-    let mut pages: Vec<u64> = Vec::new();
-    for m in live {
-        if m.ino == 0
-            || !(m.path == arg || m.path == canon || (!canon.is_empty() && m.path.ends_with(canon)))
-        {
-            continue;
-        }
-        let mut p = m.start & !(page - 1);
-        while p < m.end {
-            pages.push(p);
-            p += page;
-        }
-    }
-    if pages.is_empty() {
-        return;
-    }
-    // One local byte per remote page; chunk under UIO_MAXIOV (1024).
-    let mut sink = vec![0u8; pages.len().min(1000)];
-    for chunk in pages.chunks(1000) {
-        sink.resize(chunk.len(), 0);
-        let local = libc::iovec {
-            iov_base: sink.as_mut_ptr() as *mut libc::c_void,
-            iov_len: chunk.len(),
-        };
-        let remote: Vec<libc::iovec> = chunk
-            .iter()
-            .map(|p| libc::iovec {
-                iov_base: *p as *mut libc::c_void,
-                iov_len: 1,
-            })
-            .collect();
-        let n = unsafe {
-            libc::process_vm_readv(
-                pid as libc::pid_t,
-                &local,
-                1,
-                remote.as_ptr(),
-                remote.len() as libc::c_ulong,
-                0,
-            )
-        };
-        if n < 0 && debug_session() {
-            eprintln!(
-                "HARVESTDBG pretouch pid={pid} pages={} err={}",
-                chunk.len(),
-                std::io::Error::last_os_error()
-            );
-        }
-    }
-}
-
-/// Candidate legacy.so paths for pre-mapping init attach: the
-/// target's OPENSSL_MODULES dir plus libcrypto's ossl-modules dir
-/// (existing files only; whichever loads fires the cookie-1 init).
-fn legacy_candidates(pid: u32, libcrypto: &str) -> Vec<PathBuf> {
+/// Candidate legacy.so path for pre-mapping init attach: only the existing
+/// libcrypto-relative ossl-modules directory. Target and observer environments
+/// are not discovery inputs; an absent candidate leaves init coverage unknown.
+fn legacy_candidates(libcrypto: &str) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     let mut consider = |p: PathBuf| {
         if p.is_file() && !out.contains(&p) {
             out.push(p);
         }
     };
-    if let Ok(env) = std::fs::read(format!("/proc/{pid}/environ")) {
-        for kv in env.split(|b| *b == 0) {
-            if let Some(v) = kv
-                .strip_prefix(b"OPENSSL_MODULES=")
-                .and_then(|v| std::str::from_utf8(v).ok())
-            {
-                for dir in v.split(':') {
-                    consider(PathBuf::from(dir).join("legacy.so"));
-                }
-            }
-        }
-    }
     if let Some(dir) = Path::new(libcrypto).parent() {
         consider(dir.join("ossl-modules").join("legacy.so"));
     }
@@ -4961,7 +4883,7 @@ impl SessionEnv for LiveEnv {
         eprintln!("INSPECT stage=legacy trips={}", set.probes.len());
         let mut note = None;
         if let Some(lc_path) = legacy::find_libcrypto(maps) {
-            for cand in legacy_candidates(pid, &lc_path) {
+            for cand in legacy_candidates(&lc_path) {
                 // Pin-first per candidate (H4): offsets resolve
                 // against the OPEN file and the pair binds through
                 // its fd-path. Unopenable candidates skip silently
@@ -5091,24 +5013,6 @@ impl SessionEnv for LiveEnv {
                 .push(format!("unreadable module: {path} (imports unknown)"));
         }
         Ok(Some(set))
-    }
-
-    fn pretouch(&mut self, cookie: u64, addr: u64) {
-        // Re-pretouch on repeat inits (unload/reload cycles): the
-        // new mapping's pages are cold and nofault BPF reads fail
-        // on them. Best-effort, never fatal.
-        if let Ok(live) = maps::read_maps(self.pid) {
-            let path = if cookie == harvest::LEGACY_COOKIE {
-                live.iter()
-                    .find(|m| m.start <= addr && addr < m.end && m.ino != 0)
-                    .map(|m| PathBuf::from(&m.path))
-            } else {
-                Some(self.provider.clone())
-            };
-            if let Some(p) = path {
-                pretouch_mappings(self.pid, &live, &p, &self.canon);
-            }
-        }
     }
 
     fn evict_array_state(&mut self, arr: u64) -> anyhow::Result<()> {
@@ -5840,6 +5744,45 @@ pub(crate) use tests::{w079_bootstrap_pin_boundary, w079_stage2_pin_boundary};
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn legacy_candidates_are_only_existing_libcrypto_relative_files() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        struct OwnedDirectory(PathBuf);
+        impl Drop for OwnedDirectory {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let root = std::env::temp_dir().join(format!(
+            "osslscope-legacy-candidate-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let fixture = OwnedDirectory(root);
+        std::fs::create_dir(fixture.0.join("ossl-modules")).unwrap();
+        std::fs::create_dir(fixture.0.join("custom-modules")).unwrap();
+        std::fs::write(fixture.0.join("custom-modules/legacy.so"), b"unselected").unwrap();
+        let locator = fixture.0.join("libcrypto.so.3");
+        std::fs::write(&locator, b"locator").unwrap();
+        assert!(legacy_candidates(locator.to_str().unwrap()).is_empty());
+        let expected = fixture.0.join("ossl-modules/legacy.so");
+        std::fs::write(&expected, b"candidate").unwrap();
+        assert_eq!(
+            legacy_candidates(locator.to_str().unwrap()),
+            vec![expected.clone()]
+        );
+        std::fs::remove_file(&expected).unwrap();
+        std::fs::create_dir(&expected).unwrap();
+        assert!(
+            legacy_candidates(locator.to_str().unwrap()).is_empty(),
+            "directory is not a module file"
+        );
+    }
+
     pub(crate) fn w079_stage2_pin_boundary(
         links: &SetupLinks,
         control: &SetupControl,
@@ -6867,8 +6810,6 @@ mod tests {
             self.plan_calls += 1;
             Ok(self.plan.clone())
         }
-
-        fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
 
         fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
             Ok(())

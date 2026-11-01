@@ -338,8 +338,6 @@ impl SessionEnv for TestEnv {
         Ok(self.probe_set.clone())
     }
 
-    fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
-
     fn evict_array_state(&mut self, arr: u64) -> anyhow::Result<()> {
         if self.evict_fail {
             anyhow::bail!("injected evict failure");
@@ -704,7 +702,7 @@ fn no_query_can_retry() {
     assert!(snap.dispatch.reloads.contains(&(0, 1)));
 
     // A repeat init at a MOVED callback re-attaches (no stale
-    // offset), while a same-target repeat only faults pages in.
+    // offset), while a same-target repeat keeps the existing attachment.
     // F-D/A11: the superseding install detaches the old link
     // (no leak, no duplicate cookie) and carries a continuity
     // signal alongside the install report.
@@ -964,6 +962,47 @@ fn legacy_links_live_until_close() {
     assert_eq!((snap.links_live.dispatch, snap.links_live.tripwire), (0, 0));
     assert_eq!(env.link_counts(), (0, 0));
     assert!(core.poll(&mut env, ample_budget()).is_err());
+}
+
+#[test]
+fn nofault_read_failure_stays_a_gap_after_later_valid_rows() {
+    use osslscope::discovery::session::CoverageState;
+    let mut env = TestEnv::new();
+    let mut core = test_core(false);
+    let arr = 0x7f00_1000;
+    env.push(query_ret(OP_DIGEST, arr, 0));
+    env.staged.trunc = vec![(OP_DIGEST, wire::TRUNC_WALK_READ)];
+    env.staged.losses = vec![(wire::LOSS_GUARD_READ_ABORT, 1)];
+    let first = core.poll(&mut env, ample_budget()).unwrap();
+    assert!(first.candidates.is_empty());
+    assert_eq!(first.losses.len(), 1);
+    assert_eq!(first.losses[0].source, wire::LOSS_GUARD_READ_ABORT);
+    assert_eq!(first.losses[0].count, 1);
+    let snap = core.snapshot();
+    assert_eq!(snap.tables.len(), 1);
+    assert_eq!(
+        snap.tables[0].state,
+        CoverageState::InProgress { walked: 0 }
+    );
+    assert_eq!(snap.truncated_ops, vec![(OP_DIGEST, wire::TRUNC_WALK_READ)]);
+    assert!(snap.reasons.contains(&"truncated-walk".to_string()));
+
+    // A later readable slot contributes positive evidence, but neither a
+    // synthetic terminator nor an erased historical loss may be inferred.
+    env.push(query_ret(OP_DIGEST, arr, 0));
+    env.push(ok_alg(OP_DIGEST, arr, 0));
+    env.push(dispatch_row(OP_DIGEST, 7, 0x7f00_2000, arr, 0));
+    let next = core.poll(&mut env, ample_budget()).unwrap();
+    assert_eq!(next.candidates.len(), 1);
+    let snap = core.snapshot();
+    assert_eq!(
+        snap.tables[0].state,
+        CoverageState::InProgress { walked: 1 }
+    );
+    assert_eq!(losses_of(&snap)[&wire::LOSS_GUARD_READ_ABORT], 1);
+    assert_eq!(snap.truncated_ops, vec![(OP_DIGEST, wire::TRUNC_WALK_READ)]);
+    assert!(snap.reasons.contains(&"truncated-walk".to_string()));
+    assert!(snap.reasons.contains(&"prefix-walk".to_string()));
 }
 
 #[test]

@@ -129,11 +129,36 @@ input becomes `other`/unreadable plus counters and findings. There
 is no partial decode, no retained prefix, and no verbatim target
 string in any artifact, including debug logs.
 
-The only other userspace read from target address space is
-`pretouch_mappings`: one byte per mapped provider page, read only to
-fault pages in before nofault BPF walks. Those bytes land in a
-throwaway sink buffer and are never stored, classified, logged, or
-emitted.
+Userspace does not prefault target memory or read target process environments
+for provider discovery. Pre-mapping legacy discovery considers only an existing
+`ossl-modules/legacy.so` alongside the selected libcrypto. Missing init events
+and cold or unreadable public tables remain explicit gaps and may be retried;
+they do not establish absence or complete coverage.
+
+Two finite observer-self mapping operations use `process_vm_readv` for fault-safe
+access to retained backing files. Both read only owner-created, read-only,
+private, nonexecutable mappings in the observer's own address space:
+
+- Backing association maps one runtime page of a regular candidate file and
+  one page from its fresh descriptor re-resolution, reserving both pages first.
+  The caller derives a within-page index after checking the file offset. Each
+  mapping supplies exactly one byte to a discarded stack slot; only an exact
+  one-byte copy succeeds. These two bytes are not separately charged to the
+  backing read budget. Both mappings are unmapped when verification ends.
+- Source custody retains a regular file descriptor and its mapping, bounded
+  to a nonempty file of at most 128 MiB. Admission reserves page-rounded mapping
+  capacity, per-page overhead and a 16 KiB scratch buffer, charges the complete
+  read length and checks the deadline for each bounded chunk. Checked addresses
+  and exact copy lengths feed only SHA-256; the hash must match the admitted
+  artifact. Faults, short reads and truncation produce an explicit gap. Mapping,
+  descriptor and capacity reservations live with their owner and are released
+  together. Hash agreement proves byte custody, not provider execution.
+
+The two reviewed owner/caller boundaries are source-pinned. They do not permit
+arbitrary self pointers, application buffers, foreign PIDs or additional reads.
+Fault-safe copies avoid a possible SIGBUS on concurrent file truncation; they
+are not replaced with unchecked Rust loads. No scratch-zeroization guarantee
+is implied by releasing these buffers.
 
 Workload output routing (not capture): a spawned workload's
 stdout+stderr follow an explicit operator-chosen destination --

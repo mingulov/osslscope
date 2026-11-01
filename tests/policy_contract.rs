@@ -2135,7 +2135,6 @@ impl SessionEnv for ScriptEnv {
     fn plan_trips(&mut self, _maps: &[maps::Mapping]) -> anyhow::Result<Option<legacy::ProbeSet>> {
         Ok(self.plan.clone())
     }
-    fn pretouch(&mut self, _cookie: u64, _addr: u64) {}
     fn evict_array_state(&mut self, _arr: u64) -> anyhow::Result<()> {
         Ok(())
     }
