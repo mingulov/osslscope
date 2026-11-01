@@ -3320,7 +3320,7 @@ pub fn publish_bound_selector(
         return OUT_POISON;
     }
     // OBJECT_SELECTOR build. The plan digest at `[144..176)` is forwarded
-    // staging-to-staging into the value tail at `[120..152)` with a
+    // staging-to-staging into the value tail at `[128..160)` with a
     // forward copy (every read precedes its source's overwrite by
     // construction, so no read observes a clobbered byte); the value words
     // around it are zeroed in two parts, preserving the forwarded digest.
@@ -3328,23 +3328,49 @@ pub fn publish_bound_selector(
     // index below read the digest back from the published OBJECT row.
     // Keep overlapping staging views on one raw base: a fresh mutable
     // array borrow would invalidate the value pointer before its stores.
+    const DIGEST_BYTES: usize = 32;
+    const TAIL_OFFSET: usize = core::mem::offset_of!(RelValue, tail);
+    const VALUE_BYTES: usize = core::mem::size_of::<RelValue>();
+    const WORD_BYTES: usize = core::mem::size_of::<u64>();
+    const STAGING_BYTES: usize = core::mem::size_of::<osslscope_bpf_contract::source::SourceSlot>()
+        - core::mem::offset_of!(osslscope_bpf_contract::source::SourceSlot, staging);
+    const ZERO_FIRST_END: usize = TAIL_OFFSET / WORD_BYTES;
+    const ZERO_LAST_START: usize = (TAIL_OFFSET + DIGEST_BYTES) / WORD_BYTES;
+    const VALUE_WORDS: usize = VALUE_BYTES / WORD_BYTES;
+    const _: () = {
+        assert!(TAIL_OFFSET == 128 && VALUE_BYTES == 256 && STAGING_BYTES == 256);
+        assert!(DIGEST_BYTES == 32 && PLAN_DIGEST == 144 && WORD_BYTES == 8);
+        assert!(TAIL_OFFSET % WORD_BYTES == 0 && DIGEST_BYTES % WORD_BYTES == 0);
+        assert!(VALUE_BYTES % WORD_BYTES == 0 && VALUE_BYTES <= STAGING_BYTES);
+        assert!(TAIL_OFFSET + DIGEST_BYTES <= VALUE_BYTES);
+        assert!(PLAN_DIGEST + DIGEST_BYTES <= STAGING_BYTES);
+        assert!(
+            core::mem::align_of::<RelValue>()
+                <= core::mem::align_of::<osslscope_bpf_contract::source::SourceSlot>()
+        );
+        assert!(
+            core::mem::offset_of!(osslscope_bpf_contract::source::SourceSlot, staging)
+                % core::mem::align_of::<RelValue>()
+                == 0
+        );
+    };
     let staging_base = unsafe { addr_of_mut!((*slot).staging) };
     let value = staging_base.cast::<RelValue>();
     unsafe {
         let base = staging_base.cast::<u8>();
         let mut i = 0;
-        while i < 32 {
-            *base.add(120 + i) = *base.add(PLAN_DIGEST + i);
+        while i < DIGEST_BYTES {
+            *base.add(TAIL_OFFSET + i) = *base.add(PLAN_DIGEST + i);
             i += 1;
         }
         let words = staging_base.cast::<u64>();
         let mut w = 0;
-        while w < 15 {
+        while w < ZERO_FIRST_END {
             *words.add(w) = 0;
             w += 1;
         }
-        w = 19;
-        while w < 32 {
+        w = ZERO_LAST_START;
+        while w < VALUE_WORDS {
             *words.add(w) = 0;
             w += 1;
         }

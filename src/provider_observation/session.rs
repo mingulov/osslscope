@@ -4110,6 +4110,7 @@ mod tests {
         generated = generated.replace(atomic, "host_cxchg");
         generated.push_str(include_str!("../../tests/runtime/typed_bind_host.rs"));
         generated.push_str(include_str!("../../tests/runtime/typed_request_host.rs"));
+        generated.push_str(include_str!("../../tests/runtime/typed_bound_host.rs"));
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4197,6 +4198,26 @@ mod tests {
         assert!(
             controls.status.success(),
             "production request controls: {}",
+            String::from_utf8_lossy(&controls.stderr)
+        );
+        let listed = std::process::Command::new(&binary)
+            .args(["bound_controls::", "--list", "--format=terse"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let selected = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .filter(|line| line.ends_with(": test"))
+            .count();
+        assert_eq!(selected, 3, "complete bound publication controls");
+        let controls = std::process::Command::new(&binary)
+            .args(["bound_controls::", "--test-threads=1", "--nocapture"])
+            .output()
+            .unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&controls.stdout));
+        assert!(
+            controls.status.success(),
+            "production bound publication controls ({selected} selected): {}",
             String::from_utf8_lossy(&controls.stderr)
         );
     }
