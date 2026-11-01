@@ -3981,7 +3981,8 @@ mod tests {
     fn typed_bind_compiles_production_bodies_and_preserves_staging() {
         // Complete production definitions, including layout attributes. The
         // fixture doubles only maps, atomics and clock; hashing is the contract
-        // implementation. Root dispatch and other return roles are out of scope.
+        // implementation. Fetch/request bodies share the same map backing;
+        // root dispatch and the other return roles are out of scope.
         fn definition<'a>(source: &'a str, marker: &str) -> &'a str {
             assert_eq!(source.matches(marker).count(), 1, "ambiguous {marker}");
             let position = source.find(marker).unwrap();
@@ -4059,6 +4060,10 @@ mod tests {
             "retire_pending_x",
             "cleanup_pending_x",
             "release_frame",
+            "fetch_return",
+            "intern_request",
+            "publish_ambiguity",
+            "retire_row",
             "bind_prepare",
             "plan_store",
             "plan_load",
@@ -4104,6 +4109,7 @@ mod tests {
         assert_eq!(generated.matches(atomic).count(), 2);
         generated = generated.replace(atomic, "host_cxchg");
         generated.push_str(include_str!("../../tests/runtime/typed_bind_host.rs"));
+        generated.push_str(include_str!("../../tests/runtime/typed_request_host.rs"));
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4165,6 +4171,32 @@ mod tests {
         assert!(
             controls.status.success(),
             "production bind controls: {}",
+            String::from_utf8_lossy(&controls.stderr)
+        );
+        let listed = std::process::Command::new(&binary)
+            .args(["request_controls::", "--list", "--format=terse"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let names: Vec<_> = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "request_controls::rebuild_kdf_request_key: test",
+                "request_controls::rebuild_mac_request_key: test",
+            ]
+        );
+        let controls = std::process::Command::new(&binary)
+            .args(["request_controls::", "--test-threads=1", "--nocapture"])
+            .output()
+            .unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&controls.stdout));
+        assert!(
+            controls.status.success(),
+            "production request controls: {}",
             String::from_utf8_lossy(&controls.stderr)
         );
     }

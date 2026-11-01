@@ -1059,7 +1059,8 @@ fn intern_request(
     let Some(slot) = crate::shared_maps::ITER_SLOT.get_ptr_mut(0) else {
         return None;
     };
-    let keyed = unsafe { (*slot).staging.as_mut_ptr().cast::<ExactNameKey>() };
+    let base = unsafe { addr_of_mut!((*slot).staging) };
+    let keyed = base.cast::<ExactNameKey>();
     unsafe {
         (*keyed).object_domain = 0;
         (*keyed).operation = family;
@@ -1082,7 +1083,7 @@ fn intern_request(
     }
     // Same lock-free staging rationale as `quarantine`: request rows are
     // immutable session facts published with NOEXIST, never hashed here.
-    let staging = unsafe { (*slot).staging.as_mut_ptr().cast::<RelValue>() };
+    let staging = base.cast::<RelValue>();
     unsafe {
         staging.write_bytes(0, 1);
         (*staging).witness_id = id;
