@@ -38,6 +38,16 @@ impl SourceKernel {
     pub(crate) fn iterator_class(&self) -> u32 {
         self._configuration[12]
     }
+    /// Admitted patch configuration (kfunc BTF IDs, field offsets,
+    /// VMA size, registration ID, allocation) for the patch audit:
+    /// the diagnostic re-validates patched images against these same
+    /// values. Read-only copy; no behavior change.
+    /// Diagnostic-evidence surface: exercised by host unit tests and
+    /// the ignored load-only diagnostic, not by production paths.
+    #[allow(dead_code)]
+    pub(crate) fn patch_configuration(&self) -> [u32; 13] {
+        self._configuration
+    }
     /// Validated running-vmlinux `uprobe_register` FUNC ID selected by the
     /// finite prototype validator. Zero is impossible here: parsing refuses
     /// a missing ID before this configuration exists.
@@ -77,6 +87,15 @@ impl JoinKernel {
     ) -> Result<(), crate::provider_observation::ObservationGap> {
         patch_source_configuration(&self._configuration, &mut prepared.progs)
             .map_err(|_| crate::provider_observation::ObservationGap::InvalidObject)
+    }
+    /// Admitted join configuration for the count post-patch survival
+    /// scan: the diagnostic re-validates the pre-patched count image
+    /// against these same values. Read-only copy; no behavior change.
+    /// Diagnostic-evidence surface: exercised by host unit tests and
+    /// the ignored load-only diagnostic, not by production paths.
+    #[allow(dead_code)]
+    pub(crate) fn patch_configuration(&self) -> [u32; 13] {
+        self._configuration
     }
     /// Join-only kernel-layout read for marker patching. Reserves the same
     /// BTF scratch against the CALLER's budget and admits pre-6.12 kernels;
@@ -2810,8 +2829,46 @@ fn load_prog(
         crate::capture::BoundaryStage,
     )>,
 ) -> anyhow::Result<OwnedFd> {
+    load_prog_inner(p, maps, spill, setup, None, None)
+}
+
+/// Shared load implementation: fixup, BTF synthesis, quiet-first
+/// logged retry. `record` threads one observed per-root record
+/// through the real decisions (production passes `None` and sees
+/// byte-identical behavior, messages, and ordering); `ops` scripts
+/// the syscall boundary for host-only tests (production: `None`).
+/// Attestation and the final info query stay with the caller.
+fn load_prog_inner(
+    p: &PreparedProg,
+    maps: &HashMap<String, OwnedFd>,
+    spill: bool,
+    setup: Option<(
+        &crate::capture_setup::SetupLinks,
+        crate::capture::BoundaryStage,
+    )>,
+    record: Option<&mut LoadDiagnostics>,
+    ops: Option<&dyn LoadBoundaryOps>,
+) -> anyhow::Result<OwnedFd> {
     use anyhow::Context as _;
+    let mut record = record;
+    let observed = record.is_some();
+    // The caller sets the entry stage (maps are ready); classification
+    // failures below keep it, fixup advances from it.
+    if let Some(record) = record.as_deref_mut() {
+        record.callback_subprogs = p.subprogs.iter().filter(|s| s.is_callback).count();
+    }
     let raw_root = lifecycle_root(p)?;
+    let kind = match raw_root {
+        Some(root) => AttemptKind::Lifecycle(root),
+        None => AttemptKind::Kprobe,
+    };
+    if let Some(record) = record.as_deref_mut() {
+        record.prog_type = if raw_root.is_some() { 17 } else { 2 };
+        record.expected_attach = if raw_root.is_some() { 0 } else { 48 };
+        record.attach_target = 0;
+        record.prog_flags = 0;
+        record.stage = LoadStage::Fixup;
+    }
     let mut insns = p.insns.clone();
     for f in &p.map_fixups {
         // Full 16-byte range first (checked: `Prepared` fields
@@ -2831,6 +2888,9 @@ fn load_prog(
             .ok_or_else(|| anyhow::anyhow!("{}: unknown map {}", p.name, f.map))?;
         insn[1] = (insn[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
         insn[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
+        if let Some(record) = record.as_deref_mut() {
+            record.maps.push((f.map.clone(), fd.as_raw_fd()));
+        }
     }
     let license = c"GPL";
     // Callback shapes only: synthesize BTF + func_info and load
@@ -2847,21 +2907,39 @@ fn load_prog(
     if let Some((links, stage)) = setup {
         links.check_owned(stage)?;
     }
+    let mut btf_number: Option<i32> = None;
     if p.subprogs.iter().any(|s| s.is_callback) {
+        if let Some(record) = record.as_deref_mut() {
+            record.stage = LoadStage::BtfSetup;
+            record.btf_synthesized = true;
+        }
         let (btf, info) =
             synth_btf(&p.subprogs).with_context(|| format!("synth_btf {}", p.name))?;
         for (off, id) in &info {
             func_info_bytes.extend_from_slice(&off.to_le_bytes());
             func_info_bytes.extend_from_slice(&id.to_le_bytes());
         }
-        let mut btf_log = vec![0u8; 1 << 16];
-        let fd = ossl_bpf_sys::btf_load(&btf, &mut btf_log).map_err(|e| {
-            let detail = String::from_utf8_lossy(trim_nul(&btf_log))
+        const BTF_LOG_CAP: usize = 1 << 16;
+        let (btf_result, mut btf_used) = match ops {
+            Some(ops) => ops.btf_load(&btf, BTF_LOG_CAP),
+            None => {
+                let mut btf_log = vec![0u8; BTF_LOG_CAP];
+                let result = ossl_bpf_sys::btf_load(&btf, &mut btf_log);
+                (result, trim_nul(&btf_log).to_vec())
+            }
+        };
+        btf_used.truncate(BTF_LOG_CAP);
+        if let Some(record) = record.as_deref_mut() {
+            record.btf_log = btf_used.clone();
+        }
+        let fd = btf_result.map_err(|e| {
+            let detail = String::from_utf8_lossy(&btf_used)
                 .chars()
                 .take(1000)
                 .collect::<String>();
             anyhow::anyhow!("btf_load {}: {e}\n{detail}", p.name)
         })?;
+        btf_number = Some(fd.as_raw_fd());
         *btf_fd = Some(fd);
     }
     let prog_btf = |fd: &Option<std::os::fd::OwnedFd>| -> Option<ossl_bpf_sys::ProgBtf<'_>> {
@@ -2880,31 +2958,76 @@ fn load_prog(
     if let Some((links, stage)) = setup {
         links.check_owned(stage)?;
     }
-    let quiet = match raw_root {
-        Some(root) => ossl_bpf_sys::prog_load_lifecycle(&insns, root, None),
-        None => {
-            ossl_bpf_sys::prog_load_kprobe_quiet(&insns, license, None, &p.name, prog_btf(&btf_fd))
-        }
-    };
-    let fd = match quiet {
+    // Production keeps its 4 MiB logged ceiling; the observed
+    // diagnostic alone uses the reviewed 16 MiB ceiling.
+    let log_cap = if record.is_some() { 16 << 20 } else { 4 << 20 };
+    if let Some(record) = record.as_deref_mut() {
+        record.stage = LoadStage::QuietLoad;
+    }
+    let quiet = run_load_attempt(
+        ops,
+        kind,
+        &p.name,
+        &insns,
+        btf_number,
+        None,
+        |_log| match raw_root {
+            Some(root) => ossl_bpf_sys::prog_load_lifecycle_attempt(&insns, root, None),
+            None => ossl_bpf_sys::prog_load_kprobe_attempt(
+                &insns,
+                license,
+                None,
+                None,
+                &p.name,
+                prog_btf(&btf_fd),
+            ),
+        },
+    );
+    if let Some(record) = record.as_deref_mut() {
+        record.quiet_errno = quiet.result.as_ref().err().and_then(|e| e.raw_os_error());
+    }
+    let fd = match quiet.result {
         Ok(fd) => fd,
         Err(_) => {
             if let Some((links, stage)) = setup {
                 links.check_owned(stage)?;
             }
-            let mut log = vec![0u8; 4 << 20];
-            let logged = match raw_root {
-                Some(root) => ossl_bpf_sys::prog_load_lifecycle(&insns, root, Some(&mut log)),
-                None => ossl_bpf_sys::prog_load_kprobe(
-                    &insns,
-                    license,
-                    None,
-                    &mut log,
-                    &p.name,
-                    prog_btf(&btf_fd),
-                ),
-            };
-            match logged {
+            if let Some(record) = record.as_deref_mut() {
+                record.stage = LoadStage::LoggedLoad;
+            }
+            let mut log = vec![0u8; log_cap];
+            let logged = run_load_attempt(
+                ops,
+                kind,
+                &p.name,
+                &insns,
+                btf_number,
+                Some(&mut log),
+                |log| match raw_root {
+                    Some(root) => ossl_bpf_sys::prog_load_lifecycle_attempt(
+                        &insns,
+                        root,
+                        log.map(Vec::as_mut_slice),
+                    ),
+                    None => ossl_bpf_sys::prog_load_kprobe_attempt(
+                        &insns,
+                        license,
+                        None,
+                        log.map(Vec::as_mut_slice),
+                        &p.name,
+                        prog_btf(&btf_fd),
+                    ),
+                },
+            );
+            if let Some(record) = record {
+                let logged_errno = logged.result.as_ref().err().and_then(|e| e.raw_os_error());
+                record.logged_errno = logged_errno;
+                let (used, completeness) = classify_log(&log, logged.log_true_size, logged_errno);
+                record.log_bytes = used;
+                record.log_true_size = logged.log_true_size;
+                record.log_completeness = completeness;
+            }
+            match logged.result {
                 Ok(fd) => fd,
                 Err(e) => {
                     let full = trim_nul(&log);
@@ -2921,7 +3044,10 @@ fn load_prog(
                             "native program load failed",
                         ));
                     }
-                    let spill = (spill && setup.is_none())
+                    // Production spills to its temp file; observed
+                    // loads keep the bytes in-record for the
+                    // grant-supplied evidence destination instead.
+                    let spill = (spill && setup.is_none() && !observed)
                         .then(|| spill_verifier_log(&p.name, full))
                         .flatten();
                     let error = anyhow::anyhow!(
@@ -2945,11 +3071,37 @@ fn load_prog(
 pub fn load(prep: &Prepared) -> anyhow::Result<Loaded> {
     load_with_custody(prep, None, None)
 }
-/// The only admission path for the two shared writer object types.
-pub(crate) fn load_gated(
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Observed gated load for the diagnostic (the legacy pair):
+/// preflights the exact pair before any effect, then loads through
+/// the shared custody path, pushing one per-root record per
+/// attempted root. Never attaches: the preflight proves the attach
+/// loop would be empty, so it does not run here at all.
+pub(crate) fn load_gated_observed(
     prep: &Prepared,
     gate: &crate::writer_gate::WriterGate,
-) -> anyhow::Result<GatedLoaded> {
+    artifact: ArtifactPins,
+    records: &mut Vec<LoadDiagnostics>,
+) -> anyhow::Result<Loaded> {
+    preflight_legacy_pair(prep)?;
+    preflight_gated_producer(prep)?;
+    load_with_custody_inner(
+        prep,
+        None,
+        Some(gate),
+        Some(DiagCtx { records, artifact }),
+        None,
+    )
+}
+/// The only admission path for the two shared writer object types.
+/// Shared gated-producer preflight: exactly one shared writer map,
+/// every program a reviewed gated shape carrying the gate fixup,
+/// and no duplicate lifecycle roots. Both the production and the
+/// observed legacy routes run this before any map/load effect.
+fn preflight_gated_producer(prep: &Prepared) -> anyhow::Result<()> {
     anyhow::ensure!(
         prep.maps.iter().filter(|m| m.name == "ADMIT").count() == 1,
         "missing shared writer map"
@@ -2976,7 +3128,15 @@ pub(crate) fn load_gated(
             "duplicate lifecycle root"
         );
     }
-    let loaded = load_with_custody(prep, None, Some(gate))?;
+    Ok(())
+}
+
+pub(crate) fn load_gated(
+    prep: &Prepared,
+    gate: &crate::writer_gate::WriterGate,
+) -> anyhow::Result<GatedLoaded> {
+    preflight_gated_producer(prep)?;
+    let loaded = load_with_custody_inner(prep, None, Some(gate), None, None)?;
     let mut owned = GatedLoaded {
         lifecycle: Vec::new(),
         loaded,
@@ -3030,6 +3190,1103 @@ const SOURCE_FIXUP_MAPS: [&str; 24] = [
     "ADMIT",
 ];
 
+/// Immutable artifact pins stamped on every observed per-root record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArtifactPins {
+    pub sha256: [u8; 32],
+    pub len: u64,
+}
+
+/// Last reached load stage, recorded at its actual owner. Refusals
+/// keep the failing stage with `LoadDiagnostics.error` set; later
+/// roots stay `Unattempted` under fail-fast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadStage {
+    Unattempted,
+    Preflight,
+    MapSetup,
+    Fixup,
+    BtfSetup,
+    QuietLoad,
+    LoggedLoad,
+    Attestation,
+    InfoQuery,
+    Loaded,
+}
+
+/// Verifier-log completeness: `log_true_size` plus termination
+/// checks prove it; anything else stays inconclusive, never a pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogCompleteness {
+    /// No logged attempt ran (quiet success or pre-load refusal).
+    NoLogAttempted,
+    /// True size fits the buffer with NUL termination.
+    Complete,
+    /// True size exceeds the buffer: truncated (ENOSPC-shaped).
+    Truncated,
+    /// Bytes retained but completeness unprovable.
+    Indeterminate,
+}
+
+/// Post-drop handle verification, set by the diagnostic owner after
+/// it proves owned descriptors closed. Unit ownership proofs use
+/// pipe-peer EOF directly instead of this field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+pub(crate) enum CleanupStatus {
+    Pending,
+    HandlesClosed,
+    /// Failure transaction: the loader dropped the transient descriptors
+    /// by RAII on its internal failure paths (proven by the pipe-EOF unit
+    /// proofs, not by the FD sweep, which cannot name descriptors the
+    /// diagnostic never held).
+    ReleasedByLoader,
+}
+
+/// Concrete bounded per-root load record. Production passes `None`
+/// and behaves exactly as before; the observed diagnostic threads
+/// one record per attempted root through the real load path.
+#[derive(Debug, Clone)]
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+pub(crate) struct LoadDiagnostics {
+    pub root: String,
+    pub section: String,
+    pub artifact: ArtifactPins,
+    /// Selected program type (2/26/17), expected attach type, supplied
+    /// attach target (nonzero only for TRACING), and program flags
+    /// (always 0; recorded, never assumed).
+    pub prog_type: u32,
+    pub expected_attach: u32,
+    pub attach_target: u32,
+    pub prog_flags: u32,
+    /// Prepared callback-classified subprograms, and whether the
+    /// loader took the BTF-synthesis path for this root.
+    pub callback_subprogs: usize,
+    pub btf_synthesized: bool,
+    /// Fixup map names resolved to live FD numbers, in fixup order.
+    pub maps: Vec<(String, i32)>,
+    pub stage: LoadStage,
+    pub quiet_errno: Option<i32>,
+    pub logged_errno: Option<i32>,
+    /// Full used logged buffer (bounded by the attempt's ceiling),
+    /// its kernel-reported true size, and completeness.
+    pub log_bytes: Vec<u8>,
+    pub log_true_size: u32,
+    pub log_completeness: LogCompleteness,
+    /// Used BTF-load log on the BTF path (bounded 64 KiB).
+    pub btf_log: Vec<u8>,
+    /// Kernel program ID and safe summary from the final info query;
+    /// `info_unavailable` carries the reason when the query (or its
+    /// credential bracketing) refused. The load itself still stands.
+    pub loaded_id: Option<u32>,
+    pub info: Option<ossl_bpf_sys::ProgramInfoSummary>,
+    pub info_unavailable: Option<String>,
+    /// The credential identity bracketing the info query (set only
+    /// when both snapshots agreed and carried query privilege).
+    /// Cross-query sameness is evaluated by the diagnostic, never
+    /// assumed from per-query bracketing alone.
+    pub query_creds: Option<ossl_bpf_sys::ThreadCredentials>,
+    pub fixup_audit: Vec<FixupAuditEntry>,
+    pub cleanup: CleanupStatus,
+    pub error: Option<String>,
+}
+
+impl LoadDiagnostics {
+    pub(crate) fn unattempted(root: &str, section: &str, artifact: ArtifactPins) -> Self {
+        Self {
+            root: root.to_owned(),
+            section: section.to_owned(),
+            artifact,
+            prog_type: 0,
+            expected_attach: 0,
+            attach_target: 0,
+            prog_flags: 0,
+            callback_subprogs: 0,
+            btf_synthesized: false,
+            maps: Vec::new(),
+            stage: LoadStage::Unattempted,
+            quiet_errno: None,
+            logged_errno: None,
+            log_bytes: Vec::new(),
+            log_true_size: 0,
+            log_completeness: LogCompleteness::NoLogAttempted,
+            btf_log: Vec::new(),
+            loaded_id: None,
+            info: None,
+            info_unavailable: None,
+            query_creds: None,
+            fixup_audit: Vec::new(),
+            cleanup: CleanupStatus::Pending,
+            error: None,
+        }
+    }
+}
+
+/// Expected role of one instruction-image change. Map-FD writes
+/// carry full site-shape conformance. Marker/kfunc and approved
+/// field roles declare their spans for window-containment,
+/// equality, and full-coverage audit; their semantic role tables
+/// (which markers/fields at which sites with which values, checked
+/// against the kernel BTF and patch inputs that produced them)
+/// arrive with the native stage that runs patch outputs through
+/// this same interface. Until then these roles prove change
+/// confinement, not marker/field semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+pub(crate) enum ImageChangeRole {
+    MapFd {
+        map: String,
+        fd: i32,
+    },
+    MarkerKfunc {
+        marker: String,
+        spans: Vec<ImageSpan>,
+    },
+    ApprovedField {
+        field: String,
+        spans: Vec<ImageSpan>,
+    },
+}
+
+/// One contiguous declared span: absolute image offset plus the
+/// exact before/after bytes (small: at most 8 each).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImageSpan {
+    pub start: usize,
+    pub before: Vec<u8>,
+    pub after: Vec<u8>,
+}
+
+/// One declared change site, anchored to an 8-aligned instruction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FixupSite {
+    pub insn_off: usize,
+    pub role: ImageChangeRole,
+}
+
+/// One verified image change recorded against its expected role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FixupAuditEntry {
+    pub insn_off: usize,
+    pub spans: Vec<(usize, usize)>,
+    pub role: ImageChangeRole,
+}
+
+/// Audit a prepared-to-fixed instruction image: same length, every
+/// declared span matches its before/after bytes, every changed byte
+/// is covered by exactly one non-overlapping span, and map-FD spans
+/// additionally conform to the ld_imm64 site shape with the declared
+/// FD. Only map-FD roles audit here: marker/field patch roles refuse
+/// outright (their transformations validate solely through
+/// `audit_patch_images` against admitted kernel configuration, never
+/// through caller-declared spans). No unchecked
+/// opcode/register/frame-access/call-target/length change inherits
+/// any conservative claim.
+pub(crate) fn audit_fixup_image(
+    before: &[u8],
+    after: &[u8],
+    sites: &[FixupSite],
+) -> anyhow::Result<Vec<FixupAuditEntry>> {
+    anyhow::ensure!(
+        before.len() == after.len(),
+        "image length changed {} -> {}",
+        before.len(),
+        after.len()
+    );
+    let mut covered = vec![false; before.len()];
+    let mut entries = Vec::with_capacity(sites.len());
+    for site in sites {
+        anyhow::ensure!(site.insn_off % 8 == 0, "audit site misaligned");
+        let end = site
+            .insn_off
+            .checked_add(16)
+            .ok_or_else(|| anyhow::anyhow!("audit site out of range"))?;
+        anyhow::ensure!(end <= before.len(), "audit site out of range");
+        let spans: Vec<ImageSpan> = match &site.role {
+            ImageChangeRole::MapFd { map: _, fd } => {
+                let base = site.insn_off;
+                let slot = &before[base..base + 16];
+                anyhow::ensure!(
+                    slot[0] == BPF_LD_IMM64 && slot[1] >> 4 == 0,
+                    "audit map site vs non-ld_imm64"
+                );
+                let src_before = slot[1];
+                let src_after = (src_before & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
+                vec![
+                    ImageSpan {
+                        start: base + 1,
+                        before: vec![src_before],
+                        after: vec![src_after],
+                    },
+                    ImageSpan {
+                        start: base + 4,
+                        before: slot[4..8].to_vec(),
+                        after: fd.to_le_bytes().to_vec(),
+                    },
+                ]
+            }
+            ImageChangeRole::MarkerKfunc { .. } | ImageChangeRole::ApprovedField { .. } => {
+                anyhow::bail!(
+                    "patch roles audit only through audit_patch_images against admitted configuration"
+                )
+            }
+        };
+        let mut entry_spans = Vec::with_capacity(spans.len());
+        for span in &spans {
+            let end = span
+                .start
+                .checked_add(span.before.len())
+                .ok_or_else(|| anyhow::anyhow!("audit span overflow"))?;
+            anyhow::ensure!(
+                span.start >= site.insn_off && end <= site.insn_off + 16,
+                "audit span outside declared instruction"
+            );
+            anyhow::ensure!(
+                span.before.len() == span.after.len()
+                    && !span.before.is_empty()
+                    && span.before.len() <= 8,
+                "audit span shape"
+            );
+            anyhow::ensure!(span.before != span.after, "audit vacuous change");
+            let actual_before = before
+                .get(span.start..end)
+                .ok_or_else(|| anyhow::anyhow!("audit span out of range"))?;
+            let actual_after = after
+                .get(span.start..end)
+                .ok_or_else(|| anyhow::anyhow!("audit span out of range"))?;
+            anyhow::ensure!(
+                actual_before == span.before.as_slice(),
+                "audit before-bytes mismatch at {start}",
+                start = span.start
+            );
+            anyhow::ensure!(
+                actual_after == span.after.as_slice(),
+                "audit after-bytes mismatch at {start}",
+                start = span.start
+            );
+            for covered in covered
+                .get_mut(span.start..end)
+                .ok_or_else(|| anyhow::anyhow!("audit span out of range"))?
+            {
+                anyhow::ensure!(!*covered, "audit overlapping spans");
+                *covered = true;
+            }
+            entry_spans.push((span.start, span.before.len()));
+        }
+        entries.push(FixupAuditEntry {
+            insn_off: site.insn_off,
+            spans: entry_spans,
+            role: site.role.clone(),
+        });
+    }
+    for (index, covered) in covered.iter().enumerate() {
+        anyhow::ensure!(
+            *covered || before[index] == after[index],
+            "audit unchecked image change at {index}"
+        );
+    }
+    Ok(entries)
+}
+
+/// Canonical VMA-join patch identities in marker order: the three
+/// kfunc call slots (configuration 0..3) then the six field-offset
+/// slots (configuration 3..9). The names match the kernel-layout
+/// admission order (`SourceLayout`: new/next/destroy, then
+/// vm_start/vm_end/vm_pgoff/vm_flags/vm_file/f_inode); the audit
+/// derives them from slot identity, never from caller declaration.
+const PATCH_KFUNC_NAMES: [&str; 3] = [
+    "bpf_iter_task_vma_new",
+    "bpf_iter_task_vma_next",
+    "bpf_iter_task_vma_destroy",
+];
+const PATCH_FIELD_NAMES: [&str; 6] = [
+    "vm_start", "vm_end", "vm_pgoff", "vm_flags", "vm_file", "f_inode",
+];
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Audit one prepared program's pre-patch-to-final images against the
+/// admitted kernel configuration: the same owner/helper/site/shape
+/// rules the patcher enforces, re-derived from the byte images, plus
+/// replacement-value equality against `configuration` (kfunc BTF IDs
+/// and field offsets from the kernel-layout read). Kfunc slots must
+/// show the pre-patch call shape `[0x85, 0, 0, 0]` and the exact
+/// post-patch rewrite `[0x85, 0x20, 0, 0]` with the admitted ID;
+/// field slots must show the mov32 shape with an unchanged
+/// destination and the admitted offset. Every changed byte must
+/// belong to exactly one validated slot; non-helper roots must be
+/// byte-identical and marker-free. Returns per-slot entries with
+/// canonical identity names. An opcode or call-target change
+/// labelled as a patch slot fails here unless the bytes prove the
+/// declared slot, shape, and admitted value.
+pub(crate) fn audit_patch_images(
+    before: &PreparedProg,
+    after: &PreparedProg,
+    configuration: &[u32; 13],
+) -> anyhow::Result<Vec<FixupAuditEntry>> {
+    anyhow::ensure!(
+        configuration[..3]
+            .iter()
+            .all(|id| *id != 0 && *id <= i32::MAX as u32),
+        "source kfunc ID range"
+    );
+    anyhow::ensure!(
+        configuration[3..9]
+            .iter()
+            .all(|offset| *offset <= i32::MAX as u32),
+        "source offset range"
+    );
+    anyhow::ensure!(
+        configuration[3..8].iter().all(|offset| offset
+            .checked_add(8)
+            .is_some_and(|end| end <= configuration[9])),
+        "source VMA extent"
+    );
+    anyhow::ensure!(
+        before.insns.len() == after.insns.len(),
+        "patch image length changed {} -> {}",
+        before.insns.len(),
+        after.insns.len()
+    );
+    let mut helper_range = None;
+    for (index, subprogram) in before.subprogs.iter().enumerate() {
+        if subprogram.name != "current_source_at" {
+            continue;
+        }
+        anyhow::ensure!(
+            blessed_source_owner(before) && !subprogram.is_callback,
+            "source helper owner"
+        );
+        anyhow::ensure!(helper_range.is_none(), "duplicate source helper body");
+        let start = subprogram.insn_off as usize * 8;
+        let end = before
+            .subprogs
+            .get(index + 1)
+            .map_or(before.insns.len(), |next| next.insn_off as usize * 8);
+        anyhow::ensure!(
+            start < end && end <= before.insns.len(),
+            "source helper extent"
+        );
+        helper_range = Some(start..end);
+    }
+    let mut sites: [Option<usize>; 9] = [None; 9];
+    for (index, instruction) in before.insns.chunks_exact(8).enumerate() {
+        let immediate = u32::from_le_bytes(instruction[4..8].try_into().unwrap());
+        let identity = match immediate {
+            0x7f001..=0x7f003 => (immediate - 0x7f001) as usize,
+            0x6f001..=0x6f006 => 3 + (immediate - 0x6f001) as usize,
+            0x7f000..=0x7ffff | 0x6f000..=0x6ffff => {
+                anyhow::bail!("unknown source patch identity")
+            }
+            _ => continue,
+        };
+        let offset = index * 8;
+        anyhow::ensure!(
+            helper_range.as_ref().is_some_and(|r| r.contains(&offset)),
+            "source patch outside helper"
+        );
+        anyhow::ensure!(sites[identity].is_none(), "duplicate source patch identity");
+        if identity < 3 {
+            anyhow::ensure!(
+                instruction[..4] == [0x85, 0, 0, 0],
+                "source kfunc patch shape"
+            );
+        } else {
+            anyhow::ensure!(
+                instruction[0] == 0xb7 && instruction[1] <= 10 && instruction[2..4] == [0, 0],
+                "source field patch shape"
+            );
+        }
+        sites[identity] = Some(offset);
+    }
+    if helper_range.is_none() {
+        anyhow::ensure!(
+            sites.iter().all(Option::is_none),
+            "source marker without helper body"
+        );
+        anyhow::ensure!(
+            before.insns == after.insns,
+            "non-helper root changed by patch"
+        );
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        sites.iter().all(Option::is_some),
+        "missing source helper patch"
+    );
+    let mut covered = vec![false; before.insns.len()];
+    let mut entries = Vec::with_capacity(9);
+    for (identity, site) in sites.into_iter().enumerate() {
+        let offset = site.unwrap();
+        let expected = configuration[identity].to_le_bytes();
+        let actual = after
+            .insns
+            .get(offset..offset + 8)
+            .ok_or_else(|| anyhow::anyhow!("patch slot out of range"))?;
+        let before_slot = &before.insns[offset..offset + 8];
+        let role = if identity < 3 {
+            anyhow::ensure!(
+                actual[..4] == [0x85, 0x20, 0, 0],
+                "source kfunc call rewrite"
+            );
+            anyhow::ensure!(actual[4..8] == expected, "source kfunc replacement value");
+            for covered in &mut covered[offset + 1..offset + 2] {
+                *covered = true;
+            }
+            for covered in &mut covered[offset + 4..offset + 8] {
+                *covered = true;
+            }
+            ImageChangeRole::MarkerKfunc {
+                marker: PATCH_KFUNC_NAMES[identity].to_owned(),
+                spans: vec![
+                    ImageSpan {
+                        start: offset + 1,
+                        before: vec![before_slot[1]],
+                        after: vec![actual[1]],
+                    },
+                    ImageSpan {
+                        start: offset + 4,
+                        before: before_slot[4..8].to_vec(),
+                        after: expected.to_vec(),
+                    },
+                ],
+            }
+        } else {
+            anyhow::ensure!(
+                actual[0] == 0xb7 && actual[1] == before_slot[1] && actual[2..4] == [0, 0],
+                "source field destination preserved"
+            );
+            anyhow::ensure!(actual[4..8] == expected, "source field replacement value");
+            for covered in &mut covered[offset + 4..offset + 8] {
+                *covered = true;
+            }
+            ImageChangeRole::ApprovedField {
+                field: PATCH_FIELD_NAMES[identity - 3].to_owned(),
+                spans: vec![ImageSpan {
+                    start: offset + 4,
+                    before: before_slot[4..8].to_vec(),
+                    after: expected.to_vec(),
+                }],
+            }
+        };
+        let spans = match &role {
+            ImageChangeRole::MarkerKfunc { spans, .. }
+            | ImageChangeRole::ApprovedField { spans, .. } => spans
+                .iter()
+                .map(|span| (span.start, span.before.len()))
+                .collect(),
+            ImageChangeRole::MapFd { .. } => Vec::new(),
+        };
+        entries.push(FixupAuditEntry {
+            insn_off: offset,
+            spans,
+            role,
+        });
+    }
+    for (index, covered) in covered.iter().enumerate() {
+        anyhow::ensure!(
+            *covered || before.insns[index] == after.insns[index],
+            "patch unchecked image change at {index}"
+        );
+    }
+    Ok(entries)
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Exact legacy-pair preflight before any map/load effect: exactly
+/// the two reviewed names with their sections and return modes,
+/// each once. `observation_return` must actually carry
+/// callback-classified subprograms (its name alone is not
+/// calibration evidence). Entry callbacks are recorded, not refused.
+pub(crate) fn preflight_legacy_pair(prepared: &Prepared) -> anyhow::Result<()> {
+    anyhow::ensure!(prepared.progs.len() == 2, "legacy pair shape");
+    let mut entry = false;
+    let mut ret = false;
+    for prog in &prepared.progs {
+        match (prog.name.as_str(), prog.section.as_str(), prog.is_return) {
+            ("observation_entry", "uprobe", false) => {
+                anyhow::ensure!(!entry, "duplicate legacy entry");
+                entry = true;
+            }
+            ("observation_return", "uretprobe", true) => {
+                anyhow::ensure!(!ret, "duplicate legacy return");
+                anyhow::ensure!(
+                    prog.subprogs.iter().any(|s| s.is_callback),
+                    "legacy return lacks callback classification"
+                );
+                ret = true;
+            }
+            _ => anyhow::bail!("unexpected legacy root {}:{}", prog.name, prog.section),
+        }
+    }
+    anyhow::ensure!(entry && ret, "legacy pair shape");
+    Ok(())
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Nine-root singleton preflight across the four prepared halves,
+/// before any kernel object exists. Source and count halves keep
+/// their zero-callback rules here; load-time seams re-check the
+/// roots they load.
+pub(crate) fn preflight_nine_roots(
+    legacy: &Prepared,
+    registration: &Prepared,
+    typed: &Prepared,
+    count: &Prepared,
+) -> anyhow::Result<()> {
+    preflight_legacy_pair(legacy)?;
+    anyhow::ensure!(registration.progs.len() == 4, "registration shape");
+    for (name, section) in [
+        ("source_reg_in", "fentry/uprobe_register"),
+        ("source_reg_out", "fexit/uprobe_register"),
+        ("attr_exit", "raw_tracepoint/sched_process_exit"),
+        ("attr_exec", "raw_tracepoint/sched_process_exec"),
+    ] {
+        let found = registration
+            .progs
+            .iter()
+            .filter(|p| p.name == name && p.section == section && !p.is_return)
+            .count();
+        anyhow::ensure!(found == 1, "registration singleton {name}");
+    }
+    for prog in &registration.progs {
+        anyhow::ensure!(
+            !prog.subprogs.iter().any(|s| s.is_callback),
+            "registration root {} forbids callback BTF",
+            prog.name
+        );
+    }
+    anyhow::ensure!(typed.progs.len() == 2, "typed pair shape");
+    for (name, section, is_return) in [
+        ("typed_entry", "uprobe", false),
+        ("typed_return", "uretprobe", true),
+    ] {
+        let found = typed
+            .progs
+            .iter()
+            .filter(|p| p.name == name && p.section == section && p.is_return == is_return)
+            .count();
+        anyhow::ensure!(found == 1, "typed singleton {name}");
+    }
+    for prog in &typed.progs {
+        anyhow::ensure!(
+            !prog.subprogs.iter().any(|s| s.is_callback),
+            "typed root {} forbids callback BTF",
+            prog.name
+        );
+    }
+    anyhow::ensure!(
+        count.progs.len() == 1
+            && count.progs[0].name == "count_entry"
+            && count.progs[0].section == "uprobe"
+            && !count.progs[0].is_return
+            && !count.progs[0].subprogs.iter().any(|s| s.is_callback),
+        "count singleton shape"
+    );
+    Ok(())
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Compare an observed kernel map-ID set against prepared references
+/// resolved to live identities: same multiset, no zeros, no
+/// duplicates. Pure; the native stage supplies both ID lists.
+pub(crate) fn check_map_id_set(expected: &[u32], observed: &[u32]) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        observed.iter().all(|id| *id != 0),
+        "observed zero map identity"
+    );
+    let mut sorted = observed.to_vec();
+    sorted.sort_unstable();
+    anyhow::ensure!(
+        sorted.windows(2).all(|pair| pair[0] != pair[1]),
+        "observed duplicate map identity"
+    );
+    let mut want = expected.to_vec();
+    want.sort_unstable();
+    anyhow::ensure!(sorted == want, "map identity set mismatch");
+    Ok(())
+}
+
+/// Split the used verifier-log bytes from a logged attempt and prove
+/// completeness: the true size must fit the buffer with NUL
+/// termination, else the log is truncated or indeterminate. A
+/// failed attempt reporting ENOSPC can never be Complete (fitting
+/// size metadata contradicts the errno). Indeterminate logs retain
+/// the NUL-trimmed buffer rather than trusting a possibly
+/// unusable true size, so no diagnostic bytes are silently
+/// discarded; only the verdict stays inconclusive.
+fn classify_log(
+    buffer: &[u8],
+    true_size: u32,
+    failed_errno: Option<i32>,
+) -> (Vec<u8>, LogCompleteness) {
+    let true_size = true_size as usize;
+    if true_size > buffer.len() {
+        return (buffer.to_vec(), LogCompleteness::Truncated);
+    }
+    if failed_errno == Some(libc::ENOSPC) {
+        return (trim_nul(buffer).to_vec(), LogCompleteness::Indeterminate);
+    }
+    if true_size >= 1 && buffer[true_size - 1] == 0 {
+        (buffer[..true_size].to_vec(), LogCompleteness::Complete)
+    } else {
+        (trim_nul(buffer).to_vec(), LogCompleteness::Indeterminate)
+    }
+}
+
+/// Observed-load context: the record table plus the artifact pins
+/// stamped on every record pushed through it.
+struct DiagCtx<'a> {
+    records: &'a mut Vec<LoadDiagnostics>,
+    artifact: ArtifactPins,
+}
+
+/// One source root's kind: tracing registration or raw lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceRootKind {
+    Tracing(ossl_bpf_sys::SourceTracingRoot),
+    Lifecycle(ossl_bpf_sys::LifecycleTracepoint),
+}
+
+/// Classify one prepared program as a source root, exactly as the
+/// production loop does: the two reviewed tracing names, else the
+/// finite lifecycle table. Anything else is unselected.
+fn classify_source_root(root: &PreparedProg) -> anyhow::Result<SourceRootKind> {
+    let tracing = match (root.name.as_str(), root.section.as_str()) {
+        ("source_reg_in", "fentry/uprobe_register") => Some(ossl_bpf_sys::SourceTracingRoot::Enter),
+        ("source_reg_out", "fexit/uprobe_register") => Some(ossl_bpf_sys::SourceTracingRoot::Exit),
+        _ => None,
+    };
+    let raw = if tracing.is_none() {
+        selected_lifecycle(&root.name, &root.section)
+    } else {
+        None
+    };
+    anyhow::ensure!(
+        tracing.is_some() || raw.is_some(),
+        "unselected source root {}:{}",
+        root.name,
+        root.section
+    );
+    Ok(match (tracing, raw) {
+        (Some(kind), None) => SourceRootKind::Tracing(kind),
+        (None, Some(kind)) => SourceRootKind::Lifecycle(kind),
+        _ => unreachable!("selected exactly one root kind"),
+    })
+}
+
+/// Load-attempt shape for the scripted boundary: kernel program
+/// type plus, for tracing roots, the validated FUNC target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptKind {
+    Kprobe,
+    Lifecycle(ossl_bpf_sys::LifecycleTracepoint),
+    SourceRegistration(ossl_bpf_sys::SourceTracingRoot, u32),
+}
+
+/// Scripted syscall-boundary effects for host-only tests. Every
+/// method replaces exactly one boundary effect (load syscall,
+/// BTF-load syscall, gate attestation, admission injection, info
+/// query, credential snapshot, link creation); selection, fixup,
+/// retry, classification, ordering, and ownership decisions stay in
+/// the real code. Production always passes `None` and takes the
+/// real path; lifecycle attachment has no scripted form (its writer
+/// is unmintable without the gate), so scripted order probes use
+/// tracing roots and scripted lifecycle attach is a refusal.
+trait LoadBoundaryOps {
+    /// One scripted load attempt. `name` identifies the root under
+    /// load, `btf_fd` the live program-BTF FD when the input took
+    /// the BTF path (scripts assert presence and stability across
+    /// the quiet/logged pair), and `log` the actual attempt buffer
+    /// (`None` for quiet attempts): scripts observe its ceiling and
+    /// may fill it with distinctive bytes, which the real
+    /// classification then retains.
+    fn load_attempt(
+        &self,
+        kind: AttemptKind,
+        name: &str,
+        insns: &[u8],
+        btf_fd: Option<i32>,
+        log: Option<&mut [u8]>,
+    ) -> ossl_bpf_sys::ProgLoadAttempt;
+    fn btf_load(&self, btf: &[u8], log_cap: usize) -> (std::io::Result<OwnedFd>, Vec<u8>);
+    fn attest(&self, program: &OwnedFd) -> std::io::Result<()>;
+    fn inject_admit(
+        &self,
+        gate: &crate::writer_gate::WriterGate,
+        spec: &MapSpecLite,
+    ) -> std::io::Result<OwnedFd>;
+    fn info_query(&self, program: &OwnedFd) -> std::io::Result<ossl_bpf_sys::ProgramInfoSummary>;
+    fn thread_creds(&self) -> std::io::Result<ossl_bpf_sys::ThreadCredentials>;
+    fn attach_link(
+        &self,
+        program: &OwnedFd,
+        kind: ossl_bpf_sys::SourceTracingRoot,
+    ) -> std::io::Result<OwnedFd>;
+}
+
+/// One load attempt through the scripted boundary or the real
+/// loader. `log` is the actual attempt buffer (`None` for quiet
+/// attempts, the sized logged buffer otherwise): scripts observe
+/// its ceiling — asserting the production (4 MiB) versus diagnostic
+/// (16 MiB) policy — and may fill it with distinctive bytes that
+/// the real classification retains. `btf_fd` carries the live
+/// program-BTF FD number when the input took the BTF path.
+fn run_load_attempt(
+    ops: Option<&dyn LoadBoundaryOps>,
+    kind: AttemptKind,
+    name: &str,
+    insns: &[u8],
+    btf_fd: Option<i32>,
+    log: Option<&mut Vec<u8>>,
+    real: impl FnOnce(Option<&mut Vec<u8>>) -> ossl_bpf_sys::ProgLoadAttempt,
+) -> ossl_bpf_sys::ProgLoadAttempt {
+    match ops {
+        Some(ops) => ops.load_attempt(kind, name, insns, btf_fd, log.map(Vec::as_mut_slice)),
+        None => real(log),
+    }
+}
+
+/// Gate attestation through the scripted boundary or the real gate.
+fn run_attest(
+    ops: Option<&dyn LoadBoundaryOps>,
+    gate: &crate::writer_gate::WriterGate,
+    program: &OwnedFd,
+) -> std::io::Result<()> {
+    match ops {
+        Some(ops) => ops.attest(program),
+        None => gate.attest(program),
+    }
+}
+
+/// Admission-map injection through the scripted boundary or the real gate.
+fn run_inject_admit(
+    ops: Option<&dyn LoadBoundaryOps>,
+    gate: &crate::writer_gate::WriterGate,
+    spec: &MapSpecLite,
+) -> std::io::Result<OwnedFd> {
+    match ops {
+        Some(ops) => ops.inject_admit(gate, spec),
+        None => gate.inject(spec),
+    }
+}
+
+/// Final safe-info observation for one loaded program: credential
+/// snapshot, info query, credential snapshot. Unchanged credentials
+/// with query privilege plus a decodable reply yield the loaded ID
+/// and summary; anything else records the precise unavailability
+/// reason. Never fails: the load stands with or without metadata.
+fn observe_loaded_program(
+    program: &OwnedFd,
+    diag: &mut LoadDiagnostics,
+    ops: Option<&dyn LoadBoundaryOps>,
+) {
+    diag.stage = LoadStage::InfoQuery;
+    let creds_before = match ops {
+        Some(ops) => ops.thread_creds(),
+        None => ossl_bpf_sys::calling_thread_credentials(),
+    };
+    let summary = match ops {
+        Some(ops) => ops.info_query(program),
+        None => ossl_bpf_sys::program_info_summary(program.as_fd()),
+    };
+    let creds_after = match ops {
+        Some(ops) => ops.thread_creds(),
+        None => ossl_bpf_sys::calling_thread_credentials(),
+    };
+    let mut unavailable = |reason: String| {
+        diag.loaded_id = None;
+        diag.info = None;
+        diag.info_unavailable = Some(reason);
+        diag.query_creds = None;
+    };
+    let (before, after) = match (creds_before, creds_after) {
+        (Ok(before), Ok(after)) => (before, after),
+        (Err(error), _) | (_, Err(error)) => {
+            unavailable(format!("credentials unavailable: {error}"));
+            return;
+        }
+    };
+    if before != after {
+        unavailable("credentials changed around info query".to_owned());
+        return;
+    }
+    if !ossl_bpf_sys::has_bpf_query_capabilities(&before) {
+        unavailable("query privilege missing".to_owned());
+        return;
+    }
+    match summary {
+        Ok(summary) => {
+            diag.loaded_id = Some(summary.prog_id);
+            diag.info = Some(summary);
+            diag.info_unavailable = None;
+            diag.query_creds = Some(before);
+        }
+        Err(error) => unavailable(format!("info query refused: {error}")),
+    }
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Load one checked source root without attaching: selection,
+/// return-mode/callback/gate checks, map fixup, quiet-first logged
+/// load, and gate attestation. Returns the attested unattached
+/// program. Carries its own checks and never assumes a group
+/// preflight ran; the diagnostic caller stops at the returned FD.
+pub(crate) fn load_source_root_unattached(
+    root: &PreparedProg,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    attach_btf_id: u32,
+    gate: &crate::writer_gate::WriterGate,
+) -> anyhow::Result<OwnedFd> {
+    load_source_root_inner(root, source_maps, legacy, attach_btf_id, gate, None, None)
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Observed single-root load for the diagnostic: runs the shared
+/// implementation and pushes exactly one per-root record (loaded or
+/// refused) into `records`. Never attaches.
+pub(crate) fn load_source_root_unattached_observed(
+    root: &PreparedProg,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    attach_btf_id: u32,
+    gate: &crate::writer_gate::WriterGate,
+    artifact: ArtifactPins,
+    records: &mut Vec<LoadDiagnostics>,
+) -> anyhow::Result<OwnedFd> {
+    let mut record = LoadDiagnostics::unattempted(&root.name, &root.section, artifact);
+    let outcome = load_source_root_inner(
+        root,
+        source_maps,
+        legacy,
+        attach_btf_id,
+        gate,
+        Some(&mut record),
+        None,
+    );
+    if let Err(error) = outcome.as_ref() {
+        record.error = Some(format!("{error:#}"));
+    }
+    records.push(record);
+    outcome
+}
+
+/// Shared single-root implementation: the exact per-root checks,
+/// fixup, quiet-first logged load, and attestation the production
+/// loop ran inline. `record` threads one observed record through
+/// the real decisions (production passes `None`); `ops` scripts
+/// the syscall boundary for host-only tests (production: `None`).
+/// No attach operation exists on this seam by construction.
+fn load_source_root_inner(
+    root: &PreparedProg,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    attach_btf_id: u32,
+    gate: &crate::writer_gate::WriterGate,
+    record: Option<&mut LoadDiagnostics>,
+    ops: Option<&dyn LoadBoundaryOps>,
+) -> anyhow::Result<OwnedFd> {
+    use anyhow::Context as _;
+    let mut record = record;
+    let observed = record.is_some();
+    if let Some(record) = record.as_deref_mut() {
+        record.stage = LoadStage::Preflight;
+        record.callback_subprogs = root.subprogs.iter().filter(|s| s.is_callback).count();
+    }
+    anyhow::ensure!(attach_btf_id != 0, "source load requires nonzero FUNC ID");
+    anyhow::ensure!(
+        gate.preparing(),
+        "source roots load only under the unopened gate"
+    );
+    // The complete map set, shared with the group loader: the seam
+    // refuses a half-built map set before touching this root, even
+    // when the root itself references only a subset.
+    check_source_map_presence(source_maps, legacy)?;
+    let kind = classify_source_root(root)?;
+    anyhow::ensure!(!root.is_return, "source root forbids return mode");
+    anyhow::ensure!(
+        !root.subprogs.iter().any(|s| s.is_callback),
+        "source root forbids callback BTF"
+    );
+    anyhow::ensure!(
+        root.map_fixups.iter().any(|f| f.map == "ADMIT"),
+        "source root lacks shared-gate fixup"
+    );
+    if let Some(record) = record.as_deref_mut() {
+        let (prog_type, expected_attach) = match kind {
+            SourceRootKind::Tracing(tr) => (26, tr.attach_type()),
+            SourceRootKind::Lifecycle(_) => (17, 0),
+        };
+        record.prog_type = prog_type;
+        record.expected_attach = expected_attach;
+        record.attach_target = match kind {
+            SourceRootKind::Tracing(_) => attach_btf_id,
+            SourceRootKind::Lifecycle(_) => 0,
+        };
+        record.prog_flags = 0;
+        record.stage = LoadStage::Fixup;
+    }
+    let mut insns = root.insns.clone();
+    // Allocated only on push, which happens for observed loads alone.
+    let mut sites = Vec::new();
+    for fixup in &root.map_fixups {
+        anyhow::ensure!(
+            SOURCE_FIXUP_MAPS.contains(&fixup.map.as_str()),
+            "source fixup to unreviewed map {}",
+            fixup.map
+        );
+        check_ld_imm64_site(&insns, fixup.insn_off, &root.name)?;
+        let fd = source_maps
+            .get(fixup.map.as_str())
+            .map(|owned| owned.as_fd())
+            .or_else(|| legacy.maps.get(&fixup.map).map(|owned| owned.as_fd()))
+            .ok_or_else(|| anyhow::anyhow!("source fixup unresolved {}", fixup.map))?;
+        let slot = insns
+            .get_mut(fixup.insn_off..fixup.insn_off + 8)
+            .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", root.name))?;
+        // Same validated ld_imm64 relocation and BPF_PSEUDO_MAP_FD rewrite
+        // as load_prog: the compiler emits map sites with src=0.
+        slot[1] = (slot[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
+        slot[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
+        if record.is_some() {
+            sites.push(FixupSite {
+                insn_off: fixup.insn_off,
+                role: ImageChangeRole::MapFd {
+                    map: fixup.map.clone(),
+                    fd: fd.as_raw_fd(),
+                },
+            });
+        }
+        if let Some(record) = record.as_deref_mut() {
+            record.maps.push((fixup.map.clone(), fd.as_raw_fd()));
+        }
+    }
+    if let Some(record) = record.as_deref_mut() {
+        record.fixup_audit = audit_fixup_image(&root.insns, &insns, &sites)
+            .with_context(|| format!("fixup audit {}", root.name))?;
+    }
+    // Production keeps its 4 MiB logged ceiling; the observed
+    // diagnostic alone uses the reviewed 16 MiB ceiling.
+    let log_cap = if record.is_some() { 16 << 20 } else { 4 << 20 };
+    let attempt_kind = match kind {
+        SourceRootKind::Tracing(tr) => AttemptKind::SourceRegistration(tr, attach_btf_id),
+        SourceRootKind::Lifecycle(lc) => AttemptKind::Lifecycle(lc),
+    };
+    if let Some(record) = record.as_deref_mut() {
+        record.stage = LoadStage::QuietLoad;
+    }
+    let quiet =
+        run_load_attempt(
+            ops,
+            attempt_kind,
+            &root.name,
+            &insns,
+            None,
+            None,
+            |_log| match kind {
+                SourceRootKind::Tracing(tr) => {
+                    ossl_bpf_sys::prog_load_source_attempt(&insns, tr, attach_btf_id, None)
+                }
+                SourceRootKind::Lifecycle(lc) => {
+                    ossl_bpf_sys::prog_load_lifecycle_attempt(&insns, lc, None)
+                }
+            },
+        );
+    if let Some(record) = record.as_deref_mut() {
+        record.quiet_errno = quiet.result.as_ref().err().and_then(|e| e.raw_os_error());
+    }
+    let program = match quiet.result {
+        Ok(fd) => fd,
+        Err(first) => {
+            if let Some(record) = record.as_deref_mut() {
+                record.stage = LoadStage::LoggedLoad;
+            }
+            let mut log = vec![0u8; log_cap];
+            let logged = run_load_attempt(
+                ops,
+                attempt_kind,
+                &root.name,
+                &insns,
+                None,
+                Some(&mut log),
+                |log| match kind {
+                    SourceRootKind::Tracing(tr) => ossl_bpf_sys::prog_load_source_attempt(
+                        &insns,
+                        tr,
+                        attach_btf_id,
+                        log.map(Vec::as_mut_slice),
+                    ),
+                    SourceRootKind::Lifecycle(lc) => ossl_bpf_sys::prog_load_lifecycle_attempt(
+                        &insns,
+                        lc,
+                        log.map(Vec::as_mut_slice),
+                    ),
+                },
+            );
+            if let Some(record) = record.as_deref_mut() {
+                let logged_errno = logged.result.as_ref().err().and_then(|e| e.raw_os_error());
+                record.logged_errno = logged_errno;
+                let (used, completeness) = classify_log(&log, logged.log_true_size, logged_errno);
+                record.log_bytes = used;
+                record.log_true_size = logged.log_true_size;
+                record.log_completeness = completeness;
+            }
+            match logged.result {
+                Ok(fd) => fd,
+                Err(error) => {
+                    let full = trim_nul(&log);
+                    let detail = String::from_utf8_lossy(full)
+                        .chars()
+                        .take(2000)
+                        .collect::<String>();
+                    // Production spills to its temp file; observed
+                    // loads keep the bytes in-record for the
+                    // grant-supplied evidence destination instead.
+                    let spill = if observed {
+                        None
+                    } else {
+                        spill_verifier_log(&root.name, full)
+                            .map(|path| format!("\n(full verifier log: {})", path.display()))
+                    };
+                    anyhow::bail!(
+                        "source prog_load {}: {error} (quiet: {first})\n{detail}{}",
+                        root.name,
+                        spill.unwrap_or_default()
+                    );
+                }
+            }
+        }
+    };
+    if let Some(record) = record.as_deref_mut() {
+        record.stage = LoadStage::Attestation;
+    }
+    run_attest(ops, gate, &program)
+        .with_context(|| format!("source program {} missing shared gate", root.name))?;
+    if let Some(record) = record {
+        observe_loaded_program(&program, record, ops);
+        record.stage = LoadStage::Loaded;
+    }
+    Ok(program)
+}
+
 /// Load the checked source half under the closed gate: resolve every map
 /// fixup against the owner's source/control maps plus the session's legacy
 /// maps, load fentry/fexit roots through the finite tracing loader and raw
@@ -3044,16 +4301,20 @@ pub(crate) fn load_source_roots(
     attach_btf_id: u32,
     gate: &crate::writer_gate::WriterGate,
 ) -> anyhow::Result<SourceLoaded> {
-    use anyhow::Context as _;
-    anyhow::ensure!(attach_btf_id != 0, "source load requires nonzero FUNC ID");
-    anyhow::ensure!(
-        gate.preparing(),
-        "source roots load only under the unopened gate"
-    );
-    anyhow::ensure!(
-        prepared.progs.len() == 4,
-        "source half must hold exactly four roots"
-    );
+    load_source_roots_inner(prepared, source_maps, legacy, attach_btf_id, gate, None)
+}
+
+/// Complete source-map presence validation, shared by the group
+/// loader and the singleton seam: every reviewed fixup map must be
+/// present on its owning side (the four legacy maps on the legacy
+/// load, the rest owned by the source maps) before any root loads.
+/// A singleton that checked only its own root's references could
+/// load into a half-built map set; the seam carries the whole check
+/// and never assumes a group preflight ran.
+fn check_source_map_presence(
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+) -> anyhow::Result<()> {
     for name in SOURCE_FIXUP_MAPS {
         if matches!(name, "CONFIG" | "MEMBERS" | "NAMESPACE" | "ADMIT") {
             anyhow::ensure!(
@@ -3067,121 +4328,60 @@ pub(crate) fn load_source_roots(
             );
         }
     }
+    Ok(())
+}
+
+/// Shared production loop: group preflight, then per-root
+/// load/attest/attach strictly in prepared order through the
+/// single-root seam. `ops` scripts the load/attest/link boundary for
+/// host-only order probes (production: `None`); the lifecycle arm
+/// always takes the real gate path.
+fn load_source_roots_inner(
+    prepared: &Prepared,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    attach_btf_id: u32,
+    gate: &crate::writer_gate::WriterGate,
+    ops: Option<&dyn LoadBoundaryOps>,
+) -> anyhow::Result<SourceLoaded> {
+    use anyhow::Context as _;
+    anyhow::ensure!(attach_btf_id != 0, "source load requires nonzero FUNC ID");
+    anyhow::ensure!(
+        gate.preparing(),
+        "source roots load only under the unopened gate"
+    );
+    anyhow::ensure!(
+        prepared.progs.len() == 4,
+        "source half must hold exactly four roots"
+    );
+    check_source_map_presence(source_maps, legacy)?;
     let mut loaded = SourceLoaded {
         programs: std::collections::HashMap::with_capacity(4),
         links: std::collections::HashMap::with_capacity(2),
         lifecycle: Vec::with_capacity(2),
     };
     for root in &prepared.progs {
-        let tracing = match (root.name.as_str(), root.section.as_str()) {
-            ("source_reg_in", "fentry/uprobe_register") => {
-                Some(ossl_bpf_sys::SourceTracingRoot::Enter)
-            }
-            ("source_reg_out", "fexit/uprobe_register") => {
-                Some(ossl_bpf_sys::SourceTracingRoot::Exit)
-            }
-            _ => None,
-        };
-        let raw = if tracing.is_none() {
-            selected_lifecycle(&root.name, &root.section)
-        } else {
-            None
-        };
-        anyhow::ensure!(
-            tracing.is_some() || raw.is_some(),
-            "unselected source root {}:{}",
-            root.name,
-            root.section
-        );
-        anyhow::ensure!(!root.is_return, "source root forbids return mode");
-        anyhow::ensure!(
-            !root.subprogs.iter().any(|s| s.is_callback),
-            "source root forbids callback BTF"
-        );
-        anyhow::ensure!(
-            root.map_fixups.iter().any(|f| f.map == "ADMIT"),
-            "source root lacks shared-gate fixup"
-        );
-        let mut insns = root.insns.clone();
-        for fixup in &root.map_fixups {
-            anyhow::ensure!(
-                SOURCE_FIXUP_MAPS.contains(&fixup.map.as_str()),
-                "source fixup to unreviewed map {}",
-                fixup.map
-            );
-            check_ld_imm64_site(&insns, fixup.insn_off, &root.name)?;
-            let fd = source_maps
-                .get(fixup.map.as_str())
-                .map(|owned| owned.as_fd())
-                .or_else(|| legacy.maps.get(&fixup.map).map(|owned| owned.as_fd()))
-                .ok_or_else(|| anyhow::anyhow!("source fixup unresolved {}", fixup.map))?;
-            let slot = insns
-                .get_mut(fixup.insn_off..fixup.insn_off + 8)
-                .ok_or_else(|| anyhow::anyhow!("{}: fixup out of range", root.name))?;
-            // Same validated ld_imm64 relocation and BPF_PSEUDO_MAP_FD rewrite
-            // as load_prog: the compiler emits map sites with src=0.
-            slot[1] = (slot[1] & 0x0f) | (BPF_PSEUDO_MAP_FD << 4);
-            slot[4..8].copy_from_slice(&(fd.as_raw_fd() as u32).to_le_bytes());
-        }
-        // Quiet load first, logged retry on failure (same rationale as
-        // load_prog: success needs no diagnostics; failure needs the report).
-        let quiet = match (tracing, raw) {
-            (Some(kind), None) => {
-                ossl_bpf_sys::prog_load_source_registration(&insns, kind, attach_btf_id, None)
-            }
-            (None, Some(kind)) => ossl_bpf_sys::prog_load_lifecycle(&insns, kind, None),
-            _ => unreachable!("selected exactly one root kind"),
-        };
-        let program = match quiet {
-            Ok(fd) => fd,
-            Err(first) => {
-                let mut log = vec![0u8; 4 << 20];
-                let logged = match (tracing, raw) {
-                    (Some(kind), None) => ossl_bpf_sys::prog_load_source_registration(
-                        &insns,
-                        kind,
-                        attach_btf_id,
-                        Some(&mut log),
-                    ),
-                    (None, Some(kind)) => {
-                        ossl_bpf_sys::prog_load_lifecycle(&insns, kind, Some(&mut log))
+        let program =
+            load_source_root_inner(root, source_maps, legacy, attach_btf_id, gate, None, ops)?;
+        match classify_source_root(root)? {
+            SourceRootKind::Tracing(kind) => {
+                let link = match ops {
+                    Some(ops) => ops
+                        .attach_link(&program, kind)
+                        .with_context(|| format!("source link_create {}", root.name))?,
+                    None => {
+                        ossl_bpf_sys::link_create_source_registration(program.as_raw_fd(), kind)
+                            .with_context(|| format!("source link_create {}", root.name))?
                     }
-                    _ => unreachable!("selected exactly one root kind"),
                 };
-                match logged {
-                    Ok(fd) => fd,
-                    Err(error) => {
-                        let full = trim_nul(&log);
-                        let detail = String::from_utf8_lossy(full)
-                            .chars()
-                            .take(2000)
-                            .collect::<String>();
-                        let spill = spill_verifier_log(&root.name, full)
-                            .map(|path| format!("\n(full verifier log: {})", path.display()));
-                        anyhow::bail!(
-                            "source prog_load {}: {error} (quiet: {first})\n{detail}{}",
-                            root.name,
-                            spill.unwrap_or_default()
-                        );
-                    }
-                }
-            }
-        };
-        gate.attest(&program)
-            .with_context(|| format!("source program {} missing shared gate", root.name))?;
-        match (tracing, raw) {
-            (Some(kind), None) => {
-                let link = ossl_bpf_sys::link_create_source_registration(program.as_raw_fd(), kind)
-                    .with_context(|| format!("source link_create {}", root.name))?;
                 loaded.links.insert(root.name.clone(), link);
             }
-            (None, Some(kind)) => {
+            SourceRootKind::Lifecycle(kind) => {
                 let writer = gate
                     .attach_lifecycle(&program, kind)
                     .with_context(|| format!("source lifecycle attach {}", root.name))?;
                 loaded.lifecycle.push(writer);
             }
-            _ => unreachable!("selected exactly one root kind"),
         }
         loaded.programs.insert(root.name.clone(), program);
     }
@@ -3273,13 +4473,57 @@ fn collect_typed_fixup_maps(
     }
     Ok(maps)
 }
+/// Load the typed roots against borrowed maps without attaching:
+/// fixups resolve against the owner's source/producer/control maps
+/// plus the session's legacy maps (same surface as
+/// `load_source_roots`), programs load through the shared kprobe
+/// loader with per-writer gate attestation, and links are created
+/// later per typed export. Needs caps. Maps are borrowed and stay
+/// with their owners; programs are returned. Typed roots take no
+/// callback BTF path (prepare refuses first; this seam re-checks).
 pub(crate) fn load_typed_borrowed(
     prepared: &Prepared,
     source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
     legacy: &Loaded,
     gate: &crate::writer_gate::WriterGate,
 ) -> anyhow::Result<std::collections::HashMap<String, OwnedFd>> {
+    load_typed_borrowed_inner(prepared, source_maps, legacy, gate, None, None)
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Observed typed load for the diagnostic: runs the shared
+/// implementation and pushes one per-root record per attempted root
+/// into `records`. Never attaches.
+pub(crate) fn load_typed_borrowed_observed(
+    prepared: &Prepared,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    gate: &crate::writer_gate::WriterGate,
+    artifact: ArtifactPins,
+    records: &mut Vec<LoadDiagnostics>,
+) -> anyhow::Result<std::collections::HashMap<String, OwnedFd>> {
+    load_typed_borrowed_inner(
+        prepared,
+        source_maps,
+        legacy,
+        gate,
+        Some(DiagCtx { records, artifact }),
+        None,
+    )
+}
+
+fn load_typed_borrowed_inner(
+    prepared: &Prepared,
+    source_maps: &std::collections::BTreeMap<&'static str, OwnedFd>,
+    legacy: &Loaded,
+    gate: &crate::writer_gate::WriterGate,
+    diag: Option<DiagCtx<'_>>,
+    ops: Option<&dyn LoadBoundaryOps>,
+) -> anyhow::Result<std::collections::HashMap<String, OwnedFd>> {
     use anyhow::Context as _;
+    let mut diag = diag;
     anyhow::ensure!(
         prepared.progs.len() == 2
             && prepared.progs.iter().any(|p| p.name == "typed_entry")
@@ -3290,27 +4534,68 @@ pub(crate) fn load_typed_borrowed(
     // program-to-map references after load, and every map stays owned by
     // its session-side owner. Nothing here outlives this call except the
     // returned unattached programs.
-    let maps = collect_typed_fixup_maps(prepared, source_maps, legacy)?;
+    let maps = match collect_typed_fixup_maps(prepared, source_maps, legacy) {
+        Ok(maps) => maps,
+        Err(error) => {
+            if let Some(ctx) = diag.as_mut() {
+                for p in &prepared.progs {
+                    let mut record =
+                        LoadDiagnostics::unattempted(&p.name, &p.section, ctx.artifact);
+                    record.stage = LoadStage::MapSetup;
+                    record.error = Some(format!("{error:#}"));
+                    ctx.records.push(record);
+                }
+            }
+            return Err(error);
+        }
+    };
     let mut programs = std::collections::HashMap::with_capacity(2);
     for p in &prepared.progs {
-        for fixup in &p.map_fixups {
+        let mut record = diag.as_ref().map(|ctx| {
+            let mut record = LoadDiagnostics::unattempted(&p.name, &p.section, ctx.artifact);
+            record.stage = LoadStage::MapSetup;
+            record
+        });
+        let outcome = (|| -> anyhow::Result<OwnedFd> {
             anyhow::ensure!(
-                SOURCE_FIXUP_MAPS.contains(&fixup.map.as_str()),
-                "typed fixup to unreviewed map {}",
-                fixup.map
+                !p.subprogs.iter().any(|s| s.is_callback),
+                "typed root forbids callback BTF"
             );
+            for fixup in &p.map_fixups {
+                anyhow::ensure!(
+                    SOURCE_FIXUP_MAPS.contains(&fixup.map.as_str()),
+                    "typed fixup to unreviewed map {}",
+                    fixup.map
+                );
+            }
+            anyhow::ensure!(
+                p.map_fixups.iter().any(|f| f.map == "ADMIT"),
+                "typed root lacks shared-gate fixup"
+            );
+            let fd = load_prog_inner(p, &maps, true, None, record.as_mut(), ops)
+                .with_context(|| format!("typed prog_load {}", p.name))?;
+            if let Some(record) = record.as_mut() {
+                record.stage = LoadStage::Attestation;
+            }
+            run_attest(ops, gate, &fd)
+                .with_context(|| format!("typed program {} missing shared gate", p.name))?;
+            if let Some(record) = record.as_mut() {
+                observe_loaded_program(&fd, record, ops);
+                record.stage = LoadStage::Loaded;
+            }
+            // Deliberately unattached: typed links are created per admitted
+            // export with per-site cookies, never bulk at load.
+            Ok(fd)
+        })();
+        if let Some(ctx) = diag.as_mut() {
+            if let Some(mut record) = record {
+                if let Err(error) = outcome.as_ref() {
+                    record.error = Some(format!("{error:#}"));
+                }
+                ctx.records.push(record);
+            }
         }
-        anyhow::ensure!(
-            p.map_fixups.iter().any(|f| f.map == "ADMIT"),
-            "typed root lacks shared-gate fixup"
-        );
-        let fd = load_prog(p, &maps, true, None)
-            .with_context(|| format!("typed prog_load {}", p.name))?;
-        gate.attest(&fd)
-            .with_context(|| format!("typed program {} missing shared gate", p.name))?;
-        // Deliberately unattached: typed links are created per admitted
-        // export with per-site cookies, never bulk at load.
-        programs.insert(p.name.clone(), fd);
+        programs.insert(p.name.clone(), outcome?);
     }
     Ok(programs)
 }
@@ -3324,7 +4609,40 @@ pub(crate) fn load_gated_borrowed(
     gate: &crate::writer_gate::WriterGate,
     borrowed: &std::collections::BTreeMap<String, std::os::fd::BorrowedFd<'_>>,
 ) -> anyhow::Result<GatedLoaded> {
+    load_gated_borrowed_inner(prep, gate, borrowed, None, None)
+}
+
+/// Diagnostic-evidence surface: exercised by host unit tests and the
+/// ignored load-only diagnostic, not by production paths.
+#[allow(dead_code)]
+/// Observed borrowed load for the diagnostic (the count root):
+/// pushes one per-root record per attempted root. Never attaches;
+/// the lifecycle vector stays empty exactly as in production.
+pub(crate) fn load_gated_borrowed_observed(
+    prep: &Prepared,
+    gate: &crate::writer_gate::WriterGate,
+    borrowed: &std::collections::BTreeMap<String, std::os::fd::BorrowedFd<'_>>,
+    artifact: ArtifactPins,
+    records: &mut Vec<LoadDiagnostics>,
+) -> anyhow::Result<GatedLoaded> {
+    load_gated_borrowed_inner(
+        prep,
+        gate,
+        borrowed,
+        Some(DiagCtx { records, artifact }),
+        None,
+    )
+}
+
+fn load_gated_borrowed_inner(
+    prep: &Prepared,
+    gate: &crate::writer_gate::WriterGate,
+    borrowed: &std::collections::BTreeMap<String, std::os::fd::BorrowedFd<'_>>,
+    diag: Option<DiagCtx<'_>>,
+    ops: Option<&dyn LoadBoundaryOps>,
+) -> anyhow::Result<GatedLoaded> {
     use anyhow::Context as _;
+    let mut diag = diag;
     anyhow::ensure!(
         prep.maps.iter().filter(|m| m.name == "ADMIT").count() == 1,
         "missing shared writer map"
@@ -3338,23 +4656,60 @@ pub(crate) fn load_gated_borrowed(
         }
     }
     let mut maps: HashMap<String, OwnedFd> = HashMap::with_capacity(prep.maps.len());
-    for m in &prep.maps {
-        let fd = if m.name == "ADMIT" {
-            gate.inject(m)?
-        } else if let Some(shared) = borrowed.get(m.name.as_str()) {
-            shared
-                .try_clone_to_owned()
-                .with_context(|| format!("borrow dup {}", m.name))?
-        } else {
-            create_native_map(m).with_context(|| format!("map_create {}", m.name))?
-        };
-        maps.insert(m.name.clone(), fd);
+    let maps_outcome = (|| -> anyhow::Result<()> {
+        for m in &prep.maps {
+            let fd = if m.name == "ADMIT" {
+                run_inject_admit(ops, gate, m)?
+            } else if let Some(shared) = borrowed.get(m.name.as_str()) {
+                shared
+                    .try_clone_to_owned()
+                    .with_context(|| format!("borrow dup {}", m.name))?
+            } else {
+                create_native_map(m).with_context(|| format!("map_create {}", m.name))?
+            };
+            maps.insert(m.name.clone(), fd);
+        }
+        Ok(())
+    })();
+    if let Err(error) = maps_outcome.as_ref() {
+        if let Some(ctx) = diag.as_mut() {
+            for p in &prep.progs {
+                let mut record = LoadDiagnostics::unattempted(&p.name, &p.section, ctx.artifact);
+                record.stage = LoadStage::MapSetup;
+                record.error = Some(format!("{error:#}"));
+                ctx.records.push(record);
+            }
+        }
     }
+    maps_outcome?;
     let mut progs: HashMap<String, OwnedFd> = HashMap::with_capacity(prep.progs.len());
     for p in &prep.progs {
-        let fd = load_prog(p, &maps, true, None)?;
-        gate.attest(&fd)?;
-        progs.insert(p.name.clone(), fd);
+        let mut record = diag.as_ref().map(|ctx| {
+            let mut record = LoadDiagnostics::unattempted(&p.name, &p.section, ctx.artifact);
+            record.stage = LoadStage::MapSetup;
+            record
+        });
+        let outcome = (|| -> anyhow::Result<OwnedFd> {
+            let fd = load_prog_inner(p, &maps, true, None, record.as_mut(), ops)?;
+            if let Some(record) = record.as_mut() {
+                record.stage = LoadStage::Attestation;
+            }
+            run_attest(ops, gate, &fd)?;
+            if let Some(record) = record.as_mut() {
+                observe_loaded_program(&fd, record, ops);
+                record.stage = LoadStage::Loaded;
+            }
+            Ok(fd)
+        })();
+        if let Some(ctx) = diag.as_mut() {
+            if let Some(mut record) = record {
+                if let Err(error) = outcome.as_ref() {
+                    record.error = Some(format!("{error:#}"));
+                }
+                ctx.records.push(record);
+            }
+        }
+        progs.insert(p.name.clone(), outcome?);
     }
     Ok(GatedLoaded {
         lifecycle: Vec::new(),
@@ -3367,6 +4722,17 @@ pub(crate) fn load_controlled(
     stage: crate::capture::BoundaryStage,
 ) -> anyhow::Result<Loaded> {
     load_with_custody(prep, Some((links, stage)), None)
+}
+
+fn load_with_custody(
+    prep: &Prepared,
+    setup: Option<(
+        &crate::capture_setup::SetupLinks,
+        crate::capture::BoundaryStage,
+    )>,
+    gate: Option<&crate::writer_gate::WriterGate>,
+) -> anyhow::Result<Loaded> {
+    load_with_custody_inner(prep, setup, gate, None, None)
 }
 #[cfg(test)]
 thread_local! {static HOST_NATIVE_MAP:std::cell::RefCell<Option<OwnedFd>>=const {std::cell::RefCell::new(None)};}
@@ -3416,14 +4782,17 @@ pub(crate) fn host_acquisition_history(blocked: bool) {
     drop(loaded);
     assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
 }
-fn load_with_custody(
+fn load_with_custody_inner(
     prep: &Prepared,
     setup: Option<(
         &crate::capture_setup::SetupLinks,
         crate::capture::BoundaryStage,
     )>,
     gate: Option<&crate::writer_gate::WriterGate>,
+    diag: Option<DiagCtx<'_>>,
+    ops: Option<&dyn LoadBoundaryOps>,
 ) -> anyhow::Result<Loaded> {
+    let mut diag = diag;
     anyhow::ensure!(
         gate.is_some() || !prep.maps.iter().any(|m| m.name == "ADMIT"),
         "shared writer map requires typed injection"
@@ -3451,26 +4820,68 @@ fn load_with_custody(
     // Every returned FD enters it before another effect can begin.
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
-            for m in &prep.maps {
-                if let Some((links, stage)) = setup {
-                    links.check_owned(stage)?;
+            let maps_outcome = (|| -> anyhow::Result<()> {
+                for m in &prep.maps {
+                    if let Some((links, stage)) = setup {
+                        links.check_owned(stage)?;
+                    }
+                    let fd = if m.name == "ADMIT" {
+                        run_inject_admit(ops, gate.context("shared gate missing")?, m)?
+                    } else {
+                        create_native_map(m).with_context(|| format!("map_create {}", m.name))?
+                    };
+                    loaded.maps.insert(m.name.clone(), fd);
                 }
-                let fd = if m.name == "ADMIT" {
-                    gate.context("shared gate missing")?.inject(m)?
-                } else {
-                    create_native_map(m).with_context(|| format!("map_create {}", m.name))?
-                };
-                loaded.maps.insert(m.name.clone(), fd);
+                Ok(())
+            })();
+            // A map-setup failure belongs to every root of this half:
+            // record the blocking stage explicitly instead of leaving
+            // the half silently unpushed.
+            if let Err(error) = maps_outcome.as_ref() {
+                if let Some(ctx) = diag.as_mut() {
+                    for p in &prep.progs {
+                        let mut record =
+                            LoadDiagnostics::unattempted(&p.name, &p.section, ctx.artifact);
+                        record.stage = LoadStage::MapSetup;
+                        record.error = Some(format!("{error:#}"));
+                        ctx.records.push(record);
+                    }
+                }
             }
+            maps_outcome?;
             for p in &prep.progs {
                 if let Some((links, stage)) = setup {
                     links.check_owned(stage)?;
                 }
-                let fd = load_prog(p, &loaded.maps, true, setup)?;
-                if let Some(gate) = gate {
-                    gate.attest(&fd)?;
+                let mut record = diag.as_ref().map(|ctx| {
+                    let mut record =
+                        LoadDiagnostics::unattempted(&p.name, &p.section, ctx.artifact);
+                    record.stage = LoadStage::MapSetup;
+                    record
+                });
+                let outcome = (|| -> anyhow::Result<OwnedFd> {
+                    let fd = load_prog_inner(p, &loaded.maps, true, setup, record.as_mut(), ops)?;
+                    if let Some(gate) = gate {
+                        if let Some(record) = record.as_mut() {
+                            record.stage = LoadStage::Attestation;
+                        }
+                        run_attest(ops, gate, &fd)?;
+                    }
+                    if let Some(record) = record.as_mut() {
+                        observe_loaded_program(&fd, record, ops);
+                        record.stage = LoadStage::Loaded;
+                    }
+                    Ok(fd)
+                })();
+                if let Some(ctx) = diag.as_mut() {
+                    if let Some(mut record) = record {
+                        if let Err(error) = outcome.as_ref() {
+                            record.error = Some(format!("{error:#}"));
+                        }
+                        ctx.records.push(record);
+                    }
                 }
-                loaded.progs.insert(p.name.clone(), fd);
+                loaded.progs.insert(p.name.clone(), outcome?);
             }
             Ok(())
         }));
@@ -6658,6 +8069,2441 @@ mod tests {
         });
         assert!(collect_typed_fixup_maps(&missing2, &owned, &legacy).is_err());
     }
+
+    // ---- Task23A unattached-seam fixtures and scripted boundary ----
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    static TASK23A_FD_LOCK: Mutex<()> = Mutex::new(());
+
+    fn task23a_lock() -> std::sync::MutexGuard<'static, ()> {
+        TASK23A_FD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn task23a_artifact() -> ArtifactPins {
+        ArtifactPins {
+            sha256: [7u8; 32],
+            len: 1234,
+        }
+    }
+
+    /// Complete source-map fixtures: all 20 owned names plus the 4
+    /// legacy join names, derived from the allowlist itself so the
+    /// fixture cannot drift from it. Reaches past the missing-map
+    /// refusals that stop the older 9-map fixtures.
+    fn source_map_fixtures_complete() -> (std::collections::BTreeMap<&'static str, OwnedFd>, Loaded)
+    {
+        let mut owned = std::collections::BTreeMap::new();
+        let mut legacy_maps = HashMap::new();
+        for name in SOURCE_FIXUP_MAPS {
+            if matches!(name, "CONFIG" | "MEMBERS" | "NAMESPACE" | "ADMIT") {
+                legacy_maps.insert(name.to_owned(), model_fd());
+            } else {
+                owned.insert(name, model_fd());
+            }
+        }
+        (
+            owned,
+            Loaded {
+                progs: HashMap::new(),
+                maps: legacy_maps,
+            },
+        )
+    }
+
+    /// Source root with valid ld_imm64 sites (one 16-byte slot per
+    /// fixup map, src 0, reserved bytes clear).
+    fn source_root_loaded_fixture(
+        name: &str,
+        section: &str,
+        is_return: bool,
+        fixup_maps: &[&str],
+    ) -> PreparedProg {
+        let mut insns = vec![0u8; fixup_maps.len() * 16];
+        for (i, _) in fixup_maps.iter().enumerate() {
+            insns[i * 16] = BPF_LD_IMM64;
+        }
+        PreparedProg {
+            name: name.to_owned(),
+            section: section.to_owned(),
+            is_return,
+            insns,
+            map_fixups: fixup_maps
+                .iter()
+                .enumerate()
+                .map(|(i, map)| MapFixup {
+                    insn_off: i * 16,
+                    map: (*map).to_owned(),
+                })
+                .collect(),
+            subprogs: vec![SubprogInfo {
+                name: name.to_owned(),
+                insn_off: 0,
+                is_callback: false,
+            }],
+        }
+    }
+
+    fn source_half_loaded_fixture() -> Prepared {
+        Prepared {
+            progs: vec![
+                source_root_loaded_fixture(
+                    "source_reg_in",
+                    "fentry/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_out",
+                    "fexit/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "attr_exit",
+                    "raw_tracepoint/sched_process_exit",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "attr_exec",
+                    "raw_tracepoint/sched_process_exec",
+                    false,
+                    &["ADMIT"],
+                ),
+            ],
+            maps: Vec::new(),
+        }
+    }
+
+    fn legacy_pair_fixture() -> Prepared {
+        Prepared {
+            progs: vec![
+                source_root_loaded_fixture("observation_entry", "uprobe", false, &["ADMIT"]),
+                PreparedProg {
+                    subprogs: vec![SubprogInfo {
+                        name: "query_return".to_owned(),
+                        insn_off: 0,
+                        is_callback: true,
+                    }],
+                    ..source_root_loaded_fixture(
+                        "observation_return",
+                        "uretprobe",
+                        true,
+                        &["ADMIT"],
+                    )
+                },
+            ],
+            maps: Vec::new(),
+        }
+    }
+
+    fn typed_pair_fixture() -> Prepared {
+        Prepared {
+            progs: vec![
+                source_root_loaded_fixture("typed_entry", "uprobe", false, &["ADMIT"]),
+                source_root_loaded_fixture("typed_return", "uretprobe", true, &["ADMIT"]),
+            ],
+            maps: Vec::new(),
+        }
+    }
+
+    fn mark_callback(root: &mut PreparedProg) {
+        root.subprogs.push(SubprogInfo {
+            name: "cb".to_owned(),
+            insn_off: 0,
+            is_callback: true,
+        });
+    }
+
+    fn count_singleton_fixture() -> Prepared {
+        Prepared {
+            progs: vec![source_root_loaded_fixture(
+                "count_entry",
+                "uprobe",
+                false,
+                &["ADMIT"],
+            )],
+            maps: Vec::new(),
+        }
+    }
+
+    /// Real pipe pair for ownership sentinels: dropping the write end
+    /// is observable as EOF on the read end. No fabricated FDs.
+    fn sentinel_pipe() -> (std::fs::File, OwnedFd) {
+        let (read, write) = UnixStream::pair().unwrap();
+        let read: OwnedFd = read.into();
+        (read.into(), write.into())
+    }
+
+    fn assert_pipe_eof(read: &mut std::fs::File) {
+        use std::io::Read as _;
+        let mut byte = [0xAAu8; 1];
+        assert_eq!(read.read(&mut byte).unwrap(), 0, "FD still open");
+    }
+
+    fn assert_fd_open(raw: i32) {
+        assert_ne!(
+            unsafe { libc::fcntl(raw, libc::F_GETFD) },
+            -1,
+            "owned FD {raw} closed early"
+        );
+    }
+
+    /// Remove one verifier-log spill file, returning whether it existed.
+    fn take_spill(prog: &str) -> bool {
+        let safe: String = prog
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-verifier-{safe}-{}.log",
+            std::process::id()
+        ));
+        std::fs::remove_file(path).is_ok()
+    }
+
+    #[derive(Debug)]
+    enum OpEvent {
+        LoadAttempt {
+            kind: AttemptKind,
+            name: String,
+            btf_fd: Option<i32>,
+            log_len: Option<usize>,
+            src1: u8,
+            imm32: u32,
+        },
+        BtfLoad {
+            len: usize,
+            cap: usize,
+        },
+        Attest,
+        InjectAdmit,
+        InfoQuery,
+        ThreadCreds,
+        AttachLink {
+            kind: ossl_bpf_sys::SourceTracingRoot,
+        },
+    }
+
+    struct LoadScript {
+        errno: Option<i32>,
+        fd: Option<OwnedFd>,
+        true_size: u32,
+        log_fill: Vec<u8>,
+    }
+
+    impl LoadScript {
+        fn ok(fd: OwnedFd) -> Self {
+            Self {
+                errno: None,
+                fd: Some(fd),
+                true_size: 0,
+                log_fill: Vec::new(),
+            }
+        }
+
+        fn err(errno: i32, true_size: u32) -> Self {
+            Self {
+                errno: Some(errno),
+                fd: None,
+                true_size,
+                log_fill: Vec::new(),
+            }
+        }
+
+        /// Distinctive bytes the script writes into the real attempt
+        /// buffer, proving the retention path keeps actual contents.
+        fn fill(mut self, bytes: &[u8]) -> Self {
+            self.log_fill = bytes.to_vec();
+            self
+        }
+
+        fn true_size(mut self, size: u32) -> Self {
+            self.true_size = size;
+            self
+        }
+    }
+
+    /// Scripted boundary: every effect is a queued outcome, every call
+    /// is recorded. An empty queue panics, so tests prove exact call
+    /// counts. Decisions (retry, order, ownership) stay in real code.
+    struct ScriptOps {
+        events: std::cell::RefCell<Vec<OpEvent>>,
+        loads: std::cell::RefCell<VecDeque<LoadScript>>,
+        btfs: std::cell::RefCell<VecDeque<(std::io::Result<OwnedFd>, Vec<u8>)>>,
+        attests: std::cell::RefCell<VecDeque<std::io::Result<()>>>,
+        injects: std::cell::RefCell<VecDeque<std::io::Result<OwnedFd>>>,
+        infos: std::cell::RefCell<VecDeque<std::io::Result<ossl_bpf_sys::ProgramInfoSummary>>>,
+        creds_list: std::cell::RefCell<VecDeque<std::io::Result<ossl_bpf_sys::ThreadCredentials>>>,
+        links: std::cell::RefCell<VecDeque<std::io::Result<OwnedFd>>>,
+    }
+
+    impl ScriptOps {
+        fn new() -> Self {
+            Self {
+                events: std::cell::RefCell::new(Vec::new()),
+                loads: std::cell::RefCell::new(VecDeque::new()),
+                btfs: std::cell::RefCell::new(VecDeque::new()),
+                attests: std::cell::RefCell::new(VecDeque::new()),
+                injects: std::cell::RefCell::new(VecDeque::new()),
+                infos: std::cell::RefCell::new(VecDeque::new()),
+                creds_list: std::cell::RefCell::new(VecDeque::new()),
+                links: std::cell::RefCell::new(VecDeque::new()),
+            }
+        }
+
+        fn events(&self) -> Vec<OpEvent> {
+            std::mem::take(&mut *self.events.borrow_mut())
+        }
+
+        /// Every queued outcome must be consumed: leftover scripts
+        /// hide unexecuted branches, so tests assert exhaustion.
+        fn assert_exhausted(&self) {
+            assert!(self.loads.borrow().is_empty(), "unused load scripts");
+            assert!(self.btfs.borrow().is_empty(), "unused btf scripts");
+            assert!(self.attests.borrow().is_empty(), "unused attest scripts");
+            assert!(self.injects.borrow().is_empty(), "unused inject scripts");
+            assert!(self.infos.borrow().is_empty(), "unused info scripts");
+            assert!(self.creds_list.borrow().is_empty(), "unused creds scripts");
+            assert!(self.links.borrow().is_empty(), "unused link scripts");
+        }
+    }
+
+    impl LoadBoundaryOps for ScriptOps {
+        fn load_attempt(
+            &self,
+            kind: AttemptKind,
+            name: &str,
+            insns: &[u8],
+            btf_fd: Option<i32>,
+            log: Option<&mut [u8]>,
+        ) -> ossl_bpf_sys::ProgLoadAttempt {
+            // The real fixup ran before this boundary: every referenced
+            // site carries the pseudo-map-FD mark. Record the first
+            // site's rewritten bytes as evidence.
+            let (src1, imm32) = if insns.len() >= 8 {
+                (
+                    insns[1],
+                    u32::from_le_bytes(insns[4..8].try_into().unwrap()),
+                )
+            } else {
+                (0xFF, 0xFFFF_FFFF)
+            };
+            // A supplied BTF FD must be live at the attempt: the guard
+            // owns it across the whole quiet/logged pair.
+            if let Some(fd) = btf_fd {
+                assert_ne!(
+                    unsafe { libc::fcntl(fd, libc::F_GETFD) },
+                    -1,
+                    "BTF FD closed before attempt"
+                );
+            }
+            let log_len = log.as_ref().map(|buffer| buffer.len());
+            self.events.borrow_mut().push(OpEvent::LoadAttempt {
+                kind,
+                name: name.to_owned(),
+                btf_fd,
+                log_len,
+                src1,
+                imm32,
+            });
+            let script = self.loads.borrow_mut().pop_front().expect("load script");
+            if let Some(buffer) = log {
+                let fill = &script.log_fill[..script.log_fill.len().min(buffer.len())];
+                buffer[..fill.len()].copy_from_slice(fill);
+            } else {
+                assert!(
+                    script.log_fill.is_empty(),
+                    "quiet attempt takes no log bytes"
+                );
+            }
+            ossl_bpf_sys::ProgLoadAttempt {
+                result: match (script.errno, script.fd) {
+                    (None, Some(fd)) => Ok(fd),
+                    (Some(errno), None) => Err(std::io::Error::from_raw_os_error(errno)),
+                    _ => panic!("load script shape"),
+                },
+                log_true_size: script.true_size,
+            }
+        }
+
+        fn btf_load(&self, btf: &[u8], log_cap: usize) -> (std::io::Result<OwnedFd>, Vec<u8>) {
+            self.events.borrow_mut().push(OpEvent::BtfLoad {
+                len: btf.len(),
+                cap: log_cap,
+            });
+            self.btfs.borrow_mut().pop_front().expect("btf script")
+        }
+
+        fn attest(&self, _program: &OwnedFd) -> std::io::Result<()> {
+            self.events.borrow_mut().push(OpEvent::Attest);
+            self.attests
+                .borrow_mut()
+                .pop_front()
+                .expect("attest script")
+        }
+
+        fn inject_admit(
+            &self,
+            _gate: &crate::writer_gate::WriterGate,
+            _spec: &MapSpecLite,
+        ) -> std::io::Result<OwnedFd> {
+            self.events.borrow_mut().push(OpEvent::InjectAdmit);
+            self.injects
+                .borrow_mut()
+                .pop_front()
+                .expect("inject script")
+        }
+
+        fn info_query(
+            &self,
+            _program: &OwnedFd,
+        ) -> std::io::Result<ossl_bpf_sys::ProgramInfoSummary> {
+            self.events.borrow_mut().push(OpEvent::InfoQuery);
+            self.infos.borrow_mut().pop_front().expect("info script")
+        }
+
+        fn thread_creds(&self) -> std::io::Result<ossl_bpf_sys::ThreadCredentials> {
+            self.events.borrow_mut().push(OpEvent::ThreadCreds);
+            self.creds_list
+                .borrow_mut()
+                .pop_front()
+                .expect("creds script")
+        }
+
+        fn attach_link(
+            &self,
+            _program: &OwnedFd,
+            kind: ossl_bpf_sys::SourceTracingRoot,
+        ) -> std::io::Result<OwnedFd> {
+            self.events.borrow_mut().push(OpEvent::AttachLink { kind });
+            self.links.borrow_mut().pop_front().expect("link script")
+        }
+    }
+
+    fn script_summary(prog_id: u32) -> ossl_bpf_sys::ProgramInfoSummary {
+        ossl_bpf_sys::ProgramInfoSummary {
+            requested_len: 232,
+            returned_len: 232,
+            prog_type: 2,
+            prog_id,
+            name: [0u8; 16],
+            tag: [0u8; 8],
+            map_ids: vec![40],
+            own_btf_id: 0,
+            func_info_count: 0,
+            line_info_count: 0,
+            jited_line_info_count: 0,
+            func_info_rec_size: 0,
+            line_info_rec_size: 0,
+            jited_line_info_rec_size: 0,
+            attach_btf_obj_id: 0,
+            attach_btf_id: 0,
+        }
+    }
+
+    fn script_creds() -> ossl_bpf_sys::ThreadCredentials {
+        // Effective CAP_SYS_ADMIN (bit 21, set 0): query privilege.
+        ossl_bpf_sys::ThreadCredentials {
+            caps: [[1 << 21, 0, 0], [0, 0, 0]],
+            euid: 1000,
+            tid: 4242,
+            userns_dev: 1,
+            userns_ino: 2,
+        }
+    }
+
+    #[test]
+    fn task23a_complete_fixtures_cover_the_fixup_surface() {
+        let (owned, legacy) = source_map_fixtures_complete();
+        assert_eq!(owned.len(), 20);
+        assert_eq!(legacy.maps.len(), 4);
+        for name in SOURCE_FIXUP_MAPS {
+            let found = owned.contains_key(name) || legacy.maps.contains_key(name);
+            assert!(found, "fixup surface name missing: {name}");
+        }
+        assert!(legacy.maps.contains_key("ADMIT"));
+        assert!(owned.contains_key("REL"));
+        assert!(owned.contains_key("SOURCE_CONFIG"));
+    }
+
+    #[test]
+    fn task23a_audit_accepts_exact_map_fd_rewrites() {
+        let mut before = vec![0u8; 32];
+        before[0] = BPF_LD_IMM64;
+        before[16] = BPF_LD_IMM64;
+        let mut after = before.clone();
+        after[1] = BPF_PSEUDO_MAP_FD << 4;
+        after[4..8].copy_from_slice(&1234u32.to_le_bytes());
+        after[17] = BPF_PSEUDO_MAP_FD << 4;
+        after[20..24].copy_from_slice(&5678u32.to_le_bytes());
+        let entries = audit_fixup_image(
+            &before,
+            &after,
+            &[
+                FixupSite {
+                    insn_off: 0,
+                    role: ImageChangeRole::MapFd {
+                        map: "ADMIT".to_owned(),
+                        fd: 1234,
+                    },
+                },
+                FixupSite {
+                    insn_off: 16,
+                    role: ImageChangeRole::MapFd {
+                        map: "REL".to_owned(),
+                        fd: 5678,
+                    },
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].spans, vec![(1, 1), (4, 4)]);
+        assert_eq!(entries[1].spans, vec![(17, 1), (20, 4)]);
+    }
+
+    #[test]
+    fn task23a_audit_refuses_every_unchecked_change_class() {
+        fn images() -> (Vec<u8>, Vec<u8>) {
+            let mut before = vec![0u8; 32];
+            before[0] = BPF_LD_IMM64;
+            before[16] = BPF_LD_IMM64;
+            let mut after = before.clone();
+            after[1] = BPF_PSEUDO_MAP_FD << 4;
+            after[4..8].copy_from_slice(&9u32.to_le_bytes());
+            after[17] = BPF_PSEUDO_MAP_FD << 4;
+            after[20..24].copy_from_slice(&10u32.to_le_bytes());
+            (before, after)
+        }
+        fn site() -> Vec<FixupSite> {
+            vec![
+                FixupSite {
+                    insn_off: 0,
+                    role: ImageChangeRole::MapFd {
+                        map: "ADMIT".to_owned(),
+                        fd: 9,
+                    },
+                },
+                FixupSite {
+                    insn_off: 16,
+                    role: ImageChangeRole::MapFd {
+                        map: "REL".to_owned(),
+                        fd: 10,
+                    },
+                },
+            ]
+        }
+        let (before, after) = images();
+        assert!(audit_fixup_image(&before, &after, &site()).is_ok());
+        // Opcode change at a declared site.
+        let mut bad = after.clone();
+        bad[0] = 0x85;
+        assert!(audit_fixup_image(&before, &bad, &site()).is_err());
+        // Reserved-bytes change inside the slot.
+        let mut bad = after.clone();
+        bad[2] = 1;
+        assert!(audit_fixup_image(&before, &bad, &site()).is_err());
+        // Off-site byte change.
+        let mut bad = after.clone();
+        bad[31] ^= 1;
+        assert!(audit_fixup_image(&before, &bad, &site()).is_err());
+        // Length change.
+        let mut bad = after.clone();
+        bad.push(0);
+        assert!(audit_fixup_image(&before, &bad, &site()).is_err());
+        // Wrong declared FD.
+        let mut wrong = site();
+        wrong[0].role = ImageChangeRole::MapFd {
+            map: "ADMIT".to_owned(),
+            fd: 11,
+        };
+        assert!(audit_fixup_image(&before, &after, &wrong).is_err());
+        // Overlapping declarations.
+        let mut overlap = site();
+        overlap.push(overlap[0].clone());
+        assert!(audit_fixup_image(&before, &after, &overlap).is_err());
+        // Misaligned site.
+        let misaligned = vec![FixupSite {
+            insn_off: 4,
+            role: ImageChangeRole::MapFd {
+                map: "ADMIT".to_owned(),
+                fd: 9,
+            },
+        }];
+        assert!(audit_fixup_image(&before, &after, &misaligned).is_err());
+        // Non-ld_imm64 site.
+        let mut non_ld = before.clone();
+        non_ld[0] = 0x85;
+        assert!(audit_fixup_image(&non_ld, &after, &site()).is_err());
+    }
+
+    #[test]
+    fn task23a_fixup_audit_rejects_patch_roles() {
+        // Caller-declared marker/field spans refuse through the fixup
+        // interface no matter how well-formed: patch roles validate
+        // only through audit_patch_images against admitted kernel
+        // configuration, never through declared spans.
+        let before = vec![0u8; 32];
+        let mut after = before.clone();
+        after[4..8].copy_from_slice(&4242u32.to_le_bytes());
+        after[12..14].copy_from_slice(&[3u8, 4u8]);
+        for role in [
+            ImageChangeRole::MarkerKfunc {
+                marker: "bpf_iter_task_vma_new".to_owned(),
+                spans: vec![ImageSpan {
+                    start: 4,
+                    before: vec![0, 0, 0, 0],
+                    after: 4242u32.to_le_bytes().to_vec(),
+                }],
+            },
+            ImageChangeRole::ApprovedField {
+                field: "vm_start".to_owned(),
+                spans: vec![ImageSpan {
+                    start: 12,
+                    before: vec![0, 0],
+                    after: vec![3, 4],
+                }],
+            },
+        ] {
+            let sites = vec![FixupSite { insn_off: 0, role }];
+            let error = audit_fixup_image(&before, &after, &sites).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("audit_patch_images"),
+                "{error:#}"
+            );
+        }
+    }
+
+    /// Admitted patch configuration: nonzero kfunc IDs, in-extent
+    /// field offsets, 64-byte VMA.
+    fn task23a_patch_configuration() -> [u32; 13] {
+        [15, 17, 19, 0, 8, 16, 24, 32, 8, 64, 7, 320, 8]
+    }
+
+    /// Blessed helper owner carrying all nine marker slots (kfunc
+    /// call shapes first, then mov32 field shapes) inside one helper
+    /// body spanning the whole image, plus trailing exits.
+    fn task23a_patch_fixture() -> PreparedProg {
+        let mut insns = vec![0u8; 16 * 8];
+        for i in 0..3 {
+            insns[i * 8] = 0x85;
+            insns[i * 8 + 4..i * 8 + 8].copy_from_slice(&(0x7f001 + i as u32).to_le_bytes());
+        }
+        for i in 0..6 {
+            let base = (3 + i) * 8;
+            insns[base] = 0xb7;
+            insns[base + 1] = 1 + i as u8;
+            insns[base + 4..base + 8].copy_from_slice(&(0x6f001 + i as u32).to_le_bytes());
+        }
+        for i in 9..16 {
+            insns[i * 8] = 0x95;
+        }
+        PreparedProg {
+            name: "source_reg_out".to_owned(),
+            section: "fexit/uprobe_register".to_owned(),
+            is_return: false,
+            insns,
+            map_fixups: Vec::new(),
+            subprogs: vec![SubprogInfo {
+                name: "current_source_at".to_owned(),
+                insn_off: 0,
+                is_callback: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn task23a_patch_audit_accepts_real_patcher_output() {
+        let configuration = task23a_patch_configuration();
+        let before = task23a_patch_fixture();
+        let mut progs = vec![before.clone()];
+        patch_source_configuration(&configuration, &mut progs).unwrap();
+        let after = progs.into_iter().next().unwrap();
+        let entries = audit_patch_images(&before, &after, &configuration).unwrap();
+        assert_eq!(entries.len(), 9);
+        // Canonical identity names derive from slot order.
+        let names: Vec<String> = entries
+            .iter()
+            .map(|entry| match &entry.role {
+                ImageChangeRole::MarkerKfunc { marker, .. } => marker.clone(),
+                ImageChangeRole::ApprovedField { field, .. } => field.clone(),
+                ImageChangeRole::MapFd { .. } => "map".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "bpf_iter_task_vma_new",
+                "bpf_iter_task_vma_next",
+                "bpf_iter_task_vma_destroy",
+                "vm_start",
+                "vm_end",
+                "vm_pgoff",
+                "vm_flags",
+                "vm_file",
+                "f_inode",
+            ]
+        );
+        // Kfunc entries carry the call rewrite plus the ID; field
+        // entries carry the offset alone.
+        assert_eq!(entries[0].spans.len(), 2);
+        assert_eq!(entries[3].spans.len(), 1);
+        // A non-helper root with identical images audits clean.
+        let mut plain = before.clone();
+        plain.subprogs.clear();
+        plain.name = "source_reg_in".to_owned();
+        plain.section = "fentry/uprobe_register".to_owned();
+        for i in 0..9 {
+            plain.insns[(i * 8 + 4)..(i * 8 + 8)].copy_from_slice(&[0, 0, 0, 0]);
+        }
+        let entries = audit_patch_images(&plain, &plain, &configuration).unwrap();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn task23a_marker_scan_sees_only_marker_ranges() {
+        // All nine slots: seen.
+        assert!(prepared_has_source_markers(&[task23a_patch_fixture()]));
+        // Plain immediates (including zero): not markers.
+        let plain = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        assert!(!prepared_has_source_markers(&[plain]));
+        // One surviving slot among clean roots: seen.
+        let mut survivor = task23a_patch_fixture();
+        for i in 1..9 {
+            survivor.insns[(i * 8 + 4)..(i * 8 + 8)].copy_from_slice(&[0, 0, 0, 0]);
+        }
+        assert!(prepared_has_source_markers(&[survivor]));
+    }
+
+    #[test]
+    fn task23a_patch_audit_accepts_colliding_admitted_values() {
+        // Legitimate collision control: admitted replacements that
+        // numerically overlap marker values are resolved slots, not
+        // surviving markers — validated against the admitted
+        // configuration, not by shape alone.
+        let mut configuration = task23a_patch_configuration();
+        configuration[0] = 0x7f001;
+        configuration[3] = 0x6f001;
+        configuration[9] = 0x70000;
+        let before = task23a_patch_fixture();
+        let mut progs = vec![before.clone()];
+        patch_source_configuration(&configuration, &mut progs).unwrap();
+        let after = progs.into_iter().next().unwrap();
+        let entries = audit_patch_images(&before, &after, &configuration).unwrap();
+        assert_eq!(entries.len(), 9);
+    }
+
+    #[test]
+    fn task23a_patch_audit_refuses_partial_rewrite() {
+        // N9's counterexample: the call nibble rewritten but the
+        // marker immediate retained is an incomplete transformation,
+        // even though the shape looks resolved.
+        let configuration = task23a_patch_configuration();
+        let before = task23a_patch_fixture();
+        let mut progs = vec![before.clone()];
+        patch_source_configuration(&configuration, &mut progs).unwrap();
+        let mut partial = progs.into_iter().next().unwrap();
+        partial.insns[4..8].copy_from_slice(&0x7f002u32.to_le_bytes());
+        assert_eq!(partial.insns[..4], [0x85, 0x20, 0, 0]);
+        let error = audit_patch_images(&before, &partial, &configuration).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("replacement value"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn task23a_patch_audit_refuses_each_bad_transformation() {
+        let configuration = task23a_patch_configuration();
+        let before = task23a_patch_fixture();
+        let mut progs = vec![before.clone()];
+        patch_source_configuration(&configuration, &mut progs).unwrap();
+        let after = progs.into_iter().next().unwrap();
+        // Admitted-configuration ranges refuse first.
+        let mut bad_config = configuration;
+        bad_config[0] = 0;
+        assert!(audit_patch_images(&before, &after, &bad_config).is_err());
+        let mut bad_config = configuration;
+        bad_config[9] = 8;
+        assert!(audit_patch_images(&before, &after, &bad_config).is_err());
+        // Unblessed owner, marker without helper, unknown identity.
+        let mut unblessed = before.clone();
+        unblessed.name = "source_reg_in".to_owned();
+        unblessed.section = "fentry/uprobe_register".to_owned();
+        assert!(audit_patch_images(&unblessed, &after, &configuration).is_err());
+        let mut helpless = before.clone();
+        helpless.subprogs.clear();
+        assert!(audit_patch_images(&helpless, &after, &configuration).is_err());
+        let mut unknown = before.clone();
+        unknown.insns[4..8].copy_from_slice(&0x7f000u32.to_le_bytes());
+        assert!(audit_patch_images(&unknown, &after, &configuration).is_err());
+        // Duplicate identity and missing slot.
+        let mut dupe = before.clone();
+        dupe.insns[12..16].copy_from_slice(&0x7f001u32.to_le_bytes());
+        assert!(audit_patch_images(&dupe, &after, &configuration).is_err());
+        let mut missing = before.clone();
+        missing.insns[4..8].copy_from_slice(&0u32.to_le_bytes());
+        assert!(audit_patch_images(&missing, &after, &configuration).is_err());
+        // Bad pre-patch shapes.
+        let mut kfunc_shape = before.clone();
+        kfunc_shape.insns[0] = 0x95;
+        assert!(audit_patch_images(&kfunc_shape, &after, &configuration).is_err());
+        let mut field_shape = before.clone();
+        field_shape.insns[3 * 8 + 1] = 11;
+        assert!(audit_patch_images(&field_shape, &after, &configuration).is_err());
+        // Wrong replacement values and missing call rewrite.
+        let mut bad_id = after.clone();
+        bad_id.insns[4..8].copy_from_slice(&21u32.to_le_bytes());
+        assert!(audit_patch_images(&before, &bad_id, &configuration).is_err());
+        let mut bad_rewrite = after.clone();
+        bad_rewrite.insns[1] = 0;
+        assert!(audit_patch_images(&before, &bad_rewrite, &configuration).is_err());
+        let mut bad_offset = after.clone();
+        bad_offset.insns[3 * 8 + 4..3 * 8 + 8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(audit_patch_images(&before, &bad_offset, &configuration).is_err());
+        // Relabelled-opcode attacks: a changed opcode or destination
+        // fails even with the right immediate.
+        let mut opcode_swap = after.clone();
+        opcode_swap.insns[3 * 8] = 0x85;
+        assert!(audit_patch_images(&before, &opcode_swap, &configuration).is_err());
+        let mut dst_swap = after.clone();
+        dst_swap.insns[3 * 8 + 1] = 9;
+        assert!(audit_patch_images(&before, &dst_swap, &configuration).is_err());
+        let mut call_opcode = after.clone();
+        call_opcode.insns[0] = 0x95;
+        assert!(audit_patch_images(&before, &call_opcode, &configuration).is_err());
+        // Undeclared changes and non-helper drift refuse.
+        let mut stray = after.clone();
+        stray.insns[15 * 8] = 0x85;
+        assert!(audit_patch_images(&before, &stray, &configuration).is_err());
+        let mut plain = before.clone();
+        plain.subprogs.clear();
+        plain.name = "source_reg_in".to_owned();
+        for i in 0..9 {
+            plain.insns[(i * 8 + 4)..(i * 8 + 8)].copy_from_slice(&[0, 0, 0, 0]);
+        }
+        let mut drifted = plain.clone();
+        drifted.insns[0] = 0x95;
+        assert!(audit_patch_images(&plain, &drifted, &configuration).is_err());
+        let mut short = after.clone();
+        short.insns.pop();
+        assert!(audit_patch_images(&before, &short, &configuration).is_err());
+    }
+
+    #[test]
+    fn task23a_log_classification_proves_completeness() {
+        let (used, verdict) = classify_log(b"AB\0", 3, None);
+        assert_eq!(verdict, LogCompleteness::Complete);
+        assert_eq!(used, b"AB\0");
+        let (used, verdict) = classify_log(b"AB\0XXXX", 3, None);
+        assert_eq!(verdict, LogCompleteness::Complete);
+        assert_eq!(used, b"AB\0");
+        let (used, verdict) = classify_log(b"AB", 9, None);
+        assert_eq!(verdict, LogCompleteness::Truncated);
+        assert_eq!(used, b"AB");
+        let (used, verdict) = classify_log(b"AB\0", 2, None);
+        assert_eq!(verdict, LogCompleteness::Indeterminate);
+        assert_eq!(used, b"AB");
+        let (used, verdict) = classify_log(b"", 0, None);
+        assert_eq!(verdict, LogCompleteness::Indeterminate);
+        assert!(used.is_empty());
+        // A zero true size with real bytes retains the evidence.
+        let (used, verdict) = classify_log(b"oops\0\0\0", 0, None);
+        assert_eq!(verdict, LogCompleteness::Indeterminate);
+        assert_eq!(used, b"oops");
+        // ENOSPC with apparently fitting size metadata stays
+        // inconclusive, never Complete.
+        let (used, verdict) = classify_log(b"AB\0", 3, Some(libc::ENOSPC));
+        assert_eq!(verdict, LogCompleteness::Indeterminate);
+        assert_eq!(used, b"AB");
+        // Other errnos do not disturb a proven-complete log.
+        let (used, verdict) = classify_log(b"AB\0", 3, Some(libc::EACCES));
+        assert_eq!(verdict, LogCompleteness::Complete);
+        assert_eq!(used, b"AB\0");
+    }
+
+    #[test]
+    fn task23a_map_id_set_check_is_exact() {
+        assert!(check_map_id_set(&[40, 41], &[41, 40]).is_ok());
+        assert!(check_map_id_set(&[], &[]).is_ok());
+        assert!(check_map_id_set(&[40], &[40, 40]).is_err());
+        assert!(check_map_id_set(&[40], &[0]).is_err());
+        assert!(check_map_id_set(&[40], &[41]).is_err());
+        assert!(check_map_id_set(&[40, 41], &[40]).is_err());
+        assert!(check_map_id_set(&[40], &[40, 41]).is_err());
+    }
+
+    #[test]
+    fn task23a_legacy_preflight_pins_the_calibration_pair() {
+        assert!(preflight_legacy_pair(&legacy_pair_fixture()).is_ok());
+        // Wrong second name refuses before any effect.
+        let mut wrong = legacy_pair_fixture();
+        wrong.progs[1].name = "observation_entry".to_owned();
+        assert!(preflight_legacy_pair(&wrong).is_err());
+        // The return root without callback classification is no control.
+        let mut no_callback = legacy_pair_fixture();
+        no_callback.progs[1].subprogs.clear();
+        assert!(preflight_legacy_pair(&no_callback).is_err());
+        // Shape violations refuse.
+        let mut three = legacy_pair_fixture();
+        three.progs.push(three.progs[0].clone());
+        assert!(preflight_legacy_pair(&three).is_err());
+        let mut swapped = legacy_pair_fixture();
+        swapped.progs[0].section = "uretprobe".to_owned();
+        assert!(preflight_legacy_pair(&swapped).is_err());
+        let mut flipped = legacy_pair_fixture();
+        flipped.progs[0].is_return = true;
+        assert!(preflight_legacy_pair(&flipped).is_err());
+    }
+
+    #[test]
+    fn task23a_nine_root_preflight_pins_every_singleton() {
+        let legacy = legacy_pair_fixture();
+        let registration = source_half_loaded_fixture();
+        let typed = typed_pair_fixture();
+        let count = count_singleton_fixture();
+        assert!(preflight_nine_roots(&legacy, &registration, &typed, &count).is_ok());
+        // Each half fails independently.
+        let mut bad_legacy = legacy.clone();
+        bad_legacy.progs[1].name = "typed_entry".to_owned();
+        assert!(preflight_nine_roots(&bad_legacy, &registration, &typed, &count).is_err());
+        let mut short = registration.clone();
+        short.progs.pop();
+        assert!(preflight_nine_roots(&legacy, &short, &typed, &count).is_err());
+        let mut dup = registration.clone();
+        dup.progs[3] = dup.progs[0].clone();
+        assert!(preflight_nine_roots(&legacy, &dup, &typed, &count).is_err());
+        let mut callback = registration.clone();
+        callback.progs[0].subprogs.push(SubprogInfo {
+            name: "cb".to_owned(),
+            insn_off: 0,
+            is_callback: true,
+        });
+        assert!(preflight_nine_roots(&legacy, &callback, &typed, &count).is_err());
+        let mut typed_callback = typed.clone();
+        typed_callback.progs[1].subprogs.push(SubprogInfo {
+            name: "cb".to_owned(),
+            insn_off: 0,
+            is_callback: true,
+        });
+        assert!(preflight_nine_roots(&legacy, &registration, &typed_callback, &count).is_err());
+        let mut swapped = typed.clone();
+        swapped.progs[0].is_return = true;
+        swapped.progs[1].is_return = false;
+        assert!(preflight_nine_roots(&legacy, &registration, &swapped, &count).is_err());
+        let mut count_callback = count.clone();
+        count_callback.progs[0].subprogs.push(SubprogInfo {
+            name: "cb".to_owned(),
+            insn_off: 0,
+            is_callback: true,
+        });
+        assert!(preflight_nine_roots(&legacy, &registration, &typed, &count_callback).is_err());
+        let mut count_section = count.clone();
+        count_section.progs[0].section = "uretprobe".to_owned();
+        assert!(preflight_nine_roots(&legacy, &registration, &typed, &count_section).is_err());
+    }
+
+    #[test]
+    fn task23a_typed_split_partitions_six_roots_by_route() {
+        // The real partition the diagnostic consumes: registration
+        // roots and typed roots separate by name, with typed shapes
+        // enforced. A wrong-half loop input starts here.
+        let half = Prepared {
+            progs: vec![
+                source_root_loaded_fixture(
+                    "source_reg_in",
+                    "fentry/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_out",
+                    "fexit/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "attr_exit",
+                    "raw_tracepoint/sched_process_exit",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "attr_exec",
+                    "raw_tracepoint/sched_process_exec",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture("typed_entry", "uprobe", false, &["ADMIT"]),
+                source_root_loaded_fixture("typed_return", "uretprobe", true, &["ADMIT"]),
+            ],
+            maps: Vec::new(),
+        };
+        let (registration, typed) = split_typed_preparation(half).unwrap();
+        let mut reg_names: Vec<&str> = registration.progs.iter().map(|p| p.name.as_str()).collect();
+        reg_names.sort_unstable();
+        assert_eq!(
+            reg_names,
+            ["attr_exec", "attr_exit", "source_reg_in", "source_reg_out"]
+        );
+        let mut typed_names: Vec<&str> = typed.progs.iter().map(|p| p.name.as_str()).collect();
+        typed_names.sort_unstable();
+        assert_eq!(typed_names, ["typed_entry", "typed_return"]);
+        // A mistyped root refuses instead of crossing halves.
+        let bad = Prepared {
+            progs: vec![
+                source_root_loaded_fixture("typed_entry", "uprobe", false, &["ADMIT"]),
+                source_root_loaded_fixture("typed_return", "uprobe", false, &["ADMIT"]),
+            ],
+            maps: Vec::new(),
+        };
+        assert!(split_typed_preparation(bad).is_err());
+    }
+
+    /// Drive the single-root seam with an empty script: any boundary
+    /// call panics, proving refusals happen before native effects.
+    fn drive_seam_refusal(
+        root: &PreparedProg,
+        attach_btf_id: u32,
+    ) -> (String, LoadStage, Vec<OpEvent>) {
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let ops = ScriptOps::new();
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        let error = load_source_root_inner(
+            root,
+            &owned,
+            &legacy,
+            attach_btf_id,
+            &gate,
+            Some(&mut record),
+            Some(&ops),
+        )
+        .unwrap_err();
+        ops.assert_exhausted();
+        (format!("{error:#}"), record.stage, ops.events())
+    }
+
+    #[test]
+    fn task23a_seam_refuses_each_missing_prerequisite_first() {
+        let _lock = task23a_lock();
+        let valid = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT", "REL"],
+        );
+        // A zero FUNC ID refuses first. (The non-preparing-gate
+        // refusal stays covered by the pre-existing group-level
+        // test: minting a spent gate needs gate.open(), which
+        // issues real rejected BPF syscalls.)
+        let (error, stage, events) = drive_seam_refusal(&valid, 0);
+        assert!(error.contains("nonzero FUNC ID"), "{error}");
+        assert_eq!(stage, LoadStage::Preflight);
+        assert!(events.is_empty());
+        // Unselected roots refuse at classification.
+        let renamed = source_root_loaded_fixture(
+            "observation_entry",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        let (error, stage, events) = drive_seam_refusal(&renamed, 7);
+        assert!(error.contains("unselected source root"), "{error}");
+        assert_eq!(stage, LoadStage::Preflight);
+        assert!(events.is_empty());
+        // Return mode, callbacks, and missing ADMIT refuse per root.
+        let mut ret = valid.clone();
+        ret.is_return = true;
+        let (error, _, events) = drive_seam_refusal(&ret, 7);
+        assert!(error.contains("forbids return mode"), "{error}");
+        assert!(events.is_empty());
+        let mut callback = valid.clone();
+        mark_callback(&mut callback);
+        let (error, _, events) = drive_seam_refusal(&callback, 7);
+        assert!(error.contains("forbids callback BTF"), "{error}");
+        assert!(events.is_empty());
+        let mut no_admit =
+            source_root_loaded_fixture("source_reg_in", "fentry/uprobe_register", false, &["REL"]);
+        no_admit.map_fixups.clear();
+        let (error, _, events) = drive_seam_refusal(&no_admit, 7);
+        assert!(error.contains("lacks shared-gate fixup"), "{error}");
+        assert!(events.is_empty());
+        // Unreviewed and unresolvable fixups refuse at the fixup stage.
+        let mut foreign = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT", "REL"],
+        );
+        foreign.map_fixups[1].map = "PENDING".to_owned();
+        let (error, stage, events) = drive_seam_refusal(&foreign, 7);
+        assert!(error.contains("unreviewed map"), "{error}");
+        assert_eq!(stage, LoadStage::Fixup);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn task23a_seam_refuses_callbacks_for_all_four_roots() {
+        let _lock = task23a_lock();
+        for (name, section) in [
+            ("source_reg_in", "fentry/uprobe_register"),
+            ("source_reg_out", "fexit/uprobe_register"),
+            ("attr_exit", "raw_tracepoint/sched_process_exit"),
+            ("attr_exec", "raw_tracepoint/sched_process_exec"),
+        ] {
+            let mut root = source_root_loaded_fixture(name, section, false, &["ADMIT"]);
+            mark_callback(&mut root);
+            let (error, stage, events) = drive_seam_refusal(&root, 7);
+            assert!(error.contains("forbids callback BTF"), "{name}: {error}");
+            assert_eq!(stage, LoadStage::Preflight);
+            assert!(events.is_empty());
+        }
+    }
+
+    #[test]
+    fn task23a_seam_requires_complete_map_set_not_just_references() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        for (remove_owned, remove_legacy, expected) in [
+            (
+                Some("SOURCE_GUARD"),
+                None,
+                "source load missing owned map SOURCE_GUARD",
+            ),
+            (
+                None,
+                Some("NAMESPACE"),
+                "source load missing legacy map NAMESPACE",
+            ),
+        ] {
+            let pool = MemoryPool::new(1 << 20);
+            let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+            let (mut owned, mut legacy) = source_map_fixtures_complete();
+            if let Some(name) = remove_owned {
+                owned.remove(name);
+            }
+            if let Some(name) = remove_legacy {
+                legacy.maps.remove(name);
+            }
+            // The root references only ADMIT: the missing map is never
+            // named by this root, yet the shared presence check refuses
+            // before classification with zero boundary effects.
+            let root = source_root_loaded_fixture(
+                "source_reg_in",
+                "fentry/uprobe_register",
+                false,
+                &["ADMIT"],
+            );
+            let ops = ScriptOps::new();
+            let mut record =
+                LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+            let error = load_source_root_inner(
+                &root,
+                &owned,
+                &legacy,
+                4242,
+                &gate,
+                Some(&mut record),
+                Some(&ops),
+            )
+            .unwrap_err();
+            ops.assert_exhausted();
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(record.stage, LoadStage::Preflight);
+            assert!(ops.events().is_empty());
+        }
+    }
+
+    #[test]
+    fn task23a_seam_refuses_malformed_fixup_sites() {
+        let _lock = task23a_lock();
+        // Misaligned site.
+        let mut root = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT", "ADMIT"],
+        );
+        root.map_fixups[1].insn_off = 4;
+        let (error, stage, events) = drive_seam_refusal(&root, 7);
+        assert!(error.contains("misaligned"), "{error}");
+        assert_eq!(stage, LoadStage::Fixup);
+        assert!(events.is_empty());
+        // Out-of-range site.
+        let mut root = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        root.map_fixups[0].insn_off = usize::MAX - 7;
+        let (error, stage, events) = drive_seam_refusal(&root, 7);
+        assert!(error.contains("out of range"), "{error}");
+        assert_eq!(stage, LoadStage::Fixup);
+        assert!(events.is_empty());
+        // Non-ld_imm64 site.
+        let mut root = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        root.insns[0] = 0x85;
+        let (error, stage, _) = drive_seam_refusal(&root, 7);
+        assert!(error.contains("non-ld_imm64"), "{error}");
+        assert_eq!(stage, LoadStage::Fixup);
+        // Already-relocated site (src nibble set).
+        let mut root = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        root.insns[1] = BPF_PSEUDO_MAP_FD << 4;
+        let (error, stage, _) = drive_seam_refusal(&root, 7);
+        assert!(error.contains("non-ld_imm64"), "{error}");
+        assert_eq!(stage, LoadStage::Fixup);
+    }
+
+    #[test]
+    fn task23a_typed_loader_refuses_callbacks_for_both_roots() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        // Callback on the first root: immediate refusal, zero effects.
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let mut pair = typed_pair_fixture();
+        mark_callback(&mut pair.progs[0]);
+        let ops = ScriptOps::new();
+        let mut records = Vec::new();
+        let error = load_typed_borrowed_inner(
+            &pair,
+            &owned,
+            &legacy,
+            &gate,
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("forbids callback BTF"),
+            "{error:#}"
+        );
+        assert!(ops.events().is_empty());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].root, "typed_entry");
+        assert!(records[0].error.is_some());
+        ops.assert_exhausted();
+        // Callback on the second root: the first root loads, then the
+        // refusal drops it (fail-fast) without touching the boundary
+        // for the refused root.
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let mut pair = typed_pair_fixture();
+        mark_callback(&mut pair.progs[1]);
+        let ops = ScriptOps::new();
+        let (mut entry_read, entry_write) = sentinel_pipe();
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::ok(entry_write));
+        ops.attests.borrow_mut().push_back(Ok(()));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(71)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        let mut records = Vec::new();
+        let error = load_typed_borrowed_inner(
+            &pair,
+            &owned,
+            &legacy,
+            &gate,
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("forbids callback BTF"),
+            "{error:#}"
+        );
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].root, "typed_entry");
+        assert_eq!(records[0].stage, LoadStage::Loaded);
+        assert!(records[0].error.is_none());
+        assert_eq!(records[1].root, "typed_return");
+        assert!(records[1].error.is_some());
+        assert_eq!(ops.events().len(), 5);
+        ops.assert_exhausted();
+        assert_pipe_eof(&mut entry_read);
+    }
+
+    #[test]
+    fn task23a_seam_quiet_success_owns_exactly_one_fd() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let root = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT", "REL"],
+        );
+        let ops = ScriptOps::new();
+        let (mut prog_read, prog_write) = sentinel_pipe();
+        ops.loads.borrow_mut().push_back(LoadScript::ok(prog_write));
+        ops.attests.borrow_mut().push_back(Ok(()));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(77)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        let program = load_source_root_inner(
+            &root,
+            &owned,
+            &legacy,
+            4242,
+            &gate,
+            Some(&mut record),
+            Some(&ops),
+        )
+        .unwrap();
+        // Exactly one quiet load (no log), attestation, and the
+        // credential-bracketed info query ran, in order.
+        let events = ops.events();
+        assert_eq!(events.len(), 5);
+        assert!(matches!(
+            events[0],
+            OpEvent::LoadAttempt { log_len: None, .. }
+        ));
+        assert!(matches!(events[1], OpEvent::Attest));
+        assert!(matches!(events[2], OpEvent::ThreadCreds));
+        assert!(matches!(events[3], OpEvent::InfoQuery));
+        assert!(matches!(events[4], OpEvent::ThreadCreds));
+        // The real fixup rewrote the first site before the boundary.
+        ops.assert_exhausted();
+        if let OpEvent::LoadAttempt {
+            src1,
+            imm32,
+            kind,
+            name,
+            btf_fd,
+            ..
+        } = &events[0]
+        {
+            assert_eq!(*src1, BPF_PSEUDO_MAP_FD << 4);
+            assert_eq!(*imm32, legacy.maps["ADMIT"].as_raw_fd() as u32);
+            assert_eq!(name, "source_reg_in");
+            assert_eq!(*btf_fd, None);
+            assert_eq!(
+                *kind,
+                AttemptKind::SourceRegistration(ossl_bpf_sys::SourceTracingRoot::Enter, 4242)
+            );
+        } else {
+            panic!("first event shape");
+        }
+        assert_eq!(record.stage, LoadStage::Loaded);
+        assert_eq!(record.prog_type, 26);
+        assert_eq!(record.expected_attach, 24);
+        assert_eq!(record.attach_target, 4242);
+        assert_eq!(record.quiet_errno, None);
+        assert_eq!(record.logged_errno, None);
+        assert_eq!(record.log_completeness, LogCompleteness::NoLogAttempted);
+        assert_eq!(record.loaded_id, Some(77));
+        assert_eq!(record.fixup_audit.len(), 2);
+        assert!(record.error.is_none());
+        // The returned program owns its FD; dropping closes it.
+        let raw = program.as_raw_fd();
+        drop(program);
+        assert_pipe_eof(&mut prog_read);
+        assert_eq!(unsafe { libc::fcntl(raw, libc::F_GETFD) }, -1);
+        // Original owners survive.
+        for fd in owned.values() {
+            assert_fd_open(fd.as_raw_fd());
+        }
+        for fd in legacy.maps.values() {
+            assert_fd_open(fd.as_raw_fd());
+        }
+    }
+
+    #[test]
+    fn task23a_seam_logged_retry_preserves_first_errno() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let root = source_root_loaded_fixture(
+            "attr_exit",
+            "raw_tracepoint/sched_process_exit",
+            false,
+            &["ADMIT"],
+        );
+        let ops = ScriptOps::new();
+        let (mut prog_read, prog_write) = sentinel_pipe();
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::EPERM, 0));
+        ops.loads.borrow_mut().push_back(LoadScript::ok(prog_write));
+        ops.attests.borrow_mut().push_back(Ok(()));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(78)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        let program = load_source_root_inner(
+            &root,
+            &owned,
+            &legacy,
+            4242,
+            &gate,
+            Some(&mut record),
+            Some(&ops),
+        )
+        .unwrap();
+        let events = ops.events();
+        assert_eq!(events.len(), 6);
+        assert!(matches!(
+            events[0],
+            OpEvent::LoadAttempt { log_len: None, .. }
+        ));
+        // The observed diagnostic uses the 16 MiB logged ceiling.
+        assert!(matches!(
+            events[1],
+            OpEvent::LoadAttempt { log_len: Some(n), .. } if n == 16 << 20
+        ));
+        for event in &events[0..2] {
+            if let OpEvent::LoadAttempt {
+                kind, name, btf_fd, ..
+            } = event
+            {
+                assert_eq!(
+                    *kind,
+                    AttemptKind::Lifecycle(ossl_bpf_sys::LifecycleTracepoint::Exit)
+                );
+                assert_eq!(name, "attr_exit");
+                assert_eq!(*btf_fd, None);
+            } else {
+                panic!("attempt event shape");
+            }
+        }
+        ops.assert_exhausted();
+        assert_eq!(record.stage, LoadStage::Loaded);
+        assert_eq!(record.prog_type, 17);
+        assert_eq!(record.expected_attach, 0);
+        assert_eq!(record.quiet_errno, Some(libc::EPERM));
+        assert_eq!(record.logged_errno, None);
+        drop(program);
+        assert_pipe_eof(&mut prog_read);
+    }
+
+    #[test]
+    fn task23a_production_path_keeps_the_4mib_ceiling() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let root = source_root_loaded_fixture(
+            "source_reg_out",
+            "fexit/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        let ops = ScriptOps::new();
+        let (_prog_read, prog_write) = sentinel_pipe();
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::EACCES, 0));
+        ops.loads.borrow_mut().push_back(LoadScript::ok(prog_write));
+        ops.attests.borrow_mut().push_back(Ok(()));
+        // No record: the production ceiling and no info query.
+        let program =
+            load_source_root_inner(&root, &owned, &legacy, 4242, &gate, None, Some(&ops)).unwrap();
+        let events = ops.events();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[1],
+            OpEvent::LoadAttempt { log_len: Some(n), .. } if n == 4 << 20
+        ));
+        assert!(matches!(events[2], OpEvent::Attest));
+        ops.assert_exhausted();
+        drop(program);
+    }
+
+    #[test]
+    fn task23a_seam_double_failure_retains_both_errnos() {
+        let _lock = task23a_lock();
+        for name in ["source_reg_in", "source_reg_out"] {
+            take_spill(name);
+        }
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let root = source_root_loaded_fixture(
+            "source_reg_in",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        let ops = ScriptOps::new();
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::EACCES, 0));
+        // True size past the buffer: truncated, bytes retained.
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::E2BIG, u32::MAX).fill(b"verifier says no\0"));
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        let error = load_source_root_inner(
+            &root,
+            &owned,
+            &legacy,
+            4242,
+            &gate,
+            Some(&mut record),
+            Some(&ops),
+        )
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("source prog_load source_reg_in"),
+            "{message}"
+        );
+        assert!(message.contains("quiet:"), "{message}");
+        assert_eq!(record.stage, LoadStage::LoggedLoad);
+        assert_eq!(record.quiet_errno, Some(libc::EACCES));
+        assert_eq!(record.logged_errno, Some(libc::E2BIG));
+        assert_eq!(record.log_true_size, u32::MAX);
+        assert_eq!(record.log_completeness, LogCompleteness::Truncated);
+        assert_eq!(record.log_bytes.len(), 16 << 20);
+        assert_eq!(&record.log_bytes[..17], b"verifier says no\0");
+        assert_eq!(ops.events().len(), 2);
+        ops.assert_exhausted();
+        // Observed loads never spill outside the grant evidence dir:
+        // the bytes live in-record for the diagnostic to flush.
+        assert!(!take_spill("source_reg_in"));
+        for fd in owned.values().chain(legacy.maps.values()) {
+            assert_fd_open(fd.as_raw_fd());
+        }
+    }
+
+    #[test]
+    fn task23a_production_loop_orders_load_attest_attach_per_root() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        // Tracing-only order probe: lifecycle attachment mints its
+        // writer through the real gate (no scripted form), so the
+        // order property is proven on four tracing roots; lifecycle
+        // classification/load/attest are covered through the seam.
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let prepared = Prepared {
+            progs: vec![
+                source_root_loaded_fixture(
+                    "source_reg_in",
+                    "fentry/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_out",
+                    "fexit/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_in",
+                    "fentry/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_out",
+                    "fexit/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+            ],
+            maps: Vec::new(),
+        };
+        let ops = ScriptOps::new();
+        let mut prog_reads = Vec::new();
+        let mut link_reads = Vec::new();
+        for _ in 0..4 {
+            let (prog_read, prog_write) = sentinel_pipe();
+            let (link_read, link_write) = sentinel_pipe();
+            prog_reads.push(prog_read);
+            link_reads.push(link_read);
+            ops.loads.borrow_mut().push_back(LoadScript::ok(prog_write));
+            ops.attests.borrow_mut().push_back(Ok(()));
+            ops.links.borrow_mut().push_back(Ok(link_write));
+        }
+        let loaded =
+            load_source_roots_inner(&prepared, &owned, &legacy, 4242, &gate, Some(&ops)).unwrap();
+        // Strict per-root load/attest/attach order, four times.
+        let events = ops.events();
+        assert_eq!(events.len(), 12);
+        for (i, chunk) in events.chunks_exact(3).enumerate() {
+            let want_name = if i % 2 == 0 {
+                "source_reg_in"
+            } else {
+                "source_reg_out"
+            };
+            assert!(
+                matches!(chunk[0], OpEvent::LoadAttempt { log_len: None, .. }),
+                "root {i} load"
+            );
+            if let OpEvent::LoadAttempt { name, .. } = &chunk[0] {
+                assert_eq!(name, want_name, "root {i} identity");
+            } else {
+                panic!("root {i} load shape");
+            }
+            assert!(matches!(chunk[1], OpEvent::Attest), "root {i} attest");
+            let want = if i % 2 == 0 {
+                ossl_bpf_sys::SourceTracingRoot::Enter
+            } else {
+                ossl_bpf_sys::SourceTracingRoot::Exit
+            };
+            assert!(
+                matches!(chunk[2], OpEvent::AttachLink { kind } if kind == want),
+                "root {i} attach"
+            );
+        }
+        // Duplicate names collapse in the maps; both roots present.
+        assert!(loaded.programs.contains_key("source_reg_in"));
+        assert!(loaded.programs.contains_key("source_reg_out"));
+        assert!(loaded.links.contains_key("source_reg_in"));
+        assert!(loaded.links.contains_key("source_reg_out"));
+        ops.assert_exhausted();
+        drop(loaded);
+        for read in prog_reads.iter_mut().chain(link_reads.iter_mut()) {
+            assert_pipe_eof(read);
+        }
+        for fd in owned.values().chain(legacy.maps.values()) {
+            assert_fd_open(fd.as_raw_fd());
+        }
+    }
+
+    #[test]
+    fn task23a_production_loop_failure_drops_prior_acquisitions() {
+        let _lock = task23a_lock();
+        take_spill("source_reg_in");
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let prepared = Prepared {
+            progs: vec![
+                source_root_loaded_fixture(
+                    "source_reg_in",
+                    "fentry/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_out",
+                    "fexit/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_in",
+                    "fentry/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+                source_root_loaded_fixture(
+                    "source_reg_out",
+                    "fexit/uprobe_register",
+                    false,
+                    &["ADMIT"],
+                ),
+            ],
+            maps: Vec::new(),
+        };
+        let ops = ScriptOps::new();
+        let (mut prog0_read, prog0_write) = sentinel_pipe();
+        let (mut link0_read, link0_write) = sentinel_pipe();
+        let (mut prog1_read, prog1_write) = sentinel_pipe();
+        let (mut link1_read, link1_write) = sentinel_pipe();
+        for (prog, link) in [(prog0_write, link0_write), (prog1_write, link1_write)] {
+            ops.loads.borrow_mut().push_back(LoadScript::ok(prog));
+            ops.attests.borrow_mut().push_back(Ok(()));
+            ops.links.borrow_mut().push_back(Ok(link));
+        }
+        // Third root fails both attempts; the fourth never starts.
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::EACCES, 0));
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::EINVAL, 0));
+        let error =
+            match load_source_roots_inner(&prepared, &owned, &legacy, 4242, &gate, Some(&ops)) {
+                Ok(_) => panic!("third-root failure must refuse"),
+                Err(error) => error,
+            };
+        assert!(
+            format!("{error:#}").contains("source prog_load source_reg_in"),
+            "{error:#}"
+        );
+        assert_eq!(ops.events().len(), 8);
+        ops.assert_exhausted();
+        assert_pipe_eof(&mut prog0_read);
+        assert_pipe_eof(&mut link0_read);
+        assert_pipe_eof(&mut prog1_read);
+        assert_pipe_eof(&mut link1_read);
+        assert!(take_spill("source_reg_in"));
+        for fd in owned.values().chain(legacy.maps.values()) {
+            assert_fd_open(fd.as_raw_fd());
+        }
+    }
+
+    #[test]
+    fn task23a_production_group_preflight_makes_no_calls() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let full = source_half_loaded_fixture();
+        // Short half refuses before any root starts.
+        let mut short = full.clone();
+        short.progs.pop();
+        let ops = ScriptOps::new();
+        assert!(load_source_roots_inner(&short, &owned, &legacy, 7, &gate, Some(&ops)).is_err());
+        assert!(ops.events().is_empty());
+        // Missing owned map refuses before any root starts.
+        let (mut owned, legacy) = source_map_fixtures_complete();
+        owned.remove("TYPED_ADMISSION");
+        let ops = ScriptOps::new();
+        assert!(load_source_roots_inner(&full, &owned, &legacy, 7, &gate, Some(&ops)).is_err());
+        assert!(ops.events().is_empty());
+    }
+
+    #[test]
+    fn task23a_custody_observed_path_loads_two_roots() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let prep = Prepared {
+            progs: vec![
+                source_root_loaded_fixture("observation_entry", "uprobe", false, &["ADMIT"]),
+                source_root_loaded_fixture("observation_return", "uretprobe", true, &["ADMIT"]),
+            ],
+            maps: vec![
+                MapSpecLite {
+                    name: "ADMIT".to_owned(),
+                    map_type: 12,
+                    key_size: 4,
+                    value_size: 4,
+                    max_entries: 1,
+                    flags: 0,
+                },
+                MapSpecLite {
+                    name: "REL".to_owned(),
+                    map_type: 1,
+                    key_size: 4,
+                    value_size: 8,
+                    max_entries: 1,
+                    flags: 0,
+                },
+            ],
+        };
+        let ops = ScriptOps::new();
+        let (mut admit_read, admit_write) = sentinel_pipe();
+        let (mut rel_read, rel_write) = sentinel_pipe();
+        ops.injects.borrow_mut().push_back(Ok(admit_write));
+        HOST_NATIVE_MAP.with(|v| *v.borrow_mut() = Some(rel_write));
+        let (mut prog0_read, prog0_write) = sentinel_pipe();
+        let (mut prog1_read, prog1_write) = sentinel_pipe();
+        for (prog, id) in [(prog0_write, 81u32), (prog1_write, 82u32)] {
+            ops.loads.borrow_mut().push_back(LoadScript::ok(prog));
+            ops.attests.borrow_mut().push_back(Ok(()));
+            ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+            ops.infos.borrow_mut().push_back(Ok(script_summary(id)));
+            ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        }
+        let mut records = Vec::new();
+        let loaded = load_with_custody_inner(
+            &prep,
+            None,
+            Some(&gate),
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        )
+        .unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r.stage == LoadStage::Loaded));
+        assert!(records.iter().all(|r| r.error.is_none()));
+        assert_eq!(records[0].loaded_id, Some(81));
+        assert_eq!(records[1].loaded_id, Some(82));
+        assert_eq!(records[0].prog_type, 2);
+        assert!(loaded.progs.contains_key("observation_entry"));
+        assert!(loaded.progs.contains_key("observation_return"));
+        // Inject ran once; the REL map came from the host seam.
+        assert!(
+            ops.events()
+                .iter()
+                .any(|e| matches!(e, OpEvent::InjectAdmit))
+        );
+        ops.assert_exhausted();
+        drop(loaded);
+        assert_pipe_eof(&mut admit_read);
+        assert_pipe_eof(&mut rel_read);
+        assert_pipe_eof(&mut prog0_read);
+        assert_pipe_eof(&mut prog1_read);
+        HOST_NATIVE_MAP.with(|v| v.borrow_mut().take());
+    }
+
+    #[test]
+    fn task23a_custody_second_failure_drops_first_root() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let prep = Prepared {
+            progs: vec![
+                source_root_loaded_fixture("observation_entry", "uprobe", false, &["ADMIT"]),
+                source_root_loaded_fixture("observation_return", "uretprobe", true, &["ADMIT"]),
+            ],
+            maps: vec![MapSpecLite {
+                name: "ADMIT".to_owned(),
+                map_type: 12,
+                key_size: 4,
+                value_size: 4,
+                max_entries: 1,
+                flags: 0,
+            }],
+        };
+        let ops = ScriptOps::new();
+        let (mut admit_read, admit_write) = sentinel_pipe();
+        ops.injects.borrow_mut().push_back(Ok(admit_write));
+        let (mut prog0_read, prog0_write) = sentinel_pipe();
+        let (mut prog1_read, prog1_write) = sentinel_pipe();
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::ok(prog0_write));
+        ops.attests.borrow_mut().push_back(Ok(()));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(81)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::ok(prog1_write));
+        ops.attests
+            .borrow_mut()
+            .push_back(Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        let mut records = Vec::new();
+        let result = load_with_custody_inner(
+            &prep,
+            None,
+            Some(&gate),
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        );
+        assert!(result.is_err());
+        ops.assert_exhausted();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].stage, LoadStage::Loaded);
+        assert!(records[0].error.is_none());
+        assert_eq!(records[1].stage, LoadStage::Attestation);
+        assert!(records[1].error.is_some());
+        assert_pipe_eof(&mut prog0_read);
+        assert_pipe_eof(&mut prog1_read);
+        assert_pipe_eof(&mut admit_read);
+    }
+
+    #[test]
+    fn task23a_observe_program_records_precise_unavailability() {
+        let fd = model_fd();
+        // Happy path: bracketed creds plus a decodable reply.
+        let ops = ScriptOps::new();
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(91)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        let mut record = LoadDiagnostics::unattempted("r", "uprobe", task23a_artifact());
+        observe_loaded_program(&fd, &mut record, Some(&ops));
+        assert_eq!(record.stage, LoadStage::InfoQuery);
+        assert_eq!(record.loaded_id, Some(91));
+        assert!(record.info.is_some());
+        assert!(record.info_unavailable.is_none());
+        assert_eq!(record.query_creds, Some(script_creds()));
+        ops.assert_exhausted();
+        // Changed credentials refuse.
+        let ops = ScriptOps::new();
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(91)));
+        let mut changed = script_creds();
+        changed.tid = 9999;
+        ops.creds_list.borrow_mut().push_back(Ok(changed));
+        let mut record = LoadDiagnostics::unattempted("r", "uprobe", task23a_artifact());
+        observe_loaded_program(&fd, &mut record, Some(&ops));
+        assert!(record.loaded_id.is_none());
+        assert!(record.info.is_none());
+        assert!(
+            record
+                .info_unavailable
+                .as_deref()
+                .unwrap()
+                .contains("changed")
+        );
+        ops.assert_exhausted();
+        // Missing privilege refuses.
+        let ops = ScriptOps::new();
+        let mut poor = script_creds();
+        poor.caps = [[0, 0, 0], [0, 0, 0]];
+        ops.creds_list.borrow_mut().push_back(Ok(poor));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(91)));
+        ops.creds_list.borrow_mut().push_back(Ok(poor));
+        let mut record = LoadDiagnostics::unattempted("r", "uprobe", task23a_artifact());
+        observe_loaded_program(&fd, &mut record, Some(&ops));
+        assert!(
+            record
+                .info_unavailable
+                .as_deref()
+                .unwrap()
+                .contains("privilege")
+        );
+        ops.assert_exhausted();
+        // Refused query and missing credentials refuse distinctly.
+        let ops = ScriptOps::new();
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        ops.infos
+            .borrow_mut()
+            .push_back(Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        let mut record = LoadDiagnostics::unattempted("r", "uprobe", task23a_artifact());
+        observe_loaded_program(&fd, &mut record, Some(&ops));
+        assert!(
+            record
+                .info_unavailable
+                .as_deref()
+                .unwrap()
+                .contains("info query refused")
+        );
+        ops.assert_exhausted();
+        let ops = ScriptOps::new();
+        ops.creds_list
+            .borrow_mut()
+            .push_back(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        ops.infos.borrow_mut().push_back(Ok(script_summary(91)));
+        ops.creds_list.borrow_mut().push_back(Ok(script_creds()));
+        let mut record = LoadDiagnostics::unattempted("r", "uprobe", task23a_artifact());
+        observe_loaded_program(&fd, &mut record, Some(&ops));
+        assert!(
+            record
+                .info_unavailable
+                .as_deref()
+                .unwrap()
+                .contains("credentials unavailable")
+        );
+        ops.assert_exhausted();
+    }
+
+    #[test]
+    fn task23a_load_prog_inner_refuses_fixup_before_boundary() {
+        let _lock = task23a_lock();
+        let mut maps = HashMap::new();
+        maps.insert("ADMIT".to_owned(), model_fd());
+        let root = source_root_loaded_fixture("typed_entry", "uprobe", false, &["ADMIT"]);
+        let ops = ScriptOps::new();
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        record.stage = LoadStage::MapSetup;
+        // Unknown second map refuses at fixup with zero boundary calls.
+        let mut bad = root.clone();
+        bad.map_fixups.push(MapFixup {
+            insn_off: 16,
+            map: "NOPE".to_owned(),
+        });
+        bad.insns.resize(32, 0);
+        bad.insns[16] = BPF_LD_IMM64;
+        let error =
+            load_prog_inner(&bad, &maps, true, None, Some(&mut record), Some(&ops)).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown map"), "{error:#}");
+        assert_eq!(record.stage, LoadStage::Fixup);
+        assert_eq!(record.prog_type, 2);
+        assert_eq!(record.maps.len(), 1);
+        assert!(ops.events().is_empty());
+        // Lifecycle classification records its type before fixup too.
+        let mut record =
+            LoadDiagnostics::unattempted("attr_exit", "raw_tracepoint", task23a_artifact());
+        record.stage = LoadStage::MapSetup;
+        let lifecycle = source_root_loaded_fixture(
+            "attr_exit",
+            "raw_tracepoint/sched_process_exit",
+            false,
+            &["ADMIT"],
+        );
+        let mut bad = lifecycle.clone();
+        bad.map_fixups[0].map = "NOPE".to_owned();
+        let error =
+            load_prog_inner(&bad, &maps, true, None, Some(&mut record), Some(&ops)).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown map"), "{error:#}");
+        assert_eq!(record.prog_type, 17);
+        assert_eq!(record.expected_attach, 0);
+    }
+
+    #[test]
+    fn task23a_load_prog_inner_records_the_btf_path() {
+        let _lock = task23a_lock();
+        let mut maps = HashMap::new();
+        maps.insert("ADMIT".to_owned(), model_fd());
+        let mut root =
+            source_root_loaded_fixture("observation_return", "uretprobe", true, &["ADMIT"]);
+        root.subprogs = vec![
+            SubprogInfo {
+                name: "observation_return".to_owned(),
+                insn_off: 0,
+                is_callback: false,
+            },
+            SubprogInfo {
+                name: "query_return".to_owned(),
+                insn_off: 8,
+                is_callback: true,
+            },
+        ];
+        // BTF success: the synthesized image loads, the BTF FD is
+        // owned by the guarded handle and drops with the call.
+        let ops = ScriptOps::new();
+        let (mut btf_read, btf_write) = sentinel_pipe();
+        let (mut prog_read, prog_write) = sentinel_pipe();
+        ops.btfs
+            .borrow_mut()
+            .push_back((Ok(btf_write), vec![b'B', b'T', b'F', 0]));
+        ops.loads.borrow_mut().push_back(LoadScript::ok(prog_write));
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        record.stage = LoadStage::MapSetup;
+        let program =
+            load_prog_inner(&root, &maps, true, None, Some(&mut record), Some(&ops)).unwrap();
+        assert_eq!(record.stage, LoadStage::QuietLoad);
+        assert_eq!(record.callback_subprogs, 1);
+        assert!(record.btf_synthesized);
+        assert_eq!(record.btf_log, vec![b'B', b'T', b'F', 0]);
+        let events = ops.events();
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            events[0],
+            OpEvent::BtfLoad { len, cap } if len > 0 && cap == 1 << 16
+        ));
+        ops.assert_exhausted();
+        drop(program);
+        assert_pipe_eof(&mut prog_read);
+        assert_pipe_eof(&mut btf_read);
+        // BTF failure: its own stage with the retained log, and the
+        // load boundary is never reached.
+        let ops = ScriptOps::new();
+        ops.btfs.borrow_mut().push_back((
+            Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            vec![b'b', b'a', b'd', 0],
+        ));
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        record.stage = LoadStage::MapSetup;
+        let error =
+            load_prog_inner(&root, &maps, true, None, Some(&mut record), Some(&ops)).unwrap_err();
+        assert!(format!("{error:#}").contains("btf_load"), "{error:#}");
+        assert_eq!(record.stage, LoadStage::BtfSetup);
+        assert_eq!(record.btf_log, vec![b'b', b'a', b'd', 0]);
+        assert_eq!(ops.events().len(), 1);
+        ops.assert_exhausted();
+    }
+
+    #[test]
+    fn task23a_observed_wrappers_refuse_before_any_effect() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        // Plain single-root wrapper: unselected root, no record channel.
+        let renamed = source_root_loaded_fixture(
+            "observation_entry",
+            "fentry/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        let error = load_source_root_unattached(&renamed, &owned, &legacy, 7, &gate).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unselected source root"),
+            "{error:#}"
+        );
+        // Observed single-root wrapper: refusal pushes its receipt.
+        let mut records = Vec::new();
+        let error = load_source_root_unattached_observed(
+            &renamed,
+            &owned,
+            &legacy,
+            7,
+            &gate,
+            task23a_artifact(),
+            &mut records,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unselected source root"),
+            "{error:#}"
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].stage, LoadStage::Preflight);
+        assert!(records[0].error.is_some());
+        // Observed typed wrapper: callback on the first root stops
+        // before the boundary with zero loads attempted.
+        let mut pair = typed_pair_fixture();
+        mark_callback(&mut pair.progs[0]);
+        let mut records = Vec::new();
+        let error = load_typed_borrowed_observed(
+            &pair,
+            &owned,
+            &legacy,
+            &gate,
+            task23a_artifact(),
+            &mut records,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("forbids callback BTF"),
+            "{error:#}"
+        );
+        assert_eq!(records.len(), 1);
+        // Observed count wrapper: a half without the shared writer
+        // map refuses before any map or load effect.
+        let mut naked = count_singleton_fixture();
+        naked.maps = Vec::new();
+        let borrowed = std::collections::BTreeMap::new();
+        let mut records = Vec::new();
+        let error = match load_gated_borrowed_observed(
+            &naked,
+            &gate,
+            &borrowed,
+            task23a_artifact(),
+            &mut records,
+        ) {
+            Ok(_) => panic!("naked count half must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("missing shared writer map"),
+            "{error:#}"
+        );
+        assert!(records.is_empty());
+        // Observed legacy wrapper: a wrong second name is rejected
+        // by the preflight before map/load calls.
+        let mut wrong = legacy_pair_fixture();
+        wrong.progs[1].name = "typed_entry".to_owned();
+        let mut records = Vec::new();
+        let error = match load_gated_observed(&wrong, &gate, task23a_artifact(), &mut records) {
+            Ok(_) => panic!("wrong-name legacy pair must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("unexpected legacy root"),
+            "{error:#}"
+        );
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn task23a_btf_stays_live_across_quiet_logged_retry() {
+        let _lock = task23a_lock();
+        let mut maps = HashMap::new();
+        maps.insert("ADMIT".to_owned(), model_fd());
+        let mut root =
+            source_root_loaded_fixture("observation_return", "uretprobe", true, &["ADMIT"]);
+        root.subprogs = vec![
+            SubprogInfo {
+                name: "observation_return".to_owned(),
+                insn_off: 0,
+                is_callback: false,
+            },
+            SubprogInfo {
+                name: "query_return".to_owned(),
+                insn_off: 8,
+                is_callback: true,
+            },
+        ];
+        let ops = ScriptOps::new();
+        let (mut btf_read, btf_write) = sentinel_pipe();
+        let btf_raw = btf_write.as_raw_fd();
+        let (mut prog_read, prog_write) = sentinel_pipe();
+        ops.btfs
+            .borrow_mut()
+            .push_back((Ok(btf_write), vec![b'B', b'T', b'F', 0]));
+        ops.loads
+            .borrow_mut()
+            .push_back(LoadScript::err(libc::EPERM, 0));
+        ops.loads.borrow_mut().push_back(
+            LoadScript::ok(prog_write)
+                .fill(b"ok-after-retry\0")
+                .true_size(15),
+        );
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        record.stage = LoadStage::MapSetup;
+        let program =
+            load_prog_inner(&root, &maps, true, None, Some(&mut record), Some(&ops)).unwrap();
+        // The same live BTF FD rode both attempts; the scripted
+        // harness already proved liveness at each attempt.
+        let events = ops.events();
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0], OpEvent::BtfLoad { .. }));
+        for event in &events[1..] {
+            if let OpEvent::LoadAttempt { name, btf_fd, .. } = event {
+                assert_eq!(name, "observation_return");
+                assert_eq!(*btf_fd, Some(btf_raw));
+            } else {
+                panic!("attempt event shape");
+            }
+        }
+        assert!(matches!(
+            events[1],
+            OpEvent::LoadAttempt { log_len: None, .. }
+        ));
+        assert!(matches!(
+            events[2],
+            OpEvent::LoadAttempt {
+                log_len: Some(n),
+                ..
+            } if n == 16 << 20
+        ));
+        // Distinctive logged bytes rode the real buffer into the record.
+        assert_eq!(record.stage, LoadStage::LoggedLoad);
+        assert_eq!(record.quiet_errno, Some(libc::EPERM));
+        assert_eq!(record.log_completeness, LogCompleteness::Complete);
+        assert_eq!(&record.log_bytes[..15], b"ok-after-retry\0");
+        ops.assert_exhausted();
+        drop(program);
+        assert_pipe_eof(&mut prog_read);
+        assert_pipe_eof(&mut btf_read);
+    }
+
+    #[test]
+    fn task23a_map_setup_failures_belong_to_their_roots() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        fn lite(name: &str) -> MapSpecLite {
+            MapSpecLite {
+                name: name.to_owned(),
+                map_type: 1,
+                key_size: 4,
+                value_size: 8,
+                max_entries: 1,
+                flags: 0,
+            }
+        }
+        // Custody: refused ADMIT inject attributes MapSetup to both roots.
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let prep = Prepared {
+            progs: vec![
+                source_root_loaded_fixture("observation_entry", "uprobe", false, &["ADMIT"]),
+                source_root_loaded_fixture("observation_return", "uretprobe", true, &["ADMIT"]),
+            ],
+            maps: vec![lite("ADMIT")],
+        };
+        let ops = ScriptOps::new();
+        ops.injects
+            .borrow_mut()
+            .push_back(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        let mut records = Vec::new();
+        let result = load_with_custody_inner(
+            &prep,
+            None,
+            Some(&gate),
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        );
+        assert!(result.is_err());
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.stage == LoadStage::MapSetup && r.error.is_some())
+        );
+        assert_eq!(ops.events().len(), 1);
+        ops.assert_exhausted();
+        // Typed: unresolvable borrow table attributes MapSetup, zero calls.
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let mut pair = typed_pair_fixture();
+        pair.maps = vec![lite("ADMIT"), lite("NOPE")];
+        let ops = ScriptOps::new();
+        let mut records = Vec::new();
+        let result = load_typed_borrowed_inner(
+            &pair,
+            &owned,
+            &legacy,
+            &gate,
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        );
+        assert!(result.is_err());
+        assert_eq!(records.len(), 2);
+        assert!(
+            records
+                .iter()
+                .all(|r| r.stage == LoadStage::MapSetup && r.error.is_some())
+        );
+        assert!(ops.events().is_empty());
+        ops.assert_exhausted();
+        // Count: refused inject attributes MapSetup to its singleton.
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let mut naked = count_singleton_fixture();
+        naked.maps = vec![lite("ADMIT")];
+        let borrowed = std::collections::BTreeMap::new();
+        let ops = ScriptOps::new();
+        ops.injects
+            .borrow_mut()
+            .push_back(Err(std::io::Error::from_raw_os_error(libc::EIO)));
+        let mut records = Vec::new();
+        let result = load_gated_borrowed_inner(
+            &naked,
+            &gate,
+            &borrowed,
+            Some(DiagCtx {
+                records: &mut records,
+                artifact: task23a_artifact(),
+            }),
+            Some(&ops),
+        );
+        assert!(result.is_err());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].stage, LoadStage::MapSetup);
+        assert!(records[0].error.is_some());
+        ops.assert_exhausted();
+    }
+
+    #[test]
+    fn task23a_observed_legacy_shares_the_gated_preflight() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        // A maps-less pair stops at the shared writer map check.
+        let pair = legacy_pair_fixture();
+        let mut records = Vec::new();
+        let error = match load_gated_observed(&pair, &gate, task23a_artifact(), &mut records) {
+            Ok(_) => panic!("maps-less pair must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("missing shared writer map"),
+            "{error:#}"
+        );
+        assert!(records.is_empty());
+        // A pair whose return root lacks the gate fixup is ungated.
+        let mut ungated = legacy_pair_fixture();
+        ungated.maps = vec![MapSpecLite {
+            name: "ADMIT".to_owned(),
+            map_type: 1,
+            key_size: 4,
+            value_size: 8,
+            max_entries: 1,
+            flags: 0,
+        }];
+        ungated.progs[1].map_fixups.clear();
+        let mut records = Vec::new();
+        let error = match load_gated_observed(&ungated, &gate, task23a_artifact(), &mut records) {
+            Ok(_) => panic!("ungated pair must refuse"),
+            Err(error) => error,
+        };
+        assert!(
+            format!("{error:#}").contains("ungated producer root"),
+            "{error:#}"
+        );
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn task23a_seam_attestation_failure_drops_current_fd() {
+        let _lock = task23a_lock();
+        use crate::observation_memory::MemoryPool;
+        let pool = MemoryPool::new(1 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
+        let (owned, legacy) = source_map_fixtures_complete();
+        let root = source_root_loaded_fixture(
+            "source_reg_out",
+            "fexit/uprobe_register",
+            false,
+            &["ADMIT"],
+        );
+        let ops = ScriptOps::new();
+        let (mut prog_read, prog_write) = sentinel_pipe();
+        ops.loads.borrow_mut().push_back(LoadScript::ok(prog_write));
+        ops.attests
+            .borrow_mut()
+            .push_back(Err(std::io::Error::from_raw_os_error(libc::EPERM)));
+        let mut record =
+            LoadDiagnostics::unattempted(&root.name, &root.section, task23a_artifact());
+        let error = load_source_root_inner(
+            &root,
+            &owned,
+            &legacy,
+            4242,
+            &gate,
+            Some(&mut record),
+            Some(&ops),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("missing shared gate"),
+            "{error:#}"
+        );
+        assert_eq!(record.stage, LoadStage::Attestation);
+        // The current FD dropped; no info query ran after refusal.
+        assert_pipe_eof(&mut prog_read);
+        assert_eq!(ops.events().len(), 2);
+        ops.assert_exhausted();
+        for fd in owned.values().chain(legacy.maps.values()) {
+            assert_fd_open(fd.as_raw_fd());
+        }
+    }
 }
 
 // Controlled ring consumption follows Aya 0.14.0 maps/ring_buf.rs.
@@ -7709,8 +11555,21 @@ pub fn prepare_focused_count(
     object: &[u8],
     budget: &crate::provider_observation::ObservationBudget,
 ) -> anyhow::Result<Prepared> {
+    let mut prepared = prepare_focused_count_unpatched(object)?;
+    patch_count_markers(&mut prepared, budget)?;
+    check_focused_count_post_patch(&prepared)?;
+    Ok(prepared)
+}
+
+/// Validate + prepare the count object WITHOUT patching: the
+/// before-image stage for the diagnostic's count patch audit.
+/// Production reaches the identical state through
+/// `prepare_focused_count`, which patches immediately after; the
+/// split moves statements verbatim and changes no behavior, only
+/// exposes the patch boundary.
+pub(crate) fn prepare_focused_count_unpatched(object: &[u8]) -> anyhow::Result<Prepared> {
     validate_count_object(object)?;
-    let mut prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
+    let prepared = prepare(object, &FOCUSED_COUNT_MAPS, &COUNT_PROGS)?;
     anyhow::ensure!(
         prepared.maps.len() == FOCUSED_COUNT_MAPS.len() && prepared.progs.len() == 1,
         "focused shape"
@@ -7728,12 +11587,18 @@ pub fn prepare_focused_count(
             && root.subprogs.iter().all(|s| !s.is_callback),
         "focused root"
     );
-    // Patch VMA-join markers before the helper allowlist runs: pre-patch
-    // kfunc call sites carry reserved immediates, not helper IDs. The
-    // allowlist then sees the patched image (kfunc calls use src 2 and
-    // skip the helper check; the join's only plain helpers are the
-    // kernel-memory read 113 and current-task-BTF 158).
-    patch_count_markers(&mut prepared, budget)?;
+    Ok(prepared)
+}
+
+/// Post-patch allowlist + fixup validation over the patched count
+/// image. Shared verbatim by production `prepare_focused_count` and
+/// the diagnostic's audited count pipeline: identical checks,
+/// identical order. Patch VMA-join markers before this runs:
+/// pre-patch kfunc call sites carry reserved immediates, not helper
+/// IDs. The allowlist then sees the patched image (kfunc calls use
+/// src 2 and skip the helper check; the join's only plain helpers
+/// are the kernel-memory read 113 and current-task-BTF 158).
+pub(crate) fn check_focused_count_post_patch(prepared: &Prepared) -> anyhow::Result<()> {
     let root = &prepared.progs[0];
     let mut namespace_helper = false;
     for i in root.insns.chunks_exact(8) {
@@ -7755,5 +11620,5 @@ pub fn prepare_focused_count(
             "focused map fixup"
         );
     }
-    Ok(prepared)
+    Ok(())
 }

@@ -2582,4 +2582,1826 @@ mod tests {
         drop(owner);
         drop(loaded);
     }
+
+    // ---- Task23A unattached nine-root diagnostic ----
+
+    /// Canonical nine-root table order with sections.
+    fn task23a_expected_roots() -> [(&'static str, &'static str); 9] {
+        [
+            ("observation_entry", "uprobe"),
+            ("observation_return", "uretprobe"),
+            ("source_reg_in", "fentry/uprobe_register"),
+            ("source_reg_out", "fexit/uprobe_register"),
+            ("attr_exit", "raw_tracepoint/sched_process_exit"),
+            ("attr_exec", "raw_tracepoint/sched_process_exec"),
+            ("typed_entry", "uprobe"),
+            ("typed_return", "uretprobe"),
+            ("count_entry", "uprobe"),
+        ]
+    }
+
+    /// Setup-failure attribution sets: a preparation failure refuses
+    /// exactly the roots whose inputs it poisoned, never the whole
+    /// table. Slots are fresh `Unattempted` at every refusal site
+    /// (setup precedes all loads; later refusals name only slots
+    /// their phase could not have pushed), so refusal is total.
+    const TASK23A_LEGACY_SLOTS: [&str; 2] = ["observation_entry", "observation_return"];
+    const TASK23A_PROVIDER_SLOTS: [&str; 8] = [
+        "observation_entry",
+        "observation_return",
+        "source_reg_in",
+        "source_reg_out",
+        "attr_exit",
+        "attr_exec",
+        "typed_entry",
+        "typed_return",
+    ];
+    const TASK23A_SOURCE_SLOTS: [&str; 6] = [
+        "source_reg_in",
+        "source_reg_out",
+        "attr_exit",
+        "attr_exec",
+        "typed_entry",
+        "typed_return",
+    ];
+    const TASK23A_NON_LEGACY_SLOTS: [&str; 7] = [
+        "source_reg_in",
+        "source_reg_out",
+        "attr_exit",
+        "attr_exec",
+        "typed_entry",
+        "typed_return",
+        "count_entry",
+    ];
+    const TASK23A_COUNT_SLOTS: [&str; 1] = ["count_entry"];
+
+    /// Pre-build the nine `Unattempted` slots with per-root artifact
+    /// pins (provider pins for the first eight, count pins last).
+    fn task23a_unattempted_table(
+        provider: loader::ArtifactPins,
+        count: loader::ArtifactPins,
+    ) -> Vec<loader::LoadDiagnostics> {
+        task23a_expected_roots()
+            .iter()
+            .enumerate()
+            .map(|(i, (name, section))| {
+                loader::LoadDiagnostics::unattempted(
+                    name,
+                    section,
+                    if i < 8 { provider } else { count },
+                )
+            })
+            .collect()
+    }
+
+    /// Align pushed per-root records into their pre-built slots by
+    /// root name. Unknown or duplicate pushed names are internal
+    /// errors; unpushed slots stay explicitly `Unattempted`.
+    fn task23a_align_records(
+        table: &mut [loader::LoadDiagnostics],
+        pushed: Vec<loader::LoadDiagnostics>,
+    ) -> Result<(), String> {
+        for record in pushed {
+            let slot = table
+                .iter_mut()
+                .find(|slot| slot.root == record.root)
+                .ok_or_else(|| format!("unexpected diagnostic root {}", record.root))?;
+            if slot.stage != loader::LoadStage::Unattempted {
+                return Err(format!("duplicate diagnostic root {}", record.root));
+            }
+            *slot = record;
+        }
+        Ok(())
+    }
+
+    /// Map a setup/preflight failure onto named `Unattempted` slots:
+    /// they become `Preflight` with the shared error. Anything else
+    /// (unknown slot, already attempted) is an internal error.
+    fn task23a_refuse_slots(
+        table: &mut [loader::LoadDiagnostics],
+        names: &[&str],
+        error: &str,
+    ) -> Result<(), String> {
+        for name in names {
+            let slot = table
+                .iter_mut()
+                .find(|slot| slot.root == *name)
+                .ok_or_else(|| format!("unknown diagnostic slot {name}"))?;
+            if slot.stage != loader::LoadStage::Unattempted {
+                return Err(format!("diagnostic slot {name} already attempted"));
+            }
+            slot.stage = loader::LoadStage::Preflight;
+            slot.error = Some(error.to_owned());
+        }
+        Ok(())
+    }
+
+    /// Refuse every slot with one shared setup error. The caller
+    /// guarantees a fresh `Unattempted` table (setup runs before any
+    /// acquisition), so a refusal here is an internal bug, never an
+    /// input failure.
+    fn task23a_refuse_all(table: &mut [loader::LoadDiagnostics], error: &str) {
+        for (name, _) in task23a_expected_roots() {
+            task23a_refuse_slots(table, &[name], error).unwrap();
+        }
+    }
+
+    /// Strict 64-lowercase-hex sha256 parse: exact length, hex digits
+    /// only, no `0x` prefix, no whitespace. Pure; the diagnostic
+    /// supplies the environment-provided string.
+    fn task23a_parse_sha_hex(raw: &str) -> Result<[u8; 32], String> {
+        fn hex_val(byte: u8) -> Result<u8, String> {
+            match byte {
+                b'0'..=b'9' => Ok(byte - b'0'),
+                b'a'..=b'f' => Ok(byte - b'a' + 10),
+                _ => Err(format!("non-hex sha256 digit {byte:#04x}")),
+            }
+        }
+        let bytes = raw.as_bytes();
+        if bytes.len() != 64 {
+            return Err(format!("sha256 must be 64 hex digits, got {}", bytes.len()));
+        }
+        let mut out = [0u8; 32];
+        for (i, pair) in bytes.chunks_exact(2).enumerate() {
+            out[i] = hex_val(pair[0])? << 4 | hex_val(pair[1])?;
+        }
+        Ok(out)
+    }
+
+    /// Required expected-sha256 pin from the environment. Missing,
+    /// non-Unicode, or malformed values refuse the diagnostic before
+    /// any kernel object exists; nothing defaults, nothing stamps.
+    fn task23a_required_sha(var: &str) -> Result<[u8; 32], String> {
+        let raw =
+            std::env::var(var).map_err(|_| format!("required pin {var} missing or non-Unicode"))?;
+        task23a_parse_sha_hex(&raw).map_err(|e| format!("required pin {var} malformed: {e}"))
+    }
+
+    /// One named evaluation verdict over the finished table.
+    struct Task23aEvaluation {
+        root: String,
+        check: &'static str,
+        passed: bool,
+        detail: String,
+    }
+
+    /// Validated phase-0 inputs: provider bytes, count bytes, and
+    /// the required evidence directory.
+    type Task23aInputs = (Vec<u8>, Vec<u8>, Option<std::path::PathBuf>);
+
+    /// Pure host-side preparation of every load input: the four
+    /// halves plus the patched source preparation and the kernel
+    /// description that patched it. Built with no kernel objects;
+    /// every failure refuses the diagnostic before acquisition.
+    struct Task23aHalves {
+        legacy: loader::Prepared,
+        registration: loader::Prepared,
+        typed: loader::Prepared,
+        count_prepared: loader::Prepared,
+        source_prepared: loader::Prepared,
+        kernel: loader::SourceKernel,
+    }
+
+    /// Source-zero evaluation: every non-control root must show zero
+    /// own BTF and zero metadata counts between live bracketing
+    /// controls, with its legitimate attachment target IDs intact
+    /// (exact FUNC target plus a nonzero target object for the
+    /// registration roots, no target at all otherwise).
+    fn task23a_evaluate_source_zeros(
+        table: &[loader::LoadDiagnostics],
+        control_before: &ossl_bpf_sys::ProgramInfoSummary,
+        control_after: &ossl_bpf_sys::ProgramInfoSummary,
+        registration_func: u32,
+    ) -> Vec<Task23aEvaluation> {
+        let mut evaluations = Vec::new();
+        for record in table {
+            if record.root == "observation_return" {
+                continue;
+            }
+            let (expected_func, expect_obj) = match record.root.as_str() {
+                "source_reg_in" | "source_reg_out" => (registration_func, true),
+                _ => (0, false),
+            };
+            let Some(info) = &record.info else {
+                evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "source-zero",
+                    passed: false,
+                    detail: "no trustworthy program info".to_owned(),
+                });
+                continue;
+            };
+            match ossl_bpf_sys::calibration_admits_source_zero(
+                control_before,
+                info,
+                control_after,
+                expected_func,
+                expect_obj,
+            ) {
+                Ok(()) => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "source-zero",
+                    passed: true,
+                    detail: "zero own metadata between live controls".to_owned(),
+                }),
+                Err(reason) => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "source-zero",
+                    passed: false,
+                    detail: reason.to_owned(),
+                }),
+            }
+        }
+        evaluations
+    }
+
+    /// Query-identity evaluation across all ten info queries: the two
+    /// calibrator snapshots must agree with each other, and every
+    /// loaded root's retained query identity must equal the
+    /// calibrator's. Only `Loaded` roots verdict: refused roots never
+    /// reached `InfoQuery` and unattempted slots never queried, so
+    /// their missing identities are expected, never passing.
+    fn task23a_evaluate_query_creds(
+        table: &[loader::LoadDiagnostics],
+        control_before: &ossl_bpf_sys::ThreadCredentials,
+        control_after: &ossl_bpf_sys::ThreadCredentials,
+    ) -> Vec<Task23aEvaluation> {
+        let mut evaluations = Vec::new();
+        evaluations.push(Task23aEvaluation {
+            root: "observation_return".to_owned(),
+            check: "query-creds",
+            passed: control_before == control_after,
+            detail: if control_before == control_after {
+                "calibrator identity stable across diagnostic".to_owned()
+            } else {
+                "calibrator identity changed across diagnostic".to_owned()
+            },
+        });
+        for record in table {
+            if record.stage != loader::LoadStage::Loaded {
+                continue;
+            }
+            match &record.query_creds {
+                Some(creds) if creds == control_before => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "query-creds",
+                    passed: true,
+                    detail: "query identity matches calibrator".to_owned(),
+                }),
+                Some(_) => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "query-creds",
+                    passed: false,
+                    detail: "query identity differs from calibrator".to_owned(),
+                }),
+                None => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "query-creds",
+                    passed: false,
+                    detail: "loaded without trustworthy query credentials".to_owned(),
+                }),
+            }
+        }
+        evaluations
+    }
+
+    /// Log-completeness evaluation: a loaded root that ran the
+    /// logged attempt must carry a `Complete` program log, so the
+    /// evidence the record ships is trustworthy. A quiet success
+    /// (`NoLogAttempted` with no quiet errno) never ran the logged
+    /// attempt and passes without a log; `Indeterminate` (truncated
+    /// or errno-marked) and a quiet failure with no logged attempt
+    /// fail their root explicitly. Unattempted slots carry no verdict.
+    fn task23a_evaluate_log_completeness(
+        table: &[loader::LoadDiagnostics],
+    ) -> Vec<Task23aEvaluation> {
+        let mut evaluations = Vec::new();
+        for record in table {
+            if record.stage != loader::LoadStage::Loaded {
+                continue;
+            }
+            let verdict = match (&record.log_completeness, record.quiet_errno) {
+                (loader::LogCompleteness::Complete, _) => Ok("program log complete".to_owned()),
+                (loader::LogCompleteness::NoLogAttempted, None) => {
+                    Ok("quiet success without logged attempt".to_owned())
+                }
+                (loader::LogCompleteness::NoLogAttempted, Some(_)) => {
+                    Err("quiet failed without a logged diagnostic".to_owned())
+                }
+                (other, _) => Err(format!("program log {other:?}: evidence inconclusive")),
+            };
+            match verdict {
+                Ok(detail) => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "log-completeness",
+                    passed: true,
+                    detail,
+                }),
+                Err(detail) => evaluations.push(Task23aEvaluation {
+                    root: record.root.clone(),
+                    check: "log-completeness",
+                    passed: false,
+                    detail,
+                }),
+            }
+        }
+        evaluations
+    }
+
+    /// Cleanup classification by sweep membership, never by stage
+    /// alone. `swept` is true only when the diagnostic held this
+    /// root's descriptors in its own sweep set: a loader transaction
+    /// that rolled back an earlier success (second-root `?` drops the
+    /// whole local collection) leaves an error-free `Loaded` record
+    /// whose FDs the sweep never saw, and that record is
+    /// `ReleasedByLoader`, never `HandlesClosed`. Slots the loader
+    /// never attempted keep no cleanup claim.
+    fn task23a_classify_cleanup(
+        stage: loader::LoadStage,
+        has_error: bool,
+        swept: bool,
+    ) -> loader::CleanupStatus {
+        use loader::{CleanupStatus, LoadStage};
+        match (stage, has_error, swept) {
+            (LoadStage::Loaded, false, true) => CleanupStatus::HandlesClosed,
+            (LoadStage::Loaded, false, false) => CleanupStatus::ReleasedByLoader,
+            (LoadStage::Unattempted | LoadStage::Preflight, _, _) => CleanupStatus::Pending,
+            (_, true, _) => CleanupStatus::ReleasedByLoader,
+            (_, false, _) => CleanupStatus::Pending,
+        }
+    }
+
+    /// True when one log line carries a retained-kernel bound
+    /// diagnostic whose size field equals the expected bound:
+    /// `combined stack size of {calls} calls is {size}. Too large`
+    /// or `stack size of subprog {idx} is {size}. Too large` (both
+    /// retained verifier.c sources emit these identical templates,
+    /// EACCES after). Exact bytes within the line; every template
+    /// occurrence parses fully, and only the size field binds.
+    fn task23a_line_binds_bound(line: &[u8], bound: &[u8]) -> bool {
+        fn digits(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+            let len = bytes.iter().take_while(|b| b.is_ascii_digit()).count();
+            if len == 0 {
+                return None;
+            }
+            Some((&bytes[..len], &bytes[len..]))
+        }
+        const TEMPLATES: [(&[u8], &[u8]); 2] = [
+            (b"combined stack size of ", b" calls is "),
+            (b"stack size of subprog ", b" is "),
+        ];
+        const SUFFIX: &[u8] = b". Too large";
+        for (prefix, infix) in TEMPLATES {
+            let mut haystack = line;
+            while let Some(at) = haystack.windows(prefix.len()).position(|w| w == prefix) {
+                let rest = &haystack[at + prefix.len()..];
+                if let Some((_, after_first)) = digits(rest) {
+                    if let Some(sized) = after_first.strip_prefix(infix) {
+                        if let Some((size, after_size)) = digits(sized) {
+                            if after_size.starts_with(SUFFIX) && size == bound {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                haystack = &haystack[at + 1..];
+            }
+        }
+        false
+    }
+
+    /// Stack-negative classification over one root's record: accepts
+    /// ONLY the named root dying AT load with a `Complete` nonempty
+    /// verifier log containing one line that matches a retained-kernel
+    /// bound diagnostic with its size field equal to the expected
+    /// numeric bound. The logged diagnostic is assessed against its
+    /// own attempt: the producing errno must be evidenced and must
+    /// not be EPERM/EINVAL, while an earlier quiet errno never vetoes
+    /// a genuine logged diagnostic. Everything else is explicitly not
+    /// that negative: wrong root, non-numeric expectation, setup
+    /// failure, post-load failure, missing logged attempt,
+    /// permission/malformed logged errno, empty or partial log,
+    /// unbound or wrong diagnostic, and unexpected success. Pure; the
+    /// native stack-negative stage (separately granted) consumes it,
+    /// this diagnostic proves it.
+    fn task23a_classify_stack_negative(
+        record: &loader::LoadDiagnostics,
+        expected_root: &str,
+        expected_bound: &str,
+    ) -> Result<(), String> {
+        use loader::LoadStage;
+        if expected_bound.is_empty() || !expected_bound.bytes().all(|b| b.is_ascii_digit()) {
+            return Err("no numeric bound named".to_owned());
+        }
+        if record.root != expected_root {
+            return Err(format!(
+                "wrong root: expected {expected_root}, got {}",
+                record.root
+            ));
+        }
+        match (&record.stage, record.error.is_some()) {
+            (LoadStage::QuietLoad | LoadStage::LoggedLoad, true) => {}
+            (LoadStage::Loaded, _) => {
+                return Err("unexpected success is not a negative".to_owned());
+            }
+            (LoadStage::Attestation | LoadStage::InfoQuery, _) => {
+                return Err("post-load failure is not a negative".to_owned());
+            }
+            (_, false) => return Err("no load failure evidenced".to_owned()),
+            _ => return Err("setup failure is not a negative".to_owned()),
+        }
+        // The logged diagnostic is assessed against its own
+        // attempt: the producing errno must be evidenced and must not
+        // be a permission/malformed refusal. An earlier quiet errno
+        // never vetoes a genuine logged diagnostic.
+        match record.logged_errno {
+            None => return Err("no logged diagnostic evidenced".to_owned()),
+            Some(errno) if errno == libc::EPERM || errno == libc::EINVAL => {
+                return Err(format!("logged errno {errno} is not a stack diagnostic"));
+            }
+            Some(_) => {}
+        }
+        if record.log_bytes.is_empty() {
+            return Err("empty log is not a negative".to_owned());
+        }
+        if record.log_completeness != loader::LogCompleteness::Complete {
+            return Err(format!(
+                "partial log ({:?}) is not a negative",
+                record.log_completeness
+            ));
+        }
+        // The bound diagnostic binds the expected number to the
+        // size field of a recognized retained-kernel template on one
+        // line. Any other shape — memory errors, negations, split
+        // templates, wrong sizes — never passes.
+        let bound = expected_bound.as_bytes();
+        let matched = record
+            .log_bytes
+            .split(|b| *b == b'\n')
+            .any(|line| task23a_line_binds_bound(line, bound));
+        if !matched {
+            return Err("log names no bound diagnostic for the intended bound".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Loader route per diagnostic root: the exact observed entry
+    /// point each of the nine names must travel. The diagnostic body
+    /// below follows this table (legacy pair, four registration
+    /// singletons, typed pair, count singleton); the pure
+    /// orchestration test pins the table against the expected names.
+    fn task23a_loader_route(root: &str) -> Result<&'static str, String> {
+        match root {
+            "observation_entry" | "observation_return" => Ok("load_gated_observed"),
+            "source_reg_in" | "source_reg_out" | "attr_exit" | "attr_exec" => {
+                Ok("load_source_root_unattached_observed")
+            }
+            "typed_entry" | "typed_return" => Ok("load_typed_borrowed_observed"),
+            "count_entry" => Ok("load_gated_borrowed_observed"),
+            other => Err(format!("no loader route for {other}")),
+        }
+    }
+
+    fn task23a_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Combine the stop reason with persistence failures for the
+    /// `blocked:` line and the terminal panic: a persistence failure
+    /// joins (never replaces, never hides behind) an existing stop
+    /// reason, and nothing suppresses it when a stop already exists.
+    fn task23a_combine_blocked(fatal: Option<&str>, persist: Option<&str>) -> Option<String> {
+        match (fatal, persist) {
+            (Some(f), Some(p)) => Some(format!("{f}; {p}")),
+            (Some(f), None) => Some(f.to_owned()),
+            (None, Some(p)) => Some(p.to_owned()),
+            (None, None) => None,
+        }
+    }
+
+    /// Fold a descriptor-leak finding into the stop reason: a leak
+    /// joins an existing stop (proving cleanup ran and found
+    /// survivors despite the earlier stop), and becomes the stop when
+    /// nothing stopped the run. No leak leaves the reason untouched.
+    fn task23a_fold_cleanup_leak(fatal: Option<&str>, leaked: &[String]) -> Option<String> {
+        if leaked.is_empty() {
+            return fatal.map(str::to_owned);
+        }
+        task23a_combine_blocked(
+            fatal,
+            Some(&format!("cleanup leaked descriptors: {}", leaked.join(","))),
+        )
+    }
+
+    /// Deterministic evidence text: per-root receipts in canonical
+    /// order, the patch audit, and the evaluation verdicts. Log bytes
+    /// enter only as length/true-size/completeness/sha256; raw bytes
+    /// ship as separate files, never inline. The calibrator identities
+    /// head the report so the per-root `query_creds` lines read
+    /// against them, and the global blocking reason is serialized so
+    /// a stopped run never omits why it stopped.
+    fn task23a_format_evidence(
+        table: &[loader::LoadDiagnostics],
+        evaluations: &[Task23aEvaluation],
+        calibration: Option<(
+            &ossl_bpf_sys::ThreadCredentials,
+            &ossl_bpf_sys::ThreadCredentials,
+        )>,
+        blocked: Option<&str>,
+        patch_audit: &[(String, Vec<loader::FixupAuditEntry>)],
+    ) -> String {
+        use sha2::Digest as _;
+        let mut out = String::from("task23a unattached nine-root diagnostic evidence\n");
+        let loaded = table
+            .iter()
+            .filter(|r| r.stage == loader::LoadStage::Loaded)
+            .count();
+        let refused = table.iter().filter(|r| r.error.is_some()).count();
+        let unattempted = table
+            .iter()
+            .filter(|r| r.stage == loader::LoadStage::Unattempted)
+            .count();
+        out.push_str(&format!(
+            "roots: {} loaded={loaded} refused={refused} unattempted={unattempted}\n",
+            table.len()
+        ));
+        match calibration {
+            Some((before, after)) => {
+                out.push_str(&format!("calibration: before={before:?} after={after:?}\n"))
+            }
+            None => out.push_str("calibration: unavailable\n"),
+        }
+        match blocked {
+            Some(reason) => out.push_str(&format!("blocked: {reason}\n")),
+            None => out.push_str("blocked: none\n"),
+        }
+        for record in table {
+            out.push_str(&format!(
+                "--- root {} ({}) ---\n",
+                record.root, record.section
+            ));
+            out.push_str(&format!(
+                "stage: {:?}\nartifact: sha256={} len={}\n",
+                record.stage,
+                task23a_hex(&record.artifact.sha256),
+                record.artifact.len
+            ));
+            out.push_str(&format!(
+                "program: type={} attach={} target={} flags={}\n",
+                record.prog_type, record.expected_attach, record.attach_target, record.prog_flags
+            ));
+            out.push_str(&format!(
+                "callbacks: {} btf_synthesized: {}\n",
+                record.callback_subprogs, record.btf_synthesized
+            ));
+            out.push_str("maps:");
+            for (name, fd) in &record.maps {
+                out.push_str(&format!(" {name}={fd}"));
+            }
+            out.push_str(&format!(
+                "\nquiet_errno: {:?} logged_errno: {:?}\n",
+                record.quiet_errno, record.logged_errno
+            ));
+            out.push_str(&format!(
+                "log: bytes={} true_size={} completeness={:?} sha256={}\n",
+                record.log_bytes.len(),
+                record.log_true_size,
+                record.log_completeness,
+                task23a_hex(&sha2::Sha256::digest(&record.log_bytes)),
+            ));
+            out.push_str(&format!(
+                "btf_log: bytes={} sha256={}\n",
+                record.btf_log.len(),
+                task23a_hex(&sha2::Sha256::digest(&record.btf_log)),
+            ));
+            out.push_str(&format!("loaded_id: {:?}\n", record.loaded_id));
+            match &record.info {
+                Some(info) => out.push_str(&format!(
+                    "info: own_btf={} func={} line={} jline={} func_rec={} line_rec={} jline_rec={} attach_obj={} attach_id={} map_ids={:?}\n",
+                    info.own_btf_id,
+                    info.func_info_count,
+                    info.line_info_count,
+                    info.jited_line_info_count,
+                    info.func_info_rec_size,
+                    info.line_info_rec_size,
+                    info.jited_line_info_rec_size,
+                    info.attach_btf_obj_id,
+                    info.attach_btf_id,
+                    info.map_ids,
+                )),
+                None => out.push_str("info: unavailable\n"),
+            }
+            out.push_str(&format!(
+                "info_unavailable: {:?}\nquery_creds: {:?}\n",
+                record.info_unavailable, record.query_creds
+            ));
+            out.push_str(&format!(
+                "fixup_audit: {} entries\n",
+                record.fixup_audit.len()
+            ));
+            for entry in &record.fixup_audit {
+                out.push_str(&format!(
+                    "  site {} spans {:?} role {:?}\n",
+                    entry.insn_off, entry.spans, entry.role
+                ));
+            }
+            out.push_str(&format!(
+                "cleanup: {:?}\nerror: {:?}\n",
+                record.cleanup, record.error
+            ));
+        }
+        out.push_str("--- patch audit ---\n");
+        if patch_audit.is_empty() {
+            out.push_str("patches: unaudited\n");
+        } else {
+            for (name, entries) in patch_audit {
+                out.push_str(&format!("patch {name}: {} slots\n", entries.len()));
+                for entry in entries {
+                    out.push_str(&format!(
+                        "  slot {} spans {:?} role {:?}\n",
+                        entry.insn_off, entry.spans, entry.role
+                    ));
+                }
+            }
+        }
+        out.push_str("--- evaluations ---\n");
+        for evaluation in evaluations {
+            out.push_str(&format!(
+                "{} {}: {} ({})\n",
+                evaluation.check,
+                evaluation.root,
+                if evaluation.passed { "PASS" } else { "FAIL" },
+                evaluation.detail
+            ));
+        }
+        out
+    }
+
+    fn task23a_test_pins() -> loader::ArtifactPins {
+        loader::ArtifactPins {
+            sha256: [9u8; 32],
+            len: 77,
+        }
+    }
+
+    fn task23a_test_summary(prog_id: u32) -> ossl_bpf_sys::ProgramInfoSummary {
+        ossl_bpf_sys::ProgramInfoSummary {
+            requested_len: 232,
+            returned_len: 232,
+            prog_type: 2,
+            prog_id,
+            name: [0u8; 16],
+            tag: [0u8; 8],
+            map_ids: vec![40],
+            own_btf_id: 0,
+            func_info_count: 0,
+            line_info_count: 0,
+            jited_line_info_count: 0,
+            func_info_rec_size: 0,
+            line_info_rec_size: 0,
+            jited_line_info_rec_size: 0,
+            attach_btf_obj_id: 0,
+            attach_btf_id: 0,
+        }
+    }
+
+    #[test]
+    fn task23a_table_alignment_keeps_explicit_unattempted() {
+        let pins = task23a_test_pins();
+        let mut table = task23a_unattempted_table(pins, pins);
+        assert_eq!(table.len(), 9);
+        assert!(
+            table
+                .iter()
+                .all(|r| r.stage == loader::LoadStage::Unattempted)
+        );
+        // Push two successes out of order; the rest stay unattempted.
+        let mut first = loader::LoadDiagnostics::unattempted("typed_entry", "uprobe", pins);
+        first.stage = loader::LoadStage::Loaded;
+        let mut second = loader::LoadDiagnostics::unattempted("observation_entry", "uprobe", pins);
+        second.stage = loader::LoadStage::Loaded;
+        task23a_align_records(&mut table, vec![first, second]).unwrap();
+        assert_eq!(table[0].stage, loader::LoadStage::Loaded);
+        assert_eq!(table[6].stage, loader::LoadStage::Loaded);
+        assert!(
+            table[1..6]
+                .iter()
+                .all(|r| r.stage == loader::LoadStage::Unattempted)
+        );
+        // Unknown and duplicate pushed names are internal errors.
+        let unknown = loader::LoadDiagnostics::unattempted("nope", "uprobe", pins);
+        assert!(task23a_align_records(&mut table, vec![unknown]).is_err());
+        let dupe = loader::LoadDiagnostics::unattempted("typed_entry", "uprobe", pins);
+        assert!(task23a_align_records(&mut table, vec![dupe]).is_err());
+        // Setup failures map onto named unattempted slots only.
+        task23a_refuse_slots(&mut table, &["typed_return", "count_entry"], "boom").unwrap();
+        assert_eq!(table[7].stage, loader::LoadStage::Preflight);
+        assert_eq!(table[7].error.as_deref(), Some("boom"));
+        assert!(task23a_refuse_slots(&mut table, &["typed_entry"], "late").is_err());
+        assert!(task23a_refuse_slots(&mut table, &["nope"], "late").is_err());
+    }
+
+    #[test]
+    fn task23a_source_zero_evaluation_uses_live_controls() {
+        let pins = task23a_test_pins();
+        let mut table = task23a_unattempted_table(pins, pins);
+        // Every non-control root carries clean zero metadata.
+        for record in table.iter_mut() {
+            let mut info = task23a_test_summary(50);
+            if record.root == "source_reg_in" || record.root == "source_reg_out" {
+                info.attach_btf_obj_id = 3;
+                info.attach_btf_id = 4242;
+            }
+            record.info = Some(info);
+        }
+        let mut control = task23a_test_summary(60);
+        control.own_btf_id = 5;
+        control.func_info_count = 2;
+        let evaluations = task23a_evaluate_source_zeros(&table, &control, &control, 4242);
+        assert_eq!(evaluations.len(), 8);
+        assert!(evaluations.iter().all(|e| e.passed));
+        assert!(evaluations.iter().all(|e| e.root != "observation_return"));
+        // A dead control fails every root; a dirty source fails one.
+        let mut dead = control.clone();
+        dead.func_info_count = 0;
+        let evaluations = task23a_evaluate_source_zeros(&table, &dead, &control, 4242);
+        assert!(evaluations.iter().all(|e| !e.passed));
+        table[2].info.as_mut().unwrap().own_btf_id = 1;
+        let evaluations = task23a_evaluate_source_zeros(&table, &control, &control, 4242);
+        assert!(
+            !evaluations
+                .iter()
+                .find(|e| e.root == "source_reg_in")
+                .unwrap()
+                .passed
+        );
+        assert!(
+            evaluations
+                .iter()
+                .find(|e| e.root == "typed_entry")
+                .unwrap()
+                .passed
+        );
+        // Missing info fails its root explicitly.
+        table[8].info = None;
+        let evaluations = task23a_evaluate_source_zeros(&table, &control, &control, 4242);
+        let count = evaluations
+            .iter()
+            .find(|e| e.root == "count_entry")
+            .unwrap();
+        assert!(!count.passed);
+        assert!(count.detail.contains("no trustworthy program info"));
+    }
+
+    #[test]
+    fn task23a_evidence_format_is_deterministic() {
+        let pins = task23a_test_pins();
+        let mut table = task23a_unattempted_table(pins, pins);
+        table[0].stage = loader::LoadStage::Loaded;
+        table[0].info = Some(task23a_test_summary(50));
+        table[0].log_bytes = vec![b'A', 0];
+        table[0].log_completeness = loader::LogCompleteness::Complete;
+        let evaluations = vec![Task23aEvaluation {
+            root: "observation_entry".to_owned(),
+            check: "source-zero",
+            passed: true,
+            detail: "zero own metadata between live controls".to_owned(),
+        }];
+        let first = task23a_format_evidence(&table, &evaluations, None, None, &[]);
+        let second = task23a_format_evidence(&table, &evaluations, None, None, &[]);
+        assert_eq!(first, second);
+        assert!(first.contains("roots: 9 loaded=1 refused=0 unattempted=8"));
+        assert!(first.contains("--- root observation_entry (uprobe) ---"));
+        assert!(first.contains("source-zero observation_entry: PASS"));
+        assert!(first.contains("calibration: unavailable"));
+        assert!(first.contains("query_creds: None"));
+        assert!(first.contains("blocked: none"));
+        assert!(first.contains("patches: unaudited"));
+        let blocked = task23a_format_evidence(&table, &evaluations, None, Some("boom"), &[]);
+        assert!(blocked.contains("blocked: boom"));
+        // Raw log bytes never appear inline, only their digest.
+        assert!(!first.contains("vec![65, 0]"));
+        assert!(first.contains("log: bytes=2"));
+    }
+
+    #[test]
+    fn task23a_blocked_combination_keeps_both_reasons() {
+        assert_eq!(task23a_combine_blocked(None, None), None);
+        assert_eq!(
+            task23a_combine_blocked(Some("stop"), None),
+            Some("stop".to_owned())
+        );
+        assert_eq!(
+            task23a_combine_blocked(None, Some("persist")),
+            Some("persist".to_owned())
+        );
+        // A persistence failure joins an existing stop; neither hides.
+        assert_eq!(
+            task23a_combine_blocked(Some("stop"), Some("persist")),
+            Some("stop; persist".to_owned())
+        );
+    }
+
+    #[test]
+    fn task23a_cleanup_leak_folds_into_any_stop() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(task23a_fold_cleanup_leak(None, &empty), None);
+        assert_eq!(
+            task23a_fold_cleanup_leak(Some("stop"), &empty),
+            Some("stop".to_owned())
+        );
+        // A leak with no earlier stop becomes the stop.
+        assert_eq!(
+            task23a_fold_cleanup_leak(None, &["a".to_owned(), "b".to_owned()]),
+            Some("cleanup leaked descriptors: a,b".to_owned())
+        );
+        // A leak with an existing stop joins it; neither hides.
+        assert_eq!(
+            task23a_fold_cleanup_leak(Some("stop"), &["a".to_owned()]),
+            Some("stop; cleanup leaked descriptors: a".to_owned())
+        );
+    }
+
+    #[test]
+    fn task23a_required_sha_parse_is_strict() {
+        let good = "9f".repeat(32);
+        let parsed = task23a_parse_sha_hex(&good).unwrap();
+        assert_eq!(parsed, [0x9fu8; 32]);
+        assert!(task23a_parse_sha_hex(&"9f".repeat(31)).is_err());
+        assert!(task23a_parse_sha_hex(&("9f".repeat(32) + "00")).is_err());
+        assert!(task23a_parse_sha_hex(&"9F".repeat(32)).is_err());
+        let mut bad = "9f".repeat(32);
+        bad.replace_range(0..2, "zz");
+        assert!(task23a_parse_sha_hex(&bad).is_err());
+        assert!(task23a_parse_sha_hex("").is_err());
+        // Missing variable refuses; the diagnostic never defaults.
+        assert!(task23a_required_sha("OSSL_TASK23A_DEFINITELY_UNSET_PIN").is_err());
+    }
+
+    #[test]
+    fn task23a_query_creds_evaluation_compares_all_identities() {
+        let pins = task23a_test_pins();
+        let mut table = task23a_unattempted_table(pins, pins);
+        let creds = ossl_bpf_sys::ThreadCredentials {
+            caps: [[0u32; 3]; 2],
+            euid: 0,
+            tid: 7,
+            userns_dev: 1,
+            userns_ino: 2,
+        };
+        let other = ossl_bpf_sys::ThreadCredentials { tid: 8, ..creds };
+        // Stable calibrator, one matching root, one mismatched, one
+        // loaded-but-untrusted; the rest stay unattempted and verdict
+        // nothing.
+        table[0].stage = loader::LoadStage::Loaded;
+        table[0].query_creds = Some(creds);
+        table[1].stage = loader::LoadStage::Loaded;
+        table[1].query_creds = Some(other);
+        table[2].stage = loader::LoadStage::Loaded;
+        table[2].query_creds = None;
+        let evaluations = task23a_evaluate_query_creds(&table, &creds, &creds);
+        assert_eq!(evaluations.len(), 4);
+        // [0] is the stable-calibrator check; the observation_return
+        // root then carries its own mismatched verdict.
+        assert!(evaluations[0].passed);
+        assert!(
+            evaluations
+                .iter()
+                .find(|e| e.root == "observation_entry")
+                .unwrap()
+                .passed
+        );
+        let control_root: Vec<_> = evaluations
+            .iter()
+            .filter(|e| e.root == "observation_return")
+            .collect();
+        assert_eq!(control_root.len(), 2);
+        assert!(control_root.iter().any(|e| e.passed));
+        assert!(control_root.iter().any(|e| !e.passed));
+        assert!(
+            !evaluations
+                .iter()
+                .find(|e| e.root == "source_reg_in")
+                .unwrap()
+                .passed
+        );
+        // A changed calibrator fails the calibration check itself.
+        let evaluations = task23a_evaluate_query_creds(&table, &creds, &other);
+        assert!(!evaluations[0].passed);
+        assert!(evaluations[0].detail.contains("changed"));
+    }
+
+    #[test]
+    fn task23a_log_completeness_evaluation_requires_complete() {
+        let pins = task23a_test_pins();
+        let mut table = task23a_unattempted_table(pins, pins);
+        table[0].stage = loader::LoadStage::Loaded;
+        table[0].log_completeness = loader::LogCompleteness::Complete;
+        table[1].stage = loader::LoadStage::Loaded;
+        table[1].log_completeness = loader::LogCompleteness::Indeterminate;
+        // A quiet success never ran the logged attempt: no log is
+        // the valid receipt. A quiet failure with no logged attempt
+        // is missing evidence, not a pass.
+        table[2].stage = loader::LoadStage::Loaded;
+        table[2].log_completeness = loader::LogCompleteness::NoLogAttempted;
+        table[2].quiet_errno = None;
+        table[3].stage = loader::LoadStage::Loaded;
+        table[3].log_completeness = loader::LogCompleteness::NoLogAttempted;
+        table[3].quiet_errno = Some(libc::EACCES);
+        let evaluations = task23a_evaluate_log_completeness(&table);
+        assert_eq!(evaluations.len(), 4);
+        assert!(evaluations[0].passed);
+        assert!(!evaluations[1].passed);
+        assert!(evaluations[1].detail.contains("Indeterminate"));
+        assert!(evaluations[2].passed);
+        assert!(evaluations[2].detail.contains("quiet success"));
+        assert!(!evaluations[3].passed);
+        assert!(
+            evaluations[3]
+                .detail
+                .contains("without a logged diagnostic")
+        );
+    }
+
+    #[test]
+    fn task23a_cleanup_classification_follows_sweep_membership() {
+        use loader::{CleanupStatus, LoadStage};
+        // Swept loaded roots close; unswept loaded roots (second-root
+        // rollback inside a failed loader transaction) release by
+        // loader, even with no error on their record.
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::Loaded, false, true),
+            CleanupStatus::HandlesClosed
+        );
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::Loaded, false, false),
+            CleanupStatus::ReleasedByLoader
+        );
+        // Attempted failures release by loader; untouched slots keep
+        // no claim; inconsistent non-loaded success claims nothing.
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::LoggedLoad, true, false),
+            CleanupStatus::ReleasedByLoader
+        );
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::MapSetup, true, true),
+            CleanupStatus::ReleasedByLoader
+        );
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::Preflight, true, false),
+            CleanupStatus::Pending
+        );
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::Unattempted, false, false),
+            CleanupStatus::Pending
+        );
+        assert_eq!(
+            task23a_classify_cleanup(LoadStage::Fixup, false, true),
+            CleanupStatus::Pending
+        );
+    }
+
+    /// A valid stack negative: the named root died at the logged
+    /// load with verifier errno and a complete log carrying the
+    /// retained kernels' combined bound diagnostic verbatim.
+    fn task23a_negative_fixture() -> loader::LoadDiagnostics {
+        let mut record =
+            loader::LoadDiagnostics::unattempted("count_entry", "uprobe", task23a_test_pins());
+        record.stage = loader::LoadStage::LoggedLoad;
+        record.error = Some("verifier rejected".to_owned());
+        record.quiet_errno = Some(libc::EACCES);
+        record.logged_errno = Some(libc::EACCES);
+        record.log_bytes = b"combined stack size of 3 calls is 816. Too large\0".to_vec();
+        record.log_true_size = record.log_bytes.len() as u32;
+        record.log_completeness = loader::LogCompleteness::Complete;
+        record
+    }
+
+    #[test]
+    fn task23a_stack_negative_accepts_only_the_named_bound() {
+        let record = task23a_negative_fixture();
+        assert!(task23a_classify_stack_negative(&record, "count_entry", "816").is_ok());
+        // Wrong root, non-numeric expectation, and every non-negative.
+        assert!(task23a_classify_stack_negative(&record, "typed_entry", "816").is_err());
+        assert!(task23a_classify_stack_negative(&record, "count_entry", "").is_err());
+        assert!(task23a_classify_stack_negative(&record, "count_entry", "chain816").is_err());
+        let mut setup = record.clone();
+        setup.stage = loader::LoadStage::MapSetup;
+        assert!(task23a_classify_stack_negative(&setup, "count_entry", "816").is_err());
+        let mut attest = record.clone();
+        attest.stage = loader::LoadStage::Attestation;
+        assert!(task23a_classify_stack_negative(&attest, "count_entry", "816").is_err());
+        let mut success = record.clone();
+        success.stage = loader::LoadStage::Loaded;
+        success.error = None;
+        assert!(task23a_classify_stack_negative(&success, "count_entry", "816").is_err());
+        let mut no_attempt = record.clone();
+        no_attempt.quiet_errno = None;
+        no_attempt.logged_errno = None;
+        assert!(task23a_classify_stack_negative(&no_attempt, "count_entry", "816").is_err());
+        // The logged attempt governs its own diagnostic: a logged
+        // permission/malformed errno refuses, while an earlier quiet
+        // errno never vetoes a genuine logged rejection.
+        let mut eperm = record.clone();
+        eperm.logged_errno = Some(libc::EPERM);
+        assert!(task23a_classify_stack_negative(&eperm, "count_entry", "816").is_err());
+        let mut logged_einval = record.clone();
+        logged_einval.logged_errno = Some(libc::EINVAL);
+        assert!(task23a_classify_stack_negative(&logged_einval, "count_entry", "816").is_err());
+        let mut quiet_einval = record.clone();
+        quiet_einval.quiet_errno = Some(libc::EINVAL);
+        assert!(task23a_classify_stack_negative(&quiet_einval, "count_entry", "816").is_ok());
+        let mut quiet_eperm = record.clone();
+        quiet_eperm.quiet_errno = Some(libc::EPERM);
+        assert!(task23a_classify_stack_negative(&quiet_eperm, "count_entry", "816").is_ok());
+        let mut empty = record.clone();
+        empty.log_bytes.clear();
+        assert!(task23a_classify_stack_negative(&empty, "count_entry", "816").is_err());
+        let mut partial = record.clone();
+        partial.log_completeness = loader::LogCompleteness::Indeterminate;
+        assert!(task23a_classify_stack_negative(&partial, "count_entry", "816").is_err());
+        // The individual-frame template binds the same way.
+        let mut frame = record.clone();
+        frame.log_bytes = b"stack size of subprog 1 is 520. Too large".to_vec();
+        assert!(task23a_classify_stack_negative(&frame, "count_entry", "520").is_ok());
+        // Wrong size, and the size must be the template's field, not
+        // a bare number elsewhere on the line.
+        assert!(task23a_classify_stack_negative(&record, "count_entry", "815").is_err());
+        let mut elsewhere = record.clone();
+        elsewhere.log_bytes =
+            b"note 816: combined stack size of 3 calls is 815. Too large".to_vec();
+        assert!(task23a_classify_stack_negative(&elsewhere, "count_entry", "816").is_err());
+        // Same-line non-bound diagnostics refuse: stack-memory error
+        // and negated bound language, both carrying the number.
+        let mut mem_error = record.clone();
+        mem_error.log_bytes = b"invalid read from stack off -8+0 size 8 in frame 816".to_vec();
+        assert!(task23a_classify_stack_negative(&mem_error, "count_entry", "816").is_err());
+        let mut negated = record.clone();
+        negated.log_bytes =
+            b"stack limit 512 not exceeded; 816 rejected for invalid access".to_vec();
+        assert!(task23a_classify_stack_negative(&negated, "count_entry", "816").is_err());
+        // A template split across lines never binds; a genuine
+        // multi-line log binds on its rejection line.
+        let mut split = record.clone();
+        split.log_bytes = b"combined stack size of 3 calls is 816.\nToo large".to_vec();
+        assert!(task23a_classify_stack_negative(&split, "count_entry", "816").is_err());
+        let mut multiline = record.clone();
+        multiline.log_bytes =
+            b"verifier error:\ncombined stack size of 3 calls is 816. Too large\n".to_vec();
+        assert!(task23a_classify_stack_negative(&multiline, "count_entry", "816").is_ok());
+        // Leading bytes on the line do not break the template.
+        let mut prefixed = record.clone();
+        prefixed.log_bytes = b"\xffcombined stack size of 3 calls is 816. Too large".to_vec();
+        assert!(task23a_classify_stack_negative(&prefixed, "count_entry", "816").is_ok());
+        // Every template occurrence on the line parses: a mismatching
+        // first diagnostic does not shadow a matching second.
+        let mut two = record.clone();
+        two.log_bytes =
+            b"combined stack size of 3 calls is 815. Too large; combined stack size of 4 calls is 816. Too large"
+                .to_vec();
+        assert!(task23a_classify_stack_negative(&two, "count_entry", "816").is_ok());
+        assert!(task23a_classify_stack_negative(&two, "count_entry", "815").is_ok());
+        assert!(task23a_classify_stack_negative(&two, "count_entry", "814").is_err());
+    }
+
+    #[test]
+    fn task23a_loader_routes_cover_all_nine_roots() {
+        let mut routes = std::collections::BTreeMap::new();
+        for (name, _) in task23a_expected_roots() {
+            routes.insert(name, task23a_loader_route(name).unwrap());
+        }
+        assert_eq!(routes.len(), 9);
+        assert_eq!(routes["observation_entry"], "load_gated_observed");
+        assert_eq!(routes["observation_return"], "load_gated_observed");
+        for root in ["source_reg_in", "source_reg_out", "attr_exit", "attr_exec"] {
+            assert_eq!(routes[root], "load_source_root_unattached_observed");
+        }
+        assert_eq!(routes["typed_entry"], "load_typed_borrowed_observed");
+        assert_eq!(routes["typed_return"], "load_typed_borrowed_observed");
+        assert_eq!(routes["count_entry"], "load_gated_borrowed_observed");
+        assert!(task23a_loader_route("nope").is_err());
+    }
+
+    /// One trustworthy calibrator query: credential snapshot, info
+    /// query, credential snapshot. Unchanged privileged credentials
+    /// plus a decodable reply yield the summary and the retained
+    /// identity; anything else is an explicit refusal, never an
+    /// assumption. The identity ships to evidence and the
+    /// cross-query evaluation, not just this query's bracketing.
+    fn task23a_calibration_query(
+        program: &std::os::fd::OwnedFd,
+    ) -> Result<
+        (
+            ossl_bpf_sys::ProgramInfoSummary,
+            ossl_bpf_sys::ThreadCredentials,
+        ),
+        String,
+    > {
+        use std::os::fd::AsFd as _;
+        let before = ossl_bpf_sys::calling_thread_credentials()
+            .map_err(|e| format!("calibrator credentials unavailable: {e}"))?;
+        let summary = ossl_bpf_sys::program_info_summary(program.as_fd())
+            .map_err(|e| format!("calibrator info query refused: {e}"))?;
+        let after = ossl_bpf_sys::calling_thread_credentials()
+            .map_err(|e| format!("calibrator credentials unavailable: {e}"))?;
+        if before != after {
+            return Err("calibrator credentials changed around query".to_owned());
+        }
+        if !ossl_bpf_sys::has_bpf_query_capabilities(&before) {
+            return Err("calibrator query privilege missing".to_owned());
+        }
+        Ok((summary, before))
+    }
+
+    #[test]
+    #[ignore = "Task23A unattached nine-root diagnostic: privileged BPF plus both production objects, no attach"]
+    fn task23a_unattached_nine_root_diagnostic() {
+        use sha2::Digest as _;
+        use std::collections::BTreeMap;
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        // Phase 0: required host inputs. Artifact bytes, required
+        // expected-sha256 pins, and the evidence directory validate
+        // here, before the table exists and before any kernel object.
+        // Any failure refuses every slot; the terminal protocol
+        // (stdout evidence, cleanup sweep, panic with the reason)
+        // still runs. Nothing defaults, nothing stamps.
+        let setup: Result<Task23aInputs, String> = (|| {
+            let provider_path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")
+                .ok_or_else(|| "missing OSSL_PROVIDER_OBSERVATION_TEST_BPF".to_owned())?;
+            let count_path = std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT")
+                .ok_or_else(|| "missing OSSLSCOPE_FOCUSED_COUNT_OBJECT".to_owned())?;
+            let provider = std::fs::read(&provider_path)
+                .map_err(|e| format!("provider object read refused: {e}"))?;
+            let count = std::fs::read(&count_path)
+                .map_err(|e| format!("count object read refused: {e}"))?;
+            let expected_provider = task23a_required_sha("OSSL_TASK23A_EXPECTED_PROVIDER_SHA256")?;
+            let expected_count = task23a_required_sha("OSSL_TASK23A_EXPECTED_COUNT_SHA256")?;
+            let actual_provider: [u8; 32] = sha2::Sha256::digest(&provider).into();
+            if actual_provider != expected_provider {
+                return Err(format!(
+                    "provider sha256 mismatch actual={} expected={}",
+                    task23a_hex(&actual_provider),
+                    task23a_hex(&expected_provider)
+                ));
+            }
+            let actual_count: [u8; 32] = sha2::Sha256::digest(&count).into();
+            if actual_count != expected_count {
+                return Err(format!(
+                    "count sha256 mismatch actual={} expected={}",
+                    task23a_hex(&actual_count),
+                    task23a_hex(&expected_count)
+                ));
+            }
+            // The raw-artifact destination is required: acquisition
+            // without a persistence target is refused outright.
+            let evidence_dir = match std::env::var_os("OSSL_TASK23A_EVIDENCE_DIR") {
+                None => return Err("required OSSL_TASK23A_EVIDENCE_DIR missing".to_owned()),
+                Some(dir) => {
+                    let dir = std::path::PathBuf::from(dir);
+                    if !dir.is_dir() {
+                        return Err(format!("evidence dir missing: {}", dir.display()));
+                    }
+                    Some(dir)
+                }
+            };
+            Ok((provider, count, evidence_dir))
+        })();
+        let (provider, count, evidence_dir, mut table, mut fatal) = match setup {
+            Ok((provider, count, evidence_dir)) => {
+                let provider_pins = loader::ArtifactPins {
+                    sha256: sha2::Sha256::digest(&provider).into(),
+                    len: provider.len() as u64,
+                };
+                let count_pins = loader::ArtifactPins {
+                    sha256: sha2::Sha256::digest(&count).into(),
+                    len: count.len() as u64,
+                };
+                println!(
+                    "provider sha256={} len={} count sha256={} len={}",
+                    task23a_hex(&provider_pins.sha256),
+                    provider.len(),
+                    task23a_hex(&count_pins.sha256),
+                    count.len()
+                );
+                (
+                    Some(provider),
+                    Some(count),
+                    evidence_dir,
+                    task23a_unattempted_table(provider_pins, count_pins),
+                    None,
+                )
+            }
+            Err(error) => {
+                let zero = loader::ArtifactPins {
+                    sha256: [0u8; 32],
+                    len: 0,
+                };
+                let mut table = task23a_unattempted_table(zero, zero);
+                task23a_refuse_all(&mut table, &error);
+                (None, None, None, table, Some(error))
+            }
+        };
+        let provider_pins = table[0].artifact;
+        let count_pins = table[8].artifact;
+        // Phase 1: pure preparation of every load input (host reads
+        // only), then the nine-root preflight BEFORE any kernel
+        // object exists. Fallible throughout: failures refuse all
+        // slots and skip every acquisition below.
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let mut budget = ObservationBudget::new(super::super::ObservationLimits::default());
+        budget.memory = Some(pool.clone());
+        let mut halves: Option<Task23aHalves> = None;
+        // Patch audit entries per source-prepared program, in prepared
+        // order. Assigned inside phase 1 the moment the audit
+        // completes, so a LATER preparation failure retains the
+        // completed audit instead of discarding it; empty ⟺ no audit
+        // completed (see the blocked reason).
+        let mut patch_audit: Vec<(String, Vec<loader::FixupAuditEntry>)> = Vec::new();
+        if fatal.is_none() {
+            let provider = provider.as_ref().unwrap();
+            let count = count.as_ref().unwrap();
+            let built: Result<Task23aHalves, (String, Vec<&'static str>)> = (|| {
+                let legacy = crate::provider_observation::session::prepare_legacy_object(provider)
+                    .map_err(|e| {
+                        (
+                            format!("legacy preparation refused: {e:?}"),
+                            TASK23A_LEGACY_SLOTS.to_vec(),
+                        )
+                    })?;
+                let full = crate::provider_observation::session::prepare_object(provider).map_err(
+                    |e| {
+                        (
+                            format!("provider preparation refused: {e:?}"),
+                            TASK23A_PROVIDER_SLOTS.to_vec(),
+                        )
+                    },
+                )?;
+                let (_, mut source_prepared) =
+                    crate::provider_observation::session::split_source_preparation(full);
+                let kernel = loader::SourceKernel::read(&budget).map_err(|e| {
+                    (
+                        format!("kernel description refused: {e:?}"),
+                        TASK23A_SOURCE_SLOTS.to_vec(),
+                    )
+                })?;
+                // Snapshot every image, patch, then audit each
+                // pre-patch-to-final pair against the admitted
+                // configuration before any split or load consumes it.
+                let patch_before = source_prepared.progs.clone();
+                kernel.patch(&mut source_prepared).map_err(|e| {
+                    (
+                        format!("source patch refused: {e:?}"),
+                        TASK23A_SOURCE_SLOTS.to_vec(),
+                    )
+                })?;
+                let configuration = kernel.patch_configuration();
+                let mut audit = Vec::with_capacity(source_prepared.progs.len());
+                for (before_prog, after_prog) in
+                    patch_before.iter().zip(source_prepared.progs.iter())
+                {
+                    let entries =
+                        loader::audit_patch_images(before_prog, after_prog, &configuration)
+                            .map_err(|e| {
+                                (
+                                    format!("patch audit {} refused: {e:#}", before_prog.name),
+                                    TASK23A_SOURCE_SLOTS.to_vec(),
+                                )
+                            })?;
+                    audit.push((before_prog.name.clone(), entries));
+                }
+                // Retain immediately: later steps may still fail.
+                patch_audit = audit;
+                let (registration, typed) =
+                    loader::split_typed_preparation(source_prepared.clone()).map_err(|e| {
+                        (
+                            format!("typed split refused: {e:#}"),
+                            TASK23A_SOURCE_SLOTS.to_vec(),
+                        )
+                    })?;
+                // Count runs the identical production pipeline with
+                // the patch audit inserted at the exposed boundary:
+                // unpatched prep, snapshot, production patch, audit
+                // against an independently read join layout, then the
+                // shared post-patch allowlist.
+                let mut count_prepared =
+                    loader::prepare_focused_count_unpatched(count).map_err(|e| {
+                        (
+                            format!("count preparation refused: {e:#}"),
+                            TASK23A_COUNT_SLOTS.to_vec(),
+                        )
+                    })?;
+                let count_before = count_prepared.progs.clone();
+                loader::patch_count_markers(&mut count_prepared, &ObservationBudget::default())
+                    .map_err(|e| {
+                        (
+                            format!("count patch refused: {e:?}"),
+                            TASK23A_COUNT_SLOTS.to_vec(),
+                        )
+                    })?;
+                let join = loader::JoinKernel::read_join(&budget).map_err(|e| {
+                    (
+                        format!("join description refused: {e:?}"),
+                        TASK23A_COUNT_SLOTS.to_vec(),
+                    )
+                })?;
+                let join_configuration = join.patch_configuration();
+                let mut count_audit = Vec::with_capacity(count_prepared.progs.len());
+                for (before_prog, after_prog) in
+                    count_before.iter().zip(count_prepared.progs.iter())
+                {
+                    let entries =
+                        loader::audit_patch_images(before_prog, after_prog, &join_configuration)
+                            .map_err(|e| {
+                                (
+                                    format!(
+                                        "count patch audit {} refused: {e:#}",
+                                        before_prog.name
+                                    ),
+                                    TASK23A_COUNT_SLOTS.to_vec(),
+                                )
+                            })?;
+                    count_audit.push((before_prog.name.clone(), entries));
+                }
+                patch_audit.extend(count_audit);
+                loader::check_focused_count_post_patch(&count_prepared).map_err(|e| {
+                    (
+                        format!("count post-patch check refused: {e:#}"),
+                        TASK23A_COUNT_SLOTS.to_vec(),
+                    )
+                })?;
+                Ok(Task23aHalves {
+                    legacy,
+                    registration,
+                    typed,
+                    count_prepared,
+                    source_prepared,
+                    kernel,
+                })
+            })();
+            match built {
+                Ok(halves_built) => {
+                    halves = Some(halves_built);
+                }
+                Err((error, slots)) => {
+                    // Phase-1 slots are fresh (see consts): refusal is total.
+                    task23a_refuse_slots(&mut table, &slots, &error).unwrap();
+                    fatal = Some(error);
+                }
+            }
+        }
+        if fatal.is_none() {
+            let halves = halves.as_ref().unwrap();
+            if let Err(error) = loader::preflight_nine_roots(
+                &halves.legacy,
+                &halves.registration,
+                &halves.typed,
+                &halves.count_prepared,
+            ) {
+                let fatal_error = format!("nine-root preflight refused: {error:#}");
+                task23a_refuse_all(&mut table, &fatal_error);
+                fatal = Some(fatal_error);
+            }
+        }
+        // First kernel objects: the gate (which owns kernel maps),
+        // then the exact legacy pair through the observed route.
+        // Skipped outright when setup or preflight already refused:
+        // no acquisition after refusal. Fail-fast from here: later
+        // roots stay explicitly unattempted after the first refusal,
+        // but cleanup, report flush, and terminal evaluation always run.
+        let mut gate: Option<WriterGate> = None;
+        if fatal.is_none() {
+            match WriterGate::create(&pool) {
+                Ok(created) => {
+                    assert!(created.preparing());
+                    gate = Some(created);
+                }
+                Err(error) => {
+                    let fatal_error = format!("writer gate creation refused: {error}");
+                    task23a_refuse_all(&mut table, &fatal_error);
+                    fatal = Some(fatal_error);
+                }
+            }
+        }
+        let mut records: Vec<loader::LoadDiagnostics> = Vec::new();
+        let loaded = if fatal.is_none() {
+            let halves = halves.as_ref().unwrap();
+            let gate = gate.as_ref().unwrap();
+            match loader::load_gated_observed(&halves.legacy, gate, provider_pins, &mut records) {
+                Ok(loaded) => Some(loaded),
+                Err(error) => {
+                    fatal = Some(format!("legacy observed load refused: {error:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let owner = if fatal.is_none() {
+            let loaded = loaded.as_ref().unwrap();
+            let gate = gate.as_ref().unwrap();
+            let halves = halves.as_mut().unwrap();
+            match SourceOwner::prepare(
+                &budget,
+                &halves.kernel,
+                gate,
+                loaded,
+                &mut halves.source_prepared,
+                Instant::now() + Duration::from_secs(60),
+                &AtomicBool::new(false),
+            ) {
+                Ok(owner) => Some(owner),
+                Err(error) => {
+                    let reason = format!("source owner prepare refused: {error:?}");
+                    // The owner feeds every non-legacy root; all seven
+                    // slots are still fresh (their loads never ran).
+                    task23a_refuse_slots(&mut table, &TASK23A_NON_LEGACY_SLOTS, &reason).unwrap();
+                    fatal = Some(reason);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Calibrator identity is retained with each summary: the
+        // cross-query evaluation compares all ten query identities,
+        // never just each query's own bracketing.
+        let mut control_before = None;
+        let mut control_after = None;
+        let mut control_creds_before = None;
+        let mut control_creds_after = None;
+        if fatal.is_none() {
+            let loaded = loaded.as_ref().unwrap();
+            match loaded.progs.get("observation_return") {
+                None => fatal = Some("legacy calibrator program missing".to_owned()),
+                Some(program) => match task23a_calibration_query(program) {
+                    Ok((summary, creds)) => {
+                        control_before = Some(summary);
+                        control_creds_before = Some(creds);
+                    }
+                    Err(error) => fatal = Some(error),
+                },
+            }
+        }
+        // Source roots load from the same split registration
+        // preparation the preflight checked — never from the admitted
+        // owner's copy — and the attested programs are retained for
+        // the descriptor sweep. The diagnostic stops at FDs: nothing
+        // attaches.
+        let mut source_programs: Vec<(String, std::os::fd::OwnedFd)> = Vec::new();
+        if fatal.is_none() {
+            let owner = owner.as_ref().unwrap();
+            let loaded = loaded.as_ref().unwrap();
+            let halves = halves.as_ref().unwrap();
+            let gate = gate.as_ref().unwrap();
+            // The singleton loop consumes exactly the preflighted
+            // registration half: every loop input must route to the
+            // singleton entry point. A wrong-half input fails loudly
+            // here instead of misloading downstream (earlier
+            // successes stay retained and swept per fail-fast).
+            for root in &halves.registration.progs {
+                match task23a_loader_route(&root.name) {
+                    Ok("load_source_root_unattached_observed") => {}
+                    _ => {
+                        fatal = Some(format!("singleton loop misrouted root {}", root.name));
+                        break;
+                    }
+                }
+                match loader::load_source_root_unattached_observed(
+                    root,
+                    &owner._maps,
+                    loaded,
+                    owner._roots.attach_btf_id(),
+                    gate,
+                    provider_pins,
+                    &mut records,
+                ) {
+                    Ok(program) => source_programs.push((root.name.clone(), program)),
+                    Err(error) => {
+                        fatal = Some(format!("source root {} refused: {error:#}", root.name));
+                        break;
+                    }
+                }
+            }
+        }
+        let typed_programs = if fatal.is_none() {
+            let owner = owner.as_ref().unwrap();
+            let loaded = loaded.as_ref().unwrap();
+            let halves = halves.as_ref().unwrap();
+            let gate = gate.as_ref().unwrap();
+            match loader::load_typed_borrowed_observed(
+                &halves.typed,
+                &owner._maps,
+                loaded,
+                gate,
+                provider_pins,
+                &mut records,
+            ) {
+                Ok(programs) => Some(programs),
+                Err(error) => {
+                    fatal = Some(format!("typed observed load refused: {error:#}"));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let count_loaded = if fatal.is_none() {
+            let owner = owner.as_ref().unwrap();
+            let halves = halves.as_ref().unwrap();
+            let gate = gate.as_ref().unwrap();
+            let mut borrowed = BTreeMap::new();
+            for name in loader::BORROWED_COUNT_MAPS {
+                match owner.owned_map(name) {
+                    Ok(fd) => {
+                        borrowed.insert(name.to_string(), fd);
+                    }
+                    Err(error) => {
+                        let reason = format!("count borrowed map {name} refused: {error:?}");
+                        // The count load never ran: its slot is fresh.
+                        task23a_refuse_slots(&mut table, &TASK23A_COUNT_SLOTS, &reason).unwrap();
+                        fatal = Some(reason);
+                        break;
+                    }
+                }
+            }
+            if fatal.is_none() {
+                match loader::load_gated_borrowed_observed(
+                    &halves.count_prepared,
+                    gate,
+                    &borrowed,
+                    count_pins,
+                    &mut records,
+                ) {
+                    Ok(loaded) => Some(loaded),
+                    Err(error) => {
+                        fatal = Some(format!("count observed load refused: {error:#}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if fatal.is_none() {
+            let loaded = loaded.as_ref().unwrap();
+            match loaded.progs.get("observation_return") {
+                None => fatal = Some("legacy calibrator program missing".to_owned()),
+                Some(program) => match task23a_calibration_query(program) {
+                    Ok((summary, creds)) => {
+                        control_after = Some(summary);
+                        control_creds_after = Some(creds);
+                    }
+                    Err(error) => fatal = Some(error),
+                },
+            }
+        }
+        task23a_align_records(&mut table, records).unwrap();
+        // Evaluations: source zeros, per-root live map-identity
+        // cross-checks (prepared references resolved to the same
+        // gate and borrowed identities, compared to the info set),
+        // cross-query credential identities, and log completeness.
+        let mut evaluations = Vec::new();
+        if fatal.is_none() {
+            let before = control_before.as_ref().unwrap();
+            let after = control_after.as_ref().unwrap();
+            let creds_before = control_creds_before.as_ref().unwrap();
+            let creds_after = control_creds_after.as_ref().unwrap();
+            let owner = owner.as_ref().unwrap();
+            let halves = halves.as_ref().unwrap();
+            evaluations.extend(task23a_evaluate_source_zeros(
+                &table,
+                before,
+                after,
+                owner._roots.attach_btf_id(),
+            ));
+            evaluations.extend(task23a_evaluate_query_creds(
+                &table,
+                creds_before,
+                creds_after,
+            ));
+            evaluations.extend(task23a_evaluate_log_completeness(&table));
+            let loaded = loaded.as_ref().unwrap();
+            let resolve = |root: &str, map: &str| -> Result<u32, String> {
+                let fd = if root == "count_entry" {
+                    count_loaded
+                        .as_ref()
+                        .unwrap()
+                        .maps
+                        .get(map)
+                        .map(|owned| owned.as_fd())
+                } else if root == "observation_entry" || root == "observation_return" {
+                    loaded.maps.get(map).map(|owned| owned.as_fd())
+                } else {
+                    owner
+                        ._maps
+                        .get(map)
+                        .map(|owned| owned.as_fd())
+                        .or_else(|| loaded.maps.get(map).map(|owned| owned.as_fd()))
+                }
+                .ok_or_else(|| format!("map identity unresolved {map}"))?;
+                loader::BorrowedMap::new(fd)
+                    .map(|borrowed| borrowed.info.id)
+                    .map_err(|e| format!("map identity query refused: {e}"))
+            };
+            let prepared_for = |root: &str| -> Option<&loader::PreparedProg> {
+                if root == "count_entry" {
+                    halves.count_prepared.progs.iter().find(|p| p.name == root)
+                } else if root == "typed_entry" || root == "typed_return" {
+                    halves.typed.progs.iter().find(|p| p.name == root)
+                } else if root == "observation_entry" || root == "observation_return" {
+                    halves.legacy.progs.iter().find(|p| p.name == root)
+                } else {
+                    halves.registration.progs.iter().find(|p| p.name == root)
+                }
+            };
+            for record in table.iter() {
+                let check = (|| -> Result<(), String> {
+                    let info = record
+                        .info
+                        .as_ref()
+                        .ok_or_else(|| "no trustworthy program info".to_owned())?;
+                    let prepared = prepared_for(&record.root)
+                        .ok_or_else(|| "prepared root missing".to_owned())?;
+                    let mut expected = Vec::with_capacity(prepared.map_fixups.len());
+                    for fixup in &prepared.map_fixups {
+                        expected.push(resolve(&record.root, &fixup.map)?);
+                    }
+                    // One map referenced by several fixups reports one
+                    // kernel ID: compare identity sets, never multisets.
+                    expected.sort_unstable();
+                    expected.dedup();
+                    loader::check_map_id_set(&expected, &info.map_ids).map_err(|e| format!("{e:#}"))
+                })();
+                match check {
+                    Ok(()) => evaluations.push(Task23aEvaluation {
+                        root: record.root.clone(),
+                        check: "map-ids",
+                        passed: true,
+                        detail: "info set matches live identities".to_owned(),
+                    }),
+                    Err(detail) => evaluations.push(Task23aEvaluation {
+                        root: record.root.clone(),
+                        check: "map-ids",
+                        passed: false,
+                        detail,
+                    }),
+                }
+            }
+        }
+        // Cleanup verification: every owned descriptor number
+        // closes, including the retained unattached source programs.
+        // FDs are collected before the ordered drop, then proven gone.
+        let mut owned_fds: Vec<(String, i32)> = Vec::new();
+        if let Some(loaded) = loaded.as_ref() {
+            for (name, fd) in loaded.maps.iter().chain(loaded.progs.iter()) {
+                owned_fds.push((format!("legacy:{name}"), fd.as_raw_fd()));
+            }
+        }
+        if let Some(owner) = owner.as_ref() {
+            for (name, fd) in owner._maps.iter() {
+                owned_fds.push((format!("owner:{name}"), fd.as_raw_fd()));
+            }
+        }
+        for (name, fd) in source_programs.iter() {
+            owned_fds.push((format!("source:{name}"), fd.as_raw_fd()));
+        }
+        if let Some(programs) = typed_programs.as_ref() {
+            for (name, fd) in programs.iter() {
+                owned_fds.push((format!("typed:{name}"), fd.as_raw_fd()));
+            }
+        }
+        if let Some(count_loaded) = count_loaded.as_ref() {
+            for (name, fd) in count_loaded.maps.iter().chain(count_loaded.progs.iter()) {
+                owned_fds.push((format!("count:{name}"), fd.as_raw_fd()));
+            }
+        }
+        // Sweep membership per root, captured before the ordered
+        // drop: a root counts as swept only when the diagnostic held
+        // its program FDs at sweep time. A loader transaction that
+        // rolled back (second-root `?` drops the whole local
+        // collection) leaves earlier successes unswept even though
+        // their records read Loaded.
+        let legacy_held = loaded.is_some();
+        let typed_held = typed_programs.is_some();
+        let count_held = count_loaded.is_some();
+        let source_held: Vec<String> = source_programs
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        drop(count_loaded);
+        drop(typed_programs);
+        drop(source_programs);
+        drop(owner);
+        drop(loaded);
+        let mut leaked = Vec::new();
+        for (name, raw) in &owned_fds {
+            if unsafe { libc::fcntl(*raw, libc::F_GETFD) } != -1 {
+                leaked.push(name.clone());
+            }
+        }
+        // Marks assign only on a clean global sweep, so
+        // HandlesClosed additionally implies the shared owner maps
+        // closed.
+        let swept = |root: &str| -> bool {
+            match root {
+                "observation_entry" | "observation_return" => legacy_held,
+                "typed_entry" | "typed_return" => typed_held,
+                "count_entry" => count_held,
+                _ => source_held.iter().any(|name| name == root),
+            }
+        };
+        if leaked.is_empty() {
+            for record in table.iter_mut() {
+                record.cleanup = task23a_classify_cleanup(
+                    record.stage,
+                    record.error.is_some(),
+                    swept(&record.root),
+                );
+            }
+        }
+        // Marks assign only on a clean sweep, but a leak finding
+        // always folds into the stop reason — including alongside an
+        // earlier stop.
+        fatal = task23a_fold_cleanup_leak(fatal.as_deref(), &leaked);
+        // Report flush: raw artifacts FIRST (their outcomes join
+        // the stop reason), then render evidence with the combined
+        // reason, then stdout (which always carries the final
+        // evidence), then evidence.txt last. A persistence failure
+        // can neither hide behind an earlier stop nor be hidden by
+        // it. The directory was validated in phase 0, never re-read
+        // here.
+        let calibration = match (control_creds_before.as_ref(), control_creds_after.as_ref()) {
+            (Some(before), Some(after)) => Some((before, after)),
+            _ => None,
+        };
+        let mut persist_failed = Vec::new();
+        if let Some(dir) = evidence_dir.as_ref() {
+            for record in table.iter() {
+                if !record.log_bytes.is_empty()
+                    && std::fs::write(
+                        dir.join(format!("log-{}.bin", record.root)),
+                        &record.log_bytes,
+                    )
+                    .is_err()
+                {
+                    persist_failed.push(format!("log-{}.bin", record.root));
+                }
+                if !record.btf_log.is_empty()
+                    && std::fs::write(
+                        dir.join(format!("btf-{}.bin", record.root)),
+                        &record.btf_log,
+                    )
+                    .is_err()
+                {
+                    persist_failed.push(format!("btf-{}.bin", record.root));
+                }
+            }
+        }
+        let persist_error = (!persist_failed.is_empty())
+            .then(|| format!("evidence write failed: {}", persist_failed.join(",")));
+        let blocked = task23a_combine_blocked(fatal.as_deref(), persist_error.as_deref());
+        let evidence = task23a_format_evidence(
+            &table,
+            &evaluations,
+            calibration,
+            blocked.as_deref(),
+            &patch_audit,
+        );
+        println!("{evidence}");
+        // evidence.txt last: stdout already carries the evidence even
+        // if this write fails, and the failure still joins the
+        // terminal reason below.
+        let mut terminal = blocked;
+        if let Some(dir) = evidence_dir.as_ref() {
+            if std::fs::write(dir.join("evidence.txt"), &evidence).is_err() {
+                println!("task23a evidence.txt write failed");
+                terminal =
+                    task23a_combine_blocked(terminal.as_deref(), Some("evidence.txt write failed"));
+            }
+        }
+        // Terminal evaluation after cleanup and report flush.
+        assert!(
+            gate.as_ref().is_none_or(|gate| gate.preparing()),
+            "diagnostic must never open the gate"
+        );
+        if let Some(terminal) = terminal {
+            panic!("task23a diagnostic failed: {terminal}");
+        }
+        assert!(
+            table.iter().all(|r| r.stage == loader::LoadStage::Loaded),
+            "all nine roots must load"
+        );
+        for evaluation in &evaluations {
+            assert!(
+                evaluation.passed,
+                "{} {}: {}",
+                evaluation.check, evaluation.root, evaluation.detail
+            );
+        }
+        drop(gate);
+    }
 }
