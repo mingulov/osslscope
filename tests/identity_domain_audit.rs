@@ -57,6 +57,172 @@ fn normalize(line: &str) -> String {
     line.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Line spans (1-based, inclusive) of column-0 `mod tests {` bodies.
+/// Brace-matched with a small lexer so braces inside comments, strings,
+/// raw strings and char literals cannot end a module early: a C fixture
+/// in a raw string once terminated the naive skip at its own column-0
+/// `}` and leaked session.rs test sites into the production set.
+fn test_module_spans(text: &str) -> Vec<(usize, usize)> {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lex {
+        Code,
+        LineComment,
+        BlockComment(u32),
+        Str,
+        RawStr(usize),
+    }
+    // String start at chars[i]: `"` or `[b|c][r][#]*"`. Returns the lexer
+    // state to enter and the prefix length consumed (quote included).
+    fn string_start(chars: &[char], i: usize) -> Option<(Lex, usize)> {
+        if i > 0 && (chars[i - 1].is_alphanumeric() || chars[i - 1] == '_') {
+            return None;
+        }
+        if chars[i] == '"' {
+            return Some((Lex::Str, 1));
+        }
+        let mut j = i;
+        if matches!(chars[j], 'b' | 'c') && matches!(chars.get(j + 1), Some('"') | Some('r')) {
+            j += 1;
+        }
+        let mut is_raw = false;
+        if chars.get(j) == Some(&'r') && matches!(chars.get(j + 1), Some('"') | Some('#')) {
+            is_raw = true;
+            j += 1;
+        }
+        let mut hashes = 0;
+        if is_raw {
+            while chars.get(j) == Some(&'#') {
+                hashes += 1;
+                j += 1;
+            }
+        }
+        if chars.get(j) != Some(&'"') {
+            return None;
+        }
+        if is_raw {
+            Some((Lex::RawStr(hashes), j - i + 1))
+        } else if j > i {
+            Some((Lex::Str, j - i + 1))
+        } else {
+            None
+        }
+    }
+    // Char literal length at chars[i] == '\'', or None for a lifetime.
+    fn char_literal_len(chars: &[char], i: usize) -> Option<usize> {
+        match chars.get(i + 1) {
+            Some('\\') => {
+                let mut j = i + 2;
+                while j < chars.len() && j - i <= 16 {
+                    if chars[j] == '\\' {
+                        j += 2;
+                    } else if chars[j] == '\'' {
+                        return Some(j - i + 1);
+                    } else {
+                        j += 1;
+                    }
+                }
+                None
+            }
+            Some(c) if *c != '\'' && chars.get(i + 2) == Some(&'\'') => Some(3),
+            _ => None,
+        }
+    }
+    let mut spans = Vec::new();
+    let mut state = Lex::Code;
+    let mut span_start: Option<usize> = None;
+    let mut depth: i64 = 0;
+    let mut last_line = 0;
+    for (idx, line) in text.lines().enumerate() {
+        let lineno = idx + 1;
+        last_line = lineno;
+        if span_start.is_none() && state == Lex::Code && line.starts_with("mod tests {") {
+            span_start = Some(lineno);
+            depth = 0;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            match state {
+                Lex::Code => {
+                    if c == '/' && next == Some('/') {
+                        state = Lex::LineComment;
+                        i += 2;
+                    } else if c == '/' && next == Some('*') {
+                        state = Lex::BlockComment(1);
+                        i += 2;
+                    } else if let Some((entered, consumed)) = string_start(&chars, i) {
+                        state = entered;
+                        i += consumed;
+                    } else if c == '\'' {
+                        match char_literal_len(&chars, i) {
+                            Some(consumed) => i += consumed,
+                            None => i += 1,
+                        }
+                    } else {
+                        if span_start.is_some() {
+                            if c == '{' {
+                                depth += 1;
+                            } else if c == '}' {
+                                depth -= 1;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                Lex::LineComment => i = chars.len(),
+                Lex::BlockComment(n) => {
+                    if c == '/' && next == Some('*') {
+                        state = Lex::BlockComment(n + 1);
+                        i += 2;
+                    } else if c == '*' && next == Some('/') {
+                        state = if n == 1 {
+                            Lex::Code
+                        } else {
+                            Lex::BlockComment(n - 1)
+                        };
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                Lex::Str => {
+                    if c == '\\' {
+                        i += 2;
+                    } else if c == '"' {
+                        state = Lex::Code;
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
+                }
+                Lex::RawStr(hashes) => {
+                    if c == '"' && (0..hashes).all(|k| chars.get(i + 1 + k) == Some(&'#')) {
+                        state = Lex::Code;
+                        i += 1 + hashes;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+        }
+        if state == Lex::LineComment {
+            state = Lex::Code;
+        }
+        if let Some(start) = span_start {
+            if depth <= 0 {
+                spans.push((start, lineno));
+                span_start = None;
+            }
+        }
+    }
+    if let Some(start) = span_start {
+        spans.push((start, last_line));
+    }
+    spans
+}
+
 fn collect(dir: &Path, out: &mut BTreeMap<(String, String), u32>) {
     let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
@@ -77,19 +243,19 @@ fn collect(dir: &Path, out: &mut BTreeMap<(String, String), u32>) {
             .to_string_lossy()
             .into_owned();
         let text = std::fs::read_to_string(&path).unwrap();
-        // Skip `mod tests` bodies: rustfmt keeps test modules
-        // top-level, so a column-0 `mod tests {` ... column-0
-        // `}` pair delimits them.
-        let mut in_tests = false;
-        for line in text.lines() {
-            if !in_tests && line.starts_with("mod tests {") {
-                in_tests = true;
-                continue;
+        // Skip `mod tests` bodies: brace-matched line spans (see
+        // test_module_spans).
+        let spans = test_module_spans(&text);
+        let mut span = spans.iter().peekable();
+        for (idx, line) in text.lines().enumerate() {
+            let lineno = idx + 1;
+            while span.peek().is_some_and(|(_, end)| lineno > *end) {
+                span.next();
             }
-            if in_tests {
-                if line.starts_with('}') {
-                    in_tests = false;
-                }
+            if span
+                .peek()
+                .is_some_and(|(start, end)| *start <= lineno && lineno <= *end)
+            {
                 continue;
             }
             let t = line.trim();
@@ -162,10 +328,12 @@ fn h5_t3_every_device_site_names_one_domain() {
             "device: ns.dev(),",
             1,
         ),
-        // Provider observations retain native fstat identities throughout.
-        // The map_files association uses makedev-decoded maps dev_t and the
-        // same reviewed Btrfs exception as inventory; only the retained FD's
-        // native device/inode is used for deduplication and expected hashes.
+        // Provider observations retain native fstat identities throughout:
+        // only the retained FD's native device/inode is used for
+        // deduplication and expected hashes. Record comparisons use the
+        // backing association's approved native identity, not a re-read.
+        // (The former map_files/Btrfs-exception pin moved to
+        // inventory/backing check_target_keys.)
         (
             "src/provider_observation/objects.rs",
             "raw",
@@ -181,14 +349,8 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/provider_observation/objects.rs",
             "raw",
-            "&& m.info.device == stamp.native",
+            "&& m.info.device == approved_native",
             2,
-        ),
-        (
-            "src/provider_observation/objects.rs",
-            "raw",
-            "&& (metadata.dev() == map.native || filesystem == 0x9123683e)",
-            1,
         ),
         (
             "src/provider_observation/objects.rs",
@@ -1212,6 +1374,114 @@ fn h5_t3_every_device_site_names_one_domain() {
             "namespaces.push((m.dev(), m.ino()));",
             1,
         ),
+        // Inventory backing: Fingerprint is the native fstat identity
+        // (MetadataExt dev_t/ino) of a retained FD. Continuity and
+        // association compare native fingerprints only; the one
+        // maps-facing check compares the native fingerprint device
+        // against the makedev-decoded maps dev_t under the same
+        // reviewed Btrfs exception (0x9123683e) as the former
+        // objects.rs map_files pin. NamespaceId pairs come from
+        // namespace-file fstat and join only namespace identities.
+        ("src/inventory/backing.rs", "raw", "dev: m.dev(),", 1),
+        (
+            "src/inventory/backing.rs",
+            "raw",
+            "device: metadata.dev(),",
+            1,
+        ),
+        (
+            "src/inventory/backing.rs",
+            "raw",
+            "before.dev == after.dev",
+            1,
+        ),
+        (
+            "src/inventory/backing.rs",
+            "raw",
+            "(self.candidate_fp.dev, self.candidate_fp.ino)",
+            1,
+        ),
+        (
+            "src/inventory/backing.rs",
+            "raw",
+            "if fingerprint.dev != vma.dev && fstype != Some(0x9123683e) {",
+            1,
+        ),
+        // Test-hook observation of the verified candidate's native
+        // fstat identity (cfg(test) only); production returns the same
+        // Metadata unjoined with any other domain.
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "let _ = hook.observed.send((verified.dev(), verified.ino()));",
+            1,
+        ),
+        // Multi-attachment admission: claims and the single-backing
+        // consistency check compare fresh stat/native site devices
+        // (attachment.site.native_device()) only.
+        (
+            "src/provider_observation/session.rs",
+            "raw",
+            "|| claimed.dev() != attachment.site.native_device()",
+            1,
+        ),
+        (
+            "src/provider_observation/session.rs",
+            "raw",
+            "let (device, inode) = (admitted[0].device, admitted[0].inode);",
+            1,
+        ),
+        (
+            "src/provider_observation/session.rs",
+            "raw",
+            ".any(|a| (a.device, a.inode) != (device, inode))",
+            1,
+        ),
+        (
+            "src/provider_observation/session.rs",
+            "raw",
+            "admitted.iter().map(|a| (a.device, a.inode)).collect();",
+            1,
+        ),
+        (
+            "src/provider_observation/session.rs",
+            "raw",
+            "let (device, inode) = (metadata.dev(), metadata.ino());",
+            1,
+        ),
+        // Source-observer enrollment records the observer PID
+        // namespace's native st_dev for kernel-side comparison.
+        (
+            "src/provider_observation/source_owner.rs",
+            "raw",
+            "namespace_device: ns.dev(),",
+            2,
+        ),
+        // Typed-site attribution: record devices are evidence-encoded
+        // once at admission (focused_count::evidence_device); SiteKey
+        // keys, the counter pin map and the admitted/sample join all
+        // compare those stat words only.
+        ("src/attribution.rs", "stat", "device: site.device,", 1),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "device: record.device,",
+            1,
+        ),
+        (
+            "src/focused_count.rs",
+            "stat",
+            ".and_then(|pins| pins.get(&(key.device, key.inode, key.offset)).copied())",
+            1,
+        ),
+        // Native test harness (cfg(test) module): the observer
+        // namespace's native st_dev/inode written as map bytes.
+        (
+            "src/writer_gate_native.rs",
+            "raw",
+            "let ns = [ns.device.to_ne_bytes(), ns.inode.to_ne_bytes()].concat();",
+            3,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(
@@ -1255,4 +1525,57 @@ fn h5_t3_every_device_site_names_one_domain() {
                 .join("\n"),
         );
     }
+}
+
+#[test]
+fn spans_skip_whole_tests_module() {
+    let src = [
+        "fn prod() {}",
+        "mod tests {",
+        "    fn t() { let _ = x.dev(); }",
+        "}",
+        "fn after() {}",
+    ]
+    .join("\n");
+    assert_eq!(test_module_spans(&src), vec![(2, 4)]);
+}
+
+#[test]
+fn spans_survive_raw_string_fixture_braces() {
+    // Regression: a C fixture in a raw string used to end the skip at
+    // its own column-0 `}` (session.rs); unbalanced `{{` in a raw JSON
+    // fixture (builtin.rs) must not corrupt the depth either.
+    let src = [
+        "mod tests {",
+        "    const C: &str = r#\"int main() {",
+        "}",
+        "\"#;",
+        "    const J: &str = r#\"{{\"a\":1}\"#;",
+        "    fn t() {}",
+        "}",
+        "fn after() {}",
+    ]
+    .join("\n");
+    assert_eq!(test_module_spans(&src), vec![(1, 7)]);
+}
+
+#[test]
+fn spans_ignore_comment_and_char_braces() {
+    let src = [
+        "mod tests {",
+        "    // } in a line comment",
+        "    /* { /* } */ still } */",
+        "    const CLOSE: char = '}';",
+        "    const OPEN: char = '{';",
+        "    fn t<'a>(x: &'a str) {}",
+        "}",
+    ]
+    .join("\n");
+    assert_eq!(test_module_spans(&src), vec![(1, 7)]);
+}
+
+#[test]
+fn spans_not_started_inside_string() {
+    let src = ["const S: &str = \"mod tests {\";", "fn prod() {}"].join("\n");
+    assert_eq!(test_module_spans(&src), Vec::<(usize, usize)>::new());
 }
