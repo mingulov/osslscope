@@ -5,6 +5,7 @@
 struct RetProbeContext(u64);
 impl RetProbeContext {
     fn ret(&self) -> u64 {
+        notice(format!("return operand={}", self.0));
         self.0
     }
 }
@@ -25,7 +26,7 @@ fn request_rebuild(family: u32) {
         control,
         &mut frame,
         (77u64 << 32) | 78,
-        15,
+        &mut target(),
     );
 
     let mut key = ExactNameKey {
@@ -75,7 +76,7 @@ fn request_rebuild(family: u32) {
         control,
         &mut frame,
         (77u64 << 32) | 78,
-        15,
+        &mut target(),
     );
     assert_eq!(bytes(&REL.peek(method_key).unwrap()), bytes(&method));
     assert_eq!(ATTRIB_CONTROL.peek(0).unwrap().next_producer_id, 1003);

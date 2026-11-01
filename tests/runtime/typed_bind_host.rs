@@ -11,6 +11,20 @@ use std::{
     rc::Rc,
 };
 
+// Fixture setup wrapper around the complete production resolver. The actual
+// entry and return roots capture their sequence and resolve their own storage.
+#[inline(always)]
+fn resolve_target(tgid: u32) -> Option<Target> {
+    let state = crate::shared_maps::ATTR_STATE.get_ptr_mut(0)?;
+    let entry_seq = unsafe { ordered_read(addr_of_mut!((*state).published_sequence)) };
+    let mut target: Target = unsafe { core::mem::zeroed() };
+    if resolve_inner(tgid, entry_seq, &mut target) {
+        Some(target)
+    } else {
+        None
+    }
+}
+
 type CellKey = (&'static str, Vec<u8>);
 type Snapshot = BTreeMap<CellKey, Vec<u8>>;
 struct Row {
@@ -35,7 +49,9 @@ impl Row {
 }
 #[derive(Debug)]
 struct Event {
+    cpu: u32,
     phase: &'static str,
+    scopes: Vec<&'static str>,
     operation: String,
     changes: Vec<(CellKey, Option<Vec<u8>>, Option<Vec<u8>>)>,
 }
@@ -48,6 +64,7 @@ struct State {
     previous: Snapshot,
     events: Vec<Event>,
     phase: &'static str,
+    scopes: Vec<&'static str>,
 }
 thread_local! { static HOST: RefCell<State> = RefCell::new(State::default()); }
 fn edit<R>(f: impl FnOnce(&mut State) -> R) -> R {
@@ -81,6 +98,8 @@ fn record(s: &mut State, operation: String) {
         .collect();
     s.events.push(Event {
         phase: s.phase,
+        scopes: s.scopes.clone(),
+        cpu: script(|script| script.cpu),
         operation,
         changes,
     });
@@ -134,7 +153,8 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
     }
     fn get_ptr_mut(&self, key: impl Borrow<K>) -> Option<*mut V> {
         let key = bytes(key.borrow());
-        edit(|s| {
+        notice(format!("lookup:{}:{key:?}", self.name));
+        let result = edit(|s| {
             let result = s.rows.get(&(self.name, key.clone())).map(Row::ptr::<V>);
             record(
                 s,
@@ -145,7 +165,9 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
                 ),
             );
             result
-        })
+        });
+        notice(format!("looked:{}", self.name));
+        result
     }
     unsafe fn get(&self, key: impl Borrow<K>) -> Option<&'static V> {
         // Match the unsafe map API. Extracted callers copy immediately and
@@ -155,10 +177,14 @@ impl<K: Copy, V: Copy + 'static> Map<K, V> {
     fn insert(&self, key: impl Borrow<K>, value: impl Borrow<V>, flags: u64) -> Result<(), i64> {
         let key = bytes(key.borrow());
         let value = *value.borrow();
+        notice(format!("insert:{}:{key:?}", self.name));
+        let denied = take_insert_failure(self.name, &key);
         edit(|s| {
             assert!(matches!(flags, 0 | 1), "only BPF_ANY/NOEXIST supported");
             let map_key = (self.name, key.clone());
-            let result = if flags == 1 && s.rows.contains_key(&map_key) {
+            let result = if denied {
+                Err(-12)
+            } else if flags == 1 && s.rows.contains_key(&map_key) {
                 Err(-17)
             } else {
                 if let Some(old) = s.rows.insert(map_key, Row::new(value)) {
@@ -204,7 +230,33 @@ static BIND_PENDING: Map<BindPendingKey, BindPendingValue> = Map::new("pending")
 static EXACT_NAME: Map<ExactNameKey, u64> = Map::new("exact");
 static DIGEST_INDEX: Map<DigestKey, u64> = Map::new("digest");
 static SELECTOR_DICT: Map<SelectorDictionaryKey, SelectorDictionaryValue> = Map::new("dictionary");
-static ITER_SLOT: Map<u32, SourceSlot> = Map::new("slot");
+// Per-CPU arrays select an independent allocation for the same BPF key on
+// another CPU. The compound host key is model identity, not a changed wire.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct SlotKey {
+    cpu: u32,
+    cell: u32,
+}
+struct SlotMap(Map<SlotKey, SourceSlot>);
+impl SlotMap {
+    fn key(cell: u32) -> SlotKey {
+        SlotKey {
+            cpu: script(|s| s.cpu),
+            cell,
+        }
+    }
+    fn set(&self, cell: u32, value: SourceSlot) {
+        self.0.set(Self::key(cell), value);
+    }
+    fn peek(&self, cell: u32) -> Option<SourceSlot> {
+        self.0.peek(Self::key(cell))
+    }
+    fn get_ptr_mut(&self, cell: u32) -> Option<*mut SourceSlot> {
+        self.0.get_ptr_mut(Self::key(cell))
+    }
+}
+static ITER_SLOT: SlotMap = SlotMap(Map::new("slot"));
 static PRODUCER_LOSS: Map<u32, u64> = Map::new("loss");
 struct ConfigMap(Map<u32, SourceConfig>);
 impl ConfigMap {
@@ -245,6 +297,10 @@ fn atomic_identity(s: &State, p: *mut u64) -> String {
                         ("image", addr_of_mut!((*r).current_image)),
                     ]
                 }
+                "guard" => {
+                    let r = row.ptr::<SourceGuard>();
+                    vec![("guard_state", addr_of_mut!((*r).state))]
+                }
                 "rel" => {
                     let r = row.ptr::<RelValue>();
                     vec![
@@ -264,7 +320,12 @@ fn atomic_identity(s: &State, p: *mut u64) -> String {
     panic!("unclassified atomic address");
 }
 unsafe fn host_cxchg(p: *mut u64, expected: u64, new: u64) -> (u64, bool) {
-    edit(|s| {
+    let identity = edit(|s| atomic_identity(s, p));
+    notice(format!(
+        "cas:{}:{expected}:{new}",
+        identity.split(" field=").nth(1).unwrap()
+    ));
+    let result = edit(|s| {
         let identity = atomic_identity(s, p);
         let observed = unsafe { *p };
         let success = observed == expected;
@@ -273,7 +334,12 @@ unsafe fn host_cxchg(p: *mut u64, expected: u64, new: u64) -> (u64, bool) {
         }
         record(s, format!("cas {identity} expected={expected} new={new} observed={observed} success={success}"));
         (observed, success)
-    })
+    });
+    notice(format!(
+        "cas-done:{}:{expected}:{new}",
+        identity.split(" field=").nth(1).unwrap()
+    ));
+    result
 }
 unsafe fn host_xchg(p: *mut u64, new: u64) -> u64 {
     edit(|s| {
@@ -288,6 +354,9 @@ unsafe fn host_xchg(p: *mut u64, new: u64) -> u64 {
     })
 }
 mod helpers {
+    pub unsafe fn bpf_probe_read_user<T: Copy>(pointer: *const T) -> Result<T, i64> {
+        super::user_read(pointer)
+    }
     pub unsafe fn bpf_ktime_get_ns() -> u64 {
         super::edit(|s| super::record(s, "clock value=900".into()));
         900
@@ -329,6 +398,7 @@ fn global_key(primary: u64, kind: u32, operation: u32) -> RelKey {
     }
 }
 fn reset(family: u32) {
+    reset_script();
     edit(|s| *s = State::default());
     ATTRIB_CONTROL.set(
         0,
@@ -493,11 +563,29 @@ fn publish(tx: &Transaction) -> u64 {
     let entry_seq = root.entry_seq;
     phase("bind");
     assert!(
-        bind_prepare(control, tx.frame, (77u64 << 32) | 78, entry_seq, tx.owner),
+        bind_prepare(
+            control,
+            tx.frame,
+            (77u64 << 32) | 78,
+            &mut Target {
+                entry_seq,
+                ..target()
+            },
+            tx.owner
+        ),
         "valid bind input refused"
     );
     phase("commit");
-    let outcome = commit_publish(control, tx.frame, (77u64 << 32) | 78, entry_seq, tx.owner);
+    let outcome = commit_publish(
+        control,
+        tx.frame,
+        (77u64 << 32) | 78,
+        &mut Target {
+            entry_seq,
+            ..target()
+        },
+        tx.owner,
+    );
     phase("commit-returned");
     println!("OUTCOME current_owner={} outcome={outcome}", tx.owner);
     // This is the unchanged constructor caller's cleanup protocol. Root

@@ -3872,11 +3872,9 @@ mod tests {
         generated.push_str(definition(producer, "StagedFrame {", "struct"));
         for name in [
             "control_cell",
-            "resolve_target",
             "resolve_inner",
             "resolve_inner_opt",
             "split_ids",
-            "admission",
             "site_bind",
             "site_bind_ptr",
             "admission_ptr",
@@ -3980,9 +3978,8 @@ mod tests {
     #[test]
     fn typed_bind_compiles_production_bodies_and_preserves_staging() {
         // Complete production definitions, including layout attributes. The
-        // fixture doubles only maps, atomics and clock; hashing is the contract
-        // implementation. Fetch/request bodies share the same map backing;
-        // root dispatch and the other return roles are out of scope.
+        // fixture doubles maps, atomics, clock and probe operands; hashing uses
+        // the contract implementation. Return handlers execute complete bodies.
         fn definition<'a>(source: &'a str, marker: &str) -> &'a str {
             assert_eq!(source.matches(marker).count(), 1, "ambiguous {marker}");
             let position = source.find(marker).unwrap();
@@ -4012,7 +4009,15 @@ mod tests {
             base.join("crates/bpf-contract/src/attribution.rs"),
             base.join("crates/bpf-contract/src/source.rs")
         );
-        for name in ["Target {", "BoundSelector {", "TailArgs {", "Tombstone<'a>"] {
+        for name in [
+            "Target {",
+            "BindInputs {",
+            "BoundSelector {",
+            "TailArgs {",
+            "Tombstone<'a>",
+            "QueryAlgoScan<'a>",
+            "QueryDispatchScan<'a, 't>",
+        ] {
             generated.push_str(definition(producer, &format!("struct {name}")));
         }
         for line in producer.lines().filter(|line| {
@@ -4022,6 +4027,8 @@ mod tests {
                 "const PLAN_",
                 "const TAIL_",
                 "const OUT_",
+                "const QUERY_",
+                "const CODE_SHAPE_",
             ]
             .iter()
             .any(|prefix| line.starts_with(prefix))
@@ -4030,13 +4037,35 @@ mod tests {
             generated.push('\n');
         }
         for name in [
+            "pair_return_frame",
+            "validate_return_site",
+            "typed_return",
+            "admission_ptr",
+            "site_bind_ptr",
+            "pop_frame",
+            "child_parent",
+            "child_parent_opt",
+            "handler_thread",
+            "frame_depth",
+            "frame_depth_opt",
+            "getter_mp_return",
+            "getter_pc_return",
+            "newctx_return",
+            "dupctx_return",
+            "dup_return",
+            "typed_query_return",
+            "query_walk_table",
+            "query_algo_slot",
+            "query_dispatch_slot",
+            "code_shape",
+            "retire_owner_reachable",
+            "retire_method",
             "ordered_read",
             "compare",
             "exchange",
             "loss",
             "control_cell",
             "split_ids",
-            "resolve_target",
             "resolve_inner",
             "resolve_inner_opt",
             "alloc_id",
@@ -4064,6 +4093,10 @@ mod tests {
             "intern_request",
             "publish_ambiguity",
             "retire_row",
+            "probe_prepared_bound",
+            "prepare_reused_plan",
+            "allocate_bind_ids",
+            "validate_bind_inputs",
             "bind_prepare",
             "plan_store",
             "plan_load",
@@ -4072,6 +4105,7 @@ mod tests {
             "commit_precheck",
             "now_of",
             "commit_publish_locked",
+            "validate_reused_bound",
             "bound_lookup",
             "publish_bound_selector",
             "reauthorize_site",
@@ -4083,7 +4117,70 @@ mod tests {
             "reuse_bound_selector_opt",
             "conflict_digest",
         ] {
-            generated.push_str(definition(producer, &format!("fn {name}(")));
+            let body = definition(producer, &format!("fn {name}("));
+            if [
+                "typed_return",
+                "fetch_return",
+                "getter_mp_return",
+                "getter_pc_return",
+                "newctx_return",
+                "dupctx_return",
+                "dup_return",
+                "typed_query_return",
+                "bind_prepare",
+                "commit_publish",
+                "commit_publish_locked",
+                "publish_bound_selector",
+                "flip_x_tail",
+                "insert_u_tail",
+                "insert_owner_selector_tail",
+                "insert_owner_tail",
+                "alloc_id",
+                "conflict_digest",
+                "collide_old_owner",
+                "dispatch_producer_outcome",
+                "cleanup_pending_x",
+                "retire_pending_x",
+                "release_frame",
+                "poison_domain",
+                "resolve_inner",
+                "plan_store",
+                "retire_owner_reachable",
+            ]
+            .contains(&name)
+            {
+                // Rename only the definition; the observer invokes this exact
+                // complete body and never substitutes a production decision.
+                generated.push_str(&body.replacen(
+                    &format!("fn {name}("),
+                    &format!("fn actual_{name}("),
+                    1,
+                ));
+                if ![
+                    "resolve_inner",
+                    "plan_store",
+                    "cleanup_pending_x",
+                    "dispatch_producer_outcome",
+                ]
+                .contains(&name)
+                {
+                    let begin = body.find(&format!("fn {name}(")).unwrap();
+                    let brace = body[begin..].find('{').unwrap() + begin;
+                    let signature = &body[begin..brace];
+                    let arguments =
+                        &signature[signature.find('(').unwrap() + 1..signature.rfind(')').unwrap()];
+                    let names: Vec<_> = arguments
+                        .split(',')
+                        .filter_map(|arg| arg.split_once(':').map(|(name, _)| name.trim()))
+                        .collect();
+                    generated.push_str(&format!(
+                        "{signature} {{ observed(\"{name}\", || actual_{name}({})) }}\n",
+                        names.join(", ")
+                    ));
+                }
+            } else {
+                generated.push_str(body);
+            }
         }
         // Substitute only the target-specific intrinsic, preserving each
         // ordered read and compare/exchange decision in its production caller.
@@ -4111,6 +4208,7 @@ mod tests {
         generated.push_str(include_str!("../../tests/runtime/typed_bind_host.rs"));
         generated.push_str(include_str!("../../tests/runtime/typed_request_host.rs"));
         generated.push_str(include_str!("../../tests/runtime/typed_bound_host.rs"));
+        generated.push_str(include_str!("../../tests/runtime/typed_return_host.rs"));
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -4201,6 +4299,26 @@ mod tests {
             String::from_utf8_lossy(&controls.stderr)
         );
         let listed = std::process::Command::new(&binary)
+            .args(["return_controls::", "--list", "--format=terse"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        let selected = String::from_utf8_lossy(&listed.stdout)
+            .lines()
+            .filter(|line| line.ends_with(": test"))
+            .count();
+        assert!(selected > 0, "return selection must not be empty");
+        let controls = std::process::Command::new(&binary)
+            .args(["return_controls::", "--test-threads=1", "--nocapture"])
+            .output()
+            .unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&controls.stdout));
+        assert!(
+            controls.status.success(),
+            "production return controls ({selected} selected): {}",
+            String::from_utf8_lossy(&controls.stderr)
+        );
+        let listed = std::process::Command::new(&binary)
             .args(["bound_controls::", "--list", "--format=terse"])
             .output()
             .unwrap();
@@ -4259,7 +4377,7 @@ mod tests {
             region(
                 producer,
                 "\npub(crate) struct Target {",
-                Some("\n/// BPF subprograms")
+                Some("\n/// Validated immutable inputs only;")
             ),
             region(
                 producer,

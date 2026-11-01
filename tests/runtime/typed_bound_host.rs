@@ -20,7 +20,10 @@ fn bound_publication(family: u32, name: &[u8], digest: [u8; 32]) {
         control,
         tx.frame,
         (77u64 << 32) | 78,
-        root.entry_seq,
+        &mut Target {
+            entry_seq: root.entry_seq,
+            ..target()
+        },
         tx.owner
     ));
     let staged = bytes(&ITER_SLOT.peek(0).unwrap().staging);
@@ -47,7 +50,10 @@ fn bound_publication(family: u32, name: &[u8], digest: [u8; 32]) {
             control,
             tx.frame,
             (77u64 << 32) | 78,
-            root.entry_seq,
+            &mut Target {
+                entry_seq: root.entry_seq,
+                ..target()
+            },
             tx.owner
         ),
         OUT_OK
