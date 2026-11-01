@@ -6,9 +6,9 @@ workloads through public interfaces and validated callback sites. Available
 algorithms and library builds determine what can be observed; there is no
 algorithm or exact-build admission list on the normal path.
 
-v0.3.0 is published. The v0.4.0 automatic-observation candidate is implemented
-and reviewed, with its finite installed qualification described in
-[the candidate notes](docs/release-v0.4.0.md). It remains unreleased.
+v0.3.0 is published. The v0.4.0 automatic-observation state is published as a
+current-state alpha, with its finite installed qualification and known limits
+described in [the alpha notes](docs/release-v0.4.0.md).
 The milestones below are planned capabilities, not claims about the current app.
 
 ## v0.5.0: useful execution answers and practical installation

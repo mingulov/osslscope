@@ -1,7 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## 0.4.0 automatic observation candidate
+## 0.4.0 current-state alpha (automatic observation)
+
+- Published as a current-state alpha. Known limits: reports remain PARTIAL
+  with Unknown attribution; one host audit test (`identity_domain_audit`)
+  fails pending a device-domain re-pin (22 sites), and
+  `cargo clippy -- -D warnings` fails on 10 pre-existing items. Live/native
+  qualification for this tree is pending. See
+  [alpha scope and limits](docs/release-v0.4.0.md).
 
 - Recover bounded public-table candidates from verified ELF files, prearm owned
   startup dependencies and retain warm-process physical entry evidence without

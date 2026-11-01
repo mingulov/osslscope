@@ -7,12 +7,13 @@ for selected processes or automatically discovered watched scopes. Normal workfl
 need no enrolled library profile,
 manual offsets or application changes.
 
-**v0.4.0 automatic observation release candidate.** Short owned commands,
+**v0.4.0 current-state alpha (automatic observation).** Short owned commands,
 warm processes and sampled watched scopes expose physical callback entries and
-separate public API activity. See the [candidate scope and qualification
+separate public API activity. See the [alpha scope, qualification and known
 limits](docs/release-v0.4.0.md). The [v0.3.0 release
 record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0) retains its
-historical artifact-specific scope; this candidate has not been published.
+historical artifact-specific scope. This alpha publishes the current
+development state; it is not a finished release.
 
 Tracing hot loops can be costly: the finite stock SHA-256 sample measured a
 4.66× baseline/observed throughput ratio. See [measured cost and limits](docs/release-v0.4.0.md#measured-cost-and-practical-limits).

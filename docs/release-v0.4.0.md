@@ -1,9 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# v0.4.0 automatic observation candidate
+# v0.4.0 current-state alpha (automatic observation)
 
-This source candidate adds automatic entry-only table discovery, owned startup
+This alpha adds automatic entry-only table discovery, owned startup
 prearming, warm-process observation, public API activity and sampled crypto
-watch. It is not a published release. Build and install using the pinned
+watch. It is published as the current development state (alpha announce), not
+as a finished release. Build and install using the pinned
 [build](build.md) and [installation](install.md) recipes.
 
 ```sh
@@ -108,17 +109,29 @@ overlayfs or 9p backing. The table is the performed set, not a complete
 cross-product of applications, algorithms, libraries and kernels. OpenSSL 4.0.3 is one pinned
 compatibility lane; broader OpenSSL 4 qualification remains open.
 
-Source checks pass with 2,058 tests and 138 explicit ignores. Fifteen fresh-object
-preparation controls, fourteen installed host-command controls and nine direct
-native source/producer controls pass; source tests and capability skips are not
-runtime passes. Known shared-test-helper warnings and the pinned BPF-linker's
-LLVM fallback warning remain disclosed. Whole-change independent review remains
-part of candidate acceptance; no release has been published.
+The qualification table above binds the earlier candidate source. The tree
+published as the v0.4.0 current-state alpha is a superset of that source. On
+the alpha tree, the host CI suite (`cargo test --workspace` under the CI
+environment: leased `TMPDIR`, lifecycle-driver path, `RUST_TEST_THREADS=1`)
+reports 1,706 passed, 151 ignored and 1 known failing test:
+`tests/identity_domain_audit.rs` (`h5_t3_every_device_site_names_one_domain`)
+fails because 22 production device-identity sites still lack a reviewed
+domain pin and 2 pins are stale. That failure predates the alpha (identical
+on the Task23A base commit) and remains open as follow-up audit work.
+`cargo clippy --workspace -- -D warnings` also fails on 10 pre-existing
+dead-code/style items in the provider-observation and attribution modules.
+`cargo fmt --check`, `cargo check --workspace` and the packaging script suite
+pass. Live/native gates (BPF load, attach, installed-runtime qualification)
+were not re-run for this alpha; source checks and host tests are not runtime
+passes. Known shared-test-helper warnings and the pinned BPF-linker's LLVM
+fallback warning remain disclosed.
 
 ## Runtime identity
 
-The CLI reports version 0.4.0. The ordinary pinned release build and protected
-installation produced these SHA-256 values; guest copies were checked unchanged:
+The CLI reports version 0.4.0. The table below records the earlier candidate
+qualification build (source `03e053c00c1bcd8c44e151373cac0c18bf038595`);
+binaries built from the alpha tree will have different hashes and are not
+covered by these receipts:
 
 | Artifact | SHA-256 |
 | --- | --- |
