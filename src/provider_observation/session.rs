@@ -3978,6 +3978,197 @@ mod tests {
         );
     }
     #[test]
+    fn typed_bind_compiles_production_bodies_and_preserves_staging() {
+        // Complete production definitions, including layout attributes. The
+        // fixture doubles only maps, atomics and clock; hashing is the contract
+        // implementation. Root dispatch and other return roles are out of scope.
+        fn definition<'a>(source: &'a str, marker: &str) -> &'a str {
+            assert_eq!(source.matches(marker).count(), 1, "ambiguous {marker}");
+            let position = source.find(marker).unwrap();
+            let mut begin = source[..position].rfind('\n').map_or(0, |p| p + 1);
+            while begin > 0 {
+                let previous = source[..begin - 1].rfind('\n').map_or(0, |p| p + 1);
+                if !source[previous..begin].starts_with("#[") {
+                    break;
+                }
+                begin = previous;
+            }
+            let end = source[position..]
+                .find("\n}\n")
+                .expect("complete definition")
+                + position
+                + 3;
+            &source[begin..end]
+        }
+        let producer = include_str!("../../crates/ebpf/src/typed_producer.rs");
+        let pending = include_str!("../../crates/ebpf/src/source_state.rs");
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut generated = format!(
+            "#![allow(dead_code, private_interfaces)]\n\
+             extern crate self as osslscope_bpf_contract;\n\
+             #[path = {:?}] pub mod attribution;\n#[path = {:?}] pub mod source;\n\
+             use attribution::*;\nuse source::*;\nuse core::ptr::addr_of_mut;\n",
+            base.join("crates/bpf-contract/src/attribution.rs"),
+            base.join("crates/bpf-contract/src/source.rs")
+        );
+        for name in ["Target {", "BoundSelector {", "TailArgs {", "Tombstone<'a>"] {
+            generated.push_str(definition(producer, &format!("struct {name}")));
+        }
+        for line in producer.lines().filter(|line| {
+            [
+                "const BPF_",
+                "const LOSS_",
+                "const PLAN_",
+                "const TAIL_",
+                "const OUT_",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        }) {
+            generated.push_str(line);
+            generated.push('\n');
+        }
+        for name in [
+            "ordered_read",
+            "compare",
+            "exchange",
+            "loss",
+            "control_cell",
+            "split_ids",
+            "resolve_target",
+            "resolve_inner",
+            "resolve_inner_opt",
+            "alloc_id",
+            "alloc_id_opt",
+            "spend",
+            "poison_domain",
+            "site_bind",
+            "ready_and_guards",
+            "row_state_is",
+            "conflict_row",
+            "method_key",
+            "ambiguity_key",
+            "quarantine_key",
+            "quarantined",
+            "quarantine",
+            "must_quarantine",
+            "live_index",
+            "collide_old_owner",
+            "reserve_pending_x",
+            "own_pending_x",
+            "retire_pending_x",
+            "cleanup_pending_x",
+            "release_frame",
+            "bind_prepare",
+            "plan_store",
+            "plan_load",
+            "dispatch_producer_outcome",
+            "commit_publish",
+            "commit_precheck",
+            "now_of",
+            "commit_publish_locked",
+            "bound_lookup",
+            "publish_bound_selector",
+            "reauthorize_site",
+            "flip_x_tail",
+            "insert_u_tail",
+            "insert_owner_selector_tail",
+            "insert_owner_tail",
+            "reuse_bound_selector",
+            "reuse_bound_selector_opt",
+            "conflict_digest",
+        ] {
+            generated.push_str(definition(producer, &format!("fn {name}(")));
+        }
+        // Substitute only the target-specific intrinsic, preserving each
+        // ordered read and compare/exchange decision in its production caller.
+        for (indent, count) in [(8, 2), (16, 2)] {
+            let pad = " ".repeat(indent);
+            let atomic = format!(
+                "core::intrinsics::atomic_cxchg::<\n{pad}u64,\n{pad}{{ core::intrinsics::AtomicOrdering::SeqCst }},\n{pad}{{ core::intrinsics::AtomicOrdering::SeqCst }},\n{}>",
+                " ".repeat(indent - 4)
+            );
+            assert_eq!(generated.matches(&atomic).count(), count);
+            generated = generated.replace(&atomic, "host_cxchg");
+        }
+        let exchange =
+            "core::intrinsics::atomic_xchg::<u64, { core::intrinsics::AtomicOrdering::SeqCst }>";
+        assert_eq!(generated.matches(exchange).count(), 1);
+        generated = generated.replace(exchange, "host_xchg");
+        generated.push_str("mod source_state { use super::*;\n");
+        for name in ["claim_pending", "release_pending"] {
+            generated.push_str(definition(pending, &format!("fn {name}(")));
+        }
+        generated.push_str("}\n");
+        let atomic = "atomic_cxchg::<u64, { SeqCst }, { SeqCst }>";
+        assert_eq!(generated.matches(atomic).count(), 2);
+        generated = generated.replace(atomic, "host_cxchg");
+        generated.push_str(include_str!("../../tests/runtime/typed_bind_host.rs"));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-bind-{}-{nonce}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("bind.rs");
+        let binary = dir.join("bind");
+        std::fs::write(&input, &generated).unwrap();
+        use sha2::Digest as _;
+        let digest = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        eprintln!(
+            "bind controls source={} producer_sha256={} generated_sha256={}",
+            input.display(),
+            digest(producer.as_bytes()),
+            digest(generated.as_bytes())
+        );
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let compiled = std::process::Command::new(compiler)
+            .args([
+                "--edition=2021",
+                "--test",
+                "-Dwarnings",
+                "-Coverflow-checks=yes",
+            ])
+            .arg(&input)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        assert!(
+            compiled.status.success(),
+            "production bind compilation: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let listed = std::process::Command::new(&binary)
+            .args(["bind_controls::", "--list", "--format=terse"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&listed.stdout)
+                .lines()
+                .filter(|l| l.ends_with(": test"))
+                .count(),
+            5
+        );
+        let controls = std::process::Command::new(&binary)
+            .args(["bind_controls::", "--test-threads=1", "--nocapture"])
+            .output()
+            .unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&controls.stdout));
+        assert!(
+            controls.status.success(),
+            "production bind controls: {}",
+            String::from_utf8_lossy(&controls.stderr)
+        );
+    }
+    #[test]
     fn typed_query_walk_compiles_production_bodies_and_preserves_boundaries() {
         // Compile the complete production query-return/walker tail. Only the
         // external nofault, source-join, publication and loss boundaries are

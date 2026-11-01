@@ -3324,15 +3324,18 @@ pub fn publish_bound_selector(
     // around it are zeroed in two parts, preserving the forwarded digest.
     // After this write the plan is clobbered, so the projection and digest
     // index below read the digest back from the published OBJECT row.
-    let value = unsafe { (*slot).staging.as_mut_ptr().cast::<RelValue>() };
+    // Keep overlapping staging views on one raw base: a fresh mutable
+    // array borrow would invalidate the value pointer before its stores.
+    let staging_base = unsafe { addr_of_mut!((*slot).staging) };
+    let value = staging_base.cast::<RelValue>();
     unsafe {
-        let base = (*slot).staging.as_mut_ptr().cast::<u8>();
+        let base = staging_base.cast::<u8>();
         let mut i = 0;
         while i < 32 {
             *base.add(120 + i) = *base.add(PLAN_DIGEST + i);
             i += 1;
         }
-        let words = (*slot).staging.as_mut_ptr();
+        let words = staging_base.cast::<u64>();
         let mut w = 0;
         while w < 15 {
             *words.add(w) = 0;
