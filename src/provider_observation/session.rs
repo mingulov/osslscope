@@ -3845,6 +3845,139 @@ mod tests {
         }
     }
     #[test]
+    fn typed_stack_compiles_production_entry_bodies_and_preserves_boundaries() {
+        // Extract complete definitions, never a second entry/staging algorithm.
+        // Atomics, maps, probe operands and clock are the host boundaries.
+        fn definition<'a>(source: &'a str, name: &str, kind: &str) -> &'a str {
+            let marker = format!("{kind} {name}");
+            assert_eq!(source.matches(&marker).count(), 1, "ambiguous {marker}");
+            let begin = source.find(&marker).unwrap();
+            let end = source[begin..].find("\n}\n").expect("complete definition") + begin + 3;
+            &source[begin..end]
+        }
+        let producer = include_str!("../../crates/ebpf/src/typed_producer.rs");
+        let pending = include_str!("../../crates/ebpf/src/source_state.rs");
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut generated = format!(
+            "#![allow(dead_code, private_interfaces)]\n\
+             extern crate self as osslscope_bpf_contract;\n\
+             #[path = {:?}] pub mod attribution;\n#[path = {:?}] pub mod source;\n\
+             use attribution::*;\nuse source::*;\nuse core::ptr::addr_of_mut;\n",
+            base.join("crates/bpf-contract/src/attribution.rs"),
+            base.join("crates/bpf-contract/src/source.rs")
+        );
+        for name in ["Target {", "StageParams<'a>", "MethodEntry {"] {
+            generated.push_str(definition(producer, name, "struct"));
+        }
+        generated.push_str(definition(producer, "StagedFrame {", "struct"));
+        for name in [
+            "control_cell",
+            "resolve_target",
+            "resolve_inner",
+            "resolve_inner_opt",
+            "split_ids",
+            "admission",
+            "site_bind",
+            "site_bind_ptr",
+            "admission_ptr",
+            "ready_and_guards",
+            "thread_incarnation",
+            "thread_incarnation_opt",
+            "alloc_id",
+            "alloc_id_opt",
+            "spend",
+            "stage_frame",
+            "stage_frame_opt",
+            "pop_frame",
+            "release_frame",
+            "row_state_is",
+            "method_key",
+            "ambiguity_key",
+            "name_state",
+            "typed_entry",
+            "entry_authorized",
+            "initialize_entry_target",
+            "pack_entry_role",
+            "entry_admission",
+            "entry_invalidate",
+            "method_entry",
+            "fetch_entry",
+            "ctx_new_entry",
+            "dup_entry",
+            "child_entry",
+            "typed_query_entry",
+            "code_shape",
+            "code_role_key",
+            "registration_identity_matches",
+            "code_role_check",
+        ] {
+            generated.push_str(definition(producer, &format!("{name}("), "fn"));
+        }
+        for name in ["initialize_pending_zero(", "insert_empty_frame("] {
+            generated.push_str(definition(producer, name, "fn"));
+        }
+        // Only the architecture-specific atomic intrinsic is substituted;
+        // quota, retry, mode, allocation and compensation bodies stay exact.
+        let atomic = "core::intrinsics::atomic_cxchg::<\n                u64,\n                { core::intrinsics::AtomicOrdering::SeqCst },\n                { core::intrinsics::AtomicOrdering::SeqCst },\n            >";
+        assert_eq!(generated.matches(atomic).count(), 2);
+        generated = generated.replace(atomic, "host_cxchg");
+        generated.push_str("mod source_state { use super::*;\n");
+        for name in ["claim_pending(", "release_pending("] {
+            generated.push_str(definition(pending, name, "fn"));
+        }
+        generated.push_str("}\n");
+        let atomic = "atomic_cxchg::<u64, { SeqCst }, { SeqCst }>";
+        assert_eq!(generated.matches(atomic).count(), 2);
+        generated = generated.replace(atomic, "host_cxchg");
+        // Generated module visibility is needed only for the host caller;
+        // this does not change any production function body.
+        generated = generated
+            .replace("fn claim_pending(", "pub fn claim_pending(")
+            .replace("fn release_pending(", "pub fn release_pending(");
+        generated.push_str(include_str!("../../tests/runtime/typed_stack_host.rs"));
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-entry-stack-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let input = dir.join("entry.rs");
+        let binary = dir.join("entry");
+        std::fs::write(&input, &generated).unwrap();
+        use sha2::Digest as _;
+        let digest = |bytes: &[u8]| {
+            sha2::Sha256::digest(bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        eprintln!(
+            "entry controls source={} producer_sha256={} generated_sha256={}",
+            input.display(),
+            digest(producer.as_bytes()),
+            digest(generated.as_bytes())
+        );
+        let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+        let mut command = std::process::Command::new(compiler);
+        command.args(["--edition=2021", "-Dwarnings", "-Coverflow-checks=yes"]);
+        let compiled = command.arg(&input).arg("-o").arg(&binary).output().unwrap();
+        assert!(
+            compiled.status.success(),
+            "production entry compilation: {}",
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let controls = std::process::Command::new(&binary).output().unwrap();
+        eprintln!("{}", String::from_utf8_lossy(&controls.stdout));
+        assert!(
+            controls.status.success(),
+            "production entry controls: {}",
+            String::from_utf8_lossy(&controls.stderr)
+        );
+    }
+    #[test]
     fn typed_query_walk_compiles_production_bodies_and_preserves_boundaries() {
         // Compile the complete production query-return/walker tail. Only the
         // external nofault, source-join, publication and loss boundaries are
@@ -3981,6 +4114,78 @@ mod tests {
             );
             assert!(!root.subprogs.iter().any(|p| p.is_callback));
         }
+        // The pending insertion is a key-only leaf: one fully initialized
+        // 304-byte local, no copy/other helper/static callee beneath it. These
+        // checks pin the permitted emission, not a whole-chain fit claim.
+        let entry = source
+            .progs
+            .iter()
+            .find(|p| p.name == "typed_entry")
+            .unwrap();
+        let index = entry
+            .subprogs
+            .iter()
+            .position(|s| s.name == "insert_empty_frame")
+            .expect("pending insertion leaf");
+        let start = entry.subprogs[index].insn_off as usize * 8;
+        let end = entry
+            .subprogs
+            .get(index + 1)
+            .map_or(entry.insns.len(), |s| s.insn_off as usize * 8);
+        let body = &entry.insns[start..end];
+        let words: Vec<_> = body.chunks_exact(8).collect();
+        assert_eq!(
+            words.len(),
+            51,
+            "review any changed insertion-leaf emission"
+        );
+        assert_eq!(
+            words[0],
+            &[0xbf, 0x12, 0, 0, 0, 0, 0, 0],
+            "preserve the only key argument in r2"
+        );
+        assert_eq!(
+            words[1],
+            &[0xb7, 1, 0, 0, 0, 0, 0, 0],
+            "immediate zero in r1"
+        );
+        for (index, word) in words[2..40].iter().enumerate() {
+            assert_eq!(
+                (word[0], word[1]),
+                (0x7b, 0x1a),
+                "u64 store of zero register to own stack"
+            );
+            assert_eq!(
+                i16::from_le_bytes([word[2], word[3]]),
+                -304 + index as i16 * 8
+            );
+            assert_eq!(&word[4..], &[0, 0, 0, 0]);
+        }
+        assert_eq!(
+            words[40],
+            &[0xbf, 0xa3, 0, 0, 0, 0, 0, 0],
+            "value pointer derives from own stack"
+        );
+        assert_eq!(
+            words[41],
+            &[0x07, 3, 0, 0, 0xd0, 0xfe, 0xff, 0xff],
+            "all 304 bytes are the inserted value"
+        );
+        assert_eq!(words[45], &[0xb7, 4, 0, 0, 1, 0, 0, 0], "BPF_NOEXIST");
+        let calls: Vec<_> = words.iter().filter(|w| w[0] == 0x85).collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            *calls[0],
+            &[0x85, 0, 0, 0, 2, 0, 0, 0],
+            "only map_update_elem, no nested memset/callee"
+        );
+        let maps: Vec<_> = entry
+            .map_fixups
+            .iter()
+            .filter(|m| (start..end).contains(&m.insn_off))
+            .map(|m| m.map.as_str())
+            .collect();
+        assert_eq!(maps, ["BIND_PENDING"]);
         for root in prepared
             .progs
             .iter()

@@ -42,13 +42,6 @@ const LOSS_PAIR: u32 = 2;
 const LOSS_POISON: u32 = 3;
 const LOSS_CONFLICT: u32 = 4;
 
-// Zero 304-byte pending frame, materialized on the stack at the single
-// insert site in `stage_frame`. All-zero is valid: every field is numeric
-// and zero means absent/empty. A `.rodata` static would be cheaper, but
-// the loader accepts no data-section relocations (every `ld_imm64` reloc
-// must name a map or a subprogram), so the frame lives on the stack; the
-// verifier checks the depth on every load.
-
 #[inline(always)]
 unsafe fn ordered_read(pointer: *mut u64) -> u64 {
     core::intrinsics::atomic_cxchg::<
@@ -95,20 +88,18 @@ pub(crate) struct Target {
 }
 
 /// BPF subprograms take at most five register arguments and share one
-/// 512-byte stack across the whole call chain, so handlers take at most five
-/// scalars and re-derive everything else: the target coordinates from the
-/// passed entry snapshot, the cookie and probe arguments from the probe
-/// context, timestamps from the clock helper, and frame fields through the
-/// frame pointer. Nothing is carried across calls except through maps or,
-/// for the split owner commit, the per-CPU staging plan below. Packed thread
-/// identifiers carry `(tgid << 32) | tid` in one register argument.
+/// 512-byte stack across the whole call chain. Paired entry handlers borrow
+/// the root's Target storage and revalidate its captured sequence; other
+/// handlers retain their scalar/map interfaces. Cookies and operands come
+/// from the probe context, clocks from the helper, and pending fields from
+/// their frame pointer. Packed thread identifiers carry `(tgid << 32) | tid`
+/// in one register argument.
 #[inline(always)]
 fn split_ids(packed: u64) -> (u32, u32) {
     ((packed >> 32) as u32, packed as u32)
 }
 
-/// Pending-frame staging parameters: one struct so the staging call keeps a
-/// single register argument.
+/// Pending-frame staging parameters, consumed by inlined bookkeeping.
 pub(crate) struct StageParams<'a> {
     target: &'a Target,
     thread: u64,
@@ -609,16 +600,86 @@ fn thread_incarnation_opt(control: *mut ProducerControl, target: &Target, tid: u
     Some(id)
 }
 
+/// Private staging result; the caller already owns every key coordinate.
+/// Only nested child entry needs the exact successful insertion depth.
+struct StagedFrame {
+    frame: *mut BindPendingValue,
+    depth: u32,
+}
+
+/// Initialize the entire pending ABI, including all reserved/name-tail bytes.
+/// Raw stores avoid ever constructing a reference to uninitialized fields.
+#[inline(always)]
+fn initialize_pending_zero(out: &mut core::mem::MaybeUninit<BindPendingValue>) {
+    const _: () = {
+        assert!(core::mem::size_of::<BindPendingValue>() == 304);
+        assert!(core::mem::align_of::<BindPendingValue>() == 8);
+    };
+    let words = out.as_mut_ptr().cast::<u64>();
+    // Fixed volatile local stores prevent a nested memset from extending the
+    // insertion chain. The emitted object, not this annotation, proves that.
+    unsafe {
+        core::ptr::write_volatile(words.add(0), 0);
+        core::ptr::write_volatile(words.add(1), 0);
+        core::ptr::write_volatile(words.add(2), 0);
+        core::ptr::write_volatile(words.add(3), 0);
+        core::ptr::write_volatile(words.add(4), 0);
+        core::ptr::write_volatile(words.add(5), 0);
+        core::ptr::write_volatile(words.add(6), 0);
+        core::ptr::write_volatile(words.add(7), 0);
+        core::ptr::write_volatile(words.add(8), 0);
+        core::ptr::write_volatile(words.add(9), 0);
+        core::ptr::write_volatile(words.add(10), 0);
+        core::ptr::write_volatile(words.add(11), 0);
+        core::ptr::write_volatile(words.add(12), 0);
+        core::ptr::write_volatile(words.add(13), 0);
+        core::ptr::write_volatile(words.add(14), 0);
+        core::ptr::write_volatile(words.add(15), 0);
+        core::ptr::write_volatile(words.add(16), 0);
+        core::ptr::write_volatile(words.add(17), 0);
+        core::ptr::write_volatile(words.add(18), 0);
+        core::ptr::write_volatile(words.add(19), 0);
+        core::ptr::write_volatile(words.add(20), 0);
+        core::ptr::write_volatile(words.add(21), 0);
+        core::ptr::write_volatile(words.add(22), 0);
+        core::ptr::write_volatile(words.add(23), 0);
+        core::ptr::write_volatile(words.add(24), 0);
+        core::ptr::write_volatile(words.add(25), 0);
+        core::ptr::write_volatile(words.add(26), 0);
+        core::ptr::write_volatile(words.add(27), 0);
+        core::ptr::write_volatile(words.add(28), 0);
+        core::ptr::write_volatile(words.add(29), 0);
+        core::ptr::write_volatile(words.add(30), 0);
+        core::ptr::write_volatile(words.add(31), 0);
+        core::ptr::write_volatile(words.add(32), 0);
+        core::ptr::write_volatile(words.add(33), 0);
+        core::ptr::write_volatile(words.add(34), 0);
+        core::ptr::write_volatile(words.add(35), 0);
+        core::ptr::write_volatile(words.add(36), 0);
+        core::ptr::write_volatile(words.add(37), 0);
+    }
+}
+
+/// Own exactly one complete pending value. Quota, loss and clock work stay
+/// in the caller, so this key-only scalar-returning leaf adds no nested frame.
+#[inline(never)]
+#[no_mangle]
+pub fn insert_empty_frame(key: &BindPendingKey) -> bool {
+    let mut storage = core::mem::MaybeUninit::<BindPendingValue>::uninit();
+    initialize_pending_zero(&mut storage);
+    // Every byte was initialized above; borrowing it avoids a second copy.
+    BIND_PENDING
+        .insert(key, unsafe { &*storage.as_ptr() }, BPF_NOEXIST)
+        .is_ok()
+}
+
 /// Stage one zeroed pending frame at the lowest free depth for this thread.
 /// Depth occupancy is slot-exclusion: an occupied slot is never reused, so a
 /// stuck frame (lost return) degrades its thread toward depth refusal instead
 /// of corrupting a later transaction. The shared pending quota is claimed
 /// before insertion and refunded only when no frame was created.
-#[no_mangle]
-pub fn stage_frame(
-    params: &StageParams,
-    out: &mut (BindPendingKey, *mut BindPendingValue),
-) -> bool {
+#[inline(always)]
+fn stage_frame(params: &StageParams, out: &mut StagedFrame) -> bool {
     match stage_frame_opt(params) {
         Some(value) => {
             *out = value;
@@ -628,11 +689,10 @@ pub fn stage_frame(
     }
 }
 
-/// Original body, always inlined into the global wrapper above: BPF
-/// subprograms cannot return aggregates across the external ABI, so the
-/// wrapper converts to an out-parameter plus a boolean.
+/// Finite bookkeeping inlined into each entry caller; the complete pending
+/// value lives only in the separate insertion leaf.
 #[inline(always)]
-fn stage_frame_opt(params: &StageParams) -> Option<(BindPendingKey, *mut BindPendingValue)> {
+fn stage_frame_opt(params: &StageParams) -> Option<StagedFrame> {
     if params.thread == 0 || params.cookie == 0 || params.occurrence == 0 {
         return None;
     }
@@ -651,8 +711,7 @@ fn stage_frame_opt(params: &StageParams) -> Option<(BindPendingKey, *mut BindPen
             loss(LOSS_MAP);
             return None;
         }
-        let zero_frame: BindPendingValue = unsafe { core::mem::zeroed() };
-        if BIND_PENDING.insert(&key, &zero_frame, BPF_NOEXIST).is_err() {
+        if !insert_empty_frame(&key) {
             let _ = crate::source_state::release_pending();
             continue;
         }
@@ -669,7 +728,7 @@ fn stage_frame_opt(params: &StageParams) -> Option<(BindPendingKey, *mut BindPen
             (*frame).entry_ns = params.now_ns;
             (*frame).api_role = params.role;
         }
-        return Some((key, frame));
+        return Some(StagedFrame { frame, depth });
     }
     loss(LOSS_MAP);
     None
@@ -1095,67 +1154,79 @@ fn name_state(len: Result<usize, i32>) -> (u32, u32) {
     }
 }
 
-/// Typed uprobe entry. Stages a pending frame for paired roles, retires
-/// eligibility for invalidator roles, and stays quiet otherwise. Operational
-/// roles (304-308) are refused here: they are served by the same-handler
-/// operational check in the focused counter, never by a second program.
-pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns: u64) -> u32 {
-    if !writer_gate::admitted() {
+/// Lossless private scalar ABI for validated entry configuration. Refuse a
+/// future role-table expansion that would exceed the two 16-bit coordinates.
+#[inline(always)]
+fn pack_entry_role(role: u32, operation: u32, function: u32) -> u64 {
+    if role == 0 {
         return 0;
     }
-    let Some(target) = resolve_target(tgid) else {
-        return 0;
-    };
-    let Some(admitted) = admission(cookie, &target) else {
-        return 0;
-    };
-    if !admitted.valid() || admitted.operational() || admitted.role_id == 308 {
+    if operation > u16::MAX as u32 || function > u16::MAX as u32 {
         return 0;
     }
-    let Some(bound) = site_bind(cookie, &target) else {
+    // valid() restricts role to <= 308, operation to <= 4 and function to
+    // <= 6. These are the earlier scalar snapshots, with no truncated field.
+    // Returning a scalar keeps the root free of an address-taken output.
+    u64::from(role) | (u64::from(operation) << 32) | (u64::from(function) << 48)
+}
+
+/// Complete the root admission/READY phase before any paired handler. The
+/// finite key and guard temporaries need not overlap pending initialization.
+#[inline(never)]
+#[no_mangle]
+fn entry_authorized(cookie: u64, target: &Target) -> u64 {
+    let Some(admitted) = admission_ptr(cookie, target) else {
         return 0;
     };
-    if !ready_and_guards(cookie, bound.source_epoch, target.entry_seq, &target) {
+    let (role, operation, function) = unsafe {
+        (
+            (*admitted).role_id,
+            (*admitted).operation,
+            (*admitted).function,
+        )
+    };
+    if unsafe { (*admitted).operational() } || role == 308 {
         return 0;
     }
-    let Some(control) = control_cell() else {
+    let Some(bound) = site_bind_ptr(cookie, target) else {
         return 0;
     };
-    let role = admitted.role_id;
-    let operation = admitted.operation;
-    let entry_seq = target.entry_seq;
-    let ids = ((tgid as u64) << 32) | tid as u64;
-    // Handlers re-derive the target from this snapshot and re-read the
-    // cookie, admission and probe arguments themselves; nothing but these
-    // scalars crosses the call boundary. Retire arms read arg0 lazily so
-    // copied-role invalidators (274/275) join live CODE_ROLE authority
-    // before any operand read; first-slice arms read the same value later.
+    let source_epoch = unsafe { (*bound).source_epoch };
+    if !ready_and_guards(cookie, source_epoch, target.entry_seq, target) {
+        return 0;
+    }
+    pack_entry_role(role, operation, function)
+}
+/// Invalidator-only work cannot stage a frame. Keep its VMA and relationship
+/// key temporaries out of the paired-entry root frame while preserving the
+/// lazy operand reads and copied-role authority checks.
+#[inline(never)]
+#[no_mangle]
+fn entry_invalidate(ctx: &ProbeContext, target: &Target, cookie: u64, admitted: u64) -> u32 {
+    let role = admitted as u32;
+    let operation = ((admitted >> 32) & 0xffff) as u32;
+    let function = (admitted >> 48) as u32;
     match role {
-        130 | 131 => fetch_entry(ctx, control, ids, entry_seq),
-        147 | 148 => ctx_new_entry(ctx, control, ids, entry_seq),
-        151 | 152 => dup_entry(ctx, control, ids, entry_seq),
-        142 | 143 | 146 | 258 | 259 | 290 | 291 => child_entry(ctx, control, ids, entry_seq),
-        161 => typed_query_entry(ctx, control, ids, entry_seq),
         136 | 137 => {
             let arg0: u64 = ctx.arg(0).unwrap_or(0);
-            retire_method(&target, arg0, operation);
+            retire_method(target, arg0, operation);
             0
         }
         149 | 150 | 153 => {
             let arg0: u64 = ctx.arg(0).unwrap_or(0);
-            retire_owner_reachable(&target, REL_U_INDEX, arg0);
+            retire_owner_reachable(target, REL_U_INDEX, arg0);
             0
         }
         274 | 275 => {
-            let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
+            let opfun = (u64::from(function) << 32) | u64::from(operation);
             let Some((inode, file_offset)) = join_firing_identity(ctx) else {
                 return 0;
             };
-            if !code_role_check(&target, cookie, inode, file_offset, opfun) {
+            if !code_role_check(target, cookie, inode, file_offset, opfun) {
                 return 0;
             }
             let arg0: u64 = ctx.arg(0).unwrap_or(0);
-            retire_owner_reachable(&target, REL_X_INDEX, arg0);
+            retire_owner_reachable(target, REL_X_INDEX, arg0);
             0
         }
         5 | 18 | 154 | 155 => {
@@ -1169,6 +1240,80 @@ pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns
     }
 }
 
+/// Initialize all root Target storage before forming its typed reference.
+/// Fixed stores keep captured entry state out of a nested memory-helper call.
+#[inline(always)]
+fn initialize_entry_target(out: &mut core::mem::MaybeUninit<Target>) {
+    const _: () = {
+        assert!(core::mem::size_of::<Target>() == 40);
+        assert!(core::mem::align_of::<Target>() == 8);
+    };
+    let pointer = out.as_mut_ptr();
+    // Initialize the root directly without a memory-helper call that spills
+    // the already captured sequence and IDs. All fields precede the reference.
+    unsafe {
+        core::ptr::write_volatile(addr_of_mut!((*pointer).process), 0);
+        core::ptr::write_volatile(addr_of_mut!((*pointer).image), 0);
+        core::ptr::write_volatile(addr_of_mut!((*pointer).relation), 0);
+        core::ptr::write_volatile(addr_of_mut!((*pointer).loss_epoch), 0);
+        core::ptr::write_volatile(addr_of_mut!((*pointer).entry_seq), 0);
+    }
+}
+
+/// Typed uprobe entry. Stages a pending frame for paired roles, retires
+/// eligibility for invalidator roles, and stays quiet otherwise. Operational
+/// roles (304-308) are refused here: they are served by the same-handler
+/// operational check in the focused counter, never by a second program.
+pub fn typed_entry(ctx: &ProbeContext, cookie: u64, tgid: u32, tid: u32, _now_ns: u64) -> u32 {
+    if !writer_gate::admitted() {
+        return 0;
+    }
+    // Capture at the same point as resolve_target, but resolve directly into
+    // the root-owned storage. Returning Option<Target> materializes a second
+    // 40-byte stack object before the paired handler can borrow it.
+    let Some(state) = crate::shared_maps::ATTR_STATE.get_ptr_mut(0) else {
+        return 0;
+    };
+    let entry_seq = unsafe { ordered_read(addr_of_mut!((*state).published_sequence)) };
+    let mut storage = core::mem::MaybeUninit::<Target>::uninit();
+    initialize_entry_target(&mut storage);
+    let target = unsafe { &mut *storage.as_mut_ptr() };
+    if !resolve_inner(tgid, entry_seq, target) {
+        return 0;
+    }
+    let admitted = entry_authorized(cookie, target);
+    if admitted == 0 {
+        return 0;
+    }
+    let role = admitted as u32;
+    let Some(control) = control_cell() else {
+        return 0;
+    };
+    let ids = ((tgid as u64) << 32) | tid as u64;
+    // Paired handlers borrow this root-owned storage and re-resolve at the
+    // original point using its captured sequence. No domain-dependent work
+    // follows those calls. Retire arms read arg0 lazily so
+    // copied-role invalidators (274/275) join live CODE_ROLE authority
+    // before any operand read; first-slice arms read the same value later.
+    match role {
+        130 | 131 => fetch_entry(ctx, control, ids, target),
+        147 | 148 => ctx_new_entry(ctx, control, ids, target),
+        151 | 152 => dup_entry(ctx, control, ids, target),
+        142 | 143 | 146 | 258 | 259 | 290 | 291 => child_entry(ctx, control, ids, target),
+        161 => typed_query_entry(ctx, control, ids, target),
+        _ => entry_invalidate(ctx, target, cookie, admitted),
+    }
+}
+
+/// Entry-only admission phase. Return the validated immutable configuration
+/// pointer as a scalar; callers snapshot its fields immediately, before any
+/// unrelated helper. The lookup key and validation spills end before staging.
+#[inline(never)]
+#[no_mangle]
+fn entry_admission(cookie: u64, target: &Target) -> *mut TypedAdmission {
+    admission_ptr(cookie, target).unwrap_or(core::ptr::null_mut())
+}
+
 /// Fetch entry (130/131): stage the libctx handle and read the bounded
 /// public algorithm name into the frame. Only a1 is read; a2 (properties)
 /// is never touched. A NULL libctx stages normally: the association stays
@@ -1180,22 +1325,24 @@ pub fn fetch_entry(
     ctx: &ProbeContext,
     control: *mut ProducerControl,
     ids: u64,
-    entry_seq: u64,
+    target: &mut Target,
 ) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let mut target: Target = unsafe { core::mem::zeroed() };
-    if !resolve_inner(tgid, entry_seq, &mut target) {
+    let captured_entry_seq = target.entry_seq;
+    if !resolve_inner(tgid, captured_entry_seq, target) {
         return 0;
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let Some(admitted) = admission(cookie, &target) else {
+    let admitted = entry_admission(cookie, target);
+    if admitted.is_null() {
         return 0;
-    };
-    if !admitted.valid() || !matches!(admitted.role_id, 130 | 131) {
+    }
+    let role = unsafe { (*admitted).role_id };
+    if !matches!(role, 130 | 131) {
         return 0;
     }
     let mut thread = 0u64;
-    if !thread_incarnation(control, &target, tid, &mut thread) {
+    if !thread_incarnation(control, target, tid, &mut thread) {
         return 0;
     }
     let mut occurrence = 0u64;
@@ -1204,18 +1351,18 @@ pub fn fetch_entry(
     }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
-        target: &target,
+        target,
         thread,
         cookie,
-        role: admitted.role_id,
+        role,
         occurrence,
         now_ns,
     };
-    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    let mut staged: StagedFrame = unsafe { core::mem::zeroed() };
     if !stage_frame(&params, &mut staged) {
         return 0;
     }
-    let frame = staged.1;
+    let frame = staged.frame;
     unsafe {
         (*frame).entry_handle = ctx.arg(0).unwrap_or(0);
     }
@@ -1235,35 +1382,19 @@ pub fn fetch_entry(
     0
 }
 
-/// Public context-constructor entry (147/148): the consumed method must name
-/// a live observed METHOD row for this family, with no ambiguity tombstone.
-/// Unknown, retired, ambiguous or poisoned methods refuse the transaction.
+/// Constructor inputs captured from the live, unambiguous method row.
+struct MethodEntry {
+    witness: u64,
+    request: u64,
+}
+
+/// Finish method validation before staging. The output retains the same
+/// immutable scalar snapshot while the two relation-key temporaries end here.
 #[inline(never)]
 #[no_mangle]
-pub fn ctx_new_entry(
-    ctx: &ProbeContext,
-    control: *mut ProducerControl,
-    ids: u64,
-    entry_seq: u64,
-) -> u32 {
-    let (tgid, tid) = split_ids(ids);
-    let mut target: Target = unsafe { core::mem::zeroed() };
-    if !resolve_inner(tgid, entry_seq, &mut target) {
-        return 0;
-    }
-    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let Some(admitted) = admission(cookie, &target) else {
-        return 0;
-    };
-    if !admitted.valid() || !matches!(admitted.role_id, 147 | 148) {
-        return 0;
-    }
-    let method: u64 = ctx.arg(0).unwrap_or(0);
-    if method == 0 {
-        return 0;
-    }
-    let Some(row) = REL.get_ptr_mut(&method_key(&target, method, admitted.operation)) else {
-        return 0;
+fn method_entry(target: &Target, method: u64, operation: u32, out: &mut MethodEntry) -> bool {
+    let Some(row) = REL.get_ptr_mut(&method_key(target, method, operation)) else {
+        return false;
     };
     let (witness, request, live) = unsafe {
         (
@@ -1276,13 +1407,53 @@ pub fn ctx_new_entry(
         || witness == 0
         || request == 0
         || REL
-            .get_ptr_mut(&ambiguity_key(&target, method, admitted.operation))
+            .get_ptr_mut(&ambiguity_key(target, method, operation))
             .is_some()
     {
+        return false;
+    }
+    *out = MethodEntry { witness, request };
+    true
+}
+
+/// Public context-constructor entry (147/148): the consumed method must name
+/// a live observed METHOD row for this family, with no ambiguity tombstone.
+/// Unknown, retired, ambiguous or poisoned methods refuse the transaction.
+#[inline(never)]
+#[no_mangle]
+pub fn ctx_new_entry(
+    ctx: &ProbeContext,
+    control: *mut ProducerControl,
+    ids: u64,
+    target: &mut Target,
+) -> u32 {
+    let (tgid, tid) = split_ids(ids);
+    let captured_entry_seq = target.entry_seq;
+    if !resolve_inner(tgid, captured_entry_seq, target) {
+        return 0;
+    }
+    let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    let admitted = entry_admission(cookie, target);
+    if admitted.is_null() {
+        return 0;
+    }
+    let (role, operation) = unsafe { ((*admitted).role_id, (*admitted).operation) };
+    if !matches!(role, 147 | 148) {
+        return 0;
+    }
+    let method: u64 = ctx.arg(0).unwrap_or(0);
+    if method == 0 {
+        return 0;
+    }
+    let mut method_inputs = MethodEntry {
+        witness: 0,
+        request: 0,
+    };
+    if !method_entry(target, method, operation, &mut method_inputs) {
         return 0;
     }
     let mut thread = 0u64;
-    if !thread_incarnation(control, &target, tid, &mut thread) {
+    if !thread_incarnation(control, target, tid, &mut thread) {
         return 0;
     }
     let mut occurrence = 0u64;
@@ -1291,22 +1462,22 @@ pub fn ctx_new_entry(
     }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
-        target: &target,
+        target,
         thread,
         cookie,
-        role: admitted.role_id,
+        role,
         occurrence,
         now_ns,
     };
-    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    let mut staged: StagedFrame = unsafe { core::mem::zeroed() };
     if !stage_frame(&params, &mut staged) {
         return 0;
     }
-    let frame = staged.1;
+    let frame = staged.frame;
     unsafe {
         (*frame).entry_handle = method;
-        (*frame).method_observation_id = witness;
-        (*frame).selector_or_set_id = request;
+        (*frame).method_observation_id = method_inputs.witness;
+        (*frame).selector_or_set_id = method_inputs.request;
     }
     0
 }
@@ -1320,18 +1491,20 @@ pub fn dup_entry(
     ctx: &ProbeContext,
     control: *mut ProducerControl,
     ids: u64,
-    entry_seq: u64,
+    target: &mut Target,
 ) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let mut target: Target = unsafe { core::mem::zeroed() };
-    if !resolve_inner(tgid, entry_seq, &mut target) {
+    let captured_entry_seq = target.entry_seq;
+    if !resolve_inner(tgid, captured_entry_seq, target) {
         return 0;
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let Some(admitted) = admission(cookie, &target) else {
+    let admitted = entry_admission(cookie, target);
+    if admitted.is_null() {
         return 0;
-    };
-    if !admitted.valid() || !matches!(admitted.role_id, 151 | 152) {
+    }
+    let role = unsafe { (*admitted).role_id };
+    if !matches!(role, 151 | 152) {
         return 0;
     }
     let source: u64 = ctx.arg(0).unwrap_or(0);
@@ -1339,7 +1512,7 @@ pub fn dup_entry(
         return 0;
     }
     let mut thread = 0u64;
-    if !thread_incarnation(control, &target, tid, &mut thread) {
+    if !thread_incarnation(control, target, tid, &mut thread) {
         return 0;
     }
     let mut occurrence = 0u64;
@@ -1348,18 +1521,18 @@ pub fn dup_entry(
     }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
-        target: &target,
+        target,
         thread,
         cookie,
-        role: admitted.role_id,
+        role,
         occurrence,
         now_ns,
     };
-    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    let mut staged: StagedFrame = unsafe { core::mem::zeroed() };
     if !stage_frame(&params, &mut staged) {
         return 0;
     }
-    let frame = staged.1;
+    let frame = staged.frame;
     unsafe {
         (*frame).entry_handle = source;
     }
@@ -1377,26 +1550,34 @@ pub fn child_entry(
     ctx: &ProbeContext,
     control: *mut ProducerControl,
     ids: u64,
-    entry_seq: u64,
+    target: &mut Target,
 ) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let mut target: Target = unsafe { core::mem::zeroed() };
-    if !resolve_inner(tgid, entry_seq, &mut target) {
+    let captured_entry_seq = target.entry_seq;
+    if !resolve_inner(tgid, captured_entry_seq, target) {
         return 0;
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let Some(admitted) = admission(cookie, &target) else {
-        return 0;
-    };
-    if !admitted.valid() || !matches!(admitted.role_id, 142 | 143 | 146 | 258 | 259 | 290 | 291) {
+    let admitted = entry_admission(cookie, target);
+    if admitted.is_null() {
         return 0;
     }
-    if matches!(admitted.role_id, 258 | 259 | 290 | 291) {
-        let opfun = (u64::from(admitted.function) << 32) | u64::from(admitted.operation);
+    let (role, operation, function) = unsafe {
+        (
+            (*admitted).role_id,
+            (*admitted).operation,
+            (*admitted).function,
+        )
+    };
+    if !matches!(role, 142 | 143 | 146 | 258 | 259 | 290 | 291) {
+        return 0;
+    }
+    if matches!(role, 258 | 259 | 290 | 291) {
+        let opfun = (u64::from(function) << 32) | u64::from(operation);
         let Some((inode, file_offset)) = join_firing_identity(ctx) else {
             return 0;
         };
-        if !code_role_check(&target, cookie, inode, file_offset, opfun) {
+        if !code_role_check(target, cookie, inode, file_offset, opfun) {
             return 0;
         }
     }
@@ -1405,7 +1586,7 @@ pub fn child_entry(
         return 0;
     }
     let mut thread = 0u64;
-    if !thread_incarnation(control, &target, tid, &mut thread) {
+    if !thread_incarnation(control, target, tid, &mut thread) {
         return 0;
     }
     let mut occurrence = 0u64;
@@ -1414,21 +1595,21 @@ pub fn child_entry(
     }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
-        target: &target,
+        target,
         thread,
         cookie,
-        role: admitted.role_id,
+        role,
         occurrence,
         now_ns,
     };
-    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    let mut staged: StagedFrame = unsafe { core::mem::zeroed() };
     if !stage_frame(&params, &mut staged) {
         return 0;
     }
-    let (key, frame) = staged;
+    let frame = staged.frame;
     unsafe {
         (*frame).entry_handle = arg0;
-        if matches!(admitted.role_id, 258 | 259 | 290 | 291) {
+        if matches!(role, 258 | 259 | 290 | 291) {
             (*frame).constructor_cookie = cookie;
         }
     }
@@ -1436,7 +1617,7 @@ pub fn child_entry(
     // closest CTX_new (147/148) or, for dup-context, dup (151/152) frame.
     // Transitive dynamic extent is the sound nesting relation: any nested
     // child is genuinely within its parent's call.
-    let mut depth = key.depth;
+    let mut depth = staged.depth;
     while depth > 0 {
         depth -= 1;
         let parent_key = BindPendingKey {
@@ -1449,23 +1630,23 @@ pub fn child_entry(
         let Some(parent) = BIND_PENDING.get_ptr_mut(&parent_key) else {
             continue;
         };
-        let (role, parent_occurrence, parent_method) = unsafe {
+        let (parent_role, parent_occurrence, parent_method) = unsafe {
             (
                 (*parent).api_role,
                 (*parent).occurrence_id,
                 (*parent).entry_handle,
             )
         };
-        let wants_dup_parent = matches!(admitted.role_id, 290 | 291);
+        let wants_dup_parent = matches!(role, 290 | 291);
         let parent_ok = if wants_dup_parent {
-            matches!(role, 151 | 152)
+            matches!(parent_role, 151 | 152)
         } else {
-            matches!(role, 147 | 148)
+            matches!(parent_role, 147 | 148)
         };
         if !parent_ok || parent_occurrence == 0 {
             continue;
         }
-        if matches!(admitted.role_id, 142 | 143) && parent_method != arg0 {
+        if matches!(role, 142 | 143) && parent_method != arg0 {
             continue;
         }
         unsafe {
@@ -5075,18 +5256,20 @@ pub fn typed_query_entry(
     ctx: &ProbeContext,
     control: *mut ProducerControl,
     ids: u64,
-    entry_seq: u64,
+    target: &mut Target,
 ) -> u32 {
     let (tgid, tid) = split_ids(ids);
-    let mut target: Target = unsafe { core::mem::zeroed() };
-    if !resolve_inner(tgid, entry_seq, &mut target) {
+    let captured_entry_seq = target.entry_seq;
+    if !resolve_inner(tgid, captured_entry_seq, target) {
         return 0;
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
-    let Some(admitted) = admission(cookie, &target) else {
+    let admitted = entry_admission(cookie, target);
+    if admitted.is_null() {
         return 0;
-    };
-    if !admitted.valid() || admitted.role_id != 161 {
+    }
+    let role = unsafe { (*admitted).role_id };
+    if role != 161 {
         return 0;
     }
     let op: u64 = ctx.arg(1).unwrap_or(0);
@@ -5098,7 +5281,7 @@ pub fn typed_query_entry(
         return 0;
     }
     let mut thread = 0u64;
-    if !thread_incarnation(control, &target, tid, &mut thread) {
+    if !thread_incarnation(control, target, tid, &mut thread) {
         return 0;
     }
     let mut occurrence = 0u64;
@@ -5107,18 +5290,18 @@ pub fn typed_query_entry(
     }
     let now_ns = unsafe { helpers::bpf_ktime_get_ns() };
     let params = StageParams {
-        target: &target,
+        target,
         thread,
         cookie,
-        role: admitted.role_id,
+        role,
         occurrence,
         now_ns,
     };
-    let mut staged: (BindPendingKey, *mut BindPendingValue) = unsafe { core::mem::zeroed() };
+    let mut staged: StagedFrame = unsafe { core::mem::zeroed() };
     if !stage_frame(&params, &mut staged) {
         return 0;
     }
-    let frame = staged.1;
+    let frame = staged.frame;
     unsafe {
         (*frame).entry_handle = op;
         (*frame).provider_witness = nocache;
