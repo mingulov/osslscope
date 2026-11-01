@@ -755,7 +755,10 @@ pub fn sha256_block(state: &mut [u32; 8], block: &[u8; 64]) -> u64 {
             d = c;
             c = b;
             b = a;
-            a = t1.wrapping_add(t2);
+            // Keep the next volatile schedule read after this round's result.
+            // SAFETY: `a` is the same initialized local word; this transient
+            // exclusive borrow does not escape or expose caller-owned memory.
+            unsafe { core::ptr::write_volatile(&mut a, t1.wrapping_add(t2)) };
         }};
     }
     round!(0, 0x428a2f98);
