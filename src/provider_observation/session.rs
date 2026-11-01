@@ -4155,7 +4155,7 @@ mod tests {
                 .lines()
                 .filter(|l| l.ends_with(": test"))
                 .count(),
-            5
+            9
         );
         let controls = std::process::Command::new(&binary)
             .args(["bind_controls::", "--test-threads=1", "--nocapture"])

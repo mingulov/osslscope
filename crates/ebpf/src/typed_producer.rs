@@ -2760,6 +2760,7 @@ pub fn bind_prepare(
             plan_store(slot, PLAN_CONTEXT_EPOCH, ids_out.2);
             plan_store(slot, PLAN_SET, ids_out.3);
             plan_store(slot, PLAN_SELECTOR_RELATION, 0);
+            plan_store(slot, PLAN_OWNER_HANDLE, rv);
         }
         return true;
     }

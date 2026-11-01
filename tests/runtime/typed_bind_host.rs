@@ -643,8 +643,140 @@ fn completed_create(family: u32) {
     assert_owner(&first, family, 1001, 16, 1006, 1007);
     assert_eq!(ATTR_STATE.peek(0).unwrap().pending_claims, 2);
 }
+fn zero_carryover(family: u32) {
+    reset(family);
+    // Both constructors have already staged their X on distinct threads.
+    // Their public returns then run sequentially on this modeled CPU.
+    let first = prepare(family, 21, 0x1000, 0x1100, 101, false);
+    let current = prepare(family, 22, 0x2000, 0x2200, 202, false);
+    assert_eq!(publish(&first), OUT_OK);
+    assert_owner(&first, family, 1001, 16, 1006, 1007);
+    let previous = owner_namespace(first.owner);
+    assert_eq!(
+        ITER_SLOT.peek(0).unwrap().staging[30],
+        0,
+        "successful OWNER build really clears previous plan owner"
+    );
+    let outcome = publish(&current);
+    trace();
+    assert_eq!(
+        outcome, OUT_OK,
+        "current-owner reuse after successful create must publish"
+    );
+    assert_owner(&current, family, 1008, 17, 1006, 1007);
+    assert_eq!(
+        owner_namespace(first.owner),
+        previous,
+        "prior owner namespace unchanged"
+    );
+    assert_eq!(ATTR_STATE.peek(0).unwrap().pending_claims, 2);
+}
+fn stale_carryover(family: u32) {
+    reset(family);
+    let first = prepare(family, 21, 0x1000, 0x1100, 101, false);
+    assert_eq!(publish(&first), OUT_OK);
+    assert_owner(&first, family, 1001, 16, 1006, 1007);
+    let first_namespace = owner_namespace(first.owner);
+    // B is prepared before A's public return. It may have been scheduled
+    // away after its provider constructor; no BPF callback is preempted.
+    let current = prepare(family, 22, 0x2000, 0x2200, 202, false);
+    let aborted = prepare(family, 23, 0x3000, 0x3300, 303, true);
+    let state = ATTR_STATE.get_ptr_mut(0).unwrap();
+    phase("competitor-acquire");
+    assert!(unsafe { compare(addr_of_mut!((*state).publication_busy), 0, 1) });
+    assert_eq!(publish(&aborted), OUT_ABORT);
+    let attempts = edit(|s| {
+        s.events
+            .iter()
+            .filter(|e| {
+                e.phase == "commit"
+                    && e.operation
+                        .contains("field=busy expected=0 new=1 observed=1 success=false")
+            })
+            .count()
+    });
+    assert_eq!(attempts, 8, "eight genuine failed lock attempts");
+    assert_eq!(
+        ATTR_STATE.peek(0).unwrap().publication_busy,
+        1,
+        "abort did not unlock competitor"
+    );
+    assert_eq!(
+        ATTR_STATE.peek(0).unwrap().published_sequence,
+        16,
+        "abort preserves publication sequence"
+    );
+    let control = ATTRIB_CONTROL.peek(0).unwrap();
+    assert_eq!(
+        (
+            control.producer_mode,
+            control.relation_epoch,
+            control.loss_epoch
+        ),
+        (1, 13, 14),
+        "abort preserves mode and epochs"
+    );
+    assert_eq!(
+        ITER_SLOT.peek(0).unwrap().staging[30],
+        0x3000,
+        "aborted create retains its own return handle through real cleanup"
+    );
+    assert_eq!(
+        REL.peek(rel_key(13, aborted.context, 0, REL_X_INDEX, 0))
+            .unwrap()
+            .data[5],
+        3
+    );
+    let aborted_namespace = owner_namespace(aborted.owner);
+    assert!(
+        aborted_namespace.is_empty(),
+        "aborted A has no committed owner namespace"
+    );
+    let residue = bytes(&ITER_SLOT.peek(0).unwrap());
+    phase("competitor-release");
+    assert!(unsafe { compare(addr_of_mut!((*state).publication_busy), 1, 0) });
+    assert_eq!(
+        bytes(&ITER_SLOT.peek(0).unwrap()),
+        residue,
+        "no later B entry staging between A residue and B bind"
+    );
+    let outcome = publish(&current);
+    trace();
+    assert_eq!(
+        outcome, OUT_OK,
+        "current-owner reuse after lock abort must publish"
+    );
+    assert_owner(&current, family, 1015, 17, 1006, 1007);
+    assert_eq!(
+        owner_namespace(aborted.owner),
+        aborted_namespace,
+        "aborted prior owner namespace unchanged"
+    );
+    assert_eq!(
+        owner_namespace(first.owner),
+        first_namespace,
+        "existing selector owner namespace unchanged"
+    );
+    assert_eq!(ATTR_STATE.peek(0).unwrap().pending_claims, 2);
+}
 mod bind_controls {
     use super::*;
+    #[test]
+    fn zero_owner_mac() {
+        zero_carryover(3);
+    }
+    #[test]
+    fn zero_owner_kdf() {
+        zero_carryover(4);
+    }
+    #[test]
+    fn stale_owner_mac() {
+        stale_carryover(3);
+    }
+    #[test]
+    fn stale_owner_kdf() {
+        stale_carryover(4);
+    }
     #[test]
     fn completed_create_mac() {
         completed_create(3);
