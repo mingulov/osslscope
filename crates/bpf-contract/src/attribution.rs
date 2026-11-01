@@ -701,21 +701,9 @@ pub fn selector_digest_parts(
 #[inline(never)]
 #[cfg_attr(target_arch = "bpf", unsafe(no_mangle))]
 pub fn sha256_block(state: &mut [u32; 8], block: &[u8; 64]) -> u64 {
-    // Stack array, not `const`: a const table is pooled in `.rodata` and
-    // addressed by relocation, which the loader rejects; the 64 immediates
-    // materialize on the stack and the verifier checks the depth on load.
-    let k: [u32; 64] = [
-        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
-        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
-        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
-        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
-        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
-        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
-        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
-        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
-        0xc67178f2,
-    ];
+    // Literal rounds keep the K constants in instructions rather than a
+    // dynamically indexed 256-byte stack table or a relocated data section.
+    // All schedule indices are compile-time values in the same 16-word ring.
     let mut w = [0u32; 16];
     let mut i = 0;
     while i < 16 {
@@ -724,46 +712,123 @@ pub fn sha256_block(state: &mut [u32; 8], block: &[u8; 64]) -> u64 {
         i += 1;
     }
     let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
-    i = 0;
-    while i < 64 {
-        if i >= 16 {
-            let x = w[(i - 15) & 15];
-            let y = w[(i - 2) & 15];
-            let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
-            let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
-            w[i & 15] = w[i & 15]
-                .wrapping_add(s0)
-                .wrapping_add(w[(i - 7) & 15])
-                .wrapping_add(s1);
-        }
-        let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
-        let choose = (e & f) ^ (!e & g);
-        let t1 = h
-            .wrapping_add(s1)
-            .wrapping_add(choose)
-            .wrapping_add(k[i])
-            .wrapping_add(w[i & 15]);
-        let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
-        let majority = (a & b) ^ (a & c) ^ (b & c);
-        let t2 = s0.wrapping_add(majority);
-        h = g;
-        g = f;
-        f = e;
-        e = d.wrapping_add(t1);
-        d = c;
-        c = b;
-        b = a;
-        a = t1.wrapping_add(t2);
-        i += 1;
+    // Keep the ring in its 64-byte local backing. Without volatile access,
+    // scalar replacement across all literal rounds can lengthen live ranges
+    // enough that the BPF register allocator spills beyond the stack limit.
+    macro_rules! schedule_word {
+        ($index:expr) => {{
+            // SAFETY: every constant index is masked to 0..15, and the full
+            // local schedule was initialized above. No pointer escapes.
+            unsafe { core::ptr::read_volatile(&w[$index]) }
+        }};
     }
+    macro_rules! round {
+        ($i:literal, $k:literal) => {{
+            if $i >= 16 {
+                // Positive modular offsets also remain valid in the first
+                // sixteen (compile-time excluded) schedule updates.
+                let x = schedule_word!(($i + 1) & 15);
+                let y = schedule_word!(($i + 14) & 15);
+                let s0 = x.rotate_right(7) ^ x.rotate_right(18) ^ (x >> 3);
+                let s1 = y.rotate_right(17) ^ y.rotate_right(19) ^ (y >> 10);
+                let next = schedule_word!($i & 15)
+                    .wrapping_add(s0)
+                    .wrapping_add(schedule_word!(($i + 9) & 15))
+                    .wrapping_add(s1);
+                // SAFETY: this writes one initialized, in-bounds local word.
+                unsafe { core::ptr::write_volatile(&mut w[$i & 15], next) };
+            }
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(choose)
+                .wrapping_add($k)
+                .wrapping_add(schedule_word!($i & 15));
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }};
+    }
+    round!(0, 0x428a2f98);
+    round!(1, 0x71374491);
+    round!(2, 0xb5c0fbcf);
+    round!(3, 0xe9b5dba5);
+    round!(4, 0x3956c25b);
+    round!(5, 0x59f111f1);
+    round!(6, 0x923f82a4);
+    round!(7, 0xab1c5ed5);
+    round!(8, 0xd807aa98);
+    round!(9, 0x12835b01);
+    round!(10, 0x243185be);
+    round!(11, 0x550c7dc3);
+    round!(12, 0x72be5d74);
+    round!(13, 0x80deb1fe);
+    round!(14, 0x9bdc06a7);
+    round!(15, 0xc19bf174);
+    round!(16, 0xe49b69c1);
+    round!(17, 0xefbe4786);
+    round!(18, 0x0fc19dc6);
+    round!(19, 0x240ca1cc);
+    round!(20, 0x2de92c6f);
+    round!(21, 0x4a7484aa);
+    round!(22, 0x5cb0a9dc);
+    round!(23, 0x76f988da);
+    round!(24, 0x983e5152);
+    round!(25, 0xa831c66d);
+    round!(26, 0xb00327c8);
+    round!(27, 0xbf597fc7);
+    round!(28, 0xc6e00bf3);
+    round!(29, 0xd5a79147);
+    round!(30, 0x06ca6351);
+    round!(31, 0x14292967);
+    round!(32, 0x27b70a85);
+    round!(33, 0x2e1b2138);
+    round!(34, 0x4d2c6dfc);
+    round!(35, 0x53380d13);
+    round!(36, 0x650a7354);
+    round!(37, 0x766a0abb);
+    round!(38, 0x81c2c92e);
+    round!(39, 0x92722c85);
+    round!(40, 0xa2bfe8a1);
+    round!(41, 0xa81a664b);
+    round!(42, 0xc24b8b70);
+    round!(43, 0xc76c51a3);
+    round!(44, 0xd192e819);
+    round!(45, 0xd6990624);
+    round!(46, 0xf40e3585);
+    round!(47, 0x106aa070);
+    round!(48, 0x19a4c116);
+    round!(49, 0x1e376c08);
+    round!(50, 0x2748774c);
+    round!(51, 0x34b0bcb5);
+    round!(52, 0x391c0cb3);
+    round!(53, 0x4ed8aa4a);
+    round!(54, 0x5b9cca4f);
+    round!(55, 0x682e6ff3);
+    round!(56, 0x748f82ee);
+    round!(57, 0x78a5636f);
+    round!(58, 0x84c87814);
+    round!(59, 0x8cc70208);
+    round!(60, 0x90befffa);
+    round!(61, 0xa4506ceb);
+    round!(62, 0xbef9a3f7);
+    round!(63, 0xc67178f2);
     let values = [a, b, c, d, e, f, g, h];
     i = 0;
     while i < 8 {
         state[i] = state[i].wrapping_add(values[i]);
         i += 1;
     }
-    // Scalar tail, not `()`: the K-materialization loop leaves a stack
-    // address in R0, and a BPF subprogram may not exit with R0 holding a
-    // stack pointer. Callers ignore the value.
+    // A BPF subprogram must return a scalar, never a stack pointer.
+    // Callers ignore the value, but retain the same first-state-word result.
     u64::from(state[0])
 }
