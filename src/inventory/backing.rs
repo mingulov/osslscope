@@ -1397,26 +1397,20 @@ mod tests {
             eprintln!("skip: denial requires an unprivileged observer");
             return;
         }
-        let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
-        let dir = File::open(format!("/proc/{}", sleep.id())).unwrap();
-        let maps = std::fs::read(format!("/proc/{}/maps", sleep.id())).unwrap();
-        let vma = maps
-            .split(|b| *b == b'\n')
-            .filter(|l| !l.is_empty())
-            .filter_map(parse_vma)
-            .find(|v| v.ino != 0 && v.executable)
-            .unwrap();
-        let candidate = File::open("/bin/true").unwrap();
-        let range = MappedRange {
-            start: vma.start,
-            end: vma.start + 1,
-        };
+        // MapChild reports readiness only after exec and mmap complete;
+        // reading a freshly spawned process's maps once races exec setup.
+        let dir = scratch("denied-map-files");
+        let path = dir.join("mapped");
+        std::fs::write(&path, vec![0x5au8; 4096]).unwrap();
+        let child = MapChild::spawn(&[path.clone()]);
+        let range = child.range_of(&path);
+        let target = child.dir();
+        let candidate = File::open(&path).unwrap();
         assert_eq!(
-            err_of(verify_mapped_backing(&dir, &range, &candidate)),
+            err_of(verify_mapped_backing(&target, &range, &candidate)),
             BackingError::Denied
         );
-        sleep.kill().unwrap();
-        sleep.wait().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
