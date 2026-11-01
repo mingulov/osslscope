@@ -11,12 +11,10 @@ use super::{
         ReadyReceipt, RetainedSourceRoots,
     },
 };
-use crate::{loader, observation_memory::MemoryLease, writer_gate::WriterGate};
 /// Attribution contract (typed admission/bind shapes, REL kinds, control
-/// cell). Core-only: safe to include by path like `contract` below.
-#[path = "../../crates/bpf-contract/src/attribution.rs"]
-#[allow(dead_code)]
-mod attr_contract;
+/// cell), shared from the single path include in `crate::attribution`.
+use crate::attribution::wire as attr_contract;
+use crate::{loader, observation_memory::MemoryLease, writer_gate::WriterGate};
 #[allow(dead_code)]
 #[path = "../../crates/bpf-contract/src/source.rs"]
 pub(super) mod contract;
@@ -346,6 +344,10 @@ pub(super) struct TypedAdmissionRequest {
 /// publishes only through the per-cookie registration protocol that runs
 /// after this returns.
 pub(super) struct TypedAdmissionReceipts {
+    #[allow(
+        dead_code,
+        reason = "complete admission receipt; consumed by native-stage record checks"
+    )]
     pub cookie: u64,
     pub site_id: u64,
     pub source_epoch: u64,
@@ -367,6 +369,10 @@ pub(crate) struct TypedAcquisitionScope {
 
 /// Producer control coordinates, retained by the session for the final
 /// cut-coordinate cross-check.
+#[allow(
+    dead_code,
+    reason = "cut cross-check consumer lands with the native stage"
+)]
 pub(super) struct ProducerControlProgrammed {
     pub session_id: u64,
     pub admission_epoch: u64,
@@ -945,9 +951,8 @@ impl SourceOwner {
         self._roots.adopt_typed(typed_programs)?;
         // Control cell last among the loads, before the mode flip below:
         // the producer admits only with all coordinates in place.
-        let control = self.program_producer_control().map_err(|gap| {
+        let control = self.program_producer_control().inspect_err(|_| {
             self._last_error = Some("producer control refused".to_string());
-            gap
         })?;
         self._control = Some(control);
         let receipts = RootsEnabled {
@@ -1256,6 +1261,10 @@ impl SourceOwner {
         Ok(observer.state)
     }
     /// Programmed control coordinates for the final cut cross-check.
+    #[allow(
+        dead_code,
+        reason = "cut cross-check consumer lands with the native stage"
+    )]
     pub(super) fn control_programmed(&self) -> Option<&ProducerControlProgrammed> {
         self._control.as_ref()
     }

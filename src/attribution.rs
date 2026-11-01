@@ -855,6 +855,10 @@ fn fold_attribution(
 pub(crate) struct AdmittedTypedSite {
     pub cookie: u64,
     pub site_id: NonZeroU64,
+    #[allow(
+        dead_code,
+        reason = "carried for the finalizer bind-role cross-check (native stage)"
+    )]
     pub role_id: u32,
     pub object: ObjectId,
     pub device: u64,
@@ -891,6 +895,10 @@ fn final_map<'a>(
 /// the cut coordinate is fixed before any row is accepted. Any refusal
 /// yields no `FinalizedAttribution`; the caller keeps the physical
 /// evidence it already holds.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one coherent finalizer input set"
+)]
 pub(crate) fn collect_closed_attribution(
     closed_gate: crate::writer_gate::OwnedClosedGate,
     gate: &crate::writer_gate::WriterGate,

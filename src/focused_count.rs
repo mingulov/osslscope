@@ -507,6 +507,10 @@ impl FocusedCounter {
     /// both programs resolve one SITE_BIND row. Absent or out-of-range
     /// pins fall back to counter-minted cookies (physical evidence
     /// preserved; the site stays unattributed).
+    #[allow(
+        dead_code,
+        reason = "exercised by session native controls; production counter wiring is staged"
+    )]
     pub(crate) fn attach_candidates_pinned(
         &mut self,
         candidates: Vec<CountCandidate>,

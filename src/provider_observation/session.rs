@@ -326,6 +326,10 @@ pub(crate) const TYPED_COOKIE_END: u64 = 1 << 32;
 pub(crate) struct TypedSiteRecord {
     pub site_id: u64,
     pub role_id: u32,
+    #[allow(
+        dead_code,
+        reason = "record identity for the finalizer SITE_BIND join (native stage)"
+    )]
     pub pid: u32,
     pub device: u64,
     pub inode: u64,
@@ -333,7 +337,15 @@ pub(crate) struct TypedSiteRecord {
     pub object: crate::evidence::ObjectId,
     pub object_id: u64,
     pub source_epoch: u64,
+    #[allow(
+        dead_code,
+        reason = "record identity for the finalizer SITE_BIND join (native stage)"
+    )]
     pub process_incarnation: u64,
+    #[allow(
+        dead_code,
+        reason = "record identity for the finalizer SITE_BIND join (native stage)"
+    )]
     pub image_epoch: u64,
 }
 struct Target {
@@ -1933,6 +1945,10 @@ impl ProviderSession {
     }
     /// Counter bridge: pinned cookie per physical site for same-cookie
     /// counter attach, so both programs resolve one SITE_BIND row.
+    #[allow(
+        dead_code,
+        reason = "exercised by session native controls; production counter wiring is staged"
+    )]
     pub(crate) fn typed_pins(&self) -> &BTreeMap<(u64, u64, u64), u64> {
         &self.typed_pins
     }
