@@ -3,6 +3,7 @@
 //! Discovery does not establish activation, execution, or policy compliance.
 pub mod artifact;
 mod assembly;
+pub mod cipher_workload;
 pub mod cli;
 pub mod copied_plan;
 pub mod digest_workload;

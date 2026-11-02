@@ -87,7 +87,8 @@ impl TypedRoleId {
             | 290
             | 291
             | 304..=308
-            | 309..=315 => Some(Self(id)),
+            | 309..=315
+            | 316..=323 => Some(Self(id)),
             _ => None,
         }
     }
@@ -167,6 +168,16 @@ impl TypedAdmission {
             313 => Some((0, 1, 3)),
             314 => Some((0, 1, 4)),
             315 => Some((0, 1, 5)),
+            // Cipher (op 2): newctx / freectx / dupctx /
+            // encrypt_init / decrypt_init / update / final / oneshot.
+            316 => Some((0, 2, 1)),
+            317 => Some((0, 2, 7)),
+            318 => Some((0, 2, 8)),
+            319 => Some((0, 2, 2)),
+            320 => Some((0, 2, 3)),
+            321 => Some((0, 2, 4)),
+            322 => Some((0, 2, 5)),
+            323 => Some((0, 2, 6)),
             _ => None,
         }
     }
@@ -232,11 +243,13 @@ impl TypedAdmission {
                 | 291
                 | 309
                 | 311
+                | 316
+                | 318
         )
     }
     #[inline(always)]
     pub const fn operational(&self) -> bool {
-        matches!(self.role_id, 304..=307 | 312..=315)
+        matches!(self.role_id, 304..=307 | 312..=315 | 319..=323)
     }
 }
 #[repr(C)]

@@ -254,6 +254,17 @@ pub(crate) fn copied_role(operation: u32, function: u32) -> Option<u32> {
         (1, 3) => Some(313),
         (1, 4) => Some(314),
         (1, 5) => Some(315),
+        // Cipher (op 2): newctx (316) / freectx (317) / dupctx (318) /
+        // encrypt_init (319) / decrypt_init (320) / update (321) /
+        // final (322) / cipher oneshot (323).
+        (2, 1) => Some(316),
+        (2, 7) => Some(317),
+        (2, 8) => Some(318),
+        (2, 2) => Some(319),
+        (2, 3) => Some(320),
+        (2, 4) => Some(321),
+        (2, 5) => Some(322),
+        (2, 6) => Some(323),
         _ => None,
     }
 }
@@ -411,13 +422,24 @@ mod tests {
             (1, 3, 313),
             (1, 4, 314),
             (1, 5, 315),
+            // Cipher (op 2): 1=newctx, 7=freectx, 8=dupctx,
+            // 2/3=encrypt_init/decrypt_init, 4=update, 5=final,
+            // 6=cipher (oneshot).
+            (2, 1, 316),
+            (2, 7, 317),
+            (2, 8, 318),
+            (2, 2, 319),
+            (2, 3, 320),
+            (2, 4, 321),
+            (2, 5, 322),
+            (2, 6, 323),
         ];
         for (op, fun, role) in pairs {
             assert_eq!(copied_role(op, fun), Some(role));
             let (_, admit_op, admit_fun) = TypedAdmission::admission_parts(role).unwrap();
             assert_eq!((admit_op, admit_fun), (op, fun));
         }
-        for op in [1, 3, 4] {
+        for op in [1, 2, 3, 4] {
             for fun in 0..64 {
                 let role = copied_role(op, fun);
                 if pairs.iter().any(|(o, f, _)| (*o, *f) == (op, fun)) {
@@ -429,7 +451,7 @@ mod tests {
         }
         for role in [
             258u32, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
-            315,
+            315, 316, 317, 318, 319, 320, 321, 322, 323,
         ] {
             let id = TypedRoleId::from_u32(role).unwrap();
             assert_eq!(id.public_export(), None);
