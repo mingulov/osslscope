@@ -2065,7 +2065,7 @@ impl FocusedSession {
             }
         });
         document.context = Some(CaptureContext {
-            kernel_release: crate::doctor::uname_release(),
+            kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
             wall_start_unix_ns: self.wall_start,
             wall_end_unix_ns: unix_ns(),
         });
@@ -3234,7 +3234,10 @@ mod session_tests {
         // The observer kernel is free context (uname), not staged
         // evidence: finish() must carry it, never an empty string.
         let context = result.document.context.expect("finish sets context");
-        assert_eq!(context.kernel_release, crate::doctor::uname_release());
+        assert_eq!(
+            context.kernel_release,
+            crate::doctor::uname_release_opt().unwrap_or_default()
+        );
         assert!(!context.kernel_release.is_empty());
     }
 

@@ -18,7 +18,7 @@
     },
     {
       "id": "caps",
-      "message": "missing caps: CAP_BPF+CAP_PERFMON (have neither file caps nor root)",
+      "message": "missing caps: CAP_BPF+CAP_PERFMON (not in effective set)",
       "remediation": "grant file caps: sudo setcap cap_bpf,cap_perfmon+ep $(command -v osslscope) [+cap_sys_ptrace for foreign-uid targets], then re-run",
       "status": "fail"
     },

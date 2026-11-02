@@ -16,6 +16,11 @@ use std::{
 const SCHEMA: &str = "osslscope.discovery.provider.v1";
 const HELP: &str = "usage: osslscope scan --observe-providers [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--duration S] [--interval S]] [--json]\n       osslscope inspect --pid PID --observe-providers [--json]\nObserve public provider APIs for 30 seconds by default; duration (0,3600]s, interval [0.05,3600]s (default 1s).\nStreams snapshot/observation/end records; activation before attachment remains unknown.\nAdvertisements do not prove execution; execution remains not_observed.\n";
 const MEANING: &str = "Provider observation: historical activation unknown; advertisements do not prove execution; execution not_observed.\n";
+/// Value-taking options of the scan parser below: the scan router
+/// consumes the token after each of these, so flag-shaped values
+/// never misroute. A new value-taking match arm MUST extend this list.
+pub(crate) const VALUE_OPTIONS: &[&str] =
+    &["--interval", "--duration", "--pid", "--module", "--cgroup"];
 struct Options {
     selection: Selection,
     json: bool,

@@ -215,21 +215,38 @@ fn status_field(status: &str, key: &str) -> Option<String> {
     })
 }
 
-pub(crate) fn uname_release() -> String {
+/// Observer kernel release, if obtainable: `None` when `uname`
+/// fails (confinement can deny it). Data fields use this with
+/// `unwrap_or_default()` — the CaptureContext/TargetInfo contract
+/// reserves the empty string for unknown; human display uses
+/// [`uname_release`], which prints `unknown` instead.
+pub(crate) fn uname_release_opt() -> Option<String> {
     // SAFETY: uname writes a fresh struct; read-only after.
     unsafe {
         let mut u: libc::utsname = std::mem::zeroed();
-        if libc::uname(&mut u) != 0 {
-            return "unknown".into();
-        }
-        let b = u
-            .release
-            .iter()
-            .map(|&c| c as u8)
-            .take_while(|&c| c != 0)
-            .collect::<Vec<_>>();
-        String::from_utf8_lossy(&b).into_owned()
+        decode_uname_release(libc::uname(&mut u), &u.release)
     }
+}
+
+/// Observer kernel release for human display (`unknown` when
+/// unobtainable).
+pub(crate) fn uname_release() -> String {
+    uname_release_opt().unwrap_or_else(|| "unknown".into())
+}
+
+/// Pure `uname` outcome decoder, split out so the failure branch is
+/// unit-testable without faulting the syscall itself (`uname` fails
+/// only on EFAULT/seccomp-deny — unreachable in-process).
+fn decode_uname_release(ret: libc::c_int, release: &[libc::c_char]) -> Option<String> {
+    if ret != 0 {
+        return None;
+    }
+    let b = release
+        .iter()
+        .map(|&c| c as u8)
+        .take_while(|&c| c != 0)
+        .collect::<Vec<_>>();
+    Some(String::from_utf8_lossy(&b).into_owned())
 }
 
 /// Active lockdown mode: the `[bracketed]` entry, or "none" when the
@@ -1241,10 +1258,7 @@ fn check_caps(env: &Env) -> Check {
     }
     Check::fail(
         "caps",
-        format!(
-            "missing caps: {} (have neither file caps nor root)",
-            missing.join("+")
-        ),
+        format!("missing caps: {} (not in effective set)", missing.join("+")),
         SETCAP_RECIPE.into(),
     )
 }
@@ -2112,6 +2126,149 @@ fn check_pagemap_for(pid: u32, subject: PagemapSubject) -> Check {
     }
 }
 
+/// One non-blocking reap poll: true when the child is reaped by
+/// this call (exited) or already gone (ECHILD). EINTR-retried; never
+/// blocks.
+fn reap_poll_once(pid: libc::pid_t, status: &mut libc::c_int) -> bool {
+    loop {
+        // SAFETY: pid names the caller's child; status is writable;
+        // WNOHANG never blocks.
+        let r = unsafe { libc::waitpid(pid, status, libc::WNOHANG) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return r == pid || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    }
+}
+
+/// Pauser rendezvous outcome: the owned child signals one byte
+/// when pausing, so "exited instantly" (denied setup) reads as EOF —
+/// deterministically, on every schedule. A reap poll cannot do this:
+/// it races the child's exit, so the verdict would depend on who got
+/// scheduled first.
+enum Rendezvous {
+    /// The byte arrived: the child is pausing until signaled (its
+    /// only exits are our signal and our death, both handled).
+    Pausing,
+    /// EOF or a read failure: the child is gone (or unreadable,
+    /// which answers nothing — same verdict).
+    Gone,
+    /// Nothing in 5s: externally stopped or bizarrely stalled.
+    Unresponsive,
+}
+
+/// Bounded rendezvous read: POLLIN until the deadline, EINTR-retried.
+/// Never blocks past the deadline; EOF (all write ends closed — the
+/// parent closed its own, so this means the child exited) is Gone.
+fn read_rendezvous_byte(read: libc::c_int, deadline: std::time::Instant) -> Rendezvous {
+    loop {
+        // SAFETY: pfd borrows the caller's pipe end; the timeout is
+        // recomputed every lap so EINTR restarts never overrun it.
+        let mut pfd = libc::pollfd {
+            fd: read,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout = deadline
+            .saturating_duration_since(std::time::Instant::now())
+            .as_millis()
+            .min(libc::c_int::MAX as u128) as libc::c_int;
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
+        if r < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Rendezvous::Gone;
+        }
+        if r == 0 || std::time::Instant::now() >= deadline {
+            return Rendezvous::Unresponsive;
+        }
+        let mut byte = [0u8; 1];
+        // SAFETY: byte is a writable 1-byte buffer.
+        let n = unsafe { libc::read(read, byte.as_mut_ptr().cast(), 1) };
+        if n > 0 {
+            return Rendezvous::Pausing;
+        }
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        // EOF (n == 0) or a read failure: the child is gone.
+        return Rendezvous::Gone;
+    }
+}
+
+/// Pauser-child setup + rendezvous signal: arm pdeathsig, guard
+/// the parent-died window, then write the byte (EINTR-retried; one
+/// byte to a live parent never blocks). Any failure _exits — the
+/// parent reads EOF/Gone. Only returns on the pausing path.
+fn write_rendezvous_byte_or_exit(write: libc::c_int, ppid: u32) {
+    unsafe {
+        // A pauser without pdeathsig would outlive a parent death:
+        // if confinement denies the setup, never pause.
+        if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+            libc::_exit(0);
+        }
+        // Parent-died-in-the-window guard: a reparented pauser would
+        // outlive the probe.
+        if libc::getppid() != ppid as libc::pid_t {
+            libc::_exit(0);
+        }
+    }
+    let byte = [1u8; 1];
+    loop {
+        // SAFETY: byte is a readable 1-byte buffer.
+        let n = unsafe { libc::write(write, byte.as_ptr().cast(), 1) };
+        if n == 1 {
+            return;
+        }
+        if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        unsafe { libc::_exit(0) };
+    }
+}
+
+/// Pauser teardown shared by every exit arm: the kill result
+/// decides the wait shape — an unsignaled child is never waited on
+/// unboundedly (its pdeathsig, armed before it could pause, is the
+/// backstop: it dies with us). True when the child is reaped by this
+/// call (or already gone); a live-but-unreaped child returns false
+/// and the caller fails loud.
+fn confirm_pauser_gone(pid: libc::pid_t, status: &mut libc::c_int) -> bool {
+    // SAFETY: pid is our child (pausing, zombie, or freshly exited —
+    // signaling a zombie is harmless, ESRCH only sharpens `killed`).
+    let killed = unsafe { libc::kill(pid, libc::SIGKILL) == 0 };
+    if reap_poll_once(pid, status) {
+        return true;
+    }
+    if !killed {
+        return false;
+    }
+    // Signaled and (momentarily) alive: it is dying — bounded
+    // confirmation wait, never an unbounded block.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if reap_poll_once(pid, status) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Shared Fail for a pauser that could not be confirmed reaped: the
+/// child is unsignaled-but-armed (pdeathsig kills it with us), so
+/// this is a loud verdict, never a silent leak.
+fn pauser_reap_unconfirmed() -> Check {
+    Check::fail(
+        "owned-child-map-files",
+        "owned-child probe leaked its child (reap unconfirmed)".into(),
+        "re-run; a leftover pausing child blocks the next probe — report this".into(),
+    )
+}
+
 /// Owned-child map_files readability: fork a pausing child (no exec,
 /// so no binary dependency) and open its map_files directory. Pass
 /// proves foreign-shaped opens work for processes we own, so a stated
@@ -2127,10 +2284,24 @@ fn check_owned_child_map_files() -> Check {
         );
     }
     let ppid = std::process::id();
+    let mut pipe = [0; 2];
+    // SAFETY: pipe writes two fds on success; the parent closes its
+    // write end after forking, the child its read end.
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Check::degraded(
+            "owned-child-map-files",
+            "cannot create the pauser rendezvous pipe".into(),
+            "check file-descriptor limits (ulimit -n), then re-run".into(),
+        );
+    }
     // SAFETY: doctor is single-threaded here; the child only
-    // prctls/pauses/_exits.
+    // prctls/signals/pauses/_exits.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
         return Check::degraded(
             "owned-child-map-files",
             "cannot fork the owned-child probe".into(),
@@ -2139,40 +2310,64 @@ fn check_owned_child_map_files() -> Check {
     }
     if pid == 0 {
         unsafe {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
-            // Parent-died-in-the-window guard: a reparented pauser
-            // would outlive the probe.
-            if libc::getppid() != ppid as libc::pid_t {
-                libc::_exit(0);
-            }
+            libc::close(pipe[0]);
+        }
+        write_rendezvous_byte_or_exit(pipe[1], ppid);
+        unsafe {
             libc::pause();
             libc::_exit(0);
         }
     }
-    // No rendezvous needed: the child's inherited mappings carry
-    // map_files entries from birth, and pause() never returns except
-    // by signal.
-    let access = probe_map_files(Path::new(&format!("/proc/{pid}/map_files")));
-    // Reap-confirming teardown (mirrors check_spawn_access): the
-    // pausing child always dies on SIGKILL, so the blocking wait
-    // cannot hang; ECHILD means reaped.
     unsafe {
-        libc::kill(pid, libc::SIGKILL);
+        // The parent's write end must close before the rendezvous
+        // read: otherwise EOF (the Gone signal) could never arrive.
+        libc::close(pipe[1]);
     }
     let mut status = 0;
-    let reaped = loop {
-        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
-        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
+    match read_rendezvous_byte(
+        pipe[0],
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    ) {
+        Rendezvous::Pausing => unsafe {
+            libc::close(pipe[0]);
+        },
+        Rendezvous::Gone => {
+            unsafe {
+                libc::close(pipe[0]);
+            }
+            // EOF means the child exited (the zombie collects here),
+            // but a read failure can land here with a live child —
+            // either way it is signaled-if-live and confirmed, never
+            // left pausing silently.
+            if !confirm_pauser_gone(pid, &mut status) {
+                return pauser_reap_unconfirmed();
+            }
+            return Check::degraded(
+                "owned-child-map-files",
+                "owned child gone before the probe read it".into(),
+                "re-run".into(),
+            );
         }
-        break r == pid || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
-    };
-    if !reaped {
-        return Check::fail(
-            "owned-child-map-files",
-            "owned-child probe leaked its child (reap unconfirmed)".into(),
-            "re-run; a leftover pausing child blocks the next probe — report this".into(),
-        );
+        Rendezvous::Unresponsive => {
+            unsafe {
+                libc::close(pipe[0]);
+            }
+            // A live-but-silent child (externally stopped?): signal
+            // it and confirm boundedly; unconfirmed is Fail, like the
+            // teardown below.
+            if !confirm_pauser_gone(pid, &mut status) {
+                return pauser_reap_unconfirmed();
+            }
+            return Check::degraded(
+                "owned-child-map-files",
+                "owned child pauser unresponsive (externally stopped?)".into(),
+                "re-run".into(),
+            );
+        }
+    }
+    let access = probe_map_files(Path::new(&format!("/proc/{pid}/map_files")));
+    if !confirm_pauser_gone(pid, &mut status) {
+        return pauser_reap_unconfirmed();
     }
     match access {
         MapFilesAccess::Readable => Check::pass(
@@ -2453,6 +2648,22 @@ pub fn run(args: &[String]) -> ExitCode {
     run_with_resolver(args, crate::package::commands::resolve_command_objects)
 }
 
+/// Value-taking options of the sectioned parser below: the doctor
+/// router consumes the token after each of these, so flag-shaped
+/// values never misroute. A new value-taking match arm MUST extend
+/// this list.
+pub(crate) const SECTIONED_VALUE_OPTIONS: &[&str] = &[
+    "--pid",
+    "--libcrypto",
+    "--exe",
+    "--table",
+    "--force-offset",
+    "--provider-table",
+    "--object",
+    "--count-object",
+    "--members-object",
+    "--format",
+];
 fn run_with_resolver(
     args: &[String],
     resolve: impl FnOnce(
@@ -3772,26 +3983,27 @@ mod tests {
         );
     }
 
+    /// Live children of this thread (children attach to the forking
+    /// thread): before/after no-leak oracle for the fork probes.
+    fn live_children_of_this_thread() -> std::collections::BTreeSet<u32> {
+        // SAFETY: gettid has no preconditions.
+        let tid = unsafe { libc::gettid() };
+        std::fs::read_to_string(format!("/proc/self/task/{tid}/children"))
+            .map(|s| {
+                s.split_ascii_whitespace()
+                    .filter_map(|w| w.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
     fn owned_child_map_files_probe_passes_and_reaps_live() {
         // Real fork (no substitution scope): the probe child must be
         // gone afterwards — no stray, no zombie. Compared as a
         // before/after child set (not global ECHILD: other tests may
         // legitimately own children).
-        fn children() -> std::collections::BTreeSet<u32> {
-            // Per-thread children file (children attach to the
-            // forking thread): this thread's id, not task-list order.
-            // SAFETY: gettid has no preconditions.
-            let tid = unsafe { libc::gettid() };
-            std::fs::read_to_string(format!("/proc/self/task/{tid}/children"))
-                .map(|s| {
-                    s.split_ascii_whitespace()
-                        .filter_map(|w| w.parse().ok())
-                        .collect()
-                })
-                .unwrap_or_default()
-        }
-        let before = children();
+        let before = live_children_of_this_thread();
         let check = check_owned_child_map_files();
         assert_eq!(check.id, "owned-child-map-files");
         assert_eq!(
@@ -3800,11 +4012,182 @@ mod tests {
             "owned child map_files must open (scope<=1): {}",
             check.message
         );
-        let after = children();
+        let after = live_children_of_this_thread();
         assert!(
             after.difference(&before).next().is_none(),
             "probe must not leave children: before={before:?} after={after:?}"
         );
+    }
+
+    /// Native worker: prctl denied (EPERM) → the pauser cannot arm
+    /// its backstop and exits instantly → the establishment check
+    /// reports Gone. Verdict byte: 1 ok / 2 skip (no seccomp) / 3
+    /// setup-fail / 4 wrong shape / 5 leaked.
+    fn prctl_denial_worker() -> u8 {
+        use crate::target::{SeccompDeny, seccomp_deny_syscall};
+        match seccomp_deny_syscall(libc::SYS_prctl, libc::EPERM) {
+            SeccompDeny::Installed => {}
+            SeccompDeny::Unsupported => return 2,
+            SeccompDeny::Failed => return 3,
+        }
+        let check = check_owned_child_map_files();
+        if check.status != Status::Degraded || !check.message.contains("gone") {
+            return 4;
+        }
+        if !live_children_of_this_thread().is_empty() {
+            return 5;
+        }
+        1
+    }
+
+    /// Native worker: kill denied (EPERM) → the probe must fail fast
+    /// (never wait unboundedly on an unsignaled child) and hand the
+    /// stranded pauser's pid to the parent for the pdeathsig-backstop
+    /// proof. Returns (verdict, stranded pid): verdict 1 ok / 2 skip
+    /// / 3 setup-fail / 4 wrong status / 5 wrong child set / 6 too
+    /// slow; pid is 0 unless the verdict is 1.
+    fn kill_denial_worker() -> (u8, u32) {
+        use crate::target::{SeccompDeny, seccomp_deny_syscall};
+        use std::time::{Duration, Instant};
+        match seccomp_deny_syscall(libc::SYS_kill, libc::EPERM) {
+            SeccompDeny::Installed => {}
+            SeccompDeny::Unsupported => return (2, 0),
+            SeccompDeny::Failed => return (3, 0),
+        }
+        let before = live_children_of_this_thread();
+        let start = Instant::now();
+        let check = check_owned_child_map_files();
+        let elapsed = start.elapsed();
+        if check.status != Status::Fail {
+            return (4, 0);
+        }
+        // Fail-fast: an unbounded wait on the unsignaled child would
+        // blow this (and the parent watchdog below would catch a true
+        // hang independently).
+        if elapsed >= Duration::from_secs(2) {
+            return (6, 0);
+        }
+        let new: Vec<u32> = live_children_of_this_thread()
+            .difference(&before)
+            .copied()
+            .collect();
+        if new.len() != 1 {
+            return (5, 0);
+        }
+        (1, new[0])
+    }
+
+    /// Fork a native worker behind a verdict pipe; parent side reads
+    /// `N` bytes, reaps the child, and returns the bytes. Any hang
+    /// kills the child and panics (the watchdog IS the hang proof).
+    fn run_native_worker<const N: usize>(worker: fn() -> Vec<u8>) -> [u8; N] {
+        use crate::target::{TestChildWait, kill_test_child, read_exact_deadline, wait_test_child};
+        use std::time::{Duration, Instant};
+        let mut pipe = [0; 2];
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        // SAFETY: fork in the single-threaded test lease; the child
+        // writes its verdict and never returns.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe { libc::close(pipe[0]) };
+            let verdict = worker();
+            let _ = crate::target::write_all_pipe(pipe[1], &verdict);
+            unsafe { libc::close(pipe[1]) };
+            unsafe { libc::_exit(0) };
+        }
+        unsafe { libc::close(pipe[1]) };
+        let pid = pid as u32;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut verdict = [0u8; N];
+        let read = read_exact_deadline(pipe[0], &mut verdict, deadline);
+        unsafe { libc::close(pipe[0]) };
+        if let Err(e) = read {
+            kill_test_child(pid, Duration::from_secs(5));
+            panic!("native worker verdict pipe: {e}");
+        }
+        match wait_test_child(pid, deadline) {
+            TestChildWait::Reaped(status) => assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "native worker must exit 0, status={status:#x}"
+            ),
+            outcome => {
+                kill_test_child(pid, Duration::from_secs(5));
+                panic!(
+                    "native worker did not exit, outcome={}",
+                    match outcome {
+                        TestChildWait::Gone => "gone",
+                        TestChildWait::Timeout => "timeout",
+                        TestChildWait::Reaped(_) =>
+                            unreachable!("Reaped is handled by the arm above"),
+                    }
+                );
+            }
+        }
+        verdict
+    }
+
+    #[test]
+    fn owned_child_probe_reports_gone_when_prctl_denied() {
+        // Confinement rejecting pdeathsig setup: the pauser exits
+        // instantly and the establishment check reports Gone — the
+        // zombie is never probed as if alive, nothing leaks.
+        let verdict = run_native_worker::<1>(|| vec![prctl_denial_worker()]);
+        match verdict[0] {
+            1 => {}
+            2 => {
+                eprintln!("SKIP: seccomp unavailable (foreign arch or no SECCOMP_MODE_FILTER)");
+                return;
+            }
+            3 => panic!("seccomp deny filter failed to install on a supporting kernel"),
+            4 => panic!("prctl-denied probe must report Degraded/gone"),
+            5 => panic!("prctl-denied probe leaked a child"),
+            v => panic!("unknown verdict {v}"),
+        }
+    }
+
+    #[test]
+    fn owned_child_probe_fails_fast_when_kill_denied() {
+        // Confinement rejecting the teardown signal: the probe fails
+        // promptly (no unbounded wait on the unsignaled child), and
+        // the stranded pauser — armed, since pdeathsig setup
+        // succeeded — dies with the worker (the pdeathsig backstop,
+        // proven by ESRCH after the reap).
+        let verdict = run_native_worker::<5>(|| {
+            let (v, pid) = kill_denial_worker();
+            let mut out = vec![v];
+            out.extend_from_slice(&pid.to_le_bytes());
+            out
+        });
+        let stranded = u32::from_le_bytes(verdict[1..5].try_into().unwrap());
+        match verdict[0] {
+            1 => assert_ne!(stranded, 0, "ok verdict must carry the stranded pid"),
+            2 => {
+                eprintln!("SKIP: seccomp unavailable (foreign arch or no SECCOMP_MODE_FILTER)");
+                return;
+            }
+            3 => panic!("seccomp deny filter failed to install on a supporting kernel"),
+            4 => panic!("kill-denied probe must report Fail"),
+            5 => panic!("kill-denied probe left the wrong child set"),
+            6 => panic!("kill-denied probe must fail fast (<2s), not wait unboundedly"),
+            v => panic!("unknown verdict {v}"),
+        }
+        // SAFETY: kill(., 0) only probes existence; the pid is the
+        // worker's child observed above, handed over before the
+        // worker exited, so a recycle cannot frame an unrelated
+        // process within this bounded poll — and ESRCH is the proof.
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let r = unsafe { libc::kill(stranded as libc::pid_t, 0) };
+            if r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "stranded pauser {stranded} outlived its parent: pdeathsig backstop failed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -3851,6 +4234,25 @@ mod tests {
     }
 
     #[test]
+    fn uname_decoder_failure_yields_none_success_decodes() {
+        // SAFETY: zeroed utsname is valid; release field written below.
+        let mut u: libc::utsname = unsafe { std::mem::zeroed() };
+        assert_eq!(decode_uname_release(-1, &u.release), None);
+        let fixture = b"6.9.0-test\0";
+        for (slot, byte) in u.release.iter_mut().zip(fixture.iter()) {
+            *slot = *byte as libc::c_char;
+        }
+        assert_eq!(
+            decode_uname_release(0, &u.release),
+            Some("6.9.0-test".to_string())
+        );
+        // The display helper prints the sentinel; data fields default
+        // to empty (CaptureContext/TargetInfo unknown contract).
+        assert_eq!(uname_release_opt().unwrap_or_default(), uname_release());
+        assert!(!uname_release().is_empty());
+    }
+
+    #[test]
     fn caps_guidance_never_overclaims_foreign() {
         // The privilege rule, pinned: a caps pass states only that
         // caps are effective (it proves self/owned attach, never
@@ -3873,6 +4275,56 @@ mod tests {
                 );
             }
             other => panic!("caps is pass/fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn caps_matrix_is_deterministic_over_effective_bits() {
+        // Environment fixtures (not host samples): the verdict is a
+        // pure function of the effective capability bits. Root with
+        // dropped caps fails exactly like an unprivileged user — the
+        // message states only effective-set membership, never ambient
+        // authority.
+        fn env_with(eff: u64) -> Env {
+            Env {
+                eff,
+                lockdown: String::new(),
+                lsm: Vec::new(),
+                enforcing: Vec::new(),
+                seccomp: 0,
+                nnp: 0,
+                release: String::new(),
+            }
+        }
+        let bpf = 1u64 << CAP_BPF;
+        let perfmon = 1u64 << CAP_PERFMON;
+        let admin = 1u64 << CAP_SYS_ADMIN;
+        // Neither bit: names the pair.
+        let none = check_caps(&env_with(0));
+        assert_eq!(none.status, Status::Fail);
+        assert!(
+            none.message.contains("CAP_BPF+CAP_PERFMON"),
+            "{}",
+            none.message
+        );
+        // The pair, or admin: pass (perf corroboration may add a
+        // note; the status is what matters).
+        for eff in [bpf | perfmon, admin] {
+            let pass = check_caps(&env_with(eff));
+            assert_eq!(pass.status, Status::Pass, "eff={eff:#x}");
+        }
+        // Half the pair: names exactly the missing bit.
+        let half = check_caps(&env_with(bpf));
+        assert_eq!(half.status, Status::Fail);
+        assert!(half.message.contains("CAP_PERFMON"), "{}", half.message);
+        assert!(!half.message.contains("CAP_BPF+"), "{}", half.message);
+        // No ambient-authority claims anywhere in the matrix.
+        for check in [&none, &half] {
+            assert!(
+                !check.message.contains("root"),
+                "caps verdicts speak of effective bits, not uid: {}",
+                check.message
+            );
         }
     }
 
@@ -4387,6 +4839,11 @@ fn spawn_coverage_note() -> Check {
                 )
 }
 
+/// Value-taking options of the discovery parser below: the doctor
+/// router consumes the token after each of these, so flag-shaped
+/// values never misroute. A new value-taking match arm MUST extend
+/// this list.
+pub(crate) const DISCOVERY_VALUE_OPTIONS: &[&str] = &["--format"];
 /// Independent discovery capability checks: no target profile or catalogue.
 /// Kernel/verifier diagnostics are reduced to finite states before rendering.
 pub(crate) fn discovery(args: &[String]) -> ExitCode {

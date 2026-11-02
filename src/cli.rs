@@ -18,45 +18,116 @@ pub(crate) fn exit_code_help() -> [&'static str; 7] {
     ]
 }
 
+/// Tokens in flag position: a value-taking option consumes the next
+/// token (whatever it is — even a flag-shaped pathname), so option
+/// VALUES never select a dispatch route. `value_flags` must be built
+/// from the dispatched parsers' VALUE_OPTIONS lists (never a
+/// hand-mirror); a missing entry reintroduces value-confusion for
+/// that option (misroute on flag-shaped values instead of honest
+/// parsing).
+fn flags_in_position<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        out.push(a);
+        i += if value_flags.contains(&a) { 2 } else { 1 };
+    }
+    out
+}
+
+/// Doctor dispatch route (precedence: discovery > profiled >
+/// sectioned > focused).
+#[derive(Debug, PartialEq, Eq)]
+enum DoctorRoute {
+    Discovery,
+    Profiled,
+    Sectioned,
+    Focused,
+}
+
+fn doctor_route(args: &[String]) -> DoctorRoute {
+    // Built from the parsers' own VALUE_OPTIONS (sectioned, focused,
+    // profiled, discovery): the router cannot drift from the parsers
+    // — a new value-taking match arm extends its parser's list, and
+    // the router follows. Duplicates across parsers are harmless
+    // (membership test only).
+    let value_flags: Vec<&str> = crate::doctor::SECTIONED_VALUE_OPTIONS
+        .iter()
+        .chain(crate::doctor::focused::VALUE_OPTIONS)
+        .chain(crate::doctor::profiled::VALUE_OPTIONS)
+        .chain(crate::doctor::DISCOVERY_VALUE_OPTIONS)
+        .copied()
+        .collect();
+    // Sectioned-only selectors/overrides.
+    const SECTIONED: &[&str] = &[
+        "--pid",
+        "--exe",
+        "--object",
+        "--members-object",
+        "--table",
+        "--force-offset",
+        "--provider-table",
+    ];
+    let flags = flags_in_position(args, &value_flags);
+    if flags.contains(&"--discovery") {
+        DoctorRoute::Discovery
+    } else if flags.contains(&"--libcrypto") {
+        // Combining --libcrypto with sectioned flags is a usage
+        // error inside profiled::run (pinned by its tests).
+        DoctorRoute::Profiled
+    } else if SECTIONED.iter().any(|f| flags.contains(f)) {
+        DoctorRoute::Sectioned
+    } else {
+        // Bare --count-object/--observation-object stay on the
+        // focused self-controls (explicit-companion override path).
+        DoctorRoute::Focused
+    }
+}
+
+/// Scan/inspect dispatch route (precedence: crypto > providers >
+/// inventory — the historical guard order).
+#[derive(Debug, PartialEq, Eq)]
+enum ScanRoute {
+    CryptoWatch,
+    Providers,
+    Inventory,
+}
+
+fn scan_route(args: &[String]) -> ScanRoute {
+    // Built from the parsers' own VALUE_OPTIONS (inventory,
+    // provider_observation — crypto_watch takes none beyond its bare
+    // selector): the router cannot drift from the parsers.
+    let value_flags: Vec<&str> = crate::inventory::cli::VALUE_OPTIONS
+        .iter()
+        .chain(crate::provider_observation::cli::VALUE_OPTIONS)
+        .copied()
+        .collect();
+    let flags = flags_in_position(args, &value_flags);
+    if flags.contains(&"--observe-crypto") {
+        ScanRoute::CryptoWatch
+    } else if flags.contains(&"--observe-providers") {
+        ScanRoute::Providers
+    } else {
+        ScanRoute::Inventory
+    }
+}
+
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let argv: Vec<String> = args.collect();
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
     match cmd {
-        "doctor" if argv[1..].iter().any(|arg| arg == "--discovery") => {
-            crate::doctor::discovery(&argv[1..])
-        }
-        "doctor" if argv[1..].iter().any(|arg| arg == "--libcrypto") => {
-            crate::doctor::profiled::run(&argv[1..])
-        }
-        // Sectioned preflight: any sectioned-only selector or object
-        // override. (--discovery/--libcrypto guards above win; combining
-        // --libcrypto with these is a usage error inside profiled::run.)
-        // Bare --count-object/--observation-object stay on the focused
-        // self-controls below (explicit-companion override path).
-        "doctor"
-            if argv[1..].iter().any(|arg| {
-                matches!(
-                    arg.as_str(),
-                    "--pid"
-                        | "--exe"
-                        | "--object"
-                        | "--members-object"
-                        | "--table"
-                        | "--force-offset"
-                        | "--provider-table"
-                )
-            }) =>
-        {
-            crate::doctor::run(&argv[1..])
-        }
-        "doctor" => crate::doctor::focused::run(&argv[1..]),
-        "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-crypto") => {
-            crate::crypto_watch::run(&argv)
-        }
-        "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-providers") => {
-            crate::provider_observation::cli::run(&argv)
-        }
-        "scan" | "inspect" => crate::inventory::cli::run(cmd, &argv[1..]),
+        "doctor" => match doctor_route(&argv[1..]) {
+            DoctorRoute::Discovery => crate::doctor::discovery(&argv[1..]),
+            DoctorRoute::Profiled => crate::doctor::profiled::run(&argv[1..]),
+            DoctorRoute::Sectioned => crate::doctor::run(&argv[1..]),
+            DoctorRoute::Focused => crate::doctor::focused::run(&argv[1..]),
+        },
+        "scan" | "inspect" => match scan_route(&argv[1..]) {
+            ScanRoute::CryptoWatch => crate::crypto_watch::run(&argv),
+            ScanRoute::Providers => crate::provider_observation::cli::run(&argv),
+            ScanRoute::Inventory => crate::inventory::cli::run(cmd, &argv[1..]),
+        },
         "alias-audit" => crate::aliases::run(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
         "check" => crate::check::run(&argv[1..]),
@@ -167,6 +238,111 @@ mod preview_tests {
         let args = ["inspect", "--help"].map(String::from);
         assert!(
             matches!(prepare(args.into_iter()), PreparedCommand::Immediate(code) if code == ExitCode::SUCCESS)
+        );
+    }
+
+    #[test]
+    fn doctor_route_consumes_values_before_routing() {
+        fn route(words: &[&str]) -> DoctorRoute {
+            doctor_route(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+        }
+        // Plain routes.
+        assert_eq!(route(&[]), DoctorRoute::Focused);
+        assert_eq!(route(&["--json"]), DoctorRoute::Focused);
+        assert_eq!(route(&["--count-object", "c.o"]), DoctorRoute::Focused);
+        assert_eq!(
+            route(&["--observation-object", "o.o", "--count-object", "c.o"]),
+            DoctorRoute::Focused
+        );
+        assert_eq!(route(&["--discovery"]), DoctorRoute::Discovery);
+        assert_eq!(route(&["--libcrypto", "lib"]), DoctorRoute::Profiled);
+        assert_eq!(route(&["--pid", "1"]), DoctorRoute::Sectioned);
+        assert_eq!(route(&["--exe", "x"]), DoctorRoute::Sectioned);
+        assert_eq!(
+            route(&[
+                "--object",
+                "h",
+                "--count-object",
+                "c",
+                "--members-object",
+                "m"
+            ]),
+            DoctorRoute::Sectioned
+        );
+        // Precedence: discovery > profiled > sectioned.
+        assert_eq!(
+            route(&["--discovery", "--pid", "1"]),
+            DoctorRoute::Discovery
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--pid", "1"]),
+            DoctorRoute::Profiled
+        );
+        // Flag-shaped VALUES never route: a companion file literally
+        // named --pid/--discovery/--libcrypto stays a focused value.
+        assert_eq!(
+            route(&["--observation-object", "--pid", "--count-object", "c.o"]),
+            DoctorRoute::Focused
+        );
+        assert_eq!(
+            route(&["--observation-object", "--discovery"]),
+            DoctorRoute::Focused
+        );
+        assert_eq!(
+            route(&["--count-object", "--libcrypto"]),
+            DoctorRoute::Focused
+        );
+        assert_eq!(route(&["--format", "--pid"]), DoctorRoute::Focused);
+        // ... while a real flag after a consumed value still routes.
+        assert_eq!(
+            route(&["--observation-object", "--pid", "--exe", "x"]),
+            DoctorRoute::Sectioned
+        );
+        // Truncated invocations route by the flag in position (the
+        // subcommand reports the missing value, exit 2, as before).
+        assert_eq!(route(&["--pid"]), DoctorRoute::Sectioned);
+        assert_eq!(route(&["--observation-object"]), DoctorRoute::Focused);
+        // --flag=value is not a flag in any sub-parser (all reject
+        // it): routing matches the naive-guard behavior exactly.
+        assert_eq!(route(&["--pid=1"]), DoctorRoute::Focused);
+    }
+
+    #[test]
+    fn scan_route_consumes_values_before_routing() {
+        fn route(words: &[&str]) -> ScanRoute {
+            scan_route(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+        }
+        assert_eq!(route(&[]), ScanRoute::Inventory);
+        assert_eq!(route(&["--pid", "1"]), ScanRoute::Inventory);
+        assert_eq!(route(&["--watch"]), ScanRoute::Inventory);
+        assert_eq!(route(&["--observe-crypto"]), ScanRoute::CryptoWatch);
+        assert_eq!(route(&["--observe-providers"]), ScanRoute::Providers);
+        // Precedence is the historical guard order.
+        assert_eq!(
+            route(&["--observe-crypto", "--observe-providers"]),
+            ScanRoute::CryptoWatch
+        );
+        // Flag-shaped values never route.
+        assert_eq!(
+            route(&["--module", "--observe-crypto"]),
+            ScanRoute::Inventory
+        );
+        assert_eq!(
+            route(&["--pid", "--observe-providers"]),
+            ScanRoute::Inventory
+        );
+        assert_eq!(
+            route(&["--cgroup", "--observe-crypto", "--watch"]),
+            ScanRoute::Inventory
+        );
+        // ... while a real flag after a consumed value still routes.
+        assert_eq!(
+            route(&["--module", "--observe-crypto", "--observe-providers"]),
+            ScanRoute::Providers
+        );
+        assert_eq!(
+            route(&["--observe-crypto", "--module", "m"]),
+            ScanRoute::CryptoWatch
         );
     }
 

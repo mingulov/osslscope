@@ -10758,7 +10758,7 @@ fn read_owned_setup_context(
     info.container_id = container_id_of(info.pid);
     links.publish_context(info);
     links.check(control, BoundaryStage::Setup)?;
-    info.kernel_release = crate::doctor::uname_release();
+    info.kernel_release = crate::doctor::uname_release_opt().unwrap_or_default();
     links.publish_context(info);
     links.check(control, BoundaryStage::Setup)?;
     Ok(())
@@ -11298,7 +11298,7 @@ fn run_controlled_owned(
         comm: String::new(),
         cmdline: args::redact_spawn_argv(&argv),
         container_id: String::new(),
-        kernel_release: crate::doctor::uname_release(),
+        kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
         provider_build_id: String::new(),
         provider_path: String::new(),
         image_digest: cfg.image_digest.clone(),
@@ -11634,7 +11634,7 @@ fn run_inner_with_admitted(
                 comm: comm_of(p),
                 cmdline: args::redact_proc_cmdline(&raw),
                 container_id: container_id_of(p),
-                kernel_release: crate::doctor::uname_release(),
+                kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
                 provider_build_id: String::new(),
                 provider_path: String::new(),
                 image_digest: cfg.image_digest.clone(),
@@ -13671,7 +13671,11 @@ pub(crate) mod tests {
 
     #[test]
     fn kernel_release_nonempty() {
-        assert!(!crate::doctor::uname_release().is_empty());
+        assert!(
+            !crate::doctor::uname_release_opt()
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[test]

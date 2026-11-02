@@ -16,6 +16,11 @@ use std::time::{Duration, Instant};
 
 const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
+/// Value-taking options of [`parse`]: the scan router consumes the
+/// token after each of these, so flag-shaped values never misroute.
+/// A new value-taking match arm MUST extend this list.
+pub(crate) const VALUE_OPTIONS: &[&str] =
+    &["--interval", "--duration", "--pid", "--module", "--cgroup"];
 
 pub(crate) struct Options {
     pub(crate) pids: Vec<u32>,

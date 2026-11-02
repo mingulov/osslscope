@@ -612,6 +612,126 @@ pub(crate) fn read_exact_deadline(
     Ok(())
 }
 
+/// Test-only seccomp self-deny outcome: a single syscall refused
+/// with a chosen errno, for denial-injection coverage (confinement
+/// rejecting the very calls a probe depends on).
+#[cfg(test)]
+pub(crate) enum SeccompDeny {
+    /// The deny filter is installed; the syscall now fails.
+    Installed,
+    /// Positively unsupported (foreign arch, or the kernel has no
+    /// SECCOMP_MODE_FILTER): the caller skips.
+    Unsupported,
+    /// Support was proven but the install failed, or the probe came
+    /// back unexpected: the caller fails loud.
+    Failed,
+}
+
+/// Test-only seccomp self-restriction: deny one syscall number with
+/// `errno` (x86_64 filter; validation of everything else proceeds
+/// untouched). Skips stay positively identified: only a recognized
+/// lack of support yields [`SeccompDeny::Unsupported`].
+#[cfg(test)]
+pub(crate) fn seccomp_deny_syscall(sysno: libc::c_long, errno: libc::c_int) -> SeccompDeny {
+    if !cfg!(target_arch = "x86_64") {
+        return SeccompDeny::Unsupported;
+    }
+    // NULL-filter probe installs nothing: EINVAL means the kernel
+    // has no SECCOMP_MODE_FILTER (skip); EFAULT means the mode
+    // exists (proceed); anything else, including success, fails.
+    // SAFETY: prctl with a NULL filter installs nothing; errno is
+    // read immediately, so it is the probe's. The NULL is a real
+    // null pointer — a `0` literal would pass as i32 in this
+    // variadic position, leaving the upper half of the kernel's
+    // 64-bit arg to chance.
+    let probe = unsafe {
+        libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            std::ptr::null::<libc::c_void>(),
+        )
+    };
+    if probe == 0 {
+        return SeccompDeny::Failed;
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::EINVAL) => return SeccompDeny::Unsupported,
+        Some(libc::EFAULT) => {}
+        _ => return SeccompDeny::Failed,
+    }
+    // SAFETY: six classic-BPF instructions over struct seccomp_data
+    // (nr at 0, arch at 4); jump targets in range; NO_NEW_PRIVS
+    // first for the unprivileged-install rule.
+    #[repr(C)]
+    struct SockFilter {
+        code: u16,
+        jt: u8,
+        jf: u8,
+        k: u32,
+    }
+    #[repr(C)]
+    struct SockFprog {
+        len: u16,
+        filter: *const SockFilter,
+    }
+    const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+    const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+    const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+    let prog = [
+        SockFilter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 4,
+        },
+        SockFilter {
+            // Non-x86_64 ABIs (compat, x32) skip to ALLOW: the deny
+            // covers exactly (arch == x86_64 && nr == sysno).
+            code: 0x15,
+            jt: 0,
+            jf: 3,
+            k: AUDIT_ARCH_X86_64,
+        },
+        SockFilter {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        SockFilter {
+            code: 0x15,
+            jt: 0,
+            jf: 1,
+            k: sysno as u32,
+        },
+        SockFilter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ERRNO | (errno as u32),
+        },
+        SockFilter {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: SECCOMP_RET_ALLOW,
+        },
+    ];
+    let fprog = SockFprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr(),
+    };
+    let installed = unsafe {
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+            && libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog) == 0
+    };
+    if installed {
+        SeccompDeny::Installed
+    } else {
+        SeccompDeny::Failed
+    }
+}
+
 /// Test-only EINTR-retried write-all for verdict pipes (no deadline:
 /// a few bytes to a live parent never block; EPIPE and other errors
 /// return Err and the fork child _exits — the parent fails on the

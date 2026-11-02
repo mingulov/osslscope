@@ -16,6 +16,11 @@ struct Args {
     json: bool,
 }
 
+/// Value-taking options of [`parse`] (every accepted flag consumes
+/// the next token): the doctor router consumes the token after each
+/// of these, so flag-shaped values never misroute. A new accepted
+/// flag MUST extend this list.
+pub(crate) const VALUE_OPTIONS: &[&str] = &["--libcrypto", "--count-object", "--format"];
 fn parse(argv: &[String]) -> Result<Args, String> {
     let mut libcrypto = None;
     let mut count_object = None;

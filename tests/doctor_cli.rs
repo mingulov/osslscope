@@ -112,6 +112,40 @@ fn doctor_object_flags_reach_sectioned_json() {
 }
 
 #[test]
+fn doctor_flag_shaped_companion_value_stays_focused() {
+    // A companion file literally named `--pid`: the value must not
+    // select the sectioned route (regression: naive token scanning
+    // misrouted this to sectioned, which rejects --observation-object).
+    // The file must be a VALID observation object, so the focused
+    // run proceeds past companion validation to its checks.
+    let obs = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/ebpf/target/bpfel-unknown-none/release/osslscope-provider-observation");
+    if !obs.is_file() {
+        eprintln!("skip flag-value pin: BPF observation object not built");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("osslscope-doctor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(&obs, dir.join("--pid")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .arg("doctor")
+        .args(["--observation-object", "--pid"])
+        .current_dir(&dir)
+        .output()
+        .expect("run doctor");
+    std::fs::remove_dir_all(&dir).unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("Focused capability checks"),
+        "focused route keeps flag-shaped values, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("== self_attach =="),
+        "must not reach sectioned output, got: {stdout}"
+    );
+}
+
+#[test]
 fn doctor_bare_still_runs_self_controls() {
     let out = doctor(&[]);
     let stdout = String::from_utf8_lossy(&out.stdout);
