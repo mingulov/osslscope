@@ -35,19 +35,74 @@ fn frozen_shape() {
     );
 }
 
-fn stage() -> Option<PathBuf> {
-    match Command::new(DIGEST_VEHICLE_BIN).arg("version").output() {
+enum VehicleProbe {
+    Ready,
+    Absent,
+    Broken(String),
+}
+
+fn probe_vehicle(path: &str) -> VehicleProbe {
+    match Command::new(path).arg("version").output() {
+        Ok(o) if o.status.success() => VehicleProbe::Ready,
+        Ok(o) => VehicleProbe::Broken(format!("`{path} version` exits {o:?}")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // ENOENT also means a missing ELF/script interpreter for an
+            // EXISTING file: present-but-broken must fail, never skip.
+            if std::path::Path::new(path).exists() {
+                VehicleProbe::Broken(format!("`{path}` exists but cannot execute: {e}"))
+            } else {
+                VehicleProbe::Absent
+            }
+        }
+        Err(e) => VehicleProbe::Broken(format!("`{path}` unusable: {e}")),
+    }
+}
+
+fn stage() -> Option<PathBuf> {
+    match probe_vehicle(DIGEST_VEHICLE_BIN) {
+        VehicleProbe::Absent => {
             eprintln!("SKIP digest stock oracle: no {DIGEST_VEHICLE_BIN}");
             return None;
         }
-        Err(e) => panic!("stock binary present but unusable: {e}"),
-        Ok(o) => assert!(o.status.success(), "stock `openssl version` must exit 0"),
+        VehicleProbe::Broken(msg) => panic!("stock binary broken: {msg}"),
+        VehicleProbe::Ready => {}
     }
     let dir = std::env::temp_dir().join(format!("osslscope-digestoracle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     Some(dir)
+}
+
+#[test]
+fn vehicle_probe_classifies_absent_ready_and_broken() {
+    assert!(
+        matches!(
+            probe_vehicle("/nonexistent-osslscope-vehicle-xyz"),
+            VehicleProbe::Absent
+        ),
+        "missing path must skip"
+    );
+    assert!(
+        matches!(probe_vehicle("/bin/true"), VehicleProbe::Ready),
+        "/bin/true must probe ready"
+    );
+    // Present-but-broken: an existing file whose interpreter is missing
+    // raises ENOENT too; it must FAIL, never silently skip.
+    let dir = std::env::temp_dir().join(format!("osslscope-vehicleprobe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("badinterp.sh");
+    std::fs::write(&script, "#!/nonexistent-interp-xyz-123\ntrue\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        matches!(
+            probe_vehicle(script.to_str().unwrap()),
+            VehicleProbe::Broken(_)
+        ),
+        "existing file with missing interpreter must fail, not skip"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

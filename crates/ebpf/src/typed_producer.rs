@@ -1148,11 +1148,18 @@ fn pack_entry_role(role: u32, operation: u32, function: u32) -> u64 {
     // valid() restricts role to <= 315, operation to <= 4 and function to
     // <= 7. The shared contract IS compiled into BPF (admission_parts /
     // paired / operational monomorphize here), so the digest roles change
-    // BPF bytes; they stay behavior-preserving because no host path can
-    // program roles 309-315 (load roots refuse them, firemap/pin held out
-    // until the R5 revision), making the new arms unreachable by data.
-    // These are the earlier scalar snapshots, with no truncated field.
-    // Returning a scalar keeps the root free of an address-taken output.
+    // BPF bytes AND verifier complexity (measured +.text at rebuild).
+    // Inertness until the R5 revision comes from BPF dispatch
+    // enumeration, NOT from host exclusion: the host CAN stage digest
+    // sites (static-table membership) and program TYPED_ADMISSION rows
+    // (triple-valid), but every dispatch refuses them — entry falls to
+    // invalidate-quiet (312-315 refused earlier in entry_authorized),
+    // return finds no staged frame and has no digest arm, and
+    // operational_check's gate rejects 309-315 explicitly. R5 blocks the
+    // whole typed object on this kernel; that is kernel-blanket, not a
+    // role-specific prohibition. These are the earlier scalar snapshots,
+    // with no truncated field. Returning a scalar keeps the root free of
+    // an address-taken output.
     u64::from(role) | (u64::from(operation) << 32) | (u64::from(function) << 48)
 }
 
