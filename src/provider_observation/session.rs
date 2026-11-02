@@ -1180,21 +1180,20 @@ impl ProviderSession {
                 .map(|gap| (pid, gap))
             })
             .collect();
-        // Pids retired for a recoverable (non-identity) gap keep their
-        // incarnation for next tick's re-add, exactly like the authority-
-        // refresh path below: the counter's learned sites keep the shared
-        // process lease alive, so a fresh admission would starve on
-        // ProcessLimit under a tight process budget. Identity failures
-        // stay terminal: the old incarnation no longer describes the pid.
+        // Pids retired on a transient budget gap keep their incarnation
+        // for next tick's re-add, exactly like the authority-refresh path
+        // below: the counter's learned sites keep the shared process lease
+        // alive, so a fresh admission would starve on ProcessLimit under
+        // a tight process budget.
         let mut readd_deferred = Vec::new();
         for (pid, gap) in retire {
             let record = records.iter().find(|r| r.pid == pid);
-            let preserved = if identity_failure(gap) {
-                None
-            } else {
+            let preserved = if transient_budget_gap(gap) {
                 self.targets
                     .get(&pid)
                     .map(|t| t.process.retained_incarnation())
+            } else {
+                None
             };
             self.retire_for_gap(pid, record, gap, &mut b);
             if let Some(retained) = preserved {
@@ -1474,7 +1473,22 @@ impl ProviderSession {
         self.targets.insert(pid, target);
         if let Err(g) = result {
             if g != ObservationGap::SnapshotLag {
+                // A late-fence budget failure consumes the refreshing
+                // entry above; preserve the fresh incarnation so the next
+                // tick retries through the shared admission instead of
+                // starving on a fresh one. SnapshotLag keeps the unready
+                // target in place for the next pass instead.
+                let preserved = if transient_budget_gap(g) {
+                    self.targets
+                        .get(&pid)
+                        .map(|t| t.process.retained_incarnation())
+                } else {
+                    None
+                };
                 self.retire_for_gap(pid, Some(record), g, b);
+                if let Some(retained) = preserved {
+                    self.refreshing.insert(pid, retained);
+                }
             }
             return Err(g);
         }
@@ -1509,18 +1523,18 @@ impl ProviderSession {
                 .filter_map(|(&pid, t)| process_retirement_gap(&t.process).map(|g| (pid, g)))
                 .collect();
             for (pid, gap) in retired {
-                // Same recoverable-retire preservation as the reconcile
+                // Same transient-budget preservation as the reconcile
                 // loop: without it a budget-gap retire here permanently
                 // strands the re-add on ProcessLimit. No same-tick
                 // deferral needed: drain runs after reconcile, so the
                 // re-add lands on a later tick through the retained
                 // incarnation.
-                let preserved = if identity_failure(gap) {
-                    None
-                } else {
+                let preserved = if transient_budget_gap(gap) {
                     self.targets
                         .get(&pid)
                         .map(|t| t.process.retained_incarnation())
+                } else {
+                    None
                 };
                 self.retire_for_gap(pid, None, gap, &mut b);
                 if let Some(retained) = preserved {
@@ -2107,15 +2121,15 @@ impl ProviderSession {
         };
         if let Some(g) = gap {
             b.gap(g);
-            // Recoverable-retire preservation, as in the reconcile and
+            // Transient-budget preservation, as in the reconcile and
             // drain loops: a budget gap here must not strand the re-add
             // on ProcessLimit.
-            let preserved = if identity_failure(g) {
-                None
-            } else {
+            let preserved = if transient_budget_gap(g) {
                 self.targets
                     .get(&pid)
                     .map(|t| t.process.retained_incarnation())
+            } else {
+                None
             };
             self.retire_for_gap(pid, None, g, b);
             if let Some(retained) = preserved {
@@ -3113,6 +3127,16 @@ fn identity_failure(gap: ObservationGap) -> bool {
             | ObservationGap::BackingUnavailable
     )
 }
+/// Budget gaps whose conditions can genuinely clear between ticks, so a
+/// preserved incarnation may retry next tick: reads refill through the
+/// retire-time release and are consumed gradually, and deadlines refresh
+/// every tick. Everything else stays terminal for the incarnation:
+/// identity changes no longer describe the pid, and deterministic faults
+/// (symbols, attach, membership, already-refused spend) would burn a full
+/// re-acquisition every tick without ever clearing.
+fn transient_budget_gap(gap: ObservationGap) -> bool {
+    matches!(gap, ObservationGap::ReadLimit | ObservationGap::SnapshotLag)
+}
 fn arm_attachment(
     config: &mut BpfMap<MapData, u64, c::Config>,
     process: &VerifiedProcess,
@@ -3122,7 +3146,10 @@ fn arm_attachment(
 ) -> Result<(), ObservationGap> {
     let result = validate_then_arm(
         || {
-            process.revalidate()?;
+            // Fence, not a hot check: both the pre- and post-arm proofs
+            // must run full (a memoized pass would stamp the pre-arm
+            // check and always skip the post-arm one).
+            process.revalidate_fresh()?;
             a.site.revalidate_object()
         },
         || {
@@ -13927,7 +13954,10 @@ mod startup_api_controls {
                 assert!(Instant::now() < until);
                 std::thread::yield_now();
             }
-            let later = fixture.targets[&pid].process.revalidate_fresh().unwrap_err();
+            let later = fixture.targets[&pid]
+                .process
+                .revalidate_fresh()
+                .unwrap_err();
             assert_eq!(later, ObservationGap::ProcessUnavailable);
             let mut aliases = super::super::assembly::Sequences::default();
             let mut batch = ObservationBatch::default();
@@ -13988,7 +14018,10 @@ mod startup_api_controls {
                 assert!(Instant::now() < until);
                 std::thread::yield_now();
             }
-            let unavailable = fixture.targets[&pid].process.revalidate_fresh().unwrap_err();
+            let unavailable = fixture.targets[&pid]
+                .process
+                .revalidate_fresh()
+                .unwrap_err();
             assert_eq!(unavailable, ObservationGap::ProcessUnavailable);
             let mut aliases = super::super::assembly::Sequences::default();
             let preserve = retire_source_owners(
@@ -16562,6 +16595,16 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
         // The attach must spend above the watermark, otherwise the
         // release assertions below prove nothing.
         let spent_after_attach = session.budget.state_spent_test();
+        let attach_spend = spent_after_attach - session.setup_state_spent;
+        assert!(
+            attach_spend > 1 << 20,
+            "attach must spend a nontrivial amount for the tight-budget check"
+        );
+        // Tighten the ceiling to spent-plus-half-an-attach: the re-add
+        // costs about one attach, so pre-fix (no release) it must fail
+        // StateLimit here, while post-fix the release frees a full
+        // attach worth of room. Smaller caller limits are honored.
+        session.budget.limits.max_state_bytes = spent_after_attach + attach_spend / 2;
         assert!(
             spent_after_attach > session.setup_state_spent,
             "attach must spend above the setup watermark"
@@ -16602,8 +16645,8 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
         session.set_deadline(Instant::now() + Duration::from_secs(120));
         let second = session.reconcile_records(&records2);
         assert!(
-            session.targets.contains_key(&pid),
-            "re-add after retire must re-acquire; gaps={:?}",
+            session.targets.get(&pid).is_some_and(|t| t.ready),
+            "re-add after retire must re-acquire a ready target; gaps={:?}",
             second.gaps
         );
         child.finish_observation().unwrap();
@@ -16660,6 +16703,11 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             "first acquire must attach; gaps={:?}",
             first.gaps
         );
+        // Pin the incarnation across the retire, simulating the focused
+        // counter's learned-site custody: without the preserved-incarnation
+        // path the re-add takes a fresh admission and must fail
+        // ProcessLimit here (max_processes = 1, lease still held).
+        let _pinned = session.targets[&pid].process.retained_incarnation();
         // Let the revalidation memo expire (1s grace): the attach's
         // fence checks stamp it, and the retirement check below must run
         // full — same as live tick spacing.
@@ -16706,10 +16754,11 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             recovered.gaps
         );
         assert!(
-            session.targets.contains_key(&pid),
-            "re-add after recoverable retire must re-acquire; gaps={:?}",
+            session.targets.get(&pid).is_some_and(|t| t.ready),
+            "re-add after recoverable retire must re-acquire a ready target; gaps={:?}",
             recovered.gaps
         );
+        drop(_pinned);
         child.finish_observation().unwrap();
     }
 }

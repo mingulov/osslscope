@@ -869,12 +869,14 @@ pub struct VerifiedProcess {
     // Inventory hints excluded from this acquisition. Stronger later metadata
     // can request fresh custody, but cannot promote these old locators.
     refused_inventory: Vec<(u64, u64)>,
-    /// Last successful full revalidation. A check re-reads maps plus every
-    /// backing (~0.5MB); the per-poll drain loop, per-event relocation and
-    /// per-candidate counter validation would otherwise burn megabytes per
-    /// second and exhaust the read budget mid-run. Enforcement granularity
-    /// is one rescan tick (1s); attach/acquire fences use
-    /// [`VerifiedProcess::revalidate_fresh`] instead.
+    /// Last successful backing re-proof. That proof re-reads ~0.5MB;
+    /// the per-poll drain loop, per-event relocation and per-candidate
+    /// counter validation would otherwise burn megabytes per second and
+    /// exhaust the read budget mid-run, so it is memoized to one rescan
+    /// tick (1s). Identity signals (pidfd/starttime/namespaces/exe,
+    /// per-object stamps, executable mappings) stay always-fresh inside
+    /// [`VerifiedProcess::revalidate`]; attach/acquire fences and arm
+    /// points use [`VerifiedProcess::revalidate_fresh`] instead.
     revalidated_at: Cell<Option<std::time::Instant>>,
 }
 struct Process {
@@ -965,14 +967,43 @@ impl VerifiedProcess {
         })
     }
     pub fn revalidate(&self) -> Result<(), ObservationGap> {
+        // Identity proof: syscalls, stat compares and one uncharged maps
+        // read. Always fresh, so exec, namespace change, remap and file
+        // replacement are caught promptly on every hot path.
+        self.process.validate()?;
+        for bound in &self.mappings {
+            bound.object.unchanged()?;
+        }
+        if !same_executable_mappings(
+            &self.maps,
+            &read_at(&self.process.directory, b"maps", MAX_MAPS)?,
+        )? {
+            return Err(ObservationGap::ProcessChanged);
+        }
+        // Costly backing re-proof (charged re-reads): memoized to one
+        // rescan tick. Only witness reassociation can lag a tick here;
+        // fences bypass via fresh.
         if self
             .revalidated_at
             .get()
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
         {
-            return Ok(());
+            return self.process.validate();
         }
-        self.revalidate_fresh()
+        for bound in &self.mappings {
+            if let Some(backing) = &bound.backing {
+                let mut adapter = BudgetAdapter {
+                    budget: &self.budget,
+                    refused: None,
+                };
+                backing
+                    .revalidate_charged(&mut adapter)
+                    .map_err(|error| adapter.map_revalidate(error))?;
+            }
+        }
+        self.process.validate()?;
+        self.revalidated_at.set(Some(std::time::Instant::now()));
+        Ok(())
     }
     /// Always-full revalidation for attach/acquire fences and
     /// change-detection tests: skips the [`VerifiedProcess::revalidate`]

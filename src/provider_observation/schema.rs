@@ -290,6 +290,16 @@ impl ObservationBudget {
     /// `state`, so the floor keeps `floor + reserved` bytes. Callers
     /// must ensure no live attachment owns direct spend above the
     /// floor (retire releases only when nothing remains live).
+    ///
+    /// Known accounting hole (external review; cost-theme followup):
+    /// the fully-idle guard cannot see owners outside targets/startup
+    /// rows. Parsed objects retained by the focused counter's learned
+    /// sites (direct spend via reservation conversion) stay live across
+    /// the release, so a re-add re-spends what the release erased — up
+    /// to one parse set per retire/re-add cycle (single-digit MB against
+    /// a ~25MB margin; cycles are rare now that steady-state retires are
+    /// eliminated). The principled fix is incarnation-scoped parse
+    /// sharing, which also removes the re-acquisition re-parse cost.
     pub(crate) fn release_state_to_floor(&self, floor: usize) {
         let mut work = self.work.borrow_mut();
         if floor >= work.state {
