@@ -95,5 +95,9 @@ exit 0
 /usr/share/doc/%{name}/
 
 %changelog
+* Mon Nov 02 2026 Denis Mingulov <denis@mingulov.com> - 0.5.0-1
+- 0.5.0 candidate package: honesty slice (named acquisition failures,
+  sectioned doctor, exit 3/4 reasons, inventory identity/coalesced gaps),
+  fenced-generation attribution; suite green, typed-load positives blocked.
 * Sat Oct 31 2026 Denis Mingulov <denis@mingulov.com> - 0.4.0-1
 - 0.4.0 development package: CLI plus five BPF roles with file-caps install.

@@ -1,6 +1,29 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## 0.5.0 (candidate — 2026-11-02)
+
+- Honesty + attribution slice over 0.4.0: named acquisition-failure
+  taxonomy (`acquire_cause`, single source of truth); sectioned
+  doctor (`self_attach` / `foreign_backing` / `target`) with
+  functional map_files/pagemap probes and sysctl context; one stderr
+  reason for exits 3/4 plus exit-code help; inventory verified-vs-
+  locator share and gaps coalesced by (reason, device, pid) with
+  JSON unchanged; fenced-generation attribution (G2).
+- Suite green where 0.4.0 was red: `identity_domain_audit` passes
+  (device-domain pins complete) and `cargo clippy -- -D warnings`
+  (CI form) passes. Full host suite: lib 1239 passed / 0 failed /
+  99 ignored; BPF shape/prep gates and the packaging script matrix
+  pass. (`clippy --all-targets` still fails on pre-existing
+  test-only lints, identical at the 0.4.0 base.)
+- Known limits: typed-program positives stay blocked — R5 refuted
+  as-built (`typed_return` exceeds the kernel-7.0 verifier limit;
+  revision options scoped, none selected). No 3.0.x or 4.x runtime
+  lane on hand; DEB/RPM install/remove on declared distro cells and
+  native re-measure stay open. Reports remain PARTIAL where
+  evidence is partial; attribution stays Unknown where unproven.
+- Root package version 0.5.0; helper crates retain their versions.
+
 ## 0.4.0 current-state alpha (automatic observation)
 
 - Published as a current-state alpha. Known limits: reports remain PARTIAL
