@@ -334,6 +334,8 @@ fn add_gap(result: &mut Snapshot, reason: GapReason) {
         device: None,
         inode: None,
         reason,
+        errno: None,
+        actor_euid: None,
     });
     result.gaps.sort();
     result.gaps.dedup();

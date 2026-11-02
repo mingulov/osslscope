@@ -559,6 +559,34 @@ mod tests {
     }
 
     #[test]
+    fn gap_refusal_fields_are_additive() {
+        // Old documents without refusal fields still parse; bare gaps keep
+        // their exact historical bytes.
+        let bare: Gap =
+            serde_json::from_str(r#"{"pid":7,"device":1,"inode":10,"reason":"too_large"}"#)
+                .unwrap();
+        assert_eq!(bare.errno, None);
+        assert_eq!(bare.actor_euid, None);
+        assert_eq!(
+            serde_json::to_value(&bare).unwrap(),
+            serde_json::json!({"pid":7,"device":1,"inode":10,"reason":"too_large"})
+        );
+        // A refused open round-trips with its errno and actor.
+        let refused = Gap {
+            pid: Some(7),
+            device: Some(1),
+            inode: Some(10),
+            reason: GapReason::IdentityUnverified,
+            errno: Some(libc::EPERM),
+            actor_euid: Some(1001),
+        };
+        let value = serde_json::to_value(&refused).unwrap();
+        assert_eq!(value["errno"], libc::EPERM);
+        assert_eq!(value["actor_euid"], 1001);
+        assert_eq!(serde_json::from_value::<Gap>(value).unwrap(), refused);
+    }
+
+    #[test]
     fn gaps_coalesce_by_reason_device_pid() {
         let gaps = vec![
             Gap {
@@ -566,24 +594,32 @@ mod tests {
                 device: Some(1),
                 inode: Some(10),
                 reason: GapReason::TooLarge,
+                errno: None,
+                actor_euid: None,
             },
             Gap {
                 pid: Some(7),
                 device: Some(1),
                 inode: Some(11),
                 reason: GapReason::TooLarge,
+                errno: None,
+                actor_euid: None,
             },
             Gap {
                 pid: Some(9),
                 device: Some(1),
                 inode: Some(12),
                 reason: GapReason::TooLarge,
+                errno: None,
+                actor_euid: None,
             },
             Gap {
                 pid: None,
                 device: None,
                 inode: None,
                 reason: GapReason::Deadline,
+                errno: None,
+                actor_euid: None,
             },
         ];
         let groups = coalesce_gaps(&gaps);
@@ -608,12 +644,16 @@ mod tests {
                 device: Some(1),
                 inode: Some(10),
                 reason: GapReason::TooLarge,
+                errno: None,
+                actor_euid: None,
             },
             Gap {
                 pid: Some(7),
                 device: Some(1),
                 inode: Some(11),
                 reason: GapReason::TooLarge,
+                errno: None,
+                actor_euid: None,
             },
         ];
         let preamble = snap.human_preamble();

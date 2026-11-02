@@ -383,3 +383,74 @@ fn digest(path: &std::path::Path) -> String {
         .map(|b| format!("{b:02x}"))
         .collect()
 }
+
+#[test]
+fn userns_target_map_files_refusal_carries_errno_and_actor() {
+    // A process in a child user namespace keeps world-readable maps but
+    // refuses map_files opens to the outside observer (EPERM): the exact
+    // foreign-target split. Every identity gap for that target must name
+    // the refusal errno and the refused actor — never a bare reason.
+    if Command::new("unshare").arg("--help").output().is_err() {
+        return;
+    }
+    let mut child = match Command::new("unshare")
+        .args(["-U", "sleep", "60"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return,
+    };
+    let pid = child.id();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let probe = (|| {
+        let maps = fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+        let range = maps.lines().find_map(|line| {
+            let mut fields = line.split_ascii_whitespace();
+            let range = fields.next()?;
+            fields.next()?;
+            fields.next()?;
+            fields.next()?;
+            (fields.next()? != "0").then_some(range)
+        })?;
+        match fs::File::open(format!("/proc/{pid}/map_files/{range}")) {
+            Ok(_) => None,
+            Err(e) => e.raw_os_error(),
+        }
+    })();
+    let expected = match probe {
+        Some(errno) if errno == libc::EPERM || errno == libc::EACCES => errno,
+        _ => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+    };
+    let out = cli(&["inspect", "--pid", &pid.to_string(), "--json"]);
+    let _ = child.kill();
+    let _ = child.wait();
+    let doc = json(&out);
+    let gaps = doc["gaps"].as_array().cloned().unwrap_or_default();
+    let identity: Vec<_> = gaps
+        .iter()
+        .filter(|g| g["reason"] == "identity_unverified")
+        .collect();
+    assert!(
+        !identity.is_empty(),
+        "userns split must produce identity gaps: {doc}"
+    );
+    for gap in &identity {
+        assert_eq!(
+            gap["errno"], expected,
+            "identity gap must name the refusal errno: {gap}"
+        );
+    }
+    let actor = unsafe { libc::geteuid() };
+    for gap in &identity {
+        assert_eq!(
+            gap["actor_euid"], actor,
+            "identity gap must name the refused actor: {gap}"
+        );
+    }
+}

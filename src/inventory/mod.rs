@@ -356,6 +356,16 @@ pub struct Gap {
     pub device: Option<u64>,
     pub inode: Option<u64>,
     pub reason: GapReason,
+    /// Raw `errno` from the refused backing open, when the gap names a
+    /// refusal rather than a limit or a change. Additive: absent in old
+    /// documents and skipped when no open was refused, so the common
+    /// shape is byte-identical. Appended last to preserve record order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub errno: Option<i32>,
+    /// Observer euid refused by the open above, present iff `errno` is.
+    /// uids are host-local diagnostics, like pids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_euid: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

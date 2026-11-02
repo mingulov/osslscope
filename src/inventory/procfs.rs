@@ -311,12 +311,38 @@ impl Work<'_> {
         }
     }
     fn gap(&mut self, pid: Option<u32>, mapping: Option<&Mapping<'_>>, reason: GapReason) {
+        self.gap_full(pid, mapping, reason, None, None);
+    }
+    /// Record a refusal gap: the backing open failed with `errno`, so the
+    /// observer that was refused is part of the record. A gap without a
+    /// refused open keeps the historical bare shape.
+    fn gap_errno(
+        &mut self,
+        pid: Option<u32>,
+        mapping: Option<&Mapping<'_>>,
+        reason: GapReason,
+        errno: Option<i32>,
+    ) {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let actor = errno.map(|_| unsafe { libc::geteuid() });
+        self.gap_full(pid, mapping, reason, errno, actor);
+    }
+    fn gap_full(
+        &mut self,
+        pid: Option<u32>,
+        mapping: Option<&Mapping<'_>>,
+        reason: GapReason,
+        errno: Option<i32>,
+        actor_euid: Option<u32>,
+    ) {
         if self.reserve_record(256).is_err() {
             self.gaps.insert(Gap {
                 pid: None,
                 device: None,
                 inode: None,
                 reason: GapReason::ReadLimit,
+                errno: None,
+                actor_euid: None,
             });
             return;
         }
@@ -325,6 +351,8 @@ impl Work<'_> {
             device: mapping.map(|m| m.device),
             inode: mapping.map(|m| m.inode),
             reason,
+            errno,
+            actor_euid,
         });
     }
     fn remaining(&self) -> u64 {
@@ -507,16 +535,25 @@ fn backing(
     process: &Process,
     mapping: &Mapping<'_>,
     work: &mut Work<'_>,
-) -> Result<BoundBacking, GapReason> {
+) -> Result<(BoundBacking, Option<i32>), (GapReason, Option<i32>)> {
     // Acquisition failures must remain distinct from a successfully acquired
     // LocatorCandidate: failure leaves mapping visibility unresolved and can
     // never support a sampled absence claim in watch.
+    // A refused range-bound open is the authoritative proof failing, not a
+    // missing file: its errno travels with both outcomes so the gap names
+    // the refusal instead of swallowing it into a bare label.
     let name = format!("map_files/{}", mapping.map_name());
     let mut ordered: Vec<File> = Vec::new();
     let mut have_direct = false;
-    if let Ok(file) = open_at(&process.directory, name.as_bytes()) {
-        ordered.push(file);
-        have_direct = true;
+    let mut direct_errno = None;
+    match open_at(&process.directory, name.as_bytes()) {
+        Ok(file) => {
+            ordered.push(file);
+            have_direct = true;
+        }
+        Err(error) => {
+            direct_errno = error.raw_os_error();
+        }
     }
     // Common verification first: the range-bound descriptor, then direct
     // layer resolutions. The first verified candidate wins and its
@@ -547,18 +584,26 @@ fn backing(
                     }
                     let page = association.witness_page();
                     let file = ordered.remove(index);
-                    let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
+                    let metadata = file.metadata().map_err(|error| {
+                        (
+                            GapReason::BackingUnavailable,
+                            error.raw_os_error().or(direct_errno),
+                        )
+                    })?;
                     return Ok((
-                        file,
-                        metadata,
-                        IdentityStatus::Verified,
-                        page,
-                        Some(association),
+                        (
+                            file,
+                            metadata,
+                            IdentityStatus::Verified,
+                            page,
+                            Some(association),
+                        ),
+                        direct_errno,
                     ));
                 }
                 Err(_) => {
                     if let Some(limit) = work.backing_limit.take() {
-                        return Err(limit);
+                        return Err((limit, direct_errno));
                     }
                 }
             }
@@ -569,35 +614,59 @@ fn backing(
     // without a process view, or when verification itself was unavailable).
     if have_direct {
         let file = ordered.remove(0);
-        let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| (GapReason::BackingUnavailable, error.raw_os_error()))?;
         if direct_filesystem(&file)
             && metadata.ino() == mapping.inode
             && (metadata.dev() == mapping.device || filesystem(&file) == Some(0x9123683e))
         {
-            return Ok((file, metadata, IdentityStatus::Verified, None, None));
+            return Ok((
+                (file, metadata, IdentityStatus::Verified, None, None),
+                direct_errno,
+            ));
         }
         // A locator may still be useful on overlay, but not after obvious
         // replacement by an inode different from the mapping's inode.
         if metadata.ino() == mapping.inode {
-            return Ok((file, metadata, IdentityStatus::LocatorCandidate, None, None));
+            return Ok((
+                (file, metadata, IdentityStatus::LocatorCandidate, None, None),
+                direct_errno,
+            ));
         }
-        return Err(GapReason::BackingUnavailable);
+        return Err((GapReason::BackingUnavailable, direct_errno));
     }
     // Namespace-relative locator fallback never establishes mapping identity.
     // Do not strip the kernel's deleted suffix into a replacement pathname.
     if !mapping.path.starts_with(b"/") || mapping.path.ends_with(b" (deleted)") {
-        return Err(GapReason::BackingUnavailable);
+        return Err((GapReason::BackingUnavailable, direct_errno));
     }
     let mut name = b"root".to_vec();
     name.extend_from_slice(mapping.path);
-    let file = open_at(&process.directory, &name).map_err(|_| GapReason::BackingUnavailable)?;
-    let metadata = file.metadata().map_err(|_| GapReason::BackingUnavailable)?;
+    // The range-bound refusal stays primary: it names the authoritative
+    // proof failing for this exact mapping, while the fallback open only
+    // names a pathname miss in our own mount namespace.
+    let file = open_at(&process.directory, &name).map_err(|error| {
+        (
+            GapReason::BackingUnavailable,
+            direct_errno.or(error.raw_os_error()),
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        (
+            GapReason::BackingUnavailable,
+            direct_errno.or(error.raw_os_error()),
+        )
+    })?;
     if metadata.ino() != mapping.inode
         || (metadata.dev() != mapping.device && filesystem(&file) != Some(0x9123683e))
     {
-        return Err(GapReason::BackingUnavailable);
+        return Err((GapReason::BackingUnavailable, direct_errno));
     }
-    Ok((file, metadata, IdentityStatus::LocatorCandidate, None, None))
+    Ok((
+        (file, metadata, IdentityStatus::LocatorCandidate, None, None),
+        direct_errno,
+    ))
 }
 
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
@@ -658,16 +727,21 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         // Bound mapping/open attempts even when locators collide or fail.
         attempts += 1;
         work.totals.objects_attempted += 1;
-        let (file, metadata, identity_status, page, association) =
+        let ((file, metadata, identity_status, page, association), direct_errno) =
             match backing(view.as_ref(), &process, &mapping, work) {
                 Ok(bound) => bound,
-                Err(reason) => {
-                    work.gap(Some(pid), Some(&mapping), reason);
+                Err((reason, errno)) => {
+                    work.gap_errno(Some(pid), Some(&mapping), reason, errno);
                     continue;
                 }
             };
         if identity_status == IdentityStatus::LocatorCandidate {
-            work.gap(Some(pid), Some(&mapping), GapReason::IdentityUnverified);
+            work.gap_errno(
+                Some(pid),
+                Some(&mapping),
+                GapReason::IdentityUnverified,
+                direct_errno,
+            );
         }
         let fingerprint = Fingerprint::from(&metadata);
         let key = (fingerprint.clone(), page);
@@ -756,6 +830,8 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                 device: Some(module.info.device),
                 inode: Some(module.info.inode),
                 reason: GapReason::Changed,
+                errno: None,
+                actor_euid: None,
             });
         }
         unchanged

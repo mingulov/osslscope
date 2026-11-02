@@ -363,6 +363,8 @@ fn observe(
                     device: None,
                     inode: None,
                     reason,
+                    errno: None,
+                    actor_euid: None,
                 },
             })?;
             out.emit(Record::End {
@@ -743,6 +745,8 @@ mod tests {
             device: None,
             inode: None,
             reason: GapReason::Deadline,
+            errno: None,
+            actor_euid: None,
         });
         assert_eq!(departure(&identity, &snapshot), Some("visibility_lost"));
     }
