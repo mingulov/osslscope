@@ -61,21 +61,34 @@ fn frozen_shape() {
     assert_eq!(pub_hex, TEST_PUBLIC_KEY_SHA256_HEX);
 }
 
+enum KemCapability {
+    Supported,
+    Unsupported,
+    Broken(String),
+}
+
 /// Capability probe: `pkeyutl -encap/-decap/-secret` exist only on
 /// newer OpenSSL (3.5 here); 3.0.x (e.g. the ubuntu-24.04 CI lane's
-/// 3.0.13, whose pkeyutl.c has no encap surface) must skip the live
-/// leg instead of failing the suite. Freeze pins above still run.
-fn pkeyutl_supports_kem(vehicle: &str) -> bool {
-    Command::new(vehicle)
-        .args(["pkeyutl", "-help"])
-        .output()
-        .map(|o| {
-            // Usage goes to stderr on some versions: scan both streams.
-            let help = String::from_utf8_lossy(&o.stdout).into_owned()
-                + &String::from_utf8_lossy(&o.stderr);
-            help.contains("-encap") && help.contains("-decap") && help.contains("-secret")
-        })
-        .unwrap_or(false)
+/// 3.0.13, whose pkeyutl.c has no encap surface) probes Unsupported
+/// so the live leg skips instead of failing the suite. A binary that
+/// fails help execution probes Broken (present-but-broken fails, never
+/// silently skips). Freeze pins above still run in all cases.
+fn probe_kem_capability(vehicle: &str) -> KemCapability {
+    let output = match Command::new(vehicle).args(["pkeyutl", "-help"]).output() {
+        Err(e) => return KemCapability::Broken(format!("pkeyutl -help unusable: {e}")),
+        Ok(o) => o,
+    };
+    // Usage goes to stderr on some versions: scan both streams.
+    let help = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    if help.contains("-encap") && help.contains("-decap") && help.contains("-secret") {
+        return KemCapability::Supported;
+    }
+    if output.status.success() {
+        KemCapability::Unsupported
+    } else {
+        KemCapability::Broken(format!("pkeyutl -help exits {}", output.status))
+    }
 }
 
 fn stage() -> Option<PathBuf> {
@@ -87,11 +100,15 @@ fn stage() -> Option<PathBuf> {
         VehicleProbe::Broken(msg) => panic!("stock binary broken: {msg}"),
         VehicleProbe::Ready => {}
     }
-    if !pkeyutl_supports_kem(KEM_VEHICLE_BIN) {
-        eprintln!(
-            "SKIP KEM stock oracle: pkeyutl lacks -encap/-decap/-secret (needs KEM CLI, e.g. OpenSSL 3.5; 3.0.x unsupported)"
-        );
-        return None;
+    match probe_kem_capability(KEM_VEHICLE_BIN) {
+        KemCapability::Supported => {}
+        KemCapability::Unsupported => {
+            eprintln!(
+                "SKIP KEM stock oracle: pkeyutl lacks -encap/-decap/-secret (needs KEM CLI, e.g. OpenSSL 3.5; 3.0.x unsupported)"
+            );
+            return None;
+        }
+        KemCapability::Broken(msg) => panic!("stock binary broken: {msg}"),
     }
     let dir = std::env::temp_dir().join(format!("osslscope-kemoracle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -99,27 +116,64 @@ fn stage() -> Option<PathBuf> {
     Some(dir)
 }
 
+fn fake_vehicle(dir: &std::path::Path, name: &str, body: &str) -> String {
+    let fake = dir.join(name);
+    std::fs::write(&fake, format!("#!/bin/sh\n{body}\n")).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake.to_str().unwrap().to_string()
+}
+
 #[test]
-fn kem_capability_probe_detects_missing_kem_cli() {
-    // This host's stock openssl has the KEM CLI (3.5.5).
-    assert!(
-        pkeyutl_supports_kem(KEM_VEHICLE_BIN),
-        "host openssl must offer pkeyutl -encap/-decap/-secret"
-    );
-    // A vehicle whose help lacks the KEM options (e.g. OpenSSL 3.0.x,
-    // as on the ubuntu-24.04 CI lane) must probe unsupported so the
-    // live leg skips instead of failing the suite.
+fn kem_capability_probe_classifies_help_fixtures() {
+    // Fully hermetic: no assertion on the host openssl (3.0.x CI lanes
+    // must pass this test too — only the live leg gates on the probe).
     let dir = std::env::temp_dir().join(format!("osslscope-kemprobe-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let fake = dir.join("old-openssl");
-    std::fs::write(&fake, "#!/bin/sh\necho 'options: -sign -verify -derive'\n").unwrap();
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(
-        !pkeyutl_supports_kem(fake.to_str().unwrap()),
-        "help without KEM options must probe unsupported"
+    // KEM options on stdout only.
+    let out_only = fake_vehicle(&dir, "kem-out.sh", "echo 'options: -encap -decap -secret'");
+    assert!(matches!(
+        probe_kem_capability(&out_only),
+        KemCapability::Supported
+    ));
+    // KEM options on stderr only (real `pkeyutl -help` shape).
+    let err_only = fake_vehicle(
+        &dir,
+        "kem-err.sh",
+        "echo 'options: -encap -decap -secret' >&2",
     );
+    assert!(matches!(
+        probe_kem_capability(&err_only),
+        KemCapability::Supported
+    ));
+    // KEM options split across streams.
+    let split = fake_vehicle(
+        &dir,
+        "kem-split.sh",
+        "echo 'options: -encap'; echo 'options: -decap -secret' >&2",
+    );
+    assert!(matches!(
+        probe_kem_capability(&split),
+        KemCapability::Supported
+    ));
+    // No KEM options, clean exit (OpenSSL 3.0.x shape): unsupported,
+    // so the live leg skips instead of failing the suite.
+    let old = fake_vehicle(
+        &dir,
+        "old-openssl.sh",
+        "echo 'options: -sign -verify -derive'",
+    );
+    assert!(matches!(
+        probe_kem_capability(&old),
+        KemCapability::Unsupported
+    ));
+    // Crashing help is broken, never a silent unsupported skip.
+    let crash = fake_vehicle(&dir, "crash.sh", "echo boom >&2; exit 3");
+    assert!(matches!(
+        probe_kem_capability(&crash),
+        KemCapability::Broken(_)
+    ));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
