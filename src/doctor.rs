@@ -3851,6 +3851,56 @@ mod tests {
     }
 
     #[test]
+    fn caps_guidance_never_overclaims_foreign() {
+        // The privilege rule, pinned: a caps pass states only that
+        // caps are effective (it proves self/owned attach, never
+        // foreign); a caps failure names the foreign-uid recourse
+        // (cap_sys_ptrace addition) in the setcap recipe.
+        let check = check_caps(&gather_env());
+        match check.status {
+            Status::Pass => {
+                assert!(
+                    !check.message.contains("foreign") && !check.message.contains("target"),
+                    "caps pass must not claim foreign: {}",
+                    check.message
+                );
+            }
+            Status::Fail => {
+                let remediation = check.remediation.unwrap_or_default();
+                assert!(
+                    remediation.contains("cap_sys_ptrace"),
+                    "caps failure must name the foreign-uid recourse: {remediation}"
+                );
+            }
+            other => panic!("caps is pass/fail, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn foreign_backing_denial_names_recourse() {
+        // pid 1 (init, uid 0) is the stable foreign-uid witness for a
+        // non-root observer: denied with recourse, never a bare
+        // denial; a privileged observer passes instead. Either way
+        // the uid-0 witness never leaks digits into messages.
+        for check in [check_map_files(1), check_pagemap(1)] {
+            match check.status {
+                Status::Pass | Status::Info => {}
+                Status::Degraded => {
+                    let remediation = check.remediation.unwrap_or_default();
+                    assert!(
+                        remediation.contains("cap_sys_ptrace")
+                            && remediation.contains("target uid"),
+                        "{} must name uid + ptrace recourse: {}",
+                        check.id,
+                        remediation
+                    );
+                }
+                other => panic!("{} must be pass/info/degraded, got {other:?}", check.id),
+            }
+        }
+    }
+
+    #[test]
     fn sysctl_context_rows_are_info_only() {
         let rows = check_sysctl_context();
         assert_eq!(rows.len(), 4);
