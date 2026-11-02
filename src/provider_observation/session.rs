@@ -1476,19 +1476,22 @@ impl ProviderSession {
                 // A late-fence budget failure consumes the refreshing
                 // entry above; preserve the fresh incarnation so the next
                 // tick retries through the shared admission instead of
-                // starving on a fresh one. Narrower than the retire-path
-                // rule: an attach that fails StateLimit refits
-                // deterministically (the release already freed maximally),
-                // so only reads/deadline pressure retries. SnapshotLag
+                // starving on a fresh one. Same rule as the retire paths,
+                // not narrower: this pass may have emitted statics into
+                // the batch before the fence failed (and a resumed
+                // deferred target may have emitted on a prior pass), so
+                // Count can already pin this admission — a StateLimit
+                // retire here would strand the re-add on ProcessLimit.
+                // Preservation is harmless when nothing is pinned: the
+                // re-add simply refits deterministically. SnapshotLag
                 // keeps the unready target in place for the next pass.
-                let preserved =
-                    if matches!(g, ObservationGap::ReadLimit | ObservationGap::SnapshotLag) {
-                        self.targets
-                            .get(&pid)
-                            .map(|t| t.process.retained_incarnation())
-                    } else {
-                        None
-                    };
+                let preserved = if transient_budget_gap(g) {
+                    self.targets
+                        .get(&pid)
+                        .map(|t| t.process.retained_incarnation())
+                } else {
+                    None
+                };
                 self.retire_for_gap(pid, Some(record), g, b);
                 if let Some(retained) = preserved {
                     self.refreshing.insert(pid, retained);
@@ -3152,8 +3155,10 @@ fn identity_failure(gap: ObservationGap) -> bool {
 /// before). Everything else stays terminal for the incarnation:
 /// identity changes no longer describe the pid, and deterministic faults
 /// (symbols, attach, membership) would burn a full re-acquisition every
-/// tick without ever clearing. Add-target failures use a narrower rule
-/// (see below): an attach that never fit refits deterministically.
+/// tick without ever clearing. Add-target failures use the same rule:
+/// a failed add may already have emitted statics this pass (or resume a
+/// deferred target that emitted earlier), so Count may pin the admission;
+/// when nothing is pinned the preserved re-add refits deterministically.
 fn transient_budget_gap(gap: ObservationGap) -> bool {
     matches!(
         gap,
