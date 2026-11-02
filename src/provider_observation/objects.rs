@@ -869,6 +869,13 @@ pub struct VerifiedProcess {
     // Inventory hints excluded from this acquisition. Stronger later metadata
     // can request fresh custody, but cannot promote these old locators.
     refused_inventory: Vec<(u64, u64)>,
+    /// Last successful full revalidation. A check re-reads maps plus every
+    /// backing (~0.5MB); the per-poll drain loop, per-event relocation and
+    /// per-candidate counter validation would otherwise burn megabytes per
+    /// second and exhaust the read budget mid-run. Enforcement granularity
+    /// is one rescan tick (1s); attach/acquire fences use
+    /// [`VerifiedProcess::revalidate_fresh`] instead.
+    revalidated_at: Cell<Option<std::time::Instant>>,
 }
 struct Process {
     _admission: Option<super::schema::ProcessAdmission>,
@@ -958,6 +965,19 @@ impl VerifiedProcess {
         })
     }
     pub fn revalidate(&self) -> Result<(), ObservationGap> {
+        if self
+            .revalidated_at
+            .get()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(1))
+        {
+            return Ok(());
+        }
+        self.revalidate_fresh()
+    }
+    /// Always-full revalidation for attach/acquire fences and
+    /// change-detection tests: skips the [`VerifiedProcess::revalidate`]
+    /// memo and re-stamps it on success.
+    pub fn revalidate_fresh(&self) -> Result<(), ObservationGap> {
         self.process.validate()?;
         if !same_executable_mappings(
             &self.maps,
@@ -977,7 +997,9 @@ impl VerifiedProcess {
                     .map_err(|error| adapter.map_revalidate(error))?;
             }
         }
-        self.process.validate()
+        self.process.validate()?;
+        self.revalidated_at.set(Some(std::time::Instant::now()));
+        Ok(())
     }
     pub fn resolve_api(&self, api: ObservationApi) -> Vec<ApiSite> {
         if api.export_name().is_none() {
@@ -1194,7 +1216,9 @@ impl VerifiedProcess {
             discovery.mapping += 1;
             discovery.locator = 0;
         }
-        self.revalidate()?;
+        // Fence: discovery re-read the tables; confirm the bindings did
+        // not change underneath, bypassing the hot-path memo.
+        self.revalidate_fresh()?;
         if discovery.emitted {
             budget.state(
                 discovery.candidates.len() * std::mem::size_of::<VerifiedStaticCandidate>(),
@@ -1560,6 +1584,7 @@ pub(crate) fn acquire_with_incarnation(
         gaps: RefCell::new(gaps),
         static_discovery: RefCell::default(),
         refused_inventory,
+        revalidated_at: Cell::new(None),
     };
     verified.revalidate()?;
     if let Some(mut admission) = admission.take() {
@@ -2945,6 +2970,7 @@ pub(super) mod fixture_support {
             gaps: RefCell::default(),
             static_discovery: RefCell::default(),
             refused_inventory: Vec::new(),
+            revalidated_at: Cell::new(None),
         };
         verified.revalidate().unwrap();
         verified

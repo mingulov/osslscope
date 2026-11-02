@@ -388,6 +388,12 @@ pub struct ProviderSession {
     roles: Roles,
     aliases: super::assembly::Sequences,
     budget: ObservationBudget,
+    /// State spend at the end of session setup (object + maps + gate).
+    /// Retire-time release returns here when no attachment remains live,
+    /// so a retire/re-add cycle can re-acquire instead of starving on
+    /// the first acquisition's permanent spend.
+    setup_state_spent: usize,
+    setup_reads_spent: u64,
     next_cookie: u64,
     /// First typed cookie. Cookies partition the (cookie, process, image)
     /// bind space across both programs: the counter mints u32
@@ -455,6 +461,12 @@ fn cold_attach_error(
 }
 fn process_retirement_gap(process: &VerifiedProcess) -> Option<ObservationGap> {
     recorded_refusal(process).or_else(|| process.revalidate().err())
+}
+/// Always-fresh variant for one-shot terminal decisions (final drain):
+/// the hot-path memo must not carry a stale "alive" verdict into a
+/// terminal-authority ruling.
+fn process_retirement_gap_fresh(process: &VerifiedProcess) -> Option<ObservationGap> {
+    recorded_refusal(process).or_else(|| process.revalidate_fresh().err())
 }
 fn candidate_validation_result(
     process: &VerifiedProcess,
@@ -560,7 +572,7 @@ fn final_source_refusals(
             b.gap(ObservationGap::DrainOverrun);
             continue;
         }
-        if let Some(gap) = process_retirement_gap(&target.process) {
+        if let Some(gap) = process_retirement_gap_fresh(&target.process) {
             let rows = startup.get(&pid).map_or(&[][..], Vec::as_slice);
             let terminal = !rejects_history(gap)
                 && recorded_refusal(&target.process).is_none()
@@ -897,6 +909,8 @@ impl ProviderSession {
             refreshing: BTreeMap::new(),
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
+            setup_state_spent: budget.spent_state(),
+            setup_reads_spent: budget.spent_reads(),
             budget,
             next_cookie: 1,
             next_typed_cookie: TYPED_COOKIE_FIRST,
@@ -1072,7 +1086,7 @@ impl ProviderSession {
             return false;
         }
         self.refreshing.remove(&pid);
-        retire_source_owners(
+        let preserve = retire_source_owners(
             (&mut self.startup, &mut self.targets),
             &mut self.aliases,
             pid,
@@ -1107,7 +1121,21 @@ impl ProviderSession {
                     Ok(())
                 }
             },
-        )
+        );
+        // Retire-time budget release: when no attachment remains live
+        // anywhere, the retired acquisition's permanent spend is dead —
+        // return to the setup watermark so a re-add can re-acquire.
+        // Guarded to the fully-idle case: live attachments elsewhere
+        // still own their spend, and per-target accounting would be
+        // needed to release partially (all current CLI flows retire
+        // the single live target here).
+        if self.targets.is_empty() && self.startup.values().all(|rows| rows.is_empty()) {
+            let floor = self.setup_state_spent;
+            self.budget.release_state_to_floor(floor);
+            let reads_floor = self.setup_reads_spent;
+            self.budget.release_reads_to_floor(reads_floor);
+        }
+        preserve
     }
     pub(crate) fn set_deadline(&self, deadline: Instant) {
         self.budget.set_deadline(deadline);
@@ -1152,8 +1180,27 @@ impl ProviderSession {
                 .map(|gap| (pid, gap))
             })
             .collect();
+        // Pids retired for a recoverable (non-identity) gap keep their
+        // incarnation for next tick's re-add, exactly like the authority-
+        // refresh path below: the counter's learned sites keep the shared
+        // process lease alive, so a fresh admission would starve on
+        // ProcessLimit under a tight process budget. Identity failures
+        // stay terminal: the old incarnation no longer describes the pid.
+        let mut readd_deferred = Vec::new();
         for (pid, gap) in retire {
-            self.retire_for_gap(pid, records.iter().find(|r| r.pid == pid), gap, &mut b);
+            let record = records.iter().find(|r| r.pid == pid);
+            let preserved = if identity_failure(gap) {
+                None
+            } else {
+                self.targets
+                    .get(&pid)
+                    .map(|t| t.process.retained_incarnation())
+            };
+            self.retire_for_gap(pid, record, gap, &mut b);
+            if let Some(retained) = preserved {
+                self.refreshing.insert(pid, retained);
+                readd_deferred.push(pid);
+            }
             b.gap(gap);
             b.gap(ObservationGap::IntervalUnknown)
         }
@@ -1195,7 +1242,7 @@ impl ProviderSession {
             b.refreshed_processes.push(pid);
         }
         for record in records {
-            if refreshed.contains(&record.pid) {
+            if refreshed.contains(&record.pid) || readd_deferred.contains(&record.pid) {
                 continue;
             }
             if self.targets.get(&record.pid).is_some_and(|t| t.ready) {
@@ -1397,7 +1444,7 @@ impl ProviderSession {
             });
             b.static_candidates
                 .extend(target.process.static_candidates(&self.budget)?);
-            target.process.revalidate()?;
+            target.process.revalidate_fresh()?;
             if target.attachments.is_empty() && b.static_candidates.is_empty() {
                 return Err(ObservationGap::SymbolUnavailable);
             }
@@ -1410,7 +1457,7 @@ impl ProviderSession {
                 .insert(pid, mapped_member(previous, generation, target.ranges)?, 0)
                 .map_err(|_| ObservationGap::AttachFailed)?;
             // The second check fences setup changes after all links and membership.
-            target.process.revalidate()?;
+            target.process.revalidate_fresh()?;
             if let Some(gap) = recorded_refusal(&target.process) {
                 return Err(gap);
             }
@@ -1462,7 +1509,23 @@ impl ProviderSession {
                 .filter_map(|(&pid, t)| process_retirement_gap(&t.process).map(|g| (pid, g)))
                 .collect();
             for (pid, gap) in retired {
+                // Same recoverable-retire preservation as the reconcile
+                // loop: without it a budget-gap retire here permanently
+                // strands the re-add on ProcessLimit. No same-tick
+                // deferral needed: drain runs after reconcile, so the
+                // re-add lands on a later tick through the retained
+                // incarnation.
+                let preserved = if identity_failure(gap) {
+                    None
+                } else {
+                    self.targets
+                        .get(&pid)
+                        .map(|t| t.process.retained_incarnation())
+                };
                 self.retire_for_gap(pid, None, gap, &mut b);
+                if let Some(retained) = preserved {
+                    self.refreshing.insert(pid, retained);
+                }
                 b.gap(gap);
             }
             if !self.startup.is_empty() {
@@ -2023,23 +2086,44 @@ impl ProviderSession {
                 return;
             }
         }
-        let target = self.targets.get_mut(&pid).unwrap();
-        if let Some(existing) = target
-            .attachments
-            .iter_mut()
-            .find(|a| same_site(&a.site, &site))
         {
-            if let Err(g) = merge_candidates(&mut existing.advertisers, advertisers, &self.budget) {
-                b.gap(g)
+            let target = self.targets.get_mut(&pid).unwrap();
+            if let Some(existing) = target
+                .attachments
+                .iter_mut()
+                .find(|a| same_site(&a.site, &site))
+            {
+                if let Err(g) =
+                    merge_candidates(&mut existing.advertisers, advertisers, &self.budget)
+                {
+                    b.gap(g)
+                }
+                return;
+            }
+        }
+        let gap = {
+            let target = self.targets.get(&pid).unwrap();
+            target.process.revalidate().err()
+        };
+        if let Some(g) = gap {
+            b.gap(g);
+            // Recoverable-retire preservation, as in the reconcile and
+            // drain loops: a budget gap here must not strand the re-add
+            // on ProcessLimit.
+            let preserved = if identity_failure(g) {
+                None
+            } else {
+                self.targets
+                    .get(&pid)
+                    .map(|t| t.process.retained_incarnation())
+            };
+            self.retire_for_gap(pid, None, g, b);
+            if let Some(retained) = preserved {
+                self.refreshing.insert(pid, retained);
             }
             return;
         }
-        if let Err(g) = target.process.revalidate() {
-            b.gap(g);
-            self.retire_for_gap(pid, None, g, b);
-            return;
-        }
-        let generation = target.generation;
+        let generation = self.targets.get(&pid).unwrap().generation;
         match self.attach_pair(pid, api, site, advertisers, 0, generation, true) {
             Ok(a) => {
                 // Pair exists but CONFIG is absent: full process/maps/object
@@ -8933,7 +9017,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     #[ignore = "U5 real-openssl fit pin (sudo, pinned BPF objects)"]
     fn real_openssl_mac_full_acquire_fits_with_oracle_agreement() {
         use crate::capture::ClockPort as _;
-        const CEILING: usize = 67108864;
+        let ceiling: usize =
+            crate::provider_observation::ObservationLimits::default().max_state_bytes;
         let dir = std::env::temp_dir().join(format!(
             "osslscope-u5-positive-{}-{}",
             std::process::id(),
@@ -9007,7 +9092,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         );
         let spent_discovery = budget.state_spent_test();
         eprintln!("u5 spent after-discovery={spent_discovery}");
-        assert!(spent_discovery < CEILING, "discovery must fit the ceiling");
+        assert!(spent_discovery < ceiling, "discovery must fit the ceiling");
         // Bind and release explicitly (§21.2 ghost-Rc lesson, as in
         // pass 1 above); only gaps/copied_skipped/plan_arrays stay.
         let crate::startup_objects::PreExecSites {
@@ -9039,7 +9124,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(session.startup[&pid].len(), 62);
         let spent_prearm = session.budget.state_spent_test();
         eprintln!("u5 spent after-prearm={spent_prearm}");
-        assert!(spent_prearm < CEILING, "prearm must fit the ceiling");
+        assert!(spent_prearm < ceiling, "prearm must fit the ceiling");
         // Claims from the retained attachments themselves (FD-path
         // targets, no pathname premise); FDs stay alive through acquire.
         let mut fds = Vec::new();
@@ -9072,7 +9157,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_prepare = session.budget.state_spent_test();
         eprintln!("u5 spent after-prepare-typed={spent_prepare}");
         assert!(
-            spent_prepare < CEILING,
+            spent_prepare < ceiling,
             "typed prepare must fit the ceiling"
         );
         let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
@@ -9105,7 +9190,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_acquire = session.budget.state_spent_test();
         eprintln!("u5 spent after-acquire={spent_acquire}");
         assert!(
-            spent_acquire < CEILING,
+            spent_acquire < ceiling,
             "full-62 acquire must fit the ceiling"
         );
         assert_eq!(receipts.attachments.len(), 62, "every claim acquires");
@@ -9261,7 +9346,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_collect = session.budget.state_spent_test();
         eprintln!("u5 spent after-collect-charge={spent_collect}");
         assert!(
-            spent_collect < CEILING,
+            spent_collect < ceiling,
             "collect charge must fit the ceiling"
         );
         let maps = session.attribution_maps().expect("attribution maps");
@@ -10327,7 +10412,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     #[ignore = "families KDF firemap (sudo, pinned BPF objects)"]
     fn kdf_typed_roles_fire_on_stock_hkdf_workload() {
         use crate::capture::ClockPort as _;
-        const CEILING: usize = 67108864;
+        let ceiling: usize =
+            crate::provider_observation::ObservationLimits::default().max_state_bytes;
         const TAG: &str = "fam-kdf";
         let openssl = fam_openssl_argv0();
         let cli_bytes = std::fs::read(&openssl).unwrap();
@@ -10388,7 +10474,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_discovery = budget.state_spent_test();
         eprintln!("{TAG} spent after-discovery={spent_discovery}");
         assert!(
-            spent_discovery < CEILING,
+            spent_discovery < ceiling,
             "{TAG}: discovery must fit the ceiling"
         );
         let crate::startup_objects::PreExecSites {
@@ -10421,7 +10507,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(session.startup[&pid].len(), legacy_sites);
         let spent_prearm = session.budget.state_spent_test();
         eprintln!("{TAG} spent after-prearm={spent_prearm}");
-        assert!(spent_prearm < CEILING, "{TAG}: prearm must fit the ceiling");
+        assert!(spent_prearm < ceiling, "{TAG}: prearm must fit the ceiling");
         let mut fds = Vec::new();
         let mut triples = Vec::new();
         for attachment in &session.startup[&pid] {
@@ -10452,7 +10538,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_prepare = session.budget.state_spent_test();
         eprintln!("{TAG} spent after-prepare-typed={spent_prepare}");
         assert!(
-            spent_prepare < CEILING,
+            spent_prepare < ceiling,
             "{TAG}: typed prepare must fit the ceiling"
         );
         let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
@@ -10485,7 +10571,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_acquire = session.budget.state_spent_test();
         eprintln!("{TAG} spent after-acquire={spent_acquire}");
         assert!(
-            spent_acquire < CEILING,
+            spent_acquire < ceiling,
             "{TAG}: full acquire must fit the ceiling"
         );
         assert_eq!(
@@ -10735,7 +10821,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         operation: super::schema::Operation,
     ) -> FamAcquireReceipt {
         use crate::capture::ClockPort as _;
-        const CEILING: usize = 67108864;
+        let ceiling: usize =
+            crate::provider_observation::ObservationLimits::default().max_state_bytes;
         let normalize = |text: &str| {
             text.trim()
                 .replace([':', '\n', ' '], "")
@@ -10781,7 +10868,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_discovery = budget.state_spent_test();
         eprintln!("{tag} spent after-discovery={spent_discovery}");
         assert!(
-            spent_discovery < CEILING,
+            spent_discovery < ceiling,
             "{tag}: discovery must fit the ceiling"
         );
         let crate::startup_objects::PreExecSites {
@@ -10814,7 +10901,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         assert_eq!(session.startup[&pid].len(), legacy_sites);
         let spent_prearm = session.budget.state_spent_test();
         eprintln!("{tag} spent after-prearm={spent_prearm}");
-        assert!(spent_prearm < CEILING, "{tag}: prearm must fit the ceiling");
+        assert!(spent_prearm < ceiling, "{tag}: prearm must fit the ceiling");
         let mut fds = Vec::new();
         let mut triples = Vec::new();
         for attachment in &session.startup[&pid] {
@@ -10845,7 +10932,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_prepare = session.budget.state_spent_test();
         eprintln!("{tag} spent after-prepare-typed={spent_prepare}");
         assert!(
-            spent_prepare < CEILING,
+            spent_prepare < ceiling,
             "{tag}: typed prepare must fit the ceiling"
         );
         let start_ns = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
@@ -10878,7 +10965,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_acquire = session.budget.state_spent_test();
         eprintln!("{tag} spent after-acquire={spent_acquire}");
         assert!(
-            spent_acquire < CEILING,
+            spent_acquire < ceiling,
             "{tag}: full acquire must fit the ceiling"
         );
         assert_eq!(
@@ -11009,7 +11096,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let spent_collect = session.budget.state_spent_test();
         eprintln!("{tag} spent after-collect-charge={spent_collect}");
         assert!(
-            spent_collect < CEILING,
+            spent_collect < ceiling,
             "{tag}: collect charge must fit the ceiling"
         );
         let maps = session.attribution_maps().expect("attribution maps");
@@ -13348,7 +13435,7 @@ mod startup_api_controls {
             if case == "nonterminal-unavailable" {
                 objects::fixture_support::lose_mapped_process_directory(&mut target.process);
                 assert_eq!(
-                    target.process.revalidate(),
+                    target.process.revalidate_fresh(),
                     Err(ObservationGap::ProcessUnavailable)
                 );
             }
@@ -13522,7 +13609,7 @@ mod startup_api_controls {
                 reconcile_retirement_gap(
                     Some(fixture.record.starttime),
                     fixture.record.starttime,
-                    || fixture.targets[&pid].process.revalidate(),
+                    || fixture.targets[&pid].process.revalidate_fresh(),
                 )
                 .unwrap()
             } else {
@@ -13840,7 +13927,7 @@ mod startup_api_controls {
                 assert!(Instant::now() < until);
                 std::thread::yield_now();
             }
-            let later = fixture.targets[&pid].process.revalidate().unwrap_err();
+            let later = fixture.targets[&pid].process.revalidate_fresh().unwrap_err();
             assert_eq!(later, ObservationGap::ProcessUnavailable);
             let mut aliases = super::super::assembly::Sequences::default();
             let mut batch = ObservationBatch::default();
@@ -13901,7 +13988,7 @@ mod startup_api_controls {
                 assert!(Instant::now() < until);
                 std::thread::yield_now();
             }
-            let unavailable = fixture.targets[&pid].process.revalidate().unwrap_err();
+            let unavailable = fixture.targets[&pid].process.revalidate_fresh().unwrap_err();
             assert_eq!(unavailable, ObservationGap::ProcessUnavailable);
             let mut aliases = super::super::assembly::Sequences::default();
             let preserve = retire_source_owners(
@@ -16423,5 +16510,206 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             "mapped handoff: same operational/metadata cookies and generation; one paired scalar success; pending natural fixture query/advertisement retained; no tail/unpaired gap"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn retire_then_readd_reacquires_operational_target_with_tight_budget() {
+        // Regression: after a retire drops the live target, the re-add
+        // must succeed so steady-state operational observation survives
+        // the transition. The first attach's spend is permanent without
+        // a retire-time release, so pre-fix the re-add always fails
+        // StateLimit and operational rows stay zero.
+        let argv = [
+            "/usr/bin/openssl",
+            "speed",
+            "-elapsed",
+            "-seconds",
+            "60",
+            "-evp",
+            "SHA256",
+            "-bytes",
+            "64",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        child.release_retaining_exit().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let records = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let pid = child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let first = session.reconcile_records(&records);
+        assert!(
+            session.targets.contains_key(&pid),
+            "first acquire must attach; gaps={:?}",
+            first.gaps
+        );
+        // The attach must spend above the watermark, otherwise the
+        // release assertions below prove nothing.
+        let spent_after_attach = session.budget.state_spent_test();
+        assert!(
+            spent_after_attach > session.setup_state_spent,
+            "attach must spend above the setup watermark"
+        );
+        let reads_after_attach = session.budget.spent_reads();
+        assert!(
+            reads_after_attach > session.setup_reads_spent,
+            "attach must spend reads above the setup watermark"
+        );
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.retire_for_gap(
+            pid,
+            None,
+            ObservationGap::ProcessChanged,
+            &mut ObservationBatch::default(),
+        );
+        assert!(session.targets.is_empty(), "retire must drop the target");
+        // Mechanism: with nothing live, retire releases acquisition
+        // spend back to the setup watermark. Standing setup leases stay
+        // live (their guards subtract on drop), so the release keeps
+        // floor + reserved, never below.
+        assert_eq!(
+            session.budget.state_spent_test(),
+            session.setup_state_spent + session.budget.reserved_test(),
+            "retire must release non-reserved acquisition spend to the setup watermark"
+        );
+        assert_eq!(
+            session.budget.spent_reads(),
+            session.setup_reads_spent,
+            "retire must release read spend to the setup watermark"
+        );
+        let records2 = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records2.len(), 1);
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let second = session.reconcile_records(&records2);
+        assert!(
+            session.targets.contains_key(&pid),
+            "re-add after retire must re-acquire; gaps={:?}",
+            second.gaps
+        );
+        child.finish_observation().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn recoverable_retire_reuses_shared_admission_under_tight_process_budget() {
+        // Regression: with max_processes = 1 (the focused spawn path), a
+        // retire on a recoverable gap (ReadLimit from revalidation, not an
+        // identity change) must preserve the incarnation so the next tick
+        // re-adds through the shared admission. Pre-fix the re-add took
+        // the fresh path, starved on ProcessLimit forever (the retired
+        // lease stays alive through retained site custody), and the run
+        // went permanently blind mid-window.
+        let argv = [
+            "/usr/bin/openssl",
+            "speed",
+            "-elapsed",
+            "-seconds",
+            "60",
+            "-evp",
+            "SHA256",
+            "-bytes",
+            "64",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .unwrap();
+        child.release_retaining_exit().unwrap();
+        std::thread::sleep(Duration::from_millis(500));
+        let records = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let pid = child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let limits = super::super::ObservationLimits {
+            max_processes: 1,
+            ..Default::default()
+        };
+        let max_reads = limits.max_elf_read_bytes;
+        let mut session =
+            ProviderSession::open_budgeted(ObservationBudget::new(limits), &object).unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let first = session.reconcile_records(&records);
+        assert!(
+            session.targets.contains_key(&pid),
+            "first acquire must attach; gaps={:?}",
+            first.gaps
+        );
+        // Let the revalidation memo expire (1s grace): the attach's
+        // fence checks stamp it, and the retirement check below must run
+        // full — same as live tick spacing.
+        std::thread::sleep(Duration::from_millis(1200));
+        // Exhaust the read budget: the next reconcile's retirement
+        // revalidation fails ReadLimit (recoverable), forcing the
+        // preserve-and-defer path instead of a terminal retire.
+        let room = max_reads.saturating_sub(session.budget.elf_read_bytes());
+        session.budget.read(room).unwrap();
+        let records2 = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records2.len(), 1);
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let retired = session.reconcile_records(&records2);
+        assert!(
+            retired.gaps.contains(&ObservationGap::ReadLimit),
+            "retire must record the honest gap; gaps={:?}",
+            retired.gaps
+        );
+        assert!(
+            session.targets.is_empty(),
+            "recoverable retire must drop the target"
+        );
+        assert!(
+            session.refreshing.contains_key(&pid),
+            "recoverable retire must preserve the incarnation for re-add"
+        );
+        // The re-add is deferred one tick (same cost class as the first
+        // attach, so it must not run inside the retiring tick).
+        let records3 = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records3.len(), 1);
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let recovered = session.reconcile_records(&records3);
+        assert!(
+            !recovered.gaps.contains(&ObservationGap::ProcessLimit),
+            "re-add must reuse the shared admission; gaps={:?}",
+            recovered.gaps
+        );
+        assert!(
+            session.targets.contains_key(&pid),
+            "re-add after recoverable retire must re-acquire; gaps={:?}",
+            recovered.gaps
+        );
+        child.finish_observation().unwrap();
     }
 }

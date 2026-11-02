@@ -78,7 +78,19 @@ impl Default for ObservationLimits {
             max_learned_sites: 4096,
             max_facts: 16384,
             ring_bytes: 1048576,
-            max_state_bytes: 67108864,
+            // Funds the documented two-mode spawn observation: session
+            // setup (~8M) + legacy startup (~4M) + typed-source retention
+            // (~31M: source maps/iterator capacity plus full-file anchors,
+            // retained even under a disabled native lease so the focused
+            // counter can borrow the producer/source maps) + a full legacy
+            // attach (~28M, full-file anchors per mapped object plus
+            // per-site roles/links). Measured together at ~71M; the
+            // legacy-era 64M ceiling starved every spawn-path attach with
+            // a deterministic StateLimit and zero operational rows. The
+            // model is conservative capacity (kernel map sizes, full-file
+            // anchors), not host RSS; pathological single objects still
+            // refuse. Native fit pins track this default, never a literal.
+            max_state_bytes: 96 << 20,
             max_elf_read_bytes: 268435456,
         }
     }
@@ -88,6 +100,11 @@ struct Work {
     processes: usize,
     objects: usize,
     state: usize,
+    /// State bytes currently held by live [`StateReservation`] guards.
+    /// Invariant: `reserved <= state`. Retire-time release must preserve
+    /// these bytes: dropping a guard subtracts from `state`, so lowering
+    /// `state` below live reservations would underflow on drop.
+    reserved: usize,
     reads: u64,
 }
 // A failed acquisition owns no retained state. Its provisional admissions can
@@ -117,7 +134,12 @@ pub(crate) struct StateReservation {
 }
 impl StateReservation {
     pub(crate) fn retain(mut self) {
-        self.bytes = 0;
+        let bytes = std::mem::replace(&mut self.bytes, 0);
+        // Retained bytes stay in `state` permanently but leave the
+        // reserved set: the guard will no longer subtract them on drop.
+        let mut work = self.work.borrow_mut();
+        debug_assert!(bytes <= work.reserved, "retain exceeds live reservations");
+        work.reserved = work.reserved.saturating_sub(bytes);
     }
     /// Test-only shared-spent readback through the retained
     /// reservation, so lifetime controls can observe the charge
@@ -129,7 +151,13 @@ impl StateReservation {
 }
 impl Drop for StateReservation {
     fn drop(&mut self) {
-        self.work.borrow_mut().state -= self.bytes;
+        let mut work = self.work.borrow_mut();
+        debug_assert!(
+            self.bytes <= work.reserved && self.bytes <= work.state,
+            "reservation drop exceeds accounted spend"
+        );
+        work.reserved = work.reserved.saturating_sub(self.bytes);
+        work.state = work.state.saturating_sub(self.bytes);
     }
 }
 /// Clones share cumulative admission, including lazy relocation work.
@@ -207,6 +235,8 @@ impl ObservationBudget {
     }
     pub(crate) fn reserve_state(&self, bytes: usize) -> Result<StateReservation, ObservationGap> {
         self.state(bytes)?;
+        let mut work = self.work.borrow_mut();
+        work.reserved = work.reserved.saturating_add(bytes);
         Ok(StateReservation {
             work: self.work.clone(),
             bytes,
@@ -225,11 +255,49 @@ impl ObservationBudget {
         work.state = next;
         Ok(())
     }
+    /// Test-only reserved-bytes readback, so retire/release controls can
+    /// distinguish standing setup leases from attach-time leaks.
+    #[cfg(test)]
+    pub(crate) fn reserved_test(&self) -> usize {
+        self.work.borrow().reserved
+    }
     /// Test-only spent-state readback, so small-budget controls can size an
     /// exact-fit versus one-byte-short budget through the real path.
     #[cfg(test)]
     pub(crate) fn state_spent_test(&self) -> usize {
+        self.spent_state()
+    }
+    /// Current cumulative state spend (setup plus live acquisitions).
+    pub(crate) fn spent_state(&self) -> usize {
         self.work.borrow().state
+    }
+    /// Current cumulative ELF-read spend.
+    pub(crate) fn spent_reads(&self) -> u64 {
+        self.work.borrow().reads
+    }
+    /// Release read spend back to a setup-time floor. Only moves
+    /// downward. Reads are cumulative across failed acquisitions by
+    /// design, but a retired live target's reads are dead spend like
+    /// its state: without a release here, no post-retire re-add could
+    /// ever re-parse its objects. Same guard as state release.
+    pub(crate) fn release_reads_to_floor(&self, floor: u64) {
+        let mut work = self.work.borrow_mut();
+        work.reads = work.reads.min(floor);
+    }
+    /// Release acquisition spend back to a setup-time floor. Only moves
+    /// downward: floors above current spend are a no-op. Live
+    /// reservations are preserved: dropping a guard subtracts from
+    /// `state`, so the floor keeps `floor + reserved` bytes. Callers
+    /// must ensure no live attachment owns direct spend above the
+    /// floor (retire releases only when nothing remains live).
+    pub(crate) fn release_state_to_floor(&self, floor: usize) {
+        let mut work = self.work.borrow_mut();
+        if floor >= work.state {
+            return; // nothing above the floor: no-op
+        }
+        let keep = floor.saturating_add(work.reserved);
+        debug_assert!(keep <= work.state, "release floor exceeds accounted spend");
+        work.state = work.state.min(keep);
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -694,5 +762,35 @@ mod admission_tests {
         drop(admitted);
         assert!(budget.process().is_ok());
         assert_eq!(budget.state(1), Err(ObservationGap::StateLimit));
+    }
+    #[test]
+    fn release_to_floor_preserves_live_reservations_and_never_underflows() {
+        let budget = ObservationBudget::new(ObservationLimits {
+            max_state_bytes: 1000,
+            ..Default::default()
+        });
+        budget.state(100).unwrap(); // permanent setup-like spend
+        let floor = budget.spent_state();
+        let guard = budget.reserve_state(300).unwrap(); // live reservation
+        budget.state(200).unwrap(); // permanent acquisition-like spend
+        assert_eq!(budget.spent_state(), 600);
+        // Release keeps floor + live reservations; the guard must still
+        // drop cleanly afterwards (no underflow, no panic).
+        budget.release_state_to_floor(floor);
+        assert_eq!(budget.spent_state(), floor + 300);
+        drop(guard);
+        assert_eq!(budget.spent_state(), floor);
+        // Retained reservations leave the reserved set (no double-drop
+        // on release) but their spend is still acquisition spend, so a
+        // later release drops it like any other dead spend.
+        let kept = budget.reserve_state(50).unwrap();
+        assert_eq!(budget.spent_state(), floor + 50);
+        kept.retain(); // consumes; implicit drop subtracts 0
+        assert_eq!(budget.spent_state(), floor + 50);
+        budget.release_state_to_floor(floor);
+        assert_eq!(budget.spent_state(), floor);
+        // Floors above current spend are a no-op.
+        budget.release_state_to_floor(floor + 5000);
+        assert_eq!(budget.spent_state(), floor);
     }
 }
