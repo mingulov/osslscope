@@ -563,6 +563,15 @@ impl FocusedCounter {
     pub(crate) fn take_attach_diagnostics(&mut self) -> std::collections::BTreeSet<String> {
         std::mem::take(&mut self.attach_diagnostics)
     }
+    /// Test-only stimulus peek: true while an undrained link
+    /// diagnostic sits in the counter. The session drain runs at
+    /// finish; polls cannot see the diagnostic until then, so a
+    /// session-level pin synchronizes on this instead of spinning
+    /// on the session set.
+    #[cfg(test)]
+    pub(crate) fn attach_diagnostics_pending_for_test(&self) -> bool {
+        !self.attach_diagnostics.is_empty()
+    }
     /// Pure ENGINE-pin custody check (no retire, no gaps):
     /// every retained pin still shows its attach-time stamp.
     /// Exit-safe (file stamps only, no live-target checks), so
@@ -2724,64 +2733,45 @@ mod startup_controls {
             // SAFETY: we own fds[0]; closing the unused read end.
             unsafe { libc::close(fds[0]) };
             let verdict: u8 = worker_verdict();
-            let buf = [verdict];
-            // SAFETY: buf is one readable byte; fds[1] is the owned pipe end.
+            // Best-effort report: any write failure ends here and the
+            // parent fails on the short read.
+            let _ = crate::target::write_all_pipe(fds[1], &[verdict]);
+            // SAFETY: fds[1] is the owned pipe end; _exit never returns.
             unsafe {
-                libc::write(fds[1], buf.as_ptr().cast(), 1);
                 libc::close(fds[1]);
                 libc::_exit(0);
             }
         }
         // SAFETY: we own fds[1]; closing the unused write end.
         unsafe { libc::close(fds[1]) };
-        // Parent-enforced deadline: worker-internal deadlines cannot
-        // interrupt a wedged worker (post-fork lock contention hangs
-        // the worker before any deadline runs), so a worker that never
-        // reports must fail the pin, never hang the suite.
-        // SAFETY: pfd borrows the owned pipe end; the timeout is finite.
-        let mut pfd = libc::pollfd {
-            fd: fds[0],
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        // One deadline spans the verdict read and the worker's exit:
+        // a worker that never reports — or reports and never exits —
+        // fails the pin, never hangs the suite. Waits are
+        // EINTR-retried; an interrupted wait never reads as an
+        // exited child.
         let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let remaining = deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as libc::c_int;
-            let polled = unsafe { libc::poll(&mut pfd, 1, remaining.max(0)) };
-            if polled < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                panic!("link pin verdict poll failed");
-            }
-            if polled == 0 {
-                // SAFETY: forked is the live child pid; killing and
-                // reaping the wedged worker, then closing our pipe end.
-                unsafe {
-                    libc::kill(forked, libc::SIGKILL);
-                    let mut status = 0;
-                    libc::waitpid(forked, &mut status, 0);
-                    libc::close(fds[0]);
-                }
-                panic!("link pin worker timed out without a verdict");
-            }
-            break;
-        }
         let mut buf = [0u8; 1];
-        // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
-        let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
+        if let Err(e) = crate::target::read_exact_deadline(fds[0], &mut buf, deadline) {
+            crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
+            // SAFETY: we own fds[0].
+            unsafe { libc::close(fds[0]) };
+            panic!("link pin verdict unread ({e}); worker killed");
+        }
         // SAFETY: we own fds[0].
         unsafe { libc::close(fds[0]) };
-        let mut status = 0;
-        // SAFETY: forked is the live child pid; status is writable.
-        unsafe { libc::waitpid(forked, &mut status, 0) };
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "link pin worker exited abnormally: {status}"
-        );
-        assert_eq!(read, 1, "child reported no verdict");
+        match crate::target::wait_test_child(forked as u32, deadline) {
+            crate::target::TestChildWait::Reaped(status) => assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "link pin worker exited abnormally: {status}"
+            ),
+            crate::target::TestChildWait::Gone => {
+                panic!("link pin worker reaped elsewhere (sole-reaper violated)")
+            }
+            crate::target::TestChildWait::Timeout => {
+                crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
+                panic!("link pin worker reported but never exited; killed");
+            }
+        }
         match buf[0] {
             1 => {}
             2 => {
@@ -2888,18 +2878,31 @@ mod startup_controls {
         if !cfg!(target_arch = "x86_64") {
             return 2;
         }
-        // Positively identify kernel support before installing: a NULL
-        // filter address must fail EFAULT when SECCOMP_MODE_FILTER
-        // exists, EINVAL when the kernel lacks it. This probe installs
-        // nothing, so NO_NEW_PRIVS is not needed yet.
+        // Positively identify kernel support before installing. The
+        // NULL-filter probe installs nothing, so NO_NEW_PRIVS is not
+        // needed yet — and every outcome is classified explicitly:
+        // only a recognized lack of support skips; anything
+        // unexpected fails.
         // SAFETY: prctl with a NULL filter installs nothing; the
-        // return/errno pair is only inspected.
-        let supported = unsafe {
-            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, 0) != 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
-        };
-        if !supported {
-            return 2;
+        // return/errno pair is only inspected (no syscall between
+        // the prctl and the errno read, so the errno is the
+        // probe's).
+        let probe = unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, 0) };
+        if probe == 0 {
+            // A NULL filter cannot install: success here is
+            // impossible — fail, investigate, do not skip.
+            return 3;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            // The kernel has no SECCOMP_MODE_FILTER: positively
+            // identified missing prerequisite, skip.
+            Some(libc::EINVAL) => return 2,
+            // The mode exists (only the NULL address was refused):
+            // supported, proceed to install.
+            Some(libc::EFAULT) => {}
+            // Anything else (EPERM, EACCES, ...) is unexpected:
+            // fail, investigate, do not skip.
+            _ => return 3,
         }
         let jailed = {
             let prog = [
@@ -2954,17 +2957,23 @@ mod startup_controls {
         if !jailed {
             return 3;
         }
+        // Fail-open count: if /proc/self/fd is unreadable the attach
+        // below fails too and the pin fails on the resulting
+        // CountFailure — a broken pin can only go undetected
+        // alongside a broken /proc.
         let link_fds = || -> usize {
             std::fs::read_dir("/proc/self/fd")
-                .unwrap()
-                .flatten()
-                .filter(|p| {
-                    std::fs::read_link(p.path()).is_ok_and(|n| {
-                        n.to_string_lossy().contains("bpf-link")
-                            || n.to_string_lossy().contains("bpf_link")
-                    })
+                .map(|dir| {
+                    dir.flatten()
+                        .filter(|p| {
+                            std::fs::read_link(p.path()).is_ok_and(|n| {
+                                n.to_string_lossy().contains("bpf-link")
+                                    || n.to_string_lossy().contains("bpf_link")
+                            })
+                        })
+                        .count()
                 })
-                .count()
+                .unwrap_or(0)
         };
         let baseline = link_fds();
         let cancel = AtomicBool::new(false);

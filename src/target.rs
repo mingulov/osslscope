@@ -398,6 +398,152 @@ fn reap_once(pid: u32) -> anyhow::Result<Option<i32>> {
     }
 }
 
+/// Test-only child-wait outcome. EINTR-retried; never panics so Drop
+/// guards can use it.
+#[cfg(test)]
+pub(crate) enum TestChildWait {
+    /// Reaped; carries the raw wait status.
+    Reaped(i32),
+    /// ECHILD: reaped elsewhere (sole-reaper tests treat this as a
+    /// failure — their child is exclusively theirs).
+    Gone,
+    /// Still unreaped at the deadline (the child may still be alive).
+    Timeout,
+}
+
+/// Test-only bounded child completion: EINTR-retried WNOHANG reap at
+/// a 10ms cadence until `deadline`. A successful wait for the
+/// expected pid is required — an interrupted waitpid must never read
+/// as an exited child.
+#[cfg(test)]
+pub(crate) fn wait_test_child(pid: u32, deadline: Instant) -> TestChildWait {
+    loop {
+        let mut status = 0;
+        // SAFETY: pid names the caller's child; status is writable;
+        // WNOHANG never blocks.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r > 0 {
+            return TestChildWait::Reaped(status);
+        }
+        if r < 0 {
+            match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::EINTR) => continue,
+                Some(libc::ECHILD) => return TestChildWait::Gone,
+                // No WUNTRACED/WCONTINUED was requested, so a
+                // stop/continue report cannot occur; any other errno
+                // (EINVAL: not our child) is a caller bug — but this
+                // helper must not panic (Drop guards use it), so
+                // report it as gone and let the caller fail loud on
+                // the unexpected outcome.
+                _ => return TestChildWait::Gone,
+            }
+        }
+        if Instant::now() >= deadline {
+            return TestChildWait::Timeout;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Test-only best-effort child teardown: SIGKILL (errors ignored —
+/// ESRCH is expected when the child already died), then a bounded
+/// reap whose outcome is ignored. For watchdog paths and Drop
+/// guards; the test itself fails separately on the timeout.
+#[cfg(test)]
+pub(crate) fn kill_test_child(pid: u32, grace: Duration) {
+    // SAFETY: pid names the caller's child (or a dead pid, in which
+    // case the kill fails closed with ESRCH).
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+    }
+    let _ = wait_test_child(pid, Instant::now() + grace);
+}
+
+/// Test-only poll-bounded exact read for verdict pipes: waits POLLIN
+/// until `deadline`, retries EINTR on poll and read, and fills `buf`
+/// (short reads loop). `Ok(())` means `buf` is full; `Err` is
+/// TimedOut (nothing became readable), UnexpectedEof (the writer
+/// died mid-protocol), or the underlying I/O error.
+#[cfg(test)]
+pub(crate) fn read_exact_deadline(
+    fd: RawFd,
+    mut buf: &mut [u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    while !buf.is_empty() {
+        let remaining = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis();
+        // SAFETY: pfd borrows the caller's pipe end; the timeout is finite.
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let polled = loop {
+            let timeout = remaining.min(libc::c_int::MAX as u128) as libc::c_int;
+            // SAFETY: pfd is one valid pollfd; timeout non-negative.
+            let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
+            if r < 0 && Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break r;
+        };
+        if polled < 0 {
+            return Err(Error::last_os_error());
+        }
+        if polled == 0 {
+            return Err(Error::new(ErrorKind::TimedOut, "verdict pipe unreadable"));
+        }
+        // SAFETY: buf is writable for buf.len(); fd is the caller's pipe end.
+        let r = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if r < 0 {
+            let e = Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        if r == 0 {
+            return Err(Error::new(ErrorKind::UnexpectedEof, "verdict writer died"));
+        }
+        let (_, rest) = buf.split_at_mut(r as usize);
+        buf = rest;
+    }
+    Ok(())
+}
+
+/// Test-only EINTR-retried write-all for verdict pipes (no deadline:
+/// a few bytes to a live parent never block; EPIPE and other errors
+/// return Err and the fork child _exits — the parent fails on the
+/// short read).
+#[cfg(test)]
+pub(crate) fn write_all_pipe(fd: RawFd, mut buf: &[u8]) -> std::io::Result<()> {
+    use std::io::Error;
+    while !buf.is_empty() {
+        // SAFETY: buf is readable for buf.len(); fd is the caller's pipe end.
+        let r = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if r < 0 {
+            let e = Error::last_os_error();
+            if e.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(e);
+        }
+        // A zero write with a nonempty buf means nothing more will
+        // ever be accepted; report it instead of spinning.
+        if r == 0 {
+            return Err(Error::new(
+                std::io::ErrorKind::WriteZero,
+                "verdict pipe wrote nothing",
+            ));
+        }
+        buf = &buf[r as usize..];
+    }
+    Ok(())
+}
+
 /// Workload stdio destination (H9/R07, pinned under R06): where a
 /// spawned child's stdout+stderr go. Observer stderr NEVER carries
 /// workload bytes: the default sinks to /dev/null and explicit

@@ -13175,14 +13175,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                 if !self.armed {
                     return;
                 }
-                // SAFETY: pid is the live unreaped vehicle (every
-                // explicit reap disarms first); kill-then-reap owns
-                // exactly this child.
-                unsafe {
-                    libc::kill(self.pid, libc::SIGKILL);
-                    let mut status = 0;
-                    libc::waitpid(self.pid, &mut status, 0);
-                }
+                // The pid is the live unreaped vehicle (every
+                // explicit reap disarms first); the shared teardown
+                // is EINTR-retried, bounded, and never panics, so it
+                // is unwind-safe here.
+                crate::target::kill_test_child(self.pid as u32, Duration::from_secs(5));
             }
         }
         let mut vehicle = ReapOnDrop {
@@ -13212,12 +13209,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         if !ready {
             eprintln!("skip foreign-refusal pin: target never settled");
             vehicle.armed = false;
-            // SAFETY: reaping the vehicle.
-            unsafe {
-                libc::kill(b_pid as i32, libc::SIGKILL);
-                let mut status = 0;
-                libc::waitpid(b_pid as i32, &mut status, 0);
-            }
+            crate::target::kill_test_child(b_pid, Duration::from_secs(5));
             return;
         }
         let object =
@@ -13300,72 +13292,47 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                     _ => 2,
                 }
             };
-            let buf = [verdict];
-            // SAFETY: buf is one readable byte; fds[1] is the owned pipe end.
+            // Best-effort report: any write failure ends here and the
+            // parent fails on the short read.
+            let _ = crate::target::write_all_pipe(fds[1], &[verdict]);
+            // SAFETY: fds[1] is the owned pipe end; _exit never returns.
             unsafe {
-                libc::write(fds[1], buf.as_ptr().cast(), 1);
                 libc::close(fds[1]);
                 libc::_exit(0);
             }
         }
         // SAFETY: we own fds[1]; closing the unused write end.
         unsafe { libc::close(fds[1]) };
-        // Parent-enforced deadline: worker-internal deadlines cannot
-        // interrupt a wedged worker (post-fork lock contention hangs
-        // the worker before any deadline runs), so a worker that never
-        // reports must fail the pin, never hang the suite.
-        // SAFETY: pfd borrows the owned pipe end; the timeout is finite.
-        let mut pfd = libc::pollfd {
-            fd: fds[0],
-            events: libc::POLLIN,
-            revents: 0,
-        };
+        // One deadline spans the verdict read and the worker's exit:
+        // a worker that never reports — or reports and never exits —
+        // fails the pin, never hangs the suite. Waits are
+        // EINTR-retried; an interrupted wait never reads as an
+        // exited child. The vehicle guard reaps B on every unwind.
         let verdict_deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let remaining = verdict_deadline
-                .saturating_duration_since(Instant::now())
-                .as_millis() as libc::c_int;
-            let polled = unsafe { libc::poll(&mut pfd, 1, remaining.max(0)) };
-            if polled < 0 {
-                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                    continue;
-                }
-                panic!("foreign-refusal pin verdict poll failed");
-            }
-            if polled == 0 {
-                // SAFETY: forked is the live child pid; killing and
-                // reaping the wedged worker, then closing our pipe end.
-                // The vehicle guard reaps B during the unwind.
-                unsafe {
-                    libc::kill(forked, libc::SIGKILL);
-                    let mut status = 0;
-                    libc::waitpid(forked, &mut status, 0);
-                    libc::close(fds[0]);
-                }
-                panic!("foreign-refusal pin worker timed out without a verdict");
-            }
-            break;
-        }
         let mut buf = [0u8; 1];
-        // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
-        let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
+        if let Err(e) = crate::target::read_exact_deadline(fds[0], &mut buf, verdict_deadline) {
+            crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
+            // SAFETY: we own fds[0].
+            unsafe { libc::close(fds[0]) };
+            panic!("foreign-refusal pin verdict unread ({e}); worker killed");
+        }
         // SAFETY: we own fds[0].
         unsafe { libc::close(fds[0]) };
-        let mut status = 0;
-        // SAFETY: forked is the live child pid; status is writable.
-        unsafe { libc::waitpid(forked, &mut status, 0) };
-        assert!(
-            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-            "foreign-refusal pin worker exited abnormally: {status}"
-        );
-        vehicle.armed = false;
-        // SAFETY: reaping the vehicle.
-        unsafe {
-            libc::kill(b_pid as i32, libc::SIGKILL);
-            let mut status = 0;
-            libc::waitpid(b_pid as i32, &mut status, 0);
+        match crate::target::wait_test_child(forked as u32, verdict_deadline) {
+            crate::target::TestChildWait::Reaped(status) => assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "foreign-refusal pin worker exited abnormally: {status}"
+            ),
+            crate::target::TestChildWait::Gone => {
+                panic!("foreign-refusal pin worker reaped elsewhere (sole-reaper violated)")
+            }
+            crate::target::TestChildWait::Timeout => {
+                crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
+                panic!("foreign-refusal pin worker reported but never exited; killed");
+            }
         }
-        assert_eq!(read, 1, "child reported no verdict");
+        vehicle.armed = false;
+        crate::target::kill_test_child(b_pid, Duration::from_secs(5));
         match buf[0] {
             1 => {}
             2 => {
