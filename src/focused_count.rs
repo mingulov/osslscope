@@ -2734,6 +2734,41 @@ mod startup_controls {
         }
         // SAFETY: we own fds[1]; closing the unused write end.
         unsafe { libc::close(fds[1]) };
+        // Parent-enforced deadline: worker-internal deadlines cannot
+        // interrupt a wedged worker (post-fork lock contention hangs
+        // the worker before any deadline runs), so a worker that never
+        // reports must fail the pin, never hang the suite.
+        // SAFETY: pfd borrows the owned pipe end; the timeout is finite.
+        let mut pfd = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as libc::c_int;
+            let polled = unsafe { libc::poll(&mut pfd, 1, remaining.max(0)) };
+            if polled < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("link pin verdict poll failed");
+            }
+            if polled == 0 {
+                // SAFETY: forked is the live child pid; killing and
+                // reaping the wedged worker, then closing our pipe end.
+                unsafe {
+                    libc::kill(forked, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(forked, &mut status, 0);
+                    libc::close(fds[0]);
+                }
+                panic!("link pin worker timed out without a verdict");
+            }
+            break;
+        }
         let mut buf = [0u8; 1];
         // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
         let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
@@ -2742,11 +2777,15 @@ mod startup_controls {
         let mut status = 0;
         // SAFETY: forked is the live child pid; status is writable.
         unsafe { libc::waitpid(forked, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "link pin worker exited abnormally: {status}"
+        );
         assert_eq!(read, 1, "child reported no verdict");
         match buf[0] {
             1 => {}
             2 => {
-                eprintln!("skip link pin: kernel allowed the unprivileged link");
+                eprintln!("skip link pin: seccomp-bpf unsupported or foreign arch");
                 return;
             }
             other => {
@@ -2756,9 +2795,12 @@ mod startup_controls {
     }
 
     /// Post-fork worker for [`unprivileged_attach_records_link_diagnostic`]:
-    /// 1 ok, 2 skip (kernel allowed the decapabilitied link, or setup
-    /// unavailable), 5 attach-Attach without a shaped diagnostic, 10-17
-    /// any other [`CountFailure`], 3 setup failure.
+    /// 1 ok, 2 skip (seccomp-bpf positively unsupported, or foreign
+    /// arch the x86_64-only filter cannot deny), 0 filter installed
+    /// yet the link succeeded (broken pin), 5 attach-Attach without a
+    /// shaped diagnostic, 10-17 any other [`CountFailure`], 3 setup
+    /// failure (missing object/vehicle support, or a failed install
+    /// on a supporting kernel).
     fn worker_verdict() -> u8 {
         use crate::capture::ClockPort;
         let argv = vec![
@@ -2840,6 +2882,25 @@ mod startup_controls {
         const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
         const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
         const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+        // The deny filter below is x86_64-only; any other arch
+        // must skip (positively identified), never pass vacuously or
+        // fail spuriously.
+        if !cfg!(target_arch = "x86_64") {
+            return 2;
+        }
+        // Positively identify kernel support before installing: a NULL
+        // filter address must fail EFAULT when SECCOMP_MODE_FILTER
+        // exists, EINVAL when the kernel lacks it. This probe installs
+        // nothing, so NO_NEW_PRIVS is not needed yet.
+        // SAFETY: prctl with a NULL filter installs nothing; the
+        // return/errno pair is only inspected.
+        let supported = unsafe {
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, 0) != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
+        };
+        if !supported {
+            return 2;
+        }
         let jailed = {
             let prog = [
                 SockFilter {
@@ -2888,8 +2949,10 @@ mod startup_controls {
                     && libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog) == 0
             }
         };
+        // Support was proven above: a failed install is a broken
+        // pin, not a skip.
         if !jailed {
-            return 2;
+            return 3;
         }
         let link_fds = || -> usize {
             std::fs::read_dir("/proc/self/fd")
@@ -2916,11 +2979,10 @@ mod startup_controls {
             &cancel,
         ) {
             Ok(()) => {
-                if link_fds() > baseline {
-                    2
-                } else {
-                    6
-                }
+                // The filter is installed on a known arch: a new link
+                // means the denial did not deny (broken pin). No new
+                // link with Ok means the attach went nowhere (6).
+                if link_fds() > baseline { 0 } else { 6 }
             }
             Err(CountFailure::Attach) => {
                 let diags = counter.take_attach_diagnostics();

@@ -1870,7 +1870,10 @@ impl FocusedSession {
             }
         }
         let counter_cpus = self.counter.as_ref().map(|c| c.cpus());
-        if let Some(c) = self.counter.take() {
+        if let Some(mut c) = self.counter.take() {
+            // Drain link diagnostics before close() consumes the
+            // counter (after the take there is nothing to drain).
+            self.attach_diagnostics.extend(c.take_attach_diagnostics());
             self.sample = c.close(deadline);
         }
         // Final ENGINE news from the closed cut, then join counts
@@ -2023,10 +2026,6 @@ impl FocusedSession {
                 CounterSource::Discovery,
                 1,
             ));
-        }
-        if let Some(counter) = self.counter.as_mut() {
-            self.attach_diagnostics
-                .extend(counter.take_attach_diagnostics());
         }
         let mut document = project(
             self.pid,
@@ -3222,5 +3221,276 @@ mod session_tests {
             .is_err()
         );
         assert!(cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn denied_link_diagnostic_survives_session_finish() {
+        // Root forks a worker that opens a real FocusedSession on a
+        // spawned vehicle, then installs a seccomp filter denying only
+        // bpf() with EPERM: the attach's link_create fails
+        // deterministically, and finish() must carry the shaped link
+        // diagnostic onto the document. The counter is consumed by
+        // close() before projection, so the drain must happen at the
+        // take — this test pins that ordering (a drain after the
+        // take silently drops every link diagnostic).
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip finish pin: needs root");
+            return;
+        }
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable ints; return checked.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: single-threaded test; the child runs the worker
+        // (session open, seccomp deny, polls, finish), reports one
+        // verdict byte, and _exits.
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0, "fork failed");
+        if forked == 0 {
+            // SAFETY: we own fds[0]; closing the unused read end.
+            unsafe { libc::close(fds[0]) };
+            let verdict: u8 = finish_worker_verdict();
+            let buf = [verdict];
+            // SAFETY: buf is one readable byte; fds[1] is the owned pipe end.
+            unsafe {
+                libc::write(fds[1], buf.as_ptr().cast(), 1);
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: we own fds[1]; closing the unused write end.
+        unsafe { libc::close(fds[1]) };
+        // Parent-enforced deadline: worker-internal deadlines cannot
+        // interrupt a wedged worker (post-fork lock contention hangs
+        // the worker before any deadline runs), so a worker that never
+        // reports must fail the pin, never hang the suite.
+        // SAFETY: pfd borrows the owned pipe end; the timeout is finite.
+        let mut pfd = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let deadline = Instant::now() + Duration::from_secs(180);
+        loop {
+            let remaining = deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as libc::c_int;
+            let polled = unsafe { libc::poll(&mut pfd, 1, remaining.max(0)) };
+            if polled < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("finish pin verdict poll failed");
+            }
+            if polled == 0 {
+                // SAFETY: forked is the live child pid; killing and
+                // reaping the wedged worker, then closing our pipe end.
+                unsafe {
+                    libc::kill(forked, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(forked, &mut status, 0);
+                    libc::close(fds[0]);
+                }
+                panic!("finish pin worker timed out without a verdict");
+            }
+            break;
+        }
+        let mut buf = [0u8; 1];
+        // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
+        let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
+        // SAFETY: we own fds[0].
+        unsafe { libc::close(fds[0]) };
+        let mut status = 0;
+        // SAFETY: forked is the live child pid; status is writable.
+        unsafe { libc::waitpid(forked, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "finish pin worker exited abnormally: {status}"
+        );
+        assert_eq!(read, 1, "child reported no verdict");
+        match buf[0] {
+            1 => {}
+            2 => {
+                eprintln!("skip finish pin: seccomp-bpf unsupported or foreign arch");
+                return;
+            }
+            other => {
+                panic!("finish pin verdict {other} (0=link-succeeded, 3=setup, 5=no-diag)")
+            }
+        }
+    }
+
+    /// Post-fork worker for
+    /// [`denied_link_diagnostic_survives_session_finish`]: 1 ok, 2
+    /// skip (seccomp-bpf positively unsupported, or foreign arch the
+    /// x86_64-only filter cannot deny), 0 filter installed yet a link
+    /// succeeded (broken pin), 5 finished without a shaped link
+    /// diagnostic, 3 setup failure.
+    fn finish_worker_verdict() -> u8 {
+        let count = match std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT")
+            .and_then(|path| std::fs::read(path).ok())
+        {
+            Some(bytes) => bytes,
+            None => return 3,
+        };
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count_sha256: Sha256::digest(&count).into(),
+            count: Arc::from(count),
+        };
+        let cancel = AtomicBool::new(false);
+        // A self-limiting live vehicle: `dgst` would exit before the
+        // denied attach runs; `speed` keeps libcrypto mapped while
+        // the worker polls, and exits on its own if orphaned.
+        let mut session = match FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Spawn {
+                argv: vec![
+                    "/usr/bin/openssl".into(),
+                    "speed".into(),
+                    "-seconds".into(),
+                    "10".into(),
+                ],
+                workload: crate::target::WorkloadDest::Null,
+            },
+            objects,
+            Instant::now() + Duration::from_secs(30),
+            &cancel,
+            None,
+        ) {
+            Ok(session) => session,
+            Err(_) => return 3,
+        };
+        // Seccomp self-restriction: deny only the bpf() syscall with
+        // EPERM (same shape as the counter-level link pin —
+        // validation proceeds untouched, the attach's link_create
+        // fails deterministically). Skips stay positively identified:
+        // foreign arch, or a kernel that demonstrably lacks
+        // SECCOMP_MODE_FILTER.
+        if !cfg!(target_arch = "x86_64") {
+            return 2;
+        }
+        // SAFETY: prctl with a NULL filter installs nothing; the
+        // return/errno pair is only inspected.
+        let supported = unsafe {
+            libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, 0) != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EFAULT)
+        };
+        if !supported {
+            return 2;
+        }
+        // SAFETY: the program is six classic-BPF instructions over
+        // struct seccomp_data (nr at 0, arch at 4); jump targets are
+        // in range; prctl args are valid; NO_NEW_PRIVS first for the
+        // unprivileged-install rule.
+        #[repr(C)]
+        struct SockFilter {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *const SockFilter,
+        }
+        const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+        let jailed = {
+            let prog = [
+                SockFilter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 4,
+                },
+                SockFilter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 0,
+                    k: AUDIT_ARCH_X86_64,
+                },
+                SockFilter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                SockFilter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: libc::SYS_bpf as u32,
+                },
+                SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                },
+                SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ALLOW,
+                },
+            ];
+            let fprog = SockFprog {
+                len: prog.len() as u16,
+                filter: prog.as_ptr(),
+            };
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                    && libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog) == 0
+            }
+        };
+        // Support was proven above: a failed install is a broken
+        // pin, not a skip.
+        if !jailed {
+            return 3;
+        }
+        let link_fds = || -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .flatten()
+                .filter(|p| {
+                    std::fs::read_link(p.path()).is_ok_and(|n| {
+                        n.to_string_lossy().contains("bpf-link")
+                            || n.to_string_lossy().contains("bpf_link")
+                    })
+                })
+                .count()
+        };
+        let baseline = link_fds();
+        // Drive a few polls: the denied attach runs here and records
+        // its diagnostic. Poll errors under the deny filter are
+        // expected (map reads refuse too); finish still runs.
+        for _ in 0..5 {
+            let _ = session.poll(Instant::now(), &cancel);
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // The filter is installed on a known arch: a new link means
+        // the denial did not deny (broken pin). Check before finish
+        // closes everything.
+        if link_fds() > baseline {
+            return 0;
+        }
+        let result = match session.finish(Instant::now() + Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => return 3,
+        };
+        if result.document.attach_diagnostics.iter().any(|d| {
+            d.starts_with("attach:link count_entry@0x")
+                && crate::acquire_cause::attach_template_shape(
+                    d.strip_prefix("attach:").unwrap_or(""),
+                )
+        }) {
+            1
+        } else {
+            5
+        }
     }
 }

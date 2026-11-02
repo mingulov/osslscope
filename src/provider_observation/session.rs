@@ -13161,6 +13161,34 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             }
         }
         let b_pid = b_pid as u32;
+        // Unwind-safe vehicle custody: any panic after the fork
+        // (object/session unwraps, pipe/fork asserts, verdict
+        // asserts) still kills and reaps the 120-second sleeper.
+        // Explicit reaps below disarm the guard first: signalling a
+        // reaped pid after reuse could hit another process.
+        struct ReapOnDrop {
+            pid: libc::pid_t,
+            armed: bool,
+        }
+        impl Drop for ReapOnDrop {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                // SAFETY: pid is the live unreaped vehicle (every
+                // explicit reap disarms first); kill-then-reap owns
+                // exactly this child.
+                unsafe {
+                    libc::kill(self.pid, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(self.pid, &mut status, 0);
+                }
+            }
+        }
+        let mut vehicle = ReapOnDrop {
+            pid: b_pid as libc::pid_t,
+            armed: true,
+        };
         // Bounded readiness: comm == sleep plus settled maps.
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut stable: Option<String> = None;
@@ -13183,6 +13211,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         };
         if !ready {
             eprintln!("skip foreign-refusal pin: target never settled");
+            vehicle.armed = false;
             // SAFETY: reaping the vehicle.
             unsafe {
                 libc::kill(b_pid as i32, libc::SIGKILL);
@@ -13281,6 +13310,42 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         }
         // SAFETY: we own fds[1]; closing the unused write end.
         unsafe { libc::close(fds[1]) };
+        // Parent-enforced deadline: worker-internal deadlines cannot
+        // interrupt a wedged worker (post-fork lock contention hangs
+        // the worker before any deadline runs), so a worker that never
+        // reports must fail the pin, never hang the suite.
+        // SAFETY: pfd borrows the owned pipe end; the timeout is finite.
+        let mut pfd = libc::pollfd {
+            fd: fds[0],
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let verdict_deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let remaining = verdict_deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as libc::c_int;
+            let polled = unsafe { libc::poll(&mut pfd, 1, remaining.max(0)) };
+            if polled < 0 {
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                panic!("foreign-refusal pin verdict poll failed");
+            }
+            if polled == 0 {
+                // SAFETY: forked is the live child pid; killing and
+                // reaping the wedged worker, then closing our pipe end.
+                // The vehicle guard reaps B during the unwind.
+                unsafe {
+                    libc::kill(forked, libc::SIGKILL);
+                    let mut status = 0;
+                    libc::waitpid(forked, &mut status, 0);
+                    libc::close(fds[0]);
+                }
+                panic!("foreign-refusal pin worker timed out without a verdict");
+            }
+            break;
+        }
         let mut buf = [0u8; 1];
         // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
         let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
@@ -13289,6 +13354,11 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         let mut status = 0;
         // SAFETY: forked is the live child pid; status is writable.
         unsafe { libc::waitpid(forked, &mut status, 0) };
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "foreign-refusal pin worker exited abnormally: {status}"
+        );
+        vehicle.armed = false;
         // SAFETY: reaping the vehicle.
         unsafe {
             libc::kill(b_pid as i32, libc::SIGKILL);
