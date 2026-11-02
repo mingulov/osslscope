@@ -170,9 +170,11 @@ impl From<&crate::provider_observation::schema::ObservationGap> for AcquisitionC
             | AmbiguousSite
             | UnsupportedArchitecture
             | FirstQueryUnknown => AcquisitionCause::SymbolDiscovery,
-            BpfUnavailable | InvalidObject | InvalidWire | RelocationRefused => {
-                AcquisitionCause::BpfLoad
-            }
+            BpfUnavailable
+            | CompanionsUnavailable
+            | InvalidObject
+            | InvalidWire
+            | RelocationRefused => AcquisitionCause::BpfLoad,
             AttachFailed | ClassifierFailed | RegistrationRace | MembershipUnknown
             | UnpairedReturn | DispatchPartial | SamplingPartial => AcquisitionCause::Attach,
             SnapshotLag | Invalidated => AcquisitionCause::DeadlineCancel,

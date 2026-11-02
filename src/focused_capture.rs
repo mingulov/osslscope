@@ -178,6 +178,7 @@ fn observation_loss(gap: ObservationGap) -> GapCounter {
         ProcessLimit | ObjectLimit | LinkLimit | SiteLimit | FactLimit | StateLimit | ReadLimit => {
             ("focused.limit", CounterSource::Discovery)
         }
+        CompanionsUnavailable => ("focused.companions_unavailable", CounterSource::Setup),
         BpfUnavailable | InvalidObject | ClassifierFailed => {
             ("focused.tracing_unavailable", CounterSource::Setup)
         }
@@ -929,7 +930,10 @@ impl FocusedSession {
                 }
             }
         };
-        let mut session = if objects.observation.is_empty() || gate.is_none() {
+        let mut session = if objects.observation.is_empty() {
+            gaps.insert(ObservationGap::CompanionsUnavailable);
+            None
+        } else if gate.is_none() {
             gaps.insert(ObservationGap::BpfUnavailable);
             None
         } else {
@@ -1034,7 +1038,10 @@ impl FocusedSession {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
             bail!("focused setup interrupted or expired");
         }
-        let mut counter = if objects.count.is_empty() || gate.is_none() {
+        let mut counter = if objects.count.is_empty() {
+            gaps.insert(ObservationGap::CompanionsUnavailable);
+            None
+        } else if gate.is_none() {
             gaps.insert(ObservationGap::BpfUnavailable);
             None
         } else {

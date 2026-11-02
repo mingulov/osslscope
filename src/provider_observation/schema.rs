@@ -40,6 +40,7 @@ pub enum ObservationGap {
     FirstQueryUnknown,
     IntervalUnknown,
     BpfUnavailable,
+    CompanionsUnavailable,
     InvalidObject,
     InvalidWire,
     AttachFailed,

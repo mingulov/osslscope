@@ -617,6 +617,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             crate::report::err_line(&format!("osslscope: {e}"));
             ExitCode::from(2)
         })?;
+        crate::report::warn_empty_companions(&objects);
         let config = crate::focused_capture::FocusedConfig {
             duration: args.cfg.duration,
             timeout: args.cfg.harvest_timeout,

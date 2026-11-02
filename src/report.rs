@@ -428,6 +428,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             crate::report::err_line(&format!("osslscope: {e}"));
             ExitCode::from(2)
         })?;
+        crate::report::warn_empty_companions(&objects);
         let config = crate::focused_capture::FocusedConfig {
             duration: args.cfg.duration,
             timeout: args.cfg.harvest_timeout,
@@ -2984,6 +2985,17 @@ pub fn err_line(text: &str) {
     let stderr = std::io::stderr();
     let mut locked = stderr.lock();
     let _ = writeln!(locked, "{text}");
+}
+
+/// Loud companion miss: resolved objects came back empty (companion
+/// lookup or validation failed). Names the absence and the remedy;
+/// locator paths and IO errors stay private by design.
+pub fn warn_empty_companions(objects: &crate::focused_capture::FocusedObjects) {
+    if objects.observation.is_empty() || objects.count.is_empty() {
+        err_line(
+            "osslscope: BPF companions unavailable for tracing: pass --observation-object and --count-object, or reinstall osslscope",
+        );
+    }
 }
 
 #[cfg(test)]

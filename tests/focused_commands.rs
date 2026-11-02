@@ -303,7 +303,14 @@ fn missing_or_symlink_replaced_installed_companions_stay_explicitly_unavailable(
             assert!(
                 doc["completeness"]["counters"]
                     .to_string()
-                    .contains("focused.tracing_unavailable")
+                    .contains("focused.companions_unavailable"),
+                "missing companions must name companions, not generic tracing: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("companions"),
+                "stderr must name the missing companions: {}",
+                String::from_utf8_lossy(&out.stderr)
             );
             assert!(
                 doc.get("count_object")
