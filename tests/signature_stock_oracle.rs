@@ -14,7 +14,8 @@
 
 use osslscope::provider_observation::signature_workload::{
     EXPECTED_SIGNATURE_HEX, SIGN_ARGV, SIGNATURE_INPUT_SHA256_HEX, SIGNATURE_VEHICLE_BIN,
-    TEST_PRIVATE_KEY_PEM, TEST_PUBLIC_KEY_PEM, signature_workload_input,
+    TEST_PRIVATE_KEY_PEM, TEST_PRIVATE_KEY_SHA256_HEX, TEST_PUBLIC_KEY_PEM,
+    TEST_PUBLIC_KEY_SHA256_HEX, signature_workload_input,
 };
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -54,6 +55,14 @@ fn frozen_shape() {
     assert_eq!(input_hex, SIGNATURE_INPUT_SHA256_HEX);
     assert!(TEST_PRIVATE_KEY_PEM.starts_with("-----BEGIN PRIVATE KEY-----"));
     assert!(TEST_PUBLIC_KEY_PEM.starts_with("-----BEGIN PUBLIC KEY-----"));
+    // Literal PEM pins (not just headers): key replacement or
+    // corruption must fail here even on the absent-binary path.
+    let priv_digest: [u8; 32] = Sha256::digest(TEST_PRIVATE_KEY_PEM.as_bytes()).into();
+    let priv_hex: String = priv_digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(priv_hex, TEST_PRIVATE_KEY_SHA256_HEX);
+    let pub_digest: [u8; 32] = Sha256::digest(TEST_PUBLIC_KEY_PEM.as_bytes()).into();
+    let pub_hex: String = pub_digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(pub_hex, TEST_PUBLIC_KEY_SHA256_HEX);
 }
 
 fn stage() -> Option<PathBuf> {

@@ -56,6 +56,15 @@ IFqcLvmBuUfKLf8QyDuh3ibO+1Z5ppOk4VjK0qD8HrkpY1KyChvmM/FkF59bd57W
 -----END PUBLIC KEY-----
 "#;
 
+/// SHA-256 of [`TEST_PRIVATE_KEY_PEM`]: key replacement or corruption
+/// fails the oracle even on the absent-binary path.
+pub const TEST_PRIVATE_KEY_SHA256_HEX: &str =
+    "8b07690fb6ccf842aec4a1c1bbb271d6e21e044bd6a6ea47a279c36db9091dc4";
+
+/// SHA-256 of [`TEST_PUBLIC_KEY_PEM`]: same absent-path pin.
+pub const TEST_PUBLIC_KEY_SHA256_HEX: &str =
+    "b6f9b837953a3ca8c3c274cb2af59972905689477ee8ddfa531ebed7682b5515";
+
 /// Frozen sign argv words: `dgst -sha256 -sign <key> -out <sig> <input>`
 /// (key path, `-out`, sig path, input path appended by the caller).
 pub const SIGN_ARGV: &[&str] = &["dgst", "-sha256", "-sign"];
