@@ -9,7 +9,8 @@
 //! X25519 throwaway generated for this fixture, plainly not a secret; it
 //! is embedded so the workload needs no keygen step.
 //!
-//! Graceful SKIP only when the stock binary is absent; a
+//! Graceful SKIP only when the stock binary is absent or its pkeyutl
+//! lacks the KEM options (3.0.x, e.g. the ubuntu-24.04 CI lane); a
 //! present-but-broken binary FAILS (never silent).
 
 use osslscope::provider_observation::kem_workload::{
@@ -60,6 +61,23 @@ fn frozen_shape() {
     assert_eq!(pub_hex, TEST_PUBLIC_KEY_SHA256_HEX);
 }
 
+/// Capability probe: `pkeyutl -encap/-decap/-secret` exist only on
+/// newer OpenSSL (3.5 here); 3.0.x (e.g. the ubuntu-24.04 CI lane's
+/// 3.0.13, whose pkeyutl.c has no encap surface) must skip the live
+/// leg instead of failing the suite. Freeze pins above still run.
+fn pkeyutl_supports_kem(vehicle: &str) -> bool {
+    Command::new(vehicle)
+        .args(["pkeyutl", "-help"])
+        .output()
+        .map(|o| {
+            // Usage goes to stderr on some versions: scan both streams.
+            let help = String::from_utf8_lossy(&o.stdout).into_owned()
+                + &String::from_utf8_lossy(&o.stderr);
+            help.contains("-encap") && help.contains("-decap") && help.contains("-secret")
+        })
+        .unwrap_or(false)
+}
+
 fn stage() -> Option<PathBuf> {
     match probe_vehicle(KEM_VEHICLE_BIN) {
         VehicleProbe::Absent => {
@@ -69,10 +87,40 @@ fn stage() -> Option<PathBuf> {
         VehicleProbe::Broken(msg) => panic!("stock binary broken: {msg}"),
         VehicleProbe::Ready => {}
     }
+    if !pkeyutl_supports_kem(KEM_VEHICLE_BIN) {
+        eprintln!(
+            "SKIP KEM stock oracle: pkeyutl lacks -encap/-decap/-secret (needs KEM CLI, e.g. OpenSSL 3.5; 3.0.x unsupported)"
+        );
+        return None;
+    }
     let dir = std::env::temp_dir().join(format!("osslscope-kemoracle-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     Some(dir)
+}
+
+#[test]
+fn kem_capability_probe_detects_missing_kem_cli() {
+    // This host's stock openssl has the KEM CLI (3.5.5).
+    assert!(
+        pkeyutl_supports_kem(KEM_VEHICLE_BIN),
+        "host openssl must offer pkeyutl -encap/-decap/-secret"
+    );
+    // A vehicle whose help lacks the KEM options (e.g. OpenSSL 3.0.x,
+    // as on the ubuntu-24.04 CI lane) must probe unsupported so the
+    // live leg skips instead of failing the suite.
+    let dir = std::env::temp_dir().join(format!("osslscope-kemprobe-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("old-openssl");
+    std::fs::write(&fake, "#!/bin/sh\necho 'options: -sign -verify -derive'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(
+        !pkeyutl_supports_kem(fake.to_str().unwrap()),
+        "help without KEM options must probe unsupported"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
