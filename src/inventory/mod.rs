@@ -365,8 +365,9 @@ pub struct Gap {
     /// Appended last to preserve record order.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub errno: Option<i32>,
-    /// Observer euid refused by the open above, present iff `errno` is.
-    /// uids are host-local diagnostics, like pids.
+    /// Observer euid associated with the selected failed operation
+    /// above, present iff `errno` is. uids are host-local diagnostics,
+    /// like pids.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actor_euid: Option<u32>,
 }

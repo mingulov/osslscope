@@ -403,10 +403,12 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
         Err(_) => return,
     };
     let pid = child.id();
-    // Bounded readiness poll: unshare must finish execing sleep before
-    // /proc/pid/maps is stable, and an exec transition can invalidate a
-    // sampled range (ENOENT). Poll transient states until the permission
-    // refusal is established; an opened entry is a definitive skip (the
+    // Bounded readiness poll: unshare enters the userns before execing
+    // sleep, so a pre-exec probe can observe the refusal (or an open) on
+    // unshare's own transient mappings and then race the exec transition.
+    // Gate on post-exec stability — comm == sleep plus two consecutive
+    // identical maps reads — before any probe result counts; poll the
+    // rest. An opened entry past the gate is a definitive skip (the
     // environment allows the shape under test).
     enum Probe {
         Opened,
@@ -414,6 +416,9 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
         Transient,
     }
     let probe_once = || {
+        if fs::read_to_string(format!("/proc/{pid}/comm")).ok()?.trim() != "sleep" {
+            return Some(Probe::Transient);
+        }
         let maps = fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
         let range = maps.lines().find_map(|line| {
             let mut fields = line.split_ascii_whitespace();
@@ -436,9 +441,26 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut expected = None;
     let mut skipped = "child exited before the refusal established";
+    let mut stable_maps: Option<String> = None;
     loop {
         if child.try_wait().unwrap_or(None).is_some() {
             break;
+        }
+        // Exec settles maps: identical consecutive reads plus comm sleep
+        // prove the transition finished; anything else keeps polling.
+        let maps_now = fs::read_to_string(format!("/proc/{pid}/maps")).ok();
+        let settled = maps_now.is_some()
+            && stable_maps
+                .as_ref()
+                .is_some_and(|last| Some(last) == maps_now.as_ref());
+        stable_maps = maps_now;
+        if !settled {
+            if std::time::Instant::now() >= deadline {
+                skipped = "maps never settled within 10s";
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
         }
         match probe_once() {
             Some(Probe::Refused(errno)) => {
@@ -450,6 +472,7 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
                 break;
             }
             _ => {
+                stable_maps = None;
                 if std::time::Instant::now() >= deadline {
                     skipped = "refusal never established within 10s";
                     break;
