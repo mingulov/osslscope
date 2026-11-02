@@ -571,6 +571,10 @@ mod tests {
             serde_json::to_value(&bare).unwrap(),
             serde_json::json!({"pid":7,"device":1,"inode":10,"reason":"too_large"})
         );
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"pid":7,"device":1,"inode":10,"reason":"too_large"}"#
+        );
         // A refused open round-trips with its errno and actor.
         let refused = Gap {
             pid: Some(7),

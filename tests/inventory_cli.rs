@@ -403,8 +403,17 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
         Err(_) => return,
     };
     let pid = child.id();
-    std::thread::sleep(std::time::Duration::from_millis(300));
-    let probe = (|| {
+    // Bounded readiness poll: unshare must finish execing sleep before
+    // /proc/pid/maps is stable, and an exec transition can invalidate a
+    // sampled range (ENOENT). Poll transient states until the permission
+    // refusal is established; an opened entry is a definitive skip (the
+    // environment allows the shape under test).
+    enum Probe {
+        Opened,
+        Refused(i32),
+        Transient,
+    }
+    let probe_once = || {
         let maps = fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
         let range = maps.lines().find_map(|line| {
             let mut fields = line.split_ascii_whitespace();
@@ -415,13 +424,44 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
             (fields.next()? != "0").then_some(range)
         })?;
         match fs::File::open(format!("/proc/{pid}/map_files/{range}")) {
-            Ok(_) => None,
-            Err(e) => e.raw_os_error(),
+            Ok(_) => Some(Probe::Opened),
+            Err(e) => match e.raw_os_error() {
+                Some(errno) if errno == libc::EPERM || errno == libc::EACCES => {
+                    Some(Probe::Refused(errno))
+                }
+                _ => Some(Probe::Transient),
+            },
         }
-    })();
-    let expected = match probe {
-        Some(errno) if errno == libc::EPERM || errno == libc::EACCES => errno,
-        _ => {
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut expected = None;
+    let mut skipped = "child exited before the refusal established";
+    loop {
+        if child.try_wait().unwrap_or(None).is_some() {
+            break;
+        }
+        match probe_once() {
+            Some(Probe::Refused(errno)) => {
+                expected = Some(errno);
+                break;
+            }
+            Some(Probe::Opened) => {
+                skipped = "environment opens foreign map_files; no refusal to pin";
+                break;
+            }
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    skipped = "refusal never established within 10s";
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+    let expected = match expected {
+        Some(errno) => errno,
+        None => {
+            eprintln!("skip userns refusal pin: {skipped}");
             let _ = child.kill();
             let _ = child.wait();
             return;
