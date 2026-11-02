@@ -454,24 +454,30 @@ pub(crate) fn wait_test_child(pid: u32, deadline: Instant) -> TestChildWait {
 /// timeout).
 #[cfg(test)]
 pub(crate) fn kill_test_child(pid: u32, grace: Duration) {
-    let mut status = 0;
-    // SAFETY: pid names the caller's child (or a dead pid); status
-    // is writable; WNOHANG never blocks.
-    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
-    if r != 0 {
-        // Exited/signaled (reaped by this probe), or an error
-        // (ECHILD: reaped elsewhere; EINTR: a transient spur — the
-        // bounded wait below re-probes before any signal): either
-        // way this child is not known-live, so never signal it.
-        // EINTR still needs its reap attempt below.
-        if r > 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+    loop {
+        let mut status = 0;
+        // SAFETY: pid names the caller's child (or a dead pid);
+        // status is writable; WNOHANG never blocks.
+        let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        if r == 0 {
+            break;
+        }
+        if r > 0 {
+            // Reaped by this probe: already dead, never signal.
             return;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            // Defensive re-probe (a WNOHANG wait rarely EINTRs):
+            // signal only a positively live child, never a spur.
+            Some(libc::EINTR) => continue,
+            // ECHILD (reaped elsewhere) and anything else: not
+            // known-live, so never signal.
+            _ => return,
         }
     }
     // SAFETY: the probe above found a live unreaped child owned by
     // the caller (sole reaper: nobody else can reap between the
-    // probe and this kill), or hit an EINTR spur (the child is still
-    // ours — an unreaped child pins its pid).
+    // probe and this kill — an unreaped child pins its pid).
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
@@ -4973,9 +4979,18 @@ mod custody_helper_tests {
         // A wrong starttime must gate the signal entirely (this is
         // the recycled-pid shape: same number, different incarnation).
         kill_test_grandchild(child.id(), starttime.wrapping_add(1));
-        // SAFETY: signal 0 sends nothing; it only probes existence.
-        let alive = unsafe { libc::kill(child.id() as libc::pid_t, 0) == 0 };
-        assert!(alive, "starttime mismatch must spare the process");
+        // Survival, not existence: a signal-0 probe also answers for
+        // zombies, so a SIGKILLed victim would pass it. A bounded
+        // reap wait instead: a killed child reaps in milliseconds
+        // (Reaped fails), a spared child is still running at the
+        // deadline (Timeout passes).
+        match wait_test_child(child.id(), Instant::now() + Duration::from_millis(500)) {
+            TestChildWait::Timeout => {}
+            TestChildWait::Reaped(status) => {
+                panic!("starttime mismatch must spare the process (reaped: {status})")
+            }
+            TestChildWait::Gone => panic!("our live child must not read as gone"),
+        }
         kill_test_child(child.id(), Duration::from_secs(5));
         let _ = child.wait();
     }
