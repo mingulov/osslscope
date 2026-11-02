@@ -13,6 +13,12 @@ pub const DIGEST_VEHICLE_BIN: &str = "/usr/bin/openssl";
 /// Frozen workload argv words before the input path: `dgst -sha256`.
 pub const DIGEST_WORKLOAD_ARGV: &[&str] = &["dgst", "-sha256"];
 
+/// Pinned SHA-256 of [`digest_workload_input`], established three ways
+/// (stock `openssl dgst`, Python hashlib, Rust `sha2`) before hardcoding.
+/// The input generator cannot drift a byte without failing the oracle.
+pub const EXPECTED_SHA256_HEX: &str =
+    "55928607572270ea0eafc10865d705adcf4483fc86166136b687ad06e5dc14ff";
+
 /// Deterministic 64 KiB input (pattern, not random: stable across runs).
 pub fn digest_workload_input() -> Vec<u8> {
     (0..65536u32)

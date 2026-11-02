@@ -1146,12 +1146,13 @@ fn pack_entry_role(role: u32, operation: u32, function: u32) -> u64 {
         return 0;
     }
     // valid() restricts role to <= 315, operation to <= 4 and function to
-    // <= 7 (digest copied roles 309-315 extend the MAC/KDF table; the
-    // digest load roots and operational gate hold out until the R5
-    // revision lands, so the new roles admit in the contract but never
-    // fire). These are the earlier scalar snapshots, with no truncated
-    // field. Returning a scalar keeps the root free of an address-taken
-    // output.
+    // <= 7. The shared contract IS compiled into BPF (admission_parts /
+    // paired / operational monomorphize here), so the digest roles change
+    // BPF bytes; they stay behavior-preserving because no host path can
+    // program roles 309-315 (load roots refuse them, firemap/pin held out
+    // until the R5 revision), making the new arms unreachable by data.
+    // These are the earlier scalar snapshots, with no truncated field.
+    // Returning a scalar keeps the root free of an address-taken output.
     u64::from(role) | (u64::from(operation) << 32) | (u64::from(function) << 48)
 }
 
