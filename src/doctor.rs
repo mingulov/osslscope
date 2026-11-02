@@ -1984,7 +1984,7 @@ fn check_self_map_files() -> Check {
 /// Pagemap probe subject: a stated foreign target, or ourselves (the
 /// no-target control — our own probe page is present by construction,
 /// so a zeroed frame positively diagnoses PFN masking).
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 enum PagemapSubject {
     Target,
     Slf,
