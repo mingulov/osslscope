@@ -1901,16 +1901,18 @@ fn check_foreign_uid(pid: u32, tuid: u32, env: &Env) -> Check {
     }
 }
 
-/// Functional `map_files` probe: backing verification binds VMA backing
-/// through `/proc/<pid>/map_files`, so doctor opens the directory for
-/// real. Golden rule (see `check_pidns`): no pids in messages.
-/// Pass = readable; Degraded = denied or target gone (never Fail:
-/// absence of evidence is inconclusive, not a refusal).
+/// Functional `map_files` probe: backing verification opens range-bound
+/// `map_files/{start}-{end}` entries, so doctor opens the directory for
+/// real. Directory access alone does not prove a range entry opens —
+/// the message reports only the observed capability. Golden rule (see
+/// `check_pidns`): no pids in messages.
+/// Pass = directory readable; Degraded = denied or target gone (never
+/// Fail: absence of evidence is inconclusive, not a refusal).
 fn check_map_files(pid: u32) -> Check {
     match std::fs::read_dir(format!("/proc/{pid}/map_files")) {
         Ok(_) => Check::pass(
             "map-files",
-            "target map_files readable (VMA backing bindable)".into(),
+            "target map_files directory readable (range-entry access unverified)".into(),
         ),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::degraded(
             "map-files",
@@ -1957,9 +1959,9 @@ fn check_pagemap(pid: u32) -> Check {
         }
     };
     // Probe address: a mapped page of our own image. For a foreign pid
-    // this address may be unmapped there — NotFound/zero reads then
-    // still prove the access path, only the frame comparison stays
-    // inconclusive, which is exactly what the Info arm reports.
+    // this address may be unmapped there — a non-present entry then
+    // proves only the access path, never PFN masking. The masking
+    // diagnosis is reserved for a present page with a withheld PFN.
     let probe_addr = check_pagemap as usize;
     let page = 4096u64;
     let mut entry = [0u8; 8];
@@ -1971,6 +1973,12 @@ fn check_pagemap(pid: u32) -> Check {
                 Check::pass(
                     "pagemap",
                     "target pagemap yields page frames (indirect backing comparable)".into(),
+                )
+            } else if !present {
+                Check::info(
+                    "pagemap",
+                    "probe page not present in target address space (foreign mapping unknown — frame comparison inconclusive)"
+                        .into(),
                 )
             } else {
                 Check::info(
@@ -3466,12 +3474,17 @@ mod tests {
         let own = check_pagemap(std::process::id());
         assert_eq!(own.id, "pagemap");
         // Unprivileged self reads zero the frame; privileged self sees it.
-        // Either way the probe itself must not fail.
+        // Either way the probe itself must not fail. The probe address is
+        // our own image, hence present in self: an Info verdict here is
+        // the masking diagnosis, never the foreign-unmapped one.
         assert!(
             own.status == Status::Pass || own.status == Status::Info,
             "{}",
             own.message
         );
+        if own.status == Status::Info {
+            assert!(own.message.contains("masking"), "{}", own.message);
+        }
         let dead = check_pagemap(u32::MAX);
         assert_eq!(dead.id, "pagemap");
         assert_eq!(dead.status, Status::Degraded);

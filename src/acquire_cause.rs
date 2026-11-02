@@ -326,6 +326,25 @@ mod tests {
             "missing program query-entry; rm -rf"
         ));
         assert!(!attach_template_shape(""));
+        // Hostile negatives: grammar widening that admitted any of
+        // these would fail here (independent of the privacy-suite
+        // oracle, which shares this function for positives).
+        assert!(!attach_template_shape(
+            "link query_entry@0x1234 failed (kind=PermissionDenied) /etc/passwd"
+        ));
+        assert!(!attach_template_shape("missing program a/b"));
+        assert!(!attach_template_shape(
+            "dispatch maps read failed (kind=PermissionDenied)\n/proc/1/maps"
+        ));
+        assert!(!attach_template_shape(
+            "stage-2 pin open failed (kind=Not Found; cookie retries next poll)"
+        ));
+        assert!(!attach_template_shape(
+            "pin dup query_entry+../escape failed (kind=NotFound)"
+        ));
+        assert!(!attach_template_shape(
+            "link q@0xzz failed (kind=PermissionDenied)"
+        ));
     }
 
     #[test]

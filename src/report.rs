@@ -1115,6 +1115,9 @@ fn consume_document_inner(
     let exit_code = exit_for(outcome, result.child_exit, &document, &delivery);
     if emit_reason {
         if let Some(line) = exit_reason_line(exit_code, outcome, &document.status) {
+            // Same publication scrub as the sibling consume path: fatal
+            // details normalize before they reach stderr.
+            let line = normalize_fatal_detail(&line);
             err_line(&format!("osslscope: {line}"));
             diagnostics.push(line);
         }

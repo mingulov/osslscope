@@ -378,47 +378,57 @@ gate reads clock + cells only).
   (`in-window`/`pre-window`/`untimed`), untimed call count. No
   timestamps, no target strings, no runtime addresses.
 - Optional `attach_diagnostics` (R06, rendered only when an attach
-  failed): sorted, deduped, capped array of producer-literal
-  failure texts. No paths, no pointers, no target strings, no
-  runtime addresses. Approved vocabulary (exact — the session
-  unit pins plus `tests/privacy_allowlist.rs` enforce it):
-  `stage-2 target unmapped; link detached`,
-  `libcrypto unmapped after replacement; tripwire anchors blind`,
-  `tripwire mapping changed across replacement; anchors blind
-  (cookie meanings shifted)`,
-  `stage-2 target superseded by replacement; old link detached`,
-  `stage-2 retry superseded by replacement; awaiting fresh init`,
-  `legacy stage-2 attach has no file mapping`,
-  `stage-2 attach has no provider mapping`,
-  `stage-2 pin open failed (kind=<ErrorKind>; cookie retries next
-  poll)`,
-  `stage-2 pin misses the resolve-time identity (cookie retries
-  next poll)`,
-  `attach <entry>@<file-offset> failed (kind=<ErrorKind>)`,
-  `attach <entry>+<ret> pin dup failed (kind=<ErrorKind>)`,
-  `tripwire anchors re-established after replacement (identical
-  mapping)`,
+  failed): sorted, deduped, capped array of classified failure
+  texts, each `class:rest` with one of the nine finite classes
+  (`src/acquire_cause.rs` is the single source of truth). No
+  paths, no pointers, no target strings, no runtime addresses.
+  Approved vocabulary (exact — the taxonomy unit pins plus
+  `tests/privacy_allowlist.rs` enforce it):
+  `backing-changed:` + one of `stage-2 target unmapped; link
+  detached`, `libcrypto unmapped after replacement; tripwire
+  anchors blind`, `tripwire mapping changed across replacement;
+  anchors blind (cookie meanings shifted)`, `stage-2 target
+  superseded by replacement; old link detached`, `stage-2 retry
+  superseded by replacement; awaiting fresh init`, `tripwire
+  anchors re-established after replacement (identical mapping)`,
   `dispatch anchors re-established after replacement; continuity
-  unproven`,
-  `attach path contains NUL`,
-  `dispatch reinstall failed: <inner>`,
-  `dispatch maps read failed (kind=<ErrorKind>)`,
-  `dispatch provider read failed (kind=<ErrorKind>)`,
-  `reinstall init anchor unresolved`,
-  `reinstall builtin anchor unresolved`,
-  `no dispatch anchor to reinstall`, `missing program <name>`.
+  unproven`;
+  `symbol-discovery:` + one of `legacy stage-2 attach has no file
+  mapping`, `stage-2 attach has no provider mapping`, or the
+  scrub fallback `resolve-failed`;
+  `attach:` + one of `stage-2 pin open failed
+  (kind=<ErrorKind>; cookie retries next poll)`, `stage-2 pin
+  misses the resolve-time identity (cookie retries next poll)`,
+  `link <entry>@<file-offset> failed (kind=<ErrorKind>)`,
+  `pin dup <entry>+<ret> failed (kind=<ErrorKind>)`, `path
+  contains NUL`, `dispatch maps read failed (kind=<ErrorKind>)`,
+  `dispatch provider read failed (kind=<ErrorKind>)`, `missing
+  program <name>`, a bare anchor literal (`reinstall init anchor
+  unresolved`, `reinstall builtin anchor unresolved`, `no
+  dispatch anchor to reinstall`), `dispatch reinstall failed:
+  <anchor>`, or a scrub fallback (`install-failed`,
+  `dispatch-reinstall-failed`);
+  `<class>:` + a kind token for I/O-kind scrubs, one of
+  `permission-denied`, `not-found`, `timed-out`, `interrupted`,
+  `busy`, `would-block`, `over-limit`, `io-failed` (the class
+  follows the kind: e.g. `backing-denied:permission-denied`).
   `<ErrorKind>` is a std io error kind name (fixed vocabulary);
-  `<entry>`/`<ret>`/`<name>` are static program names; offsets
-  are file offsets; `<inner>` is one of the above. The cookie and
-  probe identity ride structurally on the attach record, never in
-  text.
+  `<entry>`/`<ret>`/`<name>` are static program names (alnum +
+  underscore only); offsets are `0x` hex file offsets; `<anchor>`
+  is one of the three anchor literals. The cookie and probe
+  identity ride structurally on the attach record, never in text.
+  Consumers parsing these strings: 0.5.0 adds the `class:`
+  prefix and rewords three shapes (`link …` / `pin dup …` /
+  bare `path contains NUL`); match on the class prefix or the
+  documented full strings, never on the bare 0.4.0 literals.
 - Optional `refusal_diagnostics` (R14 minor, rendered only when a
   budget refusal occurred): sorted, deduped, capped array of
   numeric refusal entries, each
-  `dev=<n> ino=<n> kind=<file_too_large|over_allowance>
+  `limit:dev=<n> ino=<n> kind=<file_too_large|over_allowance>
   bytes=<n> allowance=<n>`. No paths, no target strings, no
   runtime addresses. (Unreadable-path `Err(_)` arms record no
-  entry — out of scope.)
+  entry — out of scope.) The `limit:` prefix is new in 0.5.0;
+  consumers must accept the prefixed form.
 - Human output is a summary, not the same fields: sites omit
   JSON's first/last timestamps, device, and inode, and fenced
   generations render summary counts with detail deferred to
