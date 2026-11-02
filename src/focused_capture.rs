@@ -570,6 +570,16 @@ pub(crate) fn process_batch(
 /// session (target_modules order); further modules stay unplanned
 /// behind an explicit gap.
 const MAX_ENGINE_PLAN_MODULES: usize = 16;
+/// One maps-consistent caller module scanned for ENGINE probe
+/// planning: path, bytes, fresh stat identity, and the content
+/// digest the offsets were parsed from (the attach re-hashes).
+struct ScannedCallerModule {
+    path: String,
+    bytes: Vec<u8>,
+    device: u64,
+    inode: u64,
+    sha256: [u8; 32],
+}
 /// Cap on caller-set baseline entries watched for late mappings
 /// and replacements. Past this the plane blinds: further caller
 /// churn is untrackable, and unwatched unknowns must not pass
@@ -1337,7 +1347,7 @@ impl FocusedSession {
         };
         // Caller modules: maps-consistent identity only, bounded
         // count+bytes; anything else stays unplanned behind a gap.
-        let mut mod_bufs: Vec<(String, Vec<u8>, u64, u64, [u8; 32])> = Vec::new();
+        let mut mod_bufs: Vec<ScannedCallerModule> = Vec::new();
         let mut skipped = 0u64;
         let mut bytes_total = lc.bytes.len();
         // Caller admission is maps-consistency only (no record
@@ -1371,7 +1381,7 @@ impl FocusedSession {
                 .find(|m| &m.path == path)
                 .map(|m| m.ino)
                 .unwrap_or(0);
-            let fresh = match std::fs::metadata(&path) {
+            let fresh = match std::fs::metadata(path) {
                 Ok(m) => m,
                 Err(_) => {
                     skipped += 1;
@@ -1382,7 +1392,7 @@ impl FocusedSession {
                 skipped += 1;
                 continue;
             }
-            let fb = match crate::plan::read_file_bound(&path) {
+            let fb = match crate::plan::read_file_bound(path) {
                 Ok(fb) if fb.dev == fresh.dev() && fb.ino == fresh.ino() => fb,
                 _ => {
                     skipped += 1;
@@ -1395,18 +1405,21 @@ impl FocusedSession {
                 skipped = skipped.saturating_add((candidates.len() - index) as u64);
                 break;
             }
-            mod_bufs.push((
-                path.clone(),
-                fb.bytes.to_vec(),
-                fresh.dev(),
-                fresh.ino(),
-                Sha256::digest(&fb.bytes).into(),
-            ));
+            mod_bufs.push(ScannedCallerModule {
+                path: path.clone(),
+                bytes: fb.bytes.to_vec(),
+                device: fresh.dev(),
+                inode: fresh.ino(),
+                sha256: Sha256::digest(&fb.bytes).into(),
+            });
         }
         self.engine.skipped_modules = self.engine.skipped_modules.saturating_add(skipped);
         let modules: Vec<legacy::Module<'_>> = mod_bufs
             .iter()
-            .map(|(p, b, _, _, _)| legacy::Module { path: p, bytes: b })
+            .map(|m| legacy::Module {
+                path: &m.path,
+                bytes: &m.bytes,
+            })
             .collect();
         let set = match legacy::probes_for(
             &lib.path,
@@ -1459,30 +1472,29 @@ impl FocusedSession {
         // emit the same minted cookie from two ProbeSet rows.
         let identities: BTreeMap<String, (u64, u64)> = mod_bufs
             .iter()
-            .map(|(p, _, dev, ino, _)| (p.clone(), (*dev, *ino)))
+            .map(|m| (m.path.clone(), (m.device, m.inode)))
             .collect();
         let wanted = dedupe_wanted_probes(&wanted, &set.probes, &identities);
         let mut plans = Vec::with_capacity(wanted.len());
         for &i in &wanted {
             let probe = &set.probes[i];
-            let Some((_, _, dev, ino, digest)) =
-                mod_bufs.iter().find(|(p, _, _, _, _)| p == &probe.module)
-            else {
+            let Some(found) = mod_bufs.iter().find(|m| m.path == probe.module) else {
                 // Probe for a module we never read: cannot join it
                 // safely — blind rather than misattribute.
                 self.engine.state = EnginePlaneState::Blind;
                 self.gaps.insert(ObservationGap::ClassifierFailed);
                 return;
             };
-            self.engine
-                .modules
-                .insert(probe.module.clone(), (*dev, *ino, String::new()));
+            self.engine.modules.insert(
+                probe.module.clone(),
+                (found.device, found.inode, String::new()),
+            );
             plans.push(EngineProbePlan {
                 path: probe.module.clone(),
                 offset: probe.offset,
-                device: *dev,
-                inode: *ino,
-                sha256: *digest,
+                device: found.device,
+                inode: found.inode,
+                sha256: found.sha256,
             });
         }
         let attach = match self.counter.as_mut() {
@@ -1534,9 +1546,9 @@ impl FocusedSession {
         }
         // Build-ids for the final object join, computed now so the
         // (large) module bytes drop with this snapshot.
-        for (path, bytes, _, _, _) in &mod_bufs {
-            if let Some(entry) = self.engine.modules.get_mut(path) {
-                entry.2 = elf::read_build_id(bytes).unwrap_or_default();
+        for m in &mod_bufs {
+            if let Some(entry) = self.engine.modules.get_mut(&m.path) {
+                entry.2 = elf::read_build_id(&m.bytes).unwrap_or_default();
             }
         }
         self.engine.generation += 1;

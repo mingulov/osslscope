@@ -2017,17 +2017,14 @@ mod startup_controls {
         assert_eq!(cookies.len(), 2);
         writeln!(commands, "B").unwrap();
         commands.flush().unwrap();
-        let mut saw_ack = false;
         loop {
             let mut ack = String::new();
             assert!(output.read_line(&mut ack).unwrap() > 0);
             if ack.starts_with("ack B 1 ") {
                 assert!(ack.contains("did=5"));
-                saw_ack = true;
                 break;
             }
         }
-        assert!(saw_ack);
         let sample = counter.sample(Instant::now() + Duration::from_secs(5));
         // Sum over distinct returned cookies: aliased plans share
         // one cookie after the fix, so distinct-counting is what
@@ -2092,7 +2089,7 @@ mod startup_controls {
                 .unwrap()
                 .success()
         );
-        let mut commands = fs::OpenOptions::new()
+        let commands = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&input)
