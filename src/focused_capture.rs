@@ -3250,8 +3250,9 @@ mod session_tests {
         if forked == 0 {
             // SAFETY: we own fds[0]; closing the unused read end.
             unsafe { libc::close(fds[0]) };
-            // Protocol: the worker writes the vehicle pid (u32 LE)
-            // first, then this wrapper writes the verdict byte.
+            // Protocol: the worker writes the vehicle incarnation
+            // (pid + starttime, 12 bytes LE) first, then this
+            // wrapper writes the verdict byte.
             let verdict: u8 = finish_worker_verdict(fds[1]);
             // Best-effort report: any write failure ends here and the
             // parent fails on the short read.
@@ -3270,27 +3271,34 @@ mod session_tests {
         // Waits are EINTR-retried; an interrupted wait never reads as
         // an exited child.
         let deadline = Instant::now() + Duration::from_secs(180);
-        // Stage 1: vehicle-pid custody handoff. The worker writes it
-        // immediately after opening the session, so every later
-        // timeout path can stop the long-lived vehicle too
-        // (finish() detaches a live workload; it never kills it).
+        // Stage 1: vehicle-incarnation custody handoff (pid +
+        // starttime, 12 bytes). The worker writes it immediately
+        // after opening the session, so every later timeout path can
+        // stop the long-lived vehicle too (finish() detaches a live
+        // workload; it never kills it). Timeout paths signal through
+        // a starttime-verified pidfd, never the bare number: the
+        // parent cannot reap its grandchild, so the number alone
+        // could name a recycled process.
         // Residual window: a worker wedged inside session open past
         // its own 30s setup deadline (lock-hang only) never hands
         // off its pid — accepted, documented, never observed.
-        let mut pid_buf = [0u8; 4];
-        if let Err(e) = crate::target::read_exact_deadline(fds[0], &mut pid_buf, deadline) {
+        let mut handoff = [0u8; 12];
+        if let Err(e) = crate::target::read_exact_deadline(fds[0], &mut handoff, deadline) {
             crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
             // SAFETY: we own fds[0].
             unsafe { libc::close(fds[0]) };
-            panic!("finish pin vehicle pid unread ({e}); worker killed");
+            panic!("finish pin vehicle handoff unread ({e}); worker killed");
         }
-        let vehicle = u32::from_le_bytes(pid_buf);
+        let vehicle = u32::from_le_bytes(handoff[..4].try_into().unwrap());
+        let vehicle_starttime = u64::from_le_bytes(handoff[4..].try_into().unwrap());
         // Stage 2: verdict byte.
         let mut buf = [0u8; 1];
         if let Err(e) = crate::target::read_exact_deadline(fds[0], &mut buf, deadline) {
             // Timeout-path custody: stop the vehicle first (it
-            // outlives the wedged worker), then the worker.
-            crate::target::kill_test_child(vehicle, Duration::from_secs(5));
+            // outlives the wedged worker), then the worker. The
+            // vehicle is a grandchild: signal through the
+            // starttime-verified pidfd, never the bare number.
+            crate::target::kill_test_grandchild(vehicle, vehicle_starttime);
             crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
             // SAFETY: we own fds[0].
             unsafe { libc::close(fds[0]) };
@@ -3307,7 +3315,7 @@ mod session_tests {
                 panic!("finish pin worker reaped elsewhere (sole-reaper violated)")
             }
             crate::target::TestChildWait::Timeout => {
-                crate::target::kill_test_child(vehicle, Duration::from_secs(5));
+                crate::target::kill_test_grandchild(vehicle, vehicle_starttime);
                 crate::target::kill_test_child(forked as u32, Duration::from_secs(5));
                 panic!("finish pin worker reported but never exited; vehicle and worker killed");
             }
@@ -3334,9 +3342,10 @@ mod session_tests {
     /// that never attempted a post-filter link), 0 filter installed
     /// yet a link succeeded (broken pin), 5 finished without a
     /// shaped link diagnostic, 3 setup failure. `pipe` carries the
-    /// vehicle-pid handoff (u32 LE); the wrapper writes the verdict
-    /// byte. No panics past session open: every outcome returns a
-    /// code so the vehicle kill below always runs.
+    /// vehicle-incarnation handoff (pid + starttime, 12 bytes LE);
+    /// the wrapper writes the verdict byte. No panics past session
+    /// open: every outcome returns a code so the vehicle kill below
+    /// always runs.
     fn finish_worker_verdict(pipe: std::os::fd::RawFd) -> u8 {
         let count = match std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT")
             .and_then(|path| std::fs::read(path).ok())
@@ -3380,7 +3389,20 @@ mod session_tests {
             .as_ref()
             .map(|owned| owned.pid())
             .unwrap_or(session.pid);
-        if crate::target::write_all_pipe(pipe, &vehicle.to_le_bytes()).is_err() {
+        // The handoff carries the incarnation (pid + starttime), not
+        // just the number: the parent cannot reap its grandchild, so
+        // a bare pid could name a recycled process by the time a
+        // timeout path signals it. A vehicle already gone here died
+        // instantly: broken setup, fail (the session's own custody
+        // reaps the zombie).
+        let Some(vehicle_starttime) = crate::target::process_starttime(vehicle) else {
+            crate::target::kill_test_child(vehicle, Duration::from_secs(5));
+            return 3;
+        };
+        let mut handoff = [0u8; 12];
+        handoff[..4].copy_from_slice(&vehicle.to_le_bytes());
+        handoff[4..].copy_from_slice(&vehicle_starttime.to_le_bytes());
+        if crate::target::write_all_pipe(pipe, &handoff).is_err() {
             // The parent is gone: nothing to report to; stop the
             // vehicle and fail.
             crate::target::kill_test_child(vehicle, Duration::from_secs(5));
@@ -3539,13 +3561,15 @@ mod session_tests {
                     .unwrap_or(0)
             };
             let baseline = link_fds();
-            // Wait for the independently established post-filter stimulus
-            // under a deadline: polls run the denied attach (mechanism:
-            // the focused counter's deferred attach, whose entry program
-            // names the diagnostic — not ENGINE discovery), and the loop
-            // ends when its diagnostic lands. Poll errors under the deny
-            // filter are expected (map reads refuse too); what matters is
-            // whether the stimulus diagnostic arrives.
+            // Wait for the independently established post-filter
+            // stimulus under a deadline: polls run the denied attach
+            // and the loop ends when its shaped diagnostic lands (in
+            // the counter, visible via the test peek, or the session
+            // set). The wait is on the outcome, not on whichever
+            // plane schedules the post-filter attempt. Poll errors
+            // under the deny filter are expected (map reads refuse
+            // too); what matters is whether the stimulus diagnostic
+            // arrives.
             let stimulus = Instant::now() + Duration::from_secs(15);
             let mut ran = false;
             loop {

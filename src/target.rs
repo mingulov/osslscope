@@ -445,18 +445,105 @@ pub(crate) fn wait_test_child(pid: u32, deadline: Instant) -> TestChildWait {
     }
 }
 
-/// Test-only best-effort child teardown: SIGKILL (errors ignored —
-/// ESRCH is expected when the child already died), then a bounded
-/// reap whose outcome is ignored. For watchdog paths and Drop
-/// guards; the test itself fails separately on the timeout.
+/// Test-only best-effort child teardown for the child's OWNER
+/// (sole reaper): probe first — a reaped-by-the-probe or
+/// already-reaped (ECHILD) child is never signaled — then SIGKILL a
+/// still-live child and reap it boundedly. Signaling never precedes
+/// the ownership check, so a recycled pid is never signaled; the
+/// reap outcome is ignored (the test itself fails separately on the
+/// timeout).
 #[cfg(test)]
 pub(crate) fn kill_test_child(pid: u32, grace: Duration) {
-    // SAFETY: pid names the caller's child (or a dead pid, in which
-    // case the kill fails closed with ESRCH).
+    let mut status = 0;
+    // SAFETY: pid names the caller's child (or a dead pid); status
+    // is writable; WNOHANG never blocks.
+    let r = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if r != 0 {
+        // Exited/signaled (reaped by this probe), or an error
+        // (ECHILD: reaped elsewhere; EINTR: a transient spur — the
+        // bounded wait below re-probes before any signal): either
+        // way this child is not known-live, so never signal it.
+        // EINTR still needs its reap attempt below.
+        if r > 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return;
+        }
+    }
+    // SAFETY: the probe above found a live unreaped child owned by
+    // the caller (sole reaper: nobody else can reap between the
+    // probe and this kill), or hit an EINTR spur (the child is still
+    // ours — an unreaped child pins its pid).
     unsafe {
         libc::kill(pid as libc::pid_t, libc::SIGKILL);
     }
     let _ = wait_test_child(pid, Instant::now() + grace);
+}
+
+/// Test-only `/proc` starttime (field 22) for one pid: the
+/// incarnation half of a pid identity. `None` when the process is
+/// gone or the table is unreadable.
+#[cfg(test)]
+pub(crate) fn process_starttime(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The comm field may contain spaces and parens; the post-comm
+    // fields start after the LAST ')'. Starttime is the 20th of
+    // those (state ppid pgrp session tty_nr tpgid flags minflt
+    // cminflt majflt cmajflt utime stime cutime cstime priority nice
+    // num_threads itrealvalue STARTTIME).
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm
+        .split_ascii_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()
+}
+
+/// Test-only best-effort teardown for a GRANDCHILD (the caller cannot
+/// reap it, so a numeric kill could hit a recycled pid): pin the
+/// current occupant with pidfd_open, verify its starttime against
+/// the handoff, and signal through the pidfd only on a match. Every
+/// mismatch path signals nothing: an exited-and-reaped vehicle whose
+/// pid was recycled is indistinguishable from gone, and gone needs
+/// no signal. Never panics; the zombie (if any) reparents to init
+/// once its parent dies and is reaped there.
+#[cfg(test)]
+pub(crate) fn kill_test_grandchild(pid: u32, starttime: u64) {
+    // Raw syscalls: this libc predates the pidfd_open /
+    // pidfd_send_signal wrappers (only the SYS_ numbers exist).
+    // SAFETY: pidfd_open pins the current occupant of the number (or
+    // fails when nothing occupies it); the fd is closed below.
+    let pidfd =
+        unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as libc::c_int;
+    if pidfd < 0 {
+        return;
+    }
+    // SAFETY: pidfd is the owned pidfd; closing it exactly once on
+    // every path below.
+    let close = |pidfd: libc::c_int| unsafe {
+        libc::close(pidfd);
+    };
+    // Order matters: the pidfd already pins its process, so a
+    // recycle between the pin and this read shows the NEW
+    // occupant's starttime (mismatch, no signal), and a recycle
+    // after this read still signals through the pin (the old,
+    // verified process — ESRCH once it is gone).
+    let current = process_starttime(pid);
+    if current != Some(starttime) {
+        close(pidfd);
+        return;
+    }
+    // SAFETY: pidfd pins the verified vehicle (or a verified-exited
+    // vehicle, in which case the signal fails closed with ESRCH); a
+    // NULL siginfo sends SIGKILL with no payload.
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd,
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+        libc::close(pidfd);
+    }
 }
 
 /// Test-only poll-bounded exact read for verdict pipes: waits POLLIN
@@ -472,9 +559,6 @@ pub(crate) fn read_exact_deadline(
 ) -> std::io::Result<()> {
     use std::io::{Error, ErrorKind};
     while !buf.is_empty() {
-        let remaining = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis();
         // SAFETY: pfd borrows the caller's pipe end; the timeout is finite.
         let mut pfd = libc::pollfd {
             fd,
@@ -482,7 +566,15 @@ pub(crate) fn read_exact_deadline(
             revents: 0,
         };
         let polled = loop {
-            let timeout = remaining.min(libc::c_int::MAX as u128) as libc::c_int;
+            // Recomputed (and expiry-checked) on EVERY retry: an
+            // EINTR spur must resume the remaining wait, never
+            // restart the full timeout (a signal storm would
+            // otherwise hold the watchdog open forever).
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break 0;
+            }
+            let timeout = remaining.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
             // SAFETY: pfd is one valid pollfd; timeout non-negative.
             let r = unsafe { libc::poll(&mut pfd, 1, timeout) };
             if r < 0 && Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
@@ -4717,4 +4809,264 @@ fn preview_release_failure_retains_exit_until_count_close() {
             code: 128 + libc::SIGKILL
         }
     );
+}
+
+#[cfg(test)]
+mod custody_helper_tests {
+    use super::*;
+
+    #[test]
+    fn starttime_orders_boot_before_new_and_gone_is_none() {
+        let boot = process_starttime(1).expect("pid 1 has a starttime");
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let born = process_starttime(child.id()).expect("live child has a starttime");
+        assert!(boot < born, "boot {boot} must predate a fresh child {born}");
+        kill_test_child(child.id(), Duration::from_secs(5));
+        // Reaped (or reaping): the pid is gone from /proc. A
+        // concurrent recycler could theoretically reuse the number in
+        // this window, but no other thread forks here.
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            if process_starttime(child.id()).is_none() {
+                break;
+            }
+            assert!(Instant::now() < end, "reaped child must leave /proc");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn kill_reaps_zombie_child() {
+        let child = std::process::Command::new("true")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        // Wait for zombiehood WITHOUT reaping (state Z in /proc),
+        // so the helper's probe does the reap.
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let stat =
+                std::fs::read_to_string(format!("/proc/{}/stat", child.id())).unwrap_or_default();
+            let state = stat
+                .rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_ascii_whitespace().next().map(str::to_string));
+            if state.as_deref() == Some("Z") {
+                break;
+            }
+            assert!(Instant::now() < end, "true must exit promptly");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        kill_test_child(child.id(), Duration::from_secs(5));
+        // Reaped by the helper's probe: nothing left to wait for.
+        let mut status = 0;
+        // SAFETY: status is writable; the child was ours.
+        let r = unsafe { libc::waitpid(child.id() as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(r, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn wait_reports_timeout_for_live_child() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        match wait_test_child(child.id(), Instant::now() + Duration::from_millis(50)) {
+            TestChildWait::Timeout => {}
+            TestChildWait::Reaped(status) => {
+                panic!("sleep must not exit in 50ms: {status}")
+            }
+            TestChildWait::Gone => panic!("our live child must not read as gone"),
+        }
+        kill_test_child(child.id(), Duration::from_secs(5));
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn grandchild_kill_stops_verified_vehicle() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable ints; return checked.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: single-threaded here; the middle child only writes
+        // 4 pid bytes, forks the sleeper, and _exits.
+        let middle = unsafe { libc::fork() };
+        assert!(middle >= 0, "fork failed");
+        if middle == 0 {
+            // SAFETY: we own fds[0]; closing the unused read end.
+            unsafe { libc::close(fds[0]) };
+            // SAFETY: single-threaded child; the grandchild only execs.
+            let grandchild = unsafe { libc::fork() };
+            if grandchild == 0 {
+                // Static bytes: no allocator use past the second fork.
+                let sleep = b"sleep\0";
+                let secs = b"60\0";
+                let argv = [sleep.as_ptr(), secs.as_ptr(), std::ptr::null()];
+                // SAFETY: argv is NUL-terminated C strings; exec
+                // replaces the image (PATH search).
+                unsafe {
+                    libc::execvp(sleep.as_ptr().cast(), argv.as_ptr().cast());
+                    libc::_exit(3);
+                }
+            }
+            let pid = (grandchild as u32).to_le_bytes();
+            // SAFETY: pid is 4 readable bytes; fds[1] is the owned end.
+            unsafe {
+                libc::write(fds[1], pid.as_ptr().cast(), pid.len());
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: we own fds[1]; closing the unused write end.
+        unsafe { libc::close(fds[1]) };
+        let mut pid_buf = [0u8; 4];
+        read_exact_deadline(
+            fds[0],
+            &mut pid_buf,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("middle child reports the grandchild pid");
+        // SAFETY: we own fds[0].
+        unsafe { libc::close(fds[0]) };
+        let mut status = 0;
+        // SAFETY: middle is our child; status is writable.
+        unsafe { libc::waitpid(middle, &mut status, 0) };
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        let vehicle = u32::from_le_bytes(pid_buf);
+        let starttime = process_starttime(vehicle).expect("live grandchild has a starttime");
+        kill_test_grandchild(vehicle, starttime);
+        // SIGKILLed (reaped by init, not by us): the number must go
+        // dark. On a helper regression the sleeper outlives this
+        // bound, fails the test, and still self-exits at 60s.
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            // SAFETY: signal 0 sends nothing; it only probes existence.
+            let alive = unsafe { libc::kill(vehicle as libc::pid_t, 0) == 0 };
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < end, "verified grandchild must die");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn grandchild_kill_spares_starttime_mismatch() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let starttime = process_starttime(child.id()).expect("live child has a starttime");
+        // A wrong starttime must gate the signal entirely (this is
+        // the recycled-pid shape: same number, different incarnation).
+        kill_test_grandchild(child.id(), starttime.wrapping_add(1));
+        // SAFETY: signal 0 sends nothing; it only probes existence.
+        let alive = unsafe { libc::kill(child.id() as libc::pid_t, 0) == 0 };
+        assert!(alive, "starttime mismatch must spare the process");
+        kill_test_child(child.id(), Duration::from_secs(5));
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn pipe_read_timeout_survives_eintr_storm() {
+        // The watchdog's deadline must hold under repeated EINTR: an
+        // interrupted poll resumes the REMAINING wait, never restarts
+        // the full timeout. Signals are thread-directed (pthread_kill
+        // at this thread only), so parallel test threads never see
+        // them; the handler is restored below.
+        static HITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        // Lock-free increment is async-signal-safe; the count proves
+        // the storm actually interrupted the wait (a silent storm
+        // would pass vacuously).
+        extern "C" fn noop(_: libc::c_int) {
+            HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: noop is a trivial async-signal-safe handler; the
+        // old disposition is restored at the end of the test.
+        let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
+        let mut install: libc::sigaction = unsafe { std::mem::zeroed() };
+        install.sa_sigaction = noop as usize;
+        install.sa_flags = 0; // No SA_RESTART: poll must EINTR.
+        // SAFETY: sigemptyset/sigaction on SIGALRM with valid pointers.
+        unsafe {
+            libc::sigemptyset(&mut install.sa_mask);
+            assert_eq!(libc::sigaction(libc::SIGALRM, &install, &mut previous), 0);
+        }
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable ints; return checked.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // Both ends stay open: no data, no EOF — the read can only
+        // end by timeout.
+        // SAFETY: pthread_self is always valid.
+        let target = unsafe { libc::pthread_self() };
+        let storm = std::thread::spawn(move || {
+            for _ in 0..30 {
+                std::thread::sleep(Duration::from_millis(10));
+                // SAFETY: target names the live test thread; SIGALRM
+                // is caught by the no-op handler above.
+                unsafe {
+                    libc::pthread_kill(target, libc::SIGALRM);
+                }
+            }
+        });
+        let start = Instant::now();
+        let mut buf = [0u8; 1];
+        let outcome = read_exact_deadline(fds[0], &mut buf, start + Duration::from_millis(100));
+        let elapsed = start.elapsed();
+        storm.join().expect("storm thread joins");
+        // SAFETY: we own both pipe ends; restoring the old SIGALRM
+        // disposition with a valid pointer.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+            libc::sigaction(libc::SIGALRM, &previous, std::ptr::null_mut());
+        }
+        assert_eq!(
+            outcome.unwrap_err().kind(),
+            std::io::ErrorKind::TimedOut,
+            "silent pipe must time out"
+        );
+        let hits = HITS.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            hits >= 10,
+            "the storm must interrupt the wait repeatedly (hit {hits}x)"
+        );
+        // Fixed: ~100ms (deadline resumes across spurs). Buggy (each
+        // spur restarts the timeout): the 300ms storm holds the wait
+        // open past 300ms. The 250ms line splits them with 2.5x
+        // fixed-side margin.
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "EINTR storm must not extend the 100ms deadline (took {elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn pipe_write_read_roundtrip() {
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable ints; return checked.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        write_all_pipe(fds[1], b"verdict").expect("write the bytes");
+        // SAFETY: we own fds[1]; closing the write end.
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 7];
+        read_exact_deadline(fds[0], &mut buf, Instant::now() + Duration::from_secs(5))
+            .expect("read the bytes");
+        // SAFETY: we own fds[0].
+        unsafe { libc::close(fds[0]) };
+        assert_eq!(&buf, b"verdict");
+    }
 }
