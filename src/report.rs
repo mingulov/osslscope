@@ -287,6 +287,72 @@ pub(crate) fn workload_hint(child_exit: Option<i32>, discarded: bool) -> Option<
     }
 }
 
+/// Single stderr reason for exits 3/4 (P1-help/exit; shared by
+/// report and check like [`workload_hint`]). The line names the
+/// evidence state in one line; the document carries the detail.
+/// Every other exit keeps its existing stderr contract (silent).
+pub(crate) fn exit_reason_line(
+    exit_code: u8,
+    outcome: crate::policy::PolicyOutcome,
+    status: &Completeness,
+) -> Option<String> {
+    fn fatal_phrase(kind: &FatalKind) -> String {
+        match kind {
+            FatalKind::Recycled => "target recycled mid-window".to_string(),
+            FatalKind::AttachZero => "zero probes attached".to_string(),
+            FatalKind::Environment(s) | FatalKind::Runtime(s) => {
+                let one_line: String = s
+                    .chars()
+                    .filter(|c| *c != '\n' && *c != '\r')
+                    .take(160)
+                    .collect();
+                if one_line.is_empty() {
+                    "environment failure".to_string()
+                } else {
+                    one_line
+                }
+            }
+        }
+    }
+    fn gap_word(reason: &GapReason) -> &'static str {
+        match reason {
+            GapReason::UnknownDenominator { .. } => "unknown-denominator",
+            GapReason::UndiscoveredSites { .. } => "undiscovered-sites",
+            GapReason::UnattachedSites { .. } => "unattached-sites",
+            GapReason::Loss { .. } => "counter-loss",
+            GapReason::UnattributedCalls { .. } => "unattributed-calls",
+            GapReason::StartupGap { .. } => "startup-gap",
+            GapReason::TailGap { .. } => "tail-gap",
+            GapReason::SignalCut => "signal-cut",
+        }
+    }
+    match exit_code {
+        3 => match status {
+            Completeness::Partial { reasons } => {
+                let first = reasons.first().map(gap_word).unwrap_or("unspecified");
+                let more = if reasons.len() > 1 { ", …" } else { "" };
+                Some(format!(
+                    "partial evidence ({} gaps: {first}{more})",
+                    reasons.len()
+                ))
+            }
+            Completeness::Fatal { kind, .. } => {
+                Some(format!("unusable evidence: {}", fatal_phrase(kind)))
+            }
+            // Unreachable via exit_for (Complete+Pass is 0); stay silent.
+            Completeness::Complete => None,
+        },
+        4 => match status {
+            Completeness::Fatal { kind, .. } => Some(format!("no verdict: {}", fatal_phrase(kind))),
+            _ if outcome == crate::policy::PolicyOutcome::NoVerdict => {
+                Some("no verdict: policy reached no verdict".to_string())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 /// Op id → display name (`OSSL_OP_DIGEST` → `DIGEST`; kept:
 /// the v2 CBOM renderer shares it).
 pub(crate) fn op_display(id: u32) -> String {
@@ -931,6 +997,27 @@ pub fn consume_capture_result_with_diagnostics(
     }
     let delivery = write_artifacts(&document, request);
     lines.extend(delivery.diagnostics.iter().cloned());
+    let exit_child = if observer_cancelled_child {
+        None
+    } else {
+        child_exit
+    };
+    let exit_code = if setup_internal_panic
+        && matches!(command, CaptureCommand::Report)
+        && outcome != crate::policy::PolicyOutcome::Violation
+    {
+        1
+    } else {
+        exit_for(outcome, exit_child, &document, &delivery)
+    };
+    // P1-help/exit: exits 3/4 are never silent. The fatal paths
+    // already carry cause lines; the canonical reason only fills
+    // the clean-Partial gap (no pre-existing output moves).
+    if matches!(exit_code, 3 | 4) && lines.is_empty() {
+        if let Some(reason) = exit_reason_line(exit_code, outcome, &document.status) {
+            lines.push(reason);
+        }
+    }
     let lines: Vec<String> = lines
         .into_iter()
         .map(|line| normalize_fatal_detail(&line))
@@ -948,19 +1035,6 @@ pub fn consume_capture_result_with_diagnostics(
             break;
         }
     }
-    let exit_child = if observer_cancelled_child {
-        None
-    } else {
-        child_exit
-    };
-    let exit_code = if setup_internal_panic
-        && matches!(command, CaptureCommand::Report)
-        && outcome != crate::policy::PolicyOutcome::Violation
-    {
-        1
-    } else {
-        exit_for(outcome, exit_child, &document, &delivery)
-    };
     CaptureCommandResult {
         document,
         child_exit,
@@ -1003,6 +1077,19 @@ pub fn consume_document(
     command: CaptureCommand<'_>,
     request: &OutputRequest,
 ) -> CaptureCommandResult {
+    consume_document_inner(result, command, request, true)
+}
+
+/// [`consume_document`] with emission control: the focused `Err`
+/// arm discards the inner exit (it overrides the code and prints
+/// its own established line), so it consumes quietly to keep the
+/// single-reason contract.
+fn consume_document_inner(
+    result: crate::focused_capture::FocusedResult,
+    command: CaptureCommand<'_>,
+    request: &OutputRequest,
+    emit_reason: bool,
+) -> CaptureCommandResult {
     let disposition = result
         .document
         .disposition
@@ -1026,6 +1113,12 @@ pub fn consume_document(
     emit_diagnostics(&delivery);
     diagnostics.extend(delivery.diagnostics.iter().cloned());
     let exit_code = exit_for(outcome, result.child_exit, &document, &delivery);
+    if emit_reason {
+        if let Some(line) = exit_reason_line(exit_code, outcome, &document.status) {
+            err_line(&format!("osslscope: {line}"));
+            diagnostics.push(line);
+        }
+    }
     CaptureCommandResult {
         document,
         child_exit: result.child_exit,
@@ -1045,7 +1138,7 @@ pub(crate) fn consume_focused_result(
         Ok(result) => consume_document(result, command, request),
         Err(error) => {
             let unavailable = error.is::<crate::focused_capture::TargetUnavailable>();
-            let mut delivered = consume_document(
+            let mut delivered = consume_document_inner(
                 crate::focused_capture::FocusedResult {
                     document: setup_failure_document(FatalKind::Environment(if unavailable {
                         "focused target unavailable".into()
@@ -1058,6 +1151,7 @@ pub(crate) fn consume_focused_result(
                 },
                 command,
                 request,
+                false,
             );
             // Delivery/runtime failures keep their execution failure exit.
             delivered.exit_code = if unavailable && !delivered.delivery.failed() {
@@ -3084,13 +3178,16 @@ mod tests {
             serde_json::from_slice(&render_json(&doc).expect("render")).expect("json");
         assert!(clean.get("attach_diagnostics").is_none());
         assert!(!render_human(&doc).contains("attach diagnostics:"));
-        doc.attach_diagnostics = vec!["EBUSY".to_string()];
+        doc.attach_diagnostics = vec!["attach:busy".to_string()];
         let rendered = render_json(&doc).expect("render");
         let v: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
-        assert_eq!(v["attach_diagnostics"], serde_json::json!(["EBUSY"]));
+        assert_eq!(v["attach_diagnostics"], serde_json::json!(["attach:busy"]));
         crate::schema::validate_v2(&v).expect("diagnostics key validates");
         let human = render_human(&doc);
-        assert!(human.contains("attach diagnostics:\n  - EBUSY"), "{human}");
+        assert!(
+            human.contains("attach diagnostics:\n  - attach:busy"),
+            "{human}"
+        );
     }
 
     #[test]
@@ -3121,6 +3218,46 @@ mod tests {
         // environment failure (4); report used to return 4 here.
         assert_eq!(exit_for(pass, None, &complete, &failed_delivery()), 1);
         assert_eq!(exit_for(pass, Some(0), &partial, &failed_delivery()), 1);
+    }
+
+    #[test]
+    fn exit_reason_line_names_3_and_4_only() {
+        use crate::policy::PolicyOutcome;
+        let partial = Completeness::Partial {
+            reasons: vec![GapReason::SignalCut, GapReason::TailGap { missing_ns: 5 }],
+        };
+        let line = exit_reason_line(3, PolicyOutcome::Pass, &partial).unwrap();
+        assert!(
+            line.starts_with("partial evidence (2 gaps: signal-cut"),
+            "{line}"
+        );
+        assert!(!line.contains('\n'), "{line}");
+        let fatal = Completeness::Fatal {
+            kind: FatalKind::AttachZero,
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            exit_reason_line(3, PolicyOutcome::Pass, &fatal).unwrap(),
+            "unusable evidence: zero probes attached"
+        );
+        assert_eq!(
+            exit_reason_line(4, PolicyOutcome::NoVerdict, &fatal).unwrap(),
+            "no verdict: zero probes attached"
+        );
+        let env = Completeness::Fatal {
+            kind: FatalKind::Environment("BPF load denied".into()),
+            reasons: Vec::new(),
+        };
+        assert_eq!(
+            exit_reason_line(4, PolicyOutcome::NoVerdict, &env).unwrap(),
+            "no verdict: BPF load denied"
+        );
+        // All other codes stay silent (their stderr contract is elsewhere).
+        assert!(exit_reason_line(0, PolicyOutcome::Pass, &Completeness::Complete).is_none());
+        assert!(exit_reason_line(1, PolicyOutcome::Pass, &partial).is_none());
+        assert!(exit_reason_line(2, PolicyOutcome::Pass, &partial).is_none());
+        assert!(exit_reason_line(10, PolicyOutcome::Violation, &Completeness::Complete).is_none());
+        assert!(exit_reason_line(11, PolicyOutcome::Inconclusive, &partial).is_none());
     }
 
     #[test]

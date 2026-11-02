@@ -4161,9 +4161,10 @@ fn r14_refusal_diagnostics_additive_old_reader_safe() {
     // layout and its supported evidence survives intact; the
     // unknown key is ignored.
     let mut doc = complete_doc();
+    // Phase 1 taxonomy: refusal entries carry the limit class prefix.
     doc.refusal_diagnostics = vec![
-        "dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string(),
-        "dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024".to_string(),
+        "limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string(),
+        "limit:dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024".to_string(),
     ];
     let bytes = render_json(&doc).expect("rendered artifact serializes");
     let rendered: Value = serde_json::from_slice(&bytes).expect("rendered artifact parses");

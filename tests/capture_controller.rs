@@ -2903,7 +2903,7 @@ fn failed_attach_diagnostic_reaches_document() {
         trigger_observed: true,
         attaches: vec![AttachEvent {
             kind: AttachKind::Stage2 { cookie: 7 },
-            failed: Some("EBUSY".to_string()),
+            failed: Some("attach:busy".to_string()),
         }],
         ..DiscoveryDelta::default()
     });
@@ -2911,7 +2911,10 @@ fn failed_attach_diagnostic_reaches_document() {
     h.exit_code = 0;
     let (out, _) = h.run();
     let c = out.unwrap();
-    assert_eq!(c.document.attach_diagnostics, vec!["EBUSY".to_string()]);
+    assert_eq!(
+        c.document.attach_diagnostics,
+        vec!["attach:busy".to_string()]
+    );
 }
 
 #[test]
@@ -9379,7 +9382,11 @@ fn r14_fix_cached_payload_over_remaining_budget_skips_loud() {
 /// allowance=\d+$` grammar is checked by hand): numeric-only, no
 /// paths.
 fn assert_refusal_shape(entry: &str) {
-    let parts: Vec<&str> = entry.split(' ').collect();
+    // Phase 1 taxonomy: refusals carry the limit class prefix.
+    let body = entry
+        .strip_prefix("limit:")
+        .unwrap_or_else(|| panic!("refusal carries the limit class: {entry:?}"));
+    let parts: Vec<&str> = body.split(' ').collect();
     assert_eq!(parts.len(), 5, "five space-separated fields: {entry:?}");
     fn num(v: &str) -> bool {
         !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit())
@@ -9652,7 +9659,7 @@ fn refusal_diagnostics_unstatable_path_falls_back_to_zero_zero() {
     assert_refusal_shape(entry);
     assert_eq!(
         *entry,
-        format!("dev=0 ino=0 kind=file_too_large bytes=0 allowance={budget}"),
+        format!("limit:dev=0 ino=0 kind=file_too_large bytes=0 allowance={budget}"),
         "unstatable path falls back to (0, 0): {entry:?}"
     );
 }

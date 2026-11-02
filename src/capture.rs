@@ -39,6 +39,7 @@
 //! no timing sleeps, no privileges.
 pub(crate) mod profiled;
 
+use crate::acquire_cause::AcquisitionCause;
 use crate::count_session::{
     CountBackend, CountDelta, CountDrain, CountSession, DiscoveredSite, FenceReason as CountFence,
 };
@@ -6241,9 +6242,11 @@ where
                         dropped = dropped.saturating_add(1);
                         let (dev, ino) = refusal_tag(std::path::Path::new(p));
                         let len = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
-                        self.state.refusal_diagnostics.insert(format!(
-                            "dev={dev} ino={ino} kind=file_too_large bytes={len} allowance={allowance}"
-                        ));
+                        self.state.refusal_diagnostics.insert(
+                            AcquisitionCause::Limit.diagnostic(&format!(
+                                "dev={dev} ino={ino} kind=file_too_large bytes={len} allowance={allowance}"
+                            )),
+                        );
                         continue;
                     }
                     Err(_) => {
@@ -6267,12 +6270,12 @@ where
             } else if self.state.file_cache.contains_key(p) {
                 let entry = {
                     let cached = self.state.file_cache.get(p).expect("contains_key");
-                    format!(
+                    AcquisitionCause::Limit.diagnostic(&format!(
                         "dev={} ino={} kind=over_allowance bytes={} allowance={allowance}",
                         cached.file.dev,
                         cached.file.ino,
                         cached.file.bytes.len()
-                    )
+                    ))
                 };
                 self.state.refusal_diagnostics.insert(entry);
                 dropped = dropped.saturating_add(1);
@@ -14408,11 +14411,11 @@ pub(crate) mod tests {
             attaches: vec![
                 AttachEvent {
                     kind: AttachKind::Stage2 { cookie: 7 },
-                    failed: Some("EBUSY".to_string()),
+                    failed: Some("attach:busy".to_string()),
                 },
                 AttachEvent {
                     kind: AttachKind::Tripwires { count: 3 },
-                    failed: Some("EBUSY".to_string()),
+                    failed: Some("attach:busy".to_string()),
                 },
                 AttachEvent {
                     kind: AttachKind::Stage2 { cookie: 9 },
@@ -14424,7 +14427,7 @@ pub(crate) mod tests {
         let (state, _) = adapt_fresh(&delta, &[]);
         assert_eq!(
             state.attach_diagnostics.into_iter().collect::<Vec<_>>(),
-            vec!["EBUSY".to_string()],
+            vec!["attach:busy".to_string()],
             "failed-attach text retained once (deduped)"
         );
     }
@@ -14442,7 +14445,7 @@ pub(crate) mod tests {
                 },
                 AttachEvent {
                     kind: AttachKind::Tripwires { count: 3 },
-                    failed: Some("EBUSY".to_string()),
+                    failed: Some("attach:busy".to_string()),
                 },
             ],
             budget_exhausted: true,

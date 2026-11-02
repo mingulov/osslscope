@@ -72,6 +72,7 @@
 //! anchors and tripwires; the capture adapter separately reads relevant
 //! identity-bound file bytes for count planning and fingerprints.
 
+use crate::acquire_cause::AcquisitionCause;
 use crate::capture_setup::{DiscoveryLinkStore, SetupControl, SetupFailure, SetupLinks};
 use crate::discovery::{builtin, coverage, elf, harvest, legacy, maps};
 use crate::loader::Loaded;
@@ -2211,7 +2212,10 @@ impl SessionCore {
             self.attached_targets.remove(&cookie);
             delta.attaches.push(AttachEvent {
                 kind: AttachKind::Stage2 { cookie },
-                failed: Some("stage-2 target unmapped; link detached".to_string()),
+                failed: Some(
+                    AcquisitionCause::BackingChanged
+                        .diagnostic("stage-2 target unmapped; link detached"),
+                ),
             });
         }
     }
@@ -2423,11 +2427,10 @@ impl SessionCore {
                         if self.probe_set.is_some() {
                             delta.attaches.push(AttachEvent {
                                 kind: AttachKind::Tripwires { count: 0 },
-                                failed: Some(
+                                failed: Some(AcquisitionCause::BackingChanged.diagnostic(
                                     "libcrypto unmapped after replacement; \
-                                     tripwire anchors blind"
-                                        .to_string(),
-                                ),
+                                         tripwire anchors blind",
+                                )),
                             });
                         }
                     }
@@ -2446,11 +2449,10 @@ impl SessionCore {
                                 kind: AttachKind::Tripwires {
                                     count: fresh.probes.len(),
                                 },
-                                failed: Some(
+                                failed: Some(AcquisitionCause::BackingChanged.diagnostic(
                                     "tripwire mapping changed across replacement; \
-                                     anchors blind (cookie meanings shifted)"
-                                        .to_string(),
-                                ),
+                                         anchors blind (cookie meanings shifted)",
+                                )),
                             });
                         }
                     }
@@ -2498,9 +2500,10 @@ impl SessionCore {
                         delta.attaches.push(AttachEvent {
                             kind: AttachKind::Tripwires { count },
                             failed: replan.then(|| {
-                                "tripwire anchors re-established after replacement \
-                                 (identical mapping)"
-                                    .to_string()
+                                AcquisitionCause::BackingChanged.diagnostic(
+                                    "tripwire anchors re-established after replacement \
+                                     (identical mapping)",
+                                )
                             }),
                         });
                     }
@@ -2598,11 +2601,10 @@ impl SessionCore {
             }
             match harvest::resolve_query_target(&maps, &self.provider, &self.canon, addr, cookie) {
                 Err(e) => {
-                    // The resolve error is already an approved
-                    // literal (cookie rides structurally) — no
-                    // wrapper (a wrapper would reintroduce the
-                    // cookie number into the text).
-                    self.record_attach_failure(&mut delta, cookie, format!("{e:#}"));
+                    // Phase 1: allowlisted resolve tops pass through
+                    // with their class; anything else scrubs (cookie
+                    // rides structurally, never in the text).
+                    self.record_attach_failure(&mut delta, cookie, classified_resolve_failure(&e));
                     // Unmapped (no identity to compare): retry from
                     // the next poll until it maps.
                     self.retry_stage2.insert(
@@ -2634,7 +2636,14 @@ impl SessionCore {
                     }
                     match env.install_stage2(cookie, t.off, &t.path, self.pid, t.expected) {
                         Err(e) => {
-                            self.record_attach_failure(&mut delta, cookie, format!("{e:#}"));
+                            // Phase 1: pin/link template tops pass
+                            // through with their class; the full
+                            // chain (nested I/O sources) never renders.
+                            self.record_attach_failure(
+                                &mut delta,
+                                cookie,
+                                classified_install_failure(&e),
+                            );
                             // Resolved but not installed: retry from
                             // the next poll against the same bytes
                             // (a changed identity drops the entry).
@@ -2658,11 +2667,10 @@ impl SessionCore {
                             if supersede {
                                 delta.attaches.push(AttachEvent {
                                     kind: AttachKind::Stage2 { cookie },
-                                    failed: Some(
+                                    failed: Some(AcquisitionCause::BackingChanged.diagnostic(
                                         "stage-2 target superseded by replacement; \
-                                         old link detached"
-                                            .to_string(),
-                                    ),
+                                             old link detached",
+                                    )),
                                 });
                             }
                         }
@@ -2710,11 +2718,10 @@ impl SessionCore {
                         self.retry_stage2.remove(&cookie);
                         delta.attaches.push(AttachEvent {
                             kind: AttachKind::Stage2 { cookie },
-                            failed: Some(
+                            failed: Some(AcquisitionCause::BackingChanged.diagnostic(
                                 "stage-2 retry superseded by replacement; \
-                                 awaiting fresh init"
-                                    .to_string(),
-                            ),
+                                     awaiting fresh init",
+                            )),
                         });
                         continue;
                     }
@@ -2772,7 +2779,7 @@ impl SessionCore {
                     self.preset_reason = Some("anchor-unresolved".to_string());
                     delta.attaches.push(AttachEvent {
                         kind: AttachKind::DispatchAnchors { count: 0 },
-                        failed: Some(format!("dispatch reinstall failed: {e:#}")),
+                        failed: Some(classified_reinstall_failure(&e)),
                     });
                 }
                 Ok(fresh) => {
@@ -2799,9 +2806,10 @@ impl SessionCore {
                     // carries no continuity caveat. Only a
                     // post-map replacement keeps the caveat.
                     let failed = prior_mapped.then(|| {
-                        "dispatch anchors re-established after replacement; \
-                         continuity unproven"
-                            .to_string()
+                        AcquisitionCause::BackingChanged.diagnostic(
+                            "dispatch anchors re-established after replacement; \
+                             continuity unproven",
+                        )
                     });
                     delta.attaches.push(AttachEvent {
                         kind: AttachKind::DispatchAnchors { count: 2 },
@@ -3856,7 +3864,7 @@ impl LinkSet {
 /// text). Session unit tests pin each producer's exact text; the
 /// privacy suite pins the no-pathname property over the set.
 fn link_path(path: &Path) -> anyhow::Result<CString> {
-    CString::new(path.as_os_str().as_bytes()).map_err(|_| anyhow!("attach path contains NUL"))
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| anyhow!("path contains NUL"))
 }
 
 /// Reword an OS failure to approved-vocabulary text, KEEPING its
@@ -3879,6 +3887,41 @@ fn reword_os_error(op: &str, e: anyhow::Error) -> anyhow::Error {
     }
 }
 
+/// Phase 1 classified resolve failure: allowlisted resolve tops pass
+/// through with the symbol-discovery class; anything else (including a
+/// future interpolated site) scrubs to a finite form. Only the outermost
+/// message is ever considered — nested chain sources never render.
+fn classified_resolve_failure(e: &anyhow::Error) -> String {
+    let top = e.to_string();
+    if crate::acquire_cause::RESOLVE_LITERALS.contains(&top.as_str()) {
+        return AcquisitionCause::SymbolDiscovery.diagnostic(&top);
+    }
+    AcquisitionCause::from_chain(AcquisitionCause::SymbolDiscovery, "resolve-failed", e)
+}
+
+/// Phase 1 classified install failure: pin/link/missing-program template
+/// tops pass through with the attach class; anything else scrubs. The
+/// I/O kind survives as a finite token; paths and errno text never render.
+fn classified_install_failure(e: &anyhow::Error) -> String {
+    let top = e.to_string();
+    if crate::acquire_cause::attach_template_shape(&top) {
+        return AcquisitionCause::Attach.diagnostic(&top);
+    }
+    AcquisitionCause::from_chain(AcquisitionCause::Attach, "install-failed", e)
+}
+
+/// Phase 1 classified reinstall failure: the three anchor tops keep their
+/// `dispatch reinstall failed: {top}` shape with the attach class;
+/// anything else scrubs. The transient-race guard above the call site
+/// still sees the raw error, so retry semantics are unchanged.
+fn classified_reinstall_failure(e: &anyhow::Error) -> String {
+    let top = e.to_string();
+    if crate::acquire_cause::ANCHOR_LITERALS.contains(&top.as_str()) {
+        return AcquisitionCause::Attach.diagnostic(&format!("dispatch reinstall failed: {top}"));
+    }
+    AcquisitionCause::from_chain(AcquisitionCause::Attach, "dispatch-reinstall-failed", e)
+}
+
 /// Stage-2 pin-open failure (host-testable): the path is the
 /// install target (never rendered); the kind token names the
 /// failure class (a mapped module disappearing before pin-open
@@ -3895,7 +3938,9 @@ fn stage2_pin_open_text(err: &std::io::Error) -> String {
 /// permitted, both retained for diagnosis); the OS error
 /// collapses to its kind token.
 fn link_attach_text(entry: &str, offset: u64, err: &std::io::Error) -> String {
-    format!("attach {entry}@{offset:#x} failed (kind={:?})", err.kind())
+    // Phase 1: no leading verb — the attach class prefix rides at the
+    // artifact boundary (`classified_install_failure`), not here.
+    format!("link {entry}@{offset:#x} failed (kind={:?})", err.kind())
 }
 
 fn prog_fd(loaded: &Loaded, name: &str) -> anyhow::Result<std::os::fd::RawFd> {
@@ -4044,7 +4089,7 @@ fn attach_pair_with_ops(
         let failure = SetupFailure::io(
             crate::capture::BoundaryStage::Discovery,
             &e,
-            &format!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()),
+            &format!("pin dup {entry}+{ret} failed (kind={:?})", e.kind()),
         );
         links.abort(failure.clone());
         failure
@@ -4054,7 +4099,7 @@ fn attach_pair_with_ops(
         let failure = SetupFailure::io(
             crate::capture::BoundaryStage::Discovery,
             &e,
-            &format!("attach {entry}+{ret} pin dup failed (kind={:?})", e.kind()),
+            &format!("pin dup {entry}+{ret} failed (kind={:?})", e.kind()),
         );
         links.abort(failure.clone());
         failure
@@ -6463,10 +6508,7 @@ mod tests {
             0x1234,
             &Error::new(ErrorKind::PermissionDenied, "x"),
         );
-        assert_eq!(
-            t,
-            "attach query_entry@0x1234 failed (kind=PermissionDenied)"
-        );
+        assert_eq!(t, "link query_entry@0x1234 failed (kind=PermissionDenied)");
         assert!(!t.contains("proc"), "diagnostics carry no paths: {t}");
         // Reword keeps the kind (InvalidData transients still
         // retry) while replacing free OS text.
@@ -7239,6 +7281,50 @@ mod tests {
     }
 
     #[test]
+    fn classified_chain_failures_keep_vocabulary_scrub_the_rest() {
+        // Phase 1 taxonomy: chain sites pass through allowlisted tops with
+        // a class prefix and scrub everything else to a finite form.
+        let resolve =
+            classified_resolve_failure(&anyhow::anyhow!("stage-2 attach has no provider mapping"));
+        assert_eq!(
+            resolve,
+            "symbol-discovery:stage-2 attach has no provider mapping"
+        );
+        let resolve_io = classified_resolve_failure(&anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        assert_eq!(resolve_io, "backing-changed:not-found");
+        let resolve_weird =
+            classified_resolve_failure(&anyhow::anyhow!("/proc/9/x leaked (os error 2)"));
+        assert_eq!(resolve_weird, "symbol-discovery:resolve-failed");
+
+        let install = classified_install_failure(&anyhow::anyhow!(
+            "stage-2 pin open failed (kind=NotFound; cookie retries next poll)"
+        ));
+        assert_eq!(
+            install,
+            "attach:stage-2 pin open failed (kind=NotFound; cookie retries next poll)"
+        );
+        let install_io = classified_install_failure(&anyhow::Error::new(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert_eq!(install_io, "backing-denied:permission-denied");
+        let install_weird =
+            classified_install_failure(&anyhow::anyhow!("/tmp/evil: busy (os error 16)"));
+        assert_eq!(install_weird, "attach:install-failed");
+
+        let reinstall =
+            classified_reinstall_failure(&anyhow::anyhow!("no dispatch anchor to reinstall"));
+        assert_eq!(
+            reinstall,
+            "attach:dispatch reinstall failed: no dispatch anchor to reinstall"
+        );
+        let reinstall_weird =
+            classified_reinstall_failure(&anyhow::anyhow!("/p/provider.so changed"));
+        assert_eq!(reinstall_weird, "attach:dispatch-reinstall-failed");
+    }
+
+    #[test]
     fn reestablished_anchor_texts_are_approved_literals() {
         // Round 3, residuals F+R (producer half of the composed
         // chain): real replacement polls emit the exact approved
@@ -7261,7 +7347,9 @@ mod tests {
             .find_map(|a| a.failed.clone());
         assert_eq!(
             trip_text.as_deref(),
-            Some("tripwire anchors re-established after replacement (identical mapping)"),
+            Some(
+                "backing-changed:tripwire anchors re-established after replacement (identical mapping)"
+            ),
         );
         // Dispatch reinstall over a previously mapped binding
         // (H10: the post-map replacement keeps its caveat):
@@ -7284,7 +7372,9 @@ mod tests {
             .find_map(|a| a.failed.clone());
         assert_eq!(
             dispatch_text.as_deref(),
-            Some("dispatch anchors re-established after replacement; continuity unproven"),
+            Some(
+                "backing-changed:dispatch anchors re-established after replacement; continuity unproven"
+            ),
         );
     }
 
@@ -7961,7 +8051,13 @@ mod tests {
             .iter()
             .filter_map(|a| a.failed.as_deref())
             .collect();
-        assert_eq!(failed, vec!["stage-2 attach has no provider mapping"]);
+        // Phase 1 taxonomy (Btrfs plan): the bare literal is superseded —
+        // every refusal carries its finite class. Literal text, no-pathname
+        // and cookie-structural properties are preserved.
+        assert_eq!(
+            failed,
+            vec!["symbol-discovery:stage-2 attach has no provider mapping"]
+        );
         assert!(
             !failed[0].contains('/'),
             "diagnostics carry no pathnames: {:?}",
@@ -7981,8 +8077,8 @@ mod tests {
             .collect();
         assert_eq!(
             snap_failed,
-            vec!["stage-2 attach has no provider mapping"],
-            "snapshot path carries the same literal"
+            vec!["symbol-discovery:stage-2 attach has no provider mapping"],
+            "snapshot path carries the same classified literal"
         );
     }
 

@@ -384,6 +384,16 @@ fn h5_t3_every_device_site_names_one_domain() {
             "if before.dev() != after.dev()",
             1,
         ),
+        // Coalesced gap display groups one snapshot's gaps by
+        // their recorded (reason, device, pid) as opaque
+        // run-local keys; comparisons never leave the snapshot
+        // or join another identity domain (stat/maps/native).
+        (
+            "src/inventory/mod.rs",
+            "local",
+            ".entry((gap.reason, gap.device, gap.pid))",
+            1,
+        ),
         ("src/inventory/procfs.rs", "raw", "dev: m.dev(),", 1),
         // Watch compares native ModuleInfo identities, previously obtained
         // from fstat; no join to encoded map text or display-domain values.

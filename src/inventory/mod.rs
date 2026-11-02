@@ -200,6 +200,36 @@ pub enum GapReason {
     NamespaceUnavailable,
 }
 
+impl GapReason {
+    /// Display word for the human preamble. Mirrors the serde
+    /// snake_case label exactly (proven by
+    /// `cli::tests::gap_reason_words_match_json`).
+    pub fn word(&self) -> &'static str {
+        match self {
+            GapReason::Unavailable => "unavailable",
+            GapReason::NonRegular => "non_regular",
+            GapReason::TooLarge => "too_large",
+            GapReason::NotElf => "not_elf",
+            GapReason::MalformedElf => "malformed_elf",
+            GapReason::Changed => "changed",
+            GapReason::UnsupportedArchitecture => "unsupported_architecture",
+            GapReason::ProcessUnavailable => "process_unavailable",
+            GapReason::IdentityUnverified => "identity_unverified",
+            GapReason::BackingUnavailable => "backing_unavailable",
+            GapReason::ReadLimit => "read_limit",
+            GapReason::ProcessLimit => "process_limit",
+            GapReason::ObjectLimit => "object_limit",
+            GapReason::MalformedMaps => "malformed_maps",
+            GapReason::Deadline => "deadline",
+            GapReason::UnsupportedCgroup => "unsupported_cgroup",
+            GapReason::CgroupUnavailable => "cgroup_unavailable",
+            GapReason::CgroupLimit => "cgroup_limit",
+            GapReason::MembershipUnknown => "membership_unknown",
+            GapReason::NamespaceUnavailable => "namespace_unavailable",
+        }
+    }
+}
+
 /// File identity plus finite interface evidence; never paths or raw symbols.
 /// `device` is the native Linux `st_dev` value, paired with `st_ino`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -363,6 +393,55 @@ impl Snapshot {
             InventoryState::Unavailable => 4,
         }
     }
+
+    /// Verified-vs-locator module counts across all processes (the
+    /// human identity summary; JSON carries the per-module status).
+    pub fn identity_counts(&self) -> (usize, usize) {
+        let mut verified = 0;
+        let mut locator = 0;
+        for module in self.processes.iter().flat_map(|p| p.modules.iter()) {
+            match module.identity_status {
+                IdentityStatus::Verified => verified += 1,
+                IdentityStatus::LocatorCandidate => locator += 1,
+            }
+        }
+        (verified, locator)
+    }
+
+    /// Human preamble inputs (display-only; JSON is unchanged):
+    /// identity counts plus gaps coalesced by (reason, device, pid).
+    pub fn human_preamble(&self) -> SnapshotPreamble {
+        SnapshotPreamble {
+            identity: self.identity_counts(),
+            gap_groups: coalesce_gaps(&self.gaps),
+        }
+    }
+}
+
+/// Human-preamble inputs for a [`Snapshot`] (see
+/// [`Snapshot::human_preamble`]). A group is (reason, device, pid,
+/// exact count), sorted by (reason, device, pid) with absent ids
+/// sorting first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotPreamble {
+    pub identity: (usize, usize),
+    pub gap_groups: Vec<(GapReason, Option<u64>, Option<u32>, usize)>,
+}
+
+/// Group gaps by (reason, device, pid) with exact counters
+/// (P1-coalesce). Inodes vary per module and never key a group;
+/// ordering is deterministic (BTreeMap iteration).
+pub fn coalesce_gaps(gaps: &[Gap]) -> Vec<(GapReason, Option<u64>, Option<u32>, usize)> {
+    let mut groups = std::collections::BTreeMap::new();
+    for gap in gaps {
+        *groups
+            .entry((gap.reason, gap.device, gap.pid))
+            .or_insert(0usize) += 1;
+    }
+    groups
+        .into_iter()
+        .map(|((reason, device, pid), count)| (reason, device, pid, count))
+        .collect()
 }
 
 /// Read-only, file-backed discovery; no target memory, code, signals or BPF.

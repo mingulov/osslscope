@@ -101,7 +101,9 @@ fn print_help() {
     println!("  --settle S: attach-settle seconds (default 2)");
     println!("  --timeout S: trigger-wait seconds (default 60)");
     println!("  --legacy: also attach ENGINE/low-level tripwires");
-    println!("  needs CAP_BPF+CAP_PERFMON (run: osslscope doctor)");
+    println!(
+        "  needs CAP_BPF+CAP_PERFMON (+CAP_SYS_PTRACE or same uid for foreign --pid targets; run: osslscope doctor)"
+    );
 }
 
 /// Parse `inspect` argv (R07 seam). Time flags route through the one

@@ -2,7 +2,7 @@
 //! Passive inventory commands. User supplied strings never enter diagnostics.
 use super::{
     Capabilities, GapReason, InventoryState, Limits, ModuleInfo, ObservationState, SnapshotOptions,
-    WorkTotals, elf, snapshot,
+    SnapshotPreamble, WorkTotals, elf, snapshot,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -283,9 +283,59 @@ fn inventory_exit(state: InventoryState) -> u8 {
         InventoryState::Unavailable => 4,
     }
 }
-fn render(value: &impl Serialize, json: bool, writer: &mut impl Write) -> io::Result<()> {
+/// Human identity summary: verified-vs-locator module counts plus
+/// the verified share (P1-human-counts). JSON mode never sees it.
+fn identity_line(verified: usize, locator: usize) -> String {
+    let total = verified + locator;
+    if total == 0 {
+        return "identity: no modules inventoried\n".to_string();
+    }
+    let pct = verified * 100 / total;
+    format!(
+        "identity: {verified} verified, {locator} locator-candidate of {total} modules ({pct}% verified)\n"
+    )
+}
+
+/// Coalesced gap block: one line per (reason, device, pid) group
+/// with exact counters (P1-coalesce, display-only). Empty when the
+/// snapshot carries no gaps.
+fn gap_block(groups: &[(GapReason, Option<u64>, Option<u32>, usize)]) -> String {
+    if groups.is_empty() {
+        return String::new();
+    }
+    let total: usize = groups.iter().map(|g| g.3).sum();
+    let mut s = format!(
+        "gaps ({total} total in {} group{}):\n",
+        groups.len(),
+        if groups.len() == 1 { "" } else { "s" },
+    );
+    for (reason, device, pid, count) in groups {
+        let dev = device.map_or("-".to_string(), |d| d.to_string());
+        let p = pid.map_or("-".to_string(), |p| p.to_string());
+        s.push_str(&format!(
+            "  {} device={dev} pid={p}: {count}\n",
+            reason.word()
+        ));
+    }
+    s
+}
+
+fn render(
+    value: &impl Serialize,
+    json: bool,
+    writer: &mut impl Write,
+    preamble: Option<&SnapshotPreamble>,
+) -> io::Result<()> {
     if !json {
         writer.write_all(MEANING.as_bytes())?;
+        // Snapshot paths pass their preamble; operator-supplied
+        // module lists (inspect --module) have no process binding
+        // to verify, so they pass None and omit the block.
+        if let Some(pre) = preamble {
+            let (verified, locator) = pre.identity;
+            writer.write_all(identity_line(verified, locator).as_bytes())?;
+            writer.write_all(gap_block(&pre.gap_groups).as_bytes())?;
+        }
     }
     serde_json::to_writer_pretty(&mut *writer, value).map_err(io::Error::other)?;
     writer.write_all(b"\n")?;
@@ -350,16 +400,18 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 }
             };
             let result = scanner.snapshot();
-            render(&result, options.json, &mut output).map(|()| result.exit_code())
+            let preamble = result.human_preamble();
+            render(&result, options.json, &mut output, Some(&preamble)).map(|()| result.exit_code())
         } else if options.modules.is_empty() {
             let result = snapshot(&SnapshotOptions {
                 pids: options.pids,
                 limits: Limits::default(),
             });
-            render(&result, options.json, &mut output).map(|()| result.exit_code())
+            let preamble = result.human_preamble();
+            render(&result, options.json, &mut output, Some(&preamble)).map(|()| result.exit_code())
         } else {
             let result = inspect_modules(&options.modules, Limits::default());
-            render(&result, options.json, &mut output)
+            render(&result, options.json, &mut output, None)
                 .map(|()| inventory_exit(result.capabilities.inventory))
         }
     };
@@ -374,7 +426,210 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{
+        Architecture, CaptureInterval, Gap, GapReason, IdentityStatus, ModuleInfo, ModuleRecord,
+        NamespaceIds, ObjectKind, ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode,
+        coalesce_gaps,
+    };
     use super::*;
+
+    fn module_with(status: IdentityStatus) -> ModuleRecord {
+        ModuleRecord {
+            info: ModuleInfo {
+                sha256: String::new(),
+                device: 0,
+                inode: 0,
+                size_bytes: 0,
+                architecture: Architecture::X86_64,
+                kind: ObjectKind::Other,
+                exports: Vec::new(),
+                depends_on_libcrypto: false,
+                depends_on_libssl: false,
+            },
+            identity_status: status,
+        }
+    }
+
+    fn snapshot_with(modules: Vec<ModuleRecord>) -> Snapshot {
+        let interval = CaptureInterval {
+            started_unix_ms: None,
+            finished_unix_ms: None,
+            elapsed_ns: 0,
+        };
+        Snapshot {
+            interval,
+            scope_record: ScopeRecord::default(),
+            schema_version: "osslscope.discovery.v1".into(),
+            mode: SnapshotMode::Snapshot,
+            scope: Scope::Pids,
+            selected_pids: vec![1],
+            processes: vec![ProcessRecord {
+                interval: CaptureInterval {
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ns: 0,
+                },
+                namespaces: NamespaceIds::default(),
+                pid: 1,
+                starttime: 0,
+                modules,
+                provider_activation: ObservationState::Unknown,
+                provider_interfaces: ObservationState::Unknown,
+                execution: ObservationState::NotObserved,
+            }],
+            gaps: Vec::new(),
+            totals: WorkTotals::default(),
+            limits: Limits::default(),
+            capabilities: Capabilities {
+                inventory: InventoryState::Complete,
+                provider_activation: ObservationState::Unknown,
+                provider_interfaces: ObservationState::Unknown,
+                execution: ObservationState::NotObserved,
+            },
+        }
+    }
+
+    #[test]
+    fn snapshot_identity_counts_verified_share() {
+        let snap = snapshot_with(vec![
+            module_with(IdentityStatus::Verified),
+            module_with(IdentityStatus::LocatorCandidate),
+        ]);
+        assert_eq!(snap.identity_counts(), (1, 1));
+        let empty = snapshot_with(Vec::new());
+        assert_eq!(empty.identity_counts(), (0, 0));
+    }
+
+    #[test]
+    fn human_render_reports_verified_share() {
+        let snap = snapshot_with(vec![
+            module_with(IdentityStatus::Verified),
+            module_with(IdentityStatus::LocatorCandidate),
+        ]);
+        let preamble = snap.human_preamble();
+        let mut buf = Vec::new();
+        render(&snap, false, &mut buf, Some(&preamble)).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)\n"),
+            "{out}"
+        );
+        // No gaps: no grouped block.
+        assert!(!out.contains("gaps ("), "{out}");
+        // JSON mode carries no preamble at all.
+        let mut buf = Vec::new();
+        render(&snap, true, &mut buf, Some(&preamble)).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("identity: "), "{out}");
+        assert!(!out.contains("Passive inventory"), "{out}");
+    }
+
+    #[test]
+    fn gap_reason_words_match_json() {
+        // Every word mirrors the serde snake_case label exactly.
+        for reason in [
+            GapReason::Unavailable,
+            GapReason::NonRegular,
+            GapReason::TooLarge,
+            GapReason::NotElf,
+            GapReason::MalformedElf,
+            GapReason::Changed,
+            GapReason::UnsupportedArchitecture,
+            GapReason::ProcessUnavailable,
+            GapReason::IdentityUnverified,
+            GapReason::BackingUnavailable,
+            GapReason::ReadLimit,
+            GapReason::ProcessLimit,
+            GapReason::ObjectLimit,
+            GapReason::MalformedMaps,
+            GapReason::Deadline,
+            GapReason::UnsupportedCgroup,
+            GapReason::CgroupUnavailable,
+            GapReason::CgroupLimit,
+            GapReason::MembershipUnknown,
+            GapReason::NamespaceUnavailable,
+        ] {
+            let json = serde_json::to_value(reason).unwrap();
+            assert_eq!(
+                json,
+                serde_json::Value::String(reason.word().into()),
+                "{reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gaps_coalesce_by_reason_device_pid() {
+        let gaps = vec![
+            Gap {
+                pid: Some(7),
+                device: Some(1),
+                inode: Some(10),
+                reason: GapReason::TooLarge,
+            },
+            Gap {
+                pid: Some(7),
+                device: Some(1),
+                inode: Some(11),
+                reason: GapReason::TooLarge,
+            },
+            Gap {
+                pid: Some(9),
+                device: Some(1),
+                inode: Some(12),
+                reason: GapReason::TooLarge,
+            },
+            Gap {
+                pid: None,
+                device: None,
+                inode: None,
+                reason: GapReason::Deadline,
+            },
+        ];
+        let groups = coalesce_gaps(&gaps);
+        assert_eq!(
+            groups,
+            vec![
+                (GapReason::TooLarge, Some(1), Some(7), 2),
+                (GapReason::TooLarge, Some(1), Some(9), 1),
+                (GapReason::Deadline, None, None, 1),
+            ]
+        );
+        // Counters are exact: group sizes sum to the input length.
+        assert_eq!(groups.iter().map(|g| g.3).sum::<usize>(), gaps.len());
+    }
+
+    #[test]
+    fn human_render_coalesces_gaps() {
+        let mut snap = snapshot_with(Vec::new());
+        snap.gaps = vec![
+            Gap {
+                pid: Some(7),
+                device: Some(1),
+                inode: Some(10),
+                reason: GapReason::TooLarge,
+            },
+            Gap {
+                pid: Some(7),
+                device: Some(1),
+                inode: Some(11),
+                reason: GapReason::TooLarge,
+            },
+        ];
+        let preamble = snap.human_preamble();
+        let mut buf = Vec::new();
+        render(&snap, false, &mut buf, Some(&preamble)).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("gaps (2 total in 1 group):\n"), "{out}");
+        assert!(out.contains("  too_large device=1 pid=7: 2\n"), "{out}");
+        // JSON mode carries the raw array, never the grouped block.
+        let mut buf = Vec::new();
+        render(&snap, true, &mut buf, Some(&preamble)).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("gaps ("), "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["gaps"].as_array().unwrap().len(), 2);
+    }
 
     #[test]
     fn module_limits_admit_no_io_when_object_or_deadline_budget_is_empty() {

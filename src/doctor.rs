@@ -59,6 +59,26 @@ impl Status {
     }
 }
 
+/// Phase 1 doctor sections: self capabilities, foreign-backing evidence,
+/// and the optional stated-target probe. Grouping is by push site (each
+/// section owns its check vector), never inferred from check ids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorSection {
+    SelfAttach,
+    ForeignBacking,
+    Target,
+}
+
+impl DoctorSection {
+    fn as_str(&self) -> &'static str {
+        match self {
+            DoctorSection::SelfAttach => "self_attach",
+            DoctorSection::ForeignBacking => "foreign_backing",
+            DoctorSection::Target => "target",
+        }
+    }
+}
+
 struct Check {
     id: &'static str,
     status: Status,
@@ -110,6 +130,59 @@ impl Check {
         }
         v
     }
+    fn json_in(&self, section: DoctorSection) -> serde_json::Value {
+        let mut v = self.json();
+        v["section"] = section.as_str().into();
+        v
+    }
+}
+
+/// Sectioned human rendering: fixed section order, a header per non-empty
+/// section, then the established `[tag] id: message` lines. The verdict
+/// line stays with the caller (exit logic unchanged).
+fn render_doctor_human(
+    sections: &[(DoctorSection, Vec<Check>)],
+    target: Option<&Target>,
+) -> String {
+    let mut s = String::new();
+    if let Some(t) = target {
+        s.push_str(&format!(
+            "target: {} (libcrypto: {})\n",
+            t.exe,
+            t.libcrypto.as_deref().unwrap_or("-")
+        ));
+    }
+    for (section, checks) in sections {
+        if checks.is_empty() {
+            continue;
+        }
+        s.push_str(&format!("== {} ==\n", section.as_str()));
+        for c in checks {
+            let tag = match c.status {
+                Status::Pass => "pass",
+                Status::Fail => "FAIL",
+                Status::Degraded => "degraded",
+                Status::Info => "info",
+            };
+            s.push_str(&format!("[{tag}] {}: {}\n", c.id, c.message));
+            if let Some(r) = &c.remediation {
+                s.push_str(&format!("  remediate: {r}\n"));
+            }
+        }
+    }
+    s
+}
+
+/// Sectioned JSON checks: established per-check shape plus the additive
+/// `section` key, in fixed section order.
+fn doctor_checks_json(sections: &[(DoctorSection, Vec<Check>)]) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for (section, checks) in sections {
+        for c in checks {
+            out.push(c.json_in(*section));
+        }
+    }
+    out
 }
 
 fn read_trimmed(path: &str) -> Option<String> {
@@ -1828,6 +1901,114 @@ fn check_foreign_uid(pid: u32, tuid: u32, env: &Env) -> Check {
     }
 }
 
+/// Functional `map_files` probe: backing verification binds VMA backing
+/// through `/proc/<pid>/map_files`, so doctor opens the directory for
+/// real. Golden rule (see `check_pidns`): no pids in messages.
+/// Pass = readable; Degraded = denied or target gone (never Fail:
+/// absence of evidence is inconclusive, not a refusal).
+fn check_map_files(pid: u32) -> Check {
+    match std::fs::read_dir(format!("/proc/{pid}/map_files")) {
+        Ok(_) => Check::pass(
+            "map-files",
+            "target map_files readable (VMA backing bindable)".into(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::degraded(
+            "map-files",
+            "target map_files gone (target exited or pid invalid)".into(),
+            "re-run against a live target pid".into(),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Check::degraded(
+            "map-files",
+            "target map_files denied (need same uid or ptrace scope to bind backing)".into(),
+            "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
+        ),
+        Err(e) => Check::degraded(
+            "map-files",
+            format!("target map_files unreadable ({})", e.kind()),
+            "re-run; persistent failure is a doctor bug — file it".into(),
+        ),
+    }
+}
+
+/// Functional `pagemap` probe: the indirect backing path compares page
+/// frames, so doctor opens `/proc/<pid>/pagemap` and reads one entry
+/// for a mapped page. Pass = a nonzero frame came back (frames
+/// observable); Info = open/read works but the frame is zeroed (stock
+/// unprivileged kernels zero PFNs — indirect backing unverifiable);
+/// Degraded = the target is gone or pagemap is unreadable.
+fn check_pagemap(pid: u32) -> Check {
+    use std::os::unix::fs::FileExt;
+    let path = format!("/proc/{pid}/pagemap");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Check::degraded(
+                "pagemap",
+                "target pagemap gone (target exited or pid invalid)".into(),
+                "re-run against a live target pid".into(),
+            );
+        }
+        Err(_) => {
+            return Check::degraded(
+                "pagemap",
+                "target pagemap denied (need same uid or elevated caps to compare frames)".into(),
+                "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
+            );
+        }
+    };
+    // Probe address: a mapped page of our own image. For a foreign pid
+    // this address may be unmapped there — NotFound/zero reads then
+    // still prove the access path, only the frame comparison stays
+    // inconclusive, which is exactly what the Info arm reports.
+    let probe_addr = check_pagemap as usize;
+    let page = 4096u64;
+    let mut entry = [0u8; 8];
+    match file.read_exact_at(&mut entry, (probe_addr as u64 / page) * 8) {
+        Ok(()) => {
+            let frame = u64::from_le_bytes(entry) & ((1u64 << 55) - 1);
+            let present = u64::from_le_bytes(entry) & (1u64 << 63) != 0;
+            if present && frame != 0 {
+                Check::pass(
+                    "pagemap",
+                    "target pagemap yields page frames (indirect backing comparable)".into(),
+                )
+            } else {
+                Check::info(
+                    "pagemap",
+                    "target pagemap readable but frames zeroed (unprivileged PFN masking — indirect backing unverifiable)"
+                        .into(),
+                )
+            }
+        }
+        Err(_) => Check::info(
+            "pagemap",
+            "target pagemap opened but the probe page is unreadable there (foreign address space — frame comparison inconclusive)"
+                .into(),
+        ),
+    }
+}
+
+/// Sysctl context lines: informational only (never verdict-driving).
+/// Each row reports the raw value or its absence; operators use these
+/// to interpret capability rows, not to re-derive them.
+fn check_sysctl_context() -> Vec<Check> {
+    fn read(name: &str) -> String {
+        let path = format!("/proc/sys/{}", name.replace('.', "/"));
+        std::fs::read_to_string(&path)
+            .map(|v| v.trim().to_string())
+            .unwrap_or_else(|_| "unreadable".into())
+    }
+    [
+        ("sys-perf-paranoid", "kernel.perf_event_paranoid"),
+        ("sys-kptr-restrict", "kernel.kptr_restrict"),
+        ("sys-unpriv-bpf", "kernel.unprivileged_bpf_disabled"),
+        ("sys-ptrace-scope", "kernel.yama.ptrace_scope"),
+    ]
+    .into_iter()
+    .map(|(id, name)| Check::info(id, format!("{name}={}", read(name))))
+    .collect()
+}
+
 /// Qualification inputs shared by every target byte check (one
 /// construction per doctor run; the same values the backend would
 /// use for this target, so rows agree with `report`/`check`).
@@ -2215,7 +2396,10 @@ fn run_with_resolver(
         Ok(exit) => exit,
         Err(error) => {
             let env = gather_env();
-            let checks = vec![
+            // Admission failure: environment-only, all self_attach.
+            let sections = [(
+                DoctorSection::SelfAttach,
+                vec![
                 Check::fail(
                     "package-admission",
                     error.to_string(),
@@ -2232,16 +2416,15 @@ fn run_with_resolver(
                 check_ima(),
                 lsm_environment_summary(&env),
                 check_seccomp(&env),
-            ];
+            ],
+            )];
             if format == "json" {
                 println!(
                     "{}",
-                    serde_json::json!({"target":null,"checks":checks.iter().map(Check::json).collect::<Vec<_>>(),"verdict":"fail-closed","exit":4})
+                    serde_json::json!({"target":null,"checks":doctor_checks_json(&sections),"verdict":"fail-closed","exit":4})
                 );
             } else {
-                for c in &checks {
-                    println!("[{}] {}: {}", c.status.as_str(), c.id, c.message);
-                }
+                print!("{}", render_doctor_human(&sections, None));
             }
             ExitCode::from(4)
         }
@@ -2262,7 +2445,9 @@ fn run_admitted_doctor(
     }
     let package_build = admitted.provenance();
     let env = gather_env();
-    let mut checks = vec![
+    // Phase 1 split: each section owns its push sites (a new push must name
+    // its section — there is no shared `checks` vec to drift into).
+    let mut self_checks = vec![
         check_kernel(&env),
         check_token_support(&env),
         check_ringbuf_query(&env),
@@ -2274,8 +2459,10 @@ fn run_admitted_doctor(
         check_seccomp(&env),
         check_spawn_access(),
     ];
+    let mut foreign_checks: Vec<Check> = Vec::new();
+    let mut target_checks: Vec<Check> = Vec::new();
     if let Some(base) = &package_build.installed_base {
-        checks.push(Check::pass(
+        self_checks.push(Check::pass(
             "package-admission",
             format!(
                 "admitted base bundle={} payload={} input={}",
@@ -2283,7 +2470,7 @@ fn run_admitted_doctor(
             ),
         ));
     } else {
-        checks.push(Check::info(
+        self_checks.push(Check::info(
             "package-admission",
             "explicit operator objects: source/build provenance unknown".into(),
         ));
@@ -2294,29 +2481,33 @@ fn run_admitted_doctor(
         (crate::package::records::Role::Members, "objects-members"),
     ] {
         if let Some(snapshot) = admitted.role(role) {
-            checks.push(Check::pass(
+            self_checks.push(Check::pass(
                 id,
                 format!("{} sha256={}", snapshot.locator.display(), snapshot.sha256),
             ));
         } else {
-            checks.push(Check::info(id, "not selected: explicit pair only".into()));
+            self_checks.push(Check::info(id, "not selected: explicit pair only".into()));
         }
     }
+    // Sysctl context: informational only, never verdict-driving.
+    self_checks.extend(check_sysctl_context());
 
     let mut target: Option<Target> = None;
     if let Some(p) = pid {
         let exe = proc_exe_name(p).unwrap_or_else(|| "?".into());
         let tuid = proc_uid(p).unwrap_or(u32::MAX);
-        checks.push(check_pidns(p));
+        foreign_checks.push(check_pidns(p));
         // v0.2 cold-gap preflight: --pid windows are blind to
         // pre-attach execution by architecture. Degraded, never a
         // refusal — --pid stays usable; post-hoc pid-prewindow-blind
         // / cold-gap emission still applies (what-it-proves.md).
-        checks.push(cold_gap_preflight());
-        checks.push(check_foreign_uid(p, tuid, &env));
+        self_checks.push(cold_gap_preflight());
+        foreign_checks.push(check_foreign_uid(p, tuid, &env));
+        foreign_checks.push(check_map_files(p));
+        foreign_checks.push(check_pagemap(p));
         match crate::discovery::maps::read_maps(p) {
             Ok(maps) => {
-                checks.push(Check::pass("target-access", "target maps readable".into()));
+                target_checks.push(Check::pass("target-access", "target maps readable".into()));
                 match onboard::libcrypto_from_maps(&maps) {
                     LibcryptoMaps::One { path } => {
                         target = Some(Target {
@@ -2333,10 +2524,10 @@ fn run_admitted_doctor(
                             onboard::MAX_OBJECT_SCAN_BYTES,
                         ) {
                             Ok(bytes) => {
-                                checks.extend(check_target_bytes(&path, &bytes, &tctx));
-                                checks.extend(coverage_checks(&maps, &path, &bytes));
+                                target_checks.extend(check_target_bytes(&path, &bytes, &tctx));
+                                target_checks.extend(coverage_checks(&maps, &path, &bytes));
                             }
-                            Err(e) => checks.push(target_file_unreadable(&path, &e)),
+                            Err(e) => target_checks.push(target_file_unreadable(&path, &e)),
                         }
                     }
                     LibcryptoMaps::None => {
@@ -2352,15 +2543,16 @@ fn run_admitted_doctor(
                         let exe_path = Path::new(&exe_link);
                         match onboard::read_bounded(exe_path, onboard::MAX_OBJECT_SCAN_BYTES) {
                             Ok(bytes) => {
-                                checks.push(Check::info(
+                                target_checks.push(Check::info(
                                     "libcrypto-found",
                                     format!("no libcrypto mapped; static candidate: {exe_link}"),
                                 ));
-                                checks.extend(check_byte_rows(&exe_link, &bytes, true, &tctx));
-                                checks.extend(coverage_checks(&maps, &exe_link, &bytes));
+                                target_checks
+                                    .extend(check_byte_rows(&exe_link, &bytes, true, &tctx));
+                                target_checks.extend(coverage_checks(&maps, &exe_link, &bytes));
                             }
                             Err(e) => {
-                                checks.push(Check::fail(
+                                target_checks.push(Check::fail(
                                     "libcrypto-found",
                                     format!("no libcrypto mapped and target exe unreadable: {e}"),
                                     "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
@@ -2375,7 +2567,7 @@ fn run_admitted_doctor(
                             self_uid: self_uid(),
                             libcrypto: None,
                         });
-                        checks.push(Check::fail(
+                        target_checks.push(Check::fail(
                             "libcrypto-found",
                             "libcrypto mapping is (deleted) (upgraded underfoot?)".into(),
                             "restart the target".into(),
@@ -2388,7 +2580,7 @@ fn run_admitted_doctor(
                             self_uid: self_uid(),
                             libcrypto: None,
                         });
-                        checks.push(Check::fail(
+                        target_checks.push(Check::fail(
                             "libcrypto-found",
                             format!(
                                 "multiple libcrypto builds mapped (dual-load, ambiguous): {}",
@@ -2411,7 +2603,7 @@ fn run_admitted_doctor(
                     .downcast_ref::<std::io::Error>()
                     .map(|io| io.kind().to_string())
                     .unwrap_or_else(|| e.to_string());
-                checks.push(Check::fail(
+                target_checks.push(Check::fail(
                     "target-access",
                     format!("cannot read target maps ({kind}) — need CAP_SYS_PTRACE or same uid (target {tuid}, self {})", self_uid()),
                     "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
@@ -2425,20 +2617,28 @@ fn run_admitted_doctor(
             self_uid: self_uid(),
             libcrypto: Some(path.clone()),
         });
-        checks.push(Check::info(
+        foreign_checks.push(Check::info(
             "pidns",
             "no process target (--libcrypto is bytes-only)".into(),
         ));
-        checks.push(Check::info(
+        foreign_checks.push(Check::info(
             "foreign-uid",
             "no process target (--libcrypto is bytes-only)".into(),
         ));
-        checks.push(Check::pass(
+        foreign_checks.push(Check::info(
+            "map-files",
+            "no process target (--libcrypto is bytes-only)".into(),
+        ));
+        foreign_checks.push(Check::info(
+            "pagemap",
+            "no process target (--libcrypto is bytes-only)".into(),
+        ));
+        target_checks.push(Check::pass(
             "target-access",
             "libcrypto file given directly (--libcrypto)".into(),
         ));
-        checks.extend(check_target_file(&path, &tctx));
-        checks.push(Check::info(
+        target_checks.extend(check_target_file(&path, &tctx));
+        target_checks.push(Check::info(
             "coverage-scope",
             "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
         ));
@@ -2453,12 +2653,20 @@ fn run_admitted_doctor(
             ld_library_path: ld_var.as_deref(),
         };
         let argv = vec![exe_arg.clone()];
-        checks.push(Check::info(
+        foreign_checks.push(Check::info(
             "pidns",
             "no process target (--exe predicts pre-exec)".into(),
         ));
-        checks.push(Check::info(
+        foreign_checks.push(Check::info(
             "foreign-uid",
+            "no process target (--exe predicts pre-exec)".into(),
+        ));
+        foreign_checks.push(Check::info(
+            "map-files",
+            "no process target (--exe predicts pre-exec)".into(),
+        ));
+        foreign_checks.push(Check::info(
+            "pagemap",
             "no process target (--exe predicts pre-exec)".into(),
         ));
         match onboard::predict_spawn_lib(&argv, &spenv) {
@@ -2469,10 +2677,10 @@ fn run_admitted_doctor(
                     self_uid: self_uid(),
                     libcrypto: None,
                 });
-                checks.push(Check::fail("target-access", e.message, e.remediation));
+                target_checks.push(Check::fail("target-access", e.message, e.remediation));
             }
             Ok(pred) => {
-                checks.push(Check::pass(
+                target_checks.push(Check::pass(
                     "target-access",
                     format!("spawn executable resolved: {}", pred.exe.display()),
                 ));
@@ -2489,7 +2697,7 @@ fn run_admitted_doctor(
                         self_uid: self_uid(),
                         libcrypto: Some(lib.clone()),
                     });
-                    checks.extend(check_target_file(&lib, &tctx));
+                    target_checks.extend(check_target_file(&lib, &tctx));
                 } else {
                     target = Some(Target {
                         exe: base_name(&pred.exe),
@@ -2503,20 +2711,20 @@ fn run_admitted_doctor(
                         && exe_arch_err.is_none()
                     {
                         let exe_s = pred.exe.to_string_lossy().into_owned();
-                        checks.push(Check::info(
+                        target_checks.push(Check::info(
                             "libcrypto-found",
                             format!("no NEEDED libcrypto; static candidate: {exe_s}"),
                         ));
-                        checks.extend(check_byte_rows(&exe_s, &pred.exe_bytes, true, &tctx));
+                        target_checks.extend(check_byte_rows(&exe_s, &pred.exe_bytes, true, &tctx));
                     } else {
                         if let Some(e) = exe_arch_err {
-                            checks.push(Check::fail(
+                            target_checks.push(Check::fail(
                                 "arch",
                                 format!("{}: {e}", pred.exe.display()),
                                 "run a 64-bit x86-64 binary".into(),
                             ));
                         } else {
-                            checks.push(Check::info(
+                            target_checks.push(Check::info(
                                 "libcrypto-found",
                                 format!(
                                     "no single predicted libcrypto for {} — see dispatch-anchor",
@@ -2526,13 +2734,13 @@ fn run_admitted_doctor(
                         }
                         match onboard::discover_spawn(&argv, &tctx.opts(), &spenv) {
                             Ok(qual) => {
-                                checks.push(anchor_check(&qual));
-                                checks.push(Check::info(
+                                target_checks.push(anchor_check(&qual));
+                                target_checks.push(Check::info(
                                     "provider-class",
                                     "unknown (target unqualified)".into(),
                                 ));
                             }
-                            Err(e) => checks.push(Check::fail(
+                            Err(e) => target_checks.push(Check::fail(
                                 "dispatch-anchor",
                                 e.message,
                                 e.remediation,
@@ -2540,21 +2748,28 @@ fn run_admitted_doctor(
                         }
                     }
                 }
-                checks.push(Check::info(
+                target_checks.push(Check::info(
                     "coverage-scope",
                     "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
                 ));
-                checks.push(spawn_coverage_note());
+                target_checks.push(spawn_coverage_note());
             }
         }
     }
 
-    let failed = checks.iter().any(|c| c.status == Status::Fail);
+    let sections = [
+        (DoctorSection::SelfAttach, self_checks),
+        (DoctorSection::ForeignBacking, foreign_checks),
+        (DoctorSection::Target, target_checks),
+    ];
+    let failed = sections
+        .iter()
+        .any(|(_, checks)| checks.iter().any(|c| c.status == Status::Fail));
     if format == "json" {
         let doc = serde_json::json!({
             "package_build": package_build,
             "target": target_json(&target),
-            "checks": checks.iter().map(Check::json).collect::<Vec<_>>(),
+            "checks": doctor_checks_json(&sections),
             "verdict": if failed { "fail-closed" } else { "ok" },
             "exit": if failed { 4 } else { 0 },
         });
@@ -2563,25 +2778,7 @@ fn run_admitted_doctor(
         let text = serde_json::to_string_pretty(&doc).unwrap_or_else(|_| "{}".to_string());
         println!("{text}");
     } else {
-        if let Some(t) = &target {
-            println!(
-                "target: {} (libcrypto: {})",
-                t.exe,
-                t.libcrypto.as_deref().unwrap_or("-")
-            );
-        }
-        for c in &checks {
-            let tag = match c.status {
-                Status::Pass => "pass",
-                Status::Fail => "FAIL",
-                Status::Degraded => "degraded",
-                Status::Info => "info",
-            };
-            println!("[{tag}] {}: {}", c.id, c.message);
-            if let Some(r) = &c.remediation {
-                println!("  remediate: {r}");
-            }
-        }
+        print!("{}", render_doctor_human(&sections, target.as_ref()));
         println!("verdict: {}", if failed { "FAIL-CLOSED" } else { "ok" });
     }
     if failed {
@@ -2594,6 +2791,35 @@ fn run_admitted_doctor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_output_groups_checks_by_section() {
+        // Phase 1 split: self_attach / foreign_backing / target sections in
+        // human (headers) and JSON (per-check section key).
+        let sections = [
+            (
+                DoctorSection::SelfAttach,
+                vec![Check::pass("caps", "cap_bpf+cap_perfmon effective".into())],
+            ),
+            (
+                DoctorSection::ForeignBacking,
+                vec![Check::info(
+                    "foreign-target",
+                    "no foreign target stated (pass --pid to probe backing)".into(),
+                )],
+            ),
+        ];
+        let human = render_doctor_human(&sections, None);
+        let self_pos = human.find("== self_attach ==").expect("self header");
+        let foreign_pos = human.find("== foreign_backing ==").expect("foreign header");
+        assert!(self_pos < foreign_pos, "fixed section order:\n{human}");
+        assert!(human.contains("[pass] caps:"), "{human}");
+        let json = doctor_checks_json(&sections);
+        assert_eq!(json.len(), 2);
+        assert_eq!(json[0]["section"], "self_attach");
+        assert_eq!(json[0]["id"], "caps");
+        assert_eq!(json[1]["section"], "foreign_backing");
+    }
 
     // Scoped substitutes sit before the actual native probe operations. They
     // observe the real refusal arm as well as admitted checks, without issuing
@@ -3188,6 +3414,104 @@ mod tests {
         assert_eq!(j["remediation"], "r");
         let c = Check::pass("y", "m".into());
         assert!(c.json().get("remediation").is_none());
+    }
+
+    #[test]
+    fn check_json_in_carries_section() {
+        let c = Check::pass("y", "m".into());
+        let j = c.json_in(DoctorSection::ForeignBacking);
+        assert_eq!(j["id"], "y");
+        assert_eq!(j["section"], "foreign_backing");
+        assert_eq!(j["status"], "pass");
+        assert_eq!(j["message"], "m");
+        // Base shape gains exactly one additive key.
+        assert_eq!(j.as_object().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn render_doctor_human_groups_by_section() {
+        let sections = [
+            (
+                DoctorSection::SelfAttach,
+                vec![Check::pass("self-ok", "s".into())],
+            ),
+            (DoctorSection::ForeignBacking, vec![]),
+            (
+                DoctorSection::Target,
+                vec![Check::fail("t", "m".into(), "r".into())],
+            ),
+        ];
+        let out = render_doctor_human(&sections, None);
+        assert!(out.contains("== self_attach =="), "{out}");
+        assert!(!out.contains("== foreign_backing =="), "{out}");
+        assert!(out.contains("== target =="), "{out}");
+        assert!(out.contains("[pass] self-ok: s"), "{out}");
+        assert!(out.contains("[FAIL] t: m"), "{out}");
+        assert!(out.contains("remediate: r"), "{out}");
+    }
+
+    #[test]
+    fn map_files_probe_passes_for_self_and_degrades_for_dead_pid() {
+        let own = check_map_files(std::process::id());
+        assert_eq!(own.id, "map-files");
+        assert_eq!(own.status, Status::Pass);
+        let dead = check_map_files(u32::MAX);
+        assert_eq!(dead.id, "map-files");
+        assert_eq!(dead.status, Status::Degraded);
+        assert!(!dead.message.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn pagemap_probe_reads_frame_for_self_and_degrades_for_dead_pid() {
+        let own = check_pagemap(std::process::id());
+        assert_eq!(own.id, "pagemap");
+        // Unprivileged self reads zero the frame; privileged self sees it.
+        // Either way the probe itself must not fail.
+        assert!(
+            own.status == Status::Pass || own.status == Status::Info,
+            "{}",
+            own.message
+        );
+        let dead = check_pagemap(u32::MAX);
+        assert_eq!(dead.id, "pagemap");
+        assert_eq!(dead.status, Status::Degraded);
+    }
+
+    #[test]
+    fn sysctl_context_rows_are_info_only() {
+        let rows = check_sysctl_context();
+        assert_eq!(rows.len(), 4);
+        for c in &rows {
+            assert_eq!(c.status, Status::Info, "{}", c.id);
+            assert!(c.remediation.is_none(), "{}", c.id);
+        }
+        let ids: Vec<&str> = rows.iter().map(|c| c.id).collect();
+        assert_eq!(
+            ids,
+            vec![
+                "sys-perf-paranoid",
+                "sys-kptr-restrict",
+                "sys-unpriv-bpf",
+                "sys-ptrace-scope",
+            ]
+        );
+    }
+
+    #[test]
+    fn doctor_checks_json_preserves_section_order() {
+        let sections = [
+            (
+                DoctorSection::SelfAttach,
+                vec![Check::pass("a", "s".into())],
+            ),
+            (DoctorSection::Target, vec![Check::info("b", "t".into())]),
+        ];
+        let vals = doctor_checks_json(&sections);
+        assert_eq!(vals.len(), 2);
+        assert_eq!(vals[0]["section"], "self_attach");
+        assert_eq!(vals[1]["section"], "target");
+        assert_eq!(vals[0]["id"], "a");
+        assert_eq!(vals[1]["id"], "b");
     }
 
     #[test]

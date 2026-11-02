@@ -5,6 +5,7 @@
 //! below. The current report/check path uses the finalized v2 evidence
 //! document; live and release qualification remain separate.
 
+pub mod acquire_cause;
 pub mod aliases;
 // T04 (coordinator review): new modules for owned-target custody +
 // safe CLI arguments; placement is alphabetical, no other movement.

@@ -1450,34 +1450,39 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
     use osslscope::evidence::{
         CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,
     };
-    // One of each producer shape (literals verbatim from the
-    // allowlist bullet; templates instantiated with
-    // representative kinds — NotFound/PermissionDenied/InvalidData
-    // plus the collapse token).
+    // One of each producer shape (Phase 1 taxonomy: every entry carries
+    // its finite class prefix; literals verbatim otherwise; templates
+    // instantiated with representative kinds — NotFound/PermissionDenied/
+    // InvalidData plus the collapse token; scrub fallbacks included).
     let diags = [
-        "stage-2 target unmapped; link detached",
-        "libcrypto unmapped after replacement; tripwire anchors blind",
-        "tripwire mapping changed across replacement; anchors blind (cookie meanings shifted)",
-        "stage-2 target superseded by replacement; old link detached",
-        "stage-2 retry superseded by replacement; awaiting fresh init",
-        "legacy stage-2 attach has no file mapping",
-        "stage-2 attach has no provider mapping",
-        "stage-2 pin open failed (kind=NotFound; cookie retries next poll)",
-        "stage-2 pin open failed (kind=PermissionDenied; cookie retries next poll)",
-        "stage-2 pin misses the resolve-time identity (cookie retries next poll)",
-        "attach query_entry@0x1234 failed (kind=PermissionDenied)",
-        "attach query_entry+query_return pin dup failed (kind=NotFound)",
-        "tripwire anchors re-established after replacement (identical mapping)",
-        "dispatch anchors re-established after replacement; continuity unproven",
-        "attach path contains NUL",
-        "dispatch reinstall failed: reinstall init anchor unresolved",
-        "dispatch reinstall failed: no dispatch anchor to reinstall",
-        "dispatch maps read failed (kind=InvalidData)",
-        "dispatch provider read failed (kind=error)",
-        "reinstall init anchor unresolved",
-        "reinstall builtin anchor unresolved",
-        "no dispatch anchor to reinstall",
-        "missing program query_entry",
+        "backing-changed:stage-2 target unmapped; link detached",
+        "backing-changed:libcrypto unmapped after replacement; tripwire anchors blind",
+        "backing-changed:tripwire mapping changed across replacement; anchors blind (cookie meanings shifted)",
+        "backing-changed:stage-2 target superseded by replacement; old link detached",
+        "backing-changed:stage-2 retry superseded by replacement; awaiting fresh init",
+        "symbol-discovery:legacy stage-2 attach has no file mapping",
+        "symbol-discovery:stage-2 attach has no provider mapping",
+        "attach:stage-2 pin open failed (kind=NotFound; cookie retries next poll)",
+        "attach:stage-2 pin open failed (kind=PermissionDenied; cookie retries next poll)",
+        "attach:stage-2 pin misses the resolve-time identity (cookie retries next poll)",
+        "attach:link query_entry@0x1234 failed (kind=PermissionDenied)",
+        "attach:pin dup query_entry+query_return failed (kind=NotFound)",
+        "backing-changed:tripwire anchors re-established after replacement (identical mapping)",
+        "backing-changed:dispatch anchors re-established after replacement; continuity unproven",
+        "attach:path contains NUL",
+        "attach:dispatch reinstall failed: reinstall init anchor unresolved",
+        "attach:dispatch reinstall failed: no dispatch anchor to reinstall",
+        "attach:dispatch maps read failed (kind=InvalidData)",
+        "attach:dispatch provider read failed (kind=error)",
+        "attach:reinstall init anchor unresolved",
+        "attach:reinstall builtin anchor unresolved",
+        "attach:no dispatch anchor to reinstall",
+        "attach:missing program query_entry",
+        "symbol-discovery:resolve-failed",
+        "attach:install-failed",
+        "attach:dispatch-reinstall-failed",
+        "backing-denied:permission-denied",
+        "backing-changed:not-found",
     ];
     let mut doc = finalize(FinalizeInput {
         window: CaptureWindow {
@@ -1512,71 +1517,54 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
         .map(|d| d.as_str().unwrap())
         .collect();
     assert_eq!(rendered.len(), diags.len());
-    fn is_kind_token(s: &str) -> bool {
-        !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric())
-    }
-    fn is_hex_offset(s: &str) -> bool {
-        s.strip_prefix("0x")
-            .is_some_and(|h| !h.is_empty() && h.bytes().all(|b| b.is_ascii_hexdigit()))
-    }
+    // Phase 1 taxonomy: every entry is `class:rest` with a finite class
+    // wire string; the rest validates against the per-class vocabulary.
+    // Template/literal sets come from the production taxonomy module
+    // (single source of truth shared with the producers).
     fn approved(text: &str) -> bool {
-        const LITERALS: &[&str] = &[
+        use osslscope::acquire_cause::{ANCHOR_LITERALS, RESOLVE_LITERALS, attach_template_shape};
+        const BACKING_CHANGED_LITERALS: &[&str] = &[
             "stage-2 target unmapped; link detached",
             "libcrypto unmapped after replacement; tripwire anchors blind",
             "tripwire mapping changed across replacement; anchors blind (cookie meanings shifted)",
             "stage-2 target superseded by replacement; old link detached",
             "stage-2 retry superseded by replacement; awaiting fresh init",
-            "legacy stage-2 attach has no file mapping",
-            "stage-2 attach has no provider mapping",
-            "stage-2 pin misses the resolve-time identity (cookie retries next poll)",
             "tripwire anchors re-established after replacement (identical mapping)",
             "dispatch anchors re-established after replacement; continuity unproven",
-            "attach path contains NUL",
-            "reinstall init anchor unresolved",
-            "reinstall builtin anchor unresolved",
-            "no dispatch anchor to reinstall",
         ];
-        if LITERALS.contains(&text) {
-            return true;
-        }
-        if let Some(rest) = text.strip_prefix("stage-2 pin open failed (kind=") {
-            return rest
-                .strip_suffix("; cookie retries next poll)")
-                .is_some_and(is_kind_token);
-        }
-        if let Some(rest) = text.strip_prefix("attach ") {
-            // Link form `<name>@<hex-offset>` or pin-dup form
-            // `<name>+<name> pin dup` — static names only.
-            fn is_prog_name(s: &str) -> bool {
-                !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            }
-            if let Some((head, kind)) = rest.rsplit_once(" failed (kind=") {
-                let kind_ok = kind.strip_suffix(')').is_some_and(is_kind_token);
-                let link_ok = head
-                    .split_once('@')
-                    .is_some_and(|(name, off)| is_prog_name(name) && is_hex_offset(off));
-                let dup_ok = head
-                    .strip_suffix(" pin dup")
-                    .and_then(|pair| pair.split_once('+'))
-                    .is_some_and(|(a, b)| is_prog_name(a) && is_prog_name(b));
-                return kind_ok && (link_ok || dup_ok);
-            }
+        const KIND_TOKENS: &[&str] = &[
+            "permission-denied",
+            "not-found",
+            "timed-out",
+            "interrupted",
+            "busy",
+            "would-block",
+            "over-limit",
+            "io-failed",
+        ];
+        let Some((class, rest)) = text.split_once(':') else {
             return false;
+        };
+        match class {
+            "backing-changed" => {
+                BACKING_CHANGED_LITERALS.contains(&rest) || KIND_TOKENS.contains(&rest)
+            }
+            "symbol-discovery" => RESOLVE_LITERALS.contains(&rest) || rest == "resolve-failed",
+            "attach" => {
+                if rest == "install-failed" || rest == "dispatch-reinstall-failed" {
+                    return true;
+                }
+                if ANCHOR_LITERALS.contains(&rest) {
+                    return true;
+                }
+                if let Some(anchor) = rest.strip_prefix("dispatch reinstall failed: ") {
+                    return ANCHOR_LITERALS.contains(&anchor);
+                }
+                attach_template_shape(rest)
+            }
+            "backing-denied" | "deadline-cancel" | "limit" => KIND_TOKENS.contains(&rest),
+            _ => false,
         }
-        if let Some(rest) = text.strip_prefix("dispatch reinstall failed: ") {
-            return approved(rest);
-        }
-        if let Some(rest) = text.strip_prefix("dispatch maps read failed (kind=") {
-            return rest.strip_suffix(')').is_some_and(is_kind_token);
-        }
-        if let Some(rest) = text.strip_prefix("dispatch provider read failed (kind=") {
-            return rest.strip_suffix(')').is_some_and(is_kind_token);
-        }
-        if let Some(name) = text.strip_prefix("missing program ") {
-            return !name.is_empty()
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
-        }
-        false
     }
     for d in &rendered {
         assert!(!d.contains('/'), "diagnostic carries a pathname: {d}");
@@ -1597,9 +1585,10 @@ fn refusal_diagnostics_shape_is_numeric_only() {
     use osslscope::evidence::{
         CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,
     };
+    // Phase 1 taxonomy: refusal entries carry the limit class prefix.
     let diags = [
-        "dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024",
-        "dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024",
+        "limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024",
+        "limit:dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024",
     ];
     let mut doc = finalize(FinalizeInput {
         window: CaptureWindow {
@@ -1642,7 +1631,10 @@ fn refusal_diagnostics_shape_is_numeric_only() {
     }
     for d in &rendered {
         assert!(!d.contains('/'), "refusal carries a pathname: {d}");
-        let parts: Vec<&str> = d.split(' ').collect();
+        let body = d
+            .strip_prefix("limit:")
+            .unwrap_or_else(|| panic!("refusal carries the limit class: {d}"));
+        let parts: Vec<&str> = body.split(' ').collect();
         assert_eq!(parts.len(), 5, "five space-separated fields: {d}");
         assert!(parts[0].strip_prefix("dev=").is_some_and(num));
         assert!(parts[1].strip_prefix("ino=").is_some_and(num));

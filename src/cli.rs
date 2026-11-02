@@ -3,6 +3,21 @@
 //! taxonomy 0/1/2/3/4/10 (see usage.md).
 use std::process::ExitCode;
 
+/// One help line per exit code (mirrors docs/usage.md#exit-codes).
+/// Exits 3/4 additionally print their single stderr reason at runtime
+/// (see `report::exit_reason_line`).
+pub(crate) fn exit_code_help() -> [&'static str; 7] {
+    [
+        "  exit 0: ok (help or successful controls; no complete-execution claim)",
+        "  exit 1: child, artifact-delivery, or usable runtime failure",
+        "  exit 2: invalid arguments, policy, or explicit companion",
+        "  exit 3: PARTIAL report or unavailable/denied capability",
+        "  exit 4: setup/environment refusal without usable observation (no verdict)",
+        "  exit 10: definite policy violation (takes precedence)",
+        "  exit 11: policy inconclusive (Unknown-only evidence)",
+    ]
+}
+
 pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
     let argv: Vec<String> = args.collect();
     let cmd = argv.first().map(String::as_str).unwrap_or("help");
@@ -47,6 +62,9 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             println!("  --observe-providers  public provider API observation (default 30 seconds)");
             println!("  doctor --discovery  capability checks without a build catalogue");
             println!("  discovery does not prove provider activation or execution");
+            for line in exit_code_help() {
+                println!("{line}");
+            }
             ExitCode::SUCCESS
         }
         "--version" | "-V" => {
@@ -123,5 +141,23 @@ mod preview_tests {
         assert!(
             matches!(prepare(args.into_iter()), PreparedCommand::Immediate(code) if code == ExitCode::SUCCESS)
         );
+    }
+
+    #[test]
+    fn help_exit_block_names_every_code_once() {
+        // P1-help/exit: the top-level help carries one line per exit
+        // code, mirroring docs/usage.md#exit-codes.
+        let lines = exit_code_help();
+        assert_eq!(lines.len(), 7);
+        let joined = lines.join("\n");
+        for code in ["0", "1", "2", "3", "4", "10", "11"] {
+            assert_eq!(
+                joined.matches(&format!("exit {code}:")).count(),
+                1,
+                "{joined}"
+            );
+        }
+        assert!(joined.contains("no verdict"), "{joined}");
+        assert!(joined.contains("violation"), "{joined}");
     }
 }
