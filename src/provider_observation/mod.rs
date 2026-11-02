@@ -9,6 +9,7 @@ pub mod copied_plan;
 pub mod digest_workload;
 pub mod objects;
 pub mod schema;
+pub mod signature_workload;
 #[cfg(test)]
 pub(crate) mod source_acquire;
 #[cfg(not(test))]

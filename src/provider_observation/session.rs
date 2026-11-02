@@ -2018,7 +2018,7 @@ impl ProviderSession {
             // operational role wins, later roles at the same offset keep
             // their own cookie (the discovery census already arbitrated
             // offset conflicts, so this is defense in depth).
-            if matches!(role_id, 304..=308 | 312..=315 | 319..=323) {
+            if matches!(role_id, 304..=308 | 312..=315 | 319..=323 | 327..=346) {
                 self.typed_pins
                     .entry((device, inode, offset))
                     .or_insert(cookie);

@@ -88,7 +88,8 @@ impl TypedRoleId {
             | 291
             | 304..=308
             | 309..=315
-            | 316..=323 => Some(Self(id)),
+            | 316..=323
+            | 324..=346 => Some(Self(id)),
             _ => None,
         }
     }
@@ -178,6 +179,33 @@ impl TypedAdmission {
             321 => Some((0, 2, 4)),
             322 => Some((0, 2, 5)),
             323 => Some((0, 2, 6)),
+            // Signature (op 12): newctx / freectx / dupctx; sign,
+            // verify, recover, digest_sign, digest_verify,
+            // sign_message, verify_message verbs (params 18-25 and
+            // query_key_types 26 stay unmapped).
+            324 => Some((0, 12, 1)),
+            325 => Some((0, 12, 16)),
+            326 => Some((0, 12, 17)),
+            327 => Some((0, 12, 2)),
+            328 => Some((0, 12, 3)),
+            329 => Some((0, 12, 4)),
+            330 => Some((0, 12, 5)),
+            331 => Some((0, 12, 6)),
+            332 => Some((0, 12, 7)),
+            333 => Some((0, 12, 8)),
+            334 => Some((0, 12, 9)),
+            335 => Some((0, 12, 10)),
+            336 => Some((0, 12, 11)),
+            337 => Some((0, 12, 12)),
+            338 => Some((0, 12, 13)),
+            339 => Some((0, 12, 14)),
+            340 => Some((0, 12, 15)),
+            341 => Some((0, 12, 27)),
+            342 => Some((0, 12, 28)),
+            343 => Some((0, 12, 29)),
+            344 => Some((0, 12, 30)),
+            345 => Some((0, 12, 31)),
+            346 => Some((0, 12, 32)),
             _ => None,
         }
     }
@@ -245,11 +273,13 @@ impl TypedAdmission {
                 | 311
                 | 316
                 | 318
+                | 324
+                | 326
         )
     }
     #[inline(always)]
     pub const fn operational(&self) -> bool {
-        matches!(self.role_id, 304..=307 | 312..=315 | 319..=323)
+        matches!(self.role_id, 304..=307 | 312..=315 | 319..=323 | 327..=346)
     }
 }
 #[repr(C)]

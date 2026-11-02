@@ -195,17 +195,18 @@ fn producer_rel_kinds_and_states_are_disjoint() {
     );
 }
 #[test]
-fn role_table_census_is_exactly_forty_five() {
+fn role_table_census_is_exactly_sixty_eight() {
     // Stage-1 grows the Phase-1 twenty-nine with exactly one role: 161,
     // the query-observation role (TYPED_QUERY_ROLES, never public). T2 S1a
-    // adds the seven digest copied roles 309-315 (newctx / freectx /
-    // dupctx / init / update / final / oneshot, op 1), and T2 S2a adds
-    // the eight cipher copied roles 316-323 (newctx / freectx / dupctx /
-    // encrypt_init / decrypt_init / update / final / oneshot, op 2);
-    // the copied probes hold out of firemap/pin and the load roots until
-    // the R5 revision lands, so the roles admit in the contract but the
-    // BPF dispatch enumeration never fires them. Any other addition or
-    // removal still fails here.
+    // adds the seven digest copied roles 309-315 (op 1), T2 S2a adds the
+    // eight cipher copied roles 316-323 (op 2), and T2 S3a adds the
+    // twenty-three signature copied roles 324-346 (newctx / freectx /
+    // dupctx + sign / verify / recover / digest_sign / digest_verify /
+    // sign_message / verify_message verbs, op 12; params 18-25 and
+    // query_key_types 26 stay unmapped). The copied probes hold out of
+    // firemap/pin and the load roots until the R5 revision lands, so the
+    // roles admit in the contract but the BPF dispatch enumeration never
+    // fires them. Any other addition or removal still fails here.
     let mut admitted = Vec::new();
     for id in 0..512u32 {
         if TypedRoleId::from_u32(id).is_some() {
@@ -217,11 +218,12 @@ fn role_table_census_is_exactly_forty_five() {
         vec![
             5, 18, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
             161, 258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313,
-            314, 315, 316, 317, 318, 319, 320, 321, 322, 323,
+            314, 315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330,
+            331, 332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346,
         ]
     );
     for id in [
-        0, 1, 12, 48, 49, 127, 128, 129, 132, 156, 160, 176, 256, 257, 260, 324, 511,
+        0, 1, 12, 48, 49, 127, 128, 129, 132, 156, 160, 176, 256, 257, 260, 347, 511,
     ] {
         assert!(
             TypedRoleId::from_u32(id).is_none(),

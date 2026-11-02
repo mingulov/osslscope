@@ -265,6 +265,33 @@ pub(crate) fn copied_role(operation: u32, function: u32) -> Option<u32> {
         (2, 4) => Some(321),
         (2, 5) => Some(322),
         (2, 6) => Some(323),
+        // Signature (op 12): newctx (324) / freectx (325) / dupctx (326);
+        // sign (327-328), verify (329-330), recover (331-332),
+        // digest_sign (333-336), digest_verify (337-340),
+        // sign_message (341-343), verify_message (344-346).
+        (12, 1) => Some(324),
+        (12, 16) => Some(325),
+        (12, 17) => Some(326),
+        (12, 2) => Some(327),
+        (12, 3) => Some(328),
+        (12, 4) => Some(329),
+        (12, 5) => Some(330),
+        (12, 6) => Some(331),
+        (12, 7) => Some(332),
+        (12, 8) => Some(333),
+        (12, 9) => Some(334),
+        (12, 10) => Some(335),
+        (12, 11) => Some(336),
+        (12, 12) => Some(337),
+        (12, 13) => Some(338),
+        (12, 14) => Some(339),
+        (12, 15) => Some(340),
+        (12, 27) => Some(341),
+        (12, 28) => Some(342),
+        (12, 29) => Some(343),
+        (12, 30) => Some(344),
+        (12, 31) => Some(345),
+        (12, 32) => Some(346),
         _ => None,
     }
 }
@@ -433,13 +460,44 @@ mod tests {
             (2, 4, 321),
             (2, 5, 322),
             (2, 6, 323),
+            // Signature (op 12): 1=newctx, 16=freectx, 17=dupctx;
+            // 2/3=sign_init/sign, 4/5=verify_init/verify,
+            // 6/7=recover_init/recover, 8/9/10/11=digest_sign
+            // init/update/final/oneshot, 12/13/14/15=digest_verify
+            // init/update/final/oneshot, 27/28/29=sign_message
+            // init/update/final, 30/31/32=verify_message
+            // init/update/final. Params (18-25) and query_key_types
+            // (26) stay unmapped, as with other families.
+            (12, 1, 324),
+            (12, 16, 325),
+            (12, 17, 326),
+            (12, 2, 327),
+            (12, 3, 328),
+            (12, 4, 329),
+            (12, 5, 330),
+            (12, 6, 331),
+            (12, 7, 332),
+            (12, 8, 333),
+            (12, 9, 334),
+            (12, 10, 335),
+            (12, 11, 336),
+            (12, 12, 337),
+            (12, 13, 338),
+            (12, 14, 339),
+            (12, 15, 340),
+            (12, 27, 341),
+            (12, 28, 342),
+            (12, 29, 343),
+            (12, 30, 344),
+            (12, 31, 345),
+            (12, 32, 346),
         ];
         for (op, fun, role) in pairs {
             assert_eq!(copied_role(op, fun), Some(role));
             let (_, admit_op, admit_fun) = TypedAdmission::admission_parts(role).unwrap();
             assert_eq!((admit_op, admit_fun), (op, fun));
         }
-        for op in [1, 2, 3, 4] {
+        for op in [1, 2, 3, 4, 12] {
             for fun in 0..64 {
                 let role = copied_role(op, fun);
                 if pairs.iter().any(|(o, f, _)| (*o, *f) == (op, fun)) {
@@ -451,7 +509,8 @@ mod tests {
         }
         for role in [
             258u32, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
-            315, 316, 317, 318, 319, 320, 321, 322, 323,
+            315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331,
+            332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346,
         ] {
             let id = TypedRoleId::from_u32(role).unwrap();
             assert_eq!(id.public_export(), None);
