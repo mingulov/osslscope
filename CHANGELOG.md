@@ -22,6 +22,13 @@
   lane on hand; DEB/RPM install/remove on declared distro cells and
   native re-measure stay open. Reports remain PARTIAL where
   evidence is partial; attribution stays Unknown where unproven.
+- Installed journey (candidate tarball, system prefix): companion-trust
+  matrix closed (mismatch/ownership/ancestry refused, root-owned +
+  matching + trusted ancestry available, doctor exit 0). Host 3.5.5
+  `report run -- openssl dgst`: 2857 sites, 11,560 calls, exited
+  code=0, attribution Unknown, named gaps, workload canary absent.
+  Container 3.5.7 scan from host userns: exit 4 with named
+  namespace/process gaps, no silent empty capture.
 - Root package version 0.5.0; helper crates retain their versions.
 
 ## 0.4.0 current-state alpha (automatic observation)
