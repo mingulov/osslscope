@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Bounded cumulative evidence folding, separate from kernel ownership.
-use super::{CountFailure, CountLimits, CountSample, gap};
+use super::{CountFailure, CountLimits, CountSample, EngineCount, gap, is_engine_cookie};
 use crate::evidence::*;
 use osslscope_ebpf_common::CountValue;
 use std::collections::BTreeMap;
@@ -27,6 +27,7 @@ pub struct CountFold {
     limits: CountLimits,
     pub(super) rows: BTreeMap<u32, Row>,
     foreign: BTreeMap<(u32, u32), u64>,
+    engine: BTreeMap<(u32, u32), EngineCount>,
     pub(super) generation: u32,
     pub(super) session: Option<u64>,
     pub(super) next_cookie: u32,
@@ -40,6 +41,7 @@ impl CountFold {
             limits,
             rows: BTreeMap::new(),
             foreign: BTreeMap::new(),
+            engine: BTreeMap::new(),
             generation: 1,
             session: None,
             next_cookie: 1,
@@ -173,6 +175,12 @@ impl CountFold {
         }
         let cookie = match pinned {
             Some(cookie) => {
+                // The ENGINE probe range is counter-private: a pinned
+                // site cookie there would shadow ENGINE evidence (or
+                // vice versa) at drain. Refuse rather than alias.
+                if is_engine_cookie(cookie) {
+                    return Err(CountFailure::Resource);
+                }
                 // A pinned cookie already bound to a different site is a
                 // cross-site collision: refuse rather than alias.
                 if let Some(r) = self.rows.get(&cookie) {
@@ -272,6 +280,37 @@ impl CountFold {
             r.row.calls = calls;
             r.row.first_ns = first;
             r.row.last_ns = last;
+        } else if is_engine_cookie(cookie) {
+            // Reserved ENGINE probe plane: same cumulative-drain
+            // discipline as foreign keys, but evidence-shaped (the
+            // session joins meanings via the planned ProbeSet), never
+            // unattributed loss.
+            if !self.engine.contains_key(&(cookie, generation)) {
+                if self.engine.len() >= self.limits.max_keys {
+                    return Err(CountFailure::Resource);
+                }
+                self.charge(96)?;
+            }
+            let slot = self
+                .engine
+                .entry((cookie, generation))
+                .or_insert(EngineCount {
+                    cookie,
+                    generation,
+                    calls: 0,
+                    first_ns: 0,
+                    last_ns: 0,
+                });
+            if calls < slot.calls {
+                return Err(CountFailure::Read);
+            }
+            slot.calls = calls;
+            if slot.first_ns == 0 || (first != 0 && first < slot.first_ns) {
+                slot.first_ns = first;
+            }
+            if last > slot.last_ns {
+                slot.last_ns = last;
+            }
         } else {
             if !self.foreign.contains_key(&(cookie, generation)) {
                 if self.foreign.len() >= self.limits.max_keys {
@@ -297,6 +336,7 @@ impl CountFold {
         if self.rows.iter().any(|(&cookie, row)| {
             row.row.calls > 0 && !keys.contains(&(cookie, row.row.generation))
         }) || self.foreign.keys().any(|key| !keys.contains(key))
+            || self.engine.keys().any(|key| !keys.contains(key))
         {
             return Err(CountFailure::Read);
         }
@@ -312,6 +352,7 @@ impl CountFold {
             }
         }
         s.unattributed = self.foreign.values().copied().fold(0, u64::saturating_add);
+        s.engine = self.engine.values().cloned().collect();
         for (&name, &value) in &self.gaps {
             s.gaps.push(gap(name, value));
         }
@@ -362,6 +403,46 @@ mod tests {
         assert_eq!(fold.validate_final_keys(&keys), Err(CountFailure::Read));
         keys.insert((999, 99));
         assert!(fold.validate_final_keys(&keys).is_ok());
+    }
+    #[test]
+    fn engine_range_cookies_accumulate_separately_from_unattributed() {
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let value = CountValue {
+            count: 5,
+            first_ns: 2,
+            last_ns: 3,
+        };
+        fold.observe(super::super::ENGINE_COOKIE_BASE, 1, &[value])
+            .unwrap();
+        fold.observe(999, 99, &[value]).unwrap();
+        let s = fold.sample();
+        assert_eq!(s.unattributed, 5, "only the non-engine key is foreign");
+        assert_eq!(s.engine.len(), 1);
+        assert_eq!(s.engine[0].cookie, super::super::ENGINE_COOKIE_BASE);
+        assert_eq!(s.engine[0].generation, 1);
+        assert_eq!(s.engine[0].calls, 5);
+        assert_eq!(s.engine[0].first_ns, 2);
+        assert_eq!(s.engine[0].last_ns, 3);
+    }
+    #[test]
+    fn pinned_engine_range_cookie_refuses() {
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let binding = SiteBinding {
+            site: SiteKey {
+                object: ObjectId("a".repeat(64)),
+                device: 1,
+                inode: 2,
+                offset: 3,
+            },
+            session_generation: 1,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        assert_eq!(
+            fold.attach_pinned(binding, super::super::ENGINE_COOKIE_BASE, |_, _| Ok(())),
+            Err(CountFailure::Resource)
+        );
     }
     #[test]
     fn count_generation_exhaustion_is_permanent() {

@@ -152,6 +152,10 @@ pub struct ProbeSet {
     pub unprobed_meth_syms: Vec<String>,
     pub unprobed_lowlevel_syms: Vec<String>,
     pub findings: Vec<String>,
+    /// Caller modules whose imports could not be scanned at all
+    /// (pass-1 ELF parse failure): zero probes, zero gap symbols —
+    /// live consumers must gap this count, never drop it.
+    pub unscannable_modules: u64,
     /// `ENGINE_by_id` probe cookies (engine-id taxonomy).
     pub by_id_cookies: HashSet<u64>,
     /// Provider-load probe cookies (load-name taxonomy).
@@ -753,6 +757,7 @@ pub fn probes_for(
             _ => {
                 set.findings
                     .push(format!("unscannable module: {} (imports unknown)", m.path));
+                set.unscannable_modules += 1;
                 None
             }
         };
@@ -817,6 +822,9 @@ pub fn probes_for(
         let r = match resolve_address_taken(&addr_taken, &definers) {
             Ok(r) => r,
             Err(_) => {
+                // No unscannable_modules increment here: the PLT
+                // probes above still bind, and the fallback gap
+                // pairs below keep the unknown imports counted.
                 set.findings.push(format!(
                     "unscannable module: {} (address-taken imports unknown)",
                     m.path
@@ -1732,6 +1740,24 @@ mod tests {
     }
 
     #[test]
+    fn probes_for_counts_unscannable_callers() {
+        // Garbage-bytes caller: unparseable imports surface as a
+        // structured count (not just a finding string), so live
+        // consumers can gap the invisible surface.
+        let b = ["/lib/x86_64-linux-gnu/libc.so.6", "/usr/lib/libc.so.6"]
+            .into_iter()
+            .find_map(|p| std::fs::read(p).ok())
+            .expect("no libc — broken test env");
+        let garbage = vec![0x7f, b'E', b'L', b'F', 0xff, 0xff, 0xff, 0xff];
+        let modules = vec![Module {
+            path: "/tmp/bogus.so",
+            bytes: &garbage,
+        }];
+        let set = probes_for("libc.so.6", &b, &modules, ("08:01".to_string(), 7)).unwrap();
+        assert_eq!(set.unscannable_modules, 1);
+        assert!(set.probes.is_empty());
+    }
+    #[test]
     fn section_shape() {
         let set = ProbeSet {
             probes: vec![
@@ -1779,6 +1805,7 @@ mod tests {
             unprobed_meth_syms: vec!["RSA_meth_new".into(), "DSA_meth_new".into()],
             unprobed_lowlevel_syms: vec![],
             findings: vec![],
+            unscannable_modules: 0,
             address_taken: vec![],
             by_id_cookies: [0].into_iter().collect(),
             load_cookies: [2].into_iter().collect(),

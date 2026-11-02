@@ -11,6 +11,7 @@ use crate::{
     },
 };
 use osslscope_ebpf_common::{CountValue, split_key};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     ffi::CString,
@@ -125,6 +126,52 @@ pub struct SiteAssociations {
     pub count_generation: u32,
     pub associations: Vec<CandidateAssociation>,
 }
+/// Reserved ENGINE probe cookie range: `[ENGINE_COOKIE_BASE,
+/// ENGINE_COOKIE_END)`. Site cookies mint upward from 1 under
+/// `max_cookies` (4096); session-pinned cookies stay far below (legacy
+/// mints need ~1.8B links to reach here; `LinkLimit` refuses far
+/// earlier) and the session typed range starts at `2^31` above.
+/// ENGINE tripwire probes mint upward from the base, so the two planes
+/// never share a cookie and the BPF program (which counts any u32
+/// cookie) needs no changes. Bounded above so a row-less typed-range
+/// cookie still folds foreign, never engine-shaped.
+pub const ENGINE_COOKIE_BASE: u32 = 0x7000_0000;
+pub const ENGINE_COOKIE_END: u32 = 0x8000_0000;
+/// True iff the cookie belongs to the reserved ENGINE probe range.
+pub fn is_engine_cookie(cookie: u32) -> bool {
+    (ENGINE_COOKIE_BASE..ENGINE_COOKIE_END).contains(&cookie)
+}
+/// One drained ENGINE probe count: the raw (cookie, generation) key
+/// plus cumulative calls and first/last hit stamps. Meanings (probe
+/// symbol/module) join userspace-side via the planned ProbeSet.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub struct EngineCount {
+    pub cookie: u32,
+    pub generation: u32,
+    pub calls: u64,
+    pub first_ns: u64,
+    pub last_ns: u64,
+}
+/// Bound on ENGINE probes per counter: 32 probed symbols per
+/// caller module, and ENGINE keys share the 8192-key COUNTS map
+/// with site rows — 2048 leaves headroom for both planes.
+pub(crate) const MAX_ENGINE_PROBES: usize = 2048;
+/// One ENGINE tripwire probe to attach: caller-module path plus file
+/// offset, with the expected attach-time file identity (native stat
+/// domain) for TOCTOU verification.
+#[derive(Clone, Debug)]
+pub(crate) struct EngineProbePlan {
+    pub path: String,
+    pub offset: u64,
+    pub device: u64,
+    pub inode: u64,
+    /// SHA-256 over the exact module bytes the session parsed
+    /// this offset from. The attach re-hashes the pinned file
+    /// and refuses on mismatch: a caller DSO modified in place
+    /// between parsing and attachment keeps (device, inode) but
+    /// must never receive a stale stub offset.
+    pub sha256: [u8; 32],
+}
 #[derive(Clone, Default)]
 pub struct CountSample {
     pub sites: Vec<SiteExecution>,
@@ -135,10 +182,75 @@ pub struct CountSample {
     pub dropfail: u64,
     pub namespace_failures: u64,
     pub unattributed: u64,
+    pub engine: Vec<EngineCount>,
 }
 mod fold;
 pub use fold::{CountFold, SiteBinding};
 
+/// Conservation total over every counted plane: provider sites (live
+/// plus fenced), ENGINE probe counts, unattributed foreign keys and
+/// map-full drops must equal the BPF admitted ledger exactly.
+fn ledger_counted(sample: &CountSample) -> u64 {
+    SiteExecution::sum_calls(&sample.sites)
+        .saturating_add(SiteExecution::sum_calls(&sample.fenced))
+        .saturating_add(
+            sample
+                .engine
+                .iter()
+                .fold(0u64, |n, e| n.saturating_add(e.calls)),
+        )
+        .saturating_add(sample.unattributed)
+        .saturating_add(sample.dropfail)
+}
+/// Dedupe ENGINE plans by physical (device, inode, offset)
+/// identity: hardlinked paths describing the same stub attach
+/// once. Returns the unique input indices (first occurrence wins)
+/// plus, for every input, its unique slot (aliases share the
+/// surviving twin's cookie, keeping the returned cookies
+/// input-aligned). `None` when aliases disagree on the content
+/// digest (the module changed between the two plan reads):
+/// collapsing would bless one stale parse silently, so the
+/// attach refuses instead.
+fn dedupe_engine_plans(probes: &[EngineProbePlan]) -> Option<(Vec<usize>, Vec<usize>)> {
+    let mut seen: BTreeMap<(u64, u64, u64), usize> = BTreeMap::new();
+    let mut unique: Vec<usize> = Vec::new();
+    let mut slots = Vec::with_capacity(probes.len());
+    for (i, p) in probes.iter().enumerate() {
+        if let Some(&u) = seen.get(&(p.device, p.inode, p.offset)) {
+            if probes[unique[u]].sha256 != p.sha256 {
+                return None;
+            }
+            slots.push(u);
+        } else {
+            seen.insert((p.device, p.inode, p.offset), unique.len());
+            slots.push(unique.len());
+            unique.push(i);
+        }
+    }
+    Some((unique, slots))
+}
+/// Map a pinned-file re-read failure: only demonstrated
+/// instability (a mid-read tear) or growth past the bound the
+/// parse succeeded under establishes a changed file
+/// (`Identity`); ordinary I/O failures are `Read`, never a
+/// fabricated object change.
+fn map_pin_read_error(kind: std::io::ErrorKind) -> CountFailure {
+    match kind {
+        std::io::ErrorKind::InvalidData | std::io::ErrorKind::FileTooLarge => {
+            CountFailure::Identity
+        }
+        _ => CountFailure::Read,
+    }
+}
+/// True iff the retained ENGINE pin still shows the attach-time
+/// [`Stamp`]: same (device, inode, size, mode, links, mtime,
+/// ctime). Any in-place modification bumps ctime at least, so a
+/// stale stub offset can never survive undetected into the join.
+fn engine_pin_unchanged(pin: &File, stamp: &crate::provider_observation::objects::Stamp) -> bool {
+    pin.metadata()
+        .map(|m| crate::provider_observation::objects::Stamp::of(&m) == *stamp)
+        .unwrap_or(false)
+}
 fn gap(name: &str, value: u64) -> GapCounter {
     let (units, source) = match name {
         "focused_unattributed" | "focused_dropfail" => {
@@ -185,6 +297,15 @@ struct Attachment {
     link: OwnedFd,
     candidates: Vec<CountCandidate>,
 }
+/// One live ENGINE probe group: the uprobe_multi link plus its
+/// retained module pin. Dropped link-first like [`Attachment`].
+/// The attach-time `Stamp` makes the pin live custody:
+/// `retain_authority` revalidates it like every provider file.
+struct EngineAttachment {
+    link: OwnedFd,
+    pin: File,
+    stamp: crate::provider_observation::objects::Stamp,
+}
 #[cfg(test)]
 thread_local! {
     static EXPIRE_AFTER_LINK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -203,6 +324,12 @@ pub struct FocusedCounter {
     cpus: usize,
     fold: CountFold,
     attachments: Vec<Attachment>,
+    engine_attachments: Vec<EngineAttachment>,
+    next_engine_cookie: u32,
+    /// Retire count, advanced by every `retire()` call even with
+    /// no links. The ENGINE plane records it at attach and
+    /// blinds when it moves: any retire destroys ENGINE links.
+    engine_epoch: u64,
     retired: bool,
     totals: [u64; 3],
     associations: BTreeMap<u32, SiteAssociations>,
@@ -347,6 +474,9 @@ impl FocusedCounter {
             cpus,
             fold,
             attachments: Vec::new(),
+            engine_attachments: Vec::new(),
+            next_engine_cookie: ENGINE_COOKIE_BASE,
+            engine_epoch: 0,
             retired: false,
             totals: [0; 3],
             associations: BTreeMap::new(),
@@ -396,13 +526,33 @@ impl FocusedCounter {
             drop(link);
             drop(candidates);
         }
+        // Destructure explicitly: ENGINE links close before pins.
+        for EngineAttachment { link, pin, .. } in self.engine_attachments.drain(..) {
+            drop(link);
+            drop(pin);
+        }
     }
     /// Scalar readiness derived from owned physical links, not advertisements.
     pub fn active_site_count(&self) -> usize {
         self.fold.rows.values().filter(|r| r.active).count()
     }
     pub fn active_link_count(&self) -> usize {
-        self.attachments.len()
+        self.attachments
+            .len()
+            .saturating_add(self.engine_attachments.len())
+    }
+    /// Retire count for the ENGINE plane's dead-link check.
+    pub(crate) fn engine_epoch(&self) -> u64 {
+        self.engine_epoch
+    }
+    /// Pure ENGINE-pin custody check (no retire, no gaps):
+    /// every retained pin still shows its attach-time stamp.
+    /// Exit-safe (file stamps only, no live-target checks), so
+    /// the finish cut uses this instead of full retention.
+    pub(crate) fn engine_pins_unchanged(&self) -> bool {
+        self.engine_attachments
+            .iter()
+            .all(|a| engine_pin_unchanged(&a.pin, &a.stamp))
     }
     /// Recheck independently retained Count custody, without obtaining any
     /// attachment authority from inventory metadata or the refresh marker.
@@ -422,6 +572,14 @@ impl FocusedCounter {
                     .revalidate_object()
                     .map_err(|_| CountFailure::Identity)?;
             }
+            // ENGINE pins are live custody too: a caller DSO
+            // modified after attachment must retire the counter
+            // rather than join counts to stale symbols.
+            for attachment in &self.engine_attachments {
+                if !engine_pin_unchanged(&attachment.pin, &attachment.stamp) {
+                    return Err(CountFailure::Identity);
+                }
+            }
             Ok(())
         })();
         if let Err(failure) = result {
@@ -433,7 +591,11 @@ impl FocusedCounter {
         result
     }
     pub fn retire(&mut self) {
-        if self.retired && self.attachments.is_empty() {
+        // Unconditional: the ENGINE plane compares epochs to
+        // detect dead links, so every call must be visible even
+        // when there is nothing left to close.
+        self.engine_epoch = self.engine_epoch.wrapping_add(1);
+        if self.retired && self.attachments.is_empty() && self.engine_attachments.is_empty() {
             return;
         }
         if self.write("TARGET", 0, &0u64.to_ne_bytes()).is_err() {
@@ -525,6 +687,212 @@ impl FocusedCounter {
             Some((deadline, cancel)),
             Some(pins),
         )
+    }
+    /// Attach caller-attributed ENGINE tripwire probes to the count
+    /// program. Each probe counts in-kernel under a reserved-range
+    /// cookie; returns the minted cookies in input order for the
+    /// session's ProbeSet join. Transactional per call: a mid-batch
+    /// failure drops every link this call created, while minted
+    /// cookies stay consumed (never reused after a possibly observed
+    /// native call — a dropped link's hits drain as unjoinable
+    /// ENGINE loss, never site evidence). Identity, namespace,
+    /// window and budget discipline mirror the site path; probe
+    /// meanings stay with the session (ProbeSet), never here.
+    /// Plans aliasing the same physical (device, inode, offset)
+    /// stub attach once: the surviving twin's cookie is returned
+    /// for every alias (input-aligned), so one stub never counts
+    /// under two cookies.
+    pub(crate) fn attach_engine_probes(
+        &mut self,
+        probes: &[EngineProbePlan],
+        pid: u32,
+        starttime: u64,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u32>, CountFailure> {
+        // Unlike the site path, an ENGINE attach failure never
+        // retires the counter: a swapped module file is plane-local
+        // (the session blinds the ENGINE plane), and target-level
+        // identity loss is the session snapshot's own verdict.
+        let result = self.attach_engine_probes_inner(probes, pid, starttime, deadline, cancel);
+        if let Err(e) = result {
+            if e != CountFailure::Deferred {
+                self.failure(e);
+            }
+        }
+        result
+    }
+    fn attach_engine_probes_inner(
+        &mut self,
+        probes: &[EngineProbePlan],
+        pid: u32,
+        starttime: u64,
+        deadline: Instant,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<Vec<u32>, CountFailure> {
+        use std::sync::atomic::Ordering;
+        if !self.gate.admitting() {
+            return Err(CountFailure::Close);
+        }
+        if probes.is_empty() {
+            return Ok(Vec::new());
+        }
+        if probes.len() > MAX_ENGINE_PROBES {
+            return Err(CountFailure::Resource);
+        }
+        if pid != self.pid || self.starttime.is_some_and(|s| s != starttime) {
+            return Err(CountFailure::Identity);
+        }
+        validate_namespace(&self.namespace, self.expected_namespace)?;
+        let hard_deadline = self.limits.window.deadline_ns;
+        let checkpoint = |native: bool| {
+            use crate::capture::ClockPort;
+            if cancel.load(Ordering::Relaxed) {
+                return Err(CountFailure::Attach);
+            }
+            if crate::capture::LiveClock
+                .checked_monotonic_ns()
+                .ok_or(CountFailure::Read)?
+                >= hard_deadline
+            {
+                return Err(CountFailure::Attach);
+            }
+            if !native && Instant::now() >= deadline {
+                return Err(CountFailure::Deferred);
+            }
+            Ok(())
+        };
+        checkpoint(false)?;
+        // Dedupe aliased plans before any native effect: one stub
+        // attaches once (the returned cookies stay input-aligned
+        // via the slot table below). A fingerprint conflict
+        // refuses: the module changed between plan reads.
+        let Some((unique, slots)) = dedupe_engine_plans(probes) else {
+            return Err(CountFailure::Identity);
+        };
+        // Bounded planning charge, validated before any native
+        // effect and committed only with the links below.
+        let planning_charge = unique
+            .iter()
+            .try_fold(0usize, |total, &i| {
+                total
+                    .checked_add(probes[i].path.len())
+                    .and_then(|n| n.checked_add(64))
+            })
+            .ok_or(CountFailure::Resource)?;
+        self.fold.checked_charge(planning_charge)?;
+        // Mint first and commit the cursor before any native
+        // effect: cookies stay consumed even when a later group
+        // fails (never reused after a possibly observed native
+        // call). Only range exhaustion (no native effect) refuses
+        // without consuming.
+        let mut cookies = Vec::with_capacity(unique.len());
+        let mut next = self.next_engine_cookie;
+        for _ in &unique {
+            if next >= ENGINE_COOKIE_END {
+                return Err(CountFailure::Resource);
+            }
+            cookies.push(next);
+            next += 1;
+        }
+        self.next_engine_cookie = next;
+        let program = self
+            .loaded
+            .progs
+            .get("count_entry")
+            .ok_or(CountFailure::Object)?
+            .as_raw_fd();
+        // Group offsets+cookies per module: one uprobe_multi link each.
+        let mut groups: BTreeMap<&str, Vec<(u64, u64)>> = BTreeMap::new();
+        for (&i, cookie) in unique.iter().zip(cookies.iter()) {
+            groups
+                .entry(probes[i].path.as_str())
+                .or_default()
+                .push((probes[i].offset, u64::from(*cookie)));
+        }
+        let mut additions = Vec::new();
+        for (index, (module, pairs)) in groups.iter().enumerate() {
+            checkpoint(index > 0)?;
+            // Pin the module and verify the planned identity against
+            // the opened file (fd-bound: no path TOCTOU). The link
+            // binds through the fd-path, and the pin is retained
+            // with it.
+            let pin = File::open(module).map_err(|_| CountFailure::Attach)?;
+            let stat = pin.metadata().map_err(|_| CountFailure::Attach)?;
+            // Every plan for this module must agree with the opened
+            // file: a swapped file — or disagreeing plans — refuses
+            // the whole batch rather than attaching half-bound.
+            let consistent = unique
+                .iter()
+                .filter(|&&i| probes[i].path == *module)
+                .all(|&i| stat.dev() == probes[i].device && stat.ino() == probes[i].inode);
+            if !consistent {
+                return Err(CountFailure::Identity);
+            }
+            // Content fingerprint over the pinned file (fd-bound
+            // re-read under the same cap the session parsed
+            // with: no path TOCTOU). Every unique plan for this
+            // module must name the digest of the bytes its stub
+            // offset was parsed from — a caller DSO modified in
+            // place between parsing and attachment keeps
+            // (device, inode) but refuses here, before any link.
+            let pinned = pin.try_clone().map_err(|_| CountFailure::Attach)?;
+            let pinned_bytes =
+                crate::plan::read_bounded_from(pinned, crate::plan::MAX_OBJECT_BYTES)
+                    .map_err(|e| map_pin_read_error(e.kind()))?;
+            let pinned_digest: [u8; 32] = Sha256::digest(&pinned_bytes.bytes).into();
+            let fingerprinted = unique
+                .iter()
+                .filter(|&&i| probes[i].path == *module)
+                .all(|&i| probes[i].sha256 == pinned_digest);
+            if !fingerprinted {
+                return Err(CountFailure::Identity);
+            }
+            let fd_path = CString::new(format!("/proc/self/fd/{}", pin.as_raw_fd()))
+                .map_err(|_| CountFailure::Attach)?;
+            let offsets: Vec<u64> = pairs.iter().map(|(off, _)| *off).collect();
+            let group_cookies: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
+            checkpoint(index > 0)?;
+            let link = ossl_bpf_sys::link_create_uprobe_multi(
+                program,
+                &fd_path,
+                &offsets,
+                &group_cookies,
+                self.pid,
+            )
+            .map_err(|_| CountFailure::Attach)?;
+            // Post-link stability: the digest proved the content
+            // at re-read time; an unchanged stamp across the link
+            // call proves the link bound those same bytes (any
+            // in-between write bumps ctime). Retained as the live
+            // custody stamp for `retain_authority`.
+            let fresh = pin.metadata().map_err(|_| CountFailure::Attach)?;
+            let stamp = crate::provider_observation::objects::Stamp::of(&fresh);
+            if stamp != crate::provider_observation::objects::Stamp::of(&stat) {
+                return Err(CountFailure::Identity);
+            }
+            additions.push(EngineAttachment { link, pin, stamp });
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(CountFailure::Attach);
+        }
+        validate_namespace(&self.namespace, self.expected_namespace)?;
+        // Commit only after every link succeeded: a planning-charge
+        // refusal here still drops the new links (transactional).
+        // (Validated upfront, so this cannot fail without an
+        // intervening same-thread mutation.)
+        if self.fold.charge(planning_charge).is_err() {
+            return Err(CountFailure::Resource);
+        }
+        self.engine_attachments.extend(additions);
+        self.starttime = Some(starttime);
+        if self.retired {
+            self.write("TARGET", 0, &(self.pid as u64).to_ne_bytes())?;
+            self.retired = false;
+        }
+        // Input-aligned cookies: aliases share the surviving
+        // twin's cookie, so the session joins one stub once.
+        Ok(slots.iter().map(|&s| cookies[s]).collect())
     }
     fn attach_candidates_with_control(
         &mut self,
@@ -932,11 +1300,7 @@ impl FocusedCounter {
             sample.gaps.push(gap("focused_cut_unavailable", 1));
         }
         // Never invent counts to balance the ledger.
-        let counted = SiteExecution::sum_calls(&sample.sites)
-            .saturating_add(SiteExecution::sum_calls(&sample.fenced))
-            .saturating_add(sample.unattributed)
-            .saturating_add(sample.dropfail);
-        if counted != sample.admitted {
+        if ledger_counted(&sample) != sample.admitted {
             sample.gaps.push(gap("focused_ledger_mismatch", 1));
         }
         sample
@@ -1258,6 +1622,599 @@ mod startup_controls {
             sample.gaps.iter().any(|g| g.name == "focused_saturated"),
             "equal saturated ledgers cannot certify conservation"
         );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_engine_probes_count_caller_plt_calls() {
+        use crate::capture::ClockPort;
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::MetadataExt as _,
+            },
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-probes-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let argv = vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()];
+        struct Child(crate::target::OwnedTarget);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // This test alone owns this finite fixture, including panic paths.
+                if self.0.state() != crate::target::CustodyState::Reaped {
+                    unsafe {
+                        libc::kill(self.0.pid() as i32, libc::SIGKILL);
+                    }
+                    let _ = self.0.finish_observation();
+                }
+            }
+        }
+        let mut child = Child(
+            crate::target::OwnedTarget::spawn_stopped(
+                &argv,
+                crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            )
+            .unwrap(),
+        );
+        let cancel = AtomicBool::new(false);
+        let bytes = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            child.0.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        child.0.release_retaining_exit().unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        // Live maps now show libcrypto: plan caller-attributed ENGINE probes.
+        let maps = crate::discovery::maps::read_maps(child.0.pid()).unwrap();
+        let lc_path = crate::discovery::legacy::find_libcrypto(&maps).expect("libcrypto mapped");
+        let lc = crate::plan::read_file_bound(&lc_path).unwrap();
+        let mut mod_bufs: Vec<(String, Vec<u8>)> = Vec::new();
+        for path in crate::discovery::legacy::target_modules(&maps, &lc_path) {
+            if let Ok(fb) = crate::plan::read_file_bound(&path) {
+                mod_bufs.push((path, fb.bytes.to_vec()));
+            }
+        }
+        let modules: Vec<crate::discovery::legacy::Module<'_>> = mod_bufs
+            .iter()
+            .map(|(p, b)| crate::discovery::legacy::Module { path: p, bytes: b })
+            .collect();
+        let set = crate::discovery::legacy::probes_for(
+            &lc_path,
+            &lc.bytes,
+            &modules,
+            (crate::plan::render_device(lc.dev), lc.ino),
+        )
+        .unwrap();
+        // Attach only this fixture's caller-attributed non-load probes.
+        let app_str = app.to_str().unwrap().to_string();
+        let wanted: Vec<&crate::discovery::legacy::Probe> = set
+            .probes
+            .iter()
+            .filter(|p| p.module == app_str && p.family.is_none())
+            .collect();
+        assert!(
+            wanted.iter().any(|p| p.symbol == "ENGINE_by_id"),
+            "fixture PLT plans by_id"
+        );
+        let meta = fs::metadata(&app).unwrap();
+        let app_bytes = &mod_bufs
+            .iter()
+            .find(|(p, _)| p == &app_str)
+            .expect("fixture bytes scanned")
+            .1;
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(app_bytes).into()
+        };
+        let plans: Vec<EngineProbePlan> = wanted
+            .iter()
+            .map(|p| EngineProbePlan {
+                path: p.module.clone(),
+                offset: p.offset,
+                device: meta.dev(),
+                inode: meta.ino(),
+                sha256: digest,
+            })
+            .collect();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![child.0.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let cookies = counter
+            .attach_engine_probes(
+                &plans,
+                child.0.pid(),
+                records[0].starttime,
+                Instant::now() + Duration::from_secs(10),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(cookies.len(), plans.len());
+        let by_id = cookies[wanted
+            .iter()
+            .position(|p| p.symbol == "ENGINE_by_id")
+            .unwrap()];
+        assert!(is_engine_cookie(by_id));
+        let mut command = |text: &str| -> String {
+            writeln!(commands, "{text}").unwrap();
+            commands.flush().unwrap();
+            let mut response = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(output.read_line(&mut line).unwrap() > 0);
+                let ack = line.starts_with("ack ");
+                response.push_str(&line);
+                if ack {
+                    assert!(
+                        line.starts_with(&format!("ack {} 1 ", &text[..1])),
+                        "{response}"
+                    );
+                    break;
+                }
+            }
+            response
+        };
+        assert!(command("B").contains("did=5"));
+        let sample = counter.sample(Instant::now() + Duration::from_secs(5));
+        let by_id_calls: u64 = sample
+            .engine
+            .iter()
+            .filter(|e| e.cookie == by_id)
+            .map(|e| e.calls)
+            .sum();
+        assert_eq!(by_id_calls, 5, "five PLT ENGINE_by_id calls counted");
+        assert_eq!(sample.unattributed, 0, "engine hits never land foreign");
+        assert!(
+            !sample
+                .gaps
+                .iter()
+                .any(|g| g.name == "focused_ledger_mismatch"),
+            "ledger balances engine plane"
+        );
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(code) = child.0.peek_exit().unwrap() {
+                assert_eq!(code, 0);
+                break;
+            }
+            assert!(Instant::now() < until, "fixture must exit");
+            std::thread::yield_now();
+        }
+        child.0.finish_observation().unwrap();
+        let final_sample = counter.close(Instant::now() + Duration::from_secs(5));
+        let final_calls: u64 = final_sample
+            .engine
+            .iter()
+            .filter(|e| e.cookie == by_id)
+            .map(|e| e.calls)
+            .sum();
+        assert_eq!(final_calls, 5, "closed cut keeps engine counts");
+        assert!(
+            !final_sample
+                .gaps
+                .iter()
+                .any(|g| g.name == "focused_ledger_mismatch"),
+            "closed ledger balances engine plane"
+        );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_engine_alias_plans_count_stub_once() {
+        use crate::capture::ClockPort;
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::MetadataExt as _,
+            },
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-alias-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Hardlink alias: same stub reached under two paths.
+        let alias = dir.join("engine_probe_calls_alias");
+        fs::hard_link(&app, &alias).unwrap();
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let argv = vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()];
+        struct Child(crate::target::OwnedTarget);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                if self.0.state() != crate::target::CustodyState::Reaped {
+                    unsafe {
+                        libc::kill(self.0.pid() as i32, libc::SIGKILL);
+                    }
+                    let _ = self.0.finish_observation();
+                }
+            }
+        }
+        let mut child = Child(
+            crate::target::OwnedTarget::spawn_stopped(
+                &argv,
+                crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            )
+            .unwrap(),
+        );
+        let cancel = AtomicBool::new(false);
+        let bytes = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            child.0.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        child.0.release_retaining_exit().unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let maps = crate::discovery::maps::read_maps(child.0.pid()).unwrap();
+        let lc_path = crate::discovery::legacy::find_libcrypto(&maps).expect("libcrypto mapped");
+        let lc = crate::plan::read_file_bound(&lc_path).unwrap();
+        let mut mod_bufs: Vec<(String, Vec<u8>)> = Vec::new();
+        for path in crate::discovery::legacy::target_modules(&maps, &lc_path) {
+            if let Ok(fb) = crate::plan::read_file_bound(&path) {
+                mod_bufs.push((path, fb.bytes.to_vec()));
+            }
+        }
+        let modules: Vec<crate::discovery::legacy::Module<'_>> = mod_bufs
+            .iter()
+            .map(|(p, b)| crate::discovery::legacy::Module { path: p, bytes: b })
+            .collect();
+        let set = crate::discovery::legacy::probes_for(
+            &lc_path,
+            &lc.bytes,
+            &modules,
+            (crate::plan::render_device(lc.dev), lc.ino),
+        )
+        .unwrap();
+        let app_str = app.to_str().unwrap().to_string();
+        let probe = set
+            .probes
+            .iter()
+            .find(|p| p.module == app_str && p.symbol == "ENGINE_by_id")
+            .expect("fixture PLT plans by_id");
+        let meta = fs::metadata(&app).unwrap();
+        let app_bytes = &mod_bufs
+            .iter()
+            .find(|(p, _)| p == &app_str)
+            .expect("fixture bytes scanned")
+            .1;
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(app_bytes).into()
+        };
+        // Same (dev, ino, offset) under two paths: one stub.
+        let plans = vec![
+            EngineProbePlan {
+                path: probe.module.clone(),
+                offset: probe.offset,
+                device: meta.dev(),
+                inode: meta.ino(),
+                sha256: digest,
+            },
+            EngineProbePlan {
+                path: alias.to_str().unwrap().to_string(),
+                offset: probe.offset,
+                device: meta.dev(),
+                inode: meta.ino(),
+                sha256: digest,
+            },
+        ];
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![child.0.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let cookies = counter
+            .attach_engine_probes(
+                &plans,
+                child.0.pid(),
+                records[0].starttime,
+                Instant::now() + Duration::from_secs(10),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(cookies.len(), 2);
+        writeln!(commands, "B").unwrap();
+        commands.flush().unwrap();
+        let mut saw_ack = false;
+        loop {
+            let mut ack = String::new();
+            assert!(output.read_line(&mut ack).unwrap() > 0);
+            if ack.starts_with("ack B 1 ") {
+                assert!(ack.contains("did=5"));
+                saw_ack = true;
+                break;
+            }
+        }
+        assert!(saw_ack);
+        let sample = counter.sample(Instant::now() + Duration::from_secs(5));
+        // Sum over distinct returned cookies: aliased plans share
+        // one cookie after the fix, so distinct-counting is what
+        // proves the stub fired once per call.
+        let mut distinct = cookies.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        let total: u64 = distinct
+            .iter()
+            .flat_map(|c| sample.engine.iter().filter(move |e| e.cookie == *c))
+            .map(|e| e.calls)
+            .sum();
+        assert_eq!(total, 5, "aliased plans count the stub once");
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(code) = child.0.peek_exit().unwrap() {
+                assert_eq!(code, 0);
+                break;
+            }
+            assert!(Instant::now() < until, "fixture must exit");
+            std::thread::yield_now();
+        }
+        let _ = child.0.finish_observation();
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_engine_pin_change_retires_counter() {
+        use crate::capture::ClockPort;
+        use std::{
+            fs,
+            io::{BufRead, BufReader},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::{MetadataExt as _, PermissionsExt as _},
+            },
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-pinchg-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let argv = vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()];
+        struct Child(crate::target::OwnedTarget);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                if self.0.state() != crate::target::CustodyState::Reaped {
+                    unsafe {
+                        libc::kill(self.0.pid() as i32, libc::SIGKILL);
+                    }
+                    let _ = self.0.finish_observation();
+                }
+            }
+        }
+        let mut child = Child(
+            crate::target::OwnedTarget::spawn_stopped(
+                &argv,
+                crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            )
+            .unwrap(),
+        );
+        let cancel = AtomicBool::new(false);
+        let bytes = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            child.0.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        child.0.release_retaining_exit().unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let maps = crate::discovery::maps::read_maps(child.0.pid()).unwrap();
+        let lc_path = crate::discovery::legacy::find_libcrypto(&maps).expect("libcrypto mapped");
+        let lc = crate::plan::read_file_bound(&lc_path).unwrap();
+        let mut mod_bufs: Vec<(String, Vec<u8>)> = Vec::new();
+        for path in crate::discovery::legacy::target_modules(&maps, &lc_path) {
+            if let Ok(fb) = crate::plan::read_file_bound(&path) {
+                mod_bufs.push((path, fb.bytes.to_vec()));
+            }
+        }
+        let modules: Vec<crate::discovery::legacy::Module<'_>> = mod_bufs
+            .iter()
+            .map(|(p, b)| crate::discovery::legacy::Module { path: p, bytes: b })
+            .collect();
+        let set = crate::discovery::legacy::probes_for(
+            &lc_path,
+            &lc.bytes,
+            &modules,
+            (crate::plan::render_device(lc.dev), lc.ino),
+        )
+        .unwrap();
+        let app_str = app.to_str().unwrap().to_string();
+        let probe = set
+            .probes
+            .iter()
+            .find(|p| p.module == app_str && p.symbol == "ENGINE_by_id")
+            .expect("fixture PLT plans by_id");
+        let meta = fs::metadata(&app).unwrap();
+        let app_bytes = &mod_bufs
+            .iter()
+            .find(|(p, _)| p == &app_str)
+            .expect("fixture bytes scanned")
+            .1;
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(app_bytes).into()
+        };
+        let plans = vec![EngineProbePlan {
+            path: probe.module.clone(),
+            offset: probe.offset,
+            device: meta.dev(),
+            inode: meta.ino(),
+            sha256: digest,
+        }];
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![child.0.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        counter
+            .attach_engine_probes(
+                &plans,
+                child.0.pid(),
+                records[0].starttime,
+                Instant::now() + Duration::from_secs(10),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(counter.active_link_count(), 1);
+        // A retained ENGINE pin is live custody: flipping one mode
+        // bit mid-window (same inode, same bytes) must fail
+        // authority and retire the counter, exactly like a changed
+        // provider backing file.
+        let mut perms = fs::metadata(&app).unwrap().permissions();
+        perms.set_mode(perms.mode() ^ 0o001);
+        fs::set_permissions(&app, perms).unwrap();
+        assert_eq!(counter.retain_authority(false), Err(CountFailure::Identity));
+        assert_eq!(counter.active_link_count(), 0);
+        let _ = commands;
+        let _ = output;
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation/count objects"]
@@ -1946,6 +2903,212 @@ mod startup_controls {
 #[cfg(test)]
 mod budget_tests {
     use super::*;
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_engine_attach_refuses_stale_fingerprint() {
+        use crate::capture::ClockPort;
+        use std::{
+            os::unix::fs::MetadataExt as _,
+            sync::atomic::AtomicBool,
+            time::{Duration, Instant},
+        };
+        // No fixture: the digest check runs before any link
+        // effect, so a wrong digest must refuse on any live pid
+        // with any readable file.
+        let me = std::process::id();
+        let exe = std::env::current_exe().unwrap();
+        let meta = std::fs::metadata(&exe).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![me],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let cancel = AtomicBool::new(false);
+        let bytes =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            me,
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let plans = vec![EngineProbePlan {
+            path: exe.to_str().unwrap().to_string(),
+            offset: 0x1000,
+            device: meta.dev(),
+            inode: meta.ino(),
+            sha256: [0u8; 32],
+        }];
+        // Correct identity, wrong content digest: the pinned bytes
+        // no longer match the parse this offset came from.
+        assert_eq!(
+            counter.attach_engine_probes(
+                &plans,
+                me,
+                records[0].starttime,
+                Instant::now() + Duration::from_secs(10),
+                &cancel,
+            ),
+            Err(CountFailure::Identity)
+        );
+        assert_eq!(counter.active_link_count(), 0);
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_engine_epoch_advances_on_every_retire() {
+        use crate::capture::ClockPort;
+        let me = std::process::id();
+        let bytes =
+            std::fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            me,
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        // Every retire advances the epoch unconditionally — even
+        // with no links — so a plane can tell dead links from
+        // live ones by comparison alone.
+        assert_eq!(counter.engine_epoch(), 0);
+        counter.retire();
+        assert_eq!(counter.engine_epoch(), 1);
+        counter.retire();
+        assert_eq!(counter.engine_epoch(), 2);
+    }
+    #[test]
+    fn engine_plan_dedupe_collapses_hardlink_aliases() {
+        let plans = vec![
+            EngineProbePlan {
+                path: "/x/a".into(),
+                offset: 7,
+                device: 1,
+                inode: 2,
+                sha256: [9u8; 32],
+            },
+            EngineProbePlan {
+                path: "/x/b".into(),
+                offset: 7,
+                device: 1,
+                inode: 2,
+                sha256: [9u8; 32],
+            },
+            EngineProbePlan {
+                path: "/x/a".into(),
+                offset: 9,
+                device: 1,
+                inode: 2,
+                sha256: [9u8; 32],
+            },
+            EngineProbePlan {
+                path: "/x/c".into(),
+                offset: 7,
+                device: 1,
+                inode: 3,
+                sha256: [9u8; 32],
+            },
+        ];
+        let (unique, slots) = dedupe_engine_plans(&plans).unwrap();
+        assert_eq!(unique, vec![0, 2, 3]);
+        assert_eq!(slots, vec![0, 0, 1, 2]);
+    }
+    #[test]
+    fn pin_read_error_maps_tears_not_io_failures() {
+        use std::io::ErrorKind;
+        // Demonstrated instability: the file changed under the
+        // read (or outgrew the bound the parse succeeded under).
+        assert_eq!(
+            map_pin_read_error(ErrorKind::InvalidData),
+            CountFailure::Identity
+        );
+        assert_eq!(
+            map_pin_read_error(ErrorKind::FileTooLarge),
+            CountFailure::Identity
+        );
+        // Ordinary read failures establish no change: Read, never
+        // a fabricated ObjectChanged.
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::NotFound,
+            ErrorKind::BrokenPipe,
+            ErrorKind::Other,
+        ] {
+            assert_eq!(map_pin_read_error(kind), CountFailure::Read, "{kind:?}");
+        }
+    }
+    #[test]
+    fn engine_plan_dedupe_refuses_fingerprint_conflict() {
+        // Same physical stub, disagreeing content digests (the
+        // module changed between the two plan reads): collapsing
+        // would bless one parse silently — refuse instead.
+        let plans = vec![
+            EngineProbePlan {
+                path: "/x/a".into(),
+                offset: 7,
+                device: 1,
+                inode: 2,
+                sha256: [1u8; 32],
+            },
+            EngineProbePlan {
+                path: "/x/b".into(),
+                offset: 7,
+                device: 1,
+                inode: 2,
+                sha256: [2u8; 32],
+            },
+        ];
+        assert!(dedupe_engine_plans(&plans).is_none());
+    }
+    #[test]
+    fn engine_pin_stamp_catches_mode_and_size_change() {
+        use crate::provider_observation::objects::Stamp;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("osslscope-pin-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mod");
+        std::fs::write(&path, b"bytes").unwrap();
+        let pin = std::fs::File::open(&path).unwrap();
+        let stamp = Stamp::of(&pin.metadata().unwrap());
+        assert!(engine_pin_unchanged(&pin, &stamp));
+        // A mode flip (no content change) still invalidates.
+        let mut perms = pin.metadata().unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        assert!(!engine_pin_unchanged(&pin, &stamp));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn ledger_balances_engine_counts_with_admission() {
+        let sample = CountSample {
+            engine: vec![EngineCount {
+                cookie: ENGINE_COOKIE_BASE,
+                generation: 1,
+                calls: 7,
+                first_ns: 2,
+                last_ns: 3,
+            }],
+            unattributed: 5,
+            dropfail: 1,
+            ..Default::default()
+        };
+        assert_eq!(ledger_counted(&sample), 13);
+    }
     /// Small-budget control through the real counter-opening path: a
     /// small-but-valid `max_state_bytes` refuses with Resource before any
     /// BTF open or allocation (unprivileged: the refusal precedes the

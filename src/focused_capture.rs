@@ -3,8 +3,12 @@
 //! callback attachment; open attribution and the production tail stay unknown.
 use crate::{
     capture::{self, ClockPort, LiveClock},
+    discovery::{elf, legacy, maps},
     evidence::*,
-    focused_count::{CountCandidate, CountLimits, CountSample, FocusedCounter},
+    focused_count::{
+        CountCandidate, CountFailure, CountLimits, CountSample, EngineCount, EngineProbePlan,
+        FocusedCounter,
+    },
     inventory::{
         self,
         scope::{ScopedScanner, Selection},
@@ -310,6 +314,145 @@ pub fn project(
     document.site_provenance = projection.site_provenance;
     document
 }
+/// Fold one counter sample's cumulative ENGINE counts into
+/// per-cookie news for the collector: sums across count
+/// generations per cookie (the binding epoch is the join key, not
+/// the count fence), then differences against the previous sample's
+/// cumulative sums. Returns only nonzero news; updates `prev` in
+/// place. Drains are cumulative by construction, so a decrease
+/// clamps to zero news rather than negative evidence.
+fn engine_news(prev: &mut BTreeMap<u32, u64>, engine: &[EngineCount]) -> Vec<(u64, u64)> {
+    let mut current: BTreeMap<u32, u64> = BTreeMap::new();
+    for e in engine {
+        current
+            .entry(e.cookie)
+            .and_modify(|n| *n = n.saturating_add(e.calls))
+            .or_insert(e.calls);
+    }
+    let mut news = Vec::new();
+    for (cookie, total) in &current {
+        let delta = total.saturating_sub(prev.get(cookie).copied().unwrap_or(0));
+        if delta > 0 {
+            news.push((u64::from(*cookie), delta));
+        }
+    }
+    for (cookie, total) in current {
+        prev.insert(cookie, total);
+    }
+    news
+}
+/// Libcrypto admitted for ENGINE probe planning: maps path plus
+/// fresh stat-domain identity, cross-checked against the admitted
+/// inventory record (a dlopen/exec race skips this snapshot; the
+/// maps dev-string is never compared — btrfs/overlay diverge it).
+struct AdmittedLibcrypto {
+    path: String,
+    device: u64,
+    inode: u64,
+}
+/// Diff the current caller set against the plan-time baseline:
+/// every new path or changed (device, inode) identity is one
+/// more module with unknown imports (single-plan policy: never
+/// rescanned, always gap-counted). The baseline grows to absorb
+/// news, so each change counts once; paths vanished from maps
+/// stay (their pinned evidence remains valid, no loss). Returns
+/// (new skipped count, overflow): overflow means the baseline is
+/// full and an unseen path appeared — the caller must blind,
+/// since further changes are untrackable.
+fn diff_caller_set(
+    baseline: &mut BTreeMap<String, Option<(u64, u64)>>,
+    current: &[(String, Option<(u64, u64)>)],
+    cap: usize,
+) -> (u64, bool) {
+    let mut skipped = 0u64;
+    let mut overflow = false;
+    for (path, identity) in current {
+        match baseline.get(path) {
+            Some(known) if known == identity => {}
+            Some(_) => {
+                baseline.insert(path.clone(), *identity);
+                skipped = skipped.saturating_add(1);
+            }
+            None => {
+                if baseline.len() >= cap {
+                    overflow = true;
+                } else {
+                    baseline.insert(path.clone(), *identity);
+                    skipped = skipped.saturating_add(1);
+                }
+            }
+        }
+    }
+    (skipped, overflow)
+}
+/// Dedupe wanted probes by physical (device, inode, offset)
+/// identity: hardlinked paths describing the same stub emit
+/// once (first wanted index wins). Probes whose module
+/// identity is unknown are kept — the attach stage blinds
+/// loudly on unjoinable modules rather than guessing.
+fn dedupe_wanted_probes(
+    wanted: &[usize],
+    probes: &[crate::discovery::legacy::Probe],
+    identities: &BTreeMap<String, (u64, u64)>,
+) -> Vec<usize> {
+    let mut seen: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
+    let mut unique = Vec::with_capacity(wanted.len());
+    for &w in wanted {
+        let p = &probes[w];
+        if let Some(&(device, inode)) = identities.get(&p.module) {
+            if !seen.insert((device, inode, p.offset)) {
+                continue;
+            }
+        }
+        unique.push(w);
+    }
+    unique
+}
+fn select_engine_libcrypto(
+    maps: &[maps::Mapping],
+    modules: &[inventory::ModuleRecord],
+) -> Option<AdmittedLibcrypto> {
+    let path = legacy::find_libcrypto(maps)?;
+    let entry = maps.iter().find(|m| m.path == path)?;
+    // Fresh stat-domain identity; swapped-away files refuse here.
+    let fresh = std::fs::metadata(&entry.path).ok()?;
+    // H5: ino-only maps guard plus full stat-domain admission
+    // against the inventory record.
+    if fresh.ino() != entry.ino {
+        return None;
+    }
+    modules
+        .iter()
+        .any(|m| m.info.device == fresh.dev() && m.info.inode == fresh.ino())
+        .then(|| AdmittedLibcrypto {
+            path,
+            device: fresh.dev(),
+            inode: fresh.ino(),
+        })
+}
+/// Map an ENGINE attach failure to its session gap, or None when
+/// the outcome surfaces elsewhere (Deferred retries next
+/// snapshot; Close means shutdown is already closing the gate,
+/// which finish() reports itself).
+fn map_engine_attach_failure(f: CountFailure) -> Option<ObservationGap> {
+    match f {
+        CountFailure::Deferred | CountFailure::Close => None,
+        CountFailure::Identity => Some(ObservationGap::ObjectChanged),
+        CountFailure::Namespace => Some(ObservationGap::NamespaceChanged),
+        CountFailure::Resource => Some(ObservationGap::StateLimit),
+        CountFailure::Attach => Some(ObservationGap::AttachFailed),
+        CountFailure::Object | CountFailure::Map => Some(ObservationGap::BpfUnavailable),
+        CountFailure::Read => Some(ObservationGap::IntervalUnknown),
+    }
+}
+/// True iff the planned ProbeSet reports an absent ENGINE
+/// interface (4.x dynsyms carry no ENGINE_*): the Unsupported
+/// (explicit fact) signal, distinct from an empty caller surface.
+fn engine_interface_absent(set: &legacy::ProbeSet) -> bool {
+    set.findings
+        .iter()
+        .any(|f| f == legacy::FINDING_ENGINE_ABSENT)
+}
 fn now_ns() -> anyhow::Result<u64> {
     LiveClock
         .checked_monotonic_ns()
@@ -423,6 +566,87 @@ pub(crate) fn process_batch(
     ))
 }
 
+/// Cap on caller modules scanned for ENGINE probe planning per
+/// session (target_modules order); further modules stay unplanned
+/// behind an explicit gap.
+const MAX_ENGINE_PLAN_MODULES: usize = 16;
+/// Cap on caller-set baseline entries watched for late mappings
+/// and replacements. Past this the plane blinds: further caller
+/// churn is untrackable, and unwatched unknowns must not pass
+/// silently (candidates past the cap at plan time are already
+/// skipped, never watched).
+const MAX_ENGINE_CALLER_WATCH: usize = 256;
+/// Cap on total ELF bytes read for ENGINE probe planning per
+/// session; modules past this stay unplanned behind the
+/// skipped-modules gap, never a silent skip.
+const MAX_ENGINE_PLAN_BYTES: usize = 32 << 20;
+/// Live ENGINE tripwire plane: at most one planned ProbeSet per
+/// session (no mid-window replan — a libcrypto replacement blinds
+/// with an explicit gap, mirroring discovery's blind latch without
+/// its re-attach).
+struct EnginePlane {
+    state: EnginePlaneState,
+    collector: capture::EngineCollector,
+    /// Binding generation for the collector join (0 = unbound).
+    generation: u64,
+    /// Per-cookie cumulative sums from the last sample (news basis).
+    prev: BTreeMap<u32, u64>,
+    /// Attached module identities for the final object join:
+    /// path → (device, inode, build-id or empty).
+    modules: BTreeMap<String, (u64, u64, String)>,
+    /// Caller modules skipped during planning (imports unknown).
+    skipped_modules: u64,
+    /// Planned ENGINE call paths left unprobed (cap/stub-less).
+    uninstrumented: u64,
+    /// Address-taken imports (diagnostic facts, never probes).
+    addrtaken: u64,
+    /// Any snapshot mapped libcrypto (unplanned-at-finish with
+    /// this set is failed observation, not a non-OpenSSL target).
+    ever_mapped: bool,
+    /// Counter retire epoch recorded at attach. Any retire
+    /// destroys ENGINE links, so a moved epoch blinds the plane.
+    counter_epoch: u64,
+    /// Caller-set baseline: every candidate path at plan time →
+    /// fresh stat identity (None if unstatable). Late mappings
+    /// and replacements gap via `skipped_modules` (single-plan
+    /// policy: never rescanned); capped, overflow blinds.
+    callers: BTreeMap<String, Option<(u64, u64)>>,
+    /// Drained-but-unvalidated ENGINE news (cookie → calls),
+    /// bounded by attached-cookie count. Joins only after a
+    /// passing validation proves the planned bytes unchanged
+    /// across the drain; a failed validation drops it (ambiguous
+    /// increments are withheld, never joined).
+    pending: BTreeMap<u64, u64>,
+}
+#[derive(Clone, PartialEq, Eq)]
+enum EnginePlaneState {
+    Unplanned,
+    Planned {
+        device: u64,
+        inode: u64,
+        libcrypto: String,
+    },
+    Blind,
+    Unsupported,
+}
+impl EnginePlane {
+    fn new() -> Self {
+        Self {
+            state: EnginePlaneState::Unplanned,
+            collector: capture::EngineCollector::new(),
+            generation: 0,
+            prev: BTreeMap::new(),
+            modules: BTreeMap::new(),
+            skipped_modules: 0,
+            uninstrumented: 0,
+            addrtaken: 0,
+            ever_mapped: false,
+            counter_epoch: 0,
+            callers: BTreeMap::new(),
+            pending: BTreeMap::new(),
+        }
+    }
+}
 /// Reusable bounded process observation. Fields close counter/provider links
 /// before releasing original owned custody, including error/drop paths.
 pub(crate) struct FocusedSession {
@@ -438,6 +662,7 @@ pub(crate) struct FocusedSession {
     initial_metadata: Option<inventory::ProcessRecord>,
     pending: Option<ObservationBatch>,
     gaps: BTreeSet<ObservationGap>,
+    engine: EnginePlane,
     state_bytes: usize,
     inventory_gaps: u64,
     sample: CountSample,
@@ -887,6 +1112,7 @@ impl FocusedSession {
             initial_metadata: expected.map(|_| initial_record),
             pending: None,
             gaps,
+            engine: EnginePlane::new(),
             state_bytes: 0,
             inventory_gaps: 0,
             sample: CountSample::default(),
@@ -967,6 +1193,368 @@ impl FocusedSession {
         self.initial_metadata = None;
         self.poll_inner(now, deadline, cancel, Some(records))
     }
+    /// ENGINE tripwire plane: plan once from the first snapshot
+    /// showing admitted libcrypto, then verify the binding each
+    /// snapshot (a replacement blinds with an explicit gap).
+    fn plan_engine_probes(
+        &mut self,
+        records: &[inventory::ProcessRecord],
+        tick_end: Instant,
+        cancel: &AtomicBool,
+    ) {
+        if matches!(
+            self.engine.state,
+            EnginePlaneState::Blind | EnginePlaneState::Unsupported
+        ) {
+            return;
+        }
+        let Some(record) = records.iter().find(|p| {
+            p.pid == self.pid && p.starttime == self.starttime && p.namespaces == self.namespaces
+        }) else {
+            return;
+        };
+        let Ok(maps) = maps::read_maps(self.pid) else {
+            return;
+        };
+        if legacy::find_libcrypto(&maps).is_some() {
+            self.engine.ever_mapped = true;
+        }
+        // Owned binding copy: the Planned arm below reassigns
+        // the state, so it cannot borrow the match scrutinee.
+        let planned_binding = match &self.engine.state {
+            EnginePlaneState::Planned {
+                device,
+                inode,
+                libcrypto,
+            } => Some((*device, *inode, libcrypto.clone())),
+            _ => None,
+        };
+        if let Some((device, inode, libcrypto)) = planned_binding {
+            // Dead-link check first: any counter retire
+            // (provider mapping transitions, sample-time
+            // namespace loss, custody failure) destroys the
+            // ENGINE links, so a moved epoch blinds rather
+            // than joining silence as evidence.
+            let retired = match self.counter.as_ref() {
+                Some(counter) => counter.engine_epoch() != self.engine.counter_epoch,
+                None => true,
+            };
+            if retired {
+                // Post-retire pins are gone with the links: pending
+                // is unverifiable (ambiguous), so drop it — a pure
+                // provider transition over-withholds clean news, the
+                // honest price of an unknowable cause.
+                self.engine.pending.clear();
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::Invalidated);
+                return;
+            }
+            // Live pin custody: revalidate before trusting
+            // another snapshot's joins. A caller DSO changed
+            // mid-window retires the counter inside and blinds
+            // here — the engine-only path has no provider
+            // batches to trigger retention otherwise.
+            let pin_failed = match self.counter.as_mut() {
+                Some(counter) => counter.retain_authority(false).is_err(),
+                None => true,
+            };
+            if pin_failed {
+                self.engine.pending.clear();
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::Invalidated);
+                return;
+            }
+            // Certified clean: no change in (attach, now] proves
+            // every pending increment counted the planned bytes —
+            // join them. Later blinds in this arm (binding, caller
+            // overflow) lose nothing already certified.
+            let pending: Vec<(u64, u64)> = std::mem::take(&mut self.engine.pending)
+                .into_iter()
+                .collect();
+            if !pending.is_empty() {
+                self.engine
+                    .collector
+                    .accumulate(self.engine.generation, &pending, &[]);
+            }
+            // Binding check: a DIFFERENT admitted identity
+            // blinds; None is a transient race (keep, retry).
+            if let Some(lib) = select_engine_libcrypto(&maps, &record.modules) {
+                if lib.device != device || lib.inode != inode {
+                    self.engine.state = EnginePlaneState::Blind;
+                    self.gaps.insert(ObservationGap::ObjectChanged);
+                    return;
+                }
+            }
+            // Caller-set watch: late mappings and replacements
+            // gap as skipped (imports unknown, never rescanned
+            // under the single-plan policy) while the plane
+            // keeps joining its bound evidence. A full baseline
+            // blinds: untrackable churn must not pass silently.
+            let current: Vec<(String, Option<(u64, u64)>)> =
+                legacy::target_modules(&maps, libcrypto.as_str())
+                    .iter()
+                    .map(|path| {
+                        let identity = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+                        (path.clone(), identity)
+                    })
+                    .collect();
+            let (news, overflow) =
+                diff_caller_set(&mut self.engine.callers, &current, MAX_ENGINE_CALLER_WATCH);
+            self.engine.skipped_modules = self.engine.skipped_modules.saturating_add(news);
+            if overflow {
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::ObjectLimit);
+            }
+        } else if matches!(self.engine.state, EnginePlaneState::Unplanned) {
+            let Some(lib) = select_engine_libcrypto(&maps, &record.modules) else {
+                return;
+            };
+            self.attach_engine_plane(&maps, &lib, tick_end, cancel);
+        }
+        // Blind/Unsupported returned at the top: terminal, no-op.
+    }
+    /// Plan, attach and bind one ENGINE ProbeSet. Terminal states
+    /// (Unsupported/Blind) and gaps keep every outcome explicit;
+    /// transient races return Unplanned for the next snapshot.
+    fn attach_engine_plane(
+        &mut self,
+        maps: &[maps::Mapping],
+        lib: &AdmittedLibcrypto,
+        tick_end: Instant,
+        cancel: &AtomicBool,
+    ) {
+        // Identity-bound libcrypto bytes (swap-during-read retries;
+        // unreadable-now retries on NotFound, blinds otherwise).
+        let lc = match crate::plan::read_file_bound(&lib.path) {
+            Ok(fb) if fb.dev == lib.device && fb.ino == lib.inode => fb,
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => {
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::ClassifierFailed);
+                return;
+            }
+        };
+        // Caller modules: maps-consistent identity only, bounded
+        // count+bytes; anything else stays unplanned behind a gap.
+        let mut mod_bufs: Vec<(String, Vec<u8>, u64, u64, [u8; 32])> = Vec::new();
+        let mut skipped = 0u64;
+        let mut bytes_total = lc.bytes.len();
+        // Caller admission is maps-consistency only (no record
+        // membership: the inventory record is scoped to
+        // provider-relevant modules, while any mapped caller may
+        // import ENGINE_* — the attach-time fstat check closes the
+        // plan→attach race instead). Scan order is maps order;
+        // prioritizing record-known libcrypto consumers is future
+        // work if the module cap ever binds on a real target.
+        let candidates = legacy::target_modules(maps, &lib.path);
+        // Caller-set baseline for the late-mapping watch: fresh
+        // stat identity per candidate (None if unstatable).
+        // Candidates past the watch cap stay skipped-but-unwatched
+        // (the scan loop below already gaps everything past the
+        // far smaller scan cap — no double count here).
+        self.engine.callers = candidates
+            .iter()
+            .take(MAX_ENGINE_CALLER_WATCH)
+            .map(|path| {
+                let identity = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
+                (path.clone(), identity)
+            })
+            .collect();
+        for (index, path) in candidates.iter().enumerate() {
+            if mod_bufs.len() >= MAX_ENGINE_PLAN_MODULES {
+                skipped += 1;
+                continue;
+            }
+            let maps_ino = maps
+                .iter()
+                .find(|m| &m.path == path)
+                .map(|m| m.ino)
+                .unwrap_or(0);
+            let fresh = match std::fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            if fresh.ino() != maps_ino {
+                skipped += 1;
+                continue;
+            }
+            let fb = match crate::plan::read_file_bound(&path) {
+                Ok(fb) if fb.dev == fresh.dev() && fb.ino == fresh.ino() => fb,
+                _ => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            bytes_total = bytes_total.saturating_add(fb.bytes.len());
+            if bytes_total > MAX_ENGINE_PLAN_BYTES {
+                // Count this module plus every unscanned remainder.
+                skipped = skipped.saturating_add((candidates.len() - index) as u64);
+                break;
+            }
+            mod_bufs.push((
+                path.clone(),
+                fb.bytes.to_vec(),
+                fresh.dev(),
+                fresh.ino(),
+                Sha256::digest(&fb.bytes).into(),
+            ));
+        }
+        self.engine.skipped_modules = self.engine.skipped_modules.saturating_add(skipped);
+        let modules: Vec<legacy::Module<'_>> = mod_bufs
+            .iter()
+            .map(|(p, b, _, _, _)| legacy::Module { path: p, bytes: b })
+            .collect();
+        let set = match legacy::probes_for(
+            &lib.path,
+            &lc.bytes,
+            &modules,
+            (crate::plan::render_device(lc.dev), lc.ino),
+        ) {
+            Ok(set) => set,
+            Err(_) => {
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::ClassifierFailed);
+                return;
+            }
+        };
+        self.engine.addrtaken = self
+            .engine
+            .addrtaken
+            .saturating_add(set.address_taken.len() as u64);
+        self.engine.uninstrumented = self
+            .engine
+            .uninstrumented
+            .saturating_add(set.engine_uninstrumented);
+        // Unscannable callers carry zero probes and zero gap
+        // symbols: their imports are unknown, exactly like a
+        // skipped module.
+        self.engine.skipped_modules = self
+            .engine
+            .skipped_modules
+            .saturating_add(set.unscannable_modules);
+        if engine_interface_absent(&set) {
+            // Absent interface (4.x style): explicit terminal fact.
+            self.engine.state = EnginePlaneState::Unsupported;
+            return;
+        }
+        // Attachable surface: ENGINE-indexed symbols only (meth,
+        // low-level and load probes never join engine_observations,
+        // so attaching them would spend links and COUNTS keys for
+        // joinable-nothing). by_id counts at symbol level here —
+        // engine-id strings stay a harvest-only taxonomy.
+        let wanted: Vec<usize> = set
+            .probes
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| engine_index(&p.symbol).is_some())
+            .map(|(i, _)| i)
+            .collect();
+        // Collapse hardlinked-path aliases to one probe per
+        // physical (device, inode, offset) stub: the counter
+        // attaches each stub once, and the join below must not
+        // emit the same minted cookie from two ProbeSet rows.
+        let identities: BTreeMap<String, (u64, u64)> = mod_bufs
+            .iter()
+            .map(|(p, _, dev, ino, _)| (p.clone(), (*dev, *ino)))
+            .collect();
+        let wanted = dedupe_wanted_probes(&wanted, &set.probes, &identities);
+        let mut plans = Vec::with_capacity(wanted.len());
+        for &i in &wanted {
+            let probe = &set.probes[i];
+            let Some((_, _, dev, ino, digest)) =
+                mod_bufs.iter().find(|(p, _, _, _, _)| p == &probe.module)
+            else {
+                // Probe for a module we never read: cannot join it
+                // safely — blind rather than misattribute.
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::ClassifierFailed);
+                return;
+            };
+            self.engine
+                .modules
+                .insert(probe.module.clone(), (*dev, *ino, String::new()));
+            plans.push(EngineProbePlan {
+                path: probe.module.clone(),
+                offset: probe.offset,
+                device: *dev,
+                inode: *ino,
+                sha256: *digest,
+            });
+        }
+        let attach = match self.counter.as_mut() {
+            Some(counter) => {
+                counter.attach_engine_probes(&plans, self.pid, self.starttime, tick_end, cancel)
+            }
+            None => return,
+        };
+        let cookies = match attach {
+            Ok(cookies) => cookies,
+            Err(e) => match map_engine_attach_failure(e) {
+                Some(gap) => {
+                    self.engine.state = EnginePlaneState::Blind;
+                    self.gaps.insert(gap);
+                    return;
+                }
+                None => return,
+            },
+        };
+        if cookies.len() != plans.len() {
+            // Unjoinable alignment: blind rather than misattribute.
+            self.engine.state = EnginePlaneState::Blind;
+            self.gaps.insert(ObservationGap::ClassifierFailed);
+            return;
+        }
+        // Snapshoted meanings: attached probes only, remapped to
+        // their minted cookies under the actual count program.
+        let mut attached = legacy::ProbeSet {
+            libcrypto: set.libcrypto.clone(),
+            ..Default::default()
+        };
+        for (&i, &cookie) in wanted.iter().zip(cookies.iter()) {
+            let mut probe = set.probes[i].clone();
+            probe.cookie = u64::from(cookie);
+            probe.program = "count_entry";
+            attached.probes.push(probe);
+        }
+        let mut pins: Vec<crate::discovery::session::TripModulePin> = Vec::new();
+        let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
+        for plan in &plans {
+            if seen.insert((plan.path.clone(), "count_entry".into())) {
+                pins.push(crate::discovery::session::TripModulePin {
+                    module: plan.path.clone(),
+                    program: "count_entry".into(),
+                    dev: crate::plan::render_device(plan.device),
+                    ino: plan.inode,
+                });
+            }
+        }
+        // Build-ids for the final object join, computed now so the
+        // (large) module bytes drop with this snapshot.
+        for (path, bytes, _, _, _) in &mod_bufs {
+            if let Some(entry) = self.engine.modules.get_mut(path) {
+                entry.2 = elf::read_build_id(bytes).unwrap_or_default();
+            }
+        }
+        self.engine.generation += 1;
+        let generation = self.engine.generation;
+        self.engine
+            .collector
+            .snapshot_binding(generation, Some(attached), &pins);
+        self.engine.counter_epoch = self
+            .counter
+            .as_ref()
+            .map(|c| c.engine_epoch())
+            .unwrap_or(u64::MAX);
+        self.engine.state = EnginePlaneState::Planned {
+            device: lib.device,
+            inode: lib.inode,
+            libcrypto: lib.path.clone(),
+        };
+    }
     fn poll_inner(
         &mut self,
         now: Instant,
@@ -1041,6 +1629,7 @@ impl FocusedSession {
                 let batch = s.reconcile_records(records);
                 self.apply_batch(batch, tick_end, cancel)?;
             }
+            self.plan_engine_probes(records, tick_end, cancel);
             self.next_snapshot = Instant::now() + RESCAN;
             if self.pending.is_some() {
                 return Ok(SessionProgress::Running);
@@ -1071,7 +1660,46 @@ impl FocusedSession {
                 self.gaps.insert(ObservationGap::NamespaceChanged);
             }
         }
+        // ENGINE news from this sample into plane pending. The
+        // join waits for the next clean snapshot validation (or
+        // the finish cut): drains between validations are
+        // unvalidated, and a change found later must withhold
+        // them rather than join stale-symbol counts.
+        if matches!(self.engine.state, EnginePlaneState::Planned { .. }) {
+            let news = engine_news(&mut self.engine.prev, &self.sample.engine);
+            for (cookie, n) in news {
+                self.engine
+                    .pending
+                    .entry(cookie)
+                    .and_modify(|total| *total = total.saturating_add(n))
+                    .or_insert(n);
+            }
+        }
         Ok(SessionProgress::Running)
+    }
+    /// Test-only ENGINE-plane binding probe (native controls gate
+    /// paced stimulus on the bound plane: zero pre-window loss).
+    #[cfg(test)]
+    pub(crate) fn engine_planned_for_test(&self) -> bool {
+        matches!(self.engine.state, EnginePlaneState::Planned { .. })
+    }
+    /// Test-only ENGINE-plane blind probe (retire-invalidation
+    /// natives assert the loud blind, never silent death).
+    #[cfg(test)]
+    pub(crate) fn engine_blind_for_test(&self) -> bool {
+        matches!(self.engine.state, EnginePlaneState::Blind)
+    }
+    /// Test-only session gap probe (retire-invalidation natives
+    /// assert the explicit coverage gap reached the session).
+    #[cfg(test)]
+    pub(crate) fn session_gaps_for_test(&self) -> Vec<ObservationGap> {
+        self.gaps.iter().copied().collect()
+    }
+    /// Test-only skipped-caller probe (caller-watch natives
+    /// assert late mappings gap without blinding the plane).
+    #[cfg(test)]
+    pub(crate) fn engine_skipped_modules_for_test(&self) -> u64 {
+        self.engine.skipped_modules
     }
     /// Fence active counting before another member's final output can block.
     pub(crate) fn stop_admission(&mut self, cancel: &AtomicBool) {
@@ -1180,9 +1808,133 @@ impl FocusedSession {
                 .map(|a| a.row)
                 .collect();
         }
+        // ENGINE closed-cut validation: the counter is consumed
+        // once below for both planes, so custody is verified
+        // first. Pass → pending + closed tail join; fail → drop
+        // pending, blind with Invalidated, tail withheld (a change
+        // after the last snapshot must not enter through the cut).
+        if matches!(self.engine.state, EnginePlaneState::Planned { .. }) {
+            // Exit-safe ENGINE custody only: full retention
+            // requires a live target (provider pidfd/maps checks),
+            // but the closed cut routinely runs post-exit. Pin
+            // stamps + epoch fully determine ENGINE attribution
+            // integrity (no change in (attach, finish] proves the
+            // tail counted the planned bytes).
+            let cut_clean = match self.counter.as_ref() {
+                Some(c) => {
+                    c.engine_epoch() == self.engine.counter_epoch && c.engine_pins_unchanged()
+                }
+                None => false,
+            };
+            if !cut_clean {
+                self.engine.pending.clear();
+                self.engine.state = EnginePlaneState::Blind;
+                self.gaps.insert(ObservationGap::Invalidated);
+            }
+        }
         let counter_cpus = self.counter.as_ref().map(|c| c.cpus());
         if let Some(c) = self.counter.take() {
             self.sample = c.close(deadline);
+        }
+        // Final ENGINE news from the closed cut, then join counts
+        // to probe meanings + pinned module identities. A blinded
+        // plane joins only validated pre-blind counts; pending and
+        // post-blind drains stay ledger-balanced but unevidenced
+        // (they would misattribute replacement bytes to stale
+        // meanings).
+        let mut engine_observations = Vec::new();
+        if matches!(
+            self.engine.state,
+            EnginePlaneState::Planned { .. } | EnginePlaneState::Blind
+        ) {
+            if matches!(self.engine.state, EnginePlaneState::Planned { .. }) {
+                let tail = engine_news(&mut self.engine.prev, &self.sample.engine);
+                for (cookie, n) in tail {
+                    self.engine
+                        .pending
+                        .entry(cookie)
+                        .and_modify(|total| *total = total.saturating_add(n))
+                        .or_insert(n);
+                }
+                let pending: Vec<(u64, u64)> = std::mem::take(&mut self.engine.pending)
+                    .into_iter()
+                    .collect();
+                if !pending.is_empty() {
+                    self.engine
+                        .collector
+                        .accumulate(self.engine.generation, &pending, &[]);
+                }
+            }
+            let objects: Vec<ObjectRecord> = self
+                .engine
+                .modules
+                .iter()
+                .map(|(path, (device, ino, bid))| {
+                    let id = if bid.is_empty() {
+                        ObjectId(format!(
+                            "unverified:{}:{ino}",
+                            crate::plan::render_device(*device)
+                        ))
+                    } else {
+                        ObjectId(format!("build:{bid}"))
+                    };
+                    ObjectRecord {
+                        id,
+                        device: *device,
+                        inode: *ino,
+                        display_locator: path.clone(),
+                    }
+                })
+                .collect();
+            let (obs, unkeyed) = self.engine.collector.build(&objects);
+            engine_observations = obs;
+            if unkeyed > 0 {
+                let mut counter = loss("focused.engine_unkeyed", CounterSource::KernelMap, unkeyed);
+                counter.units = CounterUnits::Calls;
+                self.sample.gaps.push(counter);
+            }
+        }
+        if matches!(self.engine.state, EnginePlaneState::Unsupported) {
+            // Absent interface (4.x style): explicit terminal fact.
+            self.sample.gaps.push(GapCounter {
+                name: "focused.engine_absent".into(),
+                source: CounterSource::Discovery,
+                value: 1,
+                kind: CounterKind::Activity,
+                units: CounterUnits::Events,
+            });
+        }
+        if matches!(self.engine.state, EnginePlaneState::Unplanned) && self.engine.ever_mapped {
+            // Libcrypto was mapped but no plan ever bound: failed
+            // observation, never a silent skip.
+            self.sample.gaps.push(loss(
+                "focused.engine_unplanned",
+                CounterSource::Discovery,
+                1,
+            ));
+        }
+        if self.engine.skipped_modules > 0 {
+            self.sample.gaps.push(loss(
+                "focused.engine_module_skipped",
+                CounterSource::Discovery,
+                self.engine.skipped_modules,
+            ));
+        }
+        if self.engine.uninstrumented > 0 {
+            self.sample.gaps.push(loss(
+                "focused.engine_uninstrumented",
+                CounterSource::Discovery,
+                self.engine.uninstrumented,
+            ));
+        }
+        if self.engine.addrtaken > 0 {
+            self.sample.gaps.push(GapCounter {
+                name: "focused.engine_addrtaken".into(),
+                source: CounterSource::Discovery,
+                value: self.engine.addrtaken,
+                kind: CounterKind::Activity,
+                units: CounterUnits::Events,
+            });
         }
         if self.owned.is_some() {
             self.sample
@@ -1241,6 +1993,12 @@ impl FocusedSession {
             std::mem::take(&mut self.sample),
             &self.gaps.iter().copied().collect::<Vec<_>>(),
         );
+        if !engine_observations.is_empty() {
+            // The live ENGINE plane joins here (project/finalize
+            // carry none); sorted exactly as finalize would.
+            document.engine_observations = engine_observations;
+            document.engine_observations.sort();
+        }
         if projectable {
             if let Some(ref attribution) = finalized_attribution {
                 // Infallible after the pre-scan (the projection
@@ -1324,6 +2082,924 @@ mod session_tests {
         })
         .processes
         .remove(0)
+    }
+    #[test]
+    fn engine_news_differences_cumulative_samples_per_cookie() {
+        use crate::focused_count::{ENGINE_COOKIE_BASE, EngineCount};
+        let base = ENGINE_COOKIE_BASE;
+        let mut prev = BTreeMap::new();
+        let first = vec![
+            EngineCount {
+                cookie: base,
+                generation: 1,
+                calls: 5,
+                first_ns: 2,
+                last_ns: 3,
+            },
+            EngineCount {
+                cookie: base,
+                generation: 2,
+                calls: 2,
+                first_ns: 4,
+                last_ns: 5,
+            },
+            EngineCount {
+                cookie: base + 1,
+                generation: 1,
+                calls: 3,
+                first_ns: 2,
+                last_ns: 3,
+            },
+        ];
+        assert_eq!(
+            engine_news(&mut prev, &first),
+            vec![(u64::from(base), 7), (u64::from(base + 1), 3)]
+        );
+        let second = vec![
+            EngineCount {
+                cookie: base,
+                generation: 1,
+                calls: 5,
+                first_ns: 2,
+                last_ns: 3,
+            },
+            EngineCount {
+                cookie: base,
+                generation: 2,
+                calls: 4,
+                first_ns: 4,
+                last_ns: 9,
+            },
+            EngineCount {
+                cookie: base + 1,
+                generation: 1,
+                calls: 3,
+                first_ns: 2,
+                last_ns: 3,
+            },
+        ];
+        assert_eq!(engine_news(&mut prev, &second), vec![(u64::from(base), 2)]);
+    }
+    #[test]
+    fn engine_libcrypto_select_binds_maps_to_record_identity() {
+        use std::os::unix::fs::MetadataExt as _;
+        // A same-named copy stands in for libcrypto: selection stats
+        // and matches identity only (ELF parsing plans later, live).
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-select-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let fake = dir.join("libcrypto.so.9");
+        std::fs::copy("/bin/true", &fake).unwrap();
+        let meta = std::fs::metadata(&fake).unwrap();
+        let maps = vec![crate::discovery::maps::Mapping {
+            start: 0x1000,
+            end: 0x2000,
+            x: true,
+            offset: 0,
+            dev: "00:00".into(),
+            ino: meta.ino(),
+            path: fake.to_str().unwrap().into(),
+        }];
+        let module = inventory::ModuleRecord {
+            info: inventory::ModuleInfo {
+                sha256: String::new(),
+                device: meta.dev(),
+                inode: meta.ino(),
+                size_bytes: 0,
+                architecture: inventory::Architecture::X86_64,
+                kind: inventory::ObjectKind::OpenSslCompatible,
+                exports: Vec::new(),
+                depends_on_libcrypto: false,
+                depends_on_libssl: false,
+            },
+            identity_status: inventory::IdentityStatus::Verified,
+        };
+        let admitted = select_engine_libcrypto(&maps, std::slice::from_ref(&module))
+            .expect("matching identity admits");
+        assert_eq!(admitted.path, fake.to_str().unwrap());
+        assert_eq!(admitted.device, meta.dev());
+        assert_eq!(admitted.inode, meta.ino());
+        // Swapped-away file (maps ino stale) refuses.
+        let stale_maps = vec![crate::discovery::maps::Mapping {
+            ino: meta.ino().wrapping_add(1),
+            ..maps[0].clone()
+        }];
+        assert!(select_engine_libcrypto(&stale_maps, std::slice::from_ref(&module)).is_none());
+        // Unadmitted identity (absent from the record) refuses.
+        assert!(select_engine_libcrypto(&maps, &[]).is_none());
+        // No libcrypto mapping refuses.
+        assert!(select_engine_libcrypto(&[], std::slice::from_ref(&module)).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_session_routes_engine_calls_to_observations() {
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::fd::{AsRawFd, FromRawFd},
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-session-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let count = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count_sha256: Sha256::digest(&count).into(),
+            count: Arc::from(count),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Spawn {
+                argv: vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()],
+                workload: crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            },
+            objects,
+            Instant::now() + Duration::from_secs(30),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        // Drive polls until the ENGINE plane binds (FIFO pacing
+        // holds every call until after attach: zero pre-window loss).
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_planned_for_test() {
+                break;
+            }
+            assert!(Instant::now() < until, "engine plane must bind");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        writeln!(commands, "B").unwrap();
+        commands.flush().unwrap();
+        let mut ack = String::new();
+        output.read_line(&mut ack).unwrap();
+        assert!(
+            ack.starts_with("ack B 1 ") && ack.contains("did=5"),
+            "{ack}"
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        loop {
+            match session.poll(Instant::now(), &cancel).unwrap() {
+                SessionProgress::Exited | SessionProgress::StopRequested => break,
+                SessionProgress::Running => {}
+                other => panic!("unexpected progress: {other:?}"),
+            }
+            assert!(Instant::now() < until, "fixture must exit");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = session
+            .finish(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.child_exit, Some(0));
+        let by_id_entry = crate::evidence::engine_index("ENGINE_by_id").unwrap();
+        let by_id_calls: u64 = result
+            .document
+            .engine_observations
+            .iter()
+            .filter(|o| o.entrypoint == by_id_entry)
+            .map(|o| o.calls)
+            .sum();
+        assert_eq!(by_id_calls, 5, "five paced by_id calls observed live");
+        assert!(
+            result
+                .document
+                .engine_observations
+                .iter()
+                .all(|o| o.window == crate::evidence::EngineWindow::InWindow),
+            "paced calls are in-window"
+        );
+        assert!(
+            !result
+                .document
+                .counters
+                .iter()
+                .any(|c| c.name == "focused_ledger_mismatch" || c.name == "focused.engine_unkeyed"),
+            "engine plane balances"
+        );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_session_engine_plane_blinds_on_pin_change() {
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::PermissionsExt as _,
+            },
+            process::Command,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-engine-planeblind-{}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let count = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count_sha256: Sha256::digest(&count).into(),
+            count: Arc::from(count),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Spawn {
+                argv: vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()],
+                workload: crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            },
+            objects,
+            Instant::now() + Duration::from_secs(60),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_planned_for_test() {
+                break;
+            }
+            assert!(Instant::now() < until, "engine plane must bind");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Mid-window pin change: the plane must blind loudly on
+        // the next snapshot (past the 1s rescan cadence), never
+        // stay Planned over dead links.
+        let mut perms = fs::metadata(&app).unwrap().permissions();
+        perms.set_mode(perms.mode() ^ 0o001);
+        fs::set_permissions(&app, perms).unwrap();
+        let blind_until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_blind_for_test() {
+                break;
+            }
+            assert!(Instant::now() < blind_until, "plane must blind");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        assert!(
+            session
+                .session_gaps_for_test()
+                .contains(&ObservationGap::Invalidated),
+            "retire-invalidated plane carries an explicit gap"
+        );
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        loop {
+            match session.poll(Instant::now(), &cancel).unwrap() {
+                SessionProgress::Exited | SessionProgress::StopRequested => break,
+                SessionProgress::Running => {}
+                other => panic!("unexpected progress: {other:?}"),
+            }
+            assert!(Instant::now() < blind_until, "fixture must exit");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = session
+            .finish(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.child_exit, Some(0));
+        assert!(
+            result
+                .document
+                .counters
+                .iter()
+                .any(|c| c.name == "focused.identity_unknown"),
+            "invalidation reaches the finished document"
+        );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_session_engine_plane_withholds_ambiguous_counts() {
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::PermissionsExt as _,
+            },
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-withhold-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let count = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count_sha256: Sha256::digest(&count).into(),
+            count: Arc::from(count),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Spawn {
+                argv: vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()],
+                workload: crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            },
+            objects,
+            Instant::now() + Duration::from_secs(60),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_planned_for_test() {
+                break;
+            }
+            assert!(Instant::now() < until, "engine plane must bind");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Change FIRST, then call: every post-change drain is
+        // unverifiable (the mode flip stands in for any file
+        // change — bytes are untestable in place on a running
+        // executable — and the design withholds on any stamp
+        // change). No pre-change calls exist, so no snapshot can
+        // have clean-joined anything: the only correct outcome is
+        // blind + fully withheld.
+        let mut perms = fs::metadata(&app).unwrap().permissions();
+        perms.set_mode(perms.mode() ^ 0o001);
+        fs::set_permissions(&app, perms).unwrap();
+        writeln!(commands, "B").unwrap();
+        commands.flush().unwrap();
+        let mut ack = String::new();
+        output.read_line(&mut ack).unwrap();
+        assert!(
+            ack.starts_with("ack B 1 ") && ack.contains("did=5"),
+            "{ack}"
+        );
+        let blind_until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_blind_for_test() {
+                break;
+            }
+            assert!(Instant::now() < blind_until, "plane must blind");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        assert!(
+            session
+                .session_gaps_for_test()
+                .contains(&ObservationGap::Invalidated),
+            "withholding carries an explicit gap"
+        );
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        loop {
+            match session.poll(Instant::now(), &cancel).unwrap() {
+                SessionProgress::Exited | SessionProgress::StopRequested => break,
+                SessionProgress::Running => {}
+                other => panic!("unexpected progress: {other:?}"),
+            }
+            assert!(Instant::now() < blind_until, "fixture must exit");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = session
+            .finish(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.child_exit, Some(0));
+        let by_id_entry = crate::evidence::engine_index("ENGINE_by_id").unwrap();
+        let by_id_calls: u64 = result
+            .document
+            .engine_observations
+            .iter()
+            .filter(|o| o.entrypoint == by_id_entry)
+            .map(|o| o.calls)
+            .sum();
+        assert_eq!(by_id_calls, 0, "ambiguous increments withheld");
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_session_engine_finish_validates_closed_tail() {
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::PermissionsExt as _,
+            },
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-fintail-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let count = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count_sha256: Sha256::digest(&count).into(),
+            count: Arc::from(count),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Spawn {
+                argv: vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()],
+                workload: crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            },
+            objects,
+            Instant::now() + Duration::from_secs(60),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_planned_for_test() {
+                break;
+            }
+            assert!(Instant::now() < until, "engine plane must bind");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        // Change, call, then finish with NO poll between: no
+        // snapshot can validate first, so the closed cut itself
+        // must validate and withhold the 5-call tail. The live
+        // child is reaped by pid after (finish consumes the
+        // session).
+        let pid = session.pid;
+        let mut perms = fs::metadata(&app).unwrap().permissions();
+        perms.set_mode(perms.mode() ^ 0o001);
+        fs::set_permissions(&app, perms).unwrap();
+        writeln!(commands, "B").unwrap();
+        commands.flush().unwrap();
+        let mut tail_ack = String::new();
+        output.read_line(&mut tail_ack).unwrap();
+        assert!(
+            tail_ack.starts_with("ack B 1 ") && tail_ack.contains("did=5"),
+            "{tail_ack}"
+        );
+        let result = session
+            .finish(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        let by_id_entry = crate::evidence::engine_index("ENGINE_by_id").unwrap();
+        let by_id_calls: u64 = result
+            .document
+            .engine_observations
+            .iter()
+            .filter(|o| o.entrypoint == by_id_entry)
+            .map(|o| o.calls)
+            .sum();
+        assert_eq!(by_id_calls, 0, "closed tail withheld without validation");
+        assert!(
+            result
+                .document
+                .counters
+                .iter()
+                .any(|c| c.name == "focused.identity_unknown"),
+            "finish-time invalidation reaches the document"
+        );
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(pid as i32, &mut status, 0);
+        }
+        let _ = commands;
+        let _ = output;
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_session_engine_plane_gaps_late_mapping() {
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::fd::{AsRawFd, FromRawFd},
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-engine-latemap-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        // Never-executed blob: a new exec mapping the plane never
+        // scanned (same maps event as a late dlopen).
+        let blob = dir.join("late.bin");
+        fs::write(&blob, vec![0u8; 8192]).unwrap();
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let count = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count_sha256: Sha256::digest(&count).into(),
+            count: Arc::from(count),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Spawn {
+                argv: vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()],
+                workload: crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            },
+            objects,
+            Instant::now() + Duration::from_secs(60),
+            &cancel,
+            None,
+        )
+        .unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            if session.engine_planned_for_test() {
+                break;
+            }
+            assert!(Instant::now() < until, "engine plane must bind");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let skipped_before = session.engine_skipped_modules_for_test();
+        writeln!(commands, "M").unwrap();
+        writeln!(commands, "{}", blob.to_str().unwrap()).unwrap();
+        commands.flush().unwrap();
+        let mut ack = String::new();
+        output.read_line(&mut ack).unwrap();
+        assert!(ack.starts_with("ack M 1 "), "{ack}");
+        // The late mapping gaps exactly once (past the 1s rescan
+        // cadence) while the plane stays Planned: existing
+        // evidence keeps joining, the unknown stays unknown.
+        let gap_until = Instant::now() + Duration::from_secs(20);
+        loop {
+            assert_eq!(
+                session.poll(Instant::now(), &cancel).unwrap(),
+                SessionProgress::Running
+            );
+            assert!(
+                session.engine_planned_for_test(),
+                "late mapping gaps, never blinds"
+            );
+            if session.engine_skipped_modules_for_test() == skipped_before + 1 {
+                break;
+            }
+            assert!(Instant::now() < gap_until, "late mapping must gap");
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        // One more snapshot past cadence: still exactly once.
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::Running
+        );
+        assert_eq!(
+            session.engine_skipped_modules_for_test(),
+            skipped_before + 1,
+            "caller news counts once"
+        );
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        loop {
+            match session.poll(Instant::now(), &cancel).unwrap() {
+                SessionProgress::Exited | SessionProgress::StopRequested => break,
+                SessionProgress::Running => {}
+                other => panic!("unexpected progress: {other:?}"),
+            }
+            assert!(Instant::now() < gap_until, "fixture must exit");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let result = session
+            .finish(Instant::now() + Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(result.child_exit, Some(0));
+        let skipped_counter = result
+            .document
+            .counters
+            .iter()
+            .find(|c| c.name == "focused.engine_module_skipped")
+            .map(|c| c.value);
+        assert_eq!(
+            skipped_counter,
+            Some(skipped_before + 1),
+            "late mapping reaches the finished document"
+        );
+    }
+    #[test]
+    fn engine_absent_signal_is_the_planner_finding() {
+        let absent = crate::discovery::legacy::ProbeSet {
+            findings: vec![crate::discovery::legacy::FINDING_ENGINE_ABSENT.to_string()],
+            ..Default::default()
+        };
+        assert!(engine_interface_absent(&absent));
+        assert!(!engine_interface_absent(
+            &crate::discovery::legacy::ProbeSet::default()
+        ));
+    }
+    #[test]
+    fn wanted_dedupe_collapses_hardlink_aliases() {
+        use crate::discovery::legacy::Probe;
+        let probes = vec![
+            Probe {
+                cookie: 0,
+                symbol: "ENGINE_by_id".into(),
+                offset: 7,
+                module: "/x/a".into(),
+                family: None,
+                str_arg: None,
+                program: "trip_count",
+            },
+            Probe {
+                cookie: 1,
+                symbol: "ENGINE_by_id".into(),
+                offset: 7,
+                module: "/x/b".into(),
+                family: None,
+                str_arg: None,
+                program: "trip_count",
+            },
+            Probe {
+                cookie: 2,
+                symbol: "ENGINE_init".into(),
+                offset: 9,
+                module: "/x/a".into(),
+                family: None,
+                str_arg: None,
+                program: "trip_count",
+            },
+        ];
+        let identities: BTreeMap<String, (u64, u64)> =
+            BTreeMap::from([("/x/a".to_string(), (1, 2)), ("/x/b".to_string(), (1, 2))]);
+        // Same (dev, ino, offset) under two paths: first wins.
+        assert_eq!(
+            dedupe_wanted_probes(&[0, 1, 2], &probes, &identities),
+            vec![0, 2]
+        );
+        // Missing identity keeps the probe (the attach stage
+        // blinds loudly on unjoinable modules instead).
+        assert_eq!(
+            dedupe_wanted_probes(&[0, 1, 2], &probes, &BTreeMap::new()),
+            vec![0, 1, 2]
+        );
+    }
+    #[test]
+    fn caller_diff_counts_new_and_replaced_once() {
+        // Baseline: /a scanned, /b skipped-at-plan (unstatable).
+        let mut baseline: BTreeMap<String, Option<(u64, u64)>> =
+            BTreeMap::from([("/a".to_string(), Some((1, 2))), ("/b".to_string(), None)]);
+        // Unchanged set: silent.
+        let (skipped, overflow) = diff_caller_set(
+            &mut baseline,
+            &[("/a".to_string(), Some((1, 2))), ("/b".to_string(), None)],
+            8,
+        );
+        assert_eq!((skipped, overflow), (0, false));
+        // New path + replacement + /b reappearing: three unknowns.
+        let (skipped, overflow) = diff_caller_set(
+            &mut baseline,
+            &[
+                ("/a".to_string(), Some((1, 3))),
+                ("/b".to_string(), Some((4, 5))),
+                ("/c".to_string(), Some((6, 7))),
+            ],
+            8,
+        );
+        assert_eq!((skipped, overflow), (3, false));
+        // Repeating the same set counts nothing (baseline grew).
+        let (skipped, overflow) = diff_caller_set(
+            &mut baseline,
+            &[
+                ("/a".to_string(), Some((1, 3))),
+                ("/b".to_string(), Some((4, 5))),
+                ("/c".to_string(), Some((6, 7))),
+            ],
+            8,
+        );
+        assert_eq!((skipped, overflow), (0, false));
+        // Vanished-from-maps entries stay (no loss, no recount).
+        let (skipped, overflow) =
+            diff_caller_set(&mut baseline, &[("/a".to_string(), Some((1, 3)))], 8);
+        assert_eq!((skipped, overflow), (0, false));
+        // Full baseline + unseen path: overflow (caller blinds).
+        baseline.insert("/d".to_string(), Some((8, 8)));
+        let (skipped, overflow) = diff_caller_set(
+            &mut baseline,
+            &[
+                ("/a".to_string(), Some((1, 3))),
+                ("/e".to_string(), Some((9, 9))),
+            ],
+            4,
+        );
+        assert_eq!((skipped, overflow), (0, true));
     }
     #[test]
     fn scanned_session_clips_kernel_window_and_uses_fresh_incarnation() {

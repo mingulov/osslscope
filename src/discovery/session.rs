@@ -6956,6 +6956,7 @@ mod tests {
             unprobed_meth_syms: Vec::new(),
             unprobed_lowlevel_syms: Vec::new(),
             findings: Vec::new(),
+            unscannable_modules: 0,
             by_id_cookies: HashSet::from([7]),
             load_cookies: HashSet::new(),
             libcrypto: Some(("/lib/libcrypto.so.3".to_string(), "08:01".to_string(), ino)),
