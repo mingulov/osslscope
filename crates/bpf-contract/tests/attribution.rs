@@ -195,11 +195,14 @@ fn producer_rel_kinds_and_states_are_disjoint() {
     );
 }
 #[test]
-fn role_table_census_is_exactly_thirty() {
+fn role_table_census_is_exactly_thirty_seven() {
     // Stage-1 grows the Phase-1 twenty-nine with exactly one role: 161,
-    // the query-observation role (TYPED_QUERY_ROLES, never public). The
-    // first-slice twenty-nine admit exactly as before; any other addition
-    // or removal still fails here.
+    // the query-observation role (TYPED_QUERY_ROLES, never public). T2 S1a
+    // adds the seven digest copied roles 309-315 (newctx / freectx /
+    // dupctx / init / update / final / oneshot, op 1); the copied digest
+    // probes hold out of firemap/pin and the load roots until the R5
+    // revision lands, so the roles admit in the contract but never fire.
+    // Any other addition or removal still fails here.
     let mut admitted = Vec::new();
     for id in 0..512u32 {
         if TypedRoleId::from_u32(id).is_some() {
@@ -210,11 +213,12 @@ fn role_table_census_is_exactly_thirty() {
         admitted,
         vec![
             5, 18, 130, 131, 136, 137, 142, 143, 146, 147, 148, 149, 150, 151, 152, 153, 154, 155,
-            161, 258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308,
+            161, 258, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313,
+            314, 315,
         ]
     );
     for id in [
-        0, 1, 12, 48, 49, 127, 128, 129, 132, 156, 160, 176, 256, 257, 260, 309, 511,
+        0, 1, 12, 48, 49, 127, 128, 129, 132, 156, 160, 176, 256, 257, 260, 316, 511,
     ] {
         assert!(
             TypedRoleId::from_u32(id).is_none(),

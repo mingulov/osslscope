@@ -244,6 +244,16 @@ pub(crate) fn copied_role(operation: u32, function: u32) -> Option<u32> {
         (3, 6) => Some(306),
         (4, 5) => Some(307),
         (4, 4) => Some(308),
+        // Digest (op 1): same lifecycle shape as MAC/KDF —
+        // newctx (309) / freectx (310) / dupctx (311) /
+        // init (312) / update (313) / final (314) / oneshot (315).
+        (1, 1) => Some(309),
+        (1, 6) => Some(310),
+        (1, 7) => Some(311),
+        (1, 2) => Some(312),
+        (1, 3) => Some(313),
+        (1, 4) => Some(314),
+        (1, 5) => Some(315),
         _ => None,
     }
 }
@@ -391,13 +401,23 @@ mod tests {
             (3, 6, 306),
             (4, 5, 307),
             (4, 4, 308),
+            // Digest (op 1) mirrors MAC/KDF by dispatch semantics,
+            // not funcid number: 1=newctx, 6=freectx, 7=dupctx,
+            // 2/3/4/5=init/update/final/oneshot (frozen kinds.rs).
+            (1, 1, 309),
+            (1, 6, 310),
+            (1, 7, 311),
+            (1, 2, 312),
+            (1, 3, 313),
+            (1, 4, 314),
+            (1, 5, 315),
         ];
         for (op, fun, role) in pairs {
             assert_eq!(copied_role(op, fun), Some(role));
             let (_, admit_op, admit_fun) = TypedAdmission::admission_parts(role).unwrap();
             assert_eq!((admit_op, admit_fun), (op, fun));
         }
-        for op in [3, 4] {
+        for op in [1, 3, 4] {
             for fun in 0..64 {
                 let role = copied_role(op, fun);
                 if pairs.iter().any(|(o, f, _)| (*o, *f) == (op, fun)) {
@@ -407,7 +427,10 @@ mod tests {
                 }
             }
         }
-        for role in [258u32, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308] {
+        for role in [
+            258u32, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
+            315,
+        ] {
             let id = TypedRoleId::from_u32(role).unwrap();
             assert_eq!(id.public_export(), None);
         }

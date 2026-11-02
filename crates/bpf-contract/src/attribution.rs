@@ -86,7 +86,8 @@ impl TypedRoleId {
             | 275
             | 290
             | 291
-            | 304..=308 => Some(Self(id)),
+            | 304..=308
+            | 309..=315 => Some(Self(id)),
             _ => None,
         }
     }
@@ -157,6 +158,15 @@ impl TypedAdmission {
             306 => Some((0, 3, 6)),
             307 => Some((0, 4, 5)),
             308 => Some((0, 4, 4)),
+            // Digest (op 1): newctx / freectx / dupctx /
+            // init / update / final / oneshot.
+            309 => Some((0, 1, 1)),
+            310 => Some((0, 1, 6)),
+            311 => Some((0, 1, 7)),
+            312 => Some((0, 1, 2)),
+            313 => Some((0, 1, 3)),
+            314 => Some((0, 1, 4)),
+            315 => Some((0, 1, 5)),
             _ => None,
         }
     }
@@ -207,12 +217,26 @@ impl TypedAdmission {
     pub const fn paired(&self) -> bool {
         matches!(
             self.role_id,
-            130 | 131 | 142 | 143 | 146 | 147 | 148 | 151 | 152 | 161 | 258 | 259 | 290 | 291
+            130 | 131
+                | 142
+                | 143
+                | 146
+                | 147
+                | 148
+                | 151
+                | 152
+                | 161
+                | 258
+                | 259
+                | 290
+                | 291
+                | 309
+                | 311
         )
     }
     #[inline(always)]
     pub const fn operational(&self) -> bool {
-        matches!(self.role_id, 304..=307)
+        matches!(self.role_id, 304..=307 | 312..=315)
     }
 }
 #[repr(C)]

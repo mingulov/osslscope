@@ -5,6 +5,7 @@ pub mod artifact;
 mod assembly;
 pub mod cli;
 pub mod copied_plan;
+pub mod digest_workload;
 pub mod objects;
 pub mod schema;
 #[cfg(test)]
