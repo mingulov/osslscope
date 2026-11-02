@@ -2065,7 +2065,7 @@ impl FocusedSession {
             }
         });
         document.context = Some(CaptureContext {
-            kernel_release: String::new(),
+            kernel_release: crate::doctor::uname_release(),
             wall_start_unix_ns: self.wall_start,
             wall_end_unix_ns: unix_ns(),
         });
@@ -3203,6 +3203,41 @@ mod session_tests {
         assert!(session.pending.is_none());
         session.finish(Instant::now()).unwrap();
     }
+    #[test]
+    fn finished_document_carries_observer_kernel_release() {
+        let mut app = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let expected = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![app.id()],
+            limits: inventory::Limits {
+                max_objects_per_process: 0,
+                ..Default::default()
+            },
+        })
+        .processes
+        .remove(0);
+        let cancel = AtomicBool::new(false);
+        let session = FocusedSession::open(
+            FocusedConfig::default(),
+            capture::Target::Pid(app.id()),
+            objects(),
+            Instant::now() + Duration::from_secs(2),
+            &cancel,
+            Some(&expected),
+        )
+        .unwrap();
+        let result = session.finish(Instant::now()).unwrap();
+        app.kill().unwrap();
+        app.wait().unwrap();
+        // The observer kernel is free context (uname), not staged
+        // evidence: finish() must carry it, never an empty string.
+        let context = result.document.context.expect("finish sets context");
+        assert_eq!(context.kernel_release, crate::doctor::uname_release());
+        assert!(!context.kernel_release.is_empty());
+    }
+
     #[test]
     fn cancelled_session_setup_never_resets_callers_signal() {
         let cancel = AtomicBool::new(true);

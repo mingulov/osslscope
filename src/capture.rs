@@ -11298,7 +11298,7 @@ fn run_controlled_owned(
         comm: String::new(),
         cmdline: args::redact_spawn_argv(&argv),
         container_id: String::new(),
-        kernel_release: String::new(),
+        kernel_release: crate::doctor::uname_release(),
         provider_build_id: String::new(),
         provider_path: String::new(),
         image_digest: cfg.image_digest.clone(),
