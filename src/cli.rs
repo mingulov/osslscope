@@ -28,6 +28,27 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "doctor" if argv[1..].iter().any(|arg| arg == "--libcrypto") => {
             crate::doctor::profiled::run(&argv[1..])
         }
+        // Sectioned preflight: any sectioned-only selector or object
+        // override. (--discovery/--libcrypto guards above win; combining
+        // --libcrypto with these is a usage error inside profiled::run.)
+        // Bare --count-object/--observation-object stay on the focused
+        // self-controls below (explicit-companion override path).
+        "doctor"
+            if argv[1..].iter().any(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "--pid"
+                        | "--exe"
+                        | "--object"
+                        | "--members-object"
+                        | "--table"
+                        | "--force-offset"
+                        | "--provider-table"
+                )
+            }) =>
+        {
+            crate::doctor::run(&argv[1..])
+        }
         "doctor" => crate::doctor::focused::run(&argv[1..]),
         "scan" | "inspect" if argv[1..].iter().any(|arg| arg == "--observe-crypto") => {
             crate::crypto_watch::run(&argv)
@@ -61,6 +82,12 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             );
             println!("  --observe-providers  public provider API observation (default 30 seconds)");
             println!("  doctor --discovery  capability checks without a build catalogue");
+            println!(
+                "  doctor --pid PID | --exe PATH  environment + foreign-backing/target preflight"
+            );
+            println!(
+                "  doctor --object O --count-object C --members-object M  admitted preflight with explicit objects"
+            );
             println!("  discovery does not prove provider activation or execution");
             for line in exit_code_help() {
                 println!("{line}");
