@@ -1880,6 +1880,30 @@ mod tests {
         assert_eq!(finalized.unresolved_calls(), 100 + 40 - 37 - 13);
     }
 
+    #[test]
+    fn readmitted_site_keeps_per_generation_partitions() {
+        let (_, closed) = closed_pair();
+        let receipt = closed.receipt();
+        drop(closed);
+        // Same site_id in active (gen 3) and fenced (gen 2) rows: each
+        // partition resolves to its own generation's physical row (G2 M-1).
+        let mut fenced = row();
+        fenced.execution.generation = 2;
+        fenced.execution.calls = 40;
+        let mut old_partition = reduced(3, 13, 20, 80);
+        old_partition.key.count_generation = 2;
+        let finalized = fold_attribution(snapshot(
+            window(receipt.close_before_ns, receipt.close_after_ns),
+            vec![row(), fenced],
+            vec![reduced(1, 37, 20, 80), old_partition],
+            vec![selector()],
+            ClosedAttributionLosses { foreign_calls: 0 },
+        ))
+        .unwrap();
+        assert_eq!(finalized.definite().len(), 2);
+        assert_eq!(finalized.unresolved_calls(), 100 + 40 - 37 - 13);
+    }
+
     /// The kernel-published digest form for a request: the
     /// encoding-2 digest's bytes `[8..32)` plus the 8 zero tail
     /// (the known-producer truncation — see
