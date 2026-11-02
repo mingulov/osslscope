@@ -7,6 +7,7 @@ pub mod cipher_workload;
 pub mod cli;
 pub mod copied_plan;
 pub mod digest_workload;
+pub mod kem_workload;
 pub mod objects;
 pub mod schema;
 pub mod signature_workload;

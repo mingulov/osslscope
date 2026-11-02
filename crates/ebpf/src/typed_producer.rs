@@ -1145,10 +1145,10 @@ fn pack_entry_role(role: u32, operation: u32, function: u32) -> u64 {
     if operation > u16::MAX as u32 || function > u16::MAX as u32 {
         return 0;
     }
-    // valid() restricts role to <= 346, operation to <= 12 and function
-    // to <= 32 (signature copied roles 324-346 join cipher 316-323 and
-    // digest 309-315 under the same R5 holdout). The shared contract IS
-    // compiled into BPF (admission_parts /
+    // valid() restricts role to <= 355, operation to <= 14 and function
+    // to <= 32 (KEM copied roles 347-355 join signature 324-346, cipher
+    // 316-323, and digest 309-315 under the same R5 holdout). The shared
+    // contract IS compiled into BPF (admission_parts /
     // paired / operational monomorphize here), so the digest roles change
     // BPF bytes AND verifier complexity (measured +.text at rebuild).
     // Inertness until the R5 revision comes from BPF dispatch

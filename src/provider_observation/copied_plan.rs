@@ -292,6 +292,19 @@ pub(crate) fn copied_role(operation: u32, function: u32) -> Option<u32> {
         (12, 30) => Some(344),
         (12, 31) => Some(345),
         (12, 32) => Some(346),
+        // KEM (op 14): newctx (347) / freectx (348) / dupctx (349) /
+        // encapsulate_init (350) / encapsulate (351) /
+        // decapsulate_init (352) / decapsulate (353) /
+        // auth_encapsulate_init (354) / auth_decapsulate_init (355).
+        (14, 1) => Some(347),
+        (14, 6) => Some(348),
+        (14, 7) => Some(349),
+        (14, 2) => Some(350),
+        (14, 3) => Some(351),
+        (14, 4) => Some(352),
+        (14, 5) => Some(353),
+        (14, 12) => Some(354),
+        (14, 13) => Some(355),
         _ => None,
     }
 }
@@ -491,13 +504,27 @@ mod tests {
             (12, 30, 344),
             (12, 31, 345),
             (12, 32, 346),
+            // KEM (op 14): 1=newctx, 6=freectx, 7=dupctx,
+            // 2/3=encapsulate_init/encapsulate,
+            // 4/5=decapsulate_init/decapsulate,
+            // 12/13=auth_encapsulate_init/auth_decapsulate_init.
+            // Params (8-11) stay unmapped, as with other families.
+            (14, 1, 347),
+            (14, 6, 348),
+            (14, 7, 349),
+            (14, 2, 350),
+            (14, 3, 351),
+            (14, 4, 352),
+            (14, 5, 353),
+            (14, 12, 354),
+            (14, 13, 355),
         ];
         for (op, fun, role) in pairs {
             assert_eq!(copied_role(op, fun), Some(role));
             let (_, admit_op, admit_fun) = TypedAdmission::admission_parts(role).unwrap();
             assert_eq!((admit_op, admit_fun), (op, fun));
         }
-        for op in [1, 2, 3, 4, 12] {
+        for op in [1, 2, 3, 4, 12, 14] {
             for fun in 0..64 {
                 let role = copied_role(op, fun);
                 if pairs.iter().any(|(o, f, _)| (*o, *f) == (op, fun)) {
@@ -510,7 +537,8 @@ mod tests {
         for role in [
             258u32, 259, 274, 275, 290, 291, 304, 305, 306, 307, 308, 309, 310, 311, 312, 313, 314,
             315, 316, 317, 318, 319, 320, 321, 322, 323, 324, 325, 326, 327, 328, 329, 330, 331,
-            332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346,
+            332, 333, 334, 335, 336, 337, 338, 339, 340, 341, 342, 343, 344, 345, 346, 347, 348,
+            349, 350, 351, 352, 353, 354, 355,
         ] {
             let id = TypedRoleId::from_u32(role).unwrap();
             assert_eq!(id.public_export(), None);
