@@ -981,8 +981,9 @@ impl VerifiedProcess {
             return Err(ObservationGap::ProcessChanged);
         }
         // Costly backing re-proof (charged re-reads): memoized to one
-        // rescan tick. Only witness reassociation can lag a tick here;
-        // fences bypass via fresh.
+        // rescan tick. Only failures detected by that proof (including
+        // witness reassociation) can lag a tick here; fences bypass via
+        // fresh.
         if self
             .revalidated_at
             .get()

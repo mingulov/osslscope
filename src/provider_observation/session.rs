@@ -1476,15 +1476,19 @@ impl ProviderSession {
                 // A late-fence budget failure consumes the refreshing
                 // entry above; preserve the fresh incarnation so the next
                 // tick retries through the shared admission instead of
-                // starving on a fresh one. SnapshotLag keeps the unready
-                // target in place for the next pass instead.
-                let preserved = if transient_budget_gap(g) {
-                    self.targets
-                        .get(&pid)
-                        .map(|t| t.process.retained_incarnation())
-                } else {
-                    None
-                };
+                // starving on a fresh one. Narrower than the retire-path
+                // rule: an attach that fails StateLimit refits
+                // deterministically (the release already freed maximally),
+                // so only reads/deadline pressure retries. SnapshotLag
+                // keeps the unready target in place for the next pass.
+                let preserved =
+                    if matches!(g, ObservationGap::ReadLimit | ObservationGap::SnapshotLag) {
+                        self.targets
+                            .get(&pid)
+                            .map(|t| t.process.retained_incarnation())
+                    } else {
+                        None
+                    };
                 self.retire_for_gap(pid, Some(record), g, b);
                 if let Some(retained) = preserved {
                     self.refreshing.insert(pid, retained);
@@ -2151,7 +2155,20 @@ impl ProviderSession {
                 );
                 if let Err(g) = result {
                     b.gap(g);
+                    // The fresh arm proof can exhaust reads; preserve like
+                    // any other live-target budget retire so the re-add
+                    // retries through the shared admission.
+                    let preserved = if transient_budget_gap(g) {
+                        self.targets
+                            .get(&pid)
+                            .map(|t| t.process.retained_incarnation())
+                    } else {
+                        None
+                    };
                     self.retire_for_gap(pid, None, g, b);
+                    if let Some(retained) = preserved {
+                        self.refreshing.insert(pid, retained);
+                    }
                     return;
                 }
                 self.targets.get_mut(&pid).unwrap().attachments.push(a);
@@ -3127,15 +3144,21 @@ fn identity_failure(gap: ObservationGap) -> bool {
             | ObservationGap::BackingUnavailable
     )
 }
-/// Budget gaps whose conditions can genuinely clear between ticks, so a
-/// preserved incarnation may retry next tick: reads refill through the
-/// retire-time release and are consumed gradually, and deadlines refresh
-/// every tick. Everything else stays terminal for the incarnation:
+/// Budget gaps that can genuinely clear between ticks when retiring a
+/// live target, so a preserved incarnation may retry next tick: reads
+/// refill through the retire-time release and are consumed gradually,
+/// deadlines refresh every tick, and fact/scratch pressure releases
+/// with the target (a StateLimit re-add refits the same attach that fit
+/// before). Everything else stays terminal for the incarnation:
 /// identity changes no longer describe the pid, and deterministic faults
-/// (symbols, attach, membership, already-refused spend) would burn a full
-/// re-acquisition every tick without ever clearing.
+/// (symbols, attach, membership) would burn a full re-acquisition every
+/// tick without ever clearing. Add-target failures use a narrower rule
+/// (see below): an attach that never fit refits deterministically.
 fn transient_budget_gap(gap: ObservationGap) -> bool {
-    matches!(gap, ObservationGap::ReadLimit | ObservationGap::SnapshotLag)
+    matches!(
+        gap,
+        ObservationGap::ReadLimit | ObservationGap::SnapshotLag | ObservationGap::StateLimit
+    )
 }
 fn arm_attachment(
     config: &mut BpfMap<MapData, u64, c::Config>,
