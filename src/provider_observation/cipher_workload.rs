@@ -41,6 +41,11 @@ pub const CIPHER_DEC_ARGV: &[&str] = &[
     "-in",
 ];
 
+/// Pinned SHA-256 of [`cipher_workload_input`]: a same-length generator
+/// change fails the oracle even on the absent-binary path.
+pub const CIPHER_INPUT_SHA256_HEX: &str =
+    "e051c20c2cb90863f3f6b70a9aefe0169f1abeff45fc83f259aab5c15b49c823";
+
 /// Deterministic 256-byte input (pattern, not random: stable across runs).
 pub fn cipher_workload_input() -> Vec<u8> {
     (0..256u32)

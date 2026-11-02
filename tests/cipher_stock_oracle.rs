@@ -12,9 +12,10 @@
 //! present-but-broken binary FAILS (never silent).
 
 use osslscope::provider_observation::cipher_workload::{
-    CIPHER_DEC_ARGV, CIPHER_ENC_ARGV, CIPHER_IV_HEX, CIPHER_KEY_HEX, CIPHER_VEHICLE_BIN,
-    EXPECTED_CIPHERTEXT_HEX, cipher_workload_input,
+    CIPHER_DEC_ARGV, CIPHER_ENC_ARGV, CIPHER_INPUT_SHA256_HEX, CIPHER_IV_HEX, CIPHER_KEY_HEX,
+    CIPHER_VEHICLE_BIN, EXPECTED_CIPHERTEXT_HEX, cipher_workload_input,
 };
+use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -42,6 +43,14 @@ fn probe_vehicle(path: &str) -> VehicleProbe {
 /// Pure freeze checks run BEFORE any prerequisite: a missing binary
 /// must not bypass the argv/input pins.
 fn frozen_shape() {
+    // Literal key/IV (not the consts): changing either constant must
+    // fail here even on the absent-binary path, which skips the
+    // ciphertext comparison below.
+    assert_eq!(
+        CIPHER_KEY_HEX,
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+    );
+    assert_eq!(CIPHER_IV_HEX, "000102030405060708090a0b0c0d0e0f");
     assert_eq!(
         CIPHER_ENC_ARGV,
         &[
@@ -67,7 +76,14 @@ fn frozen_shape() {
             "-in",
         ]
     );
-    assert_eq!(cipher_workload_input().len(), 256);
+    // Pinned input hash (not just length): a same-length generator
+    // change must fail here. sha2 is a change detector here, not an
+    // independence claim (the ciphertext oracle is the pinned vector).
+    let input = cipher_workload_input();
+    assert_eq!(input.len(), 256);
+    let digest: [u8; 32] = Sha256::digest(&input).into();
+    let input_hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(input_hex, CIPHER_INPUT_SHA256_HEX);
 }
 
 fn stage() -> Option<PathBuf> {
