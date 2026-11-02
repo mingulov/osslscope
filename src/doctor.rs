@@ -1908,28 +1908,86 @@ fn check_foreign_uid(pid: u32, tuid: u32, env: &Env) -> Check {
 /// `check_pidns`): no pids in messages.
 /// Pass = directory readable; Degraded = denied or target gone (never
 /// Fail: absence of evidence is inconclusive, not a refusal).
+/// Finite map_files access outcome: shared by the target, self, and
+/// owned-child probes so every refusal class renders identically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapFilesAccess {
+    Readable,
+    Gone,
+    Denied,
+    Unreadable(std::io::ErrorKind),
+}
+
+fn probe_map_files(path: &Path) -> MapFilesAccess {
+    match std::fs::read_dir(path) {
+        Ok(_) => MapFilesAccess::Readable,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => MapFilesAccess::Gone,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => MapFilesAccess::Denied,
+        Err(e) => MapFilesAccess::Unreadable(e.kind()),
+    }
+}
+
 fn check_map_files(pid: u32) -> Check {
-    match std::fs::read_dir(format!("/proc/{pid}/map_files")) {
-        Ok(_) => Check::pass(
+    match probe_map_files(Path::new(&format!("/proc/{pid}/map_files"))) {
+        MapFilesAccess::Readable => Check::pass(
             "map-files",
             "target map_files directory readable (range-entry access unverified)".into(),
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Check::degraded(
+        MapFilesAccess::Gone => Check::degraded(
             "map-files",
             "target map_files gone (target exited or pid invalid)".into(),
             "re-run against a live target pid".into(),
         ),
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Check::degraded(
+        MapFilesAccess::Denied => Check::degraded(
             "map-files",
             "target map_files denied (need same uid or ptrace scope to bind backing)".into(),
             "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
         ),
-        Err(e) => Check::degraded(
+        MapFilesAccess::Unreadable(kind) => Check::degraded(
             "map-files",
-            format!("target map_files unreadable ({})", e.kind()),
+            format!("target map_files unreadable ({kind})"),
             "re-run; persistent failure is a doctor bug — file it".into(),
         ),
     }
+}
+
+/// Own map_files readability: the no-target control proving the open
+/// mechanism itself works when a stated target refuses.
+fn check_self_map_files() -> Check {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::SelfMapFiles) {
+        return Check::pass("self-map-files", "test-only functional probe result".into());
+    }
+    match probe_map_files(Path::new("/proc/self/map_files")) {
+        MapFilesAccess::Readable => Check::pass(
+            "self-map-files",
+            "own map_files readable (open mechanism works)".into(),
+        ),
+        MapFilesAccess::Gone => Check::degraded(
+            "self-map-files",
+            "own map_files gone (non-Linux /proc or kernel too old)".into(),
+            "check /proc is mounted and re-run".into(),
+        ),
+        MapFilesAccess::Denied => Check::degraded(
+            "self-map-files",
+            "own map_files denied (confinement denies even self opens)".into(),
+            "run with an unconfined profile and re-run".into(),
+        ),
+        MapFilesAccess::Unreadable(kind) => Check::degraded(
+            "self-map-files",
+            format!("own map_files unreadable ({kind})"),
+            "re-run; persistent failure is a doctor bug — file it".into(),
+        ),
+    }
+}
+
+/// Pagemap probe subject: a stated foreign target, or ourselves (the
+/// no-target control — our own probe page is present by construction,
+/// so a zeroed frame positively diagnoses PFN masking).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PagemapSubject {
+    Target,
+    Slf,
 }
 
 /// Functional `pagemap` probe: the indirect backing path compares page
@@ -1939,30 +1997,68 @@ fn check_map_files(pid: u32) -> Check {
 /// unprivileged kernels zero PFNs — indirect backing unverifiable);
 /// Degraded = the target is gone or pagemap is unreadable.
 fn check_pagemap(pid: u32) -> Check {
+    check_pagemap_for(pid, PagemapSubject::Target)
+}
+
+/// Own pagemap frames: the no-target control proving whether PFN
+/// comparison is available at all when no target is stated.
+fn check_self_pagemap() -> Check {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::SelfPagemap) {
+        return Check::pass("self-pagemap", "test-only functional probe result".into());
+    }
+    check_pagemap_for(std::process::id(), PagemapSubject::Slf)
+}
+
+fn check_pagemap_for(pid: u32, subject: PagemapSubject) -> Check {
     use std::os::unix::fs::FileExt;
+    let id = match subject {
+        PagemapSubject::Target => "pagemap",
+        PagemapSubject::Slf => "self-pagemap",
+    };
     let path = format!("/proc/{pid}/pagemap");
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Check::degraded(
-                "pagemap",
-                "target pagemap gone (target exited or pid invalid)".into(),
-                "re-run against a live target pid".into(),
-            );
+            return match subject {
+                PagemapSubject::Target => Check::degraded(
+                    id,
+                    "target pagemap gone (target exited or pid invalid)".into(),
+                    "re-run against a live target pid".into(),
+                ),
+                PagemapSubject::Slf => Check::degraded(
+                    id,
+                    "own pagemap gone (non-Linux /proc or kernel too old)".into(),
+                    "check /proc is mounted and re-run".into(),
+                ),
+            };
         }
-        Err(_) => {
-            return Check::degraded(
-                "pagemap",
-                "target pagemap denied (need same uid or elevated caps to compare frames)".into(),
-                "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
-            );
+        Err(e) => {
+            return match subject {
+                PagemapSubject::Target => Check::degraded(
+                    id,
+                    "target pagemap denied (need same uid or elevated caps to compare frames)"
+                        .into(),
+                    "run as the target uid, or grant cap_sys_ptrace file cap and re-run".into(),
+                ),
+                PagemapSubject::Slf => Check::degraded(
+                    id,
+                    format!("own pagemap unreadable ({})", e.kind()),
+                    "re-run; persistent failure is a doctor bug — file it".into(),
+                ),
+            };
         }
     };
     // Probe address: a mapped page of our own image. For a foreign pid
     // this address may be unmapped there — a non-present entry then
     // proves only the access path, never PFN masking. The masking
     // diagnosis is reserved for a present page with a withheld PFN.
-    let probe_addr = check_pagemap as usize;
+    // For ourselves the probe page is present by construction (it is
+    // the executing code).
+    let probe_addr = match subject {
+        PagemapSubject::Target => check_pagemap as usize,
+        PagemapSubject::Slf => check_self_pagemap as usize,
+    };
     let page = 4096u64;
     let mut entry = [0u8; 8];
     match file.read_exact_at(&mut entry, (probe_addr as u64 / page) * 8) {
@@ -1971,27 +2067,132 @@ fn check_pagemap(pid: u32) -> Check {
             let present = u64::from_le_bytes(entry) & (1u64 << 63) != 0;
             if present && frame != 0 {
                 Check::pass(
-                    "pagemap",
-                    "target pagemap yields page frames (indirect backing comparable)".into(),
+                    id,
+                    match subject {
+                        PagemapSubject::Target => {
+                            "target pagemap yields page frames (indirect backing comparable)"
+                        }
+                        PagemapSubject::Slf => {
+                            "own pagemap yields page frames (PFN comparison available)"
+                        }
+                    }
+                    .into(),
                 )
             } else if !present {
                 Check::info(
-                    "pagemap",
-                    "probe page not present in target address space (foreign mapping unknown — frame comparison inconclusive)"
-                        .into(),
+                    id,
+                    match subject {
+                        PagemapSubject::Target => "probe page not present in target address space (foreign mapping unknown — frame comparison inconclusive)",
+                        // Defensive only: our own executing page cannot
+                        // be non-present; kept honest (no panic) in case
+                        // a future kernel reports otherwise.
+                        PagemapSubject::Slf => "own probe page not present (unexpected — frame comparison inconclusive)",
+                    }
+                    .into(),
                 )
             } else {
                 Check::info(
-                    "pagemap",
-                    "target pagemap readable but frames zeroed (unprivileged PFN masking — indirect backing unverifiable)"
-                        .into(),
+                    id,
+                    match subject {
+                        PagemapSubject::Target => "target pagemap readable but frames zeroed (unprivileged PFN masking — indirect backing unverifiable)",
+                        PagemapSubject::Slf => "own pagemap readable but frames zeroed (unprivileged PFN masking — indirect backing unverifiable)",
+                    }
+                    .into(),
                 )
             }
         }
         Err(_) => Check::info(
-            "pagemap",
-            "target pagemap opened but the probe page is unreadable there (foreign address space — frame comparison inconclusive)"
-                .into(),
+            id,
+            match subject {
+                PagemapSubject::Target => "target pagemap opened but the probe page is unreadable there (foreign address space — frame comparison inconclusive)",
+                PagemapSubject::Slf => "own pagemap opened but the probe entry is unreadable (frame comparison inconclusive)",
+            }
+            .into(),
+        ),
+    }
+}
+
+/// Owned-child map_files readability: fork a pausing child (no exec,
+/// so no binary dependency) and open its map_files directory. Pass
+/// proves foreign-shaped opens work for processes we own, so a stated
+/// target's refusal is about THAT target (uid/scope), not the
+/// mechanism. The child dies with us (pdeathsig) and is reaped
+/// confirming (never a silent leak).
+fn check_owned_child_map_files() -> Check {
+    #[cfg(test)]
+    if tests::record_probe(tests::Probe::OwnedChildMapFiles) {
+        return Check::pass(
+            "owned-child-map-files",
+            "test-only functional probe result".into(),
+        );
+    }
+    let ppid = std::process::id();
+    // SAFETY: doctor is single-threaded here; the child only
+    // prctls/pauses/_exits.
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Check::degraded(
+            "owned-child-map-files",
+            "cannot fork the owned-child probe".into(),
+            "check process limits (ulimit -u), then re-run".into(),
+        );
+    }
+    if pid == 0 {
+        unsafe {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            // Parent-died-in-the-window guard: a reparented pauser
+            // would outlive the probe.
+            if libc::getppid() != ppid as libc::pid_t {
+                libc::_exit(0);
+            }
+            libc::pause();
+            libc::_exit(0);
+        }
+    }
+    // No rendezvous needed: the child's inherited mappings carry
+    // map_files entries from birth, and pause() never returns except
+    // by signal.
+    let access = probe_map_files(Path::new(&format!("/proc/{pid}/map_files")));
+    // Reap-confirming teardown (mirrors check_spawn_access): the
+    // pausing child always dies on SIGKILL, so the blocking wait
+    // cannot hang; ECHILD means reaped.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let mut status = 0;
+    let reaped = loop {
+        let r = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        break r == pid || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    };
+    if !reaped {
+        return Check::fail(
+            "owned-child-map-files",
+            "owned-child probe leaked its child (reap unconfirmed)".into(),
+            "re-run; a leftover pausing child blocks the next probe — report this".into(),
+        );
+    }
+    match access {
+        MapFilesAccess::Readable => Check::pass(
+            "owned-child-map-files",
+            "owned child map_files readable (foreign-capable opens work)".into(),
+        ),
+        MapFilesAccess::Gone => Check::degraded(
+            "owned-child-map-files",
+            "owned child gone before the probe read it".into(),
+            "re-run".into(),
+        ),
+        MapFilesAccess::Denied => Check::degraded(
+            "owned-child-map-files",
+            "owned child map_files denied (LSM/ptrace-scope confines even owned children)".into(),
+            "audit ptrace_scope/LSM policy for the observer, then re-run".into(),
+        ),
+        MapFilesAccess::Unreadable(kind) => Check::degraded(
+            "owned-child-map-files",
+            format!("owned child map_files unreadable ({kind})"),
+            "re-run; persistent failure is a doctor bug — file it".into(),
         ),
     }
 }
@@ -2513,6 +2714,12 @@ fn run_admitted_doctor(
         foreign_checks.push(check_foreign_uid(p, tuid, &env));
         foreign_checks.push(check_map_files(p));
         foreign_checks.push(check_pagemap(p));
+        // Target-independent capability controls: prove the probe
+        // machinery works, so a target refusal above reads as about
+        // the target, not the mechanism.
+        foreign_checks.push(check_self_map_files());
+        foreign_checks.push(check_self_pagemap());
+        foreign_checks.push(check_owned_child_map_files());
         match crate::discovery::maps::read_maps(p) {
             Ok(maps) => {
                 target_checks.push(Check::pass("target-access", "target maps readable".into()));
@@ -2763,6 +2970,16 @@ fn run_admitted_doctor(
                 target_checks.push(spawn_coverage_note());
             }
         }
+    } else {
+        // No stated target: capability controls plus an explicit
+        // pointer — never an undifferentiated foreign-ready verdict.
+        foreign_checks.push(check_self_map_files());
+        foreign_checks.push(check_self_pagemap());
+        foreign_checks.push(check_owned_child_map_files());
+        foreign_checks.push(Check::info(
+            "foreign-target",
+            "no foreign target stated (pass --pid to probe backing)".into(),
+        ));
     }
 
     let sections = [
@@ -2843,6 +3060,9 @@ mod tests {
         SpawnAccess,
         PerfmonFork,
         TargetFile(String),
+        SelfMapFiles,
+        SelfPagemap,
+        OwnedChildMapFiles,
     }
 
     thread_local! {
@@ -3488,6 +3708,146 @@ mod tests {
         let dead = check_pagemap(u32::MAX);
         assert_eq!(dead.id, "pagemap");
         assert_eq!(dead.status, Status::Degraded);
+    }
+
+    #[test]
+    fn map_files_access_mapping_is_finite() {
+        // Gone: nothing at the path.
+        assert_eq!(
+            probe_map_files(std::path::Path::new("/proc/0/map_files")),
+            MapFilesAccess::Gone
+        );
+        // Readable: our own directory (any uid, any caps).
+        assert_eq!(
+            probe_map_files(std::path::Path::new("/proc/self/map_files")),
+            MapFilesAccess::Readable
+        );
+    }
+
+    #[test]
+    fn map_files_access_denied_under_confinement() {
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip confinement pin: root reads through mode 000");
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-doctor-deny-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let access = probe_map_files(&dir);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+        assert_eq!(access, MapFilesAccess::Denied);
+    }
+
+    #[test]
+    fn self_map_files_probe_passes_live() {
+        let check = check_self_map_files();
+        assert_eq!(check.id, "self-map-files");
+        assert_eq!(check.status, Status::Pass);
+        assert!(!check.message.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn self_pagemap_probe_reports_frames_or_masking_live() {
+        let check = check_self_pagemap();
+        assert_eq!(check.id, "self-pagemap");
+        // Own page is present by construction: Pass (frames visible)
+        // or Info naming the masking (zeroed frames), never Degraded
+        // for a live self, never the foreign-unmapped wording.
+        assert!(
+            check.status == Status::Pass || check.status == Status::Info,
+            "{}",
+            check.message
+        );
+        if check.status == Status::Info {
+            assert!(check.message.contains("masking"), "{}", check.message);
+        }
+        assert!(
+            !check.message.contains("foreign"),
+            "self probe must not speak of foreign: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn owned_child_map_files_probe_passes_and_reaps_live() {
+        // Real fork (no substitution scope): the probe child must be
+        // gone afterwards — no stray, no zombie. Compared as a
+        // before/after child set (not global ECHILD: other tests may
+        // legitimately own children).
+        fn children() -> std::collections::BTreeSet<u32> {
+            // Per-thread children file (children attach to the
+            // forking thread): this thread's id, not task-list order.
+            // SAFETY: gettid has no preconditions.
+            let tid = unsafe { libc::gettid() };
+            std::fs::read_to_string(format!("/proc/self/task/{tid}/children"))
+                .map(|s| {
+                    s.split_ascii_whitespace()
+                        .filter_map(|w| w.parse().ok())
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+        let before = children();
+        let check = check_owned_child_map_files();
+        assert_eq!(check.id, "owned-child-map-files");
+        assert_eq!(
+            check.status,
+            Status::Pass,
+            "owned child map_files must open (scope<=1): {}",
+            check.message
+        );
+        let after = children();
+        assert!(
+            after.difference(&before).next().is_none(),
+            "probe must not leave children: before={before:?} after={after:?}"
+        );
+    }
+
+    #[test]
+    fn admitted_doctor_emits_capability_probes_without_target() {
+        let scope = ProbeScope::start();
+        let args = ["--format", "json"].map(str::to_string);
+        let _exit = run_with_resolver(&args, |kind, _| {
+            assert_eq!(kind, crate::package::commands::CommandKind::Doctor);
+            Ok(crate::package::commands::test_support::selection(false))
+        });
+        let events = scope.events();
+        for required in [
+            Probe::SelfMapFiles,
+            Probe::SelfPagemap,
+            Probe::OwnedChildMapFiles,
+        ] {
+            assert!(
+                events.contains(&required),
+                "no-target admitted path did not reach {required:?}: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn admitted_doctor_emits_capability_probes_with_pid() {
+        let scope = ProbeScope::start();
+        let pid = std::process::id().to_string();
+        let args = ["--pid", &pid, "--format", "json"].map(str::to_string);
+        let _exit = run_with_resolver(&args, |kind, _| {
+            assert_eq!(kind, crate::package::commands::CommandKind::Doctor);
+            Ok(crate::package::commands::test_support::selection(false))
+        });
+        let events = scope.events();
+        for required in [
+            Probe::SelfMapFiles,
+            Probe::SelfPagemap,
+            Probe::OwnedChildMapFiles,
+        ] {
+            assert!(
+                events.contains(&required),
+                "--pid admitted path did not reach {required:?}: {events:?}"
+            );
+        }
     }
 
     #[test]

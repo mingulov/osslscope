@@ -91,6 +91,24 @@ fn doctor_object_flags_reach_sectioned_json() {
         checks.iter().any(|c| c["section"] == "self_attach"),
         "self_attach rows, got: {stdout}"
     );
+    // No-target foreign section: capability controls plus an explicit
+    // pointer — never an undifferentiated foreign-ready verdict.
+    let foreign: Vec<&str> = checks
+        .iter()
+        .filter(|c| c["section"] == "foreign_backing")
+        .filter_map(|c| c["id"].as_str())
+        .collect();
+    for required in [
+        "self-map-files",
+        "self-pagemap",
+        "owned-child-map-files",
+        "foreign-target",
+    ] {
+        assert!(
+            foreign.contains(&required),
+            "missing {required} in {foreign:?}"
+        );
+    }
 }
 
 #[test]
