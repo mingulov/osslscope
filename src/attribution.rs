@@ -721,14 +721,22 @@ fn fold_attribution(
 ) -> Result<FinalizedAttribution, AttributionError> {
     use AttributionError::*;
     use std::collections::{BTreeMap, BTreeSet};
-    let mut by_site: BTreeMap<u64, usize> = BTreeMap::new();
+    // Physical rows join partitions by (site, generation): a retired
+    // generation's fenced row keeps its own identity next to a readmitted
+    // active row. Same site + same generation twice is a duplicate.
+    let mut by_site: BTreeMap<(u64, u32), usize> = BTreeMap::new();
+    let mut site_present: BTreeSet<u64> = BTreeSet::new();
     let mut by_row: BTreeMap<(&SiteKey, u32), usize> = BTreeMap::new();
     let mut totals: Vec<u64> = Vec::with_capacity(snapshot.physical.len());
     let mut known = 0u64;
     for (index, row) in snapshot.physical.iter().enumerate() {
-        if by_site.insert(row.site_id.get(), index).is_some() {
+        if by_site
+            .insert((row.site_id.get(), row.execution.generation), index)
+            .is_some()
+        {
             return Err(Identity);
         }
+        site_present.insert(row.site_id.get());
         if by_row
             .insert((&row.execution.site, row.execution.generation), index)
             .is_some()
@@ -765,14 +773,20 @@ fn fold_attribution(
         if !seen_segments.insert(key.segment_id) {
             return Err(DuplicatePartition);
         }
-        let index = *by_site.get(&key.site_id).ok_or(UnknownSite)?;
-        let row = &snapshot.physical[index];
         // Host-verifiable half of same-handler coupling: the partition
-        // was recorded in exactly this physical row's count generation,
-        // from the same retained source custody.
-        if key.count_generation != row.execution.generation {
-            return Err(Generation);
-        }
+        // resolves to the physical row of exactly its count generation.
+        // A known site with no row of that generation is a generation
+        // mismatch, not an unknown site.
+        let index = *by_site
+            .get(&(key.site_id, key.count_generation))
+            .ok_or_else(|| {
+                if site_present.contains(&key.site_id) {
+                    Generation
+                } else {
+                    UnknownSite
+                }
+            })?;
+        let row = &snapshot.physical[index];
         if key.source_epoch != row.source_epoch.get() {
             return Err(Identity);
         }
@@ -1077,6 +1091,11 @@ pub(crate) fn collect_closed_attribution(
     let partitions = reduce_partition_shards(&shards)?;
     // Physical: join sample executions to admitted sites by full physical
     // identity; the bind-verified site ID and source epoch attach here.
+    // Retired generations ride along: fenced rows join exactly like active
+    // rows so an earlier valid hit keeps its partition once and stays
+    // inside the conserved remainder. Executions for non-admitted sites
+    // stay out of attribution in both lists; their physical evidence is
+    // retained in the caller's sample, never fabricated here.
     let mut by_site = std::collections::BTreeMap::new();
     for site in admitted {
         let key = SiteKey {
@@ -1090,7 +1109,7 @@ pub(crate) fn collect_closed_attribution(
         }
     }
     let mut physical = Vec::new();
-    for execution in &sample.sites {
+    for execution in sample.sites.iter().chain(&sample.fenced) {
         let Some(site) = by_site.get(&execution.site) else {
             continue;
         };
@@ -2269,5 +2288,268 @@ mod tests {
             Err(AttributionError::Identity)
         );
         assert_eq!(doc, before);
+    }
+
+    // G2 production-seam controls: real kernel BPF maps (privileged) through
+    // the actual `collect_closed_attribution` finalizer. Map shapes mirror the
+    // `final_map` calls exactly: control ARRAY key4/val64, bind HASH key24/val56,
+    // loss PERCPU_ARRAY key4/val8, selector HASH key16/val64, partition
+    // PERCPU_HASH key104/val24. Kernel type ids: HASH=1, ARRAY=2,
+    // PERCPU_HASH=5, PERCPU_ARRAY=6.
+    struct SeamMaps {
+        control: std::os::fd::OwnedFd,
+        bind: std::os::fd::OwnedFd,
+        loss: std::os::fd::OwnedFd,
+        selector: std::os::fd::OwnedFd,
+        partition: std::os::fd::OwnedFd,
+        cpus: usize,
+    }
+
+    impl SeamMaps {
+        fn create() -> std::io::Result<Self> {
+            let cpus = aya::util::nr_cpus().map_err(|(_, error)| error)?;
+            let mk = |t: u32, k: u32, v: u32, e: u32, n: &str| {
+                // SAFETY: plain map creation; the OwnedFd closes on drop.
+                ossl_bpf_sys::map_create(t, k, v, e, None, n)
+            };
+            Ok(Self {
+                control: mk(2, 4, 64, 1, "g2seamctl")?,
+                bind: mk(1, 24, 56, 16, "g2seambind")?,
+                loss: mk(6, 4, 8, 8, "g2seamloss")?,
+                selector: mk(1, 16, 64, 16, "g2seamsel")?,
+                partition: mk(5, 104, 24, 16, "g2seampart")?,
+                cpus,
+            })
+        }
+
+        fn update(&self, fd: &std::os::fd::OwnedFd, key: &[u8], value: &[u8]) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: key/value lengths match the created map shapes.
+            unsafe { ossl_bpf_sys::map_update_elem(fd.as_raw_fd(), key, value, 0) }.unwrap();
+        }
+
+        fn put_u64(buf: &mut [u8], offset: usize, value: u64) {
+            buf[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+        }
+
+        /// Populate one coherent admitted site (cookie 61, site 21, epoch 41,
+        /// object 51) with one partition shard (segment 22, 37 calls, [20,80]).
+        fn populate(&self) {
+            let mut control = [0u8; 64];
+            Self::put_u64(&mut control, 0, wire::PRODUCER_ADMITTED);
+            Self::put_u64(&mut control, 8, 11);
+            Self::put_u64(&mut control, 16, 13);
+            Self::put_u64(&mut control, 24, 12);
+            self.update(&self.control, &0u32.to_ne_bytes(), &control);
+            let mut bind_key = [0u8; 24];
+            Self::put_u64(&mut bind_key, 0, 61);
+            let mut bind_val = [0u8; 56];
+            Self::put_u64(&mut bind_val, 0, 21);
+            Self::put_u64(&mut bind_val, 8, 41);
+            Self::put_u64(&mut bind_val, 16, 51);
+            bind_val[24..56].copy_from_slice(&[9u8; 32]);
+            self.update(&self.bind, &bind_key, &bind_val);
+            let zero_cell = vec![0u8; 8usize.next_multiple_of(8) * self.cpus];
+            for cell in 0..8u32 {
+                self.update(&self.loss, &cell.to_ne_bytes(), &zero_cell);
+            }
+            let mut sel_key = [0u8; 16];
+            Self::put_u64(&mut sel_key, 0, 11);
+            Self::put_u64(&mut sel_key, 8, 31);
+            let mut sel_val = [0u8; 64];
+            Self::put_u64(&mut sel_val, 0, 51);
+            sel_val[8..12].copy_from_slice(&3u32.to_ne_bytes());
+            sel_val[12..16].copy_from_slice(&wire::SELECTOR_ENCODING.to_ne_bytes());
+            sel_val[16..48].copy_from_slice(&[7u8; 32]);
+            Self::put_u64(&mut sel_val, 48, 32);
+            self.update(&self.selector, &sel_key, &sel_val);
+            let part_key = raw_key(|_| {});
+            let mut part_val = vec![0u8; 24usize.next_multiple_of(8) * self.cpus];
+            part_val[0..8].copy_from_slice(&37u64.to_ne_bytes());
+            part_val[8..16].copy_from_slice(&20u64.to_ne_bytes());
+            part_val[16..24].copy_from_slice(&80u64.to_ne_bytes());
+            self.update(&self.partition, &part_key, &part_val);
+        }
+
+        fn borrowed(&self) -> ClosedAttributionMaps<'_> {
+            use std::os::fd::AsFd;
+            ClosedAttributionMaps {
+                partition: self.partition.as_fd(),
+                selector: self.selector.as_fd(),
+                loss: self.loss.as_fd(),
+                bind: self.bind.as_fd(),
+                control: self.control.as_fd(),
+            }
+        }
+    }
+
+    fn seam_admitted() -> Vec<AdmittedTypedSite> {
+        vec![AdmittedTypedSite {
+            cookie: 61,
+            site_id: nz(21),
+            role_id: 0,
+            object: object(),
+            device: 7,
+            inode: 9,
+            offset: 16,
+            object_id: 51,
+            source_epoch: 41,
+        }]
+    }
+
+    fn seam_windows() -> (CountAdmissionWindow, CaptureWindow) {
+        (
+            CountAdmissionWindow {
+                start_ns: 10,
+                deadline_ns: 200,
+            },
+            CaptureWindow {
+                requested_start_ns: 10,
+                requested_end_ns: 200,
+                effective_start_ns: 10,
+                effective_end_ns: 200,
+                signal_cut: false,
+                count_admission: None,
+            },
+        )
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF map creation (G2 seam)"]
+    fn seam_positive_control_collects_one_definite_partition() {
+        let maps = SeamMaps::create().unwrap();
+        maps.populate();
+        let (gate, closed_gate) = closed_pair();
+        let (admission, report) = seam_windows();
+        let sample = crate::focused_count::CountSample {
+            sites: vec![execution(100, 10, 100)],
+            ..Default::default()
+        };
+        let out = collect_closed_attribution(
+            closed_gate,
+            &gate,
+            &maps.borrowed(),
+            maps.cpus,
+            &sample,
+            &seam_admitted(),
+            admission,
+            report,
+        )
+        .unwrap();
+        assert_eq!(out.definite().len(), 1);
+        assert_eq!(out.definite()[0].calls, 37);
+        assert_eq!(out.unresolved_calls(), 63);
+        assert_eq!(out.coordinate(), (11, 12, 13));
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF map creation (G2 seam)"]
+    fn seam_failed_strict_read_yields_no_attribution() {
+        let maps = SeamMaps::create().unwrap();
+        maps.populate();
+        // Poison the control plane after a valid cached positive exists.
+        let mut control = [0u8; 64];
+        SeamMaps::put_u64(&mut control, 0, 0);
+        maps.update(&maps.control, &0u32.to_ne_bytes(), &control);
+        let (gate, closed_gate) = closed_pair();
+        let (admission, report) = seam_windows();
+        let sample = crate::focused_count::CountSample {
+            sites: vec![execution(100, 10, 100)],
+            ..Default::default()
+        };
+        let err = collect_closed_attribution(
+            closed_gate,
+            &gate,
+            &maps.borrowed(),
+            maps.cpus,
+            &sample,
+            &seam_admitted(),
+            admission,
+            report,
+        )
+        .unwrap_err();
+        assert_eq!(err, AttributionError::Cut);
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF map creation (G2 seam)"]
+    fn seam_fenced_row_yields_earlier_partition_once() {
+        let maps = SeamMaps::create().unwrap();
+        maps.populate();
+        let (gate, closed_gate) = closed_pair();
+        let (admission, report) = seam_windows();
+        // Earlier valid hit retired to fenced; no current row.
+        let sample = crate::focused_count::CountSample {
+            fenced: vec![execution(100, 10, 100)],
+            ..Default::default()
+        };
+        let out = collect_closed_attribution(
+            closed_gate,
+            &gate,
+            &maps.borrowed(),
+            maps.cpus,
+            &sample,
+            &seam_admitted(),
+            admission,
+            report,
+        )
+        .unwrap();
+        assert_eq!(out.definite().len(), 1);
+        assert_eq!(out.definite()[0].calls, 37);
+        assert_eq!(out.unresolved_calls(), 63);
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF map creation (G2 seam)"]
+    fn seam_active_fenced_duplicate_generation_is_identity_error() {
+        let maps = SeamMaps::create().unwrap();
+        maps.populate();
+        let (gate, closed_gate) = closed_pair();
+        let (admission, report) = seam_windows();
+        // Same site + generation in both active and fenced rows.
+        let sample = crate::focused_count::CountSample {
+            sites: vec![execution(100, 10, 100)],
+            fenced: vec![execution(50, 10, 100)],
+            ..Default::default()
+        };
+        let err = collect_closed_attribution(
+            closed_gate,
+            &gate,
+            &maps.borrowed(),
+            maps.cpus,
+            &sample,
+            &seam_admitted(),
+            admission,
+            report,
+        )
+        .unwrap_err();
+        assert_eq!(err, AttributionError::Identity);
+    }
+
+    #[test]
+    #[ignore = "requires privileged BPF map creation (G2 seam)"]
+    fn seam_count_generation_mismatch_is_generation_error() {
+        let maps = SeamMaps::create().unwrap();
+        maps.populate();
+        let (gate, closed_gate) = closed_pair();
+        let (admission, report) = seam_windows();
+        let mut execution = execution(100, 10, 100);
+        execution.generation = 5;
+        let sample = crate::focused_count::CountSample {
+            sites: vec![execution],
+            ..Default::default()
+        };
+        let err = collect_closed_attribution(
+            closed_gate,
+            &gate,
+            &maps.borrowed(),
+            maps.cpus,
+            &sample,
+            &seam_admitted(),
+            admission,
+            report,
+        )
+        .unwrap_err();
+        assert_eq!(err, AttributionError::Generation);
     }
 }
