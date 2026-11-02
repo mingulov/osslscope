@@ -60,6 +60,27 @@ impl AcquisitionCause {
         default.diagnostic(literal)
     }
 
+    /// Finite (class, kind-token) for one raw open errno. The kernel
+    /// number maps through the I/O kind table, so no errno free text
+    /// enters the diagnostic; a missing number is a plain attach miss.
+    pub fn errno_token(raw: Option<i32>) -> (AcquisitionCause, &'static str) {
+        match raw {
+            Some(errno) => {
+                let kind = std::io::Error::from_raw_os_error(errno).kind();
+                AcquisitionCause::classify_io_kind(kind)
+            }
+            None => (AcquisitionCause::Attach, "io-failed"),
+        }
+    }
+
+    /// One focused-link failure top: static program name, file offset
+    /// (a static locator, never a slid address), and the Debug kind
+    /// token. The caller prefixes the attach class; the shape must
+    /// keep passing [`attach_template_shape`].
+    pub fn link_top(prog: &str, offset: u64, kind: std::io::ErrorKind) -> String {
+        format!("link {prog}@0x{offset:x} failed (kind={kind:?})")
+    }
+
     /// Finite (class, kind-token) for one I/O error kind. The token keeps
     /// the errno class without errno free text.
     pub fn classify_io_kind(kind: std::io::ErrorKind) -> (AcquisitionCause, &'static str) {
@@ -398,5 +419,42 @@ mod tests {
             AcquisitionCause::classify_io_kind(ResourceBusy),
             (AcquisitionCause::Attach, "busy")
         );
+    }
+
+    #[test]
+    fn raw_errno_maps_to_finite_refusal_token() {
+        assert_eq!(
+            AcquisitionCause::errno_token(Some(libc::EPERM)),
+            (AcquisitionCause::BackingDenied, "permission-denied")
+        );
+        assert_eq!(
+            AcquisitionCause::errno_token(Some(libc::EACCES)),
+            (AcquisitionCause::BackingDenied, "permission-denied")
+        );
+        assert_eq!(
+            AcquisitionCause::errno_token(Some(libc::ENOENT)),
+            (AcquisitionCause::BackingChanged, "not-found")
+        );
+        assert_eq!(
+            AcquisitionCause::errno_token(None),
+            (AcquisitionCause::Attach, "io-failed")
+        );
+    }
+
+    #[test]
+    fn focused_link_tops_match_attach_template() {
+        use crate::acquire_cause::attach_template_shape;
+        for (offset, kind) in [
+            (0x0u64, std::io::ErrorKind::PermissionDenied),
+            (0x1a2bu64, std::io::ErrorKind::NotFound),
+            (u64::MAX, std::io::ErrorKind::InvalidInput),
+        ] {
+            let top = AcquisitionCause::link_top("count_entry", offset, kind);
+            assert!(
+                attach_template_shape(&top),
+                "focused link top must stay template-shaped: {top}"
+            );
+            assert!(!top.contains('/'), "no pathnames: {top}");
+        }
     }
 }

@@ -1466,6 +1466,7 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
         "attach:stage-2 pin open failed (kind=PermissionDenied; cookie retries next poll)",
         "attach:stage-2 pin misses the resolve-time identity (cookie retries next poll)",
         "attach:link query_entry@0x1234 failed (kind=PermissionDenied)",
+        "attach:link count_entry@0x1a2b failed (kind=PermissionDenied)",
         "attach:pin dup query_entry+query_return failed (kind=NotFound)",
         "backing-changed:tripwire anchors re-established after replacement (identical mapping)",
         "backing-changed:dispatch anchors re-established after replacement; continuity unproven",

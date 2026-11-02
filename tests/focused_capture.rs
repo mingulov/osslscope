@@ -99,6 +99,7 @@ fn project_leaves_attribution_projection_to_finish() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     check_open(&doc);
     assert_eq!(doc.schema, CAPTURE_SCHEMA_V2);
@@ -117,6 +118,7 @@ fn advertisements_without_calls_never_become_execution_assets() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     check_open(&doc);
     assert_eq!(doc.total_calls(), 0);
@@ -136,6 +138,7 @@ fn known_algorithm_with_unknown_candidates_has_no_definite_calls() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     check_open(&doc);
     assert_eq!(doc.legacy_partition.shared_ambiguous, 7);
@@ -151,6 +154,7 @@ fn shared_candidates_conserve_one_physical_count() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     check_open(&doc);
     assert_eq!(doc.total_calls(), 11);
@@ -168,6 +172,7 @@ fn empty_and_zero_hit_documents_remain_useful_partial() {
                 ..Default::default()
             },
             &[ObservationGap::BpfUnavailable],
+            &std::collections::BTreeSet::new(),
         );
         check_open(&doc);
         assert!(doc.has_usable_evidence());
@@ -205,7 +210,13 @@ fn unscoped_loss_and_identity_churn_require_later_advertisements() {
             ..Default::default()
         };
         assert!(batch_requires_retirement(&batch, 42), "{gap:?}");
-        let doc = project(42, window(), CountSample::default(), &[gap]);
+        let doc = project(
+            42,
+            window(),
+            CountSample::default(),
+            &[gap],
+            &std::collections::BTreeSet::new(),
+        );
         check_open(&doc);
         assert!(doc.engine_observations.is_empty());
     }
@@ -280,6 +291,7 @@ fn partition_serialization_conserves_current_and_fenced_physical_rows_only() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     check_open(&doc);
     let json: serde_json::Value =
@@ -337,6 +349,7 @@ fn only_zero_call_zero_timestamp_sentinel_bypasses_activity_bounds() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     let value: serde_json::Value =
         serde_json::from_slice(&report::render_json(&doc).unwrap()).unwrap();
@@ -367,6 +380,7 @@ fn projection_never_promotes_upstream_candidate_coverage() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     check_open(&doc);
     assert_eq!(doc.sites[0].candidates_coverage, CandidateCoverage::Unknown);
@@ -384,6 +398,7 @@ fn zero_hit_row_does_not_skip_a_later_invalid_execution_row() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     let mut value: serde_json::Value =
         serde_json::from_slice(&report::render_json(&doc).unwrap()).unwrap();
@@ -453,6 +468,7 @@ fn association_handoff_keeps_fenced_identity_without_another_count() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     assert_eq!(doc.total_calls(), 37);
     assert_eq!(doc.candidate_associations, vec![association]);
@@ -505,6 +521,7 @@ fn advertisement_invalidation_alone_preserves_physical_lifetime_but_identity_los
                 ..Default::default()
             },
             &[advertisement],
+            &std::collections::BTreeSet::new(),
         );
         assert_eq!(doc.total_calls(), 37);
         check_open(&doc);
@@ -572,6 +589,7 @@ fn bounded_projection_retains_used_site_metadata_under_pressure() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     assert_eq!(doc.total_calls(), 37);
     assert!(
@@ -630,6 +648,7 @@ fn bounded_projection_counts_omitted_rows_exactly() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     assert_eq!(doc.total_calls(), 0);
     assert_eq!(doc.site_provenance.len(), 2);
@@ -675,6 +694,7 @@ fn bounded_projection_keeps_stable_input_order_when_everything_fits() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     assert_eq!(doc.total_calls(), 9);
     let offsets: Vec<u64> = doc
@@ -712,6 +732,7 @@ fn candidate_output_budget_refuses_metadata_without_losing_physical_counts() {
             ..Default::default()
         },
         &[],
+        &std::collections::BTreeSet::new(),
     );
     assert_eq!(doc.total_calls(), 37);
     assert!(doc.site_provenance.is_empty());
@@ -721,4 +742,52 @@ fn candidate_output_budget_refuses_metadata_without_losing_physical_counts() {
             .any(|c| c.name == "focused.metadata_output_limit" && c.value == 1)
     );
     check_open(&doc);
+}
+
+#[test]
+fn project_carries_attach_diagnostics_sorted_capped() {
+    let diags: std::collections::BTreeSet<String> = [
+        "backing-denied:permission-denied",
+        "attach:link count_entry@0x1a2b failed (kind=PermissionDenied)",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            sites: vec![site(37, &["SHA2-256"])],
+            ..Default::default()
+        },
+        &[],
+        &diags,
+    );
+    check_open(&doc);
+    assert_eq!(
+        doc.attach_diagnostics,
+        vec![
+            "attach:link count_entry@0x1a2b failed (kind=PermissionDenied)".to_string(),
+            "backing-denied:permission-denied".to_string(),
+        ]
+    );
+    // Past the cap, the take keeps the first sorted sixteen.
+    let many: std::collections::BTreeSet<String> = (0u64..20)
+        .map(|i| format!("attach:link count_entry@0x{i:x} failed (kind=NotFound)"))
+        .collect();
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            sites: vec![site(37, &["SHA2-256"])],
+            ..Default::default()
+        },
+        &[],
+        &many,
+    );
+    assert_eq!(doc.attach_diagnostics.len(), 16);
+    assert_eq!(
+        doc.attach_diagnostics[0],
+        "attach:link count_entry@0x0 failed (kind=NotFound)"
+    );
 }

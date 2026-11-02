@@ -359,6 +359,7 @@ impl<W: Write> Stream<'_, W> {
         let ObservationBatch {
             facts,
             mut gaps,
+            refusals: _,
             learned_sites: _,
             static_candidates: _,
             api_activity: _,

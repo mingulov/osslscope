@@ -195,6 +195,7 @@ pub fn project(
     window: CaptureWindow,
     mut sample: CountSample,
     gaps: &[ObservationGap],
+    attach_diagnostics: &BTreeSet<String>,
 ) -> CaptureDocument {
     let mut partition = LegacyCallPartition::default();
     let mut objects = BTreeSet::new();
@@ -305,6 +306,14 @@ pub fn project(
         traversal: None,
     });
     document.candidate_associations = associations;
+    // R06: failed-attach/backing diagnostics ride the document (sorted
+    // set take, capped — deterministic; the counters stay the exact
+    // counts regardless). Same rule as the capture path.
+    document.attach_diagnostics = attach_diagnostics
+        .iter()
+        .take(crate::capture::ATTACH_DIAGNOSTICS_CAP)
+        .cloned()
+        .collect();
     let projection = project_metadata_bounded(&document, METADATA_PROJECTION_BUDGET_BYTES);
     debug_assert_eq!(projection.omitted_sites, selection.omitted_sites);
     debug_assert_eq!(
@@ -673,6 +682,10 @@ pub(crate) struct FocusedSession {
     initial_metadata: Option<inventory::ProcessRecord>,
     pending: Option<ObservationBatch>,
     gaps: BTreeSet<ObservationGap>,
+    /// Shaped attach/backing diagnostics: link failures drained from
+    /// the counter plus batch refusals (R06 rule: sorted + deduped
+    /// here, capped at the document).
+    attach_diagnostics: BTreeSet<String>,
     engine: EnginePlane,
     state_bytes: usize,
     inventory_gaps: u64,
@@ -1129,6 +1142,7 @@ impl FocusedSession {
             initial_metadata: expected.map(|_| initial_record),
             pending: None,
             gaps,
+            attach_diagnostics: BTreeSet::new(),
             engine: EnginePlane::new(),
             state_bytes: 0,
             inventory_gaps: 0,
@@ -1156,6 +1170,10 @@ impl FocusedSession {
         cancel: &AtomicBool,
     ) -> anyhow::Result<()> {
         self.gaps.extend(batch.gaps.iter().copied());
+        // Batch refusals merge alongside the gaps (fresh and re-driven
+        // pending batches share this funnel); the set dedupes replays.
+        self.attach_diagnostics
+            .extend(batch.refusals.iter().cloned());
         if let (Some(session), Some(counter)) = (&self.session, &mut self.counter) {
             match process_batch(
                 session,
@@ -2006,11 +2024,16 @@ impl FocusedSession {
                 1,
             ));
         }
+        if let Some(counter) = self.counter.as_mut() {
+            self.attach_diagnostics
+                .extend(counter.take_attach_diagnostics());
+        }
         let mut document = project(
             self.pid,
             report,
             std::mem::take(&mut self.sample),
             &self.gaps.iter().copied().collect::<Vec<_>>(),
+            &self.attach_diagnostics,
         );
         if !engine_observations.is_empty() {
             // The live ENGINE plane joins here (project/finalize

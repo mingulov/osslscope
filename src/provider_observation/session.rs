@@ -30,6 +30,10 @@ unsafe impl aya::Pod for c::ApiAggregate {}
 pub struct ObservationBatch {
     pub facts: Vec<ObservationFact>,
     pub gaps: Vec<ObservationGap>,
+    /// Shaped backing-refusal strings drained from the acquisition
+    /// budget (R06 vocabulary, caller-rendered). The session merges
+    /// these into its attach diagnostics at projection.
+    pub refusals: Vec<String>,
     pub learned_sites: Vec<VerifiedSiteCandidate>,
     pub static_candidates: Vec<VerifiedStaticCandidate>,
     pub api_activity: Vec<ProcessApiActivity>,
@@ -1258,6 +1262,7 @@ impl ProviderSession {
             }
         }
         b.gap(ObservationGap::IntervalUnknown);
+        b.refusals.extend(self.budget.take_refusals());
         b
     }
     fn add_target(
@@ -11666,7 +11671,13 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
         // Physical sites (counts plus Unknown-coverage hints)
         // still project verbatim.
         sample.associations.clear();
-        let mut doc = crate::focused_capture::project(pid, window, sample, &[]);
+        let mut doc = crate::focused_capture::project(
+            pid,
+            window,
+            sample,
+            &[],
+            &std::collections::BTreeSet::new(),
+        );
         finalized
             .project_into_document(&mut doc)
             .expect("a certified closed result projects");
@@ -13099,6 +13110,202 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             );
         }
     }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn reconcile_records_shapes_foreign_backing_refusal() {
+        // Root-only choreography: B (a libcrypto-preloaded sleeper in a
+        // child user namespace, running as the invoking user) keeps
+        // world-readable maps but refuses map_files opens cross-userns;
+        // A (forked post-BPF-load, deprivileged to the invoking user)
+        // snapshots and reconciles B, so the range-bound opens fail
+        // EPERM deterministically and the refusal must shape itself.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip foreign-refusal pin: needs root");
+            return;
+        }
+        let target: u32 = match std::env::var("SUDO_UID").ok().and_then(|v| v.parse().ok()) {
+            Some(uid) if uid != 0 => uid,
+            _ => {
+                eprintln!("skip foreign-refusal pin: needs SUDO_UID of an unprivileged user");
+                return;
+            }
+        };
+        // SAFETY: single-threaded test; B only drops privilege and execs.
+        let b_pid = unsafe { libc::fork() };
+        assert!(b_pid >= 0, "fork failed");
+        if b_pid == 0 {
+            // SAFETY: dropping from root to the invoking uid; checked.
+            if unsafe { libc::setuid(target) } != 0 {
+                unsafe { libc::_exit(3) };
+            }
+            let unshare = std::ffi::CString::new("/usr/bin/unshare").unwrap();
+            let dash_u = std::ffi::CString::new("-U").unwrap();
+            let env = std::ffi::CString::new("env").unwrap();
+            let preload = std::ffi::CString::new("LD_PRELOAD=libcrypto.so.3").unwrap();
+            let sleep = std::ffi::CString::new("sleep").unwrap();
+            let secs = std::ffi::CString::new("120").unwrap();
+            let argv = [
+                unshare.as_ptr(),
+                dash_u.as_ptr(),
+                env.as_ptr(),
+                preload.as_ptr(),
+                sleep.as_ptr(),
+                secs.as_ptr(),
+                std::ptr::null(),
+            ];
+            // SAFETY: argv is NUL-terminated C strings; exec replaces the image.
+            unsafe {
+                libc::execv(unshare.as_ptr(), argv.as_ptr());
+                libc::_exit(3);
+            }
+        }
+        let b_pid = b_pid as u32;
+        // Bounded readiness: comm == sleep plus settled maps.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut stable: Option<String> = None;
+        let ready = loop {
+            let comm = std::fs::read_to_string(format!("/proc/{b_pid}/comm")).unwrap_or_default();
+            let maps_now = std::fs::read_to_string(format!("/proc/{b_pid}/maps")).ok();
+            let settled = comm.trim() == "sleep"
+                && maps_now.is_some()
+                && stable
+                    .as_ref()
+                    .is_some_and(|last| Some(last) == maps_now.as_ref());
+            stable = maps_now;
+            if settled {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if !ready {
+            eprintln!("skip foreign-refusal pin: target never settled");
+            // SAFETY: reaping the vehicle.
+            unsafe {
+                libc::kill(b_pid as i32, libc::SIGKILL);
+                let mut status = 0;
+                libc::waitpid(b_pid as i32, &mut status, 0);
+            }
+            return;
+        }
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable ints; return checked.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: single-threaded test; A only snapshots/reconciles with
+        // COW-local session state, reports one byte, and _exits.
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0, "fork failed");
+        if forked == 0 {
+            // SAFETY: we own fds[0]; closing the unused read end.
+            unsafe { libc::close(fds[0]) };
+            // SAFETY: dropping from root to the invoking uid; checked.
+            let verdict: u8 = if unsafe { libc::setuid(target) } != 0 {
+                0
+            } else {
+                // Direct shape probe: maps must read, one file-backed
+                // range's entry must refuse with a permission errno.
+                let shape = (|| {
+                    let maps = std::fs::read_to_string(format!("/proc/{b_pid}/maps")).ok()?;
+                    let range = maps.lines().find_map(|line| {
+                        let mut fields = line.split_ascii_whitespace();
+                        let range = fields.next()?;
+                        fields.next()?;
+                        fields.next()?;
+                        fields.next()?;
+                        (fields.next()? != "0").then_some(range)
+                    })?;
+                    match std::fs::File::open(format!("/proc/{b_pid}/map_files/{range}")) {
+                        Ok(_) => None,
+                        Err(e) => e.raw_os_error(),
+                    }
+                })();
+                match shape {
+                    Some(errno) if errno == libc::EPERM || errno == libc::EACCES => {
+                        let records = inventory::snapshot(&inventory::SnapshotOptions {
+                            pids: vec![b_pid],
+                            ..Default::default()
+                        })
+                        .processes;
+                        if records.len() != 1 {
+                            2
+                        } else {
+                            // A silently failed LD_PRELOAD leaves no
+                            // operational exports, so acquisition is
+                            // correctly skipped and there is no refusal
+                            // to shape: skip, don't fail.
+                            let observable = records[0].modules.iter().any(|m| {
+                                m.info.exports.iter().any(|api| {
+                                    api.operational_id().is_some()
+                                        || (1..=16).any(|id| {
+                                            wire::api(id) == Ok(ObservationApi::Inventoried(*api))
+                                        })
+                                })
+                            });
+                            if !observable {
+                                2
+                            } else {
+                                session.set_deadline(Instant::now() + Duration::from_secs(10));
+                                let batch = session.reconcile_records(&records);
+                                u8::from(
+                                    batch
+                                        .refusals
+                                        .iter()
+                                        .any(|r| r == "backing-denied:permission-denied"),
+                                )
+                            }
+                        }
+                    }
+                    _ => 2,
+                }
+            };
+            let buf = [verdict];
+            // SAFETY: buf is one readable byte; fds[1] is the owned pipe end.
+            unsafe {
+                libc::write(fds[1], buf.as_ptr().cast(), 1);
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: we own fds[1]; closing the unused write end.
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 1];
+        // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
+        let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
+        // SAFETY: we own fds[0].
+        unsafe { libc::close(fds[0]) };
+        let mut status = 0;
+        // SAFETY: forked is the live child pid; status is writable.
+        unsafe { libc::waitpid(forked, &mut status, 0) };
+        // SAFETY: reaping the vehicle.
+        unsafe {
+            libc::kill(b_pid as i32, libc::SIGKILL);
+            let mut status = 0;
+            libc::waitpid(b_pid as i32, &mut status, 0);
+        }
+        assert_eq!(read, 1, "child reported no verdict");
+        match buf[0] {
+            1 => {}
+            2 => {
+                eprintln!("skip foreign-refusal pin: shape absent on this kernel");
+                return;
+            }
+            _ => panic!("foreign backing refusal was not shaped"),
+        }
+    }
+
     #[test]
     #[ignore = "requires privileged BPF and fresh observation object"]
     fn verified_inventory_recovers_a_previously_refused_locator() {

@@ -168,6 +168,13 @@ pub struct ObservationBudget {
     work: Rc<RefCell<Work>>,
     deadline: Rc<Cell<Option<std::time::Instant>>>,
     pub(crate) memory: Option<crate::observation_memory::MemoryPool>,
+    /// Shaped backing-refusal strings recorded during acquisition (R06
+    /// vocabulary, caller-rendered). Shared across budget clones like
+    /// the work ledger; the session drains it once per reconcile so a
+    /// refusal surfaces on the batch it belongs to. A set: repeats of
+    /// the same refusal (one per mapping) collapse here, and past the
+    /// cap further refusals drop (the gap counts stay exact).
+    refusals: Rc<RefCell<std::collections::BTreeSet<String>>>,
 }
 impl Default for ObservationBudget {
     fn default() -> Self {
@@ -181,7 +188,22 @@ impl ObservationBudget {
             work: Rc::default(),
             deadline: Rc::default(),
             memory: None,
+            refusals: Rc::default(),
         }
+    }
+    /// Stash one caller-rendered refusal string for the session drain.
+    pub(crate) fn record_refusal(&self, refusal: String) {
+        const CAP: usize = 64;
+        let mut refusals = self.refusals.borrow_mut();
+        if refusals.len() < CAP {
+            refusals.insert(refusal);
+        }
+    }
+    /// Take the refusals recorded since the last drain.
+    pub(crate) fn take_refusals(&self) -> Vec<String> {
+        std::mem::take(&mut *self.refusals.borrow_mut())
+            .into_iter()
+            .collect()
     }
     pub(crate) fn set_deadline(&self, deadline: std::time::Instant) {
         self.deadline.set(Some(deadline));

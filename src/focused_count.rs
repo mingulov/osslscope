@@ -337,6 +337,10 @@ pub struct FocusedCounter {
     mapped_generation: Option<u64>,
     authority_refresh_pending: bool,
     mapped_guards: Vec<crate::provider_observation::VerifiedSite>,
+    /// Shaped link-failure tops (R06 rule: sorted + deduped here, capped
+    /// at the document). The session drains these at projection; the
+    /// counters keep the exact failure counts regardless.
+    attach_diagnostics: std::collections::BTreeSet<String>,
 }
 /// One-shot stable physical acquisition. It keeps the actual counter/maps and
 /// successful shared-gate owner alive; a copied sample is never this capability.
@@ -484,6 +488,7 @@ impl FocusedCounter {
             mapped_generation: None,
             authority_refresh_pending: false,
             mapped_guards: Vec::new(),
+            attach_diagnostics: std::collections::BTreeSet::new(),
         };
         let NamespaceId { device, inode } = namespace;
         let mut config = [0u8; 16];
@@ -544,6 +549,19 @@ impl FocusedCounter {
     /// Retire count for the ENGINE plane's dead-link check.
     pub(crate) fn engine_epoch(&self) -> u64 {
         self.engine_epoch
+    }
+    /// Record one failed link as a shaped attach diagnostic (R06
+    /// vocabulary: static program, first group file-offset, Debug
+    /// kind token). Sorted + deduped; the session drains at projection.
+    fn record_link_diagnostic(&mut self, offset: u64, error: &std::io::Error) {
+        let top =
+            crate::acquire_cause::AcquisitionCause::link_top("count_entry", offset, error.kind());
+        self.attach_diagnostics
+            .insert(crate::acquire_cause::AcquisitionCause::Attach.diagnostic(&top));
+    }
+    /// Drain the recorded link diagnostics for the document path.
+    pub(crate) fn take_attach_diagnostics(&mut self) -> std::collections::BTreeSet<String> {
+        std::mem::take(&mut self.attach_diagnostics)
     }
     /// Pure ENGINE-pin custody check (no retire, no gaps):
     /// every retained pin still shows its attach-time stamp.
@@ -853,14 +871,22 @@ impl FocusedCounter {
             let offsets: Vec<u64> = pairs.iter().map(|(off, _)| *off).collect();
             let group_cookies: Vec<u64> = pairs.iter().map(|(_, c)| *c).collect();
             checkpoint(index > 0)?;
-            let link = ossl_bpf_sys::link_create_uprobe_multi(
+            let link = match ossl_bpf_sys::link_create_uprobe_multi(
                 program,
                 &fd_path,
                 &offsets,
                 &group_cookies,
                 self.pid,
-            )
-            .map_err(|_| CountFailure::Attach)?;
+            ) {
+                Ok(link) => link,
+                Err(error) => {
+                    self.record_link_diagnostic(
+                        pairs.first().map(|(off, _)| *off).unwrap_or_default(),
+                        &error,
+                    );
+                    return Err(CountFailure::Attach);
+                }
+            };
             // Post-link stability: the digest proved the content
             // at re-read time; an unchanged stamp across the link
             // call proves the link bound those same bytes (any
@@ -1178,10 +1204,18 @@ impl FocusedCounter {
             // Cookies are never reused after a possibly observed native call.
             self.fold.next_cookie =
                 cookies.last().copied().expect("nonempty native offsets") as u32 + 1;
-            let link = ossl_bpf_sys::link_create_uprobe_multi(
+            let link = match ossl_bpf_sys::link_create_uprobe_multi(
                 program, &path, &offsets, &cookies, self.pid,
-            )
-            .map_err(|_| CountFailure::Attach)?;
+            ) {
+                Ok(link) => link,
+                Err(error) => {
+                    self.record_link_diagnostic(
+                        offsets.first().copied().unwrap_or_default(),
+                        &error,
+                    );
+                    return Err(CountFailure::Attach);
+                }
+            };
             #[cfg(test)]
             EXPIRE_AFTER_LINK.with(|flag| {
                 if flag.replace(false) {
@@ -2664,6 +2698,257 @@ mod startup_controls {
         counter.close(Instant::now() + Duration::from_secs(1));
         child.finish_observation().unwrap();
     }
+    #[test]
+    #[ignore = "requires privileged BPF and freshly built focused count object"]
+    fn unprivileged_attach_records_link_diagnostic() {
+        // Root forks a worker child that performs the whole setup
+        // itself, then installs a seccomp filter denying only bpf()
+        // with EPERM — validation (procfs opens, fstat, reads)
+        // proceeds untouched, but the attach's link_create fails
+        // deterministically and the failure must shape itself as a
+        // link diagnostic.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip link pin: needs root");
+            return;
+        }
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: fds points to two writable ints; return checked.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: single-threaded test; the child runs the worker
+        // (setup, release, deprivilege, attach), reports one verdict
+        // byte, and _exits.
+        let forked = unsafe { libc::fork() };
+        assert!(forked >= 0, "fork failed");
+        if forked == 0 {
+            // SAFETY: we own fds[0]; closing the unused read end.
+            unsafe { libc::close(fds[0]) };
+            let verdict: u8 = worker_verdict();
+            let buf = [verdict];
+            // SAFETY: buf is one readable byte; fds[1] is the owned pipe end.
+            unsafe {
+                libc::write(fds[1], buf.as_ptr().cast(), 1);
+                libc::close(fds[1]);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: we own fds[1]; closing the unused write end.
+        unsafe { libc::close(fds[1]) };
+        let mut buf = [0u8; 1];
+        // SAFETY: buf is one writable byte; fds[0] is the owned pipe end.
+        let read = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), 1) };
+        // SAFETY: we own fds[0].
+        unsafe { libc::close(fds[0]) };
+        let mut status = 0;
+        // SAFETY: forked is the live child pid; status is writable.
+        unsafe { libc::waitpid(forked, &mut status, 0) };
+        assert_eq!(read, 1, "child reported no verdict");
+        match buf[0] {
+            1 => {}
+            2 => {
+                eprintln!("skip link pin: kernel allowed the unprivileged link");
+                return;
+            }
+            other => {
+                panic!("link diagnostic verdict {other} (10-17=CountFailure, 5=no-diag, 6=vacuous)")
+            }
+        }
+    }
+
+    /// Post-fork worker for [`unprivileged_attach_records_link_diagnostic`]:
+    /// 1 ok, 2 skip (kernel allowed the decapabilitied link, or setup
+    /// unavailable), 5 attach-Attach without a shaped diagnostic, 10-17
+    /// any other [`CountFailure`], 3 setup failure.
+    fn worker_verdict() -> u8 {
+        use crate::capture::ClockPort;
+        let argv = vec![
+            "/usr/bin/openssl".to_string(),
+            "dgst".to_string(),
+            "-sha512".to_string(),
+            "/dev/null".to_string(),
+        ];
+        let child = match crate::target::OwnedTarget::spawn_stopped(
+            &argv,
+            crate::target::WorkloadDest::Null,
+        ) {
+            Ok(child) => child,
+            Err(_) => return 3,
+        };
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let sites = match crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut crate::provider_observation::ObservationBudget::default(),
+            Instant::now() + Duration::from_secs(10),
+            &cancelled,
+            None,
+        ) {
+            Ok(sites) if !sites.candidates.is_empty() => sites,
+            _ => return 3,
+        };
+        let bytes = match std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT")
+            .and_then(|path| std::fs::read(path).ok())
+        {
+            Some(bytes) => bytes,
+            None => return 3,
+        };
+        let Some(start_ns) = crate::capture::LiveClock.checked_monotonic_ns() else {
+            return 3;
+        };
+        let observer = match crate::focused_capture::observer_namespace() {
+            Ok(namespace) => namespace,
+            Err(_) => return 3,
+        };
+        let mut counter = match FocusedCounter::open(
+            &bytes,
+            child.pid(),
+            observer,
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns,
+                    deadline_ns: start_ns + 10_000_000_000,
+                },
+                ..Default::default()
+            },
+        ) {
+            Ok(counter) => counter,
+            Err(_) => return 3,
+        };
+        // Seccomp self-restriction: deny only the bpf() syscall with
+        // EPERM, allow everything else. Validation (procfs opens,
+        // fstat, reads) proceeds untouched, while the first BPF
+        // operation of the attach — link_create — fails
+        // deterministically. The filter is per-task, so the parent
+        // test process is unaffected.
+        // SAFETY: the program is six classic-BPF instructions over
+        // struct seccomp_data (nr at 0, arch at 4); jump targets are
+        // in range; non-x86_64 falls through to ALLOW (foreign arch
+        // then skips via verdict 2 instead of dying); prctl args are
+        // valid; NO_NEW_PRIVS first for the unprivileged-install rule.
+        #[repr(C)]
+        struct SockFilter {
+            code: u16,
+            jt: u8,
+            jf: u8,
+            k: u32,
+        }
+        #[repr(C)]
+        struct SockFprog {
+            len: u16,
+            filter: *const SockFilter,
+        }
+        const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+        const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
+        const SECCOMP_RET_ALLOW: u32 = 0x7FFF_0000;
+        let jailed = {
+            let prog = [
+                SockFilter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 4,
+                },
+                SockFilter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 0,
+                    k: AUDIT_ARCH_X86_64,
+                },
+                SockFilter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 0,
+                },
+                SockFilter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1,
+                    k: libc::SYS_bpf as u32,
+                },
+                SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                },
+                SockFilter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: SECCOMP_RET_ALLOW,
+                },
+            ];
+            let fprog = SockFprog {
+                len: prog.len() as u16,
+                filter: prog.as_ptr(),
+            };
+            unsafe {
+                libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0
+                    && libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &fprog) == 0
+            }
+        };
+        if !jailed {
+            return 2;
+        }
+        let link_fds = || -> usize {
+            std::fs::read_dir("/proc/self/fd")
+                .unwrap()
+                .flatten()
+                .filter(|p| {
+                    std::fs::read_link(p.path()).is_ok_and(|n| {
+                        n.to_string_lossy().contains("bpf-link")
+                            || n.to_string_lossy().contains("bpf_link")
+                    })
+                })
+                .count()
+        };
+        let baseline = link_fds();
+        let cancel = AtomicBool::new(false);
+        let verdict = match counter.attach_candidates_controlled(
+            sites
+                .candidates
+                .into_iter()
+                .map(CountCandidate::Static)
+                .collect(),
+            start_ns,
+            Instant::now() + Duration::from_secs(10),
+            &cancel,
+        ) {
+            Ok(()) => {
+                if link_fds() > baseline {
+                    2
+                } else {
+                    6
+                }
+            }
+            Err(CountFailure::Attach) => {
+                let diags = counter.take_attach_diagnostics();
+                if diags.iter().any(|d| {
+                    d.starts_with("attach:link count_entry@0x")
+                        && crate::acquire_cause::attach_template_shape(
+                            d.strip_prefix("attach:").unwrap_or(""),
+                        )
+                }) {
+                    1
+                } else {
+                    5
+                }
+            }
+            Err(CountFailure::Object) => 10,
+            Err(CountFailure::Map) => 11,
+            Err(CountFailure::Namespace) => 12,
+            Err(CountFailure::Identity) => 13,
+            Err(CountFailure::Deferred) => 14,
+            Err(CountFailure::Read) => 15,
+            Err(CountFailure::Resource) => 16,
+            Err(CountFailure::Close) => 17,
+        };
+        drop(counter);
+        drop(child);
+        verdict
+    }
+
     #[test]
     #[ignore = "requires privileged BPF and freshly built focused count object"]
     fn cancelled_startup_transaction_closes_partial_links_and_burns_cookies() {

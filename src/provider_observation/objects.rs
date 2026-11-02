@@ -1463,9 +1463,19 @@ pub(crate) fn acquire_with_incarnation(
         let name = format!("map_files/{:x}-{:x}", map.start, map.end);
         let mut ordered: Vec<File> = Vec::new();
         let mut have_direct = false;
-        if let Ok(file) = open_at(&process.directory, name.as_bytes()) {
-            ordered.push(file);
-            have_direct = true;
+        match open_at(&process.directory, name.as_bytes()) {
+            Ok(file) => {
+                ordered.push(file);
+                have_direct = true;
+            }
+            Err(refusal) => {
+                // The range-bound proof failed: shape the refusal for the
+                // document instead of swallowing it into the gap that the
+                // fallback (or its absence) derives below.
+                let (cause, token) =
+                    crate::acquire_cause::AcquisitionCause::errno_token(refusal.errno);
+                limits.record_refusal(cause.diagnostic(token));
+            }
         }
         if let Some(path) = paths.get(&(map.start, map.end)) {
             let mut adapter = BudgetAdapter {
@@ -1654,8 +1664,22 @@ fn maps_path_index(maps: &[u8]) -> std::collections::BTreeMap<(u64, u64), &[u8]>
     }
     index
 }
-fn open_at(directory: &File, name: &[u8]) -> Result<File, ObservationGap> {
-    let name = CString::new(name).map_err(|_| ObservationGap::ProcessUnavailable)?;
+/// A refused range-bound open: the gap for control flow plus the raw
+/// errno for the shaped refusal diagnostic.
+pub(crate) struct OpenRefusal {
+    pub gap: ObservationGap,
+    pub errno: Option<i32>,
+}
+impl From<OpenRefusal> for ObservationGap {
+    fn from(refusal: OpenRefusal) -> Self {
+        refusal.gap
+    }
+}
+fn open_at(directory: &File, name: &[u8]) -> Result<File, OpenRefusal> {
+    let name = CString::new(name).map_err(|_| OpenRefusal {
+        gap: ObservationGap::ProcessUnavailable,
+        errno: None,
+    })?;
     // SAFETY: owned live directory/name; returned descriptor transferred once.
     let raw = unsafe {
         libc::openat(
@@ -1665,7 +1689,12 @@ fn open_at(directory: &File, name: &[u8]) -> Result<File, ObservationGap> {
         )
     };
     if raw < 0 {
-        Err(ObservationGap::ProcessUnavailable)
+        // Capture before any other syscall runs.
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        Err(OpenRefusal {
+            gap: ObservationGap::ProcessUnavailable,
+            errno,
+        })
     } else {
         Ok(unsafe { File::from_raw_fd(raw) })
     }
@@ -1715,7 +1744,7 @@ fn starttime(directory: &File) -> Result<u64, ObservationGap> {
 // Observation failure is absence, not a compared identity change. Callers
 // produce NamespaceChanged only after a successful unequal comparison.
 fn namespaces(directory: &File) -> Result<NamespaceIds, ObservationGap> {
-    let id = |name: &[u8]| {
+    let id = |name: &[u8]| -> Result<Option<NamespaceId>, ObservationGap> {
         let file = open_at(directory, name).map_err(|_| ObservationGap::ProcessUnavailable)?;
         let m = file
             .metadata()
