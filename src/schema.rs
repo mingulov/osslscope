@@ -2331,6 +2331,24 @@ mod tests {
         assert_eq!(e.message, "value forbidden here");
     }
 
+    #[test]
+    fn r12_new_reader_accepts_context_free_older_minor() {
+        // Mirror of r12_old_strict_schema_rejects_context_key: the
+        // additive direction. A pre-R12 document (no `context` key)
+        // validates under the current schema and semantics — old
+        // documents stay readable, only old STRICT validators refuse
+        // new keys.
+        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
+        let mut doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/report-v2-complete.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(doc.get("context").is_some(), "golden must carry context");
+        doc.as_object_mut().unwrap().remove("context");
+        validate_v2(&doc).expect("new schema accepts context-free doc");
+        check_v2_semantics(&doc).expect("new semantics accept context-free doc");
+    }
+
     fn report_golden_names(names: impl Iterator<Item = String>) -> Vec<String> {
         let mut names: Vec<_> = names
             .filter(|f| f.starts_with("report-") && f.ends_with(".json"))

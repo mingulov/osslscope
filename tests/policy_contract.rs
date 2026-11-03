@@ -3611,3 +3611,118 @@ fn mixed_pass_and_inconclusive_compose_to_inconclusive() {
         "poisoned gate exits 11, not 0"
     );
 }
+
+/// F-007 fatal salvage pair: the SAME definite site mints a CBOM
+/// asset under salvaged-Runtime (usable evidence survives the tool
+/// failure) but mints nothing under evidence-free AttachZero —
+/// untrusted physical prefixes are never promoted into definite
+/// assets. Both docs stay marked FATAL on every path.
+#[test]
+fn salvaged_runtime_mints_cbom_assets_while_attachzero_mints_none() {
+    let sites = || {
+        vec![site_at(
+            1,
+            0,
+            7,
+            vec![cand(
+                "prov-default",
+                "default",
+                DIGEST,
+                7,
+                &["SHA2-256"],
+                false,
+            )],
+            CandidateCoverage::Complete,
+        )]
+    };
+    let build = |fatal: FatalKind| {
+        doc(
+            sites(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            exact_window(),
+            Some(fatal),
+        )
+    };
+    let salvaged = build(FatalKind::Runtime("close_and_drain: boom".to_string()));
+    let untrusted = build(FatalKind::AttachZero);
+    assert!(salvaged.has_usable_evidence());
+    assert!(!untrusted.has_usable_evidence());
+    // CBOM: salvaged mints one, untrusted mints none.
+    for (name, document, want) in [("salvaged", &salvaged, 1), ("untrusted", &untrusted, 0)] {
+        let bytes = osslscope::report::render_cbom(document).unwrap();
+        let cbom: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            cbom["components"].as_array().unwrap().len(),
+            want,
+            "{name} CBOM asset count"
+        );
+        // JSON: both stay FATAL with their kind; human names it.
+        let bytes = osslscope::report::render_json(document).unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            report["completeness"]["status"], "FATAL",
+            "{name} JSON status"
+        );
+        let human = osslscope::report::render_human(document);
+        assert!(
+            human.contains("fatal: "),
+            "{name} human marks fatal:\n{human}"
+        );
+    }
+    let human = osslscope::report::render_human(&salvaged);
+    assert!(
+        human.contains("fatal: runtime: close_and_drain: boom"),
+        "salvaged human carries the detail:\n{human}"
+    );
+    // Policy agrees: salvaged evaluates, untrusted yields no verdict.
+    let v = evaluate_document(
+        std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
+        &salvaged,
+    );
+    assert_eq!(v.overall(), PolicyOutcome::Pass);
+    let v = evaluate_document(
+        std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
+        &untrusted,
+    );
+    assert_eq!(v.overall(), PolicyOutcome::NoVerdict);
+    assert!(v.rules.is_empty());
+}
+
+/// F-007 one finalized record: human/JSON/policy/CBOM report the
+/// same verdict, the same definite count, and the same asset set —
+/// four renderings, one record, no per-format recomputation.
+#[test]
+fn all_four_formats_agree_on_verdict_counts_and_assets() {
+    let mut d = complete_doc(vec![site_at(
+        1,
+        0,
+        7,
+        vec![cand("prov-default", "default", DIGEST, 7, &["MD5"], true)],
+        CandidateCoverage::Complete,
+    )]);
+    let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &d);
+    assert_eq!(v.overall(), PolicyOutcome::Violation);
+    d.policy = Some(policy_record(&v));
+    // Human: verdict word + definite count.
+    let human = osslscope::report::render_human(&d);
+    assert!(
+        human.contains("policy: violation"),
+        "human verdict:\n{human}"
+    );
+    assert!(human.contains("definite=7"), "human count:\n{human}");
+    // JSON: verdict + the site's calls.
+    let bytes = osslscope::report::render_json(&d).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(report["policy"]["verdict"], "violation");
+    assert_eq!(report["sites"].as_array().unwrap().len(), 1);
+    // CBOM: verdict metadata + exactly the one definite asset.
+    let bytes = osslscope::report::render_cbom(&d).unwrap();
+    let cbom: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let meta = cbom_metadata(&cbom);
+    assert_eq!(meta["osslscope:policy-verdict"], "violation");
+    assert_eq!(cbom["components"].as_array().unwrap().len(), 1);
+    // Physical total conserved across all three count sites.
+    assert_eq!(d.total_calls(), 7);
+}
