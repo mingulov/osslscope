@@ -585,17 +585,32 @@ impl BtrfsFixture {
         let mut subvols = Vec::with_capacity(names.len());
         for name in names {
             let path = base.join(name);
-            let ok = Command::new("btrfs")
+            let created = Command::new("btrfs")
                 .args(["subvolume", "create"])
                 .arg(&path)
-                .status()
-                .is_ok_and(|s| s.success());
-            if !ok {
-                eprintln!("skip: btrfs subvolume create failed for {}", path.display());
-                let _ = fs::remove_dir_all(&base);
-                return None;
+                .output();
+            match created {
+                Ok(out) if out.status.success() => subvols.push(path),
+                _ => {
+                    // Prerequisites passed, so this is an acquisition
+                    // failure (ENOSPC, unexpected fs error) — fail the
+                    // cell, never green-skip. Reclaim first, in reverse.
+                    for done in subvols.iter().rev() {
+                        let _ = Command::new("btrfs")
+                            .args(["subvolume", "delete"])
+                            .arg(done)
+                            .status();
+                    }
+                    let _ = fs::remove_dir_all(&base);
+                    let detail = created
+                        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                        .unwrap_or_else(|e| e.to_string());
+                    panic!(
+                        "btrfs subvolume create failed for {}: {detail}",
+                        path.display()
+                    );
+                }
             }
-            subvols.push(path);
         }
         Some(Self(base, subvols))
     }
@@ -634,14 +649,19 @@ impl BtrfsFixture {
 impl Drop for BtrfsFixture {
     fn drop(&mut self) {
         // Loud, never panicking: a failed delete leaks a subvolume
-        // and must show in logs, not vanish.
+        // and must show in logs, not vanish. Both spawn errors and
+        // unsuccessful exit statuses count as failures.
         for subvol in self.1.iter().rev() {
-            if let Err(error) = Command::new("btrfs")
+            match Command::new("btrfs")
                 .args(["subvolume", "delete"])
                 .arg(subvol)
                 .status()
             {
-                eprintln!("BtrfsFixture: subvolume delete failed: {error}");
+                Ok(status) if status.success() => {}
+                other => eprintln!(
+                    "BtrfsFixture: subvolume delete failed for {}: {other:?}",
+                    subvol.display()
+                ),
             }
         }
         if let Err(error) = fs::remove_dir_all(&self.0) {

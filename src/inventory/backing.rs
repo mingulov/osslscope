@@ -1679,9 +1679,14 @@ mod tests {
         let range = child.range_of(&a);
         let target = child.dir();
         let before = File::open(&link).unwrap();
-        verify_mapped_backing(&target, &range, &before).unwrap();
+        let assoc = verify_mapped_backing(&target, &range, &before).unwrap();
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&b, &link).unwrap();
+        // H5a Verified column: the retained association binds file A
+        // through file descriptors, so a pathname swap cannot disturb it.
+        assoc.revalidate().unwrap();
+        // But a candidate opened through the swapped link is file B — a
+        // different file from the mapping — and must refuse.
         let after = File::open(&link).unwrap();
         assert_eq!(
             err_of(verify_mapped_backing(&target, &range, &after)),
@@ -1780,10 +1785,6 @@ mod tests {
     #[test]
     #[ignore = "requires root + loop + ext4 (T4)"]
     fn ext4_loop_backed_mapping_verifies() {
-        // Never touch host mounts: isolated mount namespace or nothing.
-        let mine = std::fs::read_link("/proc/self/ns/mnt").unwrap();
-        let init = std::fs::read_link("/proc/1/ns/mnt").unwrap();
-        assert_ne!(mine, init, "requires isolated mount namespace");
         let mkfs = ["/sbin/mke2fs", "/sbin/mkfs.ext4"]
             .into_iter()
             .find(|p| std::path::Path::new(p).exists());
@@ -1807,17 +1808,17 @@ mod tests {
             .stderr(Stdio::null())
             .status();
         assert!(formatted.is_ok_and(|s| s.success()), "mke2fs failed");
+        // MountGuard owns the mount: isolated-mntns + private-propagation
+        // asserts, mountinfo verification, retention policy, and unwind
+        // cleanup if any later assert fails.
         let mnt = dir.join("mnt");
         std::fs::create_dir(&mnt).unwrap();
-        assert!(
-            Command::new("mount")
-                .args(["-o", "loop"])
-                .arg(&img)
-                .arg(&mnt)
-                .status()
-                .is_ok_and(|s| s.success()),
-            "loop mount failed"
-        );
+        let mut guard = MountGuard::new(dir);
+        guard
+            .mount(mnt.clone(), &["-o", "loop", img.to_str().unwrap()])
+            .unwrap();
+        // The child mapping must be gone before cleanup: an open mapping
+        // pins the mount and normal umount refuses (by design).
         {
             let path = mnt.join("lib.so");
             std::fs::write(&path, vec![0x45u8; 4096]).unwrap();
@@ -1833,14 +1834,7 @@ mod tests {
             assert_eq!(assoc.object_identity(), (meta.dev(), meta.ino()));
             assoc.revalidate().unwrap();
         }
-        assert!(
-            Command::new("umount")
-                .arg(&mnt)
-                .status()
-                .is_ok_and(|s| s.success()),
-            "umount failed"
-        );
-        std::fs::remove_dir_all(&dir).unwrap();
+        guard.cleanup().unwrap();
     }
 
     #[derive(Debug)]
@@ -2125,17 +2119,32 @@ mod tests {
             let mut subvols = Vec::with_capacity(names.len());
             for name in names {
                 let path = base.join(name);
-                let ok = Command::new("btrfs")
+                let created = Command::new("btrfs")
                     .args(["subvolume", "create"])
                     .arg(&path)
-                    .status()
-                    .is_ok_and(|s| s.success());
-                if !ok {
-                    eprintln!("skip: btrfs subvolume create failed for {}", path.display());
-                    let _ = std::fs::remove_dir_all(&base);
-                    return None;
+                    .output();
+                match created {
+                    Ok(out) if out.status.success() => subvols.push(path),
+                    _ => {
+                        // Prerequisites passed, so this is an acquisition
+                        // failure (ENOSPC, unexpected fs error) — fail the
+                        // cell, never green-skip. Reclaim first, in reverse.
+                        for done in subvols.iter().rev() {
+                            let _ = Command::new("btrfs")
+                                .args(["subvolume", "delete"])
+                                .arg(done)
+                                .status();
+                        }
+                        let _ = std::fs::remove_dir_all(&base);
+                        let detail = created
+                            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+                            .unwrap_or_else(|e| e.to_string());
+                        panic!(
+                            "btrfs subvolume create failed for {}: {detail}",
+                            path.display()
+                        );
+                    }
                 }
-                subvols.push(path);
             }
             Some(Self { base, subvols })
         }
@@ -2184,17 +2193,35 @@ mod tests {
             panic!("no same-ino pair across fresh subvolumes after 16 files each");
         }
     }
+    impl BtrfsFixture {
+        /// Couple to a retained mount: when unmount refuses and the mount
+        /// is kept by policy, the backing subvolumes must survive with it
+        /// (leak by design, loudly) instead of being deleted from under it.
+        fn retain(self, reason: &str) {
+            eprintln!(
+                "BtrfsFixture: retaining {} subvolumes under {}: {reason}",
+                self.subvols.len(),
+                self.base.display()
+            );
+            std::mem::forget(self);
+        }
+    }
     impl Drop for BtrfsFixture {
         fn drop(&mut self) {
             for subvol in self.subvols.iter().rev() {
                 // Loud, never panicking: a failed delete leaks a subvolume
-                // and must show in logs, not vanish.
-                if let Err(error) = Command::new("btrfs")
+                // and must show in logs, not vanish. Both spawn errors and
+                // unsuccessful exit statuses count as failures.
+                match Command::new("btrfs")
                     .args(["subvolume", "delete"])
                     .arg(subvol)
                     .status()
                 {
-                    eprintln!("BtrfsFixture: subvolume delete failed: {error}");
+                    Ok(status) if status.success() => {}
+                    other => eprintln!(
+                        "BtrfsFixture: subvolume delete failed for {}: {other:?}",
+                        subvol.display()
+                    ),
                 }
             }
             if let Err(error) = std::fs::remove_dir_all(&self.base) {
@@ -2299,7 +2326,14 @@ mod tests {
                 BackingError::Changed
             );
         }
-        guard.cleanup().unwrap();
+        // Couple the backing to the mount's fate: if cleanup refuses, the
+        // mount is retained by policy and the subvolumes must survive with
+        // it — deleting them from under a retained mount would corrupt the
+        // evidence MountGuard kept.
+        if let Err(error) = guard.cleanup() {
+            fx.retain(&error);
+            panic!("{error}");
+        }
     }
 
     fn mount_tmpfs_siblings(base: std::path::PathBuf, points: &[std::path::PathBuf]) -> MountGuard {
