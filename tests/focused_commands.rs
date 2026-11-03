@@ -1064,4 +1064,27 @@ fn top_level_help_points_blocked_first_runs_at_doctor() {
         help.contains("blocked? run 'osslscope doctor' first"),
         "top-level help must point blocked runs at doctor, got: {help}"
     );
+    let pointer = help
+        .lines()
+        .find(|line| line.contains("blocked? run"))
+        .unwrap_or("");
+    assert!(
+        pointer.contains("--pid PID"),
+        "top-level pointer line must name the foreign-target probe flag, got: {help}"
+    );
+}
+
+#[test]
+fn subcommand_help_distinguishes_self_and_foreign_doctor() {
+    let out = cli("report", &["--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("bare 'doctor' checks self"),
+        "sub pointer must scope bare doctor to self, got: {help}"
+    );
+    assert!(
+        help.contains("'doctor --pid PID' probes foreign")
+            && help.contains("root/capable"),
+        "sub pointer must route foreign targets at doctor --pid with the root/capable requirement, got: {help}"
+    );
 }

@@ -21,13 +21,13 @@ pub(crate) fn exit_code_help() -> [&'static str; 7] {
 /// First-run pointer for top-level help (printed after the exit
 /// lines): one shared sentence, not per-command tutorials.
 pub(crate) fn blocked_pointer_top() -> &'static str {
-    "  blocked? run 'osslscope doctor' first; '<cmd> --help' names that command's exits"
+    "  blocked? run 'osslscope doctor' first ('--pid PID' for a foreign target); '<cmd> --help' names that command's exits"
 }
 
 /// First-run pointer for subcommand helps (printed after the exit
 /// lines): the doctor command diagnoses; help texts do not.
 pub(crate) fn blocked_pointer_sub() -> &'static str {
-    "  first run blocked? 'osslscope doctor' diagnoses capabilities (CAP_BPF+CAP_PERFMON; same uid or root for foreign targets)"
+    "  first run blocked? bare 'doctor' checks self (CAP_BPF+CAP_PERFMON); 'doctor --pid PID' probes foreign backing (needs root/capable proof)"
 }
 
 /// Tokens in flag position: a value-taking option consumes the next
