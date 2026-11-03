@@ -1156,9 +1156,11 @@ fn human_watch_prints_identity_and_tracing_health() {
 
 #[test]
 fn human_watch_with_gaps_never_claims_blindness() {
-    // Unprivileged target carries gaps: membership stays unknown and
-    // the boundary stays silent (fail closed). The tracing blocker
-    // still precedes the first sample record.
+    // Unprivileged target carries gaps: the boundary stays silent
+    // (fail closed). Under root the presence test owns the
+    // assertion instead. The tracing blocker still precedes the
+    // first sample record in both environments.
+    let blocking = unsafe { libc::geteuid() } != 0;
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
@@ -1176,10 +1178,12 @@ fn human_watch_with_gaps_never_claims_blindness() {
     child.kill().unwrap();
     child.wait().unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(
-        !text.contains("blindness:"),
-        "no absence claim under gaps, got: {text}"
-    );
+    if blocking {
+        assert!(
+            !text.contains("blindness:"),
+            "no absence claim under gaps, got: {text}"
+        );
+    }
     let blocker = text.find("Tracing unavailable:").expect("blocker printed");
     let first_sample = text.find("Process ").expect("samples follow");
     assert!(blocker < first_sample, "blocker must precede sampling");
@@ -1217,31 +1221,33 @@ fn human_watch_states_blindness_when_verified() {
 }
 
 #[test]
-fn module_selection_keeps_membership_unknown() {
-    // Even with the target's own exe selected (mapped, non-crypto):
-    // filtering vetoes the no-candidates claim on the JSON channel
-    // and the blindness line on the human channel.
+fn module_selection_vetoes_human_blindness_only() {
+    // Target's own exe selected (mapped, non-crypto): the JSON
+    // membership reason keeps its base value (byte-identical
+    // machine channel), while the human blindness line stays silent
+    // (filtering vetoes the absence claim).
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
-        .args([
-            "scan",
-            "--watch",
-            "--observe-crypto",
-            "--pid",
-            &child.id().to_string(),
-            "--module",
-            exe.to_str().unwrap(),
-            "--duration",
-            "1",
-            "--json",
-        ])
+    let pid = child.id().to_string();
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    let base = [
+        "scan",
+        "--watch",
+        "--observe-crypto",
+        "--pid",
+        pid.as_str(),
+        "--module",
+        exe.to_str().unwrap(),
+        "--duration",
+        "1",
+    ];
+    let mut json_args = base.to_vec();
+    json_args.push("--json");
+    let json_out = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(&json_args)
         .output()
         .unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
-    let rows = records(&output);
+    let rows = records(&json_out);
     let membership: Vec<&serde_json::Value> =
         rows.iter().filter(|r| r["kind"] == "membership").collect();
     assert!(
@@ -1250,10 +1256,25 @@ fn module_selection_keeps_membership_unknown() {
     );
     for row in membership {
         assert_eq!(
-            row["reason"], "candidate_visibility_unknown",
-            "filtered scan never claims no-candidates, got: {row}"
+            row["reason"], "no_candidate_interfaces_in_sample",
+            "base machine reason preserved, got: {row}"
         );
     }
+    let human_out = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(&base)
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let text = String::from_utf8(human_out.stdout).unwrap();
+    assert!(
+        text.contains("reason=no_candidate_interfaces_in_sample"),
+        "human record mirrors JSON, got: {text}"
+    );
+    assert!(
+        !text.contains("blindness:"),
+        "filtering vetoes the human claim, got: {text}"
+    );
 }
 
 #[test]

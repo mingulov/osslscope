@@ -932,14 +932,19 @@ mod tests {
             limits: super::super::Limits::default(),
         });
         child.kill().unwrap();
-        assert!(
-            !scanned.gaps.is_empty(),
-            "fixture precondition: unprivileged scan carries gaps"
-        );
-        assert!(
-            !super::super::snapshot_conclusively_without_openssl(&scanned),
-            "any gap vetoes the blindness claim"
-        );
+        if scanned.gaps.is_empty() {
+            // Verified environment (root): the gap-free no-OpenSSL
+            // scan holds directly.
+            assert!(
+                super::super::snapshot_conclusively_without_openssl(&scanned),
+                "gap-free no-OpenSSL scan holds"
+            );
+        } else {
+            assert!(
+                !super::super::snapshot_conclusively_without_openssl(&scanned),
+                "any gap vetoes the blindness claim"
+            );
+        }
         // The same snapshot with gaps cleared (as a verified scan
         // would produce): no OpenSSL kinds, nothing hidden — holds.
         let mut cleared = scanned.clone();

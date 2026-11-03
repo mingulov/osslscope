@@ -151,6 +151,30 @@ impl<W: Write> Output<'_, W> {
         self.sequence += 1;
         Ok(())
     }
+    /// Membership record plus the optional human blindness boundary.
+    /// The record reason is the frozen machine vocabulary; `blind` is
+    /// the caller's stricter human-only decision (full visibility).
+    /// JSON output is exactly one membership envelope either way.
+    fn emit_membership(
+        &mut self,
+        incarnation: &Incarnation,
+        segment: u64,
+        state: &'static str,
+        reason: &'static str,
+        blind: bool,
+    ) -> io::Result<()> {
+        self.emit(Record::Membership {
+            incarnation,
+            segment,
+            state,
+            reason,
+        })?;
+        if blind && !self.json && reason == "no_candidate_interfaces_in_sample" {
+            self.writer
+                .write_all(inventory::blindness_line().as_bytes())?;
+        }
+        Ok(())
+    }
     /// Flush buffered human gaps as one grouped block (no-op when empty).
     fn flush_gaps(&mut self) -> io::Result<()> {
         if self.pending_gaps.is_empty() {
@@ -227,20 +251,11 @@ impl<W: Write> Output<'_, W> {
                 segment,
                 state,
                 reason,
-            } => {
-                writeln!(
-                    w,
-                    "Membership pid={} start={} segment={segment} state={state} reason={reason}; sampled",
-                    i.pid, i.starttime
-                )?;
-                // The !eligible-no-uncertainty reason (set at the
-                // Membership emission branch) carries the conclusive
-                // no-OpenSSL finding: state the shared boundary.
-                if *reason == "no_candidate_interfaces_in_sample" {
-                    w.write_all(inventory::blindness_line().as_bytes())?;
-                }
-                Ok(())
-            }
+            } => writeln!(
+                w,
+                "Membership pid={} start={} segment={segment} state={state} reason={reason}; sampled",
+                i.pid, i.starttime
+            ),
             Record::Limit {
                 incarnation: i,
                 reason,
@@ -562,28 +577,30 @@ fn observe(
                     continue;
                 }
                 if !eligible(p) {
-                    // No-candidates is claimed only with full
-                    // visibility: any gap touching this process
-                    // (including IdentityUnverified, whose candidate
-                    // file never proved the mapping's backing) or any
-                    // module-selector filtering keeps visibility
-                    // unknown instead.
-                    let uncertain = !config.selection.modules.is_empty()
-                        || snapshot
+                    // Machine-record reason (base logic, frozen): only
+                    // non-identity gaps keep visibility unknown here.
+                    // The human blindness decision is stricter and
+                    // computed separately below — the JSON reason never
+                    // changes for display purposes.
+                    let uncertain = snapshot.snapshot.gaps.iter().any(|g| {
+                        (g.pid.is_none() || g.pid == Some(p.pid))
+                            && g.reason != GapReason::IdentityUnverified
+                    });
+                    // Conservative human boundary: any gap touching
+                    // this process (identity uncertainty included) or
+                    // any module-selector filtering vetoes the claim.
+                    let blind = config.selection.modules.is_empty()
+                        && !snapshot
                             .snapshot
                             .gaps
                             .iter()
                             .any(|g| g.pid.is_none() || g.pid == Some(p.pid));
-                    out.emit(Record::Membership {
-                        incarnation: &identity,
-                        segment: 0,
-                        state: "sampled",
-                        reason: if uncertain {
-                            "candidate_visibility_unknown"
-                        } else {
-                            "no_candidate_interfaces_in_sample"
-                        },
-                    })?;
+                    let reason = if uncertain {
+                        "candidate_visibility_unknown"
+                    } else {
+                        "no_candidate_interfaces_in_sample"
+                    };
+                    out.emit_membership(&identity, 0, "sampled", reason, blind)?;
                     continue;
                 }
                 if !tracing {
@@ -1050,9 +1067,11 @@ mod tests {
     }
 
     #[test]
-    fn human_membership_states_blindness_when_no_candidates() {
-        // The ineligible-no-uncertainty reason (emitted at the !eligible
-        // branch) renders the shared blindness boundary in human output.
+    fn membership_blindness_follows_caller_decision_not_reason() {
+        // The blindness line follows the caller's stricter `blind`
+        // decision — never the record reason alone: the same
+        // no-candidates reason prints the boundary when blind and
+        // stays silent when not, while the record line is identical.
         let identity = Incarnation {
             pid: 42,
             starttime: 123,
@@ -1061,25 +1080,34 @@ mod tests {
                 mount: None,
             },
         };
-        let mut bytes = Vec::new();
-        let mut out = Output {
-            writer: &mut bytes,
-            sequence: 0,
-            json: false,
-            pending_gaps: Vec::new(),
-        };
-        out.emit(Record::Membership {
-            incarnation: &identity,
-            segment: 0,
-            state: "sampled",
-            reason: "no_candidate_interfaces_in_sample",
-        })
-        .unwrap();
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(
-            text.contains("blindness: no-mapped-openssl"),
-            "blindness boundary stated, got: {text}"
-        );
+        for (blind, expect) in [(true, true), (false, false)] {
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: false,
+                pending_gaps: Vec::new(),
+            };
+            out.emit_membership(
+                &identity,
+                0,
+                "sampled",
+                "no_candidate_interfaces_in_sample",
+                blind,
+            )
+            .unwrap();
+            drop(out);
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(
+                text.contains("reason=no_candidate_interfaces_in_sample"),
+                "record line identical, got: {text}"
+            );
+            assert_eq!(
+                text.contains("blindness: no-mapped-openssl"),
+                expect,
+                "blind={blind} decides, got: {text}"
+            );
+        }
     }
 
     #[test]

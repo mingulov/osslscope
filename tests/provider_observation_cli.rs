@@ -588,7 +588,12 @@ fn human_snapshot_prints_identity_totals() {
 #[test]
 fn human_watch_with_gaps_never_claims_blindness() {
     // Unprivileged initial snapshot carries gaps: the boundary stays
-    // silent (fail closed).
+    // silent (fail closed). Under root the presence test owns the
+    // assertion instead.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIP: absence needs an unprivileged gap fixture");
+        return;
+    }
     let mut child = std::process::Command::new("sleep")
         .arg("30")
         .spawn()

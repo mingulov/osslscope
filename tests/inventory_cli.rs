@@ -561,6 +561,12 @@ fn dead_pid_inspect_exit4_names_reason_on_stderr() {
 fn human_scan_with_gaps_never_claims_blindness() {
     // Unprivileged sleep scan carries gaps: absence stays
     // inconclusive, so the boundary must stay silent (fail closed).
+    // Under root the scan verifies clean and the presence test owns
+    // the assertion instead.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIP: absence needs an unprivileged gap fixture");
+        return;
+    }
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let output = cli(&["scan", "--pid", &child.id().to_string()]);
