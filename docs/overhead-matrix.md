@@ -1,6 +1,99 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Overhead and support matrix
 
+## v0.5.0-candidate repeat (T6/4D)
+
+The v0.4.0 openssl-speed paired shape, repeated on the current candidate
+with a matched rebuilt-v0.4.0 control on the same machine (kernel
+7.0.0-38-generic, stock cmdline, OpenSSL 3.5.5, powersave, root,
+`taskset -c 0,1` on every leg of both versions, workload's own
+throughput table as the independent metric; HEAD: 1 warmup + 5
+pairs alternating order; control: 3 pairs fixed baseline-first, a
+disclosed method asymmetry):
+
+- HEAD: baselines 2.511–2.520 GB/s, observed 0.463–0.466 GB/s →
+  median **5.425x** (range 5.387–5.426).
+- Rebuilt v0.4.0 control, 3 pairs: 4.665 / 4.650 / 4.661 →
+  median **4.661**, span 4.650–4.665, inside the published range
+  4.637–4.699 (machine and method validated).
+- Count-only mode (`--libcrypto` + count object, a different
+  population: 3 profile sites, no API rows): 2.136–2.140 GB/s →
+  **1.18x**. Published as a mode comparison only — it cannot
+  isolate API admission (coverage, counter path, and mode all
+  differ).
+
+The +0.76x wall-ratio delta (+16.392% slowdown ratio; 13.633%
+observed-throughput loss) is ATTRIBUTED (qualified — see limits),
+consistent with a source-related regression: baselines match,
+attached sites are identical (2857), and per-leg system time rose
+(5.40–5.51s vs 5.13s) while user time is unchanged (comparability
+supported; not every tracing-specific environmental effect
+excluded). bpftool per-program run
+stats (candidate series re-run with retained invocation after the
+first head series proved variant-suspect; both series retained)
+show observation per-hit cost approximately similar (entry
+320.8→320.1ns, return 298.9→302.7ns) while count_entry rose
+165.1→204.0ns (+39ns — the T2 staging prologue executes there,
+~1.6% wall), and observation hits up +44–46% (193,248 →
+277,366–281,611 per 2s, two series): the T1 API59 expansion grew
+the observed API surface 29→53 functions (T1 spawn-path attach
+fit, Nov 2; API ids 20–48 vs 20–72; API entries 588–591k→848–849k;
+new hot APIs 69/70), and each added entry+uretprobe pair pays
+trap overhead (~3.2µs/pair scale check — circular as proof,
+stated only for scale). A no-staging variant BPF object (calls
+removed, diff + object retained; 169,880 B vs 170,280 B
+candidate) measures ~0.1x lower unpaired (~5.30–5.34x) — an
+observed estimate, not a recoverable-share bound. The expanded
+hit population is the SUPPORTED explanation, but its dominant
+share is not independently isolated (no additive residual model
+is claimed). Host/BPF swap confirmations were correctly refused
+by the companion-ABI check in both directions. Optimization (if
+any) is follow-up work under D-08/F-025; this record only
+measures.
+
+Rechecks on the same candidate:
+
+- Maximal-session reserve recomputed: 104 MiB base + 388,784 B real
+  companions + 12,153,024 B maps (16 CPUs) = 121,593,712 B
+  (115.96 MiB) focused, plus 17,546,660 B of source-owner map
+  leases from the SAME pool when typed-source preparation runs
+  (139,140,372 B = 132.69 MiB/session; preparation precedes the
+  lease-enabled check, so a disabled lease does not prevent
+  retention). Campaign lease presence is UNKNOWN from retained
+  docs (success is silent), but preparation-failure signatures
+  are absent on all legs and mechanism analysis indicates
+  preparation was reached — so the conservative gate reading is
+  **132.69 MiB/session; at most ONE maximal session per pool;
+  second maximal refused** (265.39 > 256 MiB). This REVISES the
+  historical "≤2 maximal" outcome for the measured configuration;
+  115.96 MiB is the verified no-preparation floor. An admission
+  limit from reserve arithmetic + mechanism analysis, not an
+  observed breach.
+- Metadata budgets enforcing: `metadata_output_limit` trips with
+  counted omissions (6,190 rows / 636 sites on the campaign legs).
+- Observer peak RSS (full run): 60.5 MiB (v0.4.0: 29.6 MiB —
+  host-side growth recorded, cause not isolated, far below
+  ceilings); max observed FDs 265 (max-only sample, series not
+  retained).
+- Drain/loss denominators stay explicit (full legs:
+  `focused.observation_loss=1` plus known-denominator unknowns;
+  `count.close_failed=1` known limitation on count-only legs;
+  no silent loss).
+- One-PID passive scan baseline (python3+ssl target, new baseline,
+  not a comparison — the v0.4.0 row scanned a different target):
+  10 objects inspected / 3 reported modules, 20.1M charged read
+  bytes deterministic, scanner interval 16.94–18.91 ms, peak RSS
+  12.2–12.4 MiB.
+
+The 5D finite-workload cells below were measured Oct 31 with the U1
+staging base but before roles 309–355 (Nov 1–2) and the T1 spawn-path
+attach fit (Nov 2; attached APIs 29→53) landed, so they are stale for
+absolute values; their repeat belongs to T10 expanded G5
+qualification.
+R15/R17 numeric budgets (≤100k callbacks/s lossless, ≤4µs median
+added latency, ≤2× wall) remain future F-025/G6F/G8 gates — this
+campaign measures one hot-loop point only.
+
 ## v0.2.0 foreground preview
 
 Native checks cover Ubuntu 26.04.1 amd64, kernel `7.0.0-38-generic`
