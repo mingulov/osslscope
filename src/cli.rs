@@ -18,6 +18,18 @@ pub(crate) fn exit_code_help() -> [&'static str; 7] {
     ]
 }
 
+/// First-run pointer for top-level help (printed after the exit
+/// lines): one shared sentence, not per-command tutorials.
+pub(crate) fn blocked_pointer_top() -> &'static str {
+    "  blocked? run 'osslscope doctor' first; '<cmd> --help' names that command's exits"
+}
+
+/// First-run pointer for subcommand helps (printed after the exit
+/// lines): the doctor command diagnoses; help texts do not.
+pub(crate) fn blocked_pointer_sub() -> &'static str {
+    "  first run blocked? 'osslscope doctor' diagnoses capabilities (CAP_BPF+CAP_PERFMON; same uid or root for foreign targets)"
+}
+
 /// Tokens in flag position: a value-taking option consumes the next
 /// token (whatever it is — even a flag-shaped pathname), so option
 /// VALUES never select a dispatch route. `value_flags` must be built
@@ -163,6 +175,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             for line in exit_code_help() {
                 println!("{line}");
             }
+            println!("{}", blocked_pointer_top());
             ExitCode::SUCCESS
         }
         "--version" | "-V" => {

@@ -585,6 +585,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         for line in crate::cli::exit_code_help() {
             println!("{line}");
         }
+        println!("{}", crate::cli::blocked_pointer_sub());
         return Err(ExitCode::from(0));
     }
     let args = match parse(argv) {

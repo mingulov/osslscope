@@ -527,6 +527,10 @@ fn scan_help_names_exit_codes() {
             stdout.contains("exit 3:") && stdout.contains("exit 4:"),
             "{command} help must name exit codes, got: {stdout}"
         );
+        assert!(
+            stdout.contains("first run blocked?"),
+            "{command} help must point first runs at doctor, got: {stdout}"
+        );
     }
 }
 

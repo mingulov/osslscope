@@ -54,6 +54,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
                 for line in crate::cli::exit_code_help() {
                     println!("{line}");
                 }
+                println!("{}", crate::cli::blocked_pointer_sub());
                 return ExitCode::SUCCESS;
             }
             "--json" if !format_seen => {

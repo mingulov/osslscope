@@ -59,6 +59,7 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
         for line in crate::cli::exit_code_help() {
             println!("{line}");
         }
+        println!("{}", crate::cli::blocked_pointer_sub());
         return ExitCode::SUCCESS;
     }
     let args = match parse(argv) {

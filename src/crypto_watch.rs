@@ -715,6 +715,7 @@ pub fn run(args: &[String]) -> ExitCode {
         for line in crate::cli::exit_code_help() {
             println!("{line}");
         }
+        println!("{}", crate::cli::blocked_pointer_sub());
         return ExitCode::SUCCESS;
     }
     let pool = MemoryPool::new(GLOBAL_BYTES);
@@ -1081,11 +1082,7 @@ mod tests {
         for g in &gaps {
             out.emit(Record::Gap { gap: g }).unwrap();
         }
-        assert_eq!(
-            out.pending_gaps.len(),
-            4,
-            "gaps buffer instead of printing"
-        );
+        assert_eq!(out.pending_gaps.len(), 4, "gaps buffer instead of printing");
         out.emit(Record::TracingGap {
             reason: "companions_unavailable",
         })

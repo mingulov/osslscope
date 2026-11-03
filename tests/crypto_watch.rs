@@ -1036,6 +1036,10 @@ fn observe_crypto_help_names_exit_codes() {
         help.contains("exit 3:") && help.contains("exit 4:"),
         "crypto watch help must name exit codes, got: {help}"
     );
+    assert!(
+        help.contains("first run blocked?"),
+        "crypto watch help must point first runs at doctor, got: {help}"
+    );
 }
 
 #[test]

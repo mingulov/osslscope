@@ -2853,6 +2853,7 @@ fn run_with_resolver(
             for line in crate::cli::exit_code_help() {
                 println!("{line}");
             }
+            println!("{}", crate::cli::blocked_pointer_sub());
             return ExitCode::SUCCESS;
         }
         let val = |it: &mut std::slice::Iter<String>| {
@@ -5888,6 +5889,7 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
                         for line in crate::cli::exit_code_help() {
                             writeln!(output, "{line}")?;
                         }
+                        writeln!(output, "{}", crate::cli::blocked_pointer_sub())?;
                         Ok(())
                     });
                 return ExitCode::from(if result.is_ok() { 0 } else { 1 });

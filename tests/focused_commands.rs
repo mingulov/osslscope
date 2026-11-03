@@ -1049,5 +1049,19 @@ fn report_check_help_names_exit_codes() {
             help.contains("exit 3:") && help.contains("exit 4:"),
             "{command} help must name exit codes, got: {help}"
         );
+        assert!(
+            help.contains("first run blocked?"),
+            "{command} help must point first runs at doctor, got: {help}"
+        );
     }
+}
+
+#[test]
+fn top_level_help_points_blocked_first_runs_at_doctor() {
+    let out = cli("help", &[]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        help.contains("blocked? run 'osslscope doctor' first"),
+        "top-level help must point blocked runs at doctor, got: {help}"
+    );
 }

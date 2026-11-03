@@ -377,6 +377,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 for line in crate::cli::exit_code_help() {
                     writeln!(output, "{line}")?;
                 }
+                writeln!(output, "{}", crate::cli::blocked_pointer_sub())?;
                 Ok(())
             })
             .and_then(|()| output.flush())

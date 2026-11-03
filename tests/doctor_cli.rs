@@ -163,6 +163,10 @@ fn doctor_sectioned_help_names_exit_codes() {
         stdout.contains("exit 3:") && stdout.contains("exit 4:"),
         "sectioned help must name exit codes, got: {stdout}"
     );
+    assert!(
+        stdout.contains("first run blocked?"),
+        "sectioned help must point first runs at doctor, got: {stdout}"
+    );
 }
 
 #[test]
@@ -172,6 +176,10 @@ fn doctor_focused_help_names_exit_codes() {
     assert!(
         stdout.contains("exit 3:") && stdout.contains("exit 4:"),
         "focused help must name exit codes, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("first run blocked?"),
+        "focused help must point first runs at doctor, got: {stdout}"
     );
 }
 
@@ -183,6 +191,10 @@ fn doctor_profiled_help_names_exit_codes() {
         stdout.contains("exit 3:") && stdout.contains("exit 4:"),
         "profiled help must name exit codes, got: {stdout}"
     );
+    assert!(
+        stdout.contains("first run blocked?"),
+        "profiled help must point first runs at doctor, got: {stdout}"
+    );
 }
 
 #[test]
@@ -192,6 +204,10 @@ fn doctor_discovery_help_names_exit_codes() {
     assert!(
         stdout.contains("exit 3:") && stdout.contains("exit 4:"),
         "discovery help must name exit codes, got: {stdout}"
+    );
+    assert!(
+        stdout.contains("first run blocked?"),
+        "discovery help must point first runs at doctor, got: {stdout}"
     );
 }
 
