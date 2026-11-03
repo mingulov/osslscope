@@ -265,8 +265,20 @@ fn emit(value: &impl Serialize, writer: &mut impl Write, human: bool) -> io::Res
                 "  {}",
                 super::identity_totals_line(verified, locator)
             )?;
-            for gap in value["snapshot"]["gaps"].as_array().into_iter().flatten() {
-                writeln!(writer, "  gap={} pid={}", gap["reason"], gap["pid"])?;
+            // Per-snapshot groups (buffered for this flush only): typed
+            // gaps deserialize from the same Value the rows below read,
+            // so the block repeats the record exactly. On schema drift
+            // the old per-gap lines keep rendering (never fail loud).
+            match serde_json::from_value::<Vec<super::Gap>>(value["snapshot"]["gaps"].clone()) {
+                Ok(gaps) => {
+                    let triples = gaps.iter().map(|g| (g.reason.word(), g.device, g.pid));
+                    writer.write_all(super::gap_groups_block(triples, "  ").as_bytes())?;
+                }
+                Err(_) => {
+                    for gap in value["snapshot"]["gaps"].as_array().into_iter().flatten() {
+                        writeln!(writer, "  gap={} pid={}", gap["reason"], gap["pid"])?;
+                    }
+                }
             }
             for change in value["changes"].as_array().into_iter().flatten() {
                 write!(
@@ -567,6 +579,51 @@ mod tests {
         assert!(
             out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)"),
             "got: {out}"
+        );
+    }
+
+    #[test]
+    fn watch_human_coalesces_repeated_gaps() {
+        // Three identical gaps + one different gap: one group line with
+        // `: 3`, one with `: 1`, plus the header with exact totals.
+        let gap = |reason: &str, pid: u32| {
+            serde_json::json!({
+                "pid": pid, "device": 7, "inode": 9, "reason": reason,
+            })
+        };
+        let record = serde_json::json!({
+            "record": "snapshot",
+            "sequence": 1,
+            "snapshot": {
+                "capabilities": {"inventory": "partial"},
+                "processes": [],
+                "gaps": [
+                    gap("identity_unverified", 11),
+                    gap("identity_unverified", 11),
+                    gap("identity_unverified", 11),
+                    gap("deadline", 12),
+                ]
+            },
+            "changes": []
+        });
+        let mut buf = Vec::new();
+        super::emit(&record, &mut buf, true).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("gaps (4 total in 2 groups):"),
+            "coalesced header, got: {out}"
+        );
+        assert!(
+            out.contains("identity_unverified device=7 pid=11: 3"),
+            "group of three, got: {out}"
+        );
+        assert!(
+            out.contains("deadline device=7 pid=12: 1"),
+            "singleton group keeps its ids, got: {out}"
+        );
+        assert!(
+            !out.contains("gap=\"identity_unverified\""),
+            "no per-gap lines remain, got: {out}"
         );
     }
 }

@@ -118,11 +118,21 @@ struct Output<'a, W> {
     writer: &'a mut W,
     sequence: u64,
     json: bool,
+    /// Human-only gap buffer: discovery gaps coalesce until the next
+    /// record flushes one grouped block. Bounded by one sample's gaps
+    /// (flushed by the records that follow); the JSON path never
+    /// buffers, so NDJSON stays one envelope per gap.
+    pending_gaps: Vec<(GapReason, Option<u64>, Option<u32>)>,
 }
 impl<W: Write> Output<'_, W> {
     fn emit(&mut self, record: Record<'_>) -> io::Result<()> {
         if !self.json {
-            self.human(&record)?;
+            if let Record::Gap { gap } = &record {
+                self.pending_gaps.push((gap.reason, gap.device, gap.pid));
+            } else {
+                self.flush_gaps()?;
+                self.human(&record)?;
+            }
             self.writer.flush()?;
             self.sequence += 1;
             return Ok(());
@@ -140,6 +150,20 @@ impl<W: Write> Output<'_, W> {
         self.writer.flush()?;
         self.sequence += 1;
         Ok(())
+    }
+    /// Flush buffered human gaps as one grouped block (no-op when empty).
+    fn flush_gaps(&mut self) -> io::Result<()> {
+        if self.pending_gaps.is_empty() {
+            return Ok(());
+        }
+        let block = inventory::gap_groups_block(
+            self.pending_gaps
+                .iter()
+                .map(|(reason, device, pid)| (reason.word(), *device, *pid)),
+            "",
+        );
+        self.pending_gaps.clear();
+        self.writer.write_all(block.as_bytes())
     }
     /// Fixed-size summaries per record. Never dump a document, raw path, symbol
     /// or target string; large object/gap populations get explicit omitted counts.
@@ -225,11 +249,10 @@ impl<W: Write> Output<'_, W> {
                 "Limit pid={} start={}: {reason}; activity=unknown",
                 i.pid, i.starttime
             ),
-            Record::Gap { gap } => writeln!(
-                w,
-                "Discovery gap pid={:?}: {:?}; coverage=unknown",
-                gap.pid, gap.reason
-            ),
+            // Buffered at emit(): human gaps coalesce into one grouped
+            // block flushed by the next record. This arm is unreachable
+            // via emit but keeps the match exhaustive.
+            Record::Gap { .. } => Ok(()),
             Record::SessionGap {
                 incarnation: i,
                 reason,
@@ -427,6 +450,7 @@ fn observe(
         writer: output,
         sequence: 0,
         json,
+        pending_gaps: Vec::new(),
     };
     let mut scanner = match ScopedScanner::new_budgeted(
         config.selection.clone(),
@@ -791,6 +815,7 @@ mod tests {
             writer: &mut bytes,
             sequence: 0,
             json: false,
+            pending_gaps: Vec::new(),
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -934,6 +959,7 @@ mod tests {
             writer: &mut bytes,
             sequence: 0,
             json: false,
+            pending_gaps: Vec::new(),
         };
         out.emit(Record::Discovery { process: &process }).unwrap();
         let text = String::from_utf8(bytes).unwrap();
@@ -967,6 +993,7 @@ mod tests {
             writer: &mut bytes,
             sequence: 0,
             json: false,
+            pending_gaps: Vec::new(),
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -1010,6 +1037,7 @@ mod tests {
             writer: &mut bytes,
             sequence: 0,
             json: false,
+            pending_gaps: Vec::new(),
         };
         out.emit(Record::Membership {
             incarnation: &identity,
@@ -1022,6 +1050,103 @@ mod tests {
         assert!(
             text.contains("blindness: no-mapped-openssl"),
             "blindness boundary stated, got: {text}"
+        );
+    }
+
+    #[test]
+    fn human_gaps_coalesce_until_next_record() {
+        // Three identical + one different gap buffer in human mode and
+        // flush as one grouped block when the next record arrives.
+        let gap = |reason| inventory::Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: None,
+            reason,
+            errno: None,
+            actor_euid: None,
+        };
+        let gaps = [
+            gap(inventory::GapReason::BackingUnavailable),
+            gap(inventory::GapReason::BackingUnavailable),
+            gap(inventory::GapReason::BackingUnavailable),
+            gap(inventory::GapReason::Deadline),
+        ];
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+            pending_gaps: Vec::new(),
+        };
+        for g in &gaps {
+            out.emit(Record::Gap { gap: g }).unwrap();
+        }
+        assert_eq!(
+            out.pending_gaps.len(),
+            4,
+            "gaps buffer instead of printing"
+        );
+        out.emit(Record::TracingGap {
+            reason: "companions_unavailable",
+        })
+        .unwrap();
+        assert!(out.pending_gaps.is_empty(), "flush drains the buffer");
+        drop(out);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("gaps (4 total in 2 groups):"),
+            "coalesced header, got: {text}"
+        );
+        assert!(
+            text.contains("backing_unavailable device=7 pid=11: 3"),
+            "group of three, got: {text}"
+        );
+        assert!(
+            text.find("gaps (").unwrap() < text.find("Tracing unavailable:").unwrap(),
+            "block flushes before the next record, got: {text}"
+        );
+    }
+
+    #[test]
+    fn json_gaps_stay_per_record_ndjson() {
+        // The JSON twin of the same stream: one envelope per gap, exact
+        // bytes (buffering is human-only).
+        let gap = |reason| inventory::Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: None,
+            reason,
+            errno: None,
+            actor_euid: None,
+        };
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+        };
+        out.emit(Record::Gap {
+            gap: &gap(inventory::GapReason::Deadline),
+        })
+        .unwrap();
+        out.emit(Record::TracingGap {
+            reason: "companions_unavailable",
+        })
+        .unwrap();
+        drop(out);
+        let text = String::from_utf8(bytes).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one envelope per record, got: {text}");
+        assert!(
+            lines[0].contains("\"sequence\":0") && lines[0].contains("\"reason\":\"deadline\""),
+            "gap envelope exact, got: {}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains("\"sequence\":1") && lines[1].contains("companions_unavailable"),
+            "second envelope exact, got: {}",
+            lines[1]
         );
     }
 

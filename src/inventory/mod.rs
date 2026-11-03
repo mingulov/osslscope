@@ -490,6 +490,37 @@ pub struct SnapshotPreamble {
     pub conclusively_without_openssl: bool,
 }
 
+/// Shared human gap-group block: groups (word, device, pid) triples
+/// with exact counters, deterministic order (BTreeMap iteration),
+/// empty string when there is nothing to show. The one grouping
+/// implementation for snapshot preambles and all streaming paths;
+/// each path adapts its gap type to words (inodes never key a group).
+/// `indent` nests the block under streaming records (`""` top-level).
+pub fn gap_groups_block<'a, I>(gaps: I, indent: &str) -> String
+where
+    I: IntoIterator<Item = (&'a str, Option<u64>, Option<u32>)>,
+{
+    let mut groups = std::collections::BTreeMap::new();
+    for key in gaps {
+        *groups.entry(key).or_insert(0usize) += 1;
+    }
+    if groups.is_empty() {
+        return String::new();
+    }
+    let total: usize = groups.values().sum();
+    let mut s = format!(
+        "{indent}gaps ({total} total in {} group{}):\n",
+        groups.len(),
+        if groups.len() == 1 { "" } else { "s" },
+    );
+    for ((word, device, pid), count) in &groups {
+        let dev = device.map_or("-".to_string(), |d| d.to_string());
+        let p = pid.map_or("-".to_string(), |p| p.to_string());
+        s.push_str(&format!("{indent}  {word} device={dev} pid={p}: {count}\n"));
+    }
+    s
+}
+
 /// Group gaps by (reason, device, pid) with exact counters
 /// (P1-coalesce). Inodes vary per module and never key a group;
 /// ordering is deterministic (BTreeMap iteration).

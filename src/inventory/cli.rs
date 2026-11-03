@@ -331,24 +331,15 @@ fn identity_line(verified: usize, locator: usize) -> String {
 /// with exact counters (P1-coalesce, display-only). Empty when the
 /// snapshot carries no gaps.
 fn gap_block(groups: &[(GapReason, Option<u64>, Option<u32>, usize)]) -> String {
-    if groups.is_empty() {
-        return String::new();
-    }
-    let total: usize = groups.iter().map(|g| g.3).sum();
-    let mut s = format!(
-        "gaps ({total} total in {} group{}):\n",
-        groups.len(),
-        if groups.len() == 1 { "" } else { "s" },
-    );
-    for (reason, device, pid, count) in groups {
-        let dev = device.map_or("-".to_string(), |d| d.to_string());
-        let p = pid.map_or("-".to_string(), |p| p.to_string());
-        s.push_str(&format!(
-            "  {} device={dev} pid={p}: {count}\n",
-            reason.word()
-        ));
-    }
-    s
+    // Delegates to the shared core: groups arrive pre-counted from
+    // coalesce_gaps, so each triple repeats per its count (counts are
+    // small; clarity over micro-efficiency on the human path).
+    super::gap_groups_block(
+        groups.iter().flat_map(|(reason, device, pid, count)| {
+            std::iter::repeat_n((reason.word(), *device, *pid), *count)
+        }),
+        "",
+    )
 }
 
 fn render(
@@ -971,5 +962,51 @@ mod tests {
             super::super::blindness_line().contains("blindness: no-mapped-openssl"),
             "shared blindness vocabulary pinned"
         );
+    }
+
+    #[test]
+    fn shared_gap_block_pins_exact_shape() {
+        use super::super::GapReason;
+        let block = super::super::gap_groups_block(
+            [
+                (GapReason::ProcessUnavailable.word(), Some(7), Some(9)),
+                (GapReason::ProcessUnavailable.word(), Some(7), Some(9)),
+                (GapReason::Deadline.word(), None, None),
+            ]
+            .into_iter(),
+            "",
+        );
+        assert_eq!(
+            block,
+            "gaps (3 total in 2 groups):\n  deadline device=- pid=-: 1\n  process_unavailable device=7 pid=9: 2\n"
+        );
+        // Indented variant nests under streaming records.
+        let nested = super::super::gap_groups_block(
+            [(GapReason::Deadline.word(), None, None)].into_iter(),
+            "  ",
+        );
+        assert_eq!(
+            nested,
+            "  gaps (1 total in 1 group):\n    deadline device=- pid=-: 1\n"
+        );
+        assert_eq!(
+            block,
+            super::gap_block(&super::super::coalesce_gaps(&[
+                gap(GapReason::ProcessUnavailable, Some(7), Some(9)),
+                gap(GapReason::ProcessUnavailable, Some(7), Some(9)),
+                gap(GapReason::Deadline, None, None),
+            ]))
+        );
+
+        fn gap(reason: GapReason, device: Option<u64>, pid: Option<u32>) -> super::super::Gap {
+            super::super::Gap {
+                pid,
+                device,
+                inode: None,
+                reason,
+                errno: None,
+                actor_euid: None,
+            }
+        }
     }
 }

@@ -709,3 +709,26 @@ fn human_watch_states_blindness_exactly_once() {
         "boundary printed once, got: {text}"
     );
 }
+
+#[test]
+fn human_watch_coalesces_snapshot_gaps() {
+    // Gappy target: per-snapshot gaps render as a grouped block with
+    // exact totals, not one line per gap.
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = child.id().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--watch", "--pid", &pid, "--duration", "0.3"])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("gaps (") && text.contains("total in"),
+        "coalesced gap block, got: {text}"
+    );
+    assert!(
+        !text.contains("  gap=\""),
+        "no per-gap lines remain, got: {text}"
+    );
+}

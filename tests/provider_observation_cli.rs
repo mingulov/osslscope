@@ -613,3 +613,27 @@ fn human_watch_states_blindness_once_before_sampling() {
         "boundary printed once, got: {text}"
     );
 }
+
+#[test]
+fn human_records_coalesce_gaps() {
+    // Dead pid, human mode: inventory + observation gaps render grouped.
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        "2147483647",
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.05",
+    ]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("gaps (") && text.contains("total in"),
+        "coalesced gap block, got: {text}"
+    );
+    assert!(
+        !text.contains("  gap=\"") && !text.contains("  inventory_gap="),
+        "no per-gap lines remain, got: {text}"
+    );
+}

@@ -1155,3 +1155,34 @@ fn human_watch_states_blindness_and_blocker_before_samples() {
     let first_sample = text.find("Process ").expect("samples follow");
     assert!(blocker < first_sample, "blocker must precede sampling");
 }
+
+#[test]
+fn human_watch_coalesces_discovery_gaps() {
+    // Gappy target: discovery gaps render as a grouped block with
+    // exact totals, not one line per gap.
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("gaps (") && text.contains("total in"),
+        "coalesced gap block, got: {text}"
+    );
+    assert!(
+        !text.contains("Discovery gap pid="),
+        "no per-gap lines remain, got: {text}"
+    );
+}

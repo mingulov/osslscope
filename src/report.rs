@@ -1994,6 +1994,9 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         }
         s.push('\n');
     }
+    // This list stays uncoalesced by design: evidence::GapReason is a
+    // different type from inventory::GapReason (no device/pid keys),
+    // so the shared gap_groups_block does not apply. Do not "fix".
     if !doc.reasons().is_empty() {
         s.push_str("reasons:\n");
         for reason in doc.reasons() {

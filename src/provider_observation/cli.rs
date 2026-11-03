@@ -252,15 +252,7 @@ impl Render for Record<'_> {
                     )?;
                 }
             }
-            for gap in &snapshot.gaps {
-                writeln!(
-                    writer,
-                    "  inventory_gap={} pid={}",
-                    finite(&gap.reason)?,
-                    gap.pid
-                        .map_or_else(|| "unknown".to_string(), |pid| pid.to_string())
-                )?;
-            }
+            writer.write_all(inventory_gap_block(&snapshot.gaps)?.as_bytes())?;
         }
         for fact in self.facts {
             let hash: String = fact.object_sha256.clone().into();
@@ -300,9 +292,7 @@ impl Render for Record<'_> {
             }
             writeln!(writer, " payload={}", finite(&fact.payload)?)?;
         }
-        for gap in self.gaps {
-            writeln!(writer, "  gap={}", finite(gap)?)?;
-        }
+        writer.write_all(observation_gap_block(self.gaps)?.as_bytes())?;
         Ok(())
     }
 }
@@ -383,6 +373,29 @@ fn end_reason_text(
         );
     }
     Some("osslscope provider discovery: providers partial (see records above)".into())
+}
+
+/// Human inventory-gap block for one batch (buffered for this flush
+/// only): typed gaps grouped by (word, device, pid). Empty when none.
+fn inventory_gap_block(gaps: &[inventory::Gap]) -> io::Result<String> {
+    Ok(crate::inventory::gap_groups_block(
+        gaps.iter().map(|g| (g.reason.word(), g.device, g.pid)),
+        "  ",
+    ))
+}
+
+/// Human observation-gap block for one batch: `ObservationGap`
+/// carries no device/pid, so groups key on the finite word only.
+/// Empty when none.
+fn observation_gap_block(gaps: &[ObservationGap]) -> io::Result<String> {
+    let mut words = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        words.push(finite(gap)?);
+    }
+    Ok(crate::inventory::gap_groups_block(
+        words.iter().map(|w| (w.as_str(), None, None)),
+        "  ",
+    ))
 }
 impl<W: Write> Stream<'_, W> {
     fn mode(&self) -> &'static str {
@@ -997,5 +1010,41 @@ mod tests {
                 "{human}"
             );
         }
+    }
+
+    #[test]
+    fn human_gap_blocks_coalesce_both_gap_kinds() {
+        use crate::inventory::{Gap, GapReason};
+        let gap = |reason: GapReason| Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: None,
+            reason,
+            errno: None,
+            actor_euid: None,
+        };
+        let inventory = super::inventory_gap_block(&[
+            gap(GapReason::BackingUnavailable),
+            gap(GapReason::BackingUnavailable),
+            gap(GapReason::Deadline),
+        ])
+        .unwrap();
+        assert!(
+            inventory.contains("gaps (3 total in 2 groups):")
+                && inventory.contains("backing_unavailable device=7 pid=11: 2"),
+            "inventory gaps coalesced, got: {inventory}"
+        );
+        let observation = super::observation_gap_block(&[
+            ObservationGap::BpfUnavailable,
+            ObservationGap::BpfUnavailable,
+            ObservationGap::SnapshotLag,
+        ])
+        .unwrap();
+        assert!(
+            observation.contains("gaps (3 total in 2 groups):"),
+            "observation gaps coalesced, got: {observation}"
+        );
+        assert_eq!(super::inventory_gap_block(&[]).unwrap(), "");
+        assert_eq!(super::observation_gap_block(&[]).unwrap(), "");
     }
 }
