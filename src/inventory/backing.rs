@@ -1290,6 +1290,9 @@ mod tests {
         fn spawn_in_new_mountns(paths: &[std::path::PathBuf]) -> Self {
             Self::spawn_via("unshare", &["-m", "python3"], paths)
         }
+        fn spawn_in_new_userns(paths: &[std::path::PathBuf]) -> Self {
+            Self::spawn_via("unshare", &["-U", "python3"], paths)
+        }
         fn spawn_via(program: &str, prefix: &[&str], paths: &[std::path::PathBuf]) -> Self {
             let mut child = Command::new(program)
                 .args(prefix)
@@ -1708,6 +1711,61 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    #[ignore = "requires root map_files (T4)"]
+    fn restarted_process_invalidates_retained_association() {
+        let dir = scratch("restart");
+        let path = dir.join("lib.so");
+        std::fs::write(&path, vec![0x52u8; 4096]).unwrap();
+        let child = MapChild::spawn(std::slice::from_ref(&path));
+        let range = child.range_of(&path);
+        let target = child.dir();
+        let candidate = File::open(&path).unwrap();
+        let assoc = verify_mapped_backing(&target, &range, &candidate).unwrap();
+        // Restart: the old incarnation is gone; a same-path successor must
+        // not validate the retained association.
+        drop(child);
+        let _successor = MapChild::spawn(std::slice::from_ref(&path));
+        assert!(
+            assoc.revalidate().is_err(),
+            "revalidate after restart must fail"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn userns_target_map_files_denied_to_outside_observer() {
+        // Portable denied shape (no privilege needed): a target in a child
+        // userns keeps world-readable maps, but the outside observer's
+        // map_files opens fail (EPERM/EACCES) — verify must say Denied,
+        // never Ok and never silent. The MapChild ready handshake proves
+        // post-exec stability, so no extra settle gate is needed.
+        if Command::new("unshare").arg("--help").output().is_err() {
+            eprintln!("skip: unshare absent");
+            return;
+        }
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: root observer bypasses the denial under test");
+            return;
+        }
+        let dir = scratch("userns");
+        let path = dir.join("lib.so");
+        std::fs::write(&path, vec![0x55u8; 4096]).unwrap();
+        let child = MapChild::spawn_in_new_userns(std::slice::from_ref(&path));
+        if std::fs::read(format!("/proc/{}/maps", child.pid())).is_err() {
+            eprintln!("skip: environment hides userns target maps");
+            return;
+        }
+        let range = child.range_of(&path);
+        let target = child.dir();
+        let candidate = File::open(&path).unwrap();
+        assert_eq!(
+            err_of(verify_mapped_backing(&target, &range, &candidate)),
+            BackingError::Denied
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[derive(Debug)]
     struct FixtureMount {
         point: std::path::PathBuf,
@@ -2085,6 +2143,79 @@ mod tests {
             )
             .unwrap();
         (guard, base)
+    }
+
+    #[test]
+    #[ignore = "requires root + btrfs + overlay mount (T4)"]
+    fn overlay_on_btrfs_subvolumes_lower_verifies_and_copyup_downgrades() {
+        let Some(fx) = BtrfsFixture::create(&["lower-sv", "upper-sv"]) else {
+            return;
+        };
+        let lower_file = fx.write("lower-sv", "lib.so", &[0x4fu8; 4096]);
+        let upper = fx.base.join("upper-sv");
+        std::fs::create_dir(upper.join("u")).unwrap();
+        std::fs::create_dir(upper.join("w")).unwrap();
+        // Preconditions: layers on btrfs, on distinct subvolumes.
+        let lower_meta = lower_file.metadata().unwrap();
+        let upper_meta = upper.metadata().unwrap();
+        assert_ne!(
+            lower_meta.dev(),
+            upper_meta.dev(),
+            "precondition: lower/upper on distinct subvolumes"
+        );
+        let mbase = scratch("overlay-btrfs");
+        std::fs::create_dir(mbase.join("merged")).unwrap();
+        let mut guard = MountGuard::new(mbase.clone());
+        guard
+            .mount(
+                mbase.join("merged"),
+                &[
+                    "-t",
+                    "overlay",
+                    "overlay",
+                    "-o",
+                    &format!(
+                        "lowerdir={},upperdir={},workdir={}",
+                        fx.base.join("lower-sv").display(),
+                        upper.join("u").display(),
+                        upper.join("w").display()
+                    ),
+                ],
+            )
+            .unwrap();
+        let merged = mbase.join("merged/lib.so");
+        // The child mapping must be gone before cleanup: an open merged
+        // mapping pins the mount and normal umount refuses (by design).
+        {
+            let child = MapChild::spawn(std::slice::from_ref(&merged));
+            let range = child.range_of(&merged);
+            let target = child.dir();
+            // Lower-only mapping verifies via the page witness (overlay target
+            // is never fast-pathed): the association carries a frame.
+            let lower = File::open(&lower_file).unwrap();
+            let assoc = verify_mapped_backing(&target, &range, &lower).unwrap();
+            assert!(
+                assoc.witness_page().is_some(),
+                "overlay must witness, not fast-path"
+            );
+            assert_eq!(
+                assoc.object_identity(),
+                (lower_meta.dev(), lower_meta.ino())
+            );
+            // Copy-up: the merged path now serves upper bytes, so the VMA's
+            // reported identity moves with it — the pre-copy-up association no
+            // longer describes live state and revalidation must fail closed.
+            std::fs::write(&merged, vec![0x55u8; 4096]).unwrap();
+            assert_eq!(assoc.revalidate(), Err(BackingError::Changed));
+            // And the merged path as a fresh candidate is a different file
+            // from the lower-bound mapping, so it must refuse too.
+            let upper_view = File::open(&merged).unwrap();
+            assert_eq!(
+                err_of(verify_mapped_backing(&target, &range, &upper_view)),
+                BackingError::Changed
+            );
+        }
+        guard.cleanup().unwrap();
     }
 
     fn mount_tmpfs_siblings(base: std::path::PathBuf, points: &[std::path::PathBuf]) -> MountGuard {
