@@ -3375,3 +3375,145 @@ fn swapped_selector_reference_matches_no_policy() {
     assert_eq!(violated.overall(), PolicyOutcome::Violation);
     assert_eq!(violated.rules[0].bounds.definite, 48);
 }
+
+/// F-005 copied code: identical bytes at two distinct code objects are
+/// two executions, never one deduplicated identity. The same alias
+/// label on both objects: require sums definite counts across objects,
+/// CBOM mints two components with distinct refs, total conserved.
+#[test]
+fn copied_code_at_distinct_objects_counts_twice() {
+    let site = |object: &str, device: u64, inode: u64, calls: u64| SiteExecution {
+        site: SiteKey {
+            object: obj(object),
+            device,
+            inode,
+            offset: 0x1000,
+        },
+        generation: 0,
+        candidates: vec![cand(
+            "prov-default",
+            "default",
+            DIGEST,
+            7,
+            &["SHA2-256"],
+            false,
+        )],
+        candidates_coverage: CandidateCoverage::Complete,
+        calls,
+        first_ns: 100,
+        last_ns: 200,
+        installed_at: None,
+    };
+    let d = complete_doc(vec![
+        site("copy-a-object", 7, 9, 7),
+        site("copy-b-object", 7, 10, 5),
+    ]);
+    assert!(
+        matches!(d.status, Completeness::Complete),
+        "two clean sites stay COMPLETE"
+    );
+    let v = evaluate_document(
+        std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
+        &d,
+    );
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    assert_eq!(v.rules[0].bounds.definite, 12);
+    assert_eq!(v.rules[0].bounds.possible, Some(12));
+    assert_eq!(d.total_calls(), 12);
+    let bytes = osslscope::report::render_cbom(&d).unwrap();
+    let cbom: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let components = cbom["components"].as_array().unwrap();
+    assert_eq!(components.len(), 2, "copied code mints two assets");
+    let refs: Vec<&str> = components
+        .iter()
+        .map(|c| c["bom-ref"].as_str().unwrap())
+        .collect();
+    assert_ne!(refs[0], refs[1], "distinct objects need distinct refs");
+}
+
+/// F-005 unfamiliar selector: an object-bound selector whose id is
+/// unregistered and carries no canonical name still selects the
+/// intended verified artifact — unknown-to-the-registry is not
+/// unknown-to-the-evidence. Contrast: an id with no entry stays
+/// inconclusive.
+#[test]
+fn unfamiliar_selector_without_canonical_name_selects_verified_artifact() {
+    const UNFAMILIAR: &str = "9f8e7d6c5b4a3928170615049382a1b0c9f8e7d6c5b4a3928170615049382a1b0c";
+    assert!(
+        !osslscope::kinds::is_known_alg(UNFAMILIAR),
+        "test id must stay unregistered"
+    );
+    let mut document = execution_doc(CandidateCoverage::Complete, exact_window());
+    document.algorithm_selectors[0].id = UNFAMILIAR.to_string();
+    document.algorithm_selectors[0].canonical_name = None;
+    let passed = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, UNFAMILIAR)],
+        &document,
+    );
+    assert_eq!(passed.overall(), PolicyOutcome::Pass);
+    assert_eq!(passed.rules[0].bounds.definite, 48);
+    let violated = evaluate_document(
+        &[PolicyRule::deny_selector(SEL_OBJECT, UNFAMILIAR)],
+        &document,
+    );
+    assert_eq!(violated.overall(), PolicyOutcome::Violation);
+    assert_eq!(violated.rules[0].bounds.definite, 48);
+    // No entry, no selection — in either rule direction.
+    for rule in [
+        PolicyRule::deny_selector(SEL_OBJECT, SEL_ID_OTHER),
+        PolicyRule::require_selector(SEL_OBJECT, SEL_ID_OTHER),
+    ] {
+        let verdict = evaluate_document(std::slice::from_ref(&rule), &document);
+        assert_eq!(
+            verdict.overall(),
+            PolicyOutcome::Inconclusive,
+            "{}",
+            rule.name
+        );
+        assert_eq!(verdict.rules[0].bounds.definite, 0);
+    }
+}
+
+/// F-005 reader survival: the exact selector facts the policy used
+/// (entries + attribution rows + site calls) reach the report JSON
+/// verbatim, so readers see the same identity evidence — identity is
+/// in the carried evidence, not in process memory.
+#[test]
+fn selector_facts_survive_into_report_json() {
+    let document = execution_doc(CandidateCoverage::Complete, exact_window());
+    let bytes = osslscope::report::render_json(&document).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    // Entries: object/id/operation/canonical name verbatim.
+    let entries = report["algorithm_selectors"].as_array().unwrap();
+    assert_eq!(entries.len(), document.algorithm_selectors.len());
+    assert_eq!(
+        entries[0]["object"],
+        document.algorithm_selectors[0].object.0
+    );
+    assert_eq!(
+        entries[0]["operation"],
+        document.algorithm_selectors[0].operation
+    );
+    assert_eq!(entries[0]["id"], document.algorithm_selectors[0].id);
+    assert_eq!(
+        entries[0]["canonical_name"].as_str(),
+        document.algorithm_selectors[0].canonical_name.as_deref()
+    );
+    // Attribution rows: selector refs + proved calls verbatim.
+    let rows = report["execution_attributions"].as_array().unwrap();
+    assert_eq!(rows.len(), document.execution_attributions.len());
+    for (row, live) in rows.iter().zip(document.execution_attributions.iter()) {
+        assert_eq!(row["selector"], live.selector);
+        assert_eq!(row["calls"], live.calls);
+        assert_eq!(row["operation"], live.operation);
+    }
+    // The policy verdict over the live doc still matches the carried
+    // facts: 37 + 11 proved calls behind the entry.
+    let v = evaluate_document(
+        &[PolicyRule::require_selector(SEL_OBJECT, SEL_ID_HMAC)],
+        &document,
+    );
+    assert_eq!(v.rules[0].bounds.definite, 48);
+    let carried: u64 = rows.iter().map(|r| r["calls"].as_u64().unwrap()).sum();
+    assert_eq!(carried, 48);
+}
