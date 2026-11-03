@@ -756,7 +756,14 @@ fn human_watch_coalesces_snapshot_gaps() {
     // gaps render as a grouped block with exact totals, not one line
     // per gap.
     let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
-        .args(["scan", "--watch", "--pid", "2147483647", "--duration", "0.3"])
+        .args([
+            "scan",
+            "--watch",
+            "--pid",
+            "2147483647",
+            "--duration",
+            "0.3",
+        ])
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
