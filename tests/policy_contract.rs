@@ -3726,3 +3726,31 @@ fn all_four_formats_agree_on_verdict_counts_and_assets() {
     // Physical total conserved across all three count sites.
     assert_eq!(d.total_calls(), 7);
 }
+
+/// Secret-canary positive control: target-namespaced pids in fatal
+/// details normalize to `/proc/<pid>` on BOTH human and JSON paths —
+/// a real pid must never reach an artifact.
+#[test]
+fn fatal_detail_pids_normalize_on_human_and_json() {
+    const PID: &str = "987654321";
+    let d = doc(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        exact_window(),
+        Some(FatalKind::Runtime(format!(
+            "open /proc/{PID}/maps: permission denied"
+        ))),
+    );
+    let human = osslscope::report::render_human(&d);
+    assert!(human.contains("/proc/<pid>"), "human normalizes:\n{human}");
+    assert!(!human.contains(PID), "human leaks pid:\n{human}");
+    let bytes = osslscope::report::render_json(&d).unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let detail = report["completeness"]["fatal_kind"]["detail"]
+        .as_str()
+        .unwrap();
+    assert!(detail.contains("/proc/<pid>"), "JSON normalizes: {detail}");
+    assert!(!detail.contains(PID), "JSON leaks pid: {detail}");
+}

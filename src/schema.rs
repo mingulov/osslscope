@@ -2349,6 +2349,43 @@ mod tests {
         check_v2_semantics(&doc).expect("new semantics accept context-free doc");
     }
 
+    #[test]
+    fn forbidden_keys_rejected_at_both_layers() {
+        // Secret-canary positive control for the reader gate: every
+        // key in FORBIDDEN_V2_KEYS (raw argv/cmdline/env/addresses)
+        // is rejected structurally by validate_v2 AND named by the
+        // check_v2_semantics sweep — at top level and nested.
+        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
+        let golden: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/report-v2-complete.json")).unwrap(),
+        )
+        .unwrap();
+        for key in FORBIDDEN_V2_KEYS {
+            let mut top = golden.clone();
+            top.as_object_mut().unwrap().insert(
+                (*key).to_string(),
+                serde_json::Value::from("canary-tripwire"),
+            );
+            assert!(
+                validate_v2(&top).is_err(),
+                "schema must reject top-level {key:?}"
+            );
+            let Err(err) = check_v2_semantics(&top) else {
+                panic!("sweep must reject top-level {key:?}");
+            };
+            assert!(err.contains(key), "sweep names the key, got: {err}");
+            let mut nested = golden.clone();
+            nested["target"]
+                .as_object_mut()
+                .unwrap()
+                .insert((*key).to_string(), serde_json::Value::from(1));
+            let Err(err) = check_v2_semantics(&nested) else {
+                panic!("sweep must reject nested {key:?}");
+            };
+            assert!(err.contains(key), "nested sweep names the key, got: {err}");
+        }
+    }
+
     fn report_golden_names(names: impl Iterator<Item = String>) -> Vec<String> {
         let mut names: Vec<_> = names
             .filter(|f| f.starts_with("report-") && f.ends_with(".json"))

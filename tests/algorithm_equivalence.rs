@@ -878,3 +878,39 @@ fn mixed_ok_blend_withholds_finite_claim() {
         "ok-then-mixed blend must withhold"
     );
 }
+
+/// Secret-canary positive control: raw unknown target bytes must
+/// never reach any output path. The canary row classifies unknown,
+/// and every renderer (human/JSON/CBOM/policy-record) carries only
+/// the unknown/other markers — the raw bytes appear nowhere.
+#[test]
+fn unknown_target_bytes_never_reach_any_output() {
+    const CANARY: &str = "canary-DOOM-7QZ";
+    let (doc, label, _, status) = doc_for_alias("canary-render", DIGEST_OP, CANARY, 0xE00);
+    assert_eq!(status, "unknown");
+    assert_eq!(label, "other");
+    let human = osslscope::report::render_human(&doc);
+    let json = osslscope::report::render_json(&doc).unwrap();
+    let cbom = osslscope::report::render_cbom(&doc).unwrap();
+    let verdict = evaluate_document(
+        std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
+        &doc,
+    );
+    let policy = serde_json::to_vec(&osslscope::check::policy_json(&doc, &verdict)).unwrap();
+    for (name, bytes) in [
+        ("human", human.as_bytes()),
+        ("json", &json),
+        ("cbom", &cbom),
+        ("policy-record", &policy),
+    ] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(
+            !text.contains(CANARY),
+            "{name} leaks raw target bytes:\n{text}"
+        );
+    }
+    // The markers readers DO see: unknown coverage + other class.
+    let report: serde_json::Value = serde_json::from_slice(&json).unwrap();
+    assert_eq!(report["sites"][0]["candidates_coverage"], "unknown");
+    assert!(human.contains("unknown"), "human names it:\n{human}");
+}
