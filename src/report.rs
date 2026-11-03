@@ -2093,7 +2093,7 @@ fn fp_short(fp: &str) -> String {
 /// vocabulary (status, verdicts, op names, numbers) needs none.
 /// JSON keeps the reversible original — only human rendering calls
 /// this.
-fn safe_display(text: &str) -> String {
+pub(crate) fn safe_display(text: &str) -> String {
     text.chars()
         .map(|c| {
             if c.is_control() || is_display_control(c) {

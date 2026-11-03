@@ -363,6 +363,23 @@ impl<W: Write> Output<'_, W> {
                 if counters.len() > ROWS {
                     writeln!(w, "  Gaps omitted={}", counters.len() - ROWS)?;
                 }
+                // P1c diagnostic channels: the same shaped cause the NDJSON
+                // envelope carries in full, bounded here by the ROWS
+                // discipline with explicit omitted counts.
+                for (name, label) in [
+                    ("attach_diagnostics", "Attach diagnostic"),
+                    ("refusal_diagnostics", "Refusal diagnostic"),
+                ] {
+                    let diags = d[name].as_array().map(Vec::as_slice).unwrap_or(&[]);
+                    for diag in diags.iter().take(ROWS) {
+                        if let Some(text) = diag.as_str() {
+                            writeln!(w, "  {label}: {}", crate::report::safe_display(text))?;
+                        }
+                    }
+                    if diags.len() > ROWS {
+                        writeln!(w, "  {label}s omitted={}", diags.len() - ROWS)?;
+                    }
+                }
                 Ok(())
             }
             Record::End {
@@ -876,6 +893,70 @@ mod tests {
         assert_eq!(text.lines().count(), 10);
         assert!(text.contains("Gaps omitted=4"));
         assert!(text.contains("coverage=partial attribution=unknown"));
+    }
+    #[test]
+    fn human_and_json_modes_carry_the_same_diagnostics() {
+        let identity = Incarnation {
+            pid: 42,
+            starttime: 123,
+            namespaces: inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        };
+        let attach: Vec<_> = (0..10)
+            .map(|i| serde_json::json!(format!("attach:link probe@0x{i:x} failed (kind=Denied)")))
+            .collect();
+        let document = serde_json::json!({
+            "sites": [], "objects": [],
+            "attach_diagnostics": attach,
+            "refusal_diagnostics": ["budget:keyed-alloc limit: 3 entries"],
+        });
+        // Human: bounded summaries with omitted counts, same ROWS discipline
+        // as ops/apis/gaps.
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+            pending_gaps: Vec::new(),
+        };
+        out.emit(Record::ProcessObservation {
+            incarnation: &identity,
+            segment: 4,
+            retirement: "duration",
+            document: &document,
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("attach:link probe@0x0 failed (kind=Denied)"),
+            "{text}"
+        );
+        assert!(text.contains("Attach diagnostics omitted=2"), "{text}");
+        assert!(
+            text.contains("budget:keyed-alloc limit: 3 entries"),
+            "{text}"
+        );
+        // JSON: the same document carries both channels in full.
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+        };
+        out.emit(Record::ProcessObservation {
+            incarnation: &identity,
+            segment: 4,
+            retirement: "duration",
+            document: &document,
+        })
+        .unwrap();
+        let envelope: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let doc = &envelope["document"];
+        assert_eq!(doc["attach_diagnostics"].as_array().unwrap().len(), 10);
+        assert_eq!(doc["refusal_diagnostics"].as_array().unwrap().len(), 1);
     }
     #[test]
     fn two_normal_reservations_include_coordinator_scanner_and_stock_parser() {
