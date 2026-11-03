@@ -1237,13 +1237,20 @@ mod tests {
     }
 
     fn scratch(prefix: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "osslscope-backing-{prefix}-{}-{}",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir(&dir).unwrap();
-        dir
+        // Retry on collision: in pid-namespaced suites pids recur across
+        // runs, so a leaked dir plus a reused pid must not panic.
+        loop {
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-backing-{prefix}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("scratch create_dir failed: {error}"),
+            }
+        }
     }
 
     fn self_range(executable: bool) -> MappedRange {
@@ -1770,6 +1777,8 @@ mod tests {
         let child = MapChild::spawn_in_new_userns(std::slice::from_ref(&path));
         if std::fs::read(format!("/proc/{}/maps", child.pid())).is_err() {
             eprintln!("skip: environment hides userns target maps");
+            drop(child);
+            std::fs::remove_dir_all(&dir).unwrap();
             return;
         }
         let range = child.range_of(&path);
@@ -2098,6 +2107,7 @@ mod tests {
     struct BtrfsFixture {
         base: std::path::PathBuf,
         subvols: Vec<std::path::PathBuf>,
+        watched: Vec<std::path::PathBuf>,
     }
     impl BtrfsFixture {
         fn create(names: &[&str]) -> Option<Self> {
@@ -2146,7 +2156,11 @@ mod tests {
                     }
                 }
             }
-            Some(Self { base, subvols })
+            Some(Self {
+                base,
+                subvols,
+                watched: Vec::new(),
+            })
         }
         fn write(&self, subvol: &str, name: &str, bytes: &[u8]) -> std::path::PathBuf {
             let path = self.base.join(subvol).join(name);
@@ -2194,20 +2208,38 @@ mod tests {
         }
     }
     impl BtrfsFixture {
-        /// Couple to a retained mount: when unmount refuses and the mount
-        /// is kept by policy, the backing subvolumes must survive with it
-        /// (leak by design, loudly) instead of being deleted from under it.
-        fn retain(self, reason: &str) {
-            eprintln!(
-                "BtrfsFixture: retaining {} subvolumes under {}: {reason}",
-                self.subvols.len(),
-                self.base.display()
-            );
-            std::mem::forget(self);
+        /// Couple to a mount's fate: while a watched mountpoint is still
+        /// mounted — including during unwind after MountGuard retained it
+        /// — the backing subvolumes survive with it instead of being
+        /// deleted from under a kept mount.
+        fn watch(&mut self, point: std::path::PathBuf) {
+            self.watched.push(point);
         }
     }
     impl Drop for BtrfsFixture {
         fn drop(&mut self) {
+            let stuck = match fixture_mounts() {
+                Ok(mounts) => self
+                    .watched
+                    .iter()
+                    .any(|w| mounts.iter().any(|(p, _)| p == w)),
+                Err(error) => {
+                    eprintln!(
+                        "BtrfsFixture: cannot verify mount release ({error}); retaining {} subvolumes under {}",
+                        self.subvols.len(),
+                        self.base.display()
+                    );
+                    return;
+                }
+            };
+            if stuck {
+                eprintln!(
+                    "BtrfsFixture: watched mount still present; retaining {} subvolumes under {}",
+                    self.subvols.len(),
+                    self.base.display()
+                );
+                return;
+            }
             for subvol in self.subvols.iter().rev() {
                 // Loud, never panicking: a failed delete leaks a subvolume
                 // and must show in logs, not vanish. Both spawn errors and
@@ -2259,7 +2291,7 @@ mod tests {
     #[test]
     #[ignore = "requires root + btrfs + overlay mount (T4)"]
     fn overlay_on_btrfs_subvolumes_lower_verifies_and_copyup_downgrades() {
-        let Some(fx) = BtrfsFixture::create(&["lower-sv", "upper-sv"]) else {
+        let Some(mut fx) = BtrfsFixture::create(&["lower-sv", "upper-sv"]) else {
             return;
         };
         let lower_file = fx.write("lower-sv", "lib.so", &[0x4fu8; 4096]);
@@ -2294,6 +2326,7 @@ mod tests {
                 ],
             )
             .unwrap();
+        fx.watch(mbase.join("merged"));
         let merged = mbase.join("merged/lib.so");
         // The child mapping must be gone before cleanup: an open merged
         // mapping pins the mount and normal umount refuses (by design).
@@ -2326,14 +2359,10 @@ mod tests {
                 BackingError::Changed
             );
         }
-        // Couple the backing to the mount's fate: if cleanup refuses, the
-        // mount is retained by policy and the subvolumes must survive with
-        // it — deleting them from under a retained mount would corrupt the
-        // evidence MountGuard kept.
-        if let Err(error) = guard.cleanup() {
-            fx.retain(&error);
-            panic!("{error}");
-        }
+        // Drop order (guard before fx) plus the watched mountpoint couples
+        // the backing to the mount's fate on every path: explicit cleanup
+        // failure, unwind retention, or success.
+        guard.cleanup().unwrap();
     }
 
     fn mount_tmpfs_siblings(base: std::path::PathBuf, points: &[std::path::PathBuf]) -> MountGuard {
