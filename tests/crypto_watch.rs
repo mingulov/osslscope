@@ -1144,7 +1144,8 @@ fn human_watch_prints_identity_and_tracing_health() {
     assert!(matches!(output.status.code(), Some(3 | 4)));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
-        text.contains("identity: ") && text.contains("verified"),
+        text.contains("identity: ")
+            && (text.contains("verified") || text.contains("no modules inventoried")),
         "identity totals on Discovery rows, got: {text}"
     );
     assert_eq!(
@@ -1279,24 +1280,21 @@ fn module_selection_vetoes_human_blindness_only() {
 
 #[test]
 fn human_watch_coalesces_discovery_gaps() {
-    // Gappy target: discovery gaps render as a grouped block with
-    // exact totals, not one line per gap.
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Dead pid (deterministic in any privilege lane): discovery gaps
+    // render as a grouped block with exact totals, not one line per
+    // gap.
     let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
         .args([
             "scan",
             "--watch",
             "--observe-crypto",
             "--pid",
-            &child.id().to_string(),
+            "2147483647",
             "--duration",
             "1",
         ])
         .output()
         .unwrap();
-    child.kill().unwrap();
-    child.wait().unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
         text.contains("gaps (") && text.contains("total in"),

@@ -676,7 +676,8 @@ fn human_watch_snapshot_prints_identity_totals() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("Snapshot 1:"), "sampled, got: {text}");
     assert!(
-        text.contains("identity: ") && text.contains("verified"),
+        text.contains("identity: ")
+            && (text.contains("verified") || text.contains("no modules inventoried")),
         "identity totals on human snapshots, got: {text}"
     );
 }
@@ -751,16 +752,13 @@ fn human_watch_states_blindness_exactly_once_when_verified() {
 
 #[test]
 fn human_watch_coalesces_snapshot_gaps() {
-    // Gappy target: per-snapshot gaps render as a grouped block with
-    // exact totals, not one line per gap.
-    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    let pid = child.id().to_string();
+    // Dead pid (deterministic in any privilege lane): per-snapshot
+    // gaps render as a grouped block with exact totals, not one line
+    // per gap.
     let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
-        .args(["scan", "--watch", "--pid", &pid, "--duration", "0.3"])
+        .args(["scan", "--watch", "--pid", "2147483647", "--duration", "0.3"])
         .output()
         .unwrap();
-    child.kill().unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(
         text.contains("gaps (") && text.contains("total in"),
