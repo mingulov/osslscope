@@ -2108,6 +2108,7 @@ mod tests {
         base: std::path::PathBuf,
         subvols: Vec<std::path::PathBuf>,
         watched: Vec<std::path::PathBuf>,
+        released: bool,
     }
     impl BtrfsFixture {
         fn create(names: &[&str]) -> Option<Self> {
@@ -2160,6 +2161,7 @@ mod tests {
                 base,
                 subvols,
                 watched: Vec::new(),
+                released: false,
             })
         }
         fn write(&self, subvol: &str, name: &str, bytes: &[u8]) -> std::path::PathBuf {
@@ -2208,12 +2210,20 @@ mod tests {
         }
     }
     impl BtrfsFixture {
-        /// Couple to a mount's fate: while a watched mountpoint is still
-        /// mounted — including during unwind after MountGuard retained it
-        /// — the backing subvolumes survive with it instead of being
-        /// deleted from under a kept mount.
+        /// Couple to a mount's fate: once watched, the backing subvolumes
+        /// survive unless the cell proves release via [`Self::disarm`]
+        /// after [`MountGuard::cleanup`] succeeds. Mount-table absence is
+        /// deliberately NOT consulted: rename-away and path replacement
+        /// both forge absence while the mount lives, so only the guard's
+        /// own confirmed cleanup is a sound release signal. Default is
+        /// unresolved — any unwind before `disarm` retains loudly.
         fn watch(&mut self, point: std::path::PathBuf) {
             self.watched.push(point);
+        }
+        /// Prove release: call only after `MountGuard::cleanup` returned
+        /// `Ok`, which verifies mount absence itself. Unlocks deletion.
+        fn disarm(&mut self) {
+            self.released = true;
         }
     }
     /// Destructor-context log: `eprintln!` panics when stderr is dead
@@ -2226,33 +2236,17 @@ mod tests {
     }
     impl Drop for BtrfsFixture {
         fn drop(&mut self) {
-            // Canonicalize for the mount-table comparison: mountinfo
-            // carries kernel-resolved absolute paths while watched points
-            // may descend from a symlinked TMPDIR. When canonicalization
-            // fails the path is gone (successful cleanup removed it, and
-            // the guard never removes its base while a mount stands), so
-            // the lexical form is a safe fallback, never a retain trigger.
-            let resolved: Vec<std::path::PathBuf> = self
-                .watched
-                .iter()
-                .map(|w| std::fs::canonicalize(w).unwrap_or_else(|_| w.clone()))
-                .collect();
-            let stuck = match fixture_mounts() {
-                Ok(mounts) => resolved.iter().any(|w| mounts.iter().any(|(p, _)| p == w)),
-                Err(error) => {
-                    drop_log(format!(
-                        "BtrfsFixture: cannot verify mount release ({error}); retaining {} subvolumes under {}",
-                        self.subvols.len(),
-                        self.base.display()
-                    ));
-                    return;
-                }
-            };
-            if stuck {
+            // Release proof, not path presence: any watched-but-undisarmed
+            // fixture retains. Unwind before disarm (mount failure, mid-test
+            // panic, retained mount) always leaks loudly rather than risk
+            // deleting backing under a live mount. Reclaim with `btrfs
+            // subvolume delete` on each subvolume, then remove the base.
+            if !self.watched.is_empty() && !self.released {
                 drop_log(format!(
-                    "BtrfsFixture: watched mount still present; retaining {} subvolumes under {}",
+                    "BtrfsFixture: mount release unconfirmed; retaining {} subvolumes under {} (watched: {:?})",
                     self.subvols.len(),
-                    self.base.display()
+                    self.base.display(),
+                    self.watched
                 ));
                 return;
             }
@@ -2324,13 +2318,13 @@ mod tests {
         );
         let mbase = scratch("overlay-btrfs");
         std::fs::create_dir(mbase.join("merged")).unwrap();
-        // Register before acquisition: mount() can establish the mount
-        // and still return Err during table/identity inspection, and the
-        // resulting unwind must find the watch already in place. A failed
-        // acquisition leaves no mount behind, so an unmatched watch is
-        // harmless — the drop check simply finds nothing mounted.
-        fx.watch(mbase.join("merged"));
         let mut guard = MountGuard::new(mbase.clone());
+        // Register after construction (which acquires nothing) but before
+        // acquisition: mount() can establish the mount and still return
+        // Err during table/identity inspection, and the resulting unwind
+        // must find the watch already in place. Release is proven by
+        // disarm() after cleanup succeeds — see BtrfsFixture::watch.
+        fx.watch(mbase.join("merged"));
         guard
             .mount(
                 mbase.join("merged"),
@@ -2380,10 +2374,11 @@ mod tests {
                 BackingError::Changed
             );
         }
-        // Drop order (guard before fx) plus the watched mountpoint couples
-        // the backing to the mount's fate on every path: explicit cleanup
-        // failure, unwind retention, or success.
+        // Proven release unlocks backing deletion: cleanup verified the
+        // mount is gone, so disarm lets the fixture reclaim. Any unwind
+        // before this point retains loudly instead.
         guard.cleanup().unwrap();
+        fx.disarm();
     }
 
     fn mount_tmpfs_siblings(base: std::path::PathBuf, points: &[std::path::PathBuf]) -> MountGuard {
