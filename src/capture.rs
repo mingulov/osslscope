@@ -538,11 +538,17 @@ fn unix_ns(t: SystemTime) -> Option<u64> {
 /// sample — the same pair the enclosing Capture carries).
 /// Monotonic window fields stay authoritative; this context never
 /// feeds durations or deadlines.
-fn doc_context(kernel_release: &str, start: SystemTime, end: SystemTime) -> CaptureContext {
+fn doc_context(
+    kernel_release: &str,
+    start: SystemTime,
+    end: SystemTime,
+    sysctls: Option<evidence::SysctlContext>,
+) -> CaptureContext {
     CaptureContext {
         kernel_release: kernel_release.to_string(),
         wall_start_unix_ns: unix_ns(start),
         wall_end_unix_ns: unix_ns(end),
+        sysctls,
     }
 }
 
@@ -5694,6 +5700,16 @@ pub struct TargetInfo {
     pub cmdline: String,
     pub container_id: String,
     pub kernel_release: String,
+    /// Admission-event sysctl sample (T5 schema D-record rule 7):
+    /// sampled once at setup, retained through finalization, never
+    /// reread. `None` before the sampling line runs.
+    pub sysctls: Option<evidence::SysctlContext>,
+    /// Eligible version observations (T5 schema D-record rule 3):
+    /// the enrolled provider's observation when eligible (target
+    /// mappings' ELF evidence is not threaded to finalize, so
+    /// foreign multi-object accumulation stays future work —
+    /// unexamined mappings are ineligible, never silently merged).
+    pub version_observations: Vec<evidence::VersionObservation>,
     pub provider_build_id: String,
     pub provider_path: String,
     pub image_digest: String,
@@ -7062,6 +7078,11 @@ where
                 &self.info.container_id,
                 &self.info.image_digest,
             ),
+            // T5 schema D-record cell 3: recycle voids the target
+            // identity the admission observation was enrolled
+            // under — no re-proof runs, so the label is unknown
+            // (evidence discarded; only observer-view sysctls
+            // stand on a recycled document).
             openssl: OpensslVersion::unknown(),
             disposition: None,
             policy: None,
@@ -7071,11 +7092,15 @@ where
         });
         // R12: retain the one consistently captured pair (the
         // observations are discarded, but the host context stands).
-        document.context = Some(doc_context(
-            &self.info.kernel_release,
-            self.state.wall_start,
-            self.state.wall_end,
-        ));
+        evidence::stamp_context(
+            &mut document,
+            doc_context(
+                &self.info.kernel_release,
+                self.state.wall_start,
+                self.state.wall_end,
+                self.info.sysctls.clone(),
+            ),
+        );
         self.state.reasons.clear();
         self.reason("pid-recycled");
         if close_failed {
@@ -7183,6 +7208,7 @@ fn preparation_error<T: TargetPort>(
                 kernel_release: info.kernel_release.clone(),
                 wall_start_unix_ns: (!info.owned).then(|| unix_ns(info.acquired_wall)).flatten(),
                 wall_end_unix_ns: None,
+                sysctls: info.sysctls.clone(),
             }),
         },
         false,
@@ -7786,6 +7812,7 @@ where
                         .then(|| unix_ns(self.info.acquired_wall))
                         .flatten(),
                     wall_end_unix_ns: None,
+                    sysctls: self.info.sysctls.clone(),
                 }),
             },
             false,
@@ -9367,7 +9394,9 @@ where
                 &self.info.container_id,
                 &self.info.image_digest,
             ),
-            openssl: OpensslVersion::unknown(),
+            // T5 schema D-record rule 3: coarse-or-unknown only, so a
+            // sysctl-stamped (v2.6) document always passes the gate.
+            openssl: evidence::accumulate_openssl_family(&self.info.version_observations),
             disposition: doc_disposition(self.info.owned, disposition.as_ref()),
             policy: None,
             legacy_partition: evidence_partition(call_partition),
@@ -9376,11 +9405,15 @@ where
         });
         // R12: retain the one consistently captured pair
         // (monotonic fields stay authoritative).
-        document.context = Some(doc_context(
-            &self.info.kernel_release,
-            self.state.wall_start,
-            self.state.wall_end,
-        ));
+        evidence::stamp_context(
+            &mut document,
+            doc_context(
+                &self.info.kernel_release,
+                self.state.wall_start,
+                self.state.wall_end,
+                self.info.sysctls.clone(),
+            ),
+        );
         // R06: failed-attach diagnostics ride the document (sorted
         // set take, capped — deterministic; the counters stay the
         // exact counts regardless).
@@ -9762,6 +9795,10 @@ fn recycled_capture(
         counters: Vec::new(),
         fatal: Some(evidence::FatalKind::Recycled),
         target: doc_target(info.pid, &info.comm, &info.container_id, &info.image_digest),
+        // T5 schema D-record cell 3: the pin failed before any
+        // session was held, so the enrolled observation never
+        // gained a live target — unknown, like every other
+        // discarded observation (sysctls stand: observer view).
         openssl: OpensslVersion::unknown(),
         disposition: None,
         policy: None,
@@ -9771,11 +9808,15 @@ fn recycled_capture(
     });
     // R12: the pre-attach recycle carries the acquisition instant in
     // both wall edges, mirroring the legacy Capture wall fields.
-    document.context = Some(doc_context(
-        &info.kernel_release,
-        info.acquired_wall,
-        info.acquired_wall,
-    ));
+    evidence::stamp_context(
+        &mut document,
+        doc_context(
+            &info.kernel_release,
+            info.acquired_wall,
+            info.acquired_wall,
+            info.sysctls.clone(),
+        ),
+    );
     // v0.2: the objects resolved before the recycle still record
     // (the selection happened; only the window never opened).
     document.selected_objects = selected_objects.clone();
@@ -9817,6 +9858,32 @@ struct ResolvedProvider {
     builtin: bool,
     build_id: String,
     provider_class: Option<String>,
+    version_observation: Option<evidence::VersionObservation>,
+}
+
+/// Enrolled-provider version observation (T5 schema D-record rule 3):
+/// builtin qualification implies core anchors on the read bytes —
+/// `qualify_libcrypto_bytes` returns unsupported for every
+/// non-OpenSSL flavor (Boring/AWS-LC/lookalike/not-crypto/parse
+/// failure), so `Supported` with `builtin` means the flavor anchors
+/// (`OSSL_PROVIDER_load` + `OPENSSL_version_major`, dynsym or
+/// `.symtab` for static exes) were present. File-provider mode
+/// (`builtin == false`) never establishes anchors → ineligible.
+/// The table hit MUST come from the shipped table (callers pass no
+/// override); override-only build-ids yield the unmatched poison.
+fn enrolled_version_observation(
+    builtin: bool,
+    build_id: Option<&str>,
+    shipped: &crate::discovery::builtin::Table,
+) -> Option<evidence::VersionObservation> {
+    if !builtin {
+        return None;
+    }
+    Some(evidence::VersionObservation {
+        table_openssl: build_id
+            .and_then(|id| shipped.by_build_id(id))
+            .map(|entry| entry.openssl.clone()),
+    })
 }
 
 /// Effective run config: onboarding `None`s replaced by resolved
@@ -9938,8 +10005,13 @@ fn resolve_qualification(
             Ok(ResolvedProvider {
                 path: t.provider_path,
                 builtin: t.builtin,
-                build_id: t.build_id.unwrap_or_else(|| "unknown".to_string()),
+                build_id: t.build_id.clone().unwrap_or_else(|| "unknown".to_string()),
                 provider_class: t.provider_class.map(|c| c.as_str().to_string()),
+                version_observation: enrolled_version_observation(
+                    t.builtin,
+                    t.build_id.as_deref(),
+                    &crate::discovery::builtin::shipped_table(),
+                ),
             })
         }
         onboard::TargetQualification::Unsupported {
@@ -10759,6 +10831,11 @@ fn read_owned_setup_context(
     links.publish_context(info);
     links.check(control, BoundaryStage::Setup)?;
     info.kernel_release = crate::doctor::uname_release_opt().unwrap_or_default();
+    // Admission-event sysctl sample (T5 schema D-record rule 7):
+    // once here, retained on `info`, never reread.
+    info.sysctls = Some(evidence::sample_sysctls_from(std::path::Path::new(
+        "/proc/sys",
+    )));
     links.publish_context(info);
     links.check(control, BoundaryStage::Setup)?;
     Ok(())
@@ -10834,6 +10911,10 @@ fn prepare_live_owned_setup(
             let effective = effective_config(&source.cfg, &source.objects, &resolved);
             source.info.provider_build_id = resolved.build_id.clone();
             source.info.provider_path = resolved.path.to_string_lossy().into_owned();
+            source
+                .info
+                .version_observations
+                .extend(resolved.version_observation.clone());
             links.check(control, BoundaryStage::Setup)?;
             let lifecycle = {
                 let prefix = lease.prefix_permit(control.deadline()).map_err(|e| {
@@ -11299,7 +11380,11 @@ fn run_controlled_owned(
         cmdline: args::redact_spawn_argv(&argv),
         container_id: String::new(),
         kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
+        sysctls: Some(evidence::sample_sysctls_from(std::path::Path::new(
+            "/proc/sys",
+        ))),
         provider_build_id: String::new(),
+        version_observations: Vec::new(),
         provider_path: String::new(),
         image_digest: cfg.image_digest.clone(),
         acquired_ns: acq_ns,
@@ -11520,6 +11605,7 @@ where
                 kernel_release: kernel,
                 wall_start_unix_ns: None,
                 wall_end_unix_ns: None,
+                sysctls: info.sysctls.clone(),
             }),
         },
         false,
@@ -11635,7 +11721,11 @@ fn run_inner_with_admitted(
                 cmdline: args::redact_proc_cmdline(&raw),
                 container_id: container_id_of(p),
                 kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
+                sysctls: Some(evidence::sample_sysctls_from(std::path::Path::new(
+                    "/proc/sys",
+                ))),
                 provider_build_id: String::new(),
+                version_observations: Vec::new(),
                 provider_path: String::new(),
                 image_digest: cfg.image_digest.clone(),
                 acquired_ns: acq_ns,
@@ -11655,6 +11745,8 @@ fn run_inner_with_admitted(
             let effective = effective_config(cfg, &objects, &resolved);
             info.provider_build_id = resolved.build_id.clone();
             info.provider_path = resolved.path.to_string_lossy().into_owned();
+            info.version_observations
+                .extend(resolved.version_observation.clone());
             let discovery = match DiscoverySession::attach(
                 &crate::discovery::session::DiscoveryConfig {
                     provider: resolved.path,
@@ -11820,6 +11912,67 @@ pub(crate) mod tests {
         assert!(
             err.to_string().contains("builtin query anchor"),
             "refusal names the anchor: {err:#}"
+        );
+    }
+
+    #[test]
+    fn t5_cell5_doc_context_threads_retained_sample() {
+        // T5 schema D-record rule 7: every stamp site (owned,
+        // foreign, pre-attach-refusal, preparation-error) funnels
+        // the retained admission sample through doc_context +
+        // stamp_context — no site rereads. Pin the seam: the
+        // stamped document carries exactly the passed sample.
+        let sample = evidence::SysctlContext {
+            perf_event_paranoid: Some(4),
+            kptr_restrict: None,
+            unprivileged_bpf_disabled: Some(2),
+            ptrace_scope: Some(1),
+        };
+        let context = doc_context(
+            "6.9.0-test",
+            SystemTime::UNIX_EPOCH,
+            SystemTime::UNIX_EPOCH,
+            Some(sample.clone()),
+        );
+        assert_eq!(context.sysctls, Some(sample));
+        assert_eq!(context.kernel_release, "6.9.0-test");
+    }
+
+    #[test]
+    fn t5_cell3_enrolled_observation_eligibility() {
+        // T5 schema D-record rules 2–3: file-provider mode never
+        // establishes core anchors → ineligible even with a
+        // shipped table hit. Builtin hits read the shipped table
+        // only; override-only/unknown ids and missing build-ids
+        // yield the unmatched poison observation (accumulates to
+        // unknown, never a label).
+        let shipped = crate::discovery::builtin::shipped_table();
+        let hit = "b12cd44337cb70619dd290b2396ab5dfcaea230f";
+        assert_eq!(
+            enrolled_version_observation(false, Some(hit), &shipped),
+            None
+        );
+        assert_eq!(
+            enrolled_version_observation(true, Some(hit), &shipped),
+            Some(evidence::VersionObservation {
+                table_openssl: Some("4.0.2".to_string()),
+            })
+        );
+        assert_eq!(
+            enrolled_version_observation(
+                true,
+                Some("0000000000000000000000000000000000000000"),
+                &shipped
+            ),
+            Some(evidence::VersionObservation {
+                table_openssl: None
+            })
+        );
+        assert_eq!(
+            enrolled_version_observation(true, None, &shipped),
+            Some(evidence::VersionObservation {
+                table_openssl: None
+            })
         );
     }
 
@@ -13700,6 +13853,7 @@ pub(crate) mod tests {
             "6.9.0-test",
             epoch + Duration::from_nanos(2_000),
             epoch + Duration::from_nanos(1_000),
+            None,
         );
         assert_eq!(ctx.kernel_release, "6.9.0-test");
         assert_eq!(ctx.wall_start_unix_ns, Some(2_000));
@@ -15806,6 +15960,50 @@ pub(crate) mod tests {
         }
 
         #[test]
+        fn t5_cell3_recycle_drops_admission_observation() {
+            // T5 schema D-record cell 3: recycle voids the target
+            // identity the admission observation was enrolled
+            // under — no re-proof runs, so the document label is
+            // unknown even when admission enrolled a table hit.
+            // Mid-run recycle path (Runner::recycled).
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.version_observations = vec![evidence::VersionObservation {
+                table_openssl: Some("3.5.8".to_string()),
+            }];
+            let clock = ClockStub::at(5_000_000_000);
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let runner = stub_runner(
+                &cfg,
+                &info,
+                TraversalStub::scripted(vec![], TraversalCapture::default()),
+                count,
+                &clock,
+                &mut proc,
+                &cancelled,
+            );
+            let cap = runner.recycled();
+            assert_eq!(cap.document.openssl, evidence::OpensslVersion::unknown());
+        }
+
+        #[test]
+        fn t5_cell3_pre_attach_recycle_drops_admission_observation() {
+            // Same fence, pre-attach recycle path
+            // (recycled_capture): the pin failed during discovery
+            // attach, so the enrolled observation never gained a
+            // live target.
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.version_observations = vec![evidence::VersionObservation {
+                table_openssl: Some("3.5.8".to_string()),
+            }];
+            let cap = recycled_capture(&cfg, &info, None);
+            assert_eq!(cap.document.openssl, evidence::OpensslVersion::unknown());
+        }
+
+        #[test]
         fn traversal_capture_merge() {
             // Records append, end-state flags refresh, provenance
             // and finish-error fill once (first wins).
@@ -16238,7 +16436,9 @@ pub(crate) mod tests {
                 cmdline: String::new(),
                 container_id: String::new(),
                 kernel_release: String::new(),
+                sysctls: None,
                 provider_build_id: String::new(),
+                version_observations: Vec::new(),
                 provider_path: String::new(),
                 image_digest: String::new(),
                 acquired_ns: 5_000_000_000,
@@ -19241,7 +19441,9 @@ mod fix1_live_provider_tests {
             cmdline: String::new(),
             container_id: String::new(),
             kernel_release: String::new(),
+            sysctls: None,
             provider_build_id: String::new(),
+            version_observations: Vec::new(),
             provider_path: String::new(),
             image_digest: String::new(),
             acquired_ns: LiveClock.monotonic_ns(),

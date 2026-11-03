@@ -152,6 +152,13 @@ const PAGEMAP_PRESENT: u64 = 1 << 63;
 const PAGEMAP_FILE: u64 = 1 << 61;
 const PAGEMAP_PFN_MASK: u64 = (1 << 55) - 1;
 
+/// Btrfs superblock magic (single home): anonymous st_dev per
+/// subvolume keeps identity unique — the device carve-out in
+/// [`check_target_keys`](BackingProcess::check_target_keys) uses it
+/// for cross-domain (maps-vs-stat) comparisons. Render-time
+/// `--resolve-paths` checks are exact and never consult it.
+pub(crate) const BTRFS_SUPER_MAGIC: libc::c_long = 0x9123683e;
+
 fn filesystem_type(file: &File) -> Option<libc::c_long> {
     let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: fstatfs initializes stat on success and borrows an open FD.
@@ -577,7 +584,7 @@ impl BackingProcess {
             return Err(BackingError::Changed);
         }
         let fstype = filesystem_type(target);
-        if fingerprint.dev != vma.dev && fstype != Some(0x9123683e) {
+        if fingerprint.dev != vma.dev && fstype != Some(BTRFS_SUPER_MAGIC) {
             return Err(BackingError::Changed);
         }
         Ok(fstype)

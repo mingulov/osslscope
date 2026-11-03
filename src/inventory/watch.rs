@@ -17,6 +17,13 @@ pub struct WatchOptions {
     pub limits: Limits,
     pub interval: Duration,
     pub duration: Option<Duration>,
+    /// T5 `--resolve-paths` RENDER intent (raw flag + JSON veto,
+    /// computed by the caller): human change-row fragments render
+    /// iff this is on AND the sink is a terminal. Acquisition is
+    /// gated separately by `selection.resolve_paths` (effective:
+    /// also requires a terminal) — machine modes bypass resolution
+    /// entirely (external F2).
+    pub resolve_paths: bool,
 }
 impl Default for WatchOptions {
     fn default() -> Self {
@@ -25,6 +32,7 @@ impl Default for WatchOptions {
             limits: Limits::default(),
             interval: Duration::from_secs(1),
             duration: None,
+            resolve_paths: false,
         }
     }
 }
@@ -209,7 +217,12 @@ fn changes(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
     }
     result
 }
-fn emit(value: &impl Serialize, writer: &mut impl Write, human: bool) -> io::Result<()> {
+fn emit(
+    value: &impl Serialize,
+    writer: &mut impl Write,
+    human: bool,
+    paths: Option<&super::resolve::TerminalPathWriter>,
+) -> io::Result<()> {
     if human {
         // Finite enums and safe numeric/hash identities only. This is one
         // transient bounded record, never a retained history array.
@@ -288,6 +301,13 @@ fn emit(value: &impl Serialize, writer: &mut impl Write, human: bool) -> io::Res
                 )?;
                 if !change["module"].is_null() {
                     write!(writer, " sha256={}", change["module"]["info"]["sha256"])?;
+                    // T5 `--resolve-paths`: TTY-only fragment from the
+                    // dedicated writer (omitted unless flag on; never
+                    // in the machine record above).
+                    if let Some(fragment) = paths.and_then(|w| w.change_fragment(&change["module"]))
+                    {
+                        write!(writer, " path={fragment}")?;
+                    }
                 }
                 writeln!(writer)?;
             }
@@ -305,13 +325,19 @@ pub fn run(
     writer: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<WatchOutcome, io::Error> {
-    run_formatted(options, writer, cancel, false)
+    // Machine-only entry: force both intents off (F2 bypass —
+    // callers cannot opt JSON output into resolution).
+    let mut machine = options.clone();
+    machine.selection.resolve_paths = false;
+    machine.resolve_paths = false;
+    run_formatted(&machine, writer, cancel, false, false)
 }
 pub(super) fn run_formatted(
     options: &WatchOptions,
     writer: &mut impl Write,
     cancel: &AtomicBool,
     human: bool,
+    terminal: bool,
 ) -> io::Result<WatchOutcome> {
     options.validate()?;
     let started = Instant::now();
@@ -338,7 +364,7 @@ pub(super) fn run_formatted(
         end.reason = EndReason::Interrupted;
         end.status = 3;
         end.elapsed = started.elapsed();
-        emit(&end, writer, human)?;
+        emit(&end, writer, human, None)?;
         return Ok(end);
     }
     let mut scanner = match ScopedScanner::new(options.selection.clone(), options.limits.clone()) {
@@ -352,7 +378,7 @@ pub(super) fn run_formatted(
             }
             end.gap = Some(gap);
             end.elapsed = started.elapsed();
-            emit(&end, writer, human)?;
+            emit(&end, writer, human, None)?;
             return Ok(end);
         }
     };
@@ -390,14 +416,23 @@ pub(super) fn run_formatted(
             snapshot: &snapshot,
             sampled_history: "incomplete",
         };
-        if let Err(error) = emit(&record, writer, human) {
+        // T5 `--resolve-paths`: per-snapshot writer over this
+        // snapshot's sidecar (render intent + TTY from the caller;
+        // acquisition was gated separately by the effective
+        // selection flag — human fragments only).
+        let paths = super::resolve::TerminalPathWriter::new(
+            options.resolve_paths,
+            terminal,
+            &snapshot.resolve,
+        );
+        if let Err(error) = emit(&record, writer, human, Some(&paths)) {
             end.reason = EndReason::Output;
             end.status = 1;
             end.sequence = sequence;
             end.elapsed = started.elapsed();
             // A broken sink often cannot accept its end record. Attempt once;
             // preserve the original error and never continue acquiring data.
-            let _ = emit(&end, writer, human);
+            let _ = emit(&end, writer, human, None);
             return Err(error);
         }
         previous = Some(snapshot);
@@ -421,7 +456,7 @@ pub(super) fn run_formatted(
     end.sequence = sequence;
     end.status = status;
     end.elapsed = started.elapsed();
-    emit(&end, writer, human)?;
+    emit(&end, writer, human, None)?;
     Ok(end)
 }
 
@@ -574,7 +609,7 @@ mod tests {
             "changes": []
         });
         let mut buf = Vec::new();
-        super::emit(&record, &mut buf, true).unwrap();
+        super::emit(&record, &mut buf, true, None).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)"),
@@ -607,7 +642,7 @@ mod tests {
             "changes": []
         });
         let mut buf = Vec::new();
-        super::emit(&record, &mut buf, true).unwrap();
+        super::emit(&record, &mut buf, true, None).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("gaps (4 total in 2 groups):"),

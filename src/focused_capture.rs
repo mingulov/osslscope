@@ -698,6 +698,9 @@ pub(crate) struct FocusedSession {
     wall_start: Option<u64>,
     signal_cut: bool,
     workload_discarded: bool,
+    /// Admission-event sysctl sample (T5 schema D-record rule 7):
+    /// sampled once in `open`, retained, never reread.
+    sysctls: Option<crate::evidence::SysctlContext>,
     _reservation: crate::observation_memory::MemoryLease,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -886,6 +889,7 @@ impl FocusedSession {
         } else {
             let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
                 pids: vec![pid],
+                resolve_paths: false,
                 limits: inventory::Limits {
                     max_pids: 1,
                     max_objects_per_process: 0,
@@ -1160,6 +1164,9 @@ impl FocusedSession {
             wall_start,
             signal_cut: false,
             workload_discarded,
+            sysctls: Some(crate::evidence::sample_sysctls_from(std::path::Path::new(
+                "/proc/sys",
+            ))),
             _reservation: reservation,
         })
     }
@@ -2064,11 +2071,15 @@ impl FocusedSession {
                 DispositionRecord::foreign_observed(pid)
             }
         });
-        document.context = Some(CaptureContext {
-            kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
-            wall_start_unix_ns: self.wall_start,
-            wall_end_unix_ns: unix_ns(),
-        });
+        crate::evidence::stamp_context(
+            &mut document,
+            CaptureContext {
+                kernel_release: crate::doctor::uname_release_opt().unwrap_or_default(),
+                wall_start_unix_ns: self.wall_start,
+                wall_end_unix_ns: unix_ns(),
+                sysctls: self.sysctls.clone(),
+            },
+        );
         Ok(FocusedResult {
             document,
             child_exit,
@@ -2116,6 +2127,7 @@ mod session_tests {
     fn record() -> inventory::ProcessRecord {
         inventory::snapshot(&inventory::SnapshotOptions {
             pids: vec![std::process::id()],
+            resolve_paths: false,
             limits: inventory::Limits {
                 max_objects_per_process: 0,
                 ..Default::default()
@@ -3175,6 +3187,7 @@ mod session_tests {
             .unwrap();
         let expected = inventory::snapshot(&inventory::SnapshotOptions {
             pids: vec![app.id()],
+            resolve_paths: false,
             limits: inventory::Limits {
                 max_objects_per_process: 0,
                 ..Default::default()
@@ -3211,6 +3224,7 @@ mod session_tests {
             .unwrap();
         let expected = inventory::snapshot(&inventory::SnapshotOptions {
             pids: vec![app.id()],
+            resolve_paths: false,
             limits: inventory::Limits {
                 max_objects_per_process: 0,
                 ..Default::default()

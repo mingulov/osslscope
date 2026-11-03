@@ -809,7 +809,9 @@ pub fn no_observation_document(failure: &capture::PreObservationFailure) -> Capt
         engine_observations: Vec::new(),
         traversal: None,
     });
-    document.context = failure.context.clone();
+    if let Some(context) = failure.context.clone() {
+        crate::evidence::stamp_context(&mut document, context);
+    }
     document
 }
 
@@ -1597,11 +1599,32 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     // optional-key rule). Unknown wall edges render explicit null,
     // never fabricated zeros; JSON keeps the reversible original.
     if let Some(context) = &doc.context {
-        out["context"] = serde_json::json!({
+        let mut ctx = serde_json::json!({
             "kernel_release": context.kernel_release,
             "wall_start_unix_ns": context.wall_start_unix_ns,
             "wall_end_unix_ns": context.wall_end_unix_ns,
         });
+        // v2.6: sampled sysctls render when present; sampled-but-failed
+        // keys are ABSENT (T5 schema D-record rule 6 — never null,
+        // never a sentinel). A fully failed sample renders `{}`.
+        if let Some(sysctls) = &context.sysctls {
+            let mut rendered = serde_json::Map::new();
+            for (key, value) in [
+                ("perf_event_paranoid", sysctls.perf_event_paranoid),
+                ("kptr_restrict", sysctls.kptr_restrict),
+                (
+                    "unprivileged_bpf_disabled",
+                    sysctls.unprivileged_bpf_disabled,
+                ),
+                ("ptrace_scope", sysctls.ptrace_scope),
+            ] {
+                if let Some(value) = value {
+                    rendered.insert(key.to_string(), serde_json::Value::from(value));
+                }
+            }
+            ctx["sysctls"] = serde_json::Value::Object(rendered);
+        }
+        out["context"] = ctx;
     }
     // R06: attach diagnostics render only when recorded (same
     // optional-key rule — producer literals, capped upstream).
@@ -1712,6 +1735,16 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         s.push_str("kernel: unknown\n");
     } else {
         s.push_str(&format!("kernel: {}\n", safe_display(kernel)));
+    }
+    if let Some(sysctls) = doc.context.as_ref().and_then(|c| c.sysctls.as_ref()) {
+        let show = |v: Option<i64>| v.map_or("unknown".to_string(), |n| n.to_string());
+        s.push_str(&format!(
+            "sysctls: perf_event_paranoid={} kptr_restrict={} unprivileged_bpf_disabled={} ptrace_scope={} (admission sample; context only)\n",
+            show(sysctls.perf_event_paranoid),
+            show(sysctls.kptr_restrict),
+            show(sysctls.unprivileged_bpf_disabled),
+            show(sysctls.ptrace_scope),
+        ));
     }
     let wall = |v: Option<u64>| v.map_or("unknown".to_string(), |n| n.to_string());
     let (wall_start, wall_end) = match &doc.context {
@@ -2816,6 +2849,15 @@ pub(crate) fn bound_line(text: &str) -> String {
 /// Applied at every detail-carrying render (JSON + human; CBOM
 /// carries the kind word only).
 pub(crate) fn normalize_fatal_detail(text: &str) -> String {
+    bound_line(&normalize_proc_pid(text))
+}
+
+/// Target-pid spelling normalization (shared): literal
+/// `/proc/<digits>` segments become the fixed `/proc/<pid>` token
+/// (the pid already publishes structurally — the path form never
+/// does); `/proc/self` and other non-numeric names pass through.
+/// Unbounded — callers apply their own bound after sanitizing.
+pub(crate) fn normalize_proc_pid(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(pos) = rest.find("/proc/") {
@@ -2831,7 +2873,7 @@ pub(crate) fn normalize_fatal_detail(text: &str) -> String {
         }
     }
     out.push_str(rest);
-    bound_line(&out)
+    out
 }
 
 fn dest_display(dest: &OutputDest) -> String {
@@ -3330,7 +3372,6 @@ mod tests {
         }
     }
 
-    #[test]
     #[test]
     fn func_display_is_op_qualified_with_numeric_fallback() {
         // Known (op, funcid) pairs label; everything else stays

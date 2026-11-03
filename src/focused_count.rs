@@ -2654,6 +2654,7 @@ mod startup_controls {
         std::thread::sleep(Duration::from_millis(100));
         let record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
             pids: vec![child.pid()],
+            resolve_paths: false,
             limits: crate::inventory::Limits {
                 max_pids: 1,
                 max_objects: 256,

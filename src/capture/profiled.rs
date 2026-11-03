@@ -138,6 +138,9 @@ pub(crate) fn run_profiled_before(
         cfg,
         profile_id: &profile.profile_id,
         kernel_release: &profile.kernel_release,
+        sysctls: Some(evidence::sample_sysctls_from(std::path::Path::new(
+            "/proc/sys",
+        ))),
         object: &profile.object,
         sites: &profile.sites,
         locator: &profile.locator,
@@ -159,6 +162,9 @@ struct RunContext<'a> {
     cfg: &'a ProfiledConfig,
     profile_id: &'a str,
     kernel_release: &'a str,
+    /// Admission-event sysctl sample (T5 schema D-record rule 7):
+    /// sampled once at setup, retained, never reread.
+    sysctls: Option<evidence::SysctlContext>,
     object: &'a ObjectRecord,
     sites: &'a [DiscoveredSite],
     locator: &'a Path,
@@ -474,11 +480,15 @@ fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
         engine_observations: Vec::new(),
         traversal: None,
     });
-    document.context = Some(doc_context(
-        ctx.kernel_release,
-        release.before.wall,
-        wall_end,
-    ));
+    evidence::stamp_context(
+        &mut document,
+        doc_context(
+            ctx.kernel_release,
+            release.before.wall,
+            wall_end,
+            ctx.sysctls.clone(),
+        ),
+    );
     document.count_object = Some(ctx.count_provenance.clone());
     let executions = document
         .sites
@@ -786,6 +796,7 @@ mod tests {
             cfg: &cfg,
             profile_id: "fixture-preview",
             kernel_release: "model",
+            sysctls: None,
             object: &object,
             sites: &sites,
             locator: &locator,

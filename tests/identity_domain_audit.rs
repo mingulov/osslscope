@@ -312,6 +312,16 @@ fn h5_t3_every_device_site_names_one_domain() {
         // Companion snapshots and executable reopen checks compare native
         // fstat identities only; no maps or encoded device-domain join.
         ("src/provider_observation/artifact.rs", "raw", "m.dev(),", 1),
+        // T5 `--resolve-paths` (external F4): crypto Object-row
+        // fragment joins the sidecar by the row's native
+        // ModuleInfo identity (fstat-derived, same snapshot) —
+        // exact equality, never maps text or display values.
+        (
+            "src/crypto_watch.rs",
+            "raw",
+            "writer.fragment(m.identity_status, (m.info.device, m.info.inode))",
+            1,
+        ),
         // Static table discovery compares before/after fstat stamps from the
         // same retained FD: native dev_t only, with no maps/encoded-domain join.
         (
@@ -401,6 +411,53 @@ fn h5_t3_every_device_site_names_one_domain() {
             "src/inventory/watch.rs",
             "raw",
             "(a.info.device, a.info.inode, &a.info.sha256) == (b.info.device, b.info.inode, &b.info.sha256)",
+            1,
+        ),
+        // T5 `--resolve-paths`: sidecar join keys and render-time
+        // identity checks. Every device value is native fstat dev_t
+        // (opened FDs) or ModuleInfo preserving it; joins are exact
+        // equality within one snapshot, never against maps text or
+        // display values.
+        (
+            "src/inventory/cli.rs",
+            "raw",
+            "(info.device, info.inode),",
+            1,
+        ),
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "let identity = (metadata.dev(), metadata.ino());",
+            1,
+        ),
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            ".push((key.clone(), (module.info.device, module.info.inode)));",
+            1,
+        ),
+        (
+            "src/inventory/resolve.rs",
+            "raw",
+            "(metadata.dev(), metadata.ino()) == retained",
+            1,
+        ),
+        (
+            "src/inventory/resolve.rs",
+            "raw",
+            "if (metadata.dev(), metadata.ino()) != expect {",
+            1,
+        ),
+        (
+            "src/inventory/resolve.rs",
+            "raw",
+            "(module.info.device, module.info.inode),",
+            1,
+        ),
+        (
+            "src/inventory/resolve.rs",
+            "raw",
+            ".fragment_module((module.device, module.inode))",
             1,
         ),
         // Namespace and cgroup descriptor IDs retain native dev_t; selector
@@ -1414,7 +1471,7 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/inventory/backing.rs",
             "raw",
-            "if fingerprint.dev != vma.dev && fstype != Some(0x9123683e) {",
+            "if fingerprint.dev != vma.dev && fstype != Some(BTRFS_SUPER_MAGIC) {",
             1,
         ),
         // Test-hook observation of the verified candidate's native

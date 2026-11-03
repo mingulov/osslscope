@@ -1916,3 +1916,122 @@ fn doctor_pid_reports_cold_gap_preflight() {
     // remain covered by the existing private post-admission target tests.
     doctor_usage_refused(&["--pid", "1", "--format", "json"]);
 }
+
+// ---------------------------------------------------------------------------
+// T5 schema D-record cell 3: role fence.
+// ---------------------------------------------------------------------------
+
+/// Provider-only shape: `OSSL_provider_init`, no core anchors
+/// (neither inventory category alone qualifies).
+const FAKE_PROVIDER_ONLY_SRC: &str = r#"
+int OSSL_provider_init(void) { return 1; }
+int provider_helper(void) { return 1; }
+"#;
+
+/// Single-API shim: one `EVP_*` export, no core anchors.
+const FAKE_SHIM_SRC: &str = r#"
+int EVP_DigestInit(void) { return 1; }
+"#;
+
+#[test]
+fn t5_cell3_role_fence_excludes_anchorless_objects_with_table_hit() {
+    // Rule 3: a provider-only module and a single-API shim, EACH
+    // with an enrolled table hit on its own build-id (copied
+    // shipped build-id semantics), stay excluded — no core
+    // anchors, no observation. Alongside them, an anchor-bearing
+    // libcrypto qualifies alone and labels alone.
+    let Some(provider_so) = build_fixture(
+        "t5-provider-only",
+        "provider.c",
+        FAKE_PROVIDER_ONLY_SRC,
+        "provider.so",
+        &["-shared", "-fPIC", "-g"],
+    ) else {
+        return;
+    };
+    let Some(shim_so) = build_fixture(
+        "t5-shim",
+        "shim.c",
+        FAKE_SHIM_SRC,
+        "shim.so",
+        &["-shared", "-fPIC", "-g"],
+    ) else {
+        return;
+    };
+    let Some(libc_so) = build_fixture(
+        "t5-libcrypto",
+        "fake.c",
+        FAKE_LIBC_SRC,
+        "libcrypto.so.3",
+        &["-shared", "-fPIC", "-g"],
+    ) else {
+        return;
+    };
+    let provider_bytes = std::fs::read(&provider_so).unwrap();
+    let shim_bytes = std::fs::read(&shim_so).unwrap();
+    let libc_bytes = std::fs::read(&libc_so).unwrap();
+    // Flavor leg: neither anchorless shape is OpenSSL.
+    assert_eq!(
+        flavor::classify_elf(&provider_bytes).unwrap().0,
+        Flavor::NotCrypto
+    );
+    assert_eq!(
+        flavor::classify_elf(&shim_bytes).unwrap().0,
+        Flavor::UnknownLookalike
+    );
+    assert!(matches!(
+        flavor::classify_elf(&libc_bytes).unwrap().0,
+        Flavor::OpenSSL { .. }
+    ));
+    // Enrollment leg: enroll every build-id (copied-id table
+    // hits for the anchorless pair); the flavor gate still
+    // refuses them before the ladder runs.
+    let provider_id = elf::read_build_id(&provider_bytes).unwrap();
+    let shim_id = elf::read_build_id(&shim_bytes).unwrap();
+    let libc_id = elf::read_build_id(&libc_bytes).unwrap();
+    let anchor_off = elf::dynsym_file_offset(&libc_bytes, "OSSL_PROVIDER_available").unwrap();
+    let query_off = elf::symtab_file_offset(&libc_bytes, "ossl_provider_query_operation").unwrap();
+    let table_src = format!(
+        r#"{{"table_version":1,"entries":[{{"build_id":"{provider_id}","openssl":"3.0.22",
+            "query_offset":8,"anchor":"OSSL_provider_init","anchor_offset":8}},
+            {{"build_id":"{shim_id}","openssl":"3.5.8",
+            "query_offset":8,"anchor":"EVP_DigestInit","anchor_offset":8}},
+            {{"build_id":"{libc_id}","openssl":"3.5.8",
+            "query_offset":{query_off},"anchor":"OSSL_PROVIDER_available",
+            "anchor_offset":{anchor_off}}}]}}"#
+    );
+    let table = builtin::load_table_str(&table_src).unwrap();
+    assert!(table.by_build_id(&provider_id).is_some());
+    assert!(table.by_build_id(&shim_id).is_some());
+    let enrollment = ProviderTable::empty();
+    let opts = QualifyOpts {
+        offset_table_explicit: true,
+        ..qualify_opts(&table, &enrollment)
+    };
+    for (bytes, path, want) in [
+        (&provider_bytes, provider_so.as_path(), "not OpenSSL"),
+        (&shim_bytes, shim_so.as_path(), "unrecognized crypto"),
+    ] {
+        match onboard::qualify_libcrypto_bytes(bytes, path, false, &opts) {
+            TargetQualification::Unsupported { reason, .. } => {
+                assert!(reason.contains(want), "{reason}");
+            }
+            other => panic!("want Unsupported for {path:?}, got {other:?}"),
+        }
+    }
+    // Positive control: the anchor-bearing libcrypto qualifies
+    // alone, and its lone table hit labels alone.
+    match onboard::qualify_libcrypto_bytes(&libc_bytes, &libc_so, false, &opts) {
+        TargetQualification::Supported(t) => {
+            assert!(t.builtin);
+            assert_eq!(t.build_id.as_deref(), Some(libc_id.as_str()));
+        }
+        other => panic!("want Supported for libcrypto, got {other:?}"),
+    }
+    let label = osslscope::evidence::accumulate_openssl_family(&[
+        osslscope::evidence::VersionObservation {
+            table_openssl: Some("3.5.8".to_string()),
+        },
+    ]);
+    assert_eq!(label.version, Some("3.5".to_string()));
+}

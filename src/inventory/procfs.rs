@@ -5,7 +5,7 @@
 use super::{
     Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, ModuleInfo,
     ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, ProcessRecord, Scope,
-    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, backing, elf,
+    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, backing, elf, resolve,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
@@ -14,6 +14,7 @@ use std::io::{self, Read as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -211,6 +212,11 @@ struct Cached {
     file: File,
     info: Result<ModuleInfo, GapReason>,
     seen: bool,
+    /// Host locator PROVEN at acquisition (constrained direct
+    /// open plus identity match — T5 `--resolve-paths` rule 3),
+    /// retained with the verifying FD. `None` unless the flag was
+    /// on at acquisition AND a permissible pathname was proven.
+    locator: Option<PathBuf>,
 }
 
 /// Cache identity: native fingerprint plus the association's witnessed page
@@ -239,6 +245,18 @@ struct Work<'a> {
     /// Lets the backing caller report Deadline/ReadLimit instead of a generic
     /// evidence gap. Taken (cleared) by the caller after each backing call.
     backing_limit: Option<GapReason>,
+    /// Per-snapshot render capabilities (T5 `--resolve-paths` rule 3),
+    /// materialized AFTER all machine acquisition (external F3 —
+    /// retained dups must not consume FDs needed by later
+    /// inventory opens), moved into the Snapshot at the end.
+    sidecar: resolve::ResolveSidecar,
+    /// Deferred staging keys (cache key + machine-record identity),
+    /// recorded during the loop, drained at materialization.
+    resolve_staged: Vec<(CacheKey, (u64, u64))>,
+    /// Dedicated resolve-staging byte budget (external F3 —
+    /// retained locator bytes charge here, never the shared
+    /// record pools, so the flag cannot change machine records).
+    resolve_bytes: usize,
 }
 
 /// Inventory half of ER-5E-I2: backing IO and buffers charge the same read
@@ -302,6 +320,21 @@ impl Work<'_> {
                 .push(pool.reserve(bytes + 64).ok_or(GapReason::ReadLimit)?);
         }
         Ok(())
+    }
+
+    /// Charge retained resolve-staging bytes against the DEDICATED
+    /// resolve budget (external F3 isolation — never shared pools).
+    /// `false` = budget exhausted, skip the row (render
+    /// `(unavailable)`); machine records are unaffected either way.
+    fn charge_resolve(&mut self, bytes: usize) -> bool {
+        let Some(total) = self.resolve_bytes.checked_add(bytes) else {
+            return false;
+        };
+        if total > resolve::RESOLVE_BUDGET_BYTES {
+            return false;
+        }
+        self.resolve_bytes = total;
+        true
     }
     fn deadline(&self) -> Result<(), GapReason> {
         if self.started.elapsed() >= self.options.limits.timeout {
@@ -468,6 +501,9 @@ impl Work<'_> {
                 file,
                 info: result.clone(),
                 seen: true,
+                // Proven later by the verify caller (which holds
+                // the mapping); cache hits reuse the retained one.
+                locator: None,
             },
         );
         result
@@ -780,6 +816,34 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                             }
                         }
                     }
+                    // T5 `--resolve-paths` rule 3: prove a host locator
+                    // for still-Verified rows (maps text is a hint;
+                    // the constrained open + identity match is the
+                    // proof). The maps recheck below may still
+                    // downgrade the row — staging re-filters by
+                    // final status, so a downgraded row never
+                    // renders. Establishment is transient (its FD is
+                    // dropped before the next machine open); only
+                    // the retained locator PathBuf charges the
+                    // DEDICATED resolve budget (F3 — never shared
+                    // pools, never a machine gap).
+                    let needs_locator = work.options.resolve_paths
+                        && status == IdentityStatus::Verified
+                        && work
+                            .cache
+                            .get(&key)
+                            .is_some_and(|cached| cached.locator.is_none());
+                    if needs_locator {
+                        let identity = (metadata.dev(), metadata.ino());
+                        let candidate =
+                            std::path::Path::new(std::ffi::OsStr::from_bytes(mapping.path));
+                        if let Some(locator) = resolve::establish_locator(candidate, identity)
+                            && work.charge_resolve(locator.as_os_str().len() + 512)
+                            && let Some(cached) = work.cache.get_mut(&key)
+                        {
+                            cached.locator = Some(locator);
+                        }
+                    }
                     modules.push((
                         ModuleRecord {
                             info,
@@ -852,6 +916,22 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
             work.gap(Some(pid), None, GapReason::NamespaceUnavailable);
         }
     }
+    // T5 `--resolve-paths` rule 3: record staging keys for rows
+    // that are STILL Verified after the maps recheck and the
+    // retain filter (downgraded rows never render — rule 4).
+    // Materialization (dup + sidecar push) happens AFTER all
+    // machine acquisition in `snapshot_reused` (external F3 —
+    // retained dups must not consume FDs needed by later
+    // inventory opens).
+    if work.options.resolve_paths {
+        for (module, key) in &modules {
+            if module.identity_status != IdentityStatus::Verified {
+                continue;
+            }
+            work.resolve_staged
+                .push((key.clone(), (module.info.device, module.info.inode)));
+        }
+    }
     Ok(ProcessRecord {
         interval: clock.finish(),
         namespaces,
@@ -910,6 +990,9 @@ pub(super) fn snapshot_reused(
         gaps: BTreeSet::new(),
         cache,
         backing_limit: None,
+        sidecar: resolve::ResolveSidecar::default(),
+        resolve_staged: Vec::new(),
+        resolve_bytes: 0,
     };
     // Keep at most two bounded prefixes while enumerating: the next PIDs
     // above the previous cursor, then wrap. Enumerating itself is deadline
@@ -981,6 +1064,7 @@ pub(super) fn snapshot_reused(
     let mut selected_pids = order.clone();
     selected_pids.sort_unstable();
     let processes = sample_order(&order, &mut work, state);
+    materialize_sidecar(&mut work);
     work.cache.retain(|key, value| {
         value.seen
             && value
@@ -1014,6 +1098,33 @@ pub(super) fn snapshot_reused(
             provider_interfaces: ObservationState::Unknown,
             execution: ObservationState::NotObserved,
         },
+        resolve: std::mem::take(&mut work.sidecar),
+    }
+}
+
+/// Materialize deferred `--resolve-paths` capabilities AFTER all
+/// machine acquisition (external F3): retained dups are cloned
+/// here, when no later inventory open can be starved of FDs.
+/// Every failure (evicted cache key, clone failure, budget
+/// exhaustion) skips the row (render `(unavailable)`); machine
+/// records are already fixed. Always drains the staging list.
+fn materialize_sidecar(work: &mut Work<'_>) {
+    for (key, identity) in std::mem::take(&mut work.resolve_staged) {
+        let staged: Option<(Option<PathBuf>, File)> = work.cache.get(&key).and_then(|cached| {
+            cached
+                .file
+                .try_clone()
+                .ok()
+                .map(|file| (cached.locator.clone(), file))
+        });
+        let Some((locator, file)) = staged else {
+            continue;
+        };
+        if !work.charge_resolve(256) {
+            continue;
+        }
+        work.sidecar
+            .push(resolve::RowCapability::new(identity, file, locator));
     }
 }
 
@@ -1063,6 +1174,7 @@ mod tests {
     fn expired_admitted_population_has_uncertainty_for_every_skipped_pid() {
         let options = SnapshotOptions {
             pids: vec![7, 11, 13],
+            resolve_paths: false,
             limits: super::super::Limits {
                 timeout: std::time::Duration::ZERO,
                 ..Default::default()
@@ -1078,6 +1190,9 @@ mod tests {
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
             backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
         };
         let mut state = ScanState::default();
         assert!(sample_order(&options.pids, &mut work, &mut state).is_empty());
@@ -1129,6 +1244,9 @@ mod tests {
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
             backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
         };
         for _ in 0..3 {
             assert_eq!(
@@ -1168,6 +1286,9 @@ mod tests {
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
             backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
         };
         assert_eq!(
             work.inspect(File::open(&path).unwrap(), &metadata, None),
@@ -1188,6 +1309,9 @@ mod tests {
             gaps: BTreeSet::new(),
             cache: BTreeMap::new(),
             backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
         };
         assert_eq!(
             fresh.inspect(File::open(&path).unwrap(), &metadata, None),

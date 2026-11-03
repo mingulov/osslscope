@@ -19,13 +19,13 @@ use osslscope::evidence::{
     Completeness, CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation,
     EngineWindow, ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter,
     LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult,
-    PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, engine_index,
-    finalize,
+    PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, SysctlContext, TargetRecord,
+    engine_index, finalize, stamp_context,
 };
 use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
-    OutputDest, OutputFormat, OutputRequest, exit_for, render_cbom, render_human, render_json,
-    setup_failure_document, write_artifacts,
+    ArtifactOutcome, DeliveryResult, OutputDest, OutputFormat, OutputRequest, exit_for,
+    render_cbom, render_human, render_json, setup_failure_document, write_artifacts,
 };
 use osslscope::schema::{
     FORBIDDEN_V2_KEYS, V2_SCHEMA_JSON, check_v2_semantics, check_version, check_version_v2,
@@ -2303,6 +2303,44 @@ fn v2_goldens_pinned() {
         "cbom-v2_5-execution.json",
         &String::from_utf8(render_cbom(&execution).unwrap()).unwrap(),
     );
+    // T5 cell 7: the 2.6 producer shape — coarse label + admission
+    // sysctl sample — pinned in all three artifacts.
+    let v26 = v26_sysctls_doc();
+    assert_golden(
+        "report-v2_6-sysctls.json",
+        &String::from_utf8(render_json(&v26).unwrap()).unwrap(),
+    );
+    assert_golden("report-v2_6-sysctls.txt", &render_human(&v26));
+    assert_golden(
+        "cbom-v2_6-sysctls.json",
+        &String::from_utf8(render_cbom(&v26).unwrap()).unwrap(),
+    );
+}
+
+/// T5 cell 7 fixture: COMPLETE evidence with a coarse 2.6 version
+/// label and a full admission sysctl sample (one key failed, so
+/// the golden also pins rule-6 key absence).
+fn v26_sysctls_doc() -> CaptureDocument {
+    let mut input = complete_input();
+    input.openssl = OpensslVersion::verified("3.5".to_string());
+    let mut doc = finalize_honest(input);
+    stamp_context(
+        &mut doc,
+        CaptureContext {
+            kernel_release: "6.9.0-test".to_string(),
+            wall_start_unix_ns: Some(1_700_000_000_000_000_000),
+            wall_end_unix_ns: Some(1_700_000_030_000_000_000),
+            sysctls: Some(SysctlContext {
+                perf_event_paranoid: Some(4),
+                kptr_restrict: None,
+                unprivileged_bpf_disabled: Some(2),
+                ptrace_scope: Some(0),
+            }),
+        },
+    );
+    assert_eq!(doc.status, Completeness::Complete);
+    assert_eq!(doc.schema, "observed-crypto-v2.6");
+    doc
 }
 
 #[test]
@@ -3426,6 +3464,7 @@ fn fixture_context() -> CaptureContext {
         kernel_release: "6.9.0-test".to_string(),
         wall_start_unix_ns: Some(1_700_000_000_000_000_000),
         wall_end_unix_ns: Some(1_700_000_030_000_000_000),
+        sysctls: None,
     }
 }
 
@@ -3788,6 +3827,7 @@ fn r12_wall_backward_adjustment_never_rewrites_monotonic() {
         kernel_release: "6.9.0-test".to_string(),
         wall_start_unix_ns: Some(2_000),
         wall_end_unix_ns: Some(1_000),
+        sysctls: None,
     });
     let v = json_of(&doc);
     assert_eq!(v["context"]["wall_start_unix_ns"], 2_000);
@@ -3832,6 +3872,7 @@ fn r12_unknown_kernel_and_wall_stay_explicit() {
         kernel_release: String::new(),
         wall_start_unix_ns: None,
         wall_end_unix_ns: None,
+        sysctls: None,
     });
     let v = json_of(&doc);
     assert_eq!(
@@ -6154,6 +6195,457 @@ fn cross_operation_selector_reference_is_rejected() {
     check_v2_semantics(&honest).expect("control is semantic-clean");
     let cbom = cbom_of(&doc);
     assert_eq!(cbom["components"].as_array().unwrap().len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// T5 schema D-record hostile cells (render/schema legs)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t5_cell5_render_omits_failed_sysctl_keys() {
+    // Rule 6: sampled-but-failed sysctl keys are ABSENT from
+    // rendered JSON — never null, never a sentinel, never string
+    // passthrough. A fully failed sample renders an empty section.
+    let mut doc = finalize_honest(input_base());
+    stamp_context(
+        &mut doc,
+        CaptureContext {
+            kernel_release: "6.9.0-test".to_string(),
+            wall_start_unix_ns: Some(1_700_000_000_000_000_000),
+            wall_end_unix_ns: Some(1_700_000_030_000_000_000),
+            sysctls: Some(SysctlContext {
+                perf_event_paranoid: Some(4),
+                kptr_restrict: None,
+                unprivileged_bpf_disabled: Some(2),
+                ptrace_scope: None,
+            }),
+        },
+    );
+    let value = json_of(&doc);
+    let sysctls = value["context"]["sysctls"].as_object().unwrap();
+    assert_eq!(
+        sysctls.keys().collect::<Vec<_>>(),
+        vec!["perf_event_paranoid", "unprivileged_bpf_disabled"]
+    );
+    assert_eq!(sysctls["perf_event_paranoid"], json!(4));
+    // Fully failed sample: section present (the sampling event
+    // happened), keys absent. Coarse label: stamping upgrades to
+    // 2.6, where patch strings are rejected by the gate.
+    let mut base = input_base();
+    base.openssl = OpensslVersion::verified("3.5".to_string());
+    let mut doc = finalize_honest(base);
+    stamp_context(
+        &mut doc,
+        CaptureContext {
+            kernel_release: "6.9.0-test".to_string(),
+            wall_start_unix_ns: Some(1_700_000_000_000_000_000),
+            wall_end_unix_ns: Some(1_700_000_030_000_000_000),
+            sysctls: Some(SysctlContext {
+                perf_event_paranoid: None,
+                kptr_restrict: None,
+                unprivileged_bpf_disabled: None,
+                ptrace_scope: None,
+            }),
+        },
+    );
+    let value = json_of(&doc);
+    assert_eq!(value["context"]["sysctls"], json!({}));
+    validate_v2(&value).expect("partial sysctls validate");
+    check_v2_semantics(&value).expect("partial sysctls pass semantics");
+}
+
+fn t5_ok_delivery() -> DeliveryResult {
+    DeliveryResult {
+        primary: ArtifactOutcome {
+            dest: "sweep".to_string(),
+            ok: true,
+            bytes: 1,
+            error: None,
+        },
+        cbom: None,
+        diagnostics: Vec::new(),
+    }
+}
+
+/// Producer-level row inputs for the label/sysctl sweeps: bare
+/// evidence (no pre-attached policy — the sweep evaluates fresh).
+/// Each row pins one exit-table leg under a fixed deny rule.
+fn t5_sweep_rows() -> Vec<(&'static str, FinalizeInput, Vec<PolicyRule>, u8)> {
+    let coverage_one = || ScopeCoverage {
+        scope: "provider/default".to_string(),
+        expected: ExpectedScope::Applicable { sites: 1 },
+        discovered: 1,
+        attached: 1,
+    };
+    let mut violation = input_base();
+    violation.sites = vec![site_at(
+        FP_A,
+        8,
+        100,
+        0x1000,
+        0,
+        500,
+        vec![cand(FP_A, "default", 2, 21, &["DES"], false)],
+        CandidateCoverage::Complete,
+    )];
+    violation.coverage = vec![coverage_one()];
+    let mut pass = input_base();
+    pass.sites = vec![site_at(
+        FP_A,
+        8,
+        100,
+        0x2000,
+        0,
+        300,
+        vec![cand(FP_A, "default", 1, 7, &["SHA-256"], false)],
+        CandidateCoverage::Complete,
+    )];
+    pass.coverage = vec![coverage_one()];
+    let mut runtime_pass = input_base();
+    runtime_pass.sites = pass.sites.clone();
+    runtime_pass.coverage = vec![coverage_one()];
+    runtime_pass.fatal = Some(FatalKind::Runtime("discovery finish: boom".to_string()));
+    let mut recycled = input_base();
+    recycled.objects = Vec::new();
+    recycled.fatal = Some(FatalKind::Recycled);
+    recycled.target = TargetRecord::new(11, "gone".to_string(), String::new(), String::new());
+    recycled.disposition = None;
+    let mut inconclusive = input_base();
+    inconclusive.sites = vec![site_at(
+        FP_B,
+        8,
+        200,
+        0x1000,
+        0,
+        100,
+        vec![
+            cand(FP_B, "default", 2, 21, &["AES-256-GCM"], false),
+            cand(FP_B, "default", 2, 21, &["ARIA-256-GCM"], false),
+        ],
+        CandidateCoverage::Complete,
+    )];
+    inconclusive.coverage = vec![coverage_one()];
+    let mut partial = input_base();
+    partial.window = CaptureWindow {
+        requested_start_ns: 0,
+        requested_end_ns: 100,
+        effective_start_ns: 5,
+        effective_end_ns: 95,
+        signal_cut: false,
+        count_admission: None,
+    };
+    partial.sites = vec![site_at(
+        FP_A,
+        8,
+        100,
+        0x1000,
+        0,
+        200,
+        vec![cand(FP_A, "default", 2, 21, &["AES-128-GCM"], false)],
+        CandidateCoverage::Complete,
+    )];
+    partial.coverage = vec![ScopeCoverage {
+        scope: "provider/default".to_string(),
+        expected: ExpectedScope::Applicable { sites: 3 },
+        discovered: 2,
+        attached: 1,
+    }];
+    partial.counters = vec![loss_counter(
+        "count.map_insert_dropped",
+        CounterSource::KernelRing,
+        3,
+    )];
+    partial.disposition = Some(DispositionRecord::detached_running(9));
+    vec![
+        (
+            "violation",
+            violation,
+            vec![PolicyRule::deny_algorithm("DES")],
+            10,
+        ),
+        (
+            "runtime-pass",
+            runtime_pass,
+            vec![PolicyRule::deny_algorithm("DES")],
+            1,
+        ),
+        (
+            "noverdict",
+            recycled,
+            vec![PolicyRule::deny_algorithm("DES")],
+            4,
+        ),
+        (
+            "inconclusive",
+            inconclusive,
+            vec![PolicyRule::deny_algorithm("AES-256-GCM")],
+            11,
+        ),
+        // Partial + Pass needs a require rule: gaps widen deny
+        // rules to Inconclusive, while definite require evidence
+        // survives gaps.
+        (
+            "partial",
+            partial,
+            vec![PolicyRule::require_executed("AES-128-GCM")],
+            3,
+        ),
+        ("complete", pass, vec![PolicyRule::deny_algorithm("DES")], 0),
+    ]
+}
+
+fn t5_cbom_has_no_openssl_key(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map {
+                assert!(
+                    !key.to_lowercase().contains("openssl"),
+                    "CBOM gained an openssl key: {key}"
+                );
+                t5_cbom_has_no_openssl_key(nested);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                t5_cbom_has_no_openssl_key(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn t5_cell4_label_sweep_leaves_verdicts_exits_cbom_identical() {
+    // Rule 4: the version label is display-only. Mutating the
+    // PRODUCER-level label input (FinalizeInput.openssl, before
+    // any decision runs) across unknown + every coarse family
+    // leaves policy verdicts, exit codes (all six table legs),
+    // and CBOM bytes identical. Probe/admission/identity run
+    // before finalize and never see the document field (it does
+    // not exist yet); CBOM gains no openssl key.
+    let labels = [
+        OpensslVersion::unknown(),
+        OpensslVersion::verified("3.0".to_string()),
+        OpensslVersion::verified("3.5".to_string()),
+        OpensslVersion::verified("3.6".to_string()),
+        OpensslVersion::verified("4.0".to_string()),
+    ];
+    for (name, input, rules, want_exit) in t5_sweep_rows() {
+        let mut baseline: Option<(osslscope::policy::PolicyVerdict, u8, Vec<u8>)> = None;
+        for openssl in &labels {
+            let mut row = input.clone();
+            row.openssl = openssl.clone();
+            let doc = finalize_honest(row);
+            let verdict = evaluate_document(&rules, &doc);
+            let delivery = t5_ok_delivery();
+            let exit = exit_for(verdict.overall(), None, &doc, &delivery);
+            assert_eq!(exit, want_exit, "row {name} left its exit leg");
+            let cbom = render_cbom(&doc).expect("CBOM renders");
+            t5_cbom_has_no_openssl_key(&serde_json::from_slice(&cbom).expect("CBOM parses"));
+            match &baseline {
+                None => baseline = Some((verdict, exit, cbom)),
+                Some((verdict0, exit0, cbom0)) => {
+                    assert_eq!(
+                        &verdict, verdict0,
+                        "row {name}: verdict moved with {openssl:?}"
+                    );
+                    assert_eq!(exit, *exit0, "row {name}: exit moved with {openssl:?}");
+                    assert_eq!(cbom, *cbom0, "row {name}: CBOM moved with {openssl:?}");
+                }
+            }
+        }
+    }
+}
+
+fn t5_sysctl_arms() -> Vec<(&'static str, SysctlContext)> {
+    let full = SysctlContext {
+        perf_event_paranoid: Some(4),
+        kptr_restrict: Some(1),
+        unprivileged_bpf_disabled: Some(2),
+        ptrace_scope: Some(0),
+    };
+    let mut arms = vec![("full", full.clone())];
+    for (name, clear) in [
+        ("omit-paranoid", 0),
+        ("omit-kptr", 1),
+        ("omit-bpf", 2),
+        ("omit-ptrace", 3),
+    ] {
+        let mut partial = full.clone();
+        match clear {
+            0 => partial.perf_event_paranoid = None,
+            1 => partial.kptr_restrict = None,
+            2 => partial.unprivileged_bpf_disabled = None,
+            _ => partial.ptrace_scope = None,
+        }
+        arms.push((name, partial));
+    }
+    arms.push((
+        "absent-values",
+        SysctlContext {
+            perf_event_paranoid: None,
+            kptr_restrict: None,
+            unprivileged_bpf_disabled: None,
+            ptrace_scope: None,
+        },
+    ));
+    arms
+}
+
+fn t5_cbom_has_no_sysctl_key(value: &Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, nested) in map {
+                let lower = key.to_lowercase();
+                assert!(
+                    !lower.contains("sysctl")
+                        && !lower.contains("paranoid")
+                        && !lower.contains("kptr")
+                        && !lower.contains("ptrace"),
+                    "CBOM gained a sysctl key: {key}"
+                );
+                if key == "value" {
+                    if let Value::String(text) = nested {
+                        assert!(
+                            !text.contains("perf_event_paranoid"),
+                            "CBOM carries a sysctl value: {text}"
+                        );
+                    }
+                }
+                t5_cbom_has_no_sysctl_key(nested);
+            }
+        }
+        Value::Array(items) => {
+            for nested in items {
+                t5_cbom_has_no_sysctl_key(nested);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// CBOM with the schema-identity display property removed: the
+/// sweep holds evidence fixed while sysctls vary, so modulo the
+/// 2.4-vs-2.6 identity string every arm must agree byte-wise.
+fn t5_cbom_minus_schema_version(cbom: &[u8]) -> Value {
+    let mut value: Value = serde_json::from_slice(cbom).expect("CBOM parses");
+    if let Some(props) = value
+        .get_mut("metadata")
+        .and_then(|meta| meta.get_mut("properties"))
+        .and_then(|props| props.as_array_mut())
+    {
+        props.retain(|prop| prop.get("name") != Some(&json!("osslscope:schema-version")));
+    }
+    value
+}
+
+#[test]
+fn t5_cell8_sysctl_sweep_leaves_verdicts_exits_cbom_identical() {
+    // Rule 8: sysctls explain; they never decide. With the
+    // evidence (attach/capability outcomes) held fixed, sweeping
+    // the PRODUCER-level sysctl sample — full, each individual
+    // omission, complete value absence, plus an unstamped
+    // section-absent control — leaves policy verdicts and exit
+    // codes (all six table legs) identical, and CBOM identical
+    // modulo the schema-identity display string. CBOM gains no
+    // sysctl key or value.
+    for (name, input, rules, want_exit) in t5_sweep_rows() {
+        let mut baseline: Option<(osslscope::policy::PolicyVerdict, u8, Value)> = None;
+        let check =
+            |doc: &CaptureDocument,
+             arm: &str,
+             baseline: &mut Option<(osslscope::policy::PolicyVerdict, u8, Value)>| {
+                let verdict = evaluate_document(&rules, doc);
+                let delivery = t5_ok_delivery();
+                let exit = exit_for(verdict.overall(), None, doc, &delivery);
+                assert_eq!(exit, want_exit, "row {name} arm {arm} left its exit leg");
+                let cbom = render_cbom(doc).expect("CBOM renders");
+                let parsed: Value = serde_json::from_slice(&cbom).expect("CBOM parses");
+                t5_cbom_has_no_sysctl_key(&parsed);
+                t5_cbom_has_no_openssl_key(&parsed);
+                let normalized = t5_cbom_minus_schema_version(&cbom);
+                match baseline {
+                    None => *baseline = Some((verdict, exit, normalized)),
+                    Some((verdict0, exit0, cbom0)) => {
+                        assert_eq!(&verdict, verdict0, "row {name} arm {arm}: verdict moved");
+                        assert_eq!(exit, *exit0, "row {name} arm {arm}: exit moved");
+                        assert_eq!(normalized, *cbom0, "row {name} arm {arm}: CBOM moved");
+                    }
+                }
+            };
+        // Section-absent control (unstamped 2.4 fixture context;
+        // same coarse label as the arms — only sysctls vary).
+        let mut control_input = input.clone();
+        control_input.openssl = OpensslVersion::verified("3.5".to_string());
+        check(
+            &finalize_honest(control_input),
+            "section-absent",
+            &mut baseline,
+        );
+        // Stamped 2.6 arms (producer-coherent coarse label).
+        for (arm, sysctls) in t5_sysctl_arms() {
+            let mut row = input.clone();
+            row.openssl = OpensslVersion::verified("3.5".to_string());
+            let mut doc = finalize_honest(row);
+            stamp_context(
+                &mut doc,
+                CaptureContext {
+                    kernel_release: "6.9.0-test".to_string(),
+                    wall_start_unix_ns: Some(1_700_000_000_000_000_000),
+                    wall_end_unix_ns: Some(1_700_000_030_000_000_000),
+                    sysctls: Some(sysctls),
+                },
+            );
+            assert_eq!(doc.schema, "observed-crypto-v2.6");
+            check(&doc, arm, &mut baseline);
+        }
+    }
+}
+
+/// T5 cell 6: an old field reader that actually reads `openssl`
+/// (the pre-R12 wire reader omits it). Top-level unknown keys are
+/// ignored like any real old reader; the `openssl` object shape
+/// itself is pinned — 2.6 changes the producer domain, never the
+/// wire shape.
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct Pre26VersionReader {
+    schema_version: String,
+    openssl: Pre26WireOpenssl,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+#[serde(deny_unknown_fields)]
+struct Pre26WireOpenssl {
+    state: String,
+    version: Option<String>,
+}
+
+#[test]
+fn t5_cell6_version_reading_old_reader_ignores_new_shape() {
+    // Rule 9: a 2.6 artifact (coarse label + sysctls section)
+    // parses in an old version-reading field reader; the coarse
+    // version survives as a plain string and the sysctls section
+    // is ignored. The same reader still reads historical
+    // patch-string artifacts.
+    let v26 = v26_sysctls_doc();
+    let bytes = render_json(&v26).expect("2.6 artifact serializes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("2.6 artifact parses");
+    assert!(rendered.get("context").unwrap().get("sysctls").is_some());
+    let back: Pre26VersionReader =
+        serde_json::from_value(rendered).expect("old reader parses 2.6 bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.6");
+    assert_eq!(back.openssl.state, "verified");
+    assert_eq!(back.openssl.version.as_deref(), Some("3.5"));
+    // Historical patch-string shape still reads.
+    let old = complete_doc();
+    let bytes = render_json(&old).expect("2.4 artifact serializes");
+    let rendered: Value = serde_json::from_slice(&bytes).expect("2.4 artifact parses");
+    let back: Pre26VersionReader =
+        serde_json::from_value(rendered).expect("old reader parses 2.4 bytes");
+    assert_eq!(back.openssl.state, "verified");
+    assert_eq!(back.openssl.version.as_deref(), Some("3.5.1"));
 }
 
 #[test]

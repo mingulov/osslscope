@@ -131,6 +131,7 @@ fn options(pid: u32) -> WatchOptions {
         limits: Limits::default(),
         interval: Duration::from_millis(50),
         duration: Some(Duration::from_secs(5)),
+        ..Default::default()
     }
 }
 struct Records<F: FnMut(&Value)> {
@@ -532,6 +533,7 @@ fn failed_scope_drops_sample_cache_but_keeps_pinned_selector() {
             pids: vec![child.pid()],
             modules: vec![module.clone()],
             cgroup: None,
+            resolve_paths: false,
         },
         Limits::default(),
     )

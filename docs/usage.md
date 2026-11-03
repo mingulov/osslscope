@@ -79,9 +79,9 @@ useful discovery-only output. Invalid grammar exits 2; output failure exits 1.
 ## Passive discovery
 
 ```sh
-osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]
-osslscope inspect --pid PID [--json]
-osslscope inspect --module PATH [--module PATH ...] [--json]
+osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths]
+osslscope inspect --pid PID [--json] [--resolve-paths]
+osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]
 ```
 
 With no selectors, `scan` inventories visible numeric entries in the observer's
@@ -103,6 +103,26 @@ not target memory, environment, command lines, keys or payloads; it sends no
 signals to targets. It does not inject code or change the target. Procfs
 pseudofiles are unavailable as module inputs; procfs links to ordinary ELF
 backing (such as `/proc/PID/exe` or `/proc/self/fd/N`) remain supported.
+
+`--resolve-paths` (argv only, default off) renders verified host paths on
+human rows, and only there: paths render only on an interactive
+terminal. `--json`/NDJSON, CBOM, policy records, diagnostics, and exit
+codes are byte-identical with the flag on or off; redirected human
+output renders `path=(not-a-terminal)` placeholders instead of paths
+(so redirected human bytes do differ from flag-off by those
+placeholders — never by path text). Only objects whose identity was
+verified render a path; locator candidates render `path=(unverified)`
+without any resolution attempt, and failures render `(unavailable)` or
+`(changed)` without ever publishing the attempted spelling. Resolved
+strings are sanitized (control bytes neutralized) and bounded to 200
+chars for terminal display. Residuals, documented and accepted: with
+the flag on, terminal scrollback becomes host-path-bearing — visible
+to terminal recording, shared tmux/screen sessions, screen sharing,
+shoulder-surfing, and anyone receiving support bundles, tickets, or
+pastes of that scrollback — so avoid the flag when the viewing
+context itself is sensitive. Sanitization preserves filename TEXT
+(other than escapes/bounds), so a name carrying secrets or identifiers
+still discloses them.
 
 For example, substitute a visible PID and actual file paths:
 

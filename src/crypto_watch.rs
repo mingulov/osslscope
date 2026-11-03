@@ -12,7 +12,7 @@ use crate::{
 };
 use serde::Serialize;
 use std::{
-    io::{self, Write},
+    io::{self, IsTerminal as _, Write},
     process::ExitCode,
     sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
@@ -29,6 +29,13 @@ pub struct CryptoWatchConfig {
     pub max_state_bytes: usize,
     pub duration: Duration,
     pub interval: Duration,
+    /// T5 `--resolve-paths` RENDER intent (raw flag; acquisition is
+    /// gated separately via `selection.resolve_paths`). Human
+    /// Object rows render `path=` fragments iff this is on AND
+    /// `terminal` is on (external F4).
+    pub resolve_paths: bool,
+    /// Stdout is a terminal (caller-observed). Render-only.
+    pub terminal: bool,
 }
 impl Default for CryptoWatchConfig {
     fn default() -> Self {
@@ -38,6 +45,8 @@ impl Default for CryptoWatchConfig {
             max_state_bytes: GLOBAL_BYTES,
             duration: Duration::from_secs(30),
             interval: Duration::from_secs(1),
+            resolve_paths: false,
+            terminal: false,
         }
     }
 }
@@ -80,6 +89,11 @@ enum Record<'a> {
     },
     Discovery {
         process: &'a ProcessRecord,
+        /// Source snapshot's resolve sidecar (human rows only;
+        /// never serialized). The writer is built per-record in
+        /// `human()` from `Output`'s render flags.
+        #[serde(skip)]
+        sidecar: Option<&'a crate::inventory::resolve::ResolveSidecar>,
     },
     TracingGap {
         reason: &'static str,
@@ -123,6 +137,10 @@ struct Output<'a, W> {
     /// (flushed by the records that follow); the JSON path never
     /// buffers, so NDJSON stays one envelope per gap.
     pending_gaps: Vec<(GapReason, Option<u64>, Option<u32>)>,
+    /// T5 `--resolve-paths` render flags (external F4): fragments
+    /// render iff `resolve_paths && terminal && !json`.
+    resolve_paths: bool,
+    terminal: bool,
 }
 impl<W: Write> Output<'_, W> {
     fn emit(&mut self, record: Record<'_>) -> io::Result<()> {
@@ -207,7 +225,10 @@ impl<W: Write> Output<'_, W> {
                 poll_interval.as_secs_f64(),
                 duration.as_secs_f64()
             ),
-            Record::Discovery { process: p } => {
+            Record::Discovery {
+                process: p,
+                sidecar,
+            } => {
                 writeln!(
                     w,
                     "Process {} start={} objects={} execution=not_observed coverage=unknown (passive inventory)",
@@ -228,8 +249,19 @@ impl<W: Write> Output<'_, W> {
                     "  {}",
                     inventory::identity_totals_line(verified, locator)
                 )?;
+                // T5 `--resolve-paths` (external F4): per-record
+                // writer over the source snapshot's sidecar
+                // (construction is I/O-free; fragments render only
+                // when flag + terminal + human all hold).
+                let writer = sidecar.map(|sidecar| {
+                    crate::inventory::resolve::TerminalPathWriter::new(
+                        self.resolve_paths && !self.json,
+                        self.terminal,
+                        sidecar,
+                    )
+                });
                 for m in p.modules.iter().take(ROWS) {
-                    writeln!(
+                    write!(
                         w,
                         "  Object sha256={} kind={:?} identity={:?} interfaces={}",
                         m.info.sha256.get(..12).unwrap_or("unknown"),
@@ -237,6 +269,12 @@ impl<W: Write> Output<'_, W> {
                         m.identity_status,
                         m.info.exports.len()
                     )?;
+                    if let Some(fragment) = writer.as_ref().and_then(|writer| {
+                        writer.fragment(m.identity_status, (m.info.device, m.info.inode))
+                    }) {
+                        write!(w, " path={fragment}")?;
+                    }
+                    writeln!(w)?;
                 }
                 if p.modules.len() > ROWS {
                     writeln!(w, "  Objects omitted={}", p.modules.len() - ROWS)?;
@@ -498,6 +536,8 @@ fn observe(
         sequence: 0,
         json,
         pending_gaps: Vec::new(),
+        resolve_paths: config.resolve_paths,
+        terminal: config.terminal,
     };
     let mut scanner = match ScopedScanner::new_budgeted(
         config.selection.clone(),
@@ -585,7 +625,10 @@ fn observe(
                 }
             }
             for p in &snapshot.snapshot.processes {
-                out.emit(Record::Discovery { process: p })?;
+                out.emit(Record::Discovery {
+                    process: p,
+                    sidecar: Some(&snapshot.snapshot.resolve),
+                })?;
                 if cancel.load(Ordering::Relaxed) || Instant::now() >= deadline {
                     break;
                 }
@@ -769,7 +812,7 @@ pub fn run(args: &[String]) -> ExitCode {
     }
     if help_requested(args) {
         println!(
-            "usage: osslscope scan --watch --observe-crypto [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--interval S] [--duration S] [--json]"
+            "usage: osslscope scan --watch --observe-crypto [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--interval S] [--duration S] [--json] [--resolve-paths]"
         );
         println!(
             "Automatic per-process crypto observations; passive inventory when tracing is unavailable."
@@ -791,14 +834,25 @@ pub fn run(args: &[String]) -> ExitCode {
         Ok(o) if o.watch => o,
         _ => return invalid(),
     };
+    // F2 gate: locator acquisition runs only for human output
+    // on a terminal; machine modes bypass resolution entirely.
+    // Render intent travels separately (F4).
+    let terminal = io::stdout().is_terminal();
     let config = CryptoWatchConfig {
         selection: Selection {
             pids: options.pids,
             cgroup: options.cgroup,
             modules: options.modules,
+            resolve_paths: crate::inventory::cli::acquire_paths(
+                options.resolve_paths,
+                options.json,
+                terminal,
+            ),
         },
         duration: options.duration.unwrap_or(Duration::from_secs(30)),
         interval: options.interval.unwrap_or(Duration::from_secs(1)),
+        resolve_paths: options.resolve_paths,
+        terminal,
         ..Default::default()
     };
     // Resolver admits at most two 16MiB objects, with bounded verification/read
@@ -879,6 +933,8 @@ mod tests {
             sequence: 0,
             json: false,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -920,6 +976,8 @@ mod tests {
             sequence: 0,
             json: false,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -945,6 +1003,8 @@ mod tests {
             sequence: 0,
             json: true,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -976,6 +1036,7 @@ mod tests {
     fn reincarnation_and_visibility_are_not_inferred_exits() {
         let mut snapshot = inventory::snapshot(&inventory::SnapshotOptions {
             pids: vec![std::process::id()],
+            resolve_paths: false,
             limits: inventory::Limits {
                 max_objects_per_process: 0,
                 ..Default::default()
@@ -1087,13 +1148,71 @@ mod tests {
             sequence: 0,
             json: false,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
-        out.emit(Record::Discovery { process: &process }).unwrap();
+        out.emit(Record::Discovery {
+            process: &process,
+            sidecar: None,
+        })
+        .unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(
             text.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)"),
             "got: {text}"
         );
+    }
+
+    #[test]
+    fn human_discovery_renders_path_fragments_by_flag_and_terminal() {
+        // External F4: crypto Object rows carry `path=` fragments
+        // under the same gates as discovery/watch (flag + terminal
+        // + human); the empty sidecar joins nothing, so the
+        // verified row reports `(unavailable)` without I/O.
+        let process: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 0},
+            "namespaces": {"pid": null, "mount": null},
+            "pid": 42, "starttime": 123,
+            "modules": [
+                {"info": {"sha256": "aa", "device": 1, "inode": 2, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false}, "identity_status": "verified"},
+                {"info": {"sha256": "bb", "device": 1, "inode": 3, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false}, "identity_status": "locator_candidate"}
+            ],
+            "provider_activation": "unknown", "provider_interfaces": "unknown", "execution": "not_observed"
+        })).unwrap();
+        let sidecar = crate::inventory::resolve::ResolveSidecar::default();
+        let render = |resolve_paths: bool, terminal: bool, json: bool| {
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json,
+                pending_gaps: Vec::new(),
+                resolve_paths,
+                terminal,
+            };
+            out.emit(Record::Discovery {
+                process: &process,
+                sidecar: Some(&sidecar),
+            })
+            .unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        // Flag off: byte-identical rows, no fragments.
+        assert!(!render(false, true, false).contains("path="));
+        // Flag on, terminal: verified joins nothing (unavailable),
+        // candidate never resolves (unverified).
+        let text = render(true, true, false);
+        assert!(text.contains("path=(unavailable)"), "got: {text}");
+        assert!(text.contains("path=(unverified)"), "got: {text}");
+        // Flag on, redirected: not-a-terminal on both rows.
+        let text = render(true, false, false);
+        assert_eq!(
+            text.matches("path=(not-a-terminal)").count(),
+            2,
+            "got: {text}"
+        );
+        // JSON: machine envelope, no fragments.
+        assert!(!render(true, true, true).contains("path="));
     }
 
     #[test]
@@ -1121,6 +1240,8 @@ mod tests {
             sequence: 0,
             json: false,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -1168,6 +1289,8 @@ mod tests {
                 sequence: 0,
                 json: false,
                 pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
             };
             out.emit_membership(
                 &identity,
@@ -1215,6 +1338,8 @@ mod tests {
             sequence: 0,
             json: false,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         for g in &gaps {
             out.emit(Record::Gap { gap: g }).unwrap();
@@ -1259,6 +1384,8 @@ mod tests {
             sequence: 0,
             json: false,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         for _ in 0..2 {
             out.emit(Record::Gap { gap: &gap }).unwrap();
@@ -1292,6 +1419,8 @@ mod tests {
             sequence: 0,
             json: true,
             pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
         };
         out.emit(Record::Gap {
             gap: &gap(inventory::GapReason::Deadline),

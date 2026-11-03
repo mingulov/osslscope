@@ -8,6 +8,7 @@ pub mod scope;
 pub mod watch;
 
 pub(crate) mod backing;
+pub(crate) mod resolve;
 
 use serde::{Deserialize, Serialize};
 
@@ -281,6 +282,12 @@ impl Default for Limits {
 pub struct SnapshotOptions {
     pub pids: Vec<u32>,
     pub limits: Limits,
+    /// T5 `--resolve-paths` EFFECTIVE acquire intent: the caller
+    /// passes `acquire_paths(raw, json, terminal)` — locators are
+    /// established and capabilities retained only for human output
+    /// on a terminal. Off (default): no resolution I/O, no
+    /// retained locator bytes (cells 5/6).
+    pub resolve_paths: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -398,6 +405,13 @@ pub struct Snapshot {
     pub totals: WorkTotals,
     pub limits: Limits,
     pub capabilities: Capabilities,
+    /// Render-time row capabilities (T5 `--resolve-paths` rule 3):
+    /// retained backing custody + proven host locators, joined by
+    /// exact object identity. Skipped by serde in BOTH directions
+    /// (never emitted; defaults to empty on read) — machine bytes
+    /// are identical with the flag on or off (cell 2).
+    #[serde(skip)]
+    pub(crate) resolve: resolve::ResolveSidecar,
 }
 impl Snapshot {
     pub fn exit_code(&self) -> u8 {

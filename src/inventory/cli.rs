@@ -7,20 +7,31 @@ use super::{
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, IsTerminal as _, Write};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json]\n       osslscope inspect --pid PID [--json]\n       osslscope inspect --module PATH [--module PATH ...] [--json]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
+const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths]\n       osslscope inspect --pid PID [--json] [--resolve-paths]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows only (default off; never in JSON, redirects, or diagnostics).\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
 /// Value-taking options of [`parse`]: the scan router consumes the
 /// token after each of these, so flag-shaped values never misroute.
 /// A new value-taking match arm MUST extend this list.
 pub(crate) const VALUE_OPTIONS: &[&str] =
     &["--interval", "--duration", "--pid", "--module", "--cgroup"];
+
+/// Effective `--resolve-paths` acquisition gate (external F2):
+/// locator establishment + sidecar staging run ONLY for human
+/// output on a terminal. Machine modes (`--json`) and redirected
+/// stdout bypass resolution ENTIRELY (zero resolver I/O — the
+/// writer's flag-off/placeholder arms are I/O-free by unit test);
+/// redirected human output still renders `(not-a-terminal)`
+/// placeholders from the raw flag (cell 6).
+pub(crate) fn acquire_paths(resolve_paths: bool, json: bool, terminal: bool) -> bool {
+    resolve_paths && !json && terminal
+}
 
 pub(crate) struct Options {
     pub(crate) pids: Vec<u32>,
@@ -30,6 +41,9 @@ pub(crate) struct Options {
     pub(crate) watch: bool,
     pub(crate) interval: Option<Duration>,
     pub(crate) duration: Option<Duration>,
+    /// T5 `--resolve-paths` (rule 1): argv only, default off. No
+    /// config-file or env enablement exists anywhere (cell 7).
+    pub(crate) resolve_paths: bool,
 }
 pub(crate) fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
     parse_inner(command, args, false)
@@ -47,11 +61,13 @@ fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Opt
         watch: false,
         interval: None,
         duration: None,
+        resolve_paths: false,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" if !options.json => options.json = true,
+            "--resolve-paths" if !options.resolve_paths => options.resolve_paths = true,
             "--observe-crypto" if allow_crypto && !crypto => crypto = true,
             "--watch" if command == "scan" && !options.watch => options.watch = true,
             "--interval" if command == "scan" && options.interval.is_none() => {
@@ -168,6 +184,12 @@ struct ModuleInventory {
     mode: &'static str,
     modules: Vec<ModuleInfo>,
     errors: Vec<ModuleError>,
+    /// Render-time row capabilities (T5 `--resolve-paths` rule 3),
+    /// skipped by serde — machine bytes flag-independent (cell 2).
+    /// Locator provenance here is operator argv (observer-side),
+    /// still canonicalized + identity-checked at render.
+    #[serde(skip)]
+    resolve: super::resolve::ResolveSidecar,
     totals: WorkTotals,
     limits: Limits,
     capabilities: Capabilities,
@@ -184,7 +206,7 @@ fn file_key(metadata: &std::fs::Metadata) -> FileKey {
         metadata.ctime_nsec(),
     )
 }
-fn inspect_modules(paths: &[PathBuf], limits: Limits) -> ModuleInventory {
+fn inspect_modules(paths: &[PathBuf], limits: Limits, resolve_paths: bool) -> ModuleInventory {
     let started = Instant::now();
     let mut result = ModuleInventory {
         schema_version: "osslscope.discovery.v1",
@@ -193,6 +215,7 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits) -> ModuleInventory {
         errors: Vec::new(),
         totals: WorkTotals::default(),
         limits,
+        resolve: super::resolve::ResolveSidecar::default(),
         capabilities: Capabilities {
             inventory: InventoryState::Complete,
             provider_activation: ObservationState::Unknown,
@@ -203,6 +226,11 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits) -> ModuleInventory {
     // Retain descriptors so cached inode identities cannot be recycled. Both
     // successful and failed bounded reads are cached for this invocation only.
     let mut cache: BTreeMap<FileKey, (File, Result<ModuleInfo, GapReason>)> = BTreeMap::new();
+    // Deferred `--resolve-paths` staging (external F3): (cache
+    // key, operator argv) recorded during the machine loop,
+    // materialized AFTER all machine acquisition so retained
+    // dups cannot starve later inventory opens of FDs.
+    let mut resolve_staged: Vec<(FileKey, PathBuf)> = Vec::new();
     for (input_index, path) in paths.iter().enumerate() {
         let reason = if started.elapsed() >= result.limits.timeout {
             Some(GapReason::Deadline)
@@ -261,15 +289,59 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits) -> ModuleInventory {
                 _ => Err(GapReason::Changed),
             };
             cache.insert(key, (file, parsed.clone()));
-            parsed.map(Some)
+            parsed.map(|info| Some((info, key)))
         })();
         match inspected {
-            Ok(Some(info)) => result.modules.push(info),
+            Ok(Some((info, key))) => {
+                if resolve_paths {
+                    resolve_staged.push((key, path.clone()));
+                }
+                result.modules.push(info);
+            }
             Ok(None) => (),
             Err(reason) => result.errors.push(ModuleError {
                 input_index,
                 reason,
             }),
+        }
+    }
+    // Materialize deferred capabilities AFTER all machine
+    // acquisition (external F3). Locator provenance is operator
+    // argv (observer-side): absolutized, never trusted — render
+    // still opens it constrained and identity-matches. Clone,
+    // absolutize, and dedicated-budget failures skip the row
+    // (render `(unavailable)`); machine records are already fixed.
+    if resolve_paths {
+        let mut resolve_bytes = 0usize;
+        for (key, argv) in &resolve_staged {
+            let Some((file, Ok(info))) = cache.get(key) else {
+                continue;
+            };
+            let locator = if argv.is_absolute() {
+                Some(argv.clone())
+            } else {
+                std::env::current_dir().ok().map(|cwd| cwd.join(argv))
+            };
+            let charge = locator
+                .as_ref()
+                .map(|locator| locator.as_os_str().len())
+                .unwrap_or(0)
+                + 512;
+            let Some(total) = resolve_bytes.checked_add(charge) else {
+                continue;
+            };
+            if total > super::resolve::RESOLVE_BUDGET_BYTES {
+                continue;
+            }
+            let Ok(dup) = file.try_clone() else {
+                continue;
+            };
+            resolve_bytes = total;
+            result.resolve.push(super::resolve::RowCapability::new(
+                (info.device, info.inode),
+                dup,
+                locator,
+            ));
         }
     }
     result.capabilities.inventory = if result.errors.is_empty() {
@@ -347,6 +419,7 @@ fn render(
     json: bool,
     writer: &mut impl Write,
     preamble: Option<&SnapshotPreamble>,
+    object_rows: &[String],
 ) -> io::Result<()> {
     if !json {
         writer.write_all(MEANING.as_bytes())?;
@@ -360,6 +433,11 @@ fn render(
             if pre.conclusively_without_openssl {
                 writer.write_all(super::blindness_line().as_bytes())?;
             }
+        }
+        // T5 `--resolve-paths` object rows (TTY-only writer output;
+        // empty unless the flag is on — preamble byte-identical).
+        for row in object_rows {
+            writeln!(writer, "{row}")?;
         }
     }
     serde_json::to_writer_pretty(&mut *writer, value).map_err(io::Error::other)?;
@@ -392,6 +470,12 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
+        // F2 gate inputs: acquisition runs only for human
+        // output on a terminal; writers keep the raw flag (plus a
+        // JSON veto) so redirected human rows still placeholder.
+        let terminal = output.is_terminal();
+        let acquire = acquire_paths(options.resolve_paths, options.json, terminal);
+        let render_paths = options.resolve_paths && !options.json;
         if options.watch {
             let _signals = match WatchSignals::install() {
                 Ok(guard) => guard,
@@ -406,14 +490,17 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                         pids: options.pids,
                         cgroup: options.cgroup,
                         modules: options.modules,
+                        resolve_paths: acquire,
                     },
                     interval: options.interval.unwrap_or(Duration::from_secs(1)),
                     duration: options.duration,
                     limits: Limits::default(),
+                    resolve_paths: render_paths,
                 },
                 &mut output,
                 &WATCH_INTERRUPTED,
                 !options.json,
+                terminal,
             )
             .map(|outcome| {
                 if let Some(line) = super::watch::exit_reason(&outcome) {
@@ -427,6 +514,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                     pids: options.pids,
                     cgroup: options.cgroup,
                     modules: options.modules,
+                    resolve_paths: acquire,
                 },
                 Limits::default(),
             ) {
@@ -438,7 +526,13 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
             };
             let result = scanner.snapshot();
             let preamble = result.human_preamble();
-            render(&result, options.json, &mut output, Some(&preamble)).map(|()| {
+            let writer = super::resolve::TerminalPathWriter::new(
+                render_paths,
+                output.is_terminal(),
+                &result.resolve,
+            );
+            let rows = writer.object_rows(&result.processes);
+            render(&result, options.json, &mut output, Some(&preamble), &rows).map(|()| {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
@@ -449,9 +543,16 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
             let result = snapshot(&SnapshotOptions {
                 pids: options.pids,
                 limits: Limits::default(),
+                resolve_paths: acquire,
             });
             let preamble = result.human_preamble();
-            render(&result, options.json, &mut output, Some(&preamble)).map(|()| {
+            let writer = super::resolve::TerminalPathWriter::new(
+                render_paths,
+                output.is_terminal(),
+                &result.resolve,
+            );
+            let rows = writer.object_rows(&result.processes);
+            render(&result, options.json, &mut output, Some(&preamble), &rows).map(|()| {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
@@ -459,8 +560,14 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 result.exit_code()
             })
         } else {
-            let result = inspect_modules(&options.modules, Limits::default());
-            render(&result, options.json, &mut output, None).map(|()| {
+            let result = inspect_modules(&options.modules, Limits::default(), acquire);
+            let writer = super::resolve::TerminalPathWriter::new(
+                render_paths,
+                output.is_terminal(),
+                &result.resolve,
+            );
+            let rows = writer.module_rows(&result.modules);
+            render(&result, options.json, &mut output, None, &rows).map(|()| {
                 let reasons: Vec<GapReason> = result.errors.iter().map(|e| e.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
@@ -540,6 +647,7 @@ mod tests {
                 provider_interfaces: ObservationState::Unknown,
                 execution: ObservationState::NotObserved,
             },
+            resolve: super::super::resolve::ResolveSidecar::default(),
         }
     }
 
@@ -562,7 +670,7 @@ mod tests {
         ]);
         let preamble = snap.human_preamble();
         let mut buf = Vec::new();
-        render(&snap, false, &mut buf, Some(&preamble)).unwrap();
+        render(&snap, false, &mut buf, Some(&preamble), &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)\n"),
@@ -572,7 +680,7 @@ mod tests {
         assert!(!out.contains("gaps ("), "{out}");
         // JSON mode carries no preamble at all.
         let mut buf = Vec::new();
-        render(&snap, true, &mut buf, Some(&preamble)).unwrap();
+        render(&snap, true, &mut buf, Some(&preamble), &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(!out.contains("identity: "), "{out}");
         assert!(!out.contains("Passive inventory"), "{out}");
@@ -716,13 +824,13 @@ mod tests {
         ];
         let preamble = snap.human_preamble();
         let mut buf = Vec::new();
-        render(&snap, false, &mut buf, Some(&preamble)).unwrap();
+        render(&snap, false, &mut buf, Some(&preamble), &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("gaps (2 total in 1 group):\n"), "{out}");
         assert!(out.contains("  too_large device=1 pid=7: 2\n"), "{out}");
         // JSON mode carries the raw array, never the grouped block.
         let mut buf = Vec::new();
-        render(&snap, true, &mut buf, Some(&preamble)).unwrap();
+        render(&snap, true, &mut buf, Some(&preamble), &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(!out.contains("gaps ("), "{out}");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -748,7 +856,7 @@ mod tests {
                 GapReason::Deadline,
             ),
         ] {
-            let result = inspect_modules(&paths, limits);
+            let result = inspect_modules(&paths, limits, false);
             assert_eq!(result.errors[0].reason, reason);
             assert_eq!(result.totals.objects_attempted, 0);
             assert_eq!(result.totals.read_bytes, 0);
@@ -762,6 +870,38 @@ mod tests {
     }
 
     #[test]
+    fn acquire_gate_truth_table() {
+        // External F2: acquisition (locator establishment +
+        // sidecar staging) runs ONLY for human output on a
+        // terminal; machine/redirected modes bypass entirely.
+        assert!(acquire_paths(true, false, true));
+        assert!(!acquire_paths(false, false, true));
+        assert!(!acquire_paths(true, true, true));
+        assert!(!acquire_paths(true, false, false));
+        assert!(!acquire_paths(true, true, false));
+        assert!(!acquire_paths(false, true, false));
+    }
+
+    #[test]
+    fn inspect_sidecar_populated_only_when_acquiring() {
+        // F2 acquisition leg: flag-off acquisition stages no
+        // capabilities (no retained FDs/bytes); flag-on stages
+        // exactly one per inspected module.
+        let executable = PathBuf::from("/bin/true");
+        let off = inspect_modules(std::slice::from_ref(&executable), Limits::default(), false);
+        assert_eq!(off.modules.len(), 1);
+        assert!(off.resolve.is_empty());
+        let on = inspect_modules(std::slice::from_ref(&executable), Limits::default(), true);
+        assert_eq!(on.modules.len(), 1);
+        assert_eq!(on.resolve.len(), 1);
+        // Machine records identical either way.
+        assert_eq!(
+            serde_json::to_value(&off).unwrap(),
+            serde_json::to_value(&on).unwrap()
+        );
+    }
+
+    #[test]
     fn module_read_admission_and_duplicate_cache_use_aggregate_budget() {
         let executable = PathBuf::from("/bin/true");
         let charge = std::fs::metadata(&executable).unwrap().len() + 1;
@@ -771,6 +911,7 @@ mod tests {
                 max_read_bytes: charge - 1,
                 ..Limits::default()
             },
+            false,
         );
         assert_eq!(denied.errors[0].reason, GapReason::ReadLimit);
         assert_eq!(denied.totals.read_bytes, 0);
@@ -780,6 +921,7 @@ mod tests {
                 max_read_bytes: charge,
                 ..Limits::default()
             },
+            false,
         );
         assert!(result.errors.is_empty());
         assert_eq!(result.modules.len(), 1);
@@ -800,6 +942,7 @@ mod tests {
                 max_objects: 1,
                 ..Limits::default()
             },
+            false,
         );
         assert_eq!(result.modules.len(), 1);
         assert_eq!(result.errors[0].input_index, 1);
@@ -827,6 +970,7 @@ mod tests {
                 timeout: std::time::Duration::from_millis(100),
                 ..Limits::default()
             },
+            false,
         );
         std::fs::remove_file(path).unwrap();
         assert!(result.totals.read_bytes > 0, "test must admit a read");
@@ -854,6 +998,7 @@ mod tests {
                 max_read_bytes: 11,
                 ..Limits::default()
             },
+            false,
         );
         std::fs::remove_file(path).unwrap();
         assert_eq!(result.errors.len(), 2);
@@ -929,6 +1074,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let scanned = super::super::snapshot(&super::super::SnapshotOptions {
             pids: vec![child.id()],
+            resolve_paths: false,
             limits: super::super::Limits::default(),
         });
         child.kill().unwrap();
@@ -966,6 +1112,7 @@ mod tests {
         // A dead target hides its mappings: inconclusive, never blind.
         let dead = super::super::snapshot(&super::super::SnapshotOptions {
             pids: vec![2147483647],
+            resolve_paths: false,
             limits: super::super::Limits::default(),
         });
         assert!(
@@ -988,6 +1135,7 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(500));
         let mut scanned = super::super::snapshot(&super::super::SnapshotOptions {
             pids: vec![child.id()],
+            resolve_paths: false,
             limits: super::super::Limits::default(),
         });
         child.kill().unwrap();
@@ -995,7 +1143,7 @@ mod tests {
         let preamble = scanned.human_preamble();
         assert!(preamble.conclusively_without_openssl);
         let mut buf = Vec::new();
-        super::render(&scanned, false, &mut buf, Some(&preamble)).unwrap();
+        super::render(&scanned, false, &mut buf, Some(&preamble), &[]).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("blindness: no-mapped-openssl"),

@@ -602,6 +602,55 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_package_provenance(root)?;
     check_preview_count_provenance(root)?;
     check_dynamic_sections(root)?;
+    check_v26_sections(root)?;
+    Ok(())
+}
+
+/// Coarse OpenSSL families the v2.6 producer may emit (T5 schema
+/// D-record rule 1): major.minor only, never patch strings.
+pub const COARSE_OPENSSL_FAMILIES: &[&str] = &["3.0", "3.5", "3.6", "4.0"];
+
+/// Sampled sysctl context + coarse version domain (v2.6): a present
+/// `context.sysctls` requires schema minor ≥ 6 (same pattern as the
+/// v2.5 attribution gate), and documents AT minor ≥ 6 must carry a
+/// coarse `openssl.version` (null or one of
+/// [`COARSE_OPENSSL_FAMILIES`]). Earlier minors keep the historical
+/// free `string|null` domain untouched (R1 finding 1: narrowing in
+/// schema would reject valid older documents).
+fn check_v26_sections(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    let version = root
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "doc.schema_version: expected string".to_string())?;
+    let minor: u64 = version
+        .strip_prefix("observed-crypto-v2.")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    let has_sysctls = root
+        .get("context")
+        .and_then(|c| c.as_object())
+        .is_some_and(|c| c.contains_key("sysctls"));
+    if has_sysctls && minor < 6 {
+        return Err(format!(
+            "doc.schema_version: sysctls section needs minor >= 6, got {version:?}"
+        ));
+    }
+    if minor >= 6 {
+        let openssl = root
+            .get("openssl")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| "doc.openssl: expected object".to_string())?;
+        match openssl.get("version") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(v)) if COARSE_OPENSSL_FAMILIES.contains(&v.as_str()) => {
+            }
+            other => {
+                return Err(format!(
+                    "doc.openssl.version: minor >= 6 needs a coarse family, got {other:?}"
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2347,6 +2396,113 @@ mod tests {
         doc.as_object_mut().unwrap().remove("context");
         validate_v2(&doc).expect("new schema accepts context-free doc");
         check_v2_semantics(&doc).expect("new semantics accept context-free doc");
+    }
+
+    #[test]
+    fn v26_gate_sysctls_need_minor_6_and_coarse_domain_above() {
+        // T5 schema D-record rules 1/5/9: sysctls sections need
+        // minor >= 6; at minor >= 6 openssl.version must be null or
+        // coarse; earlier minors keep free strings.
+        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
+        let golden: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/report-v2-complete.json")).unwrap(),
+        )
+        .unwrap();
+        let with_sysctls = |mut doc: serde_json::Value| {
+            doc["context"]["sysctls"] = serde_json::json!({
+                "perf_event_paranoid": 4,
+                "kptr_restrict": 1,
+                "unprivileged_bpf_disabled": 2,
+                "ptrace_scope": 0,
+            });
+            doc
+        };
+        // 2.4 + sysctls → gate rejects (minor too low).
+        let v24 = with_sysctls(golden.clone());
+        assert_eq!(v24["schema_version"], "observed-crypto-v2.4");
+        let err = check_v2_semantics(&v24).unwrap_err();
+        assert!(err.contains("minor >= 6"), "got: {err}");
+        // 2.6 + sysctls + coarse → gate passes (full semantics may
+        // still fail elsewhere; assert NOT the gate error).
+        let mut v26 = with_sysctls(golden.clone());
+        v26["schema_version"] = serde_json::Value::from("observed-crypto-v2.6");
+        v26["openssl"]["version"] = serde_json::Value::from("3.5");
+        match check_v2_semantics(&v26) {
+            Ok(()) => {}
+            Err(err) => assert!(
+                !err.contains("minor >= 6") && !err.contains("coarse family"),
+                "gate must pass, got: {err}"
+            ),
+        }
+        // 2.6 + patch string → coarse-domain rejects.
+        let mut v26patch = with_sysctls(golden.clone());
+        v26patch["schema_version"] = serde_json::Value::from("observed-crypto-v2.6");
+        v26patch["openssl"]["version"] = serde_json::Value::from("3.5.1");
+        let err = check_v2_semantics(&v26patch).unwrap_err();
+        assert!(err.contains("coarse family"), "got: {err}");
+        // 2.4 + patch string → gate passes (historical domain kept).
+        let mut v24patch = golden.clone();
+        v24patch["openssl"]["version"] = serde_json::Value::from("3.5.1");
+        match check_v2_semantics(&v24patch) {
+            Ok(()) => {}
+            Err(err) => assert!(
+                !err.contains("minor >= 6") && !err.contains("coarse family"),
+                "old minor keeps free strings, got: {err}"
+            ),
+        }
+    }
+
+    #[test]
+    fn t5_cell6_r12_mirrors_sysctls_and_historical_patch_strings() {
+        // T5 schema D-record rule 9: old STRICT validators refuse
+        // the new sysctls KEY (naming it), never minor 2.6 itself;
+        // UNCHANGED historical 2.4/2.5 patch-string fixtures keep
+        // validating under the new schema AND semantics.
+        let dir = format!("{}/tests/goldens", env!("CARGO_MANIFEST_DIR"));
+        let v26: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(format!("{dir}/report-v2_6-sysctls.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(v26["schema_version"], "observed-crypto-v2.6");
+        validate_v2(&v26).expect("new schema accepts 2.6 doc");
+        check_v2_semantics(&v26).expect("new semantics accept 2.6 doc");
+        let mut old_schema: serde_json::Value = serde_json::from_str(V2_SCHEMA_JSON).unwrap();
+        old_schema
+            .get_mut("properties")
+            .unwrap()
+            .get_mut("context")
+            .unwrap()
+            .get_mut("properties")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .remove("sysctls");
+        let Err(e) = check_inline(&old_schema, &v26) else {
+            panic!("pinned pre-2.6 strict schema accepted a sysctls-bearing doc");
+        };
+        assert!(
+            e.path.contains("sysctls"),
+            "refusal names the key, got: {} ({})",
+            e.path,
+            e.message
+        );
+        // Historical fixtures stay patch-shaped AND valid.
+        for (name, minor) in [
+            ("report-v2-complete.json", "observed-crypto-v2.4"),
+            ("report-v2_5-execution.json", "observed-crypto-v2.5"),
+        ] {
+            let doc: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(format!("{dir}/{name}")).unwrap())
+                    .unwrap();
+            assert_eq!(doc["schema_version"], minor);
+            let version = doc["openssl"]["version"].as_str().unwrap();
+            assert!(
+                version.matches('.').count() >= 2,
+                "{name} must stay patch-shaped, got {version:?}"
+            );
+            validate_v2(&doc).expect("{name} validates under the new schema");
+            check_v2_semantics(&doc).expect("{name} passes the new semantics");
+        }
     }
 
     #[test]

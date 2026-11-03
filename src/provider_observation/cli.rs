@@ -977,6 +977,7 @@ mod tests {
         // Own-pid snapshot: counts vary by privilege, the line shape not.
         let snapshot = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
             pids: vec![std::process::id()],
+            resolve_paths: false,
             limits: crate::inventory::Limits::default(),
         });
         let capabilities = Capabilities::new(true);

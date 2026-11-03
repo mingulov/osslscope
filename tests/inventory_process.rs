@@ -118,7 +118,11 @@ impl Drop for OwnedChild {
     }
 }
 fn snap(pids: Vec<u32>, limits: Limits) -> Snapshot {
-    snapshot(&SnapshotOptions { pids, limits })
+    snapshot(&SnapshotOptions {
+        pids,
+        limits,
+        resolve_paths: false,
+    })
 }
 fn digest(path: &Path) -> String {
     Sha256::digest(fs::read(path).unwrap())

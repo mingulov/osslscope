@@ -18,6 +18,11 @@ pub struct Selection {
     pub pids: Vec<u32>,
     pub cgroup: Option<PathBuf>,
     pub modules: Vec<PathBuf>,
+    /// T5 `--resolve-paths` EFFECTIVE acquire intent: the caller
+    /// passes `acquire_paths(raw, json, terminal)` — acquisition
+    /// establishes locators only for human output on a terminal.
+    /// Render intent travels separately (external F2).
+    pub resolve_paths: bool,
 }
 
 type Fingerprint = (u64, u64, u64, i64, i64, i64, i64);
@@ -54,6 +59,7 @@ pub struct ScopedScanner {
     scope: Scope,
     record: ScopeRecord,
     scan_state: procfs::ScanState,
+    resolve_paths: bool,
 }
 impl ScopedScanner {
     pub fn new(selection: Selection, limits: Limits) -> Result<Self, GapReason> {
@@ -149,6 +155,7 @@ impl ScopedScanner {
                 state.memory = memory;
                 state
             },
+            resolve_paths: selection.resolve_paths,
         })
     }
 
@@ -223,7 +230,11 @@ impl ScopedScanner {
         limits.max_read_bytes = limits.max_read_bytes.saturating_sub(budget.bytes);
         limits.timeout = limits.timeout.saturating_sub(budget.started.elapsed());
         let mut result = procfs::snapshot_reused(
-            &SnapshotOptions { pids, limits },
+            &SnapshotOptions {
+                pids,
+                limits,
+                resolve_paths: self.resolve_paths,
+            },
             self.pids.is_empty() && self.cgroup.is_none(),
             !self.modules.is_empty(),
             &mut self.scan_state,
@@ -316,6 +327,7 @@ impl ScopedScanner {
             &SnapshotOptions {
                 pids: vec![],
                 limits: self.limits.clone(),
+                resolve_paths: self.resolve_paths,
             },
             false,
         );
@@ -844,6 +856,7 @@ mod observation_tests {
         let mut scanner = ScopedScanner::new_budgeted(
             Selection {
                 pids: vec![child.id()],
+                resolve_paths: false,
                 ..selection
             },
             Limits::default(),

@@ -30,6 +30,15 @@ pub const CAPTURE_SCHEMA_V2: &str = "observed-crypto-v2.4";
 /// [`CAPTURE_SCHEMA_V2`].
 pub const CAPTURE_SCHEMA_V2_5: &str = "observed-crypto-v2.5";
 
+/// Schema identity for finalized documents carrying a sampled
+/// sysctl context (v2.6, T5 schema D-record): the producer upgrades
+/// to this identity exactly when `context.sysctls` is present (see
+/// [`stamp_context`]). The coarse `openssl.version` domain is
+/// enforced by `check_v2_semantics` gated numerically on minor ≥ 6;
+/// the schema keeps the historical free `string|null` domain so
+/// 2.4/2.5 documents stay valid.
+pub const CAPTURE_SCHEMA_V2_6: &str = "observed-crypto-v2.6";
+
 /// Scope token for a certified execution attribution: an observed
 /// successful fetch of an exact spelling returned a method, and
 /// the consuming API used that method under the public-reference
@@ -443,6 +452,76 @@ pub struct CaptureContext {
     pub wall_start_unix_ns: Option<u64>,
     /// Wall-clock window end in unix nanoseconds (`None` = unknown).
     pub wall_end_unix_ns: Option<u64>,
+    /// Sampled sysctl context (v2.6, T5 schema D-record): one
+    /// admission-event sample, retained never reread. `None` means
+    /// never sampled (pre-2.6 documents); per-key `None` means
+    /// sampled-but-failed (rendered JSON omits the key, human
+    /// shows `unknown`). Forensics only — no verdict, exit,
+    /// admission, or policy input may read these fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sysctls: Option<SysctlContext>,
+}
+
+/// One admission-event sysctl sample (observer's `/proc/sys` view).
+/// Bounded signed integers as read; `-1` is legitimate data
+/// (`perf_event_paranoid`), never a sentinel.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct SysctlContext {
+    pub perf_event_paranoid: Option<i64>,
+    pub kptr_restrict: Option<i64>,
+    pub unprivileged_bpf_disabled: Option<i64>,
+    pub ptrace_scope: Option<i64>,
+}
+
+/// Sample the four forensic sysctls from a `/proc/sys` root (T5
+/// schema D-record rule 7): one admission-event sample, retained
+/// never reread. Per-key failure (unreadable, empty, malformed,
+/// overflowing) yields `None` for that key; the sample as a whole
+/// never fails. Production passes `/proc/sys`; tests inject a
+/// scratch root.
+pub fn sample_sysctls_from(proc_sys: &std::path::Path) -> SysctlContext {
+    let read = |relative: &str| {
+        std::fs::read_to_string(proc_sys.join(relative))
+            .ok()
+            .and_then(|text| parse_sysctl_value(&text))
+    };
+    SysctlContext {
+        perf_event_paranoid: read("kernel/perf_event_paranoid"),
+        kptr_restrict: read("kernel/kptr_restrict"),
+        unprivileged_bpf_disabled: read("kernel/unprivileged_bpf_disabled"),
+        ptrace_scope: read("kernel/yama/ptrace_scope"),
+    }
+}
+
+/// Parse one sysctl file's text: trimmed ASCII integer, else `None`.
+/// Empty, malformed, and overflowing inputs yield `None` (absent
+/// key), never a sentinel or a string passthrough.
+pub fn parse_sysctl_value(text: &str) -> Option<i64> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed
+        .strip_prefix('-')
+        .unwrap_or(trimmed)
+        .bytes()
+        .all(|b| b.is_ascii_digit())
+        || trimmed.strip_prefix('-').unwrap_or(trimmed).is_empty()
+    {
+        return None;
+    }
+    trimmed.parse::<i64>().ok()
+}
+
+/// Attach execution context to a finalized document (T5 schema
+/// D-record): stamps `context` and upgrades the schema identity to
+/// v2.6 exactly when `sysctls` is present. All context attach sites
+/// go through here so the schema rule has one home.
+pub fn stamp_context(doc: &mut CaptureDocument, context: CaptureContext) {
+    if context.sysctls.is_some() {
+        doc.schema = CAPTURE_SCHEMA_V2_6.to_string();
+    }
+    doc.context = Some(context);
 }
 
 /// Observed code object: verified identity plus a display locator. The
@@ -569,6 +648,83 @@ impl OpensslVersion {
             OpensslVersionState::Verified => self.version.as_ref().is_some_and(|v| !v.is_empty()),
             OpensslVersionState::Unknown => self.version.is_none(),
         }
+    }
+}
+
+/// Coarse OpenSSL family (T5 schema D-record rule 1): the ONLY
+/// values the v2.6 producer emits. Major.minor, never patch strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum OpensslFamily {
+    V3_0,
+    V3_5,
+    V3_6,
+    V4_0,
+}
+
+impl OpensslFamily {
+    pub fn label(self) -> &'static str {
+        match self {
+            OpensslFamily::V3_0 => "3.0",
+            OpensslFamily::V3_5 => "3.5",
+            OpensslFamily::V3_6 => "3.6",
+            OpensslFamily::V4_0 => "4.0",
+        }
+    }
+
+    /// Strict coarsen of a shipped-table `openssl` string: dotted
+    /// numerics only (`3.0.22` → `V3_0`); anything else — including
+    /// family-prefixed poison (`3.5.8-EVIL`) — yields `None`
+    /// (→ `Unknown`, never passthrough).
+    pub fn coarsen(table_string: &str) -> Option<OpensslFamily> {
+        let parts: Vec<&str> = table_string.split('.').collect();
+        if parts.len() < 2
+            || !parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return None;
+        }
+        match (parts[0], parts[1]) {
+            ("3", "0") => Some(OpensslFamily::V3_0),
+            ("3", "5") => Some(OpensslFamily::V3_5),
+            ("3", "6") => Some(OpensslFamily::V3_6),
+            ("4", "0") => Some(OpensslFamily::V4_0),
+            _ => None,
+        }
+    }
+}
+
+/// One ELIGIBLE version observation (T5 schema D-record rule 3):
+/// the caller (capture) establishes eligibility — backing-verified
+/// AND core-anchor role on the same bytes — before constructing
+/// this. `table_openssl` is the shipped-table `openssl` string for
+/// the object's build-id hit, or `None` when the eligible object
+/// has no hit (which poisons the claim).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VersionObservation {
+    pub table_openssl: Option<String>,
+}
+
+/// Capture-wide accumulation (T5 schema D-record rule 3): the
+/// unique KNOWN TABLE-HIT FAMILY, else `Unknown`. Zero observations,
+/// any unmatched/malformed entry, or ≥2 distinct families all yield
+/// `Unknown`; multi-patch same-family entries are compatible.
+pub fn accumulate_openssl_family(observations: &[VersionObservation]) -> OpensslVersion {
+    use std::collections::BTreeSet;
+    let mut families = BTreeSet::new();
+    for observation in observations {
+        let Some(table_string) = &observation.table_openssl else {
+            return OpensslVersion::unknown();
+        };
+        let Some(family) = OpensslFamily::coarsen(table_string) else {
+            return OpensslVersion::unknown();
+        };
+        families.insert(family);
+    }
+    if families.len() == 1 {
+        OpensslVersion::verified(families.into_iter().next().unwrap().label().to_string())
+    } else {
+        OpensslVersion::unknown()
     }
 }
 
@@ -1473,6 +1629,284 @@ pub fn project_metadata_bounded(doc: &CaptureDocument, budget: usize) -> Metadat
     );
     let selection = select_metadata_rows(&doc.candidate_associations, &used, budget);
     build_metadata_projection(&doc.candidate_associations, &selection)
+}
+
+#[cfg(test)]
+mod t5_schema_d_record_tests {
+    use super::*;
+
+    #[test]
+    fn hostile_cell_1_poisoned_table_strings_yield_unknown() {
+        for poison in [
+            "9.9.9-EVIL",
+            "3.5.8-EVIL",
+            "3",
+            "",
+            "3.5.8 ",
+            "v3.5.8",
+            "03.05.01",
+        ] {
+            // "03.05.01" is numeric-dot but not a known family.
+            assert_eq!(OpensslFamily::coarsen(poison), None, "{poison:?}");
+            let version = accumulate_openssl_family(&[VersionObservation {
+                table_openssl: Some(poison.to_string()),
+            }]);
+            assert_eq!(version, OpensslVersion::unknown(), "{poison:?}");
+        }
+        // Controls: genuine table strings coarsen; extra numeric parts
+        // and bare major.minor are unambiguous, so they coarsen too.
+        for (raw, family) in [
+            ("3.0.22", OpensslFamily::V3_0),
+            ("4.0.2", OpensslFamily::V4_0),
+            ("3.5", OpensslFamily::V3_5),
+            ("3.5.8.1.2", OpensslFamily::V3_5),
+        ] {
+            assert_eq!(OpensslFamily::coarsen(raw), Some(family), "{raw:?}");
+        }
+    }
+
+    #[test]
+    fn hostile_cell_2_family_matrix() {
+        let obs = |strings: &[Option<&str>]| {
+            strings
+                .iter()
+                .map(|s| VersionObservation {
+                    table_openssl: s.map(str::to_string),
+                })
+                .collect::<Vec<_>>()
+        };
+        let label = |version: &OpensslVersion| version.version.clone();
+        // Zero observations → unknown.
+        assert_eq!(accumulate_openssl_family(&[]), OpensslVersion::unknown());
+        // One hit → its family.
+        assert_eq!(
+            label(&accumulate_openssl_family(&obs(&[Some("3.5.8")]))),
+            Some("3.5".to_string())
+        );
+        // Duplicate same-family hits → family.
+        assert_eq!(
+            label(&accumulate_openssl_family(&obs(&[
+                Some("3.5.8"),
+                Some("3.5.8")
+            ]))),
+            Some("3.5".to_string())
+        );
+        // Multi-patch same-family → family (compatible, not unknown).
+        assert_eq!(
+            label(&accumulate_openssl_family(&obs(&[
+                Some("3.0.22"),
+                Some("3.0.25")
+            ]))),
+            Some("3.0".to_string())
+        );
+        // Two families → unknown.
+        assert_eq!(
+            accumulate_openssl_family(&obs(&[Some("3.0.22"), Some("3.5.8")])),
+            OpensslVersion::unknown()
+        );
+        // Eligible-but-unmatched poisons a known hit.
+        assert_eq!(
+            accumulate_openssl_family(&obs(&[Some("3.0.22"), None])),
+            OpensslVersion::unknown()
+        );
+        // Malformed poisons a known hit.
+        assert_eq!(
+            accumulate_openssl_family(&obs(&[Some("3.0.22"), Some("9.9.9-EVIL")])),
+            OpensslVersion::unknown()
+        );
+    }
+
+    #[test]
+    fn parse_sysctl_value_matrix() {
+        // Valid: plain, trimmed, negative (data, never sentinel).
+        assert_eq!(parse_sysctl_value("4\n"), Some(4));
+        assert_eq!(parse_sysctl_value("  0  "), Some(0));
+        assert_eq!(parse_sysctl_value("-1\n"), Some(-1));
+        assert_eq!(parse_sysctl_value("9223372036854775807"), Some(i64::MAX));
+        // Invalid: empty, malformed, overflowing, bare sign.
+        assert_eq!(parse_sysctl_value(""), None);
+        assert_eq!(parse_sysctl_value("   \n"), None);
+        assert_eq!(parse_sysctl_value("unreadable"), None);
+        assert_eq!(parse_sysctl_value("4x"), None);
+        assert_eq!(parse_sysctl_value("0x4"), None);
+        assert_eq!(parse_sysctl_value("-"), None);
+        assert_eq!(parse_sysctl_value("9223372036854775808"), None);
+        assert_eq!(parse_sysctl_value("4.0"), None);
+    }
+
+    #[test]
+    fn stamp_context_upgrades_schema_only_with_sysctls() {
+        let mut doc = finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 0,
+                requested_end_ns: 0,
+                effective_start_ns: 0,
+                effective_end_ns: 0,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites: Vec::new(),
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        });
+        assert_eq!(doc.schema, CAPTURE_SCHEMA_V2);
+        stamp_context(
+            &mut doc,
+            CaptureContext {
+                kernel_release: "6.9.0-test".to_string(),
+                wall_start_unix_ns: None,
+                wall_end_unix_ns: None,
+                sysctls: None,
+            },
+        );
+        assert_eq!(doc.schema, CAPTURE_SCHEMA_V2);
+        stamp_context(
+            &mut doc,
+            CaptureContext {
+                kernel_release: "6.9.0-test".to_string(),
+                wall_start_unix_ns: None,
+                wall_end_unix_ns: None,
+                sysctls: Some(SysctlContext {
+                    perf_event_paranoid: Some(4),
+                    kptr_restrict: None,
+                    unprivileged_bpf_disabled: Some(2),
+                    ptrace_scope: Some(1),
+                }),
+            },
+        );
+        assert_eq!(doc.schema, CAPTURE_SCHEMA_V2_6);
+        assert!(doc.context.unwrap().sysctls.is_some());
+    }
+
+    static SYSCTL_SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn sysctl_scratch(test: &str) -> std::path::PathBuf {
+        let n = SYSCTL_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-sysctl-{}-{}-{}",
+            std::process::id(),
+            test,
+            n
+        ));
+        std::fs::create_dir_all(dir.join("kernel/yama")).unwrap();
+        dir
+    }
+
+    fn write_sysctl(root: &std::path::Path, relative: &str, text: &str) {
+        std::fs::write(root.join(relative), text).unwrap();
+    }
+
+    #[test]
+    fn hostile_cell_5_sample_matrix() {
+        // All valid, including legitimate `-1` data and nested
+        // yama path.
+        let root = sysctl_scratch("valid");
+        write_sysctl(&root, "kernel/perf_event_paranoid", "-1\n");
+        write_sysctl(&root, "kernel/kptr_restrict", "1\n");
+        write_sysctl(&root, "kernel/unprivileged_bpf_disabled", "2\n");
+        write_sysctl(&root, "kernel/yama/ptrace_scope", "0\n");
+        assert_eq!(
+            sample_sysctls_from(&root),
+            SysctlContext {
+                perf_event_paranoid: Some(-1),
+                kptr_restrict: Some(1),
+                unprivileged_bpf_disabled: Some(2),
+                ptrace_scope: Some(0),
+            }
+        );
+        // Partial + full read failures: keys absent, the sample as
+        // a whole never fails (capture continues).
+        let root = sysctl_scratch("missing");
+        assert_eq!(
+            sample_sysctls_from(&root),
+            SysctlContext {
+                perf_event_paranoid: None,
+                kptr_restrict: None,
+                unprivileged_bpf_disabled: None,
+                ptrace_scope: None,
+            }
+        );
+        write_sysctl(&root, "kernel/perf_event_paranoid", "4\n");
+        let sample = sample_sysctls_from(&root);
+        assert_eq!(sample.perf_event_paranoid, Some(4));
+        assert_eq!(sample.kptr_restrict, None);
+        // Malformed, empty, and overflowing inputs yield absent
+        // keys, never sentinels or passthrough.
+        let root = sysctl_scratch("malformed");
+        write_sysctl(&root, "kernel/perf_event_paranoid", "unreadable");
+        write_sysctl(&root, "kernel/kptr_restrict", "");
+        write_sysctl(&root, "kernel/unprivileged_bpf_disabled", "4x");
+        write_sysctl(&root, "kernel/yama/ptrace_scope", "9223372036854775808");
+        assert_eq!(
+            sample_sysctls_from(&root),
+            SysctlContext {
+                perf_event_paranoid: None,
+                kptr_restrict: None,
+                unprivileged_bpf_disabled: None,
+                ptrace_scope: None,
+            }
+        );
+    }
+
+    #[test]
+    fn hostile_cell_5_sample_frozen_no_reread() {
+        // Rule 7: one admission-event sample, retained through
+        // finalization, never reread. Mutating the source after
+        // sampling cannot move the retained value or the stamp.
+        let root = sysctl_scratch("frozen");
+        write_sysctl(&root, "kernel/perf_event_paranoid", "4\n");
+        let retained = sample_sysctls_from(&root);
+        assert_eq!(retained.perf_event_paranoid, Some(4));
+        write_sysctl(&root, "kernel/perf_event_paranoid", "0\n");
+        std::fs::remove_file(root.join("kernel/perf_event_paranoid")).unwrap();
+        assert_eq!(retained.perf_event_paranoid, Some(4));
+        let mut doc = finalize(FinalizeInput {
+            window: CaptureWindow {
+                requested_start_ns: 0,
+                requested_end_ns: 0,
+                effective_start_ns: 0,
+                effective_end_ns: 0,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites: Vec::new(),
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        });
+        stamp_context(
+            &mut doc,
+            CaptureContext {
+                kernel_release: "6.9.0-test".to_string(),
+                wall_start_unix_ns: None,
+                wall_end_unix_ns: None,
+                sysctls: Some(retained),
+            },
+        );
+        assert_eq!(
+            doc.context.unwrap().sysctls.unwrap().perf_event_paranoid,
+            Some(4)
+        );
+    }
 }
 
 #[cfg(test)]

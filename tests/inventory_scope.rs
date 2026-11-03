@@ -128,6 +128,7 @@ fn current_real_cgroup_selects_owned_child_and_reports_provenance() {
         Selection {
             pids: vec![child.pid()],
             cgroup: Some(cgroup),
+            resolve_paths: false,
             modules: vec![],
         },
         Limits::default(),
@@ -211,6 +212,7 @@ fn explicit_empty_cgroup_pid_intersection_never_scans_system() {
         Selection {
             pids: vec![i32::MAX as u32],
             cgroup: Some(current_cgroup()),
+            resolve_paths: false,
             modules: vec![],
         },
         Limits::default(),
@@ -235,6 +237,7 @@ fn supplied_module_sha_matches_copies_without_merging_native_identities() {
             pids: vec![child.pid(), sibling.pid()],
             modules: vec![modules[0].clone()],
             cgroup: None,
+            resolve_paths: false,
         },
         Limits::default(),
     )
@@ -259,6 +262,7 @@ fn supplied_module_sha_matches_copies_without_merging_native_identities() {
             pids: vec![sibling.pid()],
             modules: vec![modules[0].clone()],
             cgroup: None,
+            resolve_paths: false,
         },
         Limits::default(),
     )
@@ -352,6 +356,7 @@ fn default_selection_remains_visible_system_and_scopes_keep_existing_limits() {
             pids: vec![i32::MAX as u32],
             modules: vec![modules[0].clone(), modules[0].clone()],
             cgroup: None,
+            resolve_paths: false,
         },
         Limits {
             max_read_bytes: charge,
@@ -376,6 +381,7 @@ fn module_or_filters_and_explicit_elf_without_openssl_exports_work() {
             pids: vec![child.pid()],
             modules: modules.to_vec(),
             cgroup: None,
+            resolve_paths: false,
         },
         Limits::default(),
     )
@@ -386,6 +392,7 @@ fn module_or_filters_and_explicit_elf_without_openssl_exports_work() {
             pids: vec![child.pid()],
             modules: vec![ordinary],
             cgroup: None,
+            resolve_paths: false,
         },
         Limits::default(),
     )
@@ -488,6 +495,7 @@ fn container_pid_snapshot_reports_verified_overlay_module() {
         Selection {
             pids: vec![pid],
             cgroup: None,
+            resolve_paths: false,
             modules: vec![],
         },
         Limits::default(),
