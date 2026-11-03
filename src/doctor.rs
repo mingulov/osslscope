@@ -36,7 +36,7 @@ use crate::discovery::legacy;
 use crate::discovery::maps;
 use crate::discovery::onboard::{self, LibcryptoMaps, QualifyOpts, TargetQualification};
 use crate::discovery::provider::{ProviderTable, ResolutionInputs, resolve_provider_class};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1399,6 +1399,18 @@ fn check_spawn_access() -> Check {
     if tests::record_probe(tests::Probe::SpawnAccess) {
         return Check::pass("spawn-access", "test-only functional probe result".into());
     }
+    // Refuse before forking when teardown identity cannot be
+    // established (same rule as the owned-child probe): under a
+    // non-waitable SIGCHLD disposition an exited child could be
+    // reaped elsewhere and its number recycled before the numeric
+    // teardown signal.
+    if !sigchld_waitable() {
+        return Check::degraded(
+            "spawn-access",
+            "spawn-setup teardown identity unavailable under a non-waitable SIGCHLD disposition (refusing to fork)".into(),
+            "re-run under a supervisor that leaves SIGCHLD waitable".into(),
+        );
+    }
     let dump_txt = self_dumpable().map_or("unknown".to_string(), |d| d.to_string());
     // SAFETY: single-threaded; child only prctls/stops/_exits.
     let pid = unsafe { libc::fork() };
@@ -1411,25 +1423,29 @@ fn check_spawn_access() -> Check {
     }
     if pid == 0 {
         unsafe {
+            // Backstop: if teardown ever abandons this child (failed
+            // signal + bounded-wait timeout), it dies with us
+            // instead of lingering stopped under init. Checked: a
+            // stopper without a backstop must never stop.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                libc::_exit(0);
+            }
             libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
             libc::raise(libc::SIGSTOP);
             libc::_exit(0);
         }
     }
-    // Identity-safe signal handle, opened immediately after forking
-    // (see pidfd_open_child): the teardown kill below cannot hit a
-    // recycled number on pidfd-capable kernels, whatever the SIGCHLD
-    // disposition. Closes itself on every return.
-    let pidfd = pidfd_open_child(pid);
     let mut status = 0;
     // Reap confirming (not assumed): the first wait may already reap
-    // a child that died instead of stopping; otherwise the kill +
-    // second wait must observe the death. ECHILD anywhere means no
-    // unwaited-for child exists (already reaped — safe, not an
-    // error). A SIGKILLed 3-instruction child always dies, so the
-    // second wait cannot hang; any non-EINTR surprise still breaks
-    // out and fails the check below (never a silent leak).
+    // a child that exited itself instead of stopping (denied
+    // backstop setup — Degraded below, not a maps verdict);
+    // otherwise the kill + bounded second wait must observe the
+    // death. ECHILD anywhere means no unwaited-for child exists
+    // (already reaped — safe, not an error). The numeric kill is
+    // sound: the pre-fork waitability refuse pins our unreaped child
+    // to its number.
     let mut reaped = false;
+    let mut exited_early = false;
     let stopped = loop {
         let r = unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) };
         if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
@@ -1437,6 +1453,7 @@ fn check_spawn_access() -> Check {
         }
         if r == pid && (libc::WIFEXITED(status) || libc::WIFSIGNALED(status)) {
             reaped = true;
+            exited_early = true;
         }
         if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
             reaped = true;
@@ -1448,50 +1465,51 @@ fn check_spawn_access() -> Check {
     } else {
         Err(std::io::Error::other("probe child never stopped"))
     };
-    // Prefer the pidfd signal (identity-safe under auto-reap);
-    // numeric only on pre-pidfd kernels. Residual there: auto-reap +
-    // exit-before-stop + instant pid reuse — the stopped child this
-    // probe normally kills is alive, so its number cannot recycle.
-    let k = match pidfd.as_ref() {
-        Some(pidfd) => unsafe {
-            // SAFETY: pidfd pins our child (opened right after
-            // forking); NULL siginfo sends SIGKILL with no payload.
-            // Raw syscall: this libc predates the wrapper.
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                pidfd.as_raw_fd(),
-                libc::SIGKILL,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            ) as libc::c_int
-        },
-        None => unsafe { libc::kill(pid, libc::SIGKILL) },
-    };
+    // SAFETY: the pre-fork waitability refuse pins our unreaped
+    // child (stopped, zombie, or exited) to its number, so this can
+    // only hit it.
+    let k = unsafe { libc::kill(pid, libc::SIGKILL) };
     let kill_errno = std::io::Error::last_os_error().raw_os_error();
     if k != 0 && !reaped && kill_errno != Some(libc::ESRCH) {
-        // Kill failed on a live, unreaped child (EPERM/EINVAL are
-        // impossible for our own pid+SIGKILL — this is defensive):
-        // the wait below still reaps, but say so loudly.
+        // Kill failed on a live, unreaped child (confinement
+        // refusing the signal): the bounded wait below still tries,
+        // but say so loudly.
         crate::report::err_line(&format!(
             "osslscope doctor: probe kill failed: {kill_errno:?}"
         ));
     }
+    // Bounded confirmation: after a FAILED signal the child may
+    // still be stopped-alive, so a blocking wait could hang forever
+    // — poll instead. Timeout keeps reaped=false and the Fail below
+    // fires (the child's pdeathsig backstop, armed before it could
+    // stop, kills it with us — never a silent lingering leak).
     let mut status2 = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
-        let r = unsafe { libc::waitpid(pid, &mut status2, 0) };
-        if r < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-            continue;
-        }
-        if r == pid || std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD) {
+        if reap_poll_once(pid, &mut status2) {
             reaped = true;
+            break;
         }
-        break;
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if !reaped {
         return Check::fail(
             "spawn-access",
             "spawn-setup probe leaked its child (reap unconfirmed)".into(),
-            "re-run; a leftover stopped child blocks the next probe — report this".into(),
+            "re-run; the leftover child dies with this process (backstop) — report this".into(),
+        );
+    }
+    if exited_early {
+        // The child exited itself instead of stopping: denied
+        // backstop setup (confinement) is the only self-exit path.
+        // Not a maps verdict — the fixture never established.
+        return Check::degraded(
+            "spawn-access",
+            "spawn-setup probe child could not arm its backstop (denied setup), exiting instead of stopping".into(),
+            "re-run outside confinement, then report".into(),
         );
     }
     match maps {
@@ -2262,53 +2280,23 @@ fn write_rendezvous_byte_or_exit(write: libc::c_int, ppid: u32) {
     }
 }
 
-/// Read-only SIGCHLD disposition query: false when children would
-/// auto-reap (SIG_IGN or SA_NOCLDWAIT), in which case a numeric pid
-/// cannot prove ownership across the teardown window. Never mutates
-/// process state: the lifecycle launcher owns SIGCHLD in this
-/// binary, so disposition enforcement is not an option (precedent:
-/// lifecycle_producer refuses instead).
+/// Read-only SIGCHLD disposition query: true only for SIG_DFL
+/// without SA_NOCLDWAIT — the one disposition under which our forked
+/// children provably zombie (no auto-reap, no custom handler that
+/// could steal the reap), so an unreaped child pins its pid number
+/// and a numeric teardown signal can only hit it. Anything else
+/// (SIG_IGN, NOCLDWAIT, custom handler) reads non-waitable and the
+/// fork probes refuse before forking rather than risk a signal to a
+/// recycled number. Never mutates process state (precedent:
+/// lifecycle_producer refuses on the same condition instead of
+/// enforcing it).
 fn sigchld_waitable() -> bool {
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
     // SAFETY: oact-only query mutates nothing; act is writable.
     if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut act) } < 0 {
         return false;
     }
-    act.sa_sigaction != libc::SIG_IGN && (act.sa_flags & libc::SA_NOCLDWAIT) == 0
-}
-
-/// Identity-safe child handle: pidfd_open pins the child across any
-/// pid-number reuse (auto-reaping supervisors included), so the
-/// teardown signal can never hit a recycled number. Must be opened
-/// IMMEDIATELY after forking, before any rendezvous or wait: pid
-/// numbers allocate sequentially, so ours cannot recycle within that
-/// window and the pin provably names our child. None on pre-pidfd
-/// kernels or fd exhaustion — the caller falls back to a numeric
-/// kill only when `sigchld_waitable` proves the number is pinned by
-/// a zombie, and refuses otherwise. Raw syscall: this libc predates
-/// the wrapper (only SYS_pidfd_open exists).
-fn pidfd_open_child(pid: libc::pid_t) -> Option<OwnedFd> {
-    // SAFETY: pidfd_open pins the current occupant of the number;
-    // on success the fd is owned exactly once by the OwnedFd.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as libc::c_int;
-    if fd < 0 {
-        return None;
-    }
-    Some(unsafe { OwnedFd::from_raw_fd(fd) })
-}
-
-/// How the pauser teardown signal is addressed.
-enum PauserKill {
-    /// pidfd: identity-safe under every disposition (auto-reap
-    /// included) — a recycled number is unreachable through the pin.
-    Pidfd(OwnedFd),
-    /// Numeric pid: sound only because `sigchld_waitable` proved the
-    /// child zombies (an unreaped child pins its number).
-    Numeric,
-    /// Pre-pidfd kernel under an auto-reaping supervisor: no safe
-    /// address exists. The child exits itself or pauses with its
-    /// backstop — never touched numerically.
-    Impossible,
+    act.sa_sigaction == libc::SIG_DFL && (act.sa_flags & libc::SA_NOCLDWAIT) == 0
 }
 
 /// Pauser teardown shared by every exit arm: the kill result
@@ -2317,32 +2305,12 @@ enum PauserKill {
 /// backstop: it dies with us). True when the child is reaped by this
 /// call (or already gone); a live-but-unreaped child returns false
 /// and the caller fails loud.
-fn confirm_pauser_gone(pid: libc::pid_t, kill: &PauserKill, status: &mut libc::c_int) -> bool {
-    let killed = match kill {
-        PauserKill::Pidfd(pidfd) => {
-            // SAFETY: pidfd pins our child (or a verified-exited
-            // child, in which case the signal fails closed with
-            // ESRCH); a NULL siginfo sends SIGKILL with no payload.
-            // Raw syscall: this libc predates the wrapper.
-            unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    pidfd.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                ) == 0
-            }
-        }
-        PauserKill::Numeric => {
-            // SAFETY: waitable disposition (checked by the caller):
-            // our unreaped child pins its number, so this can only
-            // hit it (signaling a zombie is harmless, ESRCH only
-            // sharpens `killed`).
-            unsafe { libc::kill(pid, libc::SIGKILL) == 0 }
-        }
-        PauserKill::Impossible => false,
-    };
+fn confirm_pauser_gone(pid: libc::pid_t, status: &mut libc::c_int) -> bool {
+    // SAFETY: the caller refused non-waitable dispositions before
+    // forking, so our unreaped child (pausing or zombie) pins its
+    // number and this can only hit it (signaling a zombie is
+    // harmless, ESRCH only sharpens `killed`).
+    let killed = unsafe { libc::kill(pid, libc::SIGKILL) == 0 };
     if reap_poll_once(pid, status) {
         return true;
     }
@@ -2388,6 +2356,18 @@ fn check_owned_child_map_files() -> Check {
             "test-only functional probe result".into(),
         );
     }
+    // Refuse before forking when teardown identity cannot be
+    // established: under a non-waitable SIGCHLD disposition the
+    // child could auto-reap (or be reaped by a custom handler) and
+    // its number recycled before the numeric teardown signal. No
+    // fork, no signal, no race — an honest Degraded instead.
+    if !sigchld_waitable() {
+        return Check::degraded(
+            "owned-child-map-files",
+            "pauser teardown identity unavailable under a non-waitable SIGCHLD disposition (refusing to fork)".into(),
+            "re-run under a supervisor that leaves SIGCHLD waitable".into(),
+        );
+    }
     let ppid = std::process::id();
     let mut pipe = [0; 2];
     // SAFETY: pipe writes two fds on success; the parent closes its
@@ -2423,16 +2403,6 @@ fn check_owned_child_map_files() -> Check {
             libc::_exit(0);
         }
     }
-    // Teardown addressing, decided immediately after forking (before
-    // any rendezvous or wait): pidfd pins the child under every
-    // disposition; a numeric pid only when waitability proves the
-    // number cannot recycle. The OwnedFd closes on every return
-    // below, whatever the verdict.
-    let kill = match pidfd_open_child(pid) {
-        Some(pidfd) => PauserKill::Pidfd(pidfd),
-        None if sigchld_waitable() => PauserKill::Numeric,
-        None => PauserKill::Impossible,
-    };
     unsafe {
         // The parent's write end must close before the rendezvous
         // read: otherwise EOF (the Gone signal) could never arrive.
@@ -2443,33 +2413,18 @@ fn check_owned_child_map_files() -> Check {
         pipe[0],
         std::time::Instant::now() + std::time::Duration::from_secs(5),
     ) {
-        Rendezvous::Pausing => {
-            unsafe {
-                libc::close(pipe[0]);
-            }
-            if matches!(kill, PauserKill::Impossible) {
-                // Pre-pidfd kernel under an auto-reaping supervisor:
-                // the pauser is proven pausing but cannot be
-                // signaled safely — abandon it to its backstop (it
-                // dies with this process) instead of risking a
-                // numeric kill on a recyclable number.
-                return Check::degraded(
-                    "owned-child-map-files",
-                    "pauser teardown unavailable under an auto-reaping supervisor on a pre-pidfd kernel (pauser dies with this process)".into(),
-                    "re-run on a pidfd-capable kernel".into(),
-                );
-            }
-        }
+        Rendezvous::Pausing => unsafe {
+            libc::close(pipe[0]);
+        },
         Rendezvous::Gone => {
             unsafe {
                 libc::close(pipe[0]);
             }
-            // EOF means the child exited (the zombie collects here,
-            // or the kernel already did under auto-reap), but a read
-            // failure can land here with a live child — either way
-            // it is signaled-if-live and confirmed, never left
-            // pausing silently.
-            if !confirm_pauser_gone(pid, &kill, &mut status) {
+            // EOF means the child exited (the zombie collects here),
+            // but a read failure can land here with a live child —
+            // either way it is signaled-if-live and confirmed, never
+            // left pausing silently.
+            if !confirm_pauser_gone(pid, &mut status) {
                 return pauser_reap_unconfirmed();
             }
             return Check::degraded(
@@ -2485,7 +2440,7 @@ fn check_owned_child_map_files() -> Check {
             // A live-but-silent child (externally stopped?): signal
             // it and confirm boundedly; unconfirmed is Fail, like the
             // teardown below.
-            if !confirm_pauser_gone(pid, &kill, &mut status) {
+            if !confirm_pauser_gone(pid, &mut status) {
                 return pauser_reap_unconfirmed();
             }
             return Check::degraded(
@@ -2496,7 +2451,7 @@ fn check_owned_child_map_files() -> Check {
         }
     }
     let access = probe_map_files(Path::new(&format!("/proc/{pid}/map_files")));
-    if !confirm_pauser_gone(pid, &kill, &mut status) {
+    if !confirm_pauser_gone(pid, &mut status) {
         return pauser_reap_unconfirmed();
     }
     match access {
@@ -4129,11 +4084,14 @@ mod tests {
                 libc::_exit(0);
             }
         }
+        // Guards install before any assert that could strand a child.
+        let mut live_guard = ReapGuard::arm(live);
         let dead = unsafe { libc::fork() };
         assert!(dead >= 0, "fork failed");
         if dead == 0 {
             unsafe { libc::_exit(0) };
         }
+        let mut dead_guard = ReapGuard::arm(dead);
         let mut st = 0;
         loop {
             // SAFETY: dead names our exited child; blocking wait
@@ -4147,6 +4105,7 @@ mod tests {
                 Some(libc::EINTR)
             );
         }
+        dead_guard.disarm();
         // Double-wait: genuine ECHILD, seeding errno. No libc call
         // that could clear it runs between here and the poll.
         // SAFETY: dead is reaped; this wait only fails.
@@ -4162,71 +4121,211 @@ mod tests {
             !reap_poll_once(live, &mut status),
             "live child must poll false despite stale ECHILD"
         );
-        // Numeric addressing: the test process stays waitable
-        // (process-global disposition discipline — set-and-restore —
-        // is pinned by sigchld_waitable_reads_both_autoreap_forms,
-        // and the autoreap worker sets IGN only in its forked child).
-        assert!(
-            confirm_pauser_gone(live, &PauserKill::Numeric, &mut status),
-            "regression-test pauser must confirm reaped"
-        );
+        // Disarm only on success: a failed confirm leaves the guard
+        // to close the leak.
+        let confirmed = confirm_pauser_gone(live, &mut status);
+        if confirmed {
+            live_guard.disarm();
+        }
+        assert!(confirmed, "regression-test pauser must confirm reaped");
     }
 
     #[test]
-    fn sigchld_waitable_reads_both_autoreap_forms() {
-        // Both auto-reap forms (SIG_IGN, SA_NOCLDWAIT) must read
-        // non-waitable; the ambient disposition must read waitable.
-        // Restores before asserting, so the suite stays clean even
-        // on failure; the saved values pin the set-up too (a set
-        // that silently failed would show up in `prev`).
-        // SAFETY: single-threaded test lease; no children exist
-        // here, so the momentary dispositions reap nothing.
-        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
-        let ignored = sigchld_waitable();
-        let prev = unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) };
-        let mut before: libc::sigaction = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut before) },
-            0
-        );
+    fn sigchld_waitable_classifies_all_dispositions() {
+        // DFL-without-NOCLDWAIT is the only waitable shape; SIG_IGN,
+        // SA_NOCLDWAIT, and custom handlers all refuse. Runs in a
+        // forked worker (never in the runner process) with the
+        // original disposition saved first and restored last.
+        let verdict = run_native_worker::<2>(waitable_worker);
+        match verdict[0] {
+            1 => {}
+            3 => panic!("disposition setup/restore failed in the worker"),
+            4 => panic!(
+                "wrong waitability reading, cases={:#06b} (bit0 IGN, bit1 DFL, bit2 NOCLDWAIT, bit3 handler)",
+                verdict[1]
+            ),
+            v => panic!("unknown verdict {v}"),
+        }
+    }
+
+    /// Native worker: exercise `sigchld_waitable` against all four
+    /// disposition shapes in an isolated process (the mutations never
+    /// touch the test runner). Saves the ORIGINAL action first and
+    /// restores it last, so the verdict is ambient-agnostic (correct
+    /// even under an inherited-ignored runner). Verdict bytes (always
+    /// two): [1, 0] ok / [3, 0] setup-fail / [4, bits] wrong reading
+    /// (bit i names the case: 0 IGN, 1 DFL, 2 NOCLDWAIT, 3 handler).
+    fn waitable_worker() -> Vec<u8> {
+        // SAFETY: forked single-threaded child; no children exist
+        // here, so the momentary dispositions reap nothing; every
+        // set is checked and the original is restored before return
+        // on all paths.
+        let mut original: libc::sigaction = unsafe { std::mem::zeroed() };
+        if unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut original) } != 0 {
+            return vec![3, 0];
+        }
+        let restore = |original: &libc::sigaction| unsafe {
+            libc::sigaction(libc::SIGCHLD, original, std::ptr::null_mut()) == 0
+        };
+        let mut wrong = 0u8;
+        // Case 0: SIG_IGN reads non-waitable.
+        if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) } == libc::SIG_ERR {
+            restore(&original);
+            return vec![3, 0];
+        }
+        if sigchld_waitable() {
+            wrong |= 1 << 0;
+        }
+        // Case 1: SIG_DFL reads waitable.
+        if unsafe { libc::signal(libc::SIGCHLD, libc::SIG_DFL) } == libc::SIG_ERR {
+            restore(&original);
+            return vec![3, 0];
+        }
+        if !sigchld_waitable() {
+            wrong |= 1 << 1;
+        }
+        // Case 2: SA_NOCLDWAIT reads non-waitable.
         let mut flagged: libc::sigaction = unsafe { std::mem::zeroed() };
         flagged.sa_sigaction = libc::SIG_DFL;
         unsafe { libc::sigemptyset(&mut flagged.sa_mask) };
         flagged.sa_flags = libc::SA_NOCLDWAIT;
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGCHLD, &flagged, std::ptr::null_mut()) },
-            0
-        );
-        let nocldwait = sigchld_waitable();
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGCHLD, &before, std::ptr::null_mut()) },
-            0
-        );
-        assert_eq!(prev, libc::SIG_IGN, "the SIG_IGN setup must take effect");
-        assert!(!ignored, "SIG_IGN must read non-waitable");
-        assert!(!nocldwait, "SA_NOCLDWAIT must read non-waitable");
-        assert!(
-            sigchld_waitable(),
-            "restored disposition must read waitable"
-        );
+        if unsafe { libc::sigaction(libc::SIGCHLD, &flagged, std::ptr::null_mut()) } != 0 {
+            restore(&original);
+            return vec![3, 0];
+        }
+        if sigchld_waitable() {
+            wrong |= 1 << 2;
+        }
+        // Case 3: a custom handler reads non-waitable (it could steal
+        // the reap) — even without NOCLDWAIT.
+        extern "C" fn handler(_: libc::c_int) {}
+        let mut handled: libc::sigaction = unsafe { std::mem::zeroed() };
+        handled.sa_sigaction = handler as usize;
+        unsafe { libc::sigemptyset(&mut handled.sa_mask) };
+        if unsafe { libc::sigaction(libc::SIGCHLD, &handled, std::ptr::null_mut()) } != 0 {
+            restore(&original);
+            return vec![3, 0];
+        }
+        if sigchld_waitable() {
+            wrong |= 1 << 3;
+        }
+        if !restore(&original) {
+            return vec![3, 0];
+        }
+        if wrong != 0 {
+            return vec![4, wrong];
+        }
+        vec![1, 0]
     }
 
-    /// Stranded-pauser death oracle: state Z (zombie awaiting the
-    /// adopter's reap) or a vanished /proc entry both prove death.
-    /// X/x (dead, rarely observed) count as dead too; any other
-    /// state (or an unparsable table) reads alive.
-    fn pauser_dead(pid: u32) -> bool {
-        let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+    /// Test-only reap guard: installed immediately after forking,
+    /// so a panicking assert can never leak the child. Drop signals
+    /// (best effort) and reaps boundedly; never panics. Disarm after
+    /// the test takes over teardown explicitly.
+    struct ReapGuard {
+        pid: libc::pid_t,
+        armed: bool,
+    }
+    impl ReapGuard {
+        fn arm(pid: libc::pid_t) -> Self {
+            ReapGuard { pid, armed: true }
+        }
+        fn disarm(&mut self) {
+            self.armed = false;
+        }
+    }
+    impl Drop for ReapGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            // Best effort only: never panic from Drop. Signal first
+            // (a zombie ignores it), then reap boundedly; a
+            // SIGKILLed pauser always dies, so this closes the leak
+            // on every realistic path.
+            // SAFETY: pid is our unreaped child (sole reaper while
+            // armed); status is writable; the waits never block past
+            // the deadline.
+            unsafe { libc::kill(self.pid, libc::SIGKILL) };
+            let mut status = 0;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if reap_poll_once(self.pid, &mut status) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+
+    /// Stranded-pauser observation: Dead is proven only by a dead
+    /// state or a vanished /proc entry (NotFound). Any other read
+    /// failure (permission, exhaustion, I/O) or an unparsable table
+    /// is Unknown — never mistaken for death.
+    #[derive(Debug, PartialEq, Eq)]
+    enum PauserState {
+        Dead,
+        Alive,
+        Unknown,
+    }
+
+    /// Pure /proc-stat classifier behind [`pauser_state`]: factored
+    /// out so the negative controls run deterministically on
+    /// synthetic inputs (no /proc needed).
+    fn classify_pauser_stat(read: std::io::Result<String>) -> PauserState {
+        let stat = match read {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return PauserState::Dead,
+            Err(_) => return PauserState::Unknown,
             Ok(s) => s,
-            Err(_) => return true,
         };
         // The comm field may contain spaces and parens; the state is
         // the first token after the LAST ')'.
-        matches!(
-            stat.rsplit_once(')')
-                .and_then(|(_, after)| after.split_ascii_whitespace().next()),
-            Some("Z" | "X" | "x")
-        )
+        match stat
+            .rsplit_once(')')
+            .and_then(|(_, after)| after.split_ascii_whitespace().next())
+        {
+            Some("Z" | "X" | "x") => PauserState::Dead,
+            Some(_) => PauserState::Alive,
+            None => PauserState::Unknown,
+        }
+    }
+
+    fn pauser_state(pid: u32) -> PauserState {
+        classify_pauser_stat(std::fs::read_to_string(format!("/proc/{pid}/stat")))
+    }
+
+    /// Backstop proof shared by the denial tests: poll until the
+    /// stranded child (handed over before its worker exited) is
+    /// Dead. A dead state or a vanished entry proves death; Unknown
+    /// observations keep polling and fail distinctly at the
+    /// deadline — never mistaken for death.
+    fn poll_stranded_dead(stranded: u32, what: &str) {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut unknown_seen = false;
+        loop {
+            match pauser_state(stranded) {
+                PauserState::Dead => break,
+                PauserState::Alive => {}
+                PauserState::Unknown => unknown_seen = true,
+            }
+            assert!(
+                std::time::Instant::now() < end,
+                "{}",
+                if unknown_seen {
+                    format!(
+                        "stranded {what} {stranded} unobservable: cannot prove the backstop fired"
+                    )
+                } else {
+                    format!(
+                        "stranded {what} {stranded} outlived its parent: pdeathsig backstop failed"
+                    )
+                }
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Live children of this thread (children attach to the forking
@@ -4286,25 +4385,21 @@ mod tests {
         1
     }
 
-    /// Native worker: teardown signals denied (EPERM) → the probe
-    /// must fail fast (never wait unboundedly on an unsignaled
+    /// Native worker: the teardown signal denied (EPERM) → the
+    /// probe must fail fast (never wait unboundedly on an unsignaled
     /// child) and hand the stranded pauser's pid to the parent for
-    /// the pdeathsig-backstop proof. Both signal paths are denied
-    /// (kill(2) for the numeric mode, pidfd_send_signal for the
-    /// pidfd mode — the filters stack); pidfd_open stays allowed so
-    /// the pidfd mode is the one that fails. Returns (verdict,
-    /// stranded pid): verdict 1 ok / 2 skip / 3 setup-fail / 4 wrong
-    /// status / 5 wrong child set / 6 too slow; pid is 0 unless the
-    /// verdict is 1.
+    /// the pdeathsig-backstop proof. The probe signals numerically
+    /// (waitability is enforced pre-fork), so denying kill(2) is the
+    /// complete denial. Returns (verdict, stranded pid): verdict 1
+    /// ok / 2 skip / 3 setup-fail / 4 wrong status / 5 wrong child
+    /// set / 6 too slow; pid is 0 unless the verdict is 1.
     fn kill_denial_worker() -> (u8, u32) {
         use crate::target::{SeccompDeny, seccomp_deny_syscall};
         use std::time::{Duration, Instant};
-        for sysno in [libc::SYS_kill, libc::SYS_pidfd_send_signal] {
-            match seccomp_deny_syscall(sysno, libc::EPERM) {
-                SeccompDeny::Installed => {}
-                SeccompDeny::Unsupported => return (2, 0),
-                SeccompDeny::Failed => return (3, 0),
-            }
+        match seccomp_deny_syscall(libc::SYS_kill, libc::EPERM) {
+            SeccompDeny::Installed => {}
+            SeccompDeny::Unsupported => return (2, 0),
+            SeccompDeny::Failed => return (3, 0),
         }
         let before = live_children_of_this_thread();
         let start = Instant::now();
@@ -4330,15 +4425,75 @@ mod tests {
     }
 
     /// Native worker: SIGCHLD ignored (auto-reap, as under an
-    /// exotic supervisor) → the probe must still pass via its pidfd
-    /// addressing, with nothing leaked. Verdict byte: 1 ok / 4 wrong
-    /// shape / 5 leaked.
+    /// exotic supervisor) → the probe must refuse BEFORE forking
+    /// (Degraded, no child, nothing leaked) rather than risk a
+    /// teardown signal to a recycled number. Verdict byte: 1 ok / 4
+    /// wrong shape / 5 forked-or-leaked.
     fn autoreap_worker() -> u8 {
         // SAFETY: forked single-threaded child; the disposition dies
         // with us, so the test process is never affected.
         unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
         let check = check_owned_child_map_files();
-        if check.status != Status::Pass {
+        if check.status != Status::Degraded || !check.message.contains("refusing to fork") {
+            return 4;
+        }
+        if !live_children_of_this_thread().is_empty() {
+            return 5;
+        }
+        1
+    }
+
+    /// Native worker: the spawn probe's teardown signal denied
+    /// (EPERM) → it must fail BOUNDED (never hang in the
+    /// confirmation wait) and strand exactly its stopped child,
+    /// which the backstop kills with us. Returns (verdict, stranded
+    /// pid): verdict 1 ok / 2 skip / 3 setup-fail / 4 wrong status /
+    /// 5 wrong child set / 6 unbounded; pid is 0 unless verdict is 1.
+    fn spawn_access_kill_denial_worker() -> (u8, u32) {
+        use crate::target::{SeccompDeny, seccomp_deny_syscall};
+        use std::time::{Duration, Instant};
+        match seccomp_deny_syscall(libc::SYS_kill, libc::EPERM) {
+            SeccompDeny::Installed => {}
+            SeccompDeny::Unsupported => return (2, 0),
+            SeccompDeny::Failed => return (3, 0),
+        }
+        let before = live_children_of_this_thread();
+        let start = Instant::now();
+        let check = check_spawn_access();
+        let elapsed = start.elapsed();
+        if check.status != Status::Fail {
+            return (4, 0);
+        }
+        // Bounded, not fast: the 5s confirmation burn is expected;
+        // the old blocking wait would hang (and the parent watchdog
+        // would catch a true hang independently).
+        if elapsed >= Duration::from_secs(30) {
+            return (6, 0);
+        }
+        let new: Vec<u32> = live_children_of_this_thread()
+            .difference(&before)
+            .copied()
+            .collect();
+        if new.len() != 1 {
+            return (5, 0);
+        }
+        (1, new[0])
+    }
+
+    /// Native worker: spawn probe's backstop setup denied (EPERM) →
+    /// the child exits itself instead of stopping and the probe
+    /// reports Degraded (fixture never established — not a maps
+    /// verdict), with nothing leaked. Verdict byte: 1 ok / 2 skip /
+    /// 3 setup-fail / 4 wrong shape / 5 leaked.
+    fn spawn_access_prctl_denial_worker() -> u8 {
+        use crate::target::{SeccompDeny, seccomp_deny_syscall};
+        match seccomp_deny_syscall(libc::SYS_prctl, libc::EPERM) {
+            SeccompDeny::Installed => {}
+            SeccompDeny::Unsupported => return 2,
+            SeccompDeny::Failed => return 3,
+        }
+        let check = check_spawn_access();
+        if check.status != Status::Degraded || !check.message.contains("backstop") {
             return 4;
         }
         if !live_children_of_this_thread().is_empty() {
@@ -4442,26 +4597,11 @@ mod tests {
             6 => panic!("kill-denied probe must fail fast (<2s), not wait unboundedly"),
             v => panic!("unknown verdict {v}"),
         }
-        // Retained-exit-evidence oracle: state Z (zombie awaiting
-        // the adopter's reap) or a vanished /proc entry both prove
-        // death — only a live state keeps polling. Never mistakes
-        // the adopter's reaping latency for survival (kill(pid, 0)
-        // sees zombies as alive).
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if pauser_dead(stranded) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < end,
-                "stranded pauser {stranded} outlived its parent: pdeathsig backstop failed"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        poll_stranded_dead(stranded, "pauser");
     }
 
     #[test]
-    fn pauser_dead_reads_zombie_as_dead() {
+    fn pauser_state_reads_zombie_as_dead() {
         // The R2 counterexample reduced: a SIGKILLed child awaiting
         // its adopter's reap is a zombie — kill(pid, 0) still sees
         // it (no ESRCH), but it IS dead and the oracle must say so.
@@ -4473,11 +4613,12 @@ mod tests {
             unsafe { libc::_exit(0) };
         }
         let pid = pid as u32;
+        let mut guard = ReapGuard::arm(pid as libc::pid_t);
         let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            // pauser_dead reads /proc only — it never reaps, so the
+            // pauser_state reads /proc only — it never reaps, so the
             // zombie is still there for the contrast below.
-            if pauser_dead(pid) {
+            if pauser_state(pid) == PauserState::Dead {
                 break;
             }
             assert!(
@@ -4509,19 +4650,138 @@ mod tests {
                 Some(libc::EINTR)
             );
         }
+        guard.disarm();
     }
 
     #[test]
-    fn owned_child_probe_passes_under_autoreap_supervisor() {
-        // Exotic supervisor with SIGCHLD ignored: the pauser
-        // auto-reaps on exit, so a numeric teardown kill could hit a
-        // recycled number — the probe must address it via pidfd and
-        // pass exactly as usual, with nothing leaked.
+    fn classify_pauser_stat_negative_controls() {
+        // Pure classifier matrix (synthetic inputs, no /proc): only
+        // NotFound reads Dead among the errors; dead states read
+        // Dead; live states read Alive; everything else is Unknown —
+        // never death by default.
+        use std::io::{Error, ErrorKind};
+        let err =
+            |kind: ErrorKind| -> std::io::Result<String> { Err(Error::new(kind, "synthetic")) };
+        assert_eq!(
+            classify_pauser_stat(err(ErrorKind::NotFound)),
+            PauserState::Dead
+        );
+        assert_eq!(
+            classify_pauser_stat(err(ErrorKind::PermissionDenied)),
+            PauserState::Unknown
+        );
+        assert_eq!(
+            classify_pauser_stat(err(ErrorKind::Interrupted)),
+            PauserState::Unknown
+        );
+        // Comm with spaces and parens: the state is past the LAST ')'.
+        assert_eq!(
+            classify_pauser_stat(Ok("1 (a (b) c) Z 0".into())),
+            PauserState::Dead
+        );
+        assert_eq!(
+            classify_pauser_stat(Ok("1 (x) X 0".into())),
+            PauserState::Dead
+        );
+        assert_eq!(
+            classify_pauser_stat(Ok("1 (x) S 0".into())),
+            PauserState::Alive
+        );
+        assert_eq!(
+            classify_pauser_stat(Ok("1 (x) R 0".into())),
+            PauserState::Alive
+        );
+        assert_eq!(classify_pauser_stat(Ok("".into())), PauserState::Unknown);
+        assert_eq!(
+            classify_pauser_stat(Ok("garbage without parens".into())),
+            PauserState::Unknown
+        );
+    }
+
+    #[test]
+    fn pauser_state_reads_live_pauser_alive() {
+        // Live-child control: a pausing child is Alive (never Dead,
+        // never Unknown) — the oracle's positive direction.
+        // SAFETY: single-threaded test lease; the guard below owns
+        // teardown if any assert panics.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::pause();
+                libc::_exit(0);
+            }
+        }
+        let mut guard = ReapGuard::arm(pid);
+        assert_eq!(pauser_state(pid as u32), PauserState::Alive);
+        let mut status = 0;
+        let confirmed = confirm_pauser_gone(pid, &mut status);
+        if confirmed {
+            guard.disarm();
+        }
+        assert!(confirmed, "live-control pauser must confirm reaped");
+    }
+
+    #[test]
+    fn spawn_access_probe_fails_bounded_when_kill_denied() {
+        // Confinement rejecting the teardown signal: the probe fails
+        // BOUNDED (the old blocking wait hung here — the reviewer
+        // reproduced the hang) and strands exactly its stopped
+        // child, which the backstop kills with the worker (proven by
+        // death after the reap, as for the pauser).
+        let verdict = run_native_worker::<5>(|| {
+            let (v, pid) = spawn_access_kill_denial_worker();
+            let mut out = vec![v];
+            out.extend_from_slice(&pid.to_le_bytes());
+            out
+        });
+        let stranded = u32::from_le_bytes(verdict[1..5].try_into().unwrap());
+        match verdict[0] {
+            1 => assert_ne!(stranded, 0, "ok verdict must carry the stranded pid"),
+            2 => {
+                eprintln!("SKIP: seccomp unavailable (foreign arch or no SECCOMP_MODE_FILTER)");
+                return;
+            }
+            3 => panic!("seccomp deny filter failed to install on a supporting kernel"),
+            4 => panic!("kill-denied spawn probe must report Fail"),
+            5 => panic!("kill-denied spawn probe left the wrong child set"),
+            6 => panic!("kill-denied spawn probe must fail bounded (<30s), not hang"),
+            v => panic!("unknown verdict {v}"),
+        }
+        poll_stranded_dead(stranded, "spawn-probe child");
+    }
+
+    #[test]
+    fn spawn_access_probe_reports_denied_setup_when_prctl_denied() {
+        // Confinement rejecting backstop setup: the child exits
+        // itself instead of stopping and the probe reports Degraded
+        // (the maps fixture never established — not a maps verdict),
+        // with nothing leaked.
+        let verdict = run_native_worker::<1>(|| vec![spawn_access_prctl_denial_worker()]);
+        match verdict[0] {
+            1 => {}
+            2 => {
+                eprintln!("SKIP: seccomp unavailable (foreign arch or no SECCOMP_MODE_FILTER)");
+                return;
+            }
+            3 => panic!("seccomp deny filter failed to install on a supporting kernel"),
+            4 => panic!("prctl-denied spawn probe must report Degraded/backstop"),
+            5 => panic!("prctl-denied spawn probe leaked a child"),
+            v => panic!("unknown verdict {v}"),
+        }
+    }
+
+    #[test]
+    fn owned_child_probe_refuses_under_autoreap_supervisor() {
+        // Exotic supervisor with SIGCHLD ignored: teardown identity
+        // cannot be established, so the probe refuses before forking
+        // (Degraded) instead of risking a signal to a recycled
+        // number. No fork means no leak by construction (pinned).
         let verdict = run_native_worker::<1>(|| vec![autoreap_worker()]);
         match verdict[0] {
             1 => {}
-            4 => panic!("auto-reaped probe must still pass"),
-            5 => panic!("auto-reaped probe leaked a child"),
+            4 => panic!("auto-reaped probe must refuse with Degraded/fork-refusal"),
+            5 => panic!("refusing probe must not fork"),
             v => panic!("unknown verdict {v}"),
         }
     }
