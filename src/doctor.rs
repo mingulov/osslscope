@@ -4148,84 +4148,78 @@ mod tests {
         assert!(confirmed, "regression-test pauser must confirm reaped");
     }
 
-    #[test]
-    fn worker_timeout_arms_oneshot_sigalrm() {
-        // Pins the harness self-destruction mechanism in-process (no
-        // fork): forced DFL + unblocked + a 55s one-shot itimer.
-        // Order matters: ambient is saved first; the timer is read
-        // and DISARMED before any assert (a live itimer would kill
-        // the suite 55s later if an assert panicked); disposition
-        // and mask are restored before any assert too — panics below
-        // are side-effect-free.
-        // SAFETY: single-threaded test lease; all queries valid.
-        let mut saved_act: libc::sigaction = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGALRM, std::ptr::null(), &mut saved_act) },
-            0
-        );
-        let mut saved_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut saved_mask) },
-            0
-        );
+    /// Native worker: pin the harness self-destruction mechanism
+    /// (forced DFL + unblocked + 55s one-shot itimer) in an isolated
+    /// process — timer changes, a setup-failure _exit, and readback
+    /// failures can never touch the runner. No asserts here: every
+    /// fallible step reports a verdict instead. Verdict bytes (always
+    /// two): [1, 0] ok / [3, 0] setup-fail / [4, bits] wrong reading
+    /// (bit0 value window, bit1 interval, bit2 DFL, bit3 unblocked,
+    /// bit4 disarm-clears).
+    fn timeout_mechanism_worker() -> Vec<u8> {
+        // SAFETY: forked single-threaded child; all queries valid.
         arm_worker_timeout();
         let mut armed: libc::itimerval = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::getitimer(libc::ITIMER_REAL, &mut armed) }, 0);
+        if unsafe { libc::getitimer(libc::ITIMER_REAL, &mut armed) } != 0 {
+            return vec![3, 0];
+        }
         let mut armed_act: libc::sigaction = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGALRM, std::ptr::null(), &mut armed_act) },
-            0
-        );
+        if unsafe { libc::sigaction(libc::SIGALRM, std::ptr::null(), &mut armed_act) } != 0 {
+            return vec![3, 0];
+        }
         let mut armed_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut armed_mask) },
-            0
-        );
+        if unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut armed_mask) } != 0 {
+            return vec![3, 0];
+        }
         let disarm: libc::itimerval = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::setitimer(libc::ITIMER_REAL, &disarm, std::ptr::null_mut()) },
-            0
-        );
+        if unsafe { libc::setitimer(libc::ITIMER_REAL, &disarm, std::ptr::null_mut()) } != 0 {
+            return vec![3, 0];
+        }
         let mut cleared: libc::itimerval = unsafe { std::mem::zeroed() };
-        assert_eq!(
-            unsafe { libc::getitimer(libc::ITIMER_REAL, &mut cleared) },
-            0
-        );
-        assert_eq!(
-            unsafe { libc::sigaction(libc::SIGALRM, &saved_act, std::ptr::null_mut()) },
-            0
-        );
-        assert_eq!(
-            unsafe { libc::sigprocmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut()) },
-            0
-        );
-        // All reads saved; the timer is dead and ambient restored —
-        // asserts below cannot strand anything.
+        if unsafe { libc::getitimer(libc::ITIMER_REAL, &mut cleared) } != 0 {
+            return vec![3, 0];
+        }
+        let mut wrong = 0u8;
         let armed_us = armed.it_value.tv_sec as i64 * 1_000_000 + armed.it_value.tv_usec as i64;
-        assert!(
-            (54_000_000..=55_000_000).contains(&armed_us),
-            "one-shot must read ~55s, got {armed_us}us"
-        );
-        assert_eq!(
-            (armed.it_interval.tv_sec, armed.it_interval.tv_usec),
-            (0, 0),
-            "must be one-shot (no interval)"
-        );
-        assert_eq!(
-            armed_act.sa_sigaction,
-            libc::SIG_DFL,
-            "SIGALRM must be forced DFL"
-        );
-        assert_eq!(
-            unsafe { libc::sigismember(&armed_mask, libc::SIGALRM) },
-            0,
-            "SIGALRM must be unblocked"
-        );
-        assert_eq!(
-            (cleared.it_value.tv_sec, cleared.it_value.tv_usec),
-            (0, 0),
-            "disarm must clear the timer"
-        );
+        if !(54_000_000..=55_000_000).contains(&armed_us) {
+            wrong |= 1 << 0;
+        }
+        if (armed.it_interval.tv_sec, armed.it_interval.tv_usec) != (0, 0) {
+            wrong |= 1 << 1;
+        }
+        if armed_act.sa_sigaction != libc::SIG_DFL {
+            wrong |= 1 << 2;
+        }
+        match unsafe { libc::sigismember(&armed_mask, libc::SIGALRM) } {
+            0 => {}
+            1 => wrong |= 1 << 3,
+            _ => return vec![3, 0],
+        }
+        if (cleared.it_value.tv_sec, cleared.it_value.tv_usec) != (0, 0) {
+            wrong |= 1 << 4;
+        }
+        if wrong != 0 {
+            return vec![4, wrong];
+        }
+        vec![1, 0]
+    }
+
+    #[test]
+    fn worker_timeout_arms_oneshot_sigalrm() {
+        // The self-destruction mechanism, verified in an isolated
+        // worker (never in the runner): a readback failure there
+        // fails this verdict, not the suite. Ambient-robust (no
+        // waits involved, no disposition precondition).
+        let verdict = run_native_worker::<2>(timeout_mechanism_worker);
+        match verdict[0] {
+            1 => {}
+            3 => panic!("timeout mechanism setup/readback failed in the worker"),
+            4 => panic!(
+                "wrong timeout mechanism reading, cases={:#07b} (bit0 value, bit1 interval, bit2 DFL, bit3 unblocked, bit4 disarm)",
+                verdict[1]
+            ),
+            v => panic!("unknown verdict {v}"),
+        }
     }
 
     /// Native worker: the R5 repro as a test — wait4 denied plus
@@ -4675,8 +4669,11 @@ mod tests {
     /// worker-local (dies with the worker), armed before the worker
     /// runs. Healthy workers finish in <6s; the margin is 10x, and
     /// the itimer does not inherit across the worker's own forks.
-    /// Setup failure _exits nonzero (the parent reads EOF and fails
-    /// loud); never returns a live worker unarmed.
+    /// Guarantee excludes externally stopped/traced workers (a
+    /// stopped worker's alarm stays pending until SIGCONT) — those
+    /// fail loud via the watchdog instead. Setup failure _exits
+    /// nonzero (the parent reads EOF and fails loud); never returns
+    /// a live worker unarmed.
     fn arm_worker_timeout() {
         // SAFETY: forked single-threaded child; all args valid;
         // failure _exits before the worker runs.
