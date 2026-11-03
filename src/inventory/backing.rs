@@ -1766,6 +1766,72 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    #[ignore = "requires root + loop + ext4 (T4)"]
+    fn ext4_loop_backed_mapping_verifies() {
+        // Never touch host mounts: isolated mount namespace or nothing.
+        let mine = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+        let init = std::fs::read_link("/proc/1/ns/mnt").unwrap();
+        assert_ne!(mine, init, "requires isolated mount namespace");
+        let mkfs = ["/sbin/mke2fs", "/sbin/mkfs.ext4"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        let Some(mkfs) = mkfs else {
+            eprintln!("skip: mke2fs absent");
+            return;
+        };
+        let dir = scratch("ext4");
+        let img = dir.join("fs.img");
+        assert!(
+            Command::new("truncate")
+                .args(["-s", "512M"])
+                .arg(&img)
+                .status()
+                .is_ok_and(|s| s.success())
+        );
+        let formatted = Command::new(mkfs)
+            .args(["-t", "ext4", "-q", "-F"])
+            .arg(&img)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        assert!(formatted.is_ok_and(|s| s.success()), "mke2fs failed");
+        let mnt = dir.join("mnt");
+        std::fs::create_dir(&mnt).unwrap();
+        assert!(
+            Command::new("mount")
+                .args(["-o", "loop"])
+                .arg(&img)
+                .arg(&mnt)
+                .status()
+                .is_ok_and(|s| s.success()),
+            "loop mount failed"
+        );
+        {
+            let path = mnt.join("lib.so");
+            std::fs::write(&path, vec![0x45u8; 4096]).unwrap();
+            let candidate = File::open(&path).unwrap();
+            // Precondition: the file really is on ext4 (0xef53), so this
+            // cell cannot silently pass on the wrong filesystem.
+            assert_eq!(filesystem_type(&candidate), Some(0xef53));
+            let meta = path.metadata().unwrap();
+            let child = MapChild::spawn(std::slice::from_ref(&path));
+            let range = child.range_of(&path);
+            let target = child.dir();
+            let assoc = verify_mapped_backing(&target, &range, &candidate).unwrap();
+            assert_eq!(assoc.object_identity(), (meta.dev(), meta.ino()));
+            assoc.revalidate().unwrap();
+        }
+        assert!(
+            Command::new("umount")
+                .arg(&mnt)
+                .status()
+                .is_ok_and(|s| s.success()),
+            "umount failed"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[derive(Debug)]
     struct FixtureMount {
         point: std::path::PathBuf,
