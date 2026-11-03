@@ -4149,6 +4149,135 @@ mod tests {
     }
 
     #[test]
+    fn worker_timeout_arms_oneshot_sigalrm() {
+        // Pins the harness self-destruction mechanism in-process (no
+        // fork): forced DFL + unblocked + a 55s one-shot itimer.
+        // Order matters: ambient is saved first; the timer is read
+        // and DISARMED before any assert (a live itimer would kill
+        // the suite 55s later if an assert panicked); disposition
+        // and mask are restored before any assert too — panics below
+        // are side-effect-free.
+        // SAFETY: single-threaded test lease; all queries valid.
+        let mut saved_act: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGALRM, std::ptr::null(), &mut saved_act) },
+            0
+        );
+        let mut saved_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut saved_mask) },
+            0
+        );
+        arm_worker_timeout();
+        let mut armed: libc::itimerval = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::getitimer(libc::ITIMER_REAL, &mut armed) }, 0);
+        let mut armed_act: libc::sigaction = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGALRM, std::ptr::null(), &mut armed_act) },
+            0
+        );
+        let mut armed_mask: libc::sigset_t = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::sigprocmask(libc::SIG_SETMASK, std::ptr::null(), &mut armed_mask) },
+            0
+        );
+        let disarm: libc::itimerval = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::setitimer(libc::ITIMER_REAL, &disarm, std::ptr::null_mut()) },
+            0
+        );
+        let mut cleared: libc::itimerval = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::getitimer(libc::ITIMER_REAL, &mut cleared) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGALRM, &saved_act, std::ptr::null_mut()) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::sigprocmask(libc::SIG_SETMASK, &saved_mask, std::ptr::null_mut()) },
+            0
+        );
+        // All reads saved; the timer is dead and ambient restored —
+        // asserts below cannot strand anything.
+        let armed_us = armed.it_value.tv_sec as i64 * 1_000_000 + armed.it_value.tv_usec as i64;
+        assert!(
+            (54_000_000..=55_000_000).contains(&armed_us),
+            "one-shot must read ~55s, got {armed_us}us"
+        );
+        assert_eq!(
+            (armed.it_interval.tv_sec, armed.it_interval.tv_usec),
+            (0, 0),
+            "must be one-shot (no interval)"
+        );
+        assert_eq!(
+            armed_act.sa_sigaction,
+            libc::SIG_DFL,
+            "SIGALRM must be forced DFL"
+        );
+        assert_eq!(
+            unsafe { libc::sigismember(&armed_mask, libc::SIGALRM) },
+            0,
+            "SIGALRM must be unblocked"
+        );
+        assert_eq!(
+            (cleared.it_value.tv_sec, cleared.it_value.tv_usec),
+            (0, 0),
+            "disarm must clear the timer"
+        );
+    }
+
+    /// Native worker: the R5 repro as a test — wait4 denied plus
+    /// SIGCHLD ignored on SELF, then run a trivial native worker
+    /// inside: the inner harness must PANIC with the wait-proof
+    /// message (loud), never accept Gone as proven auto-reaping.
+    /// Verdict byte: 1 inner panicked as required / 2 skip / 3
+    /// setup-fail / 4 inner accepted (the hole) or panicked wrongly.
+    fn broken_wait_worker() -> u8 {
+        use crate::target::{SeccompDeny, seccomp_deny_syscall};
+        match seccomp_deny_syscall(libc::SYS_wait4, libc::EPERM) {
+            SeccompDeny::Installed => {}
+            SeccompDeny::Unsupported => return 2,
+            SeccompDeny::Failed => return 3,
+        }
+        // SAFETY: forked single-threaded child; dies with us.
+        unsafe { libc::signal(libc::SIGCHLD, libc::SIG_IGN) };
+        // The inner verdict pipe needs no waits (byte write only),
+        // so the inner run reaches the Gone arm, where the ECHILD
+        // proof must reject the EPERM wait and panic.
+        let r = std::panic::catch_unwind(|| run_native_worker::<1>(|| vec![41u8]));
+        match r {
+            Err(payload) => match payload.downcast_ref::<String>() {
+                Some(msg) if msg.contains("worker wait failed") => 1,
+                _ => 4,
+            },
+            Ok(_) => 4,
+        }
+    }
+
+    #[test]
+    fn native_harness_fails_loud_when_wait_is_denied() {
+        // wait4 denied + IGN must panic with the wait proof (loud),
+        // never accept Gone as proven auto-reaping. Works under any
+        // runner ambient (the worker sets its own state); no skip
+        // beyond seccomp-unavailable.
+        let verdict = run_native_worker::<1>(|| vec![broken_wait_worker()]);
+        match verdict[0] {
+            1 => {}
+            2 => {
+                eprintln!("SKIP: seccomp unavailable (foreign arch or no SECCOMP_MODE_FILTER)");
+                return;
+            }
+            3 => panic!("seccomp deny filter failed to install on a supporting kernel"),
+            4 => {
+                panic!("harness accepted broken wait as proven auto-reaping (or panicked wrongly)")
+            }
+            v => panic!("unknown verdict {v}"),
+        }
+    }
+
+    #[test]
     fn sigchld_waitable_classifies_all_dispositions() {
         // DFL-without-NOCLDWAIT is the only waitable shape; SIG_IGN,
         // SA_NOCLDWAIT, and custom handlers all refuse. Runs in a
@@ -4539,20 +4668,64 @@ mod tests {
         1
     }
 
+    /// Forked-worker self-destruction: a hung worker must die by
+    /// itself so the parent NEVER signals it (numeric cleanup races
+    /// pid reuse under auto-reap, and no address is provable there).
+    /// Forced SIGALRM DFL + unblocked + a 55s one-shot itimer — all
+    /// worker-local (dies with the worker), armed before the worker
+    /// runs. Healthy workers finish in <6s; the margin is 10x, and
+    /// the itimer does not inherit across the worker's own forks.
+    /// Setup failure _exits nonzero (the parent reads EOF and fails
+    /// loud); never returns a live worker unarmed.
+    fn arm_worker_timeout() {
+        // SAFETY: forked single-threaded child; all args valid;
+        // failure _exits before the worker runs.
+        unsafe {
+            if libc::signal(libc::SIGALRM, libc::SIG_DFL) == libc::SIG_ERR {
+                libc::_exit(10);
+            }
+            let mut unblock: libc::sigset_t = std::mem::zeroed();
+            if libc::sigemptyset(&mut unblock) != 0
+                || libc::sigaddset(&mut unblock, libc::SIGALRM) != 0
+                || libc::sigprocmask(libc::SIG_UNBLOCK, &unblock, std::ptr::null_mut()) != 0
+            {
+                libc::_exit(10);
+            }
+            let timer = libc::itimerval {
+                it_interval: libc::timeval {
+                    tv_sec: 0,
+                    tv_usec: 0,
+                },
+                it_value: libc::timeval {
+                    tv_sec: 55,
+                    tv_usec: 0,
+                },
+            };
+            if libc::setitimer(libc::ITIMER_REAL, &timer, std::ptr::null_mut()) != 0 {
+                libc::_exit(10);
+            }
+        }
+    }
+
     /// Fork a native worker behind a verdict pipe; parent side reads
     /// `N` bytes, reaps the child, and returns the bytes. Any hang
-    /// kills the child and panics (the watchdog IS the hang proof).
+    /// fails loud (the watchdog IS the hang proof). The parent never
+    /// signals the worker — a hung worker dies by its own 55s
+    /// self-timeout, so there is no numeric cleanup to race pid
+    /// reuse under any disposition; the waits below only reap.
     fn run_native_worker<const N: usize>(worker: fn() -> Vec<u8>) -> [u8; N] {
-        use crate::target::{TestChildWait, kill_test_child, read_exact_deadline, wait_test_child};
+        use crate::target::{TestChildWait, read_exact_deadline, wait_test_child};
         use std::time::{Duration, Instant};
         let mut pipe = [0; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
         // SAFETY: fork in the single-threaded test lease; the child
-        // writes its verdict and never returns.
+        // arms its self-timeout, writes its verdict, and never
+        // returns.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             unsafe { libc::close(pipe[0]) };
+            arm_worker_timeout();
             let verdict = worker();
             let _ = crate::target::write_all_pipe(pipe[1], &verdict);
             unsafe { libc::close(pipe[1]) };
@@ -4565,26 +4738,58 @@ mod tests {
         let read = read_exact_deadline(pipe[0], &mut verdict, deadline);
         unsafe { libc::close(pipe[0]) };
         if let Err(e) = read {
-            kill_test_child(pid, Duration::from_secs(5));
+            // Reap-only (never signal): the worker is dead or dying
+            // by its self-timeout; collect it best-effort and fail
+            // on the pipe.
+            let _ = wait_test_child(pid, Instant::now() + Duration::from_secs(5));
             panic!("native worker verdict pipe: {e}");
         }
         match wait_test_child(pid, deadline) {
-            TestChildWait::Reaped(status) => assert!(
-                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
-                "native worker must exit 0, status={status:#x}"
-            ),
+            TestChildWait::Reaped(status) => {
+                if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGALRM {
+                    panic!("native worker self-timeout fired (hung verdict)");
+                }
+                assert!(
+                    libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                    "native worker must exit 0, status={status:#x}"
+                );
+            }
             // Auto-reaped by the kernel (non-waitable runner
             // disposition): the verdict bytes were already read in
             // full above — a crashed worker yields EOF there, still
-            // loud — so only the exit status is unobservable. Under
-            // a waitable disposition Gone means a stolen reap and
-            // stays loud.
-            TestChildWait::Gone if !sigchld_waitable() => {}
+            // loud — so only the exit status is unobservable. Proven
+            // genuine below: only ECHILD evidences gone; a broken
+            // wait (denied wait4 reads as Gone too) fails loud.
+            // Under a waitable disposition Gone means a stolen reap
+            // and stays loud.
+            TestChildWait::Gone if !sigchld_waitable() => {
+                let mut status = 0;
+                let errno = loop {
+                    // SAFETY: single WNOHANG poll; status writable;
+                    // EINTR-retried like the house helpers.
+                    let r =
+                        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+                    if r >= 0 {
+                        panic!("inconsistent wait state after Gone (r={r})");
+                    }
+                    let e = std::io::Error::last_os_error().raw_os_error();
+                    if e == Some(libc::EINTR) {
+                        continue;
+                    }
+                    break e;
+                };
+                if errno != Some(libc::ECHILD) {
+                    panic!("worker wait failed ({errno:?}), not auto-reaped: cannot confirm");
+                }
+            }
             TestChildWait::Gone => {
                 panic!("native worker reaped elsewhere under a waitable disposition");
             }
             TestChildWait::Timeout => {
-                kill_test_child(pid, Duration::from_secs(5));
+                // Reap-only (never signal): the self-timeout kills
+                // the worker; collect it best-effort and fail on the
+                // hang.
+                let _ = wait_test_child(pid, Instant::now() + Duration::from_secs(5));
                 panic!("native worker did not exit, outcome=timeout");
             }
         }
