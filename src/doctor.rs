@@ -2799,6 +2799,9 @@ fn run_with_resolver(
                 "  --object O | --count-object C | --members-object M: vet explicit BPF objects instead of installed defaults"
             );
             println!("  --format human|json (default human)");
+            for line in crate::cli::exit_code_help() {
+                println!("{line}");
+            }
             return ExitCode::SUCCESS;
         }
         let val = |it: &mut std::slice::Iter<String>| {
@@ -5765,7 +5768,16 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
                 format = true;
             }
             "--help" | "-h" if !format && discovery && args.len() == 0 => {
-                let result = io::stdout().lock().write_all(b"usage: osslscope doctor --discovery [--json | --format human|json]\nFinite discovery capability checks; no build catalogue.\n");
+                let mut output = io::stdout().lock();
+                let result = output
+                    .write_all(b"usage: osslscope doctor --discovery [--json | --format human|json]\nFinite discovery capability checks; no build catalogue.\n")
+                    .and_then(|()| {
+                        use std::io::Write as _;
+                        for line in crate::cli::exit_code_help() {
+                            writeln!(output, "{line}")?;
+                        }
+                        Ok(())
+                    });
                 return ExitCode::from(if result.is_ok() { 0 } else { 1 });
             }
             _ => {

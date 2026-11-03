@@ -399,6 +399,9 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
         .any(|a| a == "--help" || a == "-h")
     {
         println!("{USAGE}");
+        for line in crate::cli::exit_code_help() {
+            println!("{line}");
+        }
         return Err(ExitCode::from(0));
     }
     let args = match parse(argv) {

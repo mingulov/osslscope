@@ -517,3 +517,15 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
         );
     }
 }
+
+#[test]
+fn scan_help_names_exit_codes() {
+    for command in ["scan", "inspect"] {
+        let out = cli(&[command, "--help"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("exit 3:") && stdout.contains("exit 4:"),
+            "{command} help must name exit codes, got: {stdout}"
+        );
+    }
+}

@@ -550,6 +550,12 @@ pub fn run(args: &[String]) -> ExitCode {
     let result = if help {
         output
             .write_all(HELP.as_bytes())
+            .and_then(|()| {
+                for line in crate::cli::exit_code_help() {
+                    writeln!(output, "{line}")?;
+                }
+                Ok(())
+            })
             .and_then(|()| output.flush())
             .map(|()| 0)
     } else {

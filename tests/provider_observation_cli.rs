@@ -518,3 +518,16 @@ fn public_c_fixtures_remain_inventory_when_observation_is_unavailable() {
     );
     redacted(&output);
 }
+
+#[test]
+fn observe_providers_help_names_exit_codes() {
+    let f = Fixture::new();
+    for command in ["scan", "inspect"] {
+        let output = f.cli(&[command, "--observe-providers", "--help"]);
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            help.contains("exit 3:") && help.contains("exit 4:"),
+            "{command} --observe-providers help must name exit codes, got: {help}"
+        );
+    }
+}

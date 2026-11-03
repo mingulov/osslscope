@@ -56,6 +56,9 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
         println!(
             "  runtime BPF permissions and attachment are checked by report/check before releasing the child"
         );
+        for line in crate::cli::exit_code_help() {
+            println!("{line}");
+        }
         return ExitCode::SUCCESS;
     }
     let args = match parse(argv) {

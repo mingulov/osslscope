@@ -1022,3 +1022,18 @@ fn container_workload_reports_positive_without_sibling_attribution() {
     );
     std::fs::remove_dir_all(&certs).unwrap();
 }
+
+#[test]
+fn observe_crypto_help_names_exit_codes() {
+    let output = command(&["scan", "--watch", "--observe-crypto", "--help"]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "crypto watch help must exit 0"
+    );
+    let help = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        help.contains("exit 3:") && help.contains("exit 4:"),
+        "crypto watch help must name exit codes, got: {help}"
+    );
+}

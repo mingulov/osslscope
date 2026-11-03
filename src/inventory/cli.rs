@@ -353,6 +353,12 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
     let outcome = if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
         output
             .write_all(HELP.as_bytes())
+            .and_then(|()| {
+                for line in crate::cli::exit_code_help() {
+                    writeln!(output, "{line}")?;
+                }
+                Ok(())
+            })
             .and_then(|()| output.flush())
             .map(|()| 0)
     } else {

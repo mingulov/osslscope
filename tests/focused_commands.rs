@@ -1039,3 +1039,15 @@ fn installed_api_six_families_failures_size_queries_and_unused_fetch() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn report_check_help_names_exit_codes() {
+    for command in ["report", "check"] {
+        let out = cli(command, &["--help"]);
+        let help = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            help.contains("exit 3:") && help.contains("exit 4:"),
+            "{command} help must name exit codes, got: {help}"
+        );
+    }
+}

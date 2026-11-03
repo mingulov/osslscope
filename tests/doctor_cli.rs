@@ -154,3 +154,43 @@ fn doctor_bare_still_runs_self_controls() {
         "default route unchanged, got: {stdout}"
     );
 }
+
+#[test]
+fn doctor_sectioned_help_names_exit_codes() {
+    let out = doctor(&["--pid", "1", "--help"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
+        "sectioned help must name exit codes, got: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_focused_help_names_exit_codes() {
+    let out = doctor(&["--help"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
+        "focused help must name exit codes, got: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_profiled_help_names_exit_codes() {
+    let out = doctor(&["--libcrypto", "x", "--help"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
+        "profiled help must name exit codes, got: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_discovery_help_names_exit_codes() {
+    let out = doctor(&["--discovery", "--help"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
+        "discovery help must name exit codes, got: {stdout}"
+    );
+}

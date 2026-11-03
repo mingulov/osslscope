@@ -598,6 +598,18 @@ pub fn run(args: &[String]) -> ExitCode {
     {
         return invalid();
     }
+    if args.iter().any(|s| s == "--help" || s == "-h") {
+        println!(
+            "usage: osslscope scan --watch --observe-crypto [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--interval S] [--duration S] [--json]"
+        );
+        println!(
+            "Automatic per-process crypto observations; passive inventory when tracing is unavailable."
+        );
+        for line in crate::cli::exit_code_help() {
+            println!("{line}");
+        }
+        return ExitCode::SUCCESS;
+    }
     let pool = MemoryPool::new(GLOBAL_BYTES);
     let argument_bytes = args.iter().try_fold(COORDINATOR_BYTES, |n, a| {
         n.checked_add(a.len().saturating_mul(4).saturating_add(1024))
