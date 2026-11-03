@@ -345,6 +345,39 @@ struct Stream<'a, W> {
     usable: bool,
     partial: bool,
 }
+
+/// Stderr reason for provider exits 3/4, derived from the same
+/// (usable, partial, reason) triple `end` maps to the exit code.
+/// `None` exactly when the status would be 0.
+fn end_reason_text(
+    usable: bool,
+    partial: bool,
+    reason: inventory::watch::EndReason,
+    gap: Option<inventory::GapReason>,
+) -> Option<String> {
+    if usable && !partial && reason != inventory::watch::EndReason::Interrupted {
+        return None;
+    }
+    if reason == inventory::watch::EndReason::ScopeUnavailable {
+        let gap = gap.map(|g| format!(": {}", g.word())).unwrap_or_default();
+        return Some(format!(
+            "osslscope provider discovery: scope unavailable{gap} (see end record above)"
+        ));
+    }
+    if !usable {
+        return Some(
+            "osslscope provider discovery: providers unavailable (no usable snapshot; see records above)"
+                .into(),
+        );
+    }
+    if reason == inventory::watch::EndReason::Interrupted {
+        return Some(
+            "osslscope provider discovery: observation interrupted (partial; see records above)"
+                .into(),
+        );
+    }
+    Some("osslscope provider discovery: providers partial (see records above)".into())
+}
 impl<W: Write> Stream<'_, W> {
     fn mode(&self) -> &'static str {
         if self.options.watch {
@@ -439,6 +472,9 @@ impl<W: Write> Stream<'_, W> {
             self.writer,
             !self.options.json,
         )?;
+        if let Some(line) = end_reason_text(self.usable, self.partial, reason, gap) {
+            crate::report::err_line(&line);
+        }
         Ok(status)
     }
 }
@@ -877,5 +913,32 @@ mod tests {
             !human.contains("schema_version"),
             "human mode should be concise"
         );
+    }
+
+    #[test]
+    fn end_reason_names_unusable_partial_and_scope() {
+        use inventory::watch::EndReason;
+        assert_eq!(
+            super::end_reason_text(true, false, EndReason::Duration, None),
+            None
+        );
+        let scope = super::end_reason_text(
+            false,
+            false,
+            EndReason::ScopeUnavailable,
+            Some(inventory::GapReason::ProcessUnavailable),
+        )
+        .unwrap();
+        assert!(
+            scope.contains("scope unavailable") && scope.contains("process_unavailable"),
+            "got: {scope}"
+        );
+        let unusable = super::end_reason_text(false, true, EndReason::Duration, None).unwrap();
+        assert!(unusable.contains("unavailable"), "got: {unusable}");
+        let partial = super::end_reason_text(true, true, EndReason::Duration, None).unwrap();
+        assert!(partial.contains("partial"), "got: {partial}");
+        let interrupted =
+            super::end_reason_text(true, false, EndReason::Interrupted, None).unwrap();
+        assert!(interrupted.contains("interrupted"), "got: {interrupted}");
     }
 }

@@ -529,3 +529,26 @@ fn scan_help_names_exit_codes() {
         );
     }
 }
+
+#[test]
+fn dead_pid_inspect_exit4_names_reason_on_stderr() {
+    // Deterministic exit 4: dead pid, JSON stdout still parses.
+    let output = cli(&["inspect", "--pid", "2147483647", "--json"]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reasons: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("osslscope discovery:"))
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one stderr reason, got: {stderr}");
+    assert!(
+        reasons[0].contains("unavailable") && reasons[0].contains("process_unavailable"),
+        "reason names the dead-target class, got: {stderr}"
+    );
+    let doc = json(&output);
+    assert!(
+        doc.get("processes").is_some(),
+        "stdout JSON still parses, got: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}

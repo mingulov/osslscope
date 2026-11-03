@@ -337,6 +337,25 @@ fn departure(identity: &Incarnation, snapshot: &Snapshot) -> Option<&'static str
         Some("sampled_removal")
     }
 }
+/// Stderr reason for the crypto end record (always exit 3/4: coverage
+/// is partial by construction), derived from the same segment count
+/// the exit code derives from.
+fn crypto_end_reason(segments: u64, reason: &str) -> String {
+    if segments == 0 {
+        format!("osslscope crypto watch: no segments observed ({reason}; see records above)")
+    } else {
+        format!(
+            "osslscope crypto watch: {segments} segments ({reason}); coverage partial (see records above)"
+        )
+    }
+}
+
+/// Stderr reason for pool-reserve failures (exit 4 before any session
+/// or parser exists).
+fn pool_exhausted_reason() -> &'static str {
+    "osslscope crypto watch: memory pool exhausted (admission blocked; no observation attempted)"
+}
+
 fn observe(
     config: &CryptoWatchConfig,
     objects: FocusedObjects,
@@ -373,6 +392,10 @@ fn observe(
                 peak_accounted_bytes: pool.peak(),
                 coverage: "unknown",
             })?;
+            crate::report::err_line(&format!(
+                "osslscope crypto watch: scope unavailable ({}; see records above)",
+                reason.word()
+            ));
             return Ok(4);
         }
     };
@@ -583,6 +606,7 @@ fn observe(
         peak_accounted_bytes: pool.peak(),
         coverage: "partial",
     })?;
+    crate::report::err_line(&crypto_end_reason(segments, reason));
     Ok(if segments == 0 { 4 } else { 3 })
 }
 /// Complete grammar admission precedes selectors, companion reads and signals.
@@ -634,6 +658,7 @@ pub fn run(args: &[String]) -> ExitCode {
     // Resolver admits at most two 16MiB objects, with bounded verification/read
     // copies. This phase ends before any session or parser is allocated.
     let Some(resolving) = pool.reserve(64 << 20) else {
+        crate::report::err_line(pool_exhausted_reason());
         return ExitCode::from(4);
     };
     let objects = match crate::package::commands::resolve_focused_objects(None, None) {
@@ -650,6 +675,7 @@ pub fn run(args: &[String]) -> ExitCode {
     let object_bytes = objects.observation.len() + objects.count.len();
     drop(resolving);
     let Some(_objects) = pool.reserve(object_bytes) else {
+        crate::report::err_line(pool_exhausted_reason());
         return ExitCode::from(4);
     };
     let _signals = match Signals::install() {
@@ -830,5 +856,23 @@ mod tests {
                     .pids
                     .contains(&(r["incarnation"]["pid"].as_u64().unwrap() as u32))
         }));
+    }
+
+    #[test]
+    fn crypto_end_reason_names_segment_outcome() {
+        let none = super::crypto_end_reason(0, "duration");
+        assert!(
+            none.contains("no segments") && none.contains("duration"),
+            "got: {none}"
+        );
+        let some = super::crypto_end_reason(7, "cancelled");
+        assert!(
+            some.contains("7 segments") && some.contains("cancelled") && some.contains("partial"),
+            "got: {some}"
+        );
+        assert!(
+            super::pool_exhausted_reason().contains("pool exhausted"),
+            "pool reason pinned"
+        );
     }
 }

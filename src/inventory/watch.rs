@@ -66,6 +66,38 @@ impl WatchOutcome {
         self.status
     }
 }
+
+/// Stderr reason for watch exits 3/4, derived from the same
+/// (reason, status, gap) triple the end record and exit code derive
+/// from. `None` on clean (0) and output-failure (1: the caller's Err
+/// arm already owns that line) ends.
+pub(super) fn exit_reason(outcome: &WatchOutcome) -> Option<String> {
+    if outcome.status == 0 || outcome.status == 1 {
+        return None;
+    }
+    let gap = outcome
+        .gap
+        .map(|g| format!(": {}", g.word()))
+        .unwrap_or_default();
+    match outcome.reason {
+        EndReason::Interrupted => {
+            Some("osslscope discovery: watch interrupted (partial; see records above)".into())
+        }
+        EndReason::ScopeUnavailable => Some(format!(
+            "osslscope discovery: watch scope unavailable{gap} (see end record above)"
+        )),
+        EndReason::Duration if outcome.status == 3 => {
+            Some("osslscope discovery: watch inventory partial (see records above)".into())
+        }
+        EndReason::Duration if outcome.sequence == 0 => Some(
+            "osslscope discovery: watch ended before any snapshot (see end record above)".into(),
+        ),
+        EndReason::Duration => {
+            Some("osslscope discovery: watch inventory unavailable (see records above)".into())
+        }
+        EndReason::Output => None,
+    }
+}
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangeKind {
@@ -433,5 +465,49 @@ mod tests {
         for child in &mut children {
             assert!(child.0.try_wait().unwrap().is_none());
         }
+    }
+
+    fn outcome(reason: EndReason, status: u8, gap: Option<GapReason>) -> WatchOutcome {
+        WatchOutcome {
+            schema_version: "osslscope.discovery.v1",
+            mode: "watch",
+            record: "end",
+            sequence: 1,
+            reason,
+            status,
+            elapsed: Duration::ZERO,
+            limits: Limits::default(),
+            gap,
+            sampled_history: "incomplete",
+        }
+    }
+
+    #[test]
+    fn watch_reason_covers_every_end_state() {
+        assert_eq!(
+            super::exit_reason(&outcome(EndReason::Duration, 0, None)),
+            None
+        );
+        let interrupted = super::exit_reason(&outcome(EndReason::Interrupted, 3, None)).unwrap();
+        assert!(interrupted.contains("interrupted"), "got: {interrupted}");
+        let scope = super::exit_reason(&outcome(
+            EndReason::ScopeUnavailable,
+            4,
+            Some(GapReason::CgroupUnavailable),
+        ))
+        .unwrap();
+        assert!(
+            scope.contains("scope unavailable") && scope.contains("cgroup_unavailable"),
+            "got: {scope}"
+        );
+        let partial = super::exit_reason(&outcome(EndReason::Duration, 3, None)).unwrap();
+        assert!(partial.contains("partial"), "got: {partial}");
+        let mut none_seen = outcome(EndReason::Duration, 4, None);
+        none_seen.sequence = 0;
+        let empty = super::exit_reason(&none_seen).unwrap();
+        assert!(
+            empty.contains("before any snapshot"),
+            "zero-snapshot end named, got: {empty}"
+        );
     }
 }

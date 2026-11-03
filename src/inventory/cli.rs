@@ -288,6 +288,39 @@ fn inventory_exit(state: InventoryState) -> u8 {
         InventoryState::Unavailable => 4,
     }
 }
+
+/// Stderr reason for snapshot/module exits 3/4, derived from the same
+/// `InventoryState` the exit code derives from. Gap words repeat the
+/// rendered records (same `GapReason::word` vocabulary); `None` on
+/// Complete.
+fn inventory_exit_reason(state: InventoryState, reasons: &[GapReason]) -> Option<String> {
+    let state_word = match state {
+        InventoryState::Complete => return None,
+        InventoryState::Partial => "partial",
+        InventoryState::Unavailable => "unavailable",
+    };
+    let mut words: Vec<&str> = reasons.iter().map(GapReason::word).collect();
+    words.sort_unstable();
+    words.dedup();
+    let detail = if words.is_empty() {
+        "no gaps named".to_string()
+    } else {
+        let shown = words.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+        if words.len() > 3 {
+            format!("{shown} (+{} more)", words.len() - 3)
+        } else {
+            shown
+        }
+    };
+    let count = if reasons.len() == 1 {
+        "1 gap".to_string()
+    } else {
+        format!("{} gaps", reasons.len())
+    };
+    Some(format!(
+        "osslscope discovery: inventory {state_word}: {detail} ({count}; see records above)"
+    ))
+}
 /// Human identity summary: verified-vs-locator module counts plus
 /// the verified share (P1-human-counts). JSON mode never sees it.
 fn identity_line(verified: usize, locator: usize) -> String {
@@ -394,7 +427,12 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 &WATCH_INTERRUPTED,
                 !options.json,
             )
-            .map(|outcome| outcome.exit_code())
+            .map(|outcome| {
+                if let Some(line) = super::watch::exit_reason(&outcome) {
+                    crate::report::err_line(&line);
+                }
+                outcome.exit_code()
+            })
         } else if command == "scan" {
             let mut scanner = match super::scope::ScopedScanner::new(
                 super::scope::Selection {
@@ -412,18 +450,35 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
             };
             let result = scanner.snapshot();
             let preamble = result.human_preamble();
-            render(&result, options.json, &mut output, Some(&preamble)).map(|()| result.exit_code())
+            render(&result, options.json, &mut output, Some(&preamble)).map(|()| {
+                let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
+                if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
+                    crate::report::err_line(&line);
+                }
+                result.exit_code()
+            })
         } else if options.modules.is_empty() {
             let result = snapshot(&SnapshotOptions {
                 pids: options.pids,
                 limits: Limits::default(),
             });
             let preamble = result.human_preamble();
-            render(&result, options.json, &mut output, Some(&preamble)).map(|()| result.exit_code())
+            render(&result, options.json, &mut output, Some(&preamble)).map(|()| {
+                let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
+                if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
+                    crate::report::err_line(&line);
+                }
+                result.exit_code()
+            })
         } else {
             let result = inspect_modules(&options.modules, Limits::default());
-            render(&result, options.json, &mut output, None)
-                .map(|()| inventory_exit(result.capabilities.inventory))
+            render(&result, options.json, &mut output, None).map(|()| {
+                let reasons: Vec<GapReason> = result.errors.iter().map(|e| e.reason).collect();
+                if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
+                    crate::report::err_line(&line);
+                }
+                inventory_exit(result.capabilities.inventory)
+            })
         }
     };
     match outcome {
@@ -823,5 +878,39 @@ mod tests {
         assert_eq!(result.totals.objects_attempted, 2);
         assert_eq!(result.totals.objects_inspected, 1);
         assert_eq!(result.totals.read_bytes, 11);
+    }
+
+    #[test]
+    fn inventory_reason_names_state_and_gap_words() {
+        assert_eq!(
+            super::inventory_exit_reason(super::InventoryState::Complete, &[]),
+            None
+        );
+        let partial = super::inventory_exit_reason(
+            super::InventoryState::Partial,
+            &[
+                super::GapReason::ProcessUnavailable,
+                super::GapReason::Deadline,
+            ],
+        )
+        .unwrap();
+        assert!(
+            partial.contains("partial")
+                && partial.contains("process_unavailable")
+                && partial.contains("deadline")
+                && partial.contains("2 gaps"),
+            "partial reason names state, words, count, got: {partial}"
+        );
+        let unavailable = super::inventory_exit_reason(
+            super::InventoryState::Unavailable,
+            &[super::GapReason::ProcessUnavailable],
+        )
+        .unwrap();
+        assert!(
+            unavailable.contains("unavailable")
+                && unavailable.contains("process_unavailable")
+                && unavailable.contains("1 gap;"),
+            "unavailable reason names state, class, singular count, got: {unavailable}"
+        );
     }
 }

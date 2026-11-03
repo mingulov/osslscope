@@ -633,3 +633,33 @@ fn unresolved_backing_loses_visibility_without_asserting_module_absence() {
 fn unresolved_backing_with_independent_selector_cannot_assert_process_absence() {
     unresolved_backing_watch(true);
 }
+
+#[test]
+fn scope_unavailable_watch_exit4_names_reason_on_stderr() {
+    // Deterministic exit 4: unresolvable module selector, end record intact.
+    let unavailable = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--module",
+            "/PRIVATE_CANARY_missing",
+            "--duration",
+            "0.1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unavailable.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&unavailable.stderr);
+    let reasons: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("osslscope discovery:"))
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one stderr reason, got: {stderr}");
+    assert!(
+        reasons[0].contains("scope unavailable"),
+        "reason names the scope failure, got: {stderr}"
+    );
+    let end: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
+    assert_eq!(end["reason"], "scope_unavailable");
+}

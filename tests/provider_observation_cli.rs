@@ -531,3 +531,31 @@ fn observe_providers_help_names_exit_codes() {
         );
     }
 }
+
+#[test]
+fn no_usable_scope_exit4_names_reason_on_stderr() {
+    // Deterministic exit 4: dead pid under provider observation.
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        "2147483647",
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.05",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let reasons: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("osslscope provider discovery:"))
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one stderr reason, got: {stderr}");
+    assert!(
+        reasons[0].contains("unavailable"),
+        "reason names the unavailable class, got: {stderr}"
+    );
+    assert_eq!(records(&output).last().unwrap()["status"], 4);
+}

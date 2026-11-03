@@ -1037,3 +1037,59 @@ fn observe_crypto_help_names_exit_codes() {
         "crypto watch help must name exit codes, got: {help}"
     );
 }
+
+#[test]
+fn dead_pid_crypto_watch_exit4_names_reason_on_stderr() {
+    // Deterministic exit 4: dead pid yields zero segments.
+    let output = command(&[
+        "scan",
+        "--watch",
+        "--observe-crypto",
+        "--pid",
+        "2147483647",
+        "--duration",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let reasons: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("osslscope crypto watch:"))
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one stderr reason, got: {stderr}");
+    assert!(
+        reasons[0].contains("no segments"),
+        "reason names the zero-segment outcome, got: {stderr}"
+    );
+    let last = records(&output).last().cloned().unwrap();
+    assert_eq!(last["segments"], 0);
+}
+
+#[test]
+fn bad_cgroup_crypto_watch_exit4_names_scope_reason_on_stderr() {
+    // Deterministic exit 4 via the scope-unavailable early return.
+    let output = command(&[
+        "scan",
+        "--watch",
+        "--observe-crypto",
+        "--cgroup",
+        "/nonexistent-osslscope-cgroup",
+        "--duration",
+        "1",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let reasons: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("osslscope crypto watch:"))
+        .collect();
+    assert_eq!(reasons.len(), 1, "exactly one stderr reason, got: {stderr}");
+    assert!(
+        reasons[0].contains("scope unavailable") && reasons[0].contains("cgroup_unavailable"),
+        "reason names the scope gap, got: {stderr}"
+    );
+    let last = records(&output).last().cloned().unwrap();
+    assert_eq!(last["reason"], "scope_unavailable");
+}
