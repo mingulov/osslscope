@@ -242,6 +242,29 @@ fn emit(value: &impl Serialize, writer: &mut impl Write, human: bool) -> io::Res
                 value["snapshot"]["capabilities"]["inventory"],
                 value["changes"].as_array().map_or(0, Vec::len)
             )?;
+            // Identity totals mirror the typed Snapshot::identity_counts
+            // over the serialized modules. Unrecognized words are ignored
+            // (never misclassified): the schema is versioned and new
+            // variants must not corrupt old totals.
+            let mut verified = 0usize;
+            let mut locator = 0usize;
+            for module in value["snapshot"]["processes"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .flat_map(|p| p["modules"].as_array().into_iter().flatten())
+            {
+                match module["identity_status"].as_str() {
+                    Some("verified") => verified += 1,
+                    Some("locator_candidate") => locator += 1,
+                    _ => {}
+                }
+            }
+            write!(
+                writer,
+                "  {}",
+                super::identity_totals_line(verified, locator)
+            )?;
             for gap in value["snapshot"]["gaps"].as_array().into_iter().flatten() {
                 writeln!(writer, "  gap={} pid={}", gap["reason"], gap["pid"])?;
             }
@@ -508,6 +531,34 @@ mod tests {
         assert!(
             empty.contains("before any snapshot"),
             "zero-snapshot end named, got: {empty}"
+        );
+    }
+
+    #[test]
+    fn watch_snapshot_prints_identity_totals() {
+        // The human emitter reads a serialized record: one verified and
+        // one locator module must total exactly.
+        let record = serde_json::json!({
+            "record": "snapshot",
+            "sequence": 1,
+            "snapshot": {
+                "capabilities": {"inventory": "complete"},
+                "processes": [
+                    {"modules": [
+                        {"identity_status": "verified"},
+                        {"identity_status": "locator_candidate"}
+                    ]}
+                ],
+                "gaps": []
+            },
+            "changes": []
+        });
+        let mut buf = Vec::new();
+        super::emit(&record, &mut buf, true).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)"),
+            "got: {out}"
         );
     }
 }

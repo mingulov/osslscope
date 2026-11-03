@@ -663,3 +663,20 @@ fn scope_unavailable_watch_exit4_names_reason_on_stderr() {
     let end: Value = serde_json::from_slice(&unavailable.stdout).unwrap();
     assert_eq!(end["reason"], "scope_unavailable");
 }
+
+#[test]
+fn human_watch_snapshot_prints_identity_totals() {
+    // Own-pid watch: human snapshots carry the identity totals line.
+    let pid = std::process::id().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--watch", "--pid", &pid, "--duration", "0.3"])
+        .output()
+        .unwrap();
+    assert!(matches!(output.status.code(), Some(0 | 3 | 4)));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Snapshot 1:"), "sampled, got: {text}");
+    assert!(
+        text.contains("identity: ") && text.contains("verified"),
+        "identity totals on human snapshots, got: {text}"
+    );
+}

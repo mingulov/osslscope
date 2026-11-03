@@ -230,6 +230,12 @@ impl Render for Record<'_> {
                 "  inventory={}",
                 finite(&snapshot.capabilities.inventory)?
             )?;
+            let (verified, locator) = snapshot.identity_counts();
+            write!(
+                writer,
+                "  {}",
+                crate::inventory::identity_totals_line(verified, locator)
+            )?;
             for process in &snapshot.processes {
                 writeln!(
                     writer,
@@ -940,5 +946,46 @@ mod tests {
         let interrupted =
             super::end_reason_text(true, false, EndReason::Interrupted, None).unwrap();
         assert!(interrupted.contains("interrupted"), "got: {interrupted}");
+    }
+
+    #[test]
+    fn human_snapshot_record_prints_identity_totals() {
+        // Own-pid snapshot: counts vary by privilege, the line shape not.
+        let snapshot = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![std::process::id()],
+            limits: crate::inventory::Limits::default(),
+        });
+        let capabilities = Capabilities::new(true);
+        let record = Record {
+            schema_version: SCHEMA,
+            mode: "watch",
+            record: "snapshot",
+            sequence: 1,
+            interval: Interval {
+                started_elapsed_ns: 0,
+                finished_elapsed_ns: 10,
+                drain_lag_ns: 10,
+            },
+            poll_interval: Duration::from_secs(1),
+            snapshot: Some(&snapshot),
+            facts: &[],
+            gaps: &[],
+            capabilities: &capabilities,
+            sampled_history: "incomplete",
+        };
+        let mut bytes = Vec::new();
+        emit(&record, &mut bytes, true).unwrap();
+        let human = String::from_utf8(bytes).unwrap();
+        let (verified, locator) = snapshot.identity_counts();
+        if verified + locator == 0 {
+            assert!(human.contains("identity: no modules"), "{human}");
+        } else {
+            assert!(
+                human.contains("identity: ")
+                    && human.contains(&format!("{verified} verified"))
+                    && human.contains("% verified"),
+                "{human}"
+            );
+        }
     }
 }

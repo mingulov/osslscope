@@ -324,14 +324,7 @@ fn inventory_exit_reason(state: InventoryState, reasons: &[GapReason]) -> Option
 /// Human identity summary: verified-vs-locator module counts plus
 /// the verified share (P1-human-counts). JSON mode never sees it.
 fn identity_line(verified: usize, locator: usize) -> String {
-    let total = verified + locator;
-    if total == 0 {
-        return "identity: no modules inventoried\n".to_string();
-    }
-    let pct = verified * 100 / total;
-    format!(
-        "identity: {verified} verified, {locator} locator-candidate of {total} modules ({pct}% verified)\n"
-    )
+    super::identity_totals_line(verified, locator)
 }
 
 /// Coalesced gap block: one line per (reason, device, pid) group
@@ -911,6 +904,23 @@ mod tests {
                 && unavailable.contains("process_unavailable")
                 && unavailable.contains("1 gap;"),
             "unavailable reason names state, class, singular count, got: {unavailable}"
+        );
+    }
+
+    #[test]
+    fn shared_identity_line_pins_exact_shape() {
+        assert_eq!(
+            super::super::identity_totals_line(1, 1),
+            "identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)\n"
+        );
+        assert_eq!(
+            super::super::identity_totals_line(0, 0),
+            "identity: no modules inventoried\n"
+        );
+        // The snapshot preamble delegates to the shared helper: one shape.
+        assert_eq!(
+            super::identity_line(3, 1),
+            super::super::identity_totals_line(3, 1)
         );
     }
 }

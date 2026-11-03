@@ -1093,3 +1093,35 @@ fn bad_cgroup_crypto_watch_exit4_names_scope_reason_on_stderr() {
     let last = records(&output).last().cloned().unwrap();
     assert_eq!(last["reason"], "scope_unavailable");
 }
+
+#[test]
+fn human_watch_prints_identity_and_tracing_health() {
+    // Live unprivileged target: Discovery rows total identity, and the
+    // tracing-health line states the finite cause exactly once.
+    let mut child = Command::new("sleep").arg("10").spawn().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(matches!(output.status.code(), Some(3 | 4)));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("identity: ") && text.contains("verified"),
+        "identity totals on Discovery rows, got: {text}"
+    );
+    assert_eq!(
+        text.matches("Tracing unavailable:").count(),
+        1,
+        "tracing health stated once, got: {text}"
+    );
+}

@@ -559,3 +559,24 @@ fn no_usable_scope_exit4_names_reason_on_stderr() {
     );
     assert_eq!(records(&output).last().unwrap()["status"], 4);
 }
+
+#[test]
+fn human_snapshot_prints_identity_totals() {
+    // Dead pid, human mode: the empty snapshot still totals identity.
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        "2147483647",
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.05",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("identity: no modules inventoried"),
+        "identity totals on empty human snapshot, got: {text}"
+    );
+}

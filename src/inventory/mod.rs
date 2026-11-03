@@ -432,6 +432,21 @@ impl Snapshot {
     }
 }
 
+/// Shared human identity totals line (one shape for snapshot
+/// preambles, watch snapshots, provider records, and crypto
+/// discovery rows): verified-vs-locator module counts plus the
+/// verified share.
+pub fn identity_totals_line(verified: usize, locator: usize) -> String {
+    let total = verified + locator;
+    if total == 0 {
+        return "identity: no modules inventoried\n".to_string();
+    }
+    let pct = verified * 100 / total;
+    format!(
+        "identity: {verified} verified, {locator} locator-candidate of {total} modules ({pct}% verified)\n"
+    )
+}
+
 /// Human-preamble inputs for a [`Snapshot`] (see
 /// [`Snapshot::human_preamble`]). A group is (reason, device, pid,
 /// exact count), sorted by (reason, device, pid) with absent ids

@@ -167,6 +167,19 @@ impl<W: Write> Output<'_, W> {
                     p.starttime,
                     p.modules.len()
                 )?;
+                let mut verified = 0usize;
+                let mut locator = 0usize;
+                for m in &p.modules {
+                    match m.identity_status {
+                        inventory::IdentityStatus::Verified => verified += 1,
+                        inventory::IdentityStatus::LocatorCandidate => locator += 1,
+                    }
+                }
+                write!(
+                    w,
+                    "  {}",
+                    inventory::identity_totals_line(verified, locator)
+                )?;
                 for m in p.modules.iter().take(ROWS) {
                     writeln!(
                         w,
@@ -244,6 +257,43 @@ impl<W: Write> Output<'_, W> {
                     total(physical),
                     total(api)
                 )?;
+                // Distinct op names across current + fenced sites: names only,
+                // never call attribution (a site's calls are never split
+                // across its candidates). Rows without ids are omitted.
+                let mut ops: Vec<u32> = rows("sites")
+                    .iter()
+                    .chain(rows("fenced").iter().flat_map(|epoch| {
+                        epoch["sites"].as_array().map(Vec::as_slice).unwrap_or(&[])
+                    }))
+                    .flat_map(|r| r["candidates"].as_array().map(Vec::as_slice).unwrap_or(&[]))
+                    .filter_map(|c| c["op"].as_u64().and_then(|v| u32::try_from(v).ok()))
+                    .collect();
+                ops.sort_unstable();
+                ops.dedup();
+                for op in ops.iter().take(ROWS) {
+                    writeln!(w, "  op={}", crate::report::op_display(*op))?;
+                }
+                if ops.len() > ROWS {
+                    writeln!(w, "  Ops omitted={}", ops.len() - ROWS)?;
+                }
+                for row in rows("api_activity").iter().take(ROWS) {
+                    let Some(api) = row["api"]
+                        .as_u64()
+                        .and_then(|v| u32::try_from(v).ok())
+                        .and_then(|v| crate::api_activity::ApiId::try_from(v).ok())
+                    else {
+                        continue;
+                    };
+                    writeln!(
+                        w,
+                        "  api={} entries={}",
+                        api.export_name(),
+                        row["entries"].as_u64().unwrap_or(0)
+                    )?;
+                }
+                if rows("api_activity").len() > ROWS {
+                    writeln!(w, "  Apis omitted={}", rows("api_activity").len() - ROWS)?;
+                }
                 let counters = d["completeness"]["counters"]
                     .as_array()
                     .map(Vec::as_slice)
@@ -856,6 +906,82 @@ mod tests {
                     .pids
                     .contains(&(r["incarnation"]["pid"].as_u64().unwrap() as u32))
         }));
+    }
+
+    #[test]
+    fn human_discovery_prints_identity_totals() {
+        let process: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 0},
+            "namespaces": {"pid": null, "mount": null},
+            "pid": 42, "starttime": 123,
+            "modules": [
+                {"info": {"sha256": "aa", "device": 1, "inode": 2, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false}, "identity_status": "verified"},
+                {"info": {"sha256": "bb", "device": 1, "inode": 3, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false}, "identity_status": "locator_candidate"}
+            ],
+            "provider_activation": "unknown", "provider_interfaces": "unknown", "execution": "not_observed"
+        })).unwrap();
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+        };
+        out.emit(Record::Discovery { process: &process }).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)"),
+            "got: {text}"
+        );
+    }
+
+    #[test]
+    fn human_observation_names_top_ops_and_apis() {
+        // Op ids resolve via op_display, api ids via ApiId export names;
+        // rows without ids are omitted, never invented.
+        let identity = Incarnation {
+            pid: 42,
+            starttime: 123,
+            namespaces: inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        };
+        let document = serde_json::json!({
+            "sites": [{"calls": 2, "candidates": [{"op": 1}]}],
+            "fenced": [],
+            "api_activity": [{"api": 20, "entries": 5}, {"entries": 3}],
+            "objects": [{}],
+            "completeness": {"counters": []}
+        });
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+        };
+        out.emit(Record::ProcessObservation {
+            incarnation: &identity,
+            segment: 4,
+            retirement: "duration",
+            document: &document,
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("op=DIGEST"), "op name rendered, got: {text}");
+        assert!(
+            text.contains("api=EVP_DigestInit_ex entries=5"),
+            "api name with exact entries, got: {text}"
+        );
+        assert_eq!(
+            text.matches("api=").count(),
+            1,
+            "id-less api row omitted, not guessed, got: {text}"
+        );
+        assert_eq!(
+            text.matches("op=").count(),
+            1,
+            "one op row for one id-bearing candidate, got: {text}"
+        );
     }
 
     #[test]
