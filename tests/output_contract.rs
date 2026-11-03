@@ -2306,6 +2306,27 @@ fn v2_goldens_pinned() {
 }
 
 #[test]
+fn diagnostics_golden_pins_producer_literals() {
+    // One doc carrying producer-literal entries on both diagnostic
+    // channels; both artifacts pin the exact bytes (generate with
+    // OSSLSCOPE_REGENERATE_GOLDENS, then review before keeping).
+    let mut doc = complete_doc();
+    doc.attach_diagnostics = vec![
+        "attach:busy".to_string(),
+        "backing-changed:not-found".to_string(),
+        "symbol-discovery:resolve-failed".to_string(),
+    ];
+    doc.refusal_diagnostics = vec![
+        "limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string(),
+    ];
+    assert_golden(
+        "report-v2-diagnostics.json",
+        &String::from_utf8(render_json(&doc).unwrap()).unwrap(),
+    );
+    assert_golden("report-v2-diagnostics.txt", &render_human(&doc));
+}
+
+#[test]
 fn traversal_section_conforms() {
     // I4/T2-1: the traversal-bearing document passes rendered
     // schema validation + cross-field semantics, and the section

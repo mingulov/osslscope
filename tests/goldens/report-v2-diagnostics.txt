@@ -1,0 +1,39 @@
+osslscope report (observed-crypto-v2.4): pid=7 (demo) window=0..100ns effective=0..100ns
+duration: requested=100ns effective=100ns (monotonic; authoritative)
+kernel: 6.9.0-test
+wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
+openssl: 3.5.1 (verified object metadata)
+target: argv_redacted=true container_id=(none) image_digest=(none)
+disposition: exited code=0
+
+sites (4, 900 calls):
+  site build:012345 file-offset=4096 gen=0: 500 calls, definite: AES-128-GCM (CIPHER) via default
+  site build:012345 file-offset=8192 gen=0: 300 calls, definite: SHA-256 (DIGEST) via default
+  site build:fedcba file-offset=4096 gen=0: 100 calls, AMBIGUOUS (2 candidates, attribution uncertain):
+    candidate: provider=build:fedcba class=default op=CIPHER funcid=21 algs=[AES-256-GCM]
+    candidate: provider=build:fedcba class=default op=CIPHER funcid=21 algs=[ARIA-256-GCM] weak
+  site unverified:8 file-offset=12288 gen=0: 0 calls, quiet (no calls in window)
+
+coverage:
+  provider/default: expected=3 discovered=3 attached=3 (complete)
+  provider/legacy: not applicable
+
+counters:
+  loss count.map_insert_dropped (events from kernel-map) = 0
+  activity count.windows_closed (events from drain) = 1
+
+completeness: COMPLETE
+
+attach diagnostics:
+  - attach:busy
+  - backing-changed:not-found
+  - symbol-discovery:resolve-failed
+
+refusal diagnostics:
+  - limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024
+
+policy: (not evaluated)
+
+status=COMPLETE
+absence = not-observed in window (never "not present / never used")
+note: argv redacted; file offsets are not runtime addresses; window-only claims

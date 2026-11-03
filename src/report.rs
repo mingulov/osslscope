@@ -2013,6 +2013,17 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         }
         s.push('\n');
     }
+    // R14 minor: budget-refusal diagnostics (same optional-section
+    // rule — numeric limit: entries, capped upstream). Rendered
+    // verbatim like attach diagnostics: the renderer never filters
+    // by class; the privacy grammar owns the vocabulary.
+    if !doc.refusal_diagnostics.is_empty() {
+        s.push_str("refusal diagnostics:\n");
+        for diagnostic in &doc.refusal_diagnostics {
+            s.push_str(&format!("  - {}\n", safe_display(diagnostic)));
+        }
+        s.push('\n');
+    }
     match &doc.policy {
         None => s.push_str("policy: (not evaluated)\n"),
         Some(policy) => {
@@ -3218,6 +3229,66 @@ mod tests {
             human.contains("attach diagnostics:\n  - attach:busy"),
             "{human}"
         );
+    }
+
+    #[test]
+    fn refusal_classes_reach_human_and_json() {
+        // Per-class gate: every wire string reaches BOTH the human
+        // section and the JSON key verbatim (the renderer never
+        // filters by class). Producer-backed classes use producer
+        // literals; the rest are marked synthetic (renderer-only pins,
+        // claiming no producer).
+        let cases: &[(&str, &str, bool)] = &[
+            ("attach", "attach:busy", true),
+            ("backing-changed", "backing-changed:not-found", true),
+            ("backing-denied", "backing-denied:permission-denied", true),
+            ("symbol-discovery", "symbol-discovery:resolve-failed", true),
+            (
+                "limit",
+                "limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024",
+                true,
+            ),
+            // Reachable via from_chain IO classification; unsampled.
+            ("deadline-cancel", "deadline-cancel:timed-out", false),
+            // No producer: renderer-only passthrough pins.
+            ("identity", "identity:SYNTHETIC-NO-PRODUCER", false),
+            ("namespace", "namespace:SYNTHETIC-NO-PRODUCER", false),
+            ("bpf-load", "bpf-load:SYNTHETIC-NO-PRODUCER", false),
+        ];
+        for (class, wire, _produced) in cases {
+            let mut doc = capture::empty_document();
+            // The refusal grammar is limit-only (privacy allowlist);
+            // every other class rides the attach channel.
+            if *class == "limit" {
+                doc.refusal_diagnostics = vec![wire.to_string()];
+            } else {
+                doc.attach_diagnostics = vec![wire.to_string()];
+            }
+            let human = render_human(&doc);
+            let section = if *class == "limit" {
+                "refusal diagnostics:"
+            } else {
+                "attach diagnostics:"
+            };
+            assert!(
+                human.contains(section) && human.contains(wire),
+                "{class} reaches human ({section}), got: {human}"
+            );
+            let json: serde_json::Value =
+                serde_json::from_slice(&render_json(&doc).expect("render")).expect("json");
+            let key = if *class == "limit" {
+                "refusal_diagnostics"
+            } else {
+                "attach_diagnostics"
+            };
+            assert!(
+                json[key].as_array().unwrap().iter().any(|d| d == wire),
+                "{class} reaches JSON ({key})"
+            );
+        }
+        // Empty documents omit both sections (existing shapes unchanged).
+        let clean = capture::empty_document();
+        assert!(!render_human(&clean).contains("refusal diagnostics:"));
     }
 
     #[test]
