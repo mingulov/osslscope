@@ -633,13 +633,20 @@ impl BtrfsFixture {
 }
 impl Drop for BtrfsFixture {
     fn drop(&mut self) {
+        // Loud, never panicking: a failed delete leaks a subvolume
+        // and must show in logs, not vanish.
         for subvol in self.1.iter().rev() {
-            let _ = Command::new("btrfs")
+            if let Err(error) = Command::new("btrfs")
                 .args(["subvolume", "delete"])
                 .arg(subvol)
-                .status();
+                .status()
+            {
+                eprintln!("BtrfsFixture: subvolume delete failed: {error}");
+            }
         }
-        let _ = fs::remove_dir_all(&self.0);
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            eprintln!("BtrfsFixture: base removal failed: {error}");
+        }
     }
 }
 

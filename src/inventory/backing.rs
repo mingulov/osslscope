@@ -1748,6 +1748,17 @@ mod tests {
             eprintln!("skip: root observer bypasses the denial under test");
             return;
         }
+        // The binary existing does not prove userns creation works
+        // (hardened kernels may forbid it): probe before spawning, or the
+        // ready-handshake assert would panic instead of skipping.
+        let probe = Command::new("unshare")
+            .args(["-U", "true"])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !probe {
+            eprintln!("skip: unprivileged userns creation unavailable");
+            return;
+        }
         let dir = scratch("userns");
         let path = dir.join("lib.so");
         std::fs::write(&path, vec![0x55u8; 4096]).unwrap();
@@ -2176,12 +2187,19 @@ mod tests {
     impl Drop for BtrfsFixture {
         fn drop(&mut self) {
             for subvol in self.subvols.iter().rev() {
-                let _ = Command::new("btrfs")
+                // Loud, never panicking: a failed delete leaks a subvolume
+                // and must show in logs, not vanish.
+                if let Err(error) = Command::new("btrfs")
                     .args(["subvolume", "delete"])
                     .arg(subvol)
-                    .status();
+                    .status()
+                {
+                    eprintln!("BtrfsFixture: subvolume delete failed: {error}");
+                }
             }
-            let _ = std::fs::remove_dir_all(&self.base);
+            if let Err(error) = std::fs::remove_dir_all(&self.base) {
+                eprintln!("BtrfsFixture: base removal failed: {error}");
+            }
         }
     }
 
