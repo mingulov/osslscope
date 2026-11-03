@@ -26,6 +26,16 @@ fn state(probe: super::ProbeOut) -> State {
         State::Unavailable
     }
 }
+/// Rendered state word, mirroring the serde snake_case so the exit-3
+/// reason repeats the rows instead of paraphrasing them.
+fn word(state: State) -> &'static str {
+    match state {
+        State::Available => "available",
+        State::Denied => "denied",
+        State::Unavailable => "unavailable",
+        State::NotChecked => "not_checked",
+    }
+}
 const USAGE: &str = "usage: osslscope doctor [--json | --format human|json] [--observation-object PATH] [--count-object PATH]\nChecks scanner-owned inventory, namespace, companion integrity and functional BPF load/self-attachment. Target access remains scope dependent.\n  --libcrypto PATH selects legacy profile diagnostics.\n  --discovery preserves discovery-only capability checks.";
 /// Value-taking options of [`run`]: the doctor router consumes the
 /// token after each of these, so flag-shaped values never misroute.
@@ -187,13 +197,13 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
     let mut out = stdout.lock();
     let rendered = (|| -> io::Result<()> {
         if json {
-            serde_json::to_writer(&mut out, &serde_json::json!({"schema_version": "osslscope.focused.doctor.v1", "record": "doctor", "capabilities": capabilities, "historical_activation": "unknown", "execution": "not_observed"})).map_err(io::Error::other)?;
+            serde_json::to_writer(&mut out, &serde_json::json!({"schema_version": "osslscope.focused.doctor.v1", "record": "doctor", "capabilities": &capabilities, "historical_activation": "unknown", "execution": "not_observed"})).map_err(io::Error::other)?;
             out.write_all(b"\n")?;
         } else {
             out.write_all(
                 b"Focused capability checks; target access/attachment remains scope dependent.\n",
             )?;
-            for (name, value) in capabilities {
+            for (name, value) in &capabilities {
                 write!(out, "  {name}=")?;
                 serde_json::to_writer(&mut out, &value).map_err(io::Error::other)?;
                 out.write_all(b"\n")?;
@@ -202,6 +212,15 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         }
         out.flush()
     })();
+    if rendered.is_ok() && !available {
+        // Same map as the rows above (same order): the reason can only
+        // repeat what was rendered.
+        let words: Vec<(&str, &str)> = capabilities
+            .iter()
+            .map(|(name, s)| (*name, word(*s)))
+            .collect();
+        crate::report::err_line(&super::capability_exit_reason(&words));
+    }
     ExitCode::from(if rendered.is_err() {
         1
     } else if available {

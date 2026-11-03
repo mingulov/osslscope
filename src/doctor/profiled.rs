@@ -150,14 +150,14 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
             serde_json::to_string_pretty(&document).unwrap_or_else(|_| "{}".into())
         );
     } else {
-        for check in checks {
+        for check in &checks {
             println!(
                 "[{}] {}: {}",
                 check.status.as_str(),
                 check.id,
                 check.message
             );
-            if let Some(remediation) = check.remediation {
+            if let Some(remediation) = &check.remediation {
                 println!("  remediate: {remediation}");
             }
         }
@@ -169,6 +169,10 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
                 "ok (preflight only)"
             }
         );
+    }
+    if failed {
+        let ids = super::failed_ids(checks.iter());
+        crate::report::err_line(&super::failed_checks_reason(&ids));
     }
     ExitCode::from(if failed { 4 } else { 0 })
 }

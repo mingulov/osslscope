@@ -194,3 +194,97 @@ fn doctor_discovery_help_names_exit_codes() {
         "discovery help must name exit codes, got: {stdout}"
     );
 }
+
+#[test]
+fn doctor_discovery_exit3_names_reason_on_stderr() {
+    let out = doctor(&["--discovery"]);
+    if out.status.code() != Some(3) {
+        eprintln!("SKIP: discovery passed on this host");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.contains("osslscope doctor:"))
+            .count(),
+        1,
+        "exactly one stderr reason, got: {stderr}"
+    );
+}
+
+#[test]
+fn doctor_focused_exit3_names_reason_on_stderr() {
+    let out = doctor(&[]);
+    if out.status.code() != Some(3) {
+        eprintln!("SKIP: focused passed on this host");
+        return;
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.contains("osslscope doctor:"))
+            .count(),
+        1,
+        "exactly one stderr reason, got: {stderr}"
+    );
+}
+
+#[test]
+fn doctor_bogus_objects_package_refusal_names_itself_on_stderr() {
+    // Explicit nonexistent object overrides fail package admission before any
+    // check runs: exit 4 with a stderr reason that names the admission refusal.
+    let out = doctor(&[
+        "--object",
+        "/nonexistent-osslscope-a.o",
+        "--count-object",
+        "/nonexistent-osslscope-b.o",
+        "--members-object",
+        "/nonexistent-osslscope-c.o",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(4),
+        "stdout:\n{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("package admission refused"),
+        "stderr names the admission refusal, got:\n{stderr}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("verdict: FAIL-CLOSED (admission refused:"),
+        "human stdout carries the verdict line with cause, got:\n{stdout}"
+    );
+}
+
+#[test]
+fn doctor_dead_pid_exit2_names_no_such_process() {
+    // CLI admission (before any object resolution): a pid with no /proc
+    // entry is a usage error, exit 2, with the established reason line.
+    let out = doctor(&["--pid", "424242"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("osslscope doctor: no such process 424242"),
+        "stderr names the dead pid, got: {stderr}"
+    );
+}
+
+#[test]
+fn doctor_profiled_exit4_names_reason_on_stderr() {
+    let out = doctor(&["--libcrypto", "/bin/true"]);
+    assert_eq!(out.status.code(), Some(4));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stderr
+            .lines()
+            .filter(|l| l.contains("osslscope doctor:"))
+            .count(),
+        1,
+        "exactly one stderr reason, got: {stderr}"
+    );
+}

@@ -173,6 +173,57 @@ fn render_doctor_human(
     s
 }
 
+/// Stderr reason for capability-gated exit 3 (focused + discovery): names
+/// every non-available capability with its rendered state word, so the
+/// reason repeats the rows above instead of offering a second opinion.
+/// Callers map their local enum to the shared serde word (`available`,
+/// `denied`, `unavailable`, `not_checked`) at the call site.
+pub(crate) fn capability_exit_reason(states: &[(&str, &str)]) -> String {
+    let bad: Vec<String> = states
+        .iter()
+        .filter(|(_, word)| *word != "available")
+        .map(|(name, word)| format!("{name}({word})"))
+        .collect();
+    if bad.is_empty() {
+        return "osslscope doctor: capability unavailable: none named (see capabilities above)"
+            .into();
+    }
+    format!(
+        "osslscope doctor: capability unavailable: {} (see capabilities above)",
+        bad.join(", ")
+    )
+}
+
+/// Failed check ids in section order (render order, no dedup: ids are
+/// unique per section by construction).
+fn failed_ids<'a, I>(checks: I) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a Check>,
+{
+    checks
+        .into_iter()
+        .filter(|c| c.status == Status::Fail)
+        .map(|c| c.id)
+        .collect()
+}
+
+/// Stderr reason for preflight exit 4 (sectioned + profiled): failed ids
+/// in render order, capped with an exact remainder count.
+pub(crate) fn failed_checks_reason(ids: &[&str]) -> String {
+    if ids.is_empty() {
+        return "osslscope doctor: preflight failed: none named (see rows above)".into();
+    }
+    let mut s = format!(
+        "osslscope doctor: preflight failed: {}",
+        ids.iter().take(3).copied().collect::<Vec<_>>().join(", ")
+    );
+    if ids.len() > 3 {
+        s.push_str(&format!(" (+{} more)", ids.len() - 3));
+    }
+    s.push_str(" (see rows above)");
+    s
+}
+
 /// Sectioned JSON checks: established per-check shape plus the additive
 /// `section` key, in fixed section order.
 fn doctor_checks_json(sections: &[(DoctorSection, Vec<Check>)]) -> Vec<serde_json::Value> {
@@ -2947,7 +2998,11 @@ fn run_with_resolver(
                 );
             } else {
                 print!("{}", render_doctor_human(&sections, None));
+                println!("verdict: FAIL-CLOSED (admission refused: {error})");
             }
+            crate::report::err_line(&format!(
+                "osslscope doctor: package admission refused: {error} (no preflight checks ran)"
+            ));
             ExitCode::from(4)
         }
     }
@@ -3320,6 +3375,8 @@ fn run_admitted_doctor(
         println!("verdict: {}", if failed { "FAIL-CLOSED" } else { "ok" });
     }
     if failed {
+        let ids = failed_ids(sections.iter().flat_map(|(_, checks)| checks.iter()));
+        crate::report::err_line(&failed_checks_reason(&ids));
         ExitCode::from(4)
     } else {
         ExitCode::SUCCESS
@@ -5666,6 +5723,51 @@ mod tests {
         assert!(!spawn.message.contains("no cold-start gap"));
         std::fs::remove_dir_all(dir).unwrap();
     }
+
+    #[test]
+    fn capability_reason_names_every_non_available_state_word() {
+        let reason = super::capability_exit_reason(&[
+            ("bpf", "available"),
+            ("fork_exec_spawn", "denied"),
+            ("observation_load", "unavailable"),
+            ("user_read", "not_checked"),
+        ]);
+        assert!(
+            reason.contains("fork_exec_spawn(denied)")
+                && reason.contains("observation_load(unavailable)")
+                && reason.contains("user_read(not_checked)"),
+            "reason names each non-available capability with its state, got: {reason}"
+        );
+        assert!(
+            !reason.contains("bpf("),
+            "available capabilities stay unnamed, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn failed_checks_reason_lists_ids_with_exact_remainder() {
+        let short = super::failed_checks_reason(&["target"]);
+        assert!(
+            short.contains("target") && !short.contains("more"),
+            "single id listed plainly, got: {short}"
+        );
+        let long = super::failed_checks_reason(&["a", "b", "c", "d", "e"]);
+        assert!(
+            long.contains("a, b, c") && long.contains("(+2 more)"),
+            "first three listed with exact remainder, got: {long}"
+        );
+    }
+
+    #[test]
+    fn failed_ids_keeps_render_order_and_fail_only() {
+        let checks = vec![
+            Check::pass("a", "ok".into()),
+            Check::fail("b", "bad".into(), "fix".into()),
+            Check::degraded("c", "meh".into(), "try".into()),
+            Check::fail("d", "bad".into(), "fix".into()),
+        ];
+        assert_eq!(super::failed_ids(checks.iter()), vec!["b", "d"]);
+    }
 }
 
 pub(crate) fn with_doctor_objects<R>(
@@ -5725,6 +5827,16 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
             Capability::Denied
         } else {
             Capability::Unavailable
+        }
+    }
+    /// Rendered state word, mirroring the serde snake_case above so the
+    /// exit-3 reason repeats the rows instead of paraphrasing them.
+    fn word(state: Capability) -> &'static str {
+        match state {
+            Capability::Available => "available",
+            Capability::Denied => "denied",
+            Capability::Unavailable => "unavailable",
+            Capability::NotChecked => "not_checked",
         }
     }
     #[derive(Serialize)]
@@ -5850,6 +5962,17 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
             execution: "not_observed",
         },
     };
+    // One ordered list feeds both the rows and the exit-3 reason, so the
+    // reason can only repeat what was rendered.
+    let states = [
+        ("inventory", result.capabilities.inventory),
+        ("companion", result.capabilities.companion),
+        ("producer", result.capabilities.producer),
+        ("bpf", result.capabilities.bpf),
+        ("user_read", result.capabilities.user_read),
+        ("ring_buffer", result.capabilities.ring_buffer),
+        ("uprobe_multi", result.capabilities.uprobe_multi),
+    ];
     let stdout = io::stdout();
     let mut out = stdout.lock();
     let rendered = (|| -> io::Result<()> {
@@ -5862,16 +5985,7 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
             serde_json::to_writer(&mut out, &result).map_err(io::Error::other)?;
             out.write_all(b"\n")?;
         } else {
-            let caps = &result.capabilities;
-            for (name, state) in [
-                ("inventory", caps.inventory),
-                ("companion", caps.companion),
-                ("producer", caps.producer),
-                ("bpf", caps.bpf),
-                ("user_read", caps.user_read),
-                ("ring_buffer", caps.ring_buffer),
-                ("uprobe_multi", caps.uprobe_multi),
-            ] {
+            for (name, state) in states {
                 write!(out, "  {name}=")?;
                 serde_json::to_writer(&mut out, &state).map_err(io::Error::other)?;
                 out.write_all(b"\n")?;
@@ -5880,6 +5994,10 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
         }
         out.flush()
     })();
+    if rendered.is_ok() && !available {
+        let words: Vec<(&str, &str)> = states.iter().map(|(name, s)| (*name, word(*s))).collect();
+        crate::report::err_line(&capability_exit_reason(&words));
+    }
     ExitCode::from(if rendered.is_err() {
         1
     } else if available {
