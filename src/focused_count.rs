@@ -182,6 +182,10 @@ pub struct CountSample {
     pub dropfail: u64,
     pub namespace_failures: u64,
     pub unattributed: u64,
+    /// 6A kernel-edge fence: calls withheld whole (straddling
+    /// aggregates + post-edge keys), conserved as explicit
+    /// unattributed loss — never projected, never foreign.
+    pub fence_withheld: u64,
     pub engine: Vec<EngineCount>,
 }
 mod fold;
@@ -201,6 +205,10 @@ fn ledger_counted(sample: &CountSample) -> u64 {
         )
         .saturating_add(sample.unattributed)
         .saturating_add(sample.dropfail)
+        // 6A: fence-withheld calls were admitted but are withheld
+        // whole from projection; they balance the ledger here,
+        // never as projected counts.
+        .saturating_add(sample.fence_withheld)
 }
 /// Dedupe ENGINE plans by physical (device, inode, offset)
 /// identity: hardlinked paths describing the same stub attach
@@ -1319,6 +1327,25 @@ impl FocusedCounter {
             self.failure(e);
         }
         self.current_sample()
+    }
+    /// 6A kernel-edge fence (§1.8): rotate the count generation
+    /// (post-edge BPF hits key under a new `(cookie, generation)`)
+    /// and arm timestamp withholding at `edge_ns` — WITHOUT
+    /// retiring rows (the fenced epoch seals; the guard only
+    /// versions the future). A failed GEN write gaps
+    /// (`focused_fence_gen_unwritten`) and proceeds: timestamps
+    /// still protect, since merged post-edge hits only widen
+    /// aggregates into straddling. One-way; an earlier edge
+    /// tightens the bound (see `CountFold::note_fence`).
+    pub fn note_fence_edge(&mut self, edge_ns: u64) {
+        let post = self.fold.note_fence(edge_ns);
+        if self.write("GEN", 0, &post.to_ne_bytes()).is_err() {
+            self.fold.gap("focused_fence_gen_unwritten");
+        }
+    }
+    /// 6A: calls conserved as withheld by the fence so far.
+    pub fn fence_withheld(&self) -> u64 {
+        self.fold.fence_withheld()
     }
     fn current_sample(&self) -> CountSample {
         let mut sample = self.fold.sample();

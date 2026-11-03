@@ -84,6 +84,14 @@ pub struct FocusedResult {
     pub document: CaptureDocument,
     pub child_exit: Option<i32>,
     pub workload_discarded: bool,
+    /// 6A fence conservation: count-plane withheld calls plus
+    /// provider-plane dropped records, merged at seal into the
+    /// member loss ledger (`LossSummary.loss`).
+    pub fence_withheld: u64,
+    /// 6A final per-index LOSS deltas (session scope, read after
+    /// the closing drain): the coordinator folds these into the
+    /// cumulative `SessionLoss.ring` exactly once at seal.
+    pub loss_totals: [u64; 8],
     pub(crate) _reservation: Option<crate::observation_memory::MemoryLease>,
 }
 
@@ -681,6 +689,17 @@ pub(crate) struct FocusedSession {
     scanner: ScopedScanner,
     initial_metadata: Option<inventory::ProcessRecord>,
     pending: Option<ObservationBatch>,
+    /// 6A session-detected exec witnesses (pids) since the last
+    /// `take_exec_witnesses` (coordinator drains per tick).
+    exec_pending: Vec<u32>,
+    /// 6A additive-refresh instants (producer ns) since the last
+    /// `take_module_refreshes` (coordinator drains per tick and
+    /// stamps record ticks).
+    refresh_pending: Vec<u64>,
+    /// 6A previous completed drain's read instant (producer ns),
+    /// the conservative edge when a witness carries no trusted
+    /// timestamp (§1.8). Starts at session start.
+    last_clean_drain_ns: u64,
     gaps: BTreeSet<ObservationGap>,
     /// Shaped attach/backing diagnostics: link failures drained from
     /// the counter plus batch refusals (R06 rule: sorted + deduped
@@ -875,13 +894,15 @@ impl FocusedSession {
         // observer mappings here can spend the setup budget on an unrelated ELF;
         // actual object inventory/reconciliation starts after release below.
         let (initial_record, initial_reads) = if let Some(expected) = expected {
+            // The exports bound derives from the Api vocabulary (6A):
+            // `exports` is deduplicated over variants, so our own
+            // snapshots always fit; only forged metadata can exceed it.
             if owned.1.is_some()
                 || expected.pid != pid
                 || expected.modules.len() > 256
-                || expected
-                    .modules
-                    .iter()
-                    .any(|m| m.info.sha256.len() != 64 || m.info.exports.len() > 46)
+                || expected.modules.iter().any(|m| {
+                    m.info.sha256.len() != 64 || m.info.exports.len() > crate::inventory::Api::COUNT
+                })
             {
                 return Err(TargetUnavailable.into());
             }
@@ -1145,6 +1166,9 @@ impl FocusedSession {
             scanner,
             initial_metadata: expected.map(|_| initial_record),
             pending: None,
+            exec_pending: Vec::new(),
+            refresh_pending: Vec::new(),
+            last_clean_drain_ns: start_ns,
             gaps,
             attach_diagnostics: BTreeSet::new(),
             engine: EnginePlane::new(),
@@ -1671,6 +1695,18 @@ impl FocusedSession {
             }
             if let Some(s) = &mut self.session {
                 let batch = s.reconcile_records(records);
+                // 6A: fresh-reconcile signals only (pending
+                // re-drives must not duplicate them).
+                for pid in batch.exec_witnesses.iter().copied() {
+                    if !self.exec_pending.contains(&pid) {
+                        self.exec_pending.push(pid);
+                    }
+                }
+                if batch.additive_refreshes.contains(&self.pid) {
+                    if let Ok(ns) = now_ns() {
+                        self.refresh_pending.push(ns);
+                    }
+                }
                 self.apply_batch(batch, tick_end, cancel)?;
             }
             self.plan_engine_probes(records, tick_end, cancel);
@@ -1690,7 +1726,24 @@ impl FocusedSession {
         }
         if let Some(s) = &mut self.session {
             let batch = s.drain((Instant::now() + DRAIN).min(tick_end));
+            // 6A: drain batches carry the same fresh signals as
+            // reconcile batches (the drain wins the race for maps
+            // changes); collect them identically or drain-detected
+            // execs and refreshes are silently dropped.
+            for pid in batch.exec_witnesses.iter().copied() {
+                if !self.exec_pending.contains(&pid) {
+                    self.exec_pending.push(pid);
+                }
+            }
+            if batch.additive_refreshes.contains(&self.pid) {
+                if let Ok(ns) = now_ns() {
+                    self.refresh_pending.push(ns);
+                }
+            }
             self.apply_batch(batch, tick_end, cancel)?;
+            if let Ok(ns) = now_ns() {
+                self.last_clean_drain_ns = ns;
+            }
         }
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         if self.signal_cut {
@@ -1825,6 +1878,65 @@ impl FocusedSession {
         )
         .ok()
     }
+    /// 6A session-detected exec witnesses (exe-stamp flips) since
+    /// the last take. The coordinator drains this per tick and
+    /// seals the image epoch (§1.4).
+    pub(crate) fn take_exec_witnesses(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.exec_pending)
+    }
+    /// 6A additive-refresh instants (producer ns) since the last
+    /// take. The coordinator drains this per tick, stamps record
+    /// ticks, and emits the `additive_module_refresh` detail (§1.2).
+    pub(crate) fn take_module_refreshes(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.refresh_pending)
+    }
+    /// 6A cumulative per-index LOSS deltas (session scope,
+    /// unlocalized — the coordinator folds these into
+    /// `SessionLoss.ring`).
+    pub(crate) fn session_loss_totals(&self) -> [u64; 8] {
+        self.session
+            .as_ref()
+            .map(|s| s.loss_totals())
+            .unwrap_or([0; 8])
+    }
+    /// 6A kernel-edge fence (§1.8): fence the counter (generation
+    /// guard + withholding) and the provider session (BPF rows +
+    /// post-edge record filter) at `edge_ns`. `None` resolves to
+    /// the previous completed drain's read instant (conservative:
+    /// the edge may be as old as the last drain). One-way;
+    /// earliest edge wins at both layers.
+    pub(crate) fn note_kernel_edge(&mut self, edge_ns: Option<u64>) {
+        let edge = edge_ns.unwrap_or(self.last_clean_drain_ns);
+        if let Some(c) = &mut self.counter {
+            c.note_fence_edge(edge);
+        }
+        if let Some(s) = &mut self.session {
+            s.fence_target(self.pid, edge);
+        }
+    }
+    /// 6A suspension for retained-unknown members (§2.4): retire
+    /// the counter (BPF stops; rows fence into history) and evict
+    /// the provider target into the gap-free refresh handoff. The
+    /// next reconcile re-adds via the retained incarnation. The
+    /// coordinator records the unknown window in the loss ledger.
+    pub(crate) fn suspend_retained(&mut self) {
+        if let Some(c) = &mut self.counter {
+            c.retire();
+        }
+        if let Some(s) = &mut self.session {
+            s.suspend_target(self.pid);
+        }
+    }
+    /// 6A seal after a kernel-edge fence: late/resolve fence, then
+    /// the normal close drain (withholding applies throughout).
+    pub(crate) fn finish_with_edge(
+        mut self,
+        deadline: Instant,
+        edge_ns: Option<u64>,
+    ) -> anyhow::Result<FocusedResult> {
+        self.note_kernel_edge(edge_ns);
+        self.finish(deadline)
+    }
     pub(crate) fn finish(mut self, deadline: Instant) -> anyhow::Result<FocusedResult> {
         self.pending = None;
         // One successful map-in-map delete closes metadata, API and physical
@@ -1839,8 +1951,12 @@ impl FocusedSession {
         }
         let end_ns = now_ns()?.min(self.deadline_ns);
         let mut api_activity = Vec::new();
+        let mut fence_withheld = 0u64;
+        let mut loss_totals = [0u64; 8];
         if let Some(s) = self.session.as_mut() {
             let batch = s.finalize_until(deadline);
+            fence_withheld = fence_withheld.saturating_add(s.take_fence_withheld());
+            loss_totals = s.loss_totals();
             if batch_invalidates_advertisements(&batch, self.pid) {
                 self.gaps.insert(ObservationGap::Invalidated);
             }
@@ -1882,6 +1998,7 @@ impl FocusedSession {
             // counter (after the take there is nothing to drain).
             self.attach_diagnostics.extend(c.take_attach_diagnostics());
             self.sample = c.close(deadline);
+            fence_withheld = fence_withheld.saturating_add(self.sample.fence_withheld);
         }
         // Final ENGINE news from the closed cut, then join counts
         // to probe meanings + pinned module identities. A blinded
@@ -2084,6 +2201,8 @@ impl FocusedSession {
             document,
             child_exit,
             workload_discarded: self.workload_discarded,
+            fence_withheld,
+            loss_totals,
             _reservation: Some(self._reservation),
         })
     }

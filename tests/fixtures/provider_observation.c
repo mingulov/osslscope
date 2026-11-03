@@ -11,6 +11,23 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <string.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+
+static pid_t fixture_tid(void) {
+#ifdef SYS_gettid
+    return (pid_t)syscall(SYS_gettid);
+#else
+    return getpid();
+#endif
+}
+static volatile pid_t churn_tid = 0;
+static void *churn_worker(void *arg) {
+    (void)arg;
+    churn_tid = fixture_tid();
+    return NULL;
+}
 
 /* Whole decimal line, bounded independently of the observer. */
 static int read_calls(unsigned long *calls) {
@@ -113,6 +130,37 @@ int main(int argc, char **argv) {
         case 'H': {
             const OSSL_DISPATCH *out = NULL; void *provctx = NULL;
             mode(2); success = init(NULL,NULL,&out,&provctx)==0;mode(0);break;
+        }
+        case 'O': {
+            /* 6A control 9a: dlopen one more module path mid-observation.
+             * The path arrives as a single bounded line; the handle is
+             * retained (stays mapped, never re-resolved). */
+            char path[512];
+            if (!fgets(path, sizeof(path), stdin) || !strchr(path, '\n')) return 7;
+            *strchr(path, '\n') = '\0';
+            char *first = path;
+            while (*first == ' ' || *first == '\t') ++first;
+            if (*first == '\0') return 7;
+            void *extra = dlopen(first, RTLD_NOW | RTLD_LOCAL);
+            success = extra != NULL;
+            printf("dlopen %s %d\n", first, success);
+            break;
+        }
+        case 'W': {
+            /* 6A control 2: spawn+join K threads (tid churn, no crypto).
+             * Each birth+death is logged with its tid. */
+            unsigned long threads;
+            if (!read_calls(&threads) || threads > 1024) return 7;
+            success = 1;
+            for (unsigned long i = 0; i < threads; ++i) {
+                pthread_t t;
+                churn_tid = 0;
+                if (pthread_create(&t, NULL, churn_worker, NULL) != 0) { success = 0; break; }
+                if (pthread_join(t, NULL) != 0 || churn_tid == 0) { success = 0; break; }
+                printf("thread %d\n", (int)churn_tid);
+                fflush(stdout);
+            }
+            break;
         }
         default: return 6;
         }

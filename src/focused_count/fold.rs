@@ -20,6 +20,26 @@ pub(super) struct Row {
     pub(super) mapping: u64,
     pub(super) active: bool,
 }
+/// 6A kernel-edge fence (§1.8): one-way pre-seal state. At the fence
+/// the fold generation rotates (post-edge BPF hits key under
+/// `post_gen`) and every aggregate not provably entirely pre-edge
+/// (`last_ns >= edge_ns`) is withheld whole into `withheld` —
+/// never projected, never attributed to either epoch. Withholding
+/// is idempotent across samples: straddling rows are REMOVED (later
+/// growth accrues via the `hw` high-water map) and post-edge keys
+/// accrue high-water deltas only. Stale-row safety: a row the drain
+/// failed to re-observe keeps its last-good `last_ns`; if that were
+/// `>= edge_ns` the row would already be withheld, so surviving
+/// stale rows are provably pre-edge and safe to project.
+#[derive(Clone)]
+struct FenceState {
+    edge_ns: u64,
+    fenced_gen: u32,
+    post_gen: u32,
+    withheld: u64,
+    withheld_cookies: std::collections::BTreeSet<u32>,
+    hw: BTreeMap<(u32, u32), u64>,
+}
 /// Bounded pure host folding and attachment admission. The install closure is
 /// called once per new physical site; a refusal never publishes a successful row.
 #[derive(Clone)]
@@ -33,6 +53,7 @@ pub struct CountFold {
     pub(super) next_cookie: u32,
     pub(super) state_bytes: usize,
     gaps: BTreeMap<&'static str, u64>,
+    fence: Option<FenceState>,
 }
 impl CountFold {
     pub fn new(limits: CountLimits) -> Result<Self, CountFailure> {
@@ -47,7 +68,75 @@ impl CountFold {
             next_cookie: 1,
             state_bytes: 0,
             gaps: BTreeMap::new(),
+            fence: None,
         })
+    }
+    /// 6A kernel-edge fence: rotate the fold generation (the caller
+    /// writes the new GEN to the map) and arm timestamp withholding
+    /// at `edge_ns`. One-way: rotation happens once; a later call
+    /// with an EARLIER edge tightens the bound and re-sweeps rows
+    /// (a conservative drain-instant edge followed by a trusted
+    /// witness must not leave truth-straddling rows projected).
+    /// Returns the post-fence generation for the GEN map write.
+    /// Generation exhaustion gaps (`focused_fence_gen_exhausted`)
+    /// and proceeds unrotated — timestamps still protect, since
+    /// merged post-edge hits only widen aggregates into straddling.
+    pub(super) fn note_fence(&mut self, edge_ns: u64) -> u32 {
+        if let Some(post_gen) = self.fence.as_ref().map(|f| f.post_gen) {
+            let tighten = self.fence.as_ref().is_some_and(|f| edge_ns < f.edge_ns);
+            if tighten {
+                if let Some(f) = self.fence.as_mut() {
+                    f.edge_ns = edge_ns;
+                }
+                self.sweep_fence();
+            }
+            return post_gen;
+        }
+        let fenced_gen = self.generation;
+        let post_gen = match self.generation.checked_add(1) {
+            Some(g) => g,
+            None => {
+                self.gap("focused_fence_gen_exhausted");
+                fenced_gen
+            }
+        };
+        self.generation = post_gen;
+        self.fence = Some(FenceState {
+            edge_ns,
+            fenced_gen,
+            post_gen,
+            withheld: 0,
+            withheld_cookies: std::collections::BTreeSet::new(),
+            hw: BTreeMap::new(),
+        });
+        self.sweep_fence();
+        post_gen
+    }
+    /// Withhold every currently-straddling row (fence arm + edge
+    /// tightening). Idempotent: withheld rows are removed, so a
+    /// re-sweep sees only survivors.
+    fn sweep_fence(&mut self) {
+        let edge_ns = match self.fence.as_ref() {
+            Some(f) => f.edge_ns,
+            None => return,
+        };
+        let straddling: Vec<(u32, u64)> = self
+            .rows
+            .iter()
+            .filter(|(_, r)| r.row.last_ns >= edge_ns && r.row.calls > 0)
+            .map(|(&cookie, r)| (cookie, r.row.calls))
+            .collect();
+        for (cookie, calls) in straddling {
+            self.rows.remove(&cookie);
+            if let Some(f) = self.fence.as_mut() {
+                f.withheld = f.withheld.saturating_add(calls);
+                f.withheld_cookies.insert(cookie);
+                f.hw.insert((cookie, f.fenced_gen), calls);
+            }
+        }
+    }
+    pub(super) fn fence_withheld(&self) -> u64 {
+        self.fence.as_ref().map(|f| f.withheld).unwrap_or(0)
     }
     pub(super) fn charge(&mut self, n: usize) -> Result<(), CountFailure> {
         let next = self.checked_charge(n)?;
@@ -269,17 +358,79 @@ impl CountFold {
         if calls == u64::MAX {
             self.gaps.insert("focused_saturated", 1);
         }
-        if let Some(r) = self
+        // 6A fence routing (before the row/foreign split): post-edge
+        // keys under the rotated guard, and later growth of removed
+        // straddling rows, accrue high-water deltas as withheld —
+        // never foreign, never projected. Stale generations fall
+        // through to today's high-water behavior (idempotent).
+        if let Some((post_gen, fenced_gen, removed)) = self.fence.as_ref().map(|f| {
+            (
+                f.post_gen,
+                f.fenced_gen,
+                f.withheld_cookies.contains(&cookie),
+            )
+        }) {
+            if (generation == post_gen && generation != fenced_gen)
+                || (generation == fenced_gen && removed)
+            {
+                if self
+                    .fence
+                    .as_ref()
+                    .is_some_and(|f| !f.hw.contains_key(&(cookie, generation)))
+                {
+                    let len = self.fence.as_ref().map(|f| f.hw.len()).unwrap_or(0);
+                    if len >= self.limits.max_keys {
+                        return Err(CountFailure::Resource);
+                    }
+                    self.charge(96)?;
+                }
+                let f = self.fence.as_mut().expect("fence checked");
+                let slot = f.hw.entry((cookie, generation)).or_default();
+                if calls < *slot {
+                    return Err(CountFailure::Read);
+                }
+                f.withheld = f.withheld.saturating_add(calls - *slot);
+                *slot = calls;
+                return Ok(());
+            }
+        }
+        enum RowAction {
+            Set,
+            Regressed,
+            NoRow,
+        }
+        let action = match self
             .rows
             .get_mut(&cookie)
             .filter(|r| r.row.generation == generation)
         {
-            if calls < r.row.calls {
-                return Err(CountFailure::Read);
+            None => RowAction::NoRow,
+            Some(r) if calls < r.row.calls => RowAction::Regressed,
+            Some(r) => {
+                r.row.calls = calls;
+                r.row.first_ns = first;
+                r.row.last_ns = last;
+                RowAction::Set
             }
-            r.row.calls = calls;
-            r.row.first_ns = first;
-            r.row.last_ns = last;
+        };
+        if matches!(action, RowAction::Regressed) {
+            return Err(CountFailure::Read);
+        }
+        if matches!(action, RowAction::Set) {
+            // 6A: a row observed straddling the fence edge is
+            // withheld whole immediately (removed; later growth
+            // accrues via the high-water branch above).
+            let edge_ns = self.fence.as_ref().map(|f| f.edge_ns);
+            if let Some(edge_ns) = edge_ns {
+                if last >= edge_ns && calls > 0 {
+                    self.rows.remove(&cookie);
+                    if let Some(f) = self.fence.as_mut() {
+                        f.withheld = f.withheld.saturating_add(calls);
+                        f.withheld_cookies.insert(cookie);
+                        f.hw.insert((cookie, generation), calls);
+                    }
+                }
+            }
         } else if is_engine_cookie(cookie) {
             // Reserved ENGINE probe plane: same cumulative-drain
             // discipline as foreign keys, but evidence-shaped (the
@@ -352,6 +503,7 @@ impl CountFold {
             }
         }
         s.unattributed = self.foreign.values().copied().fold(0, u64::saturating_add);
+        s.fence_withheld = self.fence_withheld();
         s.engine = self.engine.values().cloned().collect();
         for (&name, &value) in &self.gaps {
             s.gaps.push(gap(name, value));

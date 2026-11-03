@@ -1182,6 +1182,8 @@ pub(crate) fn consume_focused_result(
                     })),
                     child_exit: None,
                     workload_discarded: false,
+                    fence_withheld: 0,
+                    loss_totals: [0; 8],
                     _reservation: None,
                 },
                 command,

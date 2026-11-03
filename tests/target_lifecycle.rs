@@ -2409,6 +2409,9 @@ pub(crate) fn connector_body_r20fix_kernel_lifecycle_witnesses_real_fork_exec_ex
                 LifecycleKind::Exec => {
                     execs.insert(e.pid);
                 }
+                // 6A feed extension: exits and thread births now
+                // surface; this witness test scopes to fork+exec.
+                LifecycleKind::Exit | LifecycleKind::ThreadBirth => {}
             }
         }
         if forks.is_empty() || execs.is_empty() {

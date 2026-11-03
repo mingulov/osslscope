@@ -41,6 +41,18 @@ pub struct ObservationBatch {
     /// Count may bridge only after independently revalidating retained custody;
     /// this is not a claim that process or backing code changed identity.
     pub refreshed_processes: Vec<u32>,
+    /// 6A exec witnesses (session-detected exe-stamp flips, §1.4): pids
+    /// whose image epoch sealed this reconcile. The coordinator seals
+    /// the segment and re-admits the post-exec image as a fresh
+    /// candidate; the session never re-adds these pids itself
+    /// (`exec_sealed`).
+    pub exec_witnesses: Vec<u32>,
+    /// 6A additive module refreshes (§1.2 late modules): pids whose
+    /// binding refreshed over added-only rows this reconcile
+    /// (distinct from `refreshed_processes`, which also covers
+    /// authority upgrades). The coordinator emits the
+    /// `additive_module_refresh` transition detail.
+    pub additive_refreshes: Vec<u32>,
 }
 /// One cumulative final API ledger, scoped to an observed incarnation.
 #[derive(Clone)]
@@ -389,6 +401,22 @@ pub struct ProviderSession {
     // Replaces (never adds to) an admitted target during metadata-only refresh.
     // The shared process lease still bounds this map and any Count site owners.
     refreshing: BTreeMap<u32, objects::ProcessIncarnation>,
+    /// 6A exec-sealed pids (§1.4): image retired by an exe-stamp flip
+    /// this session already reported via `exec_witnesses`. The
+    /// coordinator owns the post-exec re-admission (new segment);
+    /// the session never re-adds these pids itself. Never cleared:
+    /// the session is dropped at segment seal.
+    exec_sealed: BTreeSet<u32>,
+    /// 6A kernel-edge fences (§1.8): pid → edge instant in the
+    /// producer timestamp domain. Fenced records with
+    /// `monotonic_ns >= edge` are dropped whole at `consume` and
+    /// conserved in `fence_withheld` (never bound, never
+    /// projected). One-way pre-seal state; earliest edge wins.
+    fenced: BTreeMap<u32, u64>,
+    /// 6A provider-plane fence conservation: ring records dropped
+    /// whole by the `fenced` timestamp rule. Read once at segment
+    /// seal into the member loss ledger.
+    fence_withheld: u64,
     roles: Roles,
     aliases: super::assembly::Sequences,
     budget: ObservationBudget,
@@ -414,6 +442,13 @@ pub struct ProviderSession {
     emitted: usize,
     learned: BTreeSet<(u32, u64, u64, u64, u64)>,
     last_loss: [u64; 8],
+    /// 6A cumulative per-index loss deltas over the session lifetime.
+    /// Same index order as the LOSS map poll below (QueueLoss,
+    /// PendingLimit, DepthLimit, UnpairedReturn, TargetReadFailed,
+    /// RelocationRefused, DispatchPartial, NamespaceChanged). The
+    /// coordinator attributes these per incarnation; only deltas ever
+    /// accumulate here (map counters are monotonic).
+    loss_totals: [u64; 8],
     last_drain: Instant,
     closed: bool,
 }
@@ -911,6 +946,9 @@ impl ProviderSession {
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
+            exec_sealed: BTreeSet::new(),
+            fenced: BTreeMap::new(),
+            fence_withheld: 0,
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
             setup_state_spent: budget.spent_state(),
@@ -927,6 +965,7 @@ impl ProviderSession {
             emitted: 0,
             learned: BTreeSet::new(),
             last_loss: [0; 8],
+            loss_totals: [0; 8],
             last_drain: Instant::now(),
             closed: false,
         })
@@ -1147,6 +1186,67 @@ impl ProviderSession {
     pub fn reconcile(&mut self, snapshot: &inventory::Snapshot) -> ObservationBatch {
         self.reconcile_records(&snapshot.processes)
     }
+    /// 6A cumulative per-index loss deltas since session setup; index
+    /// order matches the LOSS map poll (see `loss_totals`).
+    pub(crate) fn loss_totals(&self) -> [u64; 8] {
+        self.loss_totals
+    }
+    /// 6A kernel-edge fence (§1.8): stop the BPF plane for `pid`
+    /// (members/config/ranges rows removed, best-effort — the
+    /// timestamp filter below is the real guard) and arm the
+    /// `monotonic_ns >= edge_ns` drop rule at `consume`. The
+    /// `Target` object is KEPT (unlike retirement) so the next
+    /// reconcile still detects the exe-stamp flip / absence for
+    /// the coordinator's seal decision. One-way; earliest edge wins.
+    pub(crate) fn fence_target(&mut self, pid: u32, edge_ns: u64) {
+        if self.fenced.get(&pid).is_some_and(|&e| e <= edge_ns) {
+            return;
+        }
+        self.fenced.insert(pid, edge_ns);
+        let _ = self.members.remove(&pid);
+        if let Some(target) = self.targets.get(&pid) {
+            for a in &target.attachments {
+                let _ = self.config.remove(&a.cookie);
+            }
+            for index in 0..target.ranges {
+                let _ = self.ranges.remove(&c::RangeKey {
+                    pid,
+                    index: index as u32,
+                });
+            }
+        }
+    }
+    /// 6A provider-plane fence conservation, taken once at seal.
+    pub(crate) fn take_fence_withheld(&mut self) -> u64 {
+        std::mem::take(&mut self.fence_withheld)
+    }
+    /// 6A suspension for retained-unknown members (§2.4): evict the
+    /// live target into the `refreshing` handoff WITHOUT gaps or
+    /// refusals (this is not a failure — the incarnation is
+    /// unchanged, only unwitnessed this tick). The next reconcile
+    /// re-adds via the retained incarnation (lease-preserving,
+    /// like the transient-budget path) and re-emits static
+    /// candidates so the counter re-attaches. Aliases and learned
+    /// sites are kept: the incarnation never died. The unknown
+    /// window itself is recorded in the coordinator's loss ledger,
+    /// never as a session gap.
+    pub(crate) fn suspend_target(&mut self, pid: u32) {
+        let Some(target) = self.targets.remove(&pid) else {
+            return;
+        };
+        let retained = target.process.retained_incarnation();
+        let _ = self.members.remove(&pid);
+        for a in &target.attachments {
+            let _ = self.config.remove(&a.cookie);
+        }
+        for index in 0..target.ranges {
+            let _ = self.ranges.remove(&c::RangeKey {
+                pid,
+                index: index as u32,
+            });
+        }
+        self.refreshing.insert(pid, retained);
+    }
     pub(crate) fn reconcile_records(
         &mut self,
         records: &[inventory::ProcessRecord],
@@ -1190,6 +1290,16 @@ impl ProviderSession {
         // alive, so a fresh admission would starve on ProcessLimit under
         // a tight process budget.
         let mut readd_deferred = Vec::new();
+        // 6A additive refresh: a `ProcessChanged` sourced from the
+        // per-tick revalidation arm (record present, starttime matched,
+        // no recorded refusal) may be a pure row-set addition (dlopen).
+        // The additive verdict then diverts the target into the same
+        // retained-incarnation refresh handoff as the authority path
+        // below instead of a terminal retire; the fresh acquire that
+        // follows re-proves backing. Any other gap — or any proof
+        // failure inside the verdict — keeps the frozen `ProcessChanged`
+        // retire. These pids skip the re-add loop like `refreshed`.
+        let mut additive_refreshed = Vec::new();
         for (pid, gap) in retire {
             let record = records.iter().find(|r| r.pid == pid);
             let preserved = if transient_budget_gap(gap) {
@@ -1199,6 +1309,49 @@ impl ProviderSession {
             } else {
                 None
             };
+            if gap == ObservationGap::ProcessChanged && preserved.is_none() {
+                // 6A exec (exe-stamp flip, §1.4) precedes the additive
+                // probe: an exec changes the exe AND the rows, so the
+                // additive verdict would fail closed anyway. The
+                // revalidation-arm isolation is the same as below
+                // (record present, starttime matched, no recorded
+                // refusal); `exec_witnessed` additionally requires a
+                // live pidfd with identical starttime/namespaces, so
+                // reuse and namespace change can never land here.
+                let witnessed = matches!(
+                    (record, self.targets.get(&pid)),
+                    (Some(record), Some(target))
+                        if record.starttime == target.starttime
+                            && recorded_refusal(&target.process).is_none()
+                            && target.process.exec_witnessed()
+                );
+                if witnessed {
+                    self.retire_for_gap(pid, record, gap, &mut b);
+                    self.exec_sealed.insert(pid);
+                    b.exec_witnesses.push(pid);
+                    b.gap(gap);
+                    b.gap(ObservationGap::IntervalUnknown);
+                    continue;
+                }
+                let additive = match (record, self.targets.get(&pid)) {
+                    (Some(record), Some(target))
+                        if record.starttime == target.starttime
+                            && recorded_refusal(&target.process).is_none() =>
+                    {
+                        target.process.additive_verdict()
+                    }
+                    _ => Err(ObservationGap::ProcessChanged),
+                };
+                if additive == Ok(objects::AdditiveVerdict::AddedRowsOnly) {
+                    let retained = self.targets[&pid].process.retained_incarnation();
+                    self.retire(pid, &mut b);
+                    self.refreshing.insert(pid, retained);
+                    additive_refreshed.push(pid);
+                    b.refreshed_processes.push(pid);
+                    b.additive_refreshes.push(pid);
+                    continue;
+                }
+            }
             self.retire_for_gap(pid, record, gap, &mut b);
             if let Some(retained) = preserved {
                 self.refreshing.insert(pid, retained);
@@ -1245,7 +1398,11 @@ impl ProviderSession {
             b.refreshed_processes.push(pid);
         }
         for record in records {
-            if refreshed.contains(&record.pid) || readd_deferred.contains(&record.pid) {
+            if refreshed.contains(&record.pid)
+                || readd_deferred.contains(&record.pid)
+                || additive_refreshed.contains(&record.pid)
+                || self.exec_sealed.contains(&record.pid)
+            {
                 continue;
             }
             if self.targets.get(&record.pid).is_some_and(|t| t.ready) {
@@ -1548,6 +1705,47 @@ impl ProviderSession {
                 } else {
                     None
                 };
+                // 6A exec/additive diversion (mirrors the reconcile
+                // loop): the drain wins the race for maps changes
+                // (25ms cadence vs tick cadence), so a drain-side
+                // terminal retire would steal execs and dlopens from
+                // the reconcile report — silently rehealing with a
+                // fresh baseline and no image seal or refresh
+                // detail. The live probes below fail closed on reuse
+                // (no record exists on this path), exactly like the
+                // revalidation-arm isolation in reconcile.
+                if gap == ObservationGap::ProcessChanged && preserved.is_none() {
+                    let witnessed = self.targets.get(&pid).is_some_and(|t| {
+                        recorded_refusal(&t.process).is_none() && t.process.exec_witnessed()
+                    });
+                    if witnessed {
+                        self.retire_for_gap(pid, None, gap, &mut b);
+                        self.exec_sealed.insert(pid);
+                        b.exec_witnesses.push(pid);
+                        b.gap(gap);
+                        b.gap(ObservationGap::IntervalUnknown);
+                        continue;
+                    }
+                    let additive = self
+                        .targets
+                        .get(&pid)
+                        .map(|t| {
+                            if recorded_refusal(&t.process).is_none() {
+                                t.process.additive_verdict()
+                            } else {
+                                Err(ObservationGap::ProcessChanged)
+                            }
+                        })
+                        .unwrap_or(Err(ObservationGap::ProcessChanged));
+                    if additive == Ok(objects::AdditiveVerdict::AddedRowsOnly) {
+                        let retained = self.targets[&pid].process.retained_incarnation();
+                        self.retire(pid, &mut b);
+                        self.refreshing.insert(pid, retained);
+                        b.refreshed_processes.push(pid);
+                        b.additive_refreshes.push(pid);
+                        continue;
+                    }
+                }
                 self.retire_for_gap(pid, None, gap, &mut b);
                 if let Some(retained) = preserved {
                     self.refreshing.insert(pid, retained);
@@ -1617,6 +1815,8 @@ impl ProviderSession {
                 Ok(values) => {
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
+                        self.loss_totals[index] =
+                            self.loss_totals[index].saturating_add(total - self.last_loss[index]);
                         self.aliases.clear();
                         invalidate_algorithms(&mut b);
                         b.gap(match index {
@@ -1650,6 +1850,14 @@ impl ProviderSession {
     }
     fn consume(&mut self, event: wire::Transport, b: &mut ObservationBatch) {
         let r = event.record();
+        // 6A fence: post-edge records never bind, never project —
+        // dropped whole and conserved as withheld loss.
+        if let Some(&edge) = self.fenced.get(&r.pid) {
+            if r.monotonic_ns >= edge {
+                self.fence_withheld = self.fence_withheld.saturating_add(1);
+                return;
+            }
+        }
         let binding = if self.final_drain {
             final_record_binding(
                 &self.targets,
@@ -11780,6 +11988,8 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
             document,
             child_exit: Some(0),
             workload_discarded: false,
+            fence_withheld: 0,
+            loss_totals: [0; 8],
             _reservation: None,
         }
     }

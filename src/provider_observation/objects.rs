@@ -858,6 +858,14 @@ struct BoundMapping {
     object: Rc<Object>,
     backing: Option<backing::BackingAssociation>,
 }
+/// 6A additive-refresh verdict (see
+/// [`VerifiedProcess::additive_verdict`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdditiveVerdict {
+    Unchanged,
+    AddedRowsOnly,
+}
+
 pub struct VerifiedProcess {
     process: Rc<Process>,
     mappings: Vec<BoundMapping>,
@@ -890,6 +898,29 @@ struct Process {
     namespaces: NamespaceIds,
 }
 impl Process {
+    /// 6A exec signal 1 (exe-stamp flip): true iff the pidfd is
+    /// live, starttime and namespaces still match, but the exe
+    /// stamp differs. Any unreadable identity input fails closed
+    /// to false (not an exec witness — the caller's revalidation
+    /// still reports the underlying gap).
+    pub(crate) fn exec_flipped(&self) -> bool {
+        if live(&self.pidfd).is_err() {
+            return false;
+        }
+        if starttime(&self.directory).ok() != Some(self.starttime) {
+            return false;
+        }
+        if namespaces(&self.directory).ok().as_ref() != Some(&self.namespaces) {
+            return false;
+        }
+        let current = match open_at(&self.directory, b"exe") {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let stamped = |f: &File| f.metadata().ok().map(|m| Stamp::of(&m));
+        stamped(&current).as_ref() != Some(&self.exe_stamp)
+            || stamped(&self.executable).as_ref() != Some(&self.exe_stamp)
+    }
     fn validate(&self) -> Result<(), ObservationGap> {
         live(&self.pidfd)?;
         if starttime(&self.directory)? != self.starttime {
@@ -1005,6 +1036,35 @@ impl VerifiedProcess {
         self.process.validate()?;
         self.revalidated_at.set(Some(std::time::Instant::now()));
         Ok(())
+    }
+    /// 6A additive-refresh verdict: `Unchanged` when the bindings still
+    /// hold, `AddedRowsOnly` when the triple still validates and every
+    /// previously-bound executable row is byte-identical with only
+    /// added rows differing. Any proof failure (or any changed/removed
+    /// row) returns the gap — the frozen `ProcessChanged` stands and
+    /// the caller retires. Backing re-proof is intentionally skipped
+    /// here: the fresh acquire that follows a refresh verdict
+    /// re-proves backing itself, and its failure also retires.
+    /// 6A exec signal 1 (exe-stamp flip): triple-identical but the
+    /// exe stamp moved. The caller retires the image epoch (§1.4);
+    /// this never fires on pid reuse (starttime differs) or
+    /// namespace change.
+    pub(crate) fn exec_witnessed(&self) -> bool {
+        self.process.exec_flipped()
+    }
+    pub(crate) fn additive_verdict(&self) -> Result<AdditiveVerdict, ObservationGap> {
+        self.process.validate()?;
+        for bound in &self.mappings {
+            bound.object.unchanged()?;
+        }
+        let fresh = read_at(&self.process.directory, b"maps", MAX_MAPS)?;
+        if same_executable_mappings(&self.maps, &fresh)? {
+            return Ok(AdditiveVerdict::Unchanged);
+        }
+        if added_rows_only(&self.maps, &fresh)? {
+            return Ok(AdditiveVerdict::AddedRowsOnly);
+        }
+        Err(ObservationGap::ProcessChanged)
     }
     /// Always-full revalidation for attach/acquire fences and
     /// change-detection tests: skips the [`VerifiedProcess::revalidate`]
@@ -1318,6 +1378,23 @@ impl ProcessIncarnation {
         self.0.validate()
     }
 }
+/// 6A: read the live (starttime, namespaces) triple for `pid`
+/// through the same pinned-directory readers the incarnation
+/// proofs use (event presence-binding). No comparison — callers
+/// compare against the recorded triple. Every failure is
+/// `ProcessUnavailable` (absence), never a compared change.
+pub(crate) fn read_triple(pid: u32) -> Result<(u64, NamespaceIds), ObservationGap> {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return Err(ObservationGap::ProcessUnavailable);
+    }
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(format!("/proc/{pid}"))
+        .map_err(|_| ObservationGap::ProcessUnavailable)?;
+    Ok((starttime(&directory)?, namespaces(&directory)?))
+}
+
 pub(crate) fn acquire_incarnation(
     record: &ProcessRecord,
 ) -> Result<ProcessIncarnation, ObservationGap> {
@@ -1771,23 +1848,24 @@ fn live(pidfd: &File) -> Result<(), ObservationGap> {
     }
     Ok(())
 }
+fn relevant_executable_rows(bytes: &[u8]) -> impl Iterator<Item = Result<&[u8], ObservationGap>> {
+    bytes
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| match parse_mapping(line) {
+            Ok(Some(_)) => Some(Ok(line)),
+            Ok(None) => None,
+            Err(gap) => Some(Err(gap)),
+        })
+}
+
 fn same_executable_mappings(before: &[u8], after: &[u8]) -> Result<bool, ObservationGap> {
     // Only executable file-backed rows can authorize retained trace sites.
     // Keep each complete validated row as a conservative change fence, including
     // permissions and association text; this never promotes a pathname to proof.
     // Anonymous/non-executable rows are parsed but cannot change this identity.
-    fn relevant(bytes: &[u8]) -> impl Iterator<Item = Result<&[u8], ObservationGap>> {
-        bytes
-            .split(|b| *b == b'\n')
-            .filter(|line| !line.is_empty())
-            .filter_map(|line| match parse_mapping(line) {
-                Ok(Some(_)) => Some(Ok(line)),
-                Ok(None) => None,
-                Err(gap) => Some(Err(gap)),
-            })
-    }
-    let mut before = relevant(before);
-    let mut after = relevant(after);
+    let mut before = relevant_executable_rows(before);
+    let mut after = relevant_executable_rows(after);
     loop {
         match (before.next().transpose()?, after.next().transpose()?) {
             (None, None) => return Ok(true),
@@ -1795,6 +1873,31 @@ fn same_executable_mappings(before: &[u8], after: &[u8]) -> Result<bool, Observa
             _ => return Ok(false),
         }
     }
+}
+
+/// 6A: true when every previously-bound executable row is byte-identical
+/// in the fresh text with only added rows differing (multiset subset +
+/// strictly longer — order-insensitive, since dlopen can insert rows
+/// anywhere in address order). A pure reorder or any changed/removed
+/// row returns false (the `ProcessChanged` stands).
+fn added_rows_only(before: &[u8], after: &[u8]) -> Result<bool, ObservationGap> {
+    use std::collections::BTreeMap;
+    let mut outstanding: BTreeMap<&[u8], usize> = BTreeMap::new();
+    let mut before_rows = 0usize;
+    for row in relevant_executable_rows(before) {
+        *outstanding.entry(row?).or_default() += 1;
+        before_rows += 1;
+    }
+    let mut after_rows = 0usize;
+    for row in relevant_executable_rows(after) {
+        let row = row?;
+        match outstanding.get_mut(row) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => {}
+        }
+        after_rows += 1;
+    }
+    Ok(after_rows > before_rows && outstanding.values().all(|count| *count == 0))
 }
 
 fn parse_mapping(line: &[u8]) -> Result<Option<Mapping>, ObservationGap> {

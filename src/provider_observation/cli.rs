@@ -421,6 +421,8 @@ impl<W: Write> Stream<'_, W> {
             static_candidates: _,
             api_activity: _,
             refreshed_processes: _,
+            exec_witnesses: _,
+            additive_refreshes: _,
         } = batch;
         if let Some(snapshot) = snapshot {
             self.capabilities.inventory = match snapshot.capabilities.inventory {

@@ -11,6 +11,7 @@ pub(crate) mod backing;
 pub(crate) mod resolve;
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Recognized dynamic code exports. Unknown symbol names are discarded.
 /// Declaration order also gives the stable, deduplicated export order.
@@ -92,6 +93,11 @@ pub enum Api {
 }
 
 impl Api {
+    /// Number of variants in this enum (update together). Bounds
+    /// coordinator-supplied export metadata: `exports` is collected
+    /// from a `BTreeSet<Api>`, so our own snapshots never exceed it.
+    pub const COUNT: usize = 70;
+
     pub(crate) fn operational_id(self) -> Option<crate::api_activity::ApiId> {
         let id = match self {
             Self::EvpDigestInitEx => 20,
@@ -412,6 +418,13 @@ pub struct Snapshot {
     /// are identical with the flag on or off (cell 2).
     #[serde(skip)]
     pub(crate) resolve: resolve::ResolveSidecar,
+    /// 6A cgroup stable-set sidecar: pid → directory identity
+    /// (`NamespaceId`) for pids stable across the sample's two
+    /// cgroup traversals (empty when unscoped). Skipped by serde
+    /// like `resolve`. The membership coordinator diffs
+    /// consecutive samples for inter-tick `cgroup_move` (§1.6).
+    #[serde(skip)]
+    pub(crate) cgroup_identity: BTreeMap<u32, NamespaceId>,
 }
 impl Snapshot {
     pub fn exit_code(&self) -> u8 {
@@ -570,7 +583,7 @@ pub struct NamespaceId {
     pub device: u64,
     pub inode: u64,
 }
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NamespaceIds {
     pub pid: Option<NamespaceId>,
@@ -608,4 +621,89 @@ fn wall_ms() -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Api;
+    use std::collections::BTreeSet;
+
+    /// `Api::COUNT` pins the variant count (update together): every
+    /// variant named once, collected exactly like `elf.rs` does.
+    #[test]
+    fn api_count_matches_variants() {
+        let all = BTreeSet::from([
+            Api::OsslProviderInit,
+            Api::OsslProviderLoad,
+            Api::OsslProviderTryLoad,
+            Api::OsslProviderUnload,
+            Api::OsslProviderLoadEx,
+            Api::OsslProviderTryLoadEx,
+            Api::OsslProviderAddBuiltin,
+            Api::OsslProviderGet0Dispatch,
+            Api::OsslProviderQueryOperation,
+            Api::OpenSslInitCrypto,
+            Api::OpenSslVersionMajor,
+            Api::EvpMdFetch,
+            Api::EvpCipherFetch,
+            Api::EvpMacFetch,
+            Api::EvpKdfFetch,
+            Api::EvpSignatureFetch,
+            Api::EvpKemFetch,
+            Api::EvpDigestInitEx,
+            Api::EvpDigestInitEx2,
+            Api::EvpDigestUpdate,
+            Api::EvpDigestFinalEx,
+            Api::EvpEncryptInitEx,
+            Api::EvpEncryptInitEx2,
+            Api::EvpEncryptUpdate,
+            Api::EvpEncryptFinalEx,
+            Api::EvpDecryptInitEx,
+            Api::EvpDecryptInitEx2,
+            Api::EvpDecryptUpdate,
+            Api::EvpDecryptFinalEx,
+            Api::EvpCipherInitEx,
+            Api::EvpCipherUpdate,
+            Api::EvpCipherFinalEx,
+            Api::EvpMacInit,
+            Api::EvpMacUpdate,
+            Api::EvpMacFinal,
+            Api::EvpKdfDerive,
+            Api::EvpPkeySign,
+            Api::EvpPkeyVerify,
+            Api::EvpPkeyEncrypt,
+            Api::EvpPkeyDecrypt,
+            Api::EvpPkeyDerive,
+            Api::EvpDigestSignFinal,
+            Api::EvpDigestVerifyFinal,
+            Api::EvpDigestSign,
+            Api::EvpDigestVerify,
+            Api::EvpRandGenerate,
+            Api::EvpPkeyEncapsulate,
+            Api::EvpPkeyDecapsulate,
+            Api::EvpPkeyKeygenInit,
+            Api::EvpPkeyKeygen,
+            Api::EvpPkeyParamgenInit,
+            Api::EvpPkeyParamgen,
+            Api::EvpPkeyDeriveInit,
+            Api::EvpPkeyCheck,
+            Api::EvpPkeyPublicCheck,
+            Api::EvpPkeyParamCheck,
+            Api::EvpPkeyCopyParameters,
+            Api::EvpDigestSignInit,
+            Api::EvpDigestSignUpdate,
+            Api::EvpDigestVerifyInit,
+            Api::EvpDigestVerifyUpdate,
+            Api::EvpQDigest,
+            Api::EvpQMac,
+            Api::EvpRandNonce,
+            Api::EvpRandCtxNew,
+            Api::EvpRandCtxFree,
+            Api::EvpMdCtxNew,
+            Api::EvpMdCtxFree,
+            Api::EvpCipherCtxNew,
+            Api::EvpCipherCtxFree,
+        ]);
+        assert_eq!(all.len(), Api::COUNT);
+    }
 }

@@ -1291,15 +1291,36 @@ impl TargetPort for PinnedTarget {
 pub enum LifecycleKind {
     Fork,
     Exec,
+    /// 6A: a task of a watched TGID exited. Absence-CONFIRMING evidence
+    /// only: revalidation runs first and the event merely confirms an
+    /// absence the revalidation already established (D-record §1.8).
+    Exit,
+    /// 6A: same-TGID clone (thread birth). Creates tid rows under a live
+    /// TGID member and never touches the TGID's physical identity.
+    ThreadBirth,
 }
 
 /// One ignored child/sibling lifecycle event.
+///
+/// The 6A (†) fields are additive: the connector payload/envelope already
+/// delivers every value and current session readers ignore the fields
+/// (D-record §1.8). `tgid`/`cpu`/`seq` are zero on polling paths (no
+/// producer); `parent_tgid` is the witnessing root on polling paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleEvent {
     pub kind: LifecycleKind,
     pub pid: u32,
     /// Producer timestamp only; polling has no event timestamp.
     pub timestamp_ns: Option<u64>,
+    /// 6A: event thread-group id (payload word, zero on polling paths).
+    pub tgid: u32,
+    /// 6A: parent thread-group id for Fork/ThreadBirth (payload word;
+    /// witnessing root on polling paths, zero for Exec/Exit).
+    pub parent_tgid: u32,
+    /// 6A: producer CPU (netlink envelope, zero on polling paths).
+    pub cpu: u32,
+    /// 6A: producer per-CPU sequence number (zero on polling paths).
+    pub seq: u32,
 }
 
 /// Original half-open observation interval; count cleanup cannot extend it.
@@ -1379,6 +1400,16 @@ pub struct LifecycleDelta {
     /// ports (`delta: None` means polling, not a truncated drain; a
     /// retained `Some(delta)` can still have `suffix_witness: false`).
     pub pending: u64,
+    /// 6A: Drops-delta contribution to `dropped` this drain
+    /// (diagnostic split; `dropped` stays authoritative).
+    pub connector_drops: u64,
+    /// 6A: ENOBUFS tripwire at-least-one fires this drain
+    /// (diagnostic split; `dropped` stays authoritative).
+    pub connector_enobufs: u64,
+    /// 6A: fork/exec events filtered by the roots ∪ known set this
+    /// drain (outside the watched set — not followed, counted).
+    /// Exit events are never counted here.
+    pub filtered: u64,
 }
 
 /// Short fork/exec and lifecycle-loss observer. Production selects
@@ -1465,11 +1496,17 @@ fn tgid_of(pid: u32) -> Option<u32> {
 /// Polling lifecycle fallback (explicit PARTIAL): ppid scans for
 /// forked children plus an exe-link watch for same-TGID exec of the
 /// target itself. Every NEW child counts once (a double-fork that
-/// reparents away stays counted); same-TGID clones never count.
+/// reparents away stays counted); same-TGID clones surface as
+/// ThreadBirth (6A) and never touch TGID identity.
 pub struct PollingLifecycle {
     target: u32,
     seen: HashSet<u32>,
     exe: Option<PathBuf>,
+    /// 6A: extra watched roots (the membership coordinator's
+    /// selection + members under polling fallback). The `seen` set
+    /// is shared; each extra root gets its own exe-link watch.
+    extra_targets: HashSet<u32>,
+    extra_exes: HashMap<u32, Option<PathBuf>>,
 }
 
 impl PollingLifecycle {
@@ -1479,6 +1516,26 @@ impl PollingLifecycle {
             target,
             seen: HashSet::new(),
             exe,
+            extra_targets: HashSet::new(),
+            extra_exes: HashMap::new(),
+        }
+    }
+
+    /// 6A: replace the extra watched roots (coordinator polling
+    /// fallback). The primary target is untouched.
+    pub fn set_targets(&mut self, targets: &HashSet<u32>) {
+        self.extra_targets = targets
+            .iter()
+            .copied()
+            .filter(|t| *t != self.target)
+            .collect();
+        self.extra_exes
+            .retain(|t, _| self.extra_targets.contains(t));
+        for t in &self.extra_targets {
+            if !self.extra_exes.contains_key(t) {
+                let exe = std::fs::read_link(format!("/proc/{t}/exe")).ok();
+                self.extra_exes.insert(*t, exe);
+            }
         }
     }
 }
@@ -1486,35 +1543,109 @@ impl PollingLifecycle {
 impl LifecyclePort for PollingLifecycle {
     fn poll(&mut self) -> LifecycleDelta {
         let mut delta = LifecycleDelta::default();
-        if std::fs::read_dir("/proc").is_err() {
+        let Ok(rd) = std::fs::read_dir("/proc") else {
             // The scan itself failed: activity may have been missed.
             delta.loss += 1;
             return delta;
+        };
+        // 6A single census: one /proc pass serves every watched
+        // root. Per-root children_of scans are O(roots × procs) and
+        // stall overload runs (1030 roots); the single view is also
+        // more consistent (no mid-poll skew between roots). Target
+        // order, per-target kid order and seen semantics match the
+        // per-root loop exactly.
+        let mut kids: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+        for e in rd.flatten() {
+            let s = e.file_name().to_string_lossy().into_owned();
+            if s.parse::<u32>().is_err() {
+                continue;
+            }
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{s}/stat")) else {
+                continue;
+            };
+            if let Some((pid, ppid)) = parse_stat_ppid(&stat) {
+                if ppid == self.target || self.extra_targets.contains(&ppid) {
+                    kids.entry(ppid).or_default().push(pid);
+                }
+            }
         }
-        for kid in children_of(self.target) {
+        for list in kids.values_mut() {
+            list.sort_unstable();
+        }
+        let targets: Vec<u32> = std::iter::once(self.target)
+            .chain(self.extra_targets.iter().copied())
+            .collect();
+        for target in targets {
+            let empty = Vec::new();
+            let target_kids = kids.get(&target).unwrap_or(&empty);
+            self.poll_one(target, target_kids, &mut delta);
+        }
+        delta
+    }
+
+    fn fallback_partial(&self) -> bool {
+        true
+    }
+}
+
+impl PollingLifecycle {
+    fn poll_one(&mut self, target: u32, kids: &[u32], delta: &mut LifecycleDelta) {
+        for &kid in kids {
             if !self.seen.insert(kid) {
                 continue;
             }
             // Same-TGID clone (thread creation) is not an ignored
             // process. Unreadable Tgid fails closed to Fork: a child
             // that vanished mid-scan is still ignored activity.
-            let is_thread = tgid_of(kid).is_some_and(|tg| tg == self.target);
-            if !is_thread {
-                delta.events.push(LifecycleEvent {
-                    kind: LifecycleKind::Fork,
-                    pid: kid,
-                    timestamp_ns: None,
-                });
+            //
+            // 6A: same-TGID clones surface as ThreadBirth (the tid
+            // never touches TGID identity); the Fork arm keeps the
+            // fail-closed behavior for unreadable Tgid.
+            let child_tgid = tgid_of(kid);
+            match child_tgid {
+                Some(tg) if tg == target => {
+                    delta.events.push(LifecycleEvent {
+                        kind: LifecycleKind::ThreadBirth,
+                        pid: kid,
+                        timestamp_ns: None,
+                        tgid: target,
+                        parent_tgid: target,
+                        cpu: 0,
+                        seq: 0,
+                    });
+                }
+                _ => {
+                    delta.events.push(LifecycleEvent {
+                        kind: LifecycleKind::Fork,
+                        pid: kid,
+                        timestamp_ns: None,
+                        tgid: child_tgid.unwrap_or(0),
+                        parent_tgid: target,
+                        cpu: 0,
+                        seq: 0,
+                    });
+                }
             }
         }
-        match std::fs::read_link(format!("/proc/{}/exe", self.target)) {
+        // Per-target exe-link watch (the primary target keeps the
+        // frozen `exe` slot; extras use `extra_exes`).
+        let slot: &mut Option<PathBuf> = if target == self.target {
+            &mut self.exe
+        } else {
+            self.extra_exes.entry(target).or_insert(None)
+        };
+        match std::fs::read_link(format!("/proc/{target}/exe")) {
             Ok(exe) => {
-                if self.exe.as_ref() != Some(&exe) {
-                    self.exe = Some(exe);
+                if slot.as_ref() != Some(&exe) {
+                    *slot = Some(exe);
                     delta.events.push(LifecycleEvent {
                         kind: LifecycleKind::Exec,
-                        pid: self.target,
+                        pid: target,
                         timestamp_ns: None,
+                        tgid: target,
+                        parent_tgid: 0,
+                        cpu: 0,
+                        seq: 0,
                     });
                 }
             }
@@ -1525,11 +1656,6 @@ impl LifecyclePort for PollingLifecycle {
                 delta.loss += 1;
             }
         }
-        delta
-    }
-
-    fn fallback_partial(&self) -> bool {
-        true
     }
 }
 
@@ -2293,9 +2419,12 @@ pub struct KernelLifecycle {
     close_deadline: Option<Instant>,
     fd: crate::capture_setup::SetupResource<OwnedFd>,
     sock_inode: u64,
-    target_pid: u32,
-    target_tgid: u32,
     known: HashSet<u32>,
+    /// 6A: watched thread-group roots. Single-target sessions leave the
+    /// default ({target_tgid}); the membership coordinator replaces the
+    /// set as the watched set evolves. The filter is roots ∪ known; the
+    /// `known` descendant set is still never pruned (fail-closed).
+    roots: HashSet<u32>,
     seqs: SeqState,
     drops_baseline: Option<u64>,
     mcast_ack: u32,
@@ -2498,9 +2627,8 @@ impl KernelLifecycle {
             close_deadline: None,
             fd,
             sock_inode,
-            target_pid: target,
-            target_tgid: tgid,
             known,
+            roots: HashSet::from([tgid]),
             seqs: SeqState::default(),
             drops_baseline,
             mcast_ack,
@@ -2705,6 +2833,21 @@ impl KernelLifecycle {
         self.last_watermark
     }
 
+    /// 6A: replace the watched thread-group roots (the membership
+    /// coordinator calls this as the watched set evolves). The
+    /// `known` descendant set is untouched (never pruned).
+    pub fn set_roots(&mut self, roots: &HashSet<u32>) {
+        self.roots = roots.clone();
+    }
+
+    /// 6A: record an admitted pid as known (never pruned,
+    /// fail-closed): delayed events for departed incarnations
+    /// still reach the coordinator for quarantine instead of
+    /// silent filtering.
+    pub fn add_known(&mut self, pid: u32) {
+        self.known.insert(pid);
+    }
+
     /// Close-time watermark plan (R20-fix round 4, F2a): the
     /// subscribe-time required lane set unioned with the current
     /// online set — never a fresh set from the current count
@@ -2789,55 +2932,100 @@ impl KernelLifecycle {
                         kind: crate::lifecycle_producer::WitnessKind::Fork,
                     });
                 }
-                if parent_tgid == self.target_tgid || self.known.contains(&parent_tgid) {
+                if self.roots.contains(&parent_tgid) || self.known.contains(&parent_tgid) {
                     if child_tgid == parent_tgid {
-                        // Same-tgid clone: thread creation, not an
-                        // ignored process (polling parity).
+                        // 6A: same-tgid clone surfaces as ThreadBirth
+                        // (previously discarded); the tid never touches
+                        // TGID identity (polling parity).
+                        delta.events.push(LifecycleEvent {
+                            kind: LifecycleKind::ThreadBirth,
+                            pid: child_pid,
+                            timestamp_ns: Some(timestamp_ns),
+                            tgid: child_tgid,
+                            parent_tgid,
+                            cpu,
+                            seq,
+                        });
                     } else {
                         self.known.insert(child_tgid);
                         delta.events.push(LifecycleEvent {
                             kind: LifecycleKind::Fork,
                             pid: child_pid,
                             timestamp_ns: Some(timestamp_ns),
+                            tgid: child_tgid,
+                            parent_tgid,
+                            cpu,
+                            seq,
                         });
                     }
+                } else {
+                    delta.filtered = delta.filtered.saturating_add(1);
                 }
             }
             PROC_EVENT_EXEC => {
-                let Some(process_tgid) = le_u32_at(ev, PROC_EVENT_HDRLEN + 4) else {
+                // 6A: the payload process_pid word (+0) is retained as
+                // the POST-exec group cross-check — it EQUALS tgid and
+                // MUST NOT be read as the originating TID (D-record §1.8).
+                let (Some(process_pid), Some(process_tgid)) = (
+                    le_u32_at(ev, PROC_EVENT_HDRLEN),
+                    le_u32_at(ev, PROC_EVENT_HDRLEN + 4),
+                ) else {
                     delta.loss += 1;
                     return;
                 };
-                if process_tgid == self.target_tgid {
+                if self.roots.contains(&process_tgid) || self.known.contains(&process_tgid) {
                     delta.events.push(LifecycleEvent {
                         kind: LifecycleKind::Exec,
-                        pid: self.target_pid,
+                        pid: process_pid,
                         timestamp_ns: Some(timestamp_ns),
+                        tgid: process_tgid,
+                        parent_tgid: 0,
+                        cpu,
+                        seq,
                     });
+                } else {
+                    delta.filtered = delta.filtered.saturating_add(1);
                 }
             }
             PROC_EVENT_EXIT => {
-                // Length-validated, then ignored: the payload must
-                // still parse (else scan loss), but no exit proves
-                // its group dead — verified live, thread exits emit
-                // EXIT with the surviving group as tgid, so pruning
-                // on EXIT would untrack live children and silently
-                // miss their later forks. The set is never pruned
-                // (polling `seen` parity — stale entries from tgid
-                // reuse can only spuriously count, never silently
-                // miss: fail-closed). Target death is custody's
-                // verdict regardless.
-                if le_u32_at(ev, PROC_EVENT_HDRLEN + 4).is_none() {
+                // Length-validated; the set is never pruned: no exit
+                // proves its group dead — verified live, thread exits
+                // emit EXIT with the surviving group as tgid, so
+                // pruning on EXIT would untrack live children and
+                // silently miss their later forks (polling `seen`
+                // parity — stale entries from tgid reuse can only
+                // spuriously count, never silently miss: fail-closed).
+                // Target death is custody's verdict regardless.
+                //
+                // 6A: the exit is REPORTED (previously ignored) for
+                // watched groups; the reader applies the
+                // absence-confirming rule (revalidate first, the event
+                // merely confirms). Nothing here prunes.
+                let (Some(exit_pid), Some(exit_tgid)) = (
+                    le_u32_at(ev, PROC_EVENT_HDRLEN),
+                    le_u32_at(ev, PROC_EVENT_HDRLEN + 4),
+                ) else {
                     delta.loss += 1;
                     return;
-                }
-                if let (Some(pid), Some(w)) = (le_u32_at(ev, PROC_EVENT_HDRLEN), sync) {
+                };
+                if let Some(w) = sync {
                     w.candidate(Candidate {
-                        pid,
+                        pid: exit_pid,
                         parent: 0,
                         cpu,
                         timestamp: timestamp_ns,
                         kind: crate::lifecycle_producer::WitnessKind::Exit,
+                    });
+                }
+                if self.roots.contains(&exit_tgid) || self.known.contains(&exit_tgid) {
+                    delta.events.push(LifecycleEvent {
+                        kind: LifecycleKind::Exit,
+                        pid: exit_pid,
+                        timestamp_ns: Some(timestamp_ns),
+                        tgid: exit_tgid,
+                        parent_tgid: 0,
+                        cpu,
+                        seq,
                     });
                 }
             }
@@ -2992,14 +3180,18 @@ impl KernelLifecycle {
             drops_delta(self.drops_baseline, socket_drops(self.sock_inode));
         self.drops_baseline = baseline;
         delta.dropped = delta.dropped.saturating_add(fresh);
+        // 6A: diagnostic split of `dropped` (which stays authoritative).
+        delta.connector_drops = delta.connector_drops.saturating_add(fresh);
         if blind {
             // Accounting blind: cannot prove no-loss.
             delta.loss += 1;
         }
-        if (enobufs || std::mem::replace(&mut self.wait_enobufs, false)) && fresh == 0 {
+        let enobufs_fired = enobufs || std::mem::replace(&mut self.wait_enobufs, false);
+        if enobufs_fired && fresh == 0 {
             // Overrun proven, counter unmoved (same-poll read race
             // or a wait-period overrun): at-least-one.
             delta.dropped = delta.dropped.saturating_add(1);
+            delta.connector_enobufs = delta.connector_enobufs.saturating_add(1);
         }
         if (records >= max_records || budget_exhausted) && socket_has_pending(&self.fd) {
             delta.pending = 1;
@@ -3403,6 +3595,27 @@ impl LifecyclePort for LiveLifecycle {
         match self {
             LiveLifecycle::Kernel(k) => k.mark_released(),
             LiveLifecycle::Polling(p) => p.mark_released(),
+        }
+    }
+}
+
+impl LiveLifecycle {
+    /// 6A: replace the watched thread-group roots (membership
+    /// coordinator). Kernel ports filter by roots ∪ known;
+    /// polling ports watch the primary target plus these extras.
+    pub fn set_roots(&mut self, roots: &HashSet<u32>) {
+        match self {
+            LiveLifecycle::Kernel(k) => k.set_roots(roots),
+            LiveLifecycle::Polling(p) => p.set_targets(roots),
+        }
+    }
+
+    /// 6A: record an admitted pid as known (never pruned).
+    /// Polling ports discover via census (nothing is filtered),
+    /// so this is a no-op there.
+    pub fn add_known(&mut self, pid: u32) {
+        if let LiveLifecycle::Kernel(k) = self {
+            k.add_known(pid);
         }
     }
 }
@@ -6546,12 +6759,15 @@ where
                 })
                 .count() as u64,
         );
+        // 6A: the session fold keeps its frozen Fork/Exec read-set;
+        // Exit/ThreadBirth events are coordinator-read and ignored here.
         let uncertain = delta
             .events
             .iter()
             .filter(|e| {
-                classify_event(e, edge, self.state.lifecycle.timing_trust())
-                    == LifecyclePlacement::Uncertain
+                matches!(e.kind, LifecycleKind::Fork | LifecycleKind::Exec)
+                    && classify_event(e, edge, self.state.lifecycle.timing_trust())
+                        == LifecyclePlacement::Uncertain
             })
             .count() as u64;
         self.state.lifecycle_loss = self
@@ -12269,9 +12485,8 @@ pub(crate) mod tests {
             close_deadline: None,
             fd: crate::capture_setup::SetupResource::local(fd),
             sock_inode: 0,
-            target_pid: 100,
-            target_tgid: 100,
             known,
+            roots: HashSet::from([100]),
             seqs,
             drops_baseline: None,
             mcast_ack: TEST_OUR_ACK.wrapping_sub(1),
@@ -12660,6 +12875,10 @@ pub(crate) mod tests {
                 kind: LifecycleKind::Fork,
                 pid: 200,
                 timestamp_ns,
+                tgid: 0,
+                parent_tgid: 0,
+                cpu: 0,
+                seq: 0,
             };
             assert_eq!(
                 classify_event(&event, edge, LifecycleTimingTrust::ReviewedMonotonic),
@@ -12792,15 +13011,24 @@ pub(crate) mod tests {
                 kind: LifecycleKind::Fork,
                 pid: 200,
                 timestamp_ns: Some(0),
+                tgid: 200,
+                parent_tgid: 100,
+                cpu: 0,
+                seq: 0,
             }]
         );
         assert!(known.contains(&200));
-        // Same-tgid clone: thread creation, non-event.
+        // Same-tgid clone: thread creation, a ThreadBirth event (6A;
+        // previously discarded). The tid never touches TGID identity.
         let d = fresh_ingest(
             &mut known,
             &cn_datagram(&proc_event(PROC_EVENT_FORK, &[100, 100, 101, 100])),
         );
-        assert!(d.events.is_empty() && d.loss == 0);
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].kind, LifecycleKind::ThreadBirth);
+        assert_eq!(d.events[0].pid, 101);
+        assert_eq!(d.events[0].tgid, 100);
+        assert_eq!(d.loss, 0);
         // Grandchild by parentage (parent = known child).
         let d = fresh_ingest(
             &mut known,
@@ -12825,29 +13053,48 @@ pub(crate) mod tests {
                 kind: LifecycleKind::Exec,
                 pid: 100,
                 timestamp_ns: Some(0),
+                tgid: 100,
+                parent_tgid: 0,
+                cpu: 0,
+                seq: 0,
             }]
         );
-        // Known-child exec: already ignored, non-event.
+        // Known-child exec: reported (6A; the roots ∪ known filter
+        // follows descendants — member execs need witnesses).
         let d = fresh_ingest(
             &mut known,
             &cn_datagram(&proc_event(PROC_EVENT_EXEC, &[200, 200])),
         );
-        assert!(d.events.is_empty() && d.loss == 0);
-        // Target exit: custody's verdict, non-event.
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].kind, LifecycleKind::Exec);
+        assert_eq!(d.events[0].pid, 200);
+        assert_eq!(d.events[0].tgid, 200);
+        assert_eq!(d.loss, 0);
+        // Target exit: reported (6A; absence-confirming evidence —
+        // the reader revalidates first). Custody still owns the
+        // death verdict; the set is never pruned.
         let d = fresh_ingest(
             &mut known,
             &cn_datagram(&proc_event(PROC_EVENT_EXIT, &[100, 100, 0, 0, 1, 1])),
         );
-        assert!(d.events.is_empty() && d.loss == 0);
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].kind, LifecycleKind::Exit);
+        assert_eq!(d.events[0].pid, 100);
+        assert_eq!(d.events[0].tgid, 100);
+        assert_eq!(d.loss, 0);
         assert!(known.contains(&100));
         // Exits never prune: a thread exit (pid != tgid) must not
         // untrack the live group — the next grandchild fork still
-        // witnesses.
+        // witnesses. The exit itself is reported (6A).
         let d = fresh_ingest(
             &mut known,
             &cn_datagram(&proc_event(PROC_EVENT_EXIT, &[201, 200, 0, 0, 100, 100])),
         );
-        assert!(d.events.is_empty() && d.loss == 0);
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].kind, LifecycleKind::Exit);
+        assert_eq!(d.events[0].pid, 201);
+        assert_eq!(d.events[0].tgid, 200);
+        assert_eq!(d.loss, 0);
         assert!(known.contains(&200));
         let d = fresh_ingest(
             &mut known,
@@ -12856,12 +13103,14 @@ pub(crate) mod tests {
         assert_eq!(d.events.len(), 1);
         assert_eq!(d.events[0].pid, 400);
         // Whole-process exit: still no prune (an EXIT never proves
-        // its group dead — polling `seen` parity).
+        // its group dead — polling `seen` parity). Reported (6A).
         let d = fresh_ingest(
             &mut known,
             &cn_datagram(&proc_event(PROC_EVENT_EXIT, &[200, 200, 0, 0, 100, 100])),
         );
-        assert!(d.events.is_empty() && d.loss == 0);
+        assert_eq!(d.events.len(), 1);
+        assert_eq!(d.events[0].kind, LifecycleKind::Exit);
+        assert_eq!(d.loss, 0);
         assert!(known.contains(&200));
         // Unknown `what` (incl. the zero registration artifact):
         // creates no process, replaces no image — ignored.
@@ -16300,6 +16549,9 @@ pub(crate) mod tests {
                     dropped: 0,
                     prefix_unwitnessed: 0,
                     pending: 0,
+                    connector_drops: 0,
+                    connector_enobufs: 0,
+                    filtered: 0,
                 }
             }
             fn fallback_partial(&self) -> bool {

@@ -1099,6 +1099,7 @@ pub(super) fn snapshot_reused(
             execution: ObservationState::NotObserved,
         },
         resolve: std::mem::take(&mut work.sidecar),
+        cgroup_identity: BTreeMap::new(),
     }
 }
 

@@ -648,6 +648,7 @@ mod tests {
                 execution: ObservationState::NotObserved,
             },
             resolve: super::super::resolve::ResolveSidecar::default(),
+            cgroup_identity: std::collections::BTreeMap::new(),
         }
     }
 

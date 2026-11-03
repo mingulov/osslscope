@@ -3114,17 +3114,28 @@ fn lifecycle_exec_is_fence_tracked_not_ignored() {
                 kind: LifecycleKind::Fork,
                 pid: 99991,
                 timestamp_ns: Some(BASE_NS + 1),
+                tgid: 0,
+                parent_tgid: 0,
+                cpu: 0,
+                seq: 0,
             },
             LifecycleEvent {
                 kind: LifecycleKind::Exec,
                 pid: PID,
                 timestamp_ns: Some(BASE_NS + 1),
+                tgid: 0,
+                parent_tgid: 0,
+                cpu: 0,
+                seq: 0,
             },
         ],
         loss: 0,
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -3150,6 +3161,9 @@ fn final_sweep_skipped_after_owned_exit() {
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -3184,6 +3198,9 @@ fn final_sweep_runs_while_target_lives() {
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -7005,6 +7022,9 @@ fn lifecycle_scan_loss_withholds_complete() {
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     h.exit_at_ns = Some(BASE_NS + 1_000_000_000);
     h.exit_code = 0;
@@ -7034,6 +7054,9 @@ fn lifecycle_signal_dropped_withholds_complete() {
         dropped: 3,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     // Exit lands in the second sleep: exactly one round runs, so the
     // round sweep consumes the overflow poll.
@@ -7062,11 +7085,18 @@ fn lifecycle_close_drain_folds_after_owned_exit() {
             kind: LifecycleKind::Fork,
             pid: 99991,
             timestamp_ns: Some(BASE_NS + 1),
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         }],
         loss: 0,
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -7089,6 +7119,9 @@ fn lifecycle_close_drain_loss_is_loud() {
         dropped: 2,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -7226,6 +7259,9 @@ fn lifecycle_truncated_close_drain_withholds_complete() {
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 1,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -7394,11 +7430,18 @@ fn lifecycle_exec_witness_fences_without_snapshot_change() {
                 kind: LifecycleKind::Exec,
                 pid: PID,
                 timestamp_ns: Some(BASE_NS + 1),
+                tgid: 0,
+                parent_tgid: 0,
+                cpu: 0,
+                seq: 0,
             }],
             loss: 0,
             dropped: 0,
             prefix_unwitnessed: 0,
             pending: 0,
+            connector_drops: 0,
+            connector_enobufs: 0,
+            filtered: 0,
         },
     ]);
     let (out, post) = h.run();
@@ -7462,11 +7505,18 @@ fn lifecycle_close_drain_exec_withholds_complete() {
             kind: LifecycleKind::Exec,
             pid: PID,
             timestamp_ns: Some(BASE_NS + 1),
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         }],
         loss: 0,
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, _) = h.run();
     let c = out.unwrap();
@@ -8738,11 +8788,18 @@ fn exec_witness_consumed_before_deadline_return_survives_to_close() {
             kind: LifecycleKind::Exec,
             pid: PID,
             timestamp_ns: Some(BASE_NS + 1),
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         }],
         loss: 0,
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     }]);
     // Slow scan: cross the 2s deadline inside round 1's sweep
     // (production scans take real time).
@@ -8800,11 +8857,18 @@ fn exec_witness_consumed_before_signal_cut_survives_to_close() {
             kind: LifecycleKind::Exec,
             pid: PID,
             timestamp_ns: Some(BASE_NS + 1),
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         }],
         loss: 0,
         dropped: 0,
         prefix_unwitnessed: 0,
         pending: 0,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     }]);
     // Async-signal model: alive through setup(1) + loop-top(2),
     // cut from the round's mid-sweep check(3) on.
@@ -9714,6 +9778,10 @@ fn g1_terminal_lifecycle_uses_original_half_open_edge() {
             kind: LifecycleKind::Fork,
             pid: 6000 + i as u32,
             timestamp_ns,
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         })
         .collect(),
         ..LifecycleDelta::default()
@@ -9790,6 +9858,10 @@ fn assert_fwr_i2_early_close_edge(finish_err: bool) {
                         6000
                     },
                     timestamp_ns: Some(BASE_NS + ns),
+                    tgid: 0,
+                    parent_tgid: 0,
+                    cpu: 0,
+                    seq: 0,
                 })
             })
             .collect(),
@@ -9850,11 +9922,18 @@ fn g1_terminal_refused_suffix_keeps_lifecycle_prefix() {
             kind: LifecycleKind::Fork,
             pid: 6000,
             timestamp_ns: Some(BASE_NS + 1),
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         }],
         loss: 2,
         dropped: 3,
         prefix_unwitnessed: 4,
         pending: 1,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (result, post) = h.run();
     let c = result.unwrap();
@@ -9893,6 +9972,10 @@ fn g1_terminal_execs_never_reopen_count_generation() {
             kind: LifecycleKind::Exec,
             pid: PID,
             timestamp_ns,
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         })
         .collect(),
         ..LifecycleDelta::default()
@@ -10368,12 +10451,19 @@ fn g1_suffix_keeps_original_lifecycle_edge() {
             kind: LifecycleKind::Fork,
             pid: 6000 + i as u32,
             timestamp_ns,
+            tgid: 0,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
         })
         .collect(),
         loss: 2,
         dropped: 3,
         prefix_unwitnessed: 4,
         pending: 1,
+        connector_drops: 0,
+        connector_enobufs: 0,
+        filtered: 0,
     });
     let (out, post) = h.run();
     let capture = out.unwrap();

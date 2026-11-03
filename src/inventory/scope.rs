@@ -162,6 +162,13 @@ impl ScopedScanner {
     pub(crate) fn set_memory_pool(&mut self, memory: crate::observation_memory::MemoryPool) {
         self.scan_state.memory = Some(memory);
     }
+    /// 6A membership following: replace the scanned PID selection
+    /// (user selection ∪ followed incarnations, coordinator-owned,
+    /// sorted). Takes effect on the next snapshot; the scan cache
+    /// and cursor survive selection churn.
+    pub(crate) fn set_pids(&mut self, pids: Vec<u32>) {
+        self.pids = pids;
+    }
     pub(crate) fn snapshot_for(&mut self, timeout: std::time::Duration) -> Snapshot {
         let original = self.limits.timeout;
         self.limits.timeout = original.min(timeout);
@@ -266,6 +273,17 @@ impl ScopedScanner {
                     };
                     result.processes.retain(|p| stable.contains(&p.pid));
                     result.selected_pids.retain(|pid| stable.contains(pid));
+                    // 6A stable-set sidecar: surviving pids map to
+                    // their single directory identity (stable pids
+                    // sit in exactly one identical directory in
+                    // both passes by `stable_members` construction).
+                    for (id, pids) in after.records.iter() {
+                        for pid in pids {
+                            if stable.contains(pid) {
+                                result.cgroup_identity.insert(*pid, *id);
+                            }
+                        }
+                    }
                     if before != &after.records {
                         add_gap(&mut result, GapReason::Changed);
                     }
