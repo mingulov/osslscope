@@ -1412,6 +1412,7 @@ fn check_spawn_access() -> Check {
         );
     }
     let dump_txt = self_dumpable().map_or("unknown".to_string(), |d| d.to_string());
+    let ppid = std::process::id();
     // SAFETY: single-threaded; child only prctls/stops/_exits.
     let pid = unsafe { libc::fork() };
     if pid < 0 {
@@ -1428,6 +1429,12 @@ fn check_spawn_access() -> Check {
             // instead of lingering stopped under init. Checked: a
             // stopper without a backstop must never stop.
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                libc::_exit(0);
+            }
+            // Parent-died-in-the-window guard (same as the pauser):
+            // arming after a reparent would leave a stopper that
+            // outlives the probe.
+            if libc::getppid() != ppid as libc::pid_t {
                 libc::_exit(0);
             }
             libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0);
@@ -1465,35 +1472,42 @@ fn check_spawn_access() -> Check {
     } else {
         Err(std::io::Error::other("probe child never stopped"))
     };
-    // SAFETY: the pre-fork waitability refuse pins our unreaped
-    // child (stopped, zombie, or exited) to its number, so this can
-    // only hit it.
-    let k = unsafe { libc::kill(pid, libc::SIGKILL) };
-    let kill_errno = std::io::Error::last_os_error().raw_os_error();
-    if k != 0 && !reaped && kill_errno != Some(libc::ESRCH) {
-        // Kill failed on a live, unreaped child (confinement
-        // refusing the signal): the bounded wait below still tries,
-        // but say so loudly.
-        crate::report::err_line(&format!(
-            "osslscope doctor: probe kill failed: {kill_errno:?}"
-        ));
-    }
-    // Bounded confirmation: after a FAILED signal the child may
-    // still be stopped-alive, so a blocking wait could hang forever
-    // — poll instead. Timeout keeps reaped=false and the Fail below
-    // fires (the child's pdeathsig backstop, armed before it could
-    // stop, kills it with us — never a silent lingering leak).
-    let mut status2 = 0;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if reap_poll_once(pid, &mut status2) {
-            reaped = true;
-            break;
+    // Teardown runs only while the child is unreaped: our own
+    // first-wait reap already released the number pin, so signaling
+    // or waiting after that could hit a recycled number (the reap
+    // itself is the confirmation — nothing left to do).
+    if !reaped {
+        // SAFETY: the pre-fork waitability refuse pins our unreaped
+        // child (stopped or zombie) to its number, so this can only
+        // hit it.
+        let k = unsafe { libc::kill(pid, libc::SIGKILL) };
+        let kill_errno = std::io::Error::last_os_error().raw_os_error();
+        if k != 0 && kill_errno != Some(libc::ESRCH) {
+            // Kill failed on a live, unreaped child (confinement
+            // refusing the signal): the bounded wait below still
+            // tries, but say so loudly.
+            crate::report::err_line(&format!(
+                "osslscope doctor: probe kill failed: {kill_errno:?}"
+            ));
         }
-        if std::time::Instant::now() >= deadline {
-            break;
+        // Bounded confirmation: after a FAILED signal the child may
+        // still be stopped-alive, so a blocking wait could hang
+        // forever — poll instead. Timeout keeps reaped=false and
+        // the Fail below fires (the child's pdeathsig backstop,
+        // armed before it could stop, kills it with us — never a
+        // silent lingering leak).
+        let mut status2 = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if reap_poll_once(pid, &mut status2) {
+                reaped = true;
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     if !reaped {
         return Check::fail(
@@ -4070,6 +4084,9 @@ mod tests {
 
     #[test]
     fn reap_poll_ignores_stale_echild_for_live_child() {
+        if skip_unless_waitable() {
+            return;
+        }
         // A successful waitpid never clears errno: with ECHILD left
         // over from an earlier call, polling a LIVE child (r == 0)
         // must still read false — never mistake the stale errno for
@@ -4095,7 +4112,8 @@ mod tests {
         let mut st = 0;
         loop {
             // SAFETY: dead names our exited child; blocking wait
-            // reaps it (EINTR-retried).
+            // reaps it (EINTR-retried). ECHILD is impossible here:
+            // the waitability skip above pins sole-reaper semantics.
             let r = unsafe { libc::waitpid(dead, &mut st, 0) };
             if r == dead {
                 break;
@@ -4221,7 +4239,9 @@ mod tests {
     /// Test-only reap guard: installed immediately after forking,
     /// so a panicking assert can never leak the child. Drop signals
     /// (best effort) and reaps boundedly; never panics. Disarm after
-    /// the test takes over teardown explicitly.
+    /// the test takes over teardown explicitly. Callers skip under
+    /// non-waitable dispositions, so sole-reaper pinning makes the
+    /// numeric Drop signal provably ours.
     struct ReapGuard {
         pid: libc::pid_t,
         armed: bool,
@@ -4297,6 +4317,20 @@ mod tests {
         classify_pauser_stat(std::fs::read_to_string(format!("/proc/{pid}/stat")))
     }
 
+    /// Parent-side precondition for the fork-path tests: under a
+    /// non-waitable runner disposition the probes under test refuse
+    /// before forking (that refuse is pinned by
+    /// owned_child_probe_refuses_under_autoreap_supervisor), so
+    /// tests pinning the fork path itself skip. True when the caller
+    /// must skip.
+    fn skip_unless_waitable() -> bool {
+        if sigchld_waitable() {
+            return false;
+        }
+        eprintln!("SKIP: fork-path test requires a waitable SIGCHLD disposition");
+        true
+    }
+
     /// Backstop proof shared by the denial tests: poll until the
     /// stranded child (handed over before its worker exited) is
     /// Dead. A dead state or a vanished entry proves death; Unknown
@@ -4344,6 +4378,9 @@ mod tests {
 
     #[test]
     fn owned_child_map_files_probe_passes_and_reaps_live() {
+        if skip_unless_waitable() {
+            return;
+        }
         // Real fork (no substitution scope): the probe child must be
         // gone afterwards — no stray, no zombie. Compared as a
         // before/after child set (not global ECHILD: other tests may
@@ -4536,17 +4573,19 @@ mod tests {
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "native worker must exit 0, status={status:#x}"
             ),
-            outcome => {
+            // Auto-reaped by the kernel (non-waitable runner
+            // disposition): the verdict bytes were already read in
+            // full above — a crashed worker yields EOF there, still
+            // loud — so only the exit status is unobservable. Under
+            // a waitable disposition Gone means a stolen reap and
+            // stays loud.
+            TestChildWait::Gone if !sigchld_waitable() => {}
+            TestChildWait::Gone => {
+                panic!("native worker reaped elsewhere under a waitable disposition");
+            }
+            TestChildWait::Timeout => {
                 kill_test_child(pid, Duration::from_secs(5));
-                panic!(
-                    "native worker did not exit, outcome={}",
-                    match outcome {
-                        TestChildWait::Gone => "gone",
-                        TestChildWait::Timeout => "timeout",
-                        TestChildWait::Reaped(_) =>
-                            unreachable!("Reaped is handled by the arm above"),
-                    }
-                );
+                panic!("native worker did not exit, outcome=timeout");
             }
         }
         verdict
@@ -4554,6 +4593,9 @@ mod tests {
 
     #[test]
     fn owned_child_probe_reports_gone_when_prctl_denied() {
+        if skip_unless_waitable() {
+            return;
+        }
         // Confinement rejecting pdeathsig setup: the pauser exits
         // instantly and the establishment check reports Gone — the
         // zombie is never probed as if alive, nothing leaks.
@@ -4573,6 +4615,9 @@ mod tests {
 
     #[test]
     fn owned_child_probe_fails_fast_when_kill_denied() {
+        if skip_unless_waitable() {
+            return;
+        }
         // Confinement rejecting the teardown signal: the probe fails
         // promptly (no unbounded wait on the unsignaled child), and
         // the stranded pauser — armed, since pdeathsig setup
@@ -4602,6 +4647,9 @@ mod tests {
 
     #[test]
     fn pauser_state_reads_zombie_as_dead() {
+        if skip_unless_waitable() {
+            return;
+        }
         // The R2 counterexample reduced: a SIGKILLed child awaiting
         // its adopter's reap is a zombie — kill(pid, 0) still sees
         // it (no ESRCH), but it IS dead and the oracle must say so.
@@ -4700,6 +4748,9 @@ mod tests {
 
     #[test]
     fn pauser_state_reads_live_pauser_alive() {
+        if skip_unless_waitable() {
+            return;
+        }
         // Live-child control: a pausing child is Alive (never Dead,
         // never Unknown) — the oracle's positive direction.
         // SAFETY: single-threaded test lease; the guard below owns
@@ -4724,6 +4775,9 @@ mod tests {
 
     #[test]
     fn spawn_access_probe_fails_bounded_when_kill_denied() {
+        if skip_unless_waitable() {
+            return;
+        }
         // Confinement rejecting the teardown signal: the probe fails
         // BOUNDED (the old blocking wait hung here — the reviewer
         // reproduced the hang) and strands exactly its stopped
@@ -4753,6 +4807,9 @@ mod tests {
 
     #[test]
     fn spawn_access_probe_reports_denied_setup_when_prctl_denied() {
+        if skip_unless_waitable() {
+            return;
+        }
         // Confinement rejecting backstop setup: the child exits
         // itself instead of stopping and the probe reports Degraded
         // (the maps fixture never established — not a maps verdict),
@@ -4994,6 +5051,9 @@ mod tests {
 
     #[test]
     fn spawn_access_probe_passes_and_reaps() {
+        if skip_unless_waitable() {
+            return;
+        }
         // The probe replicates the run -- setup maps read (fork a
         // stopped child that opts itself dumpable pre-exec, then
         // read its maps): it must pass on a healthy host, and the
