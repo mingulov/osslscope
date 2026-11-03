@@ -2089,7 +2089,7 @@ mod tests {
     impl Drop for MountGuard {
         fn drop(&mut self) {
             if let Err(error) = self.cleanup() {
-                eprintln!("{error}");
+                drop_log(error.clone());
                 // A normal test must fail on refusal. During unwind retain the
                 // original panic and report refusal without double-panicking.
                 if !std::thread::panicking() {
@@ -2216,28 +2216,44 @@ mod tests {
             self.watched.push(point);
         }
     }
+    /// Destructor-context log: `eprintln!` panics when stderr is dead
+    /// (/dev/full, closed fd), which aborts during unwind. Destructors
+    /// must report loudly when they can and silently survive when they
+    /// cannot — never panic.
+    fn drop_log(message: String) {
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "{message}");
+    }
     impl Drop for BtrfsFixture {
         fn drop(&mut self) {
+            // Canonicalize for the mount-table comparison: mountinfo
+            // carries kernel-resolved absolute paths while watched points
+            // may descend from a symlinked TMPDIR. When canonicalization
+            // fails the path is gone (successful cleanup removed it, and
+            // the guard never removes its base while a mount stands), so
+            // the lexical form is a safe fallback, never a retain trigger.
+            let resolved: Vec<std::path::PathBuf> = self
+                .watched
+                .iter()
+                .map(|w| std::fs::canonicalize(w).unwrap_or_else(|_| w.clone()))
+                .collect();
             let stuck = match fixture_mounts() {
-                Ok(mounts) => self
-                    .watched
-                    .iter()
-                    .any(|w| mounts.iter().any(|(p, _)| p == w)),
+                Ok(mounts) => resolved.iter().any(|w| mounts.iter().any(|(p, _)| p == w)),
                 Err(error) => {
-                    eprintln!(
+                    drop_log(format!(
                         "BtrfsFixture: cannot verify mount release ({error}); retaining {} subvolumes under {}",
                         self.subvols.len(),
                         self.base.display()
-                    );
+                    ));
                     return;
                 }
             };
             if stuck {
-                eprintln!(
+                drop_log(format!(
                     "BtrfsFixture: watched mount still present; retaining {} subvolumes under {}",
                     self.subvols.len(),
                     self.base.display()
-                );
+                ));
                 return;
             }
             for subvol in self.subvols.iter().rev() {
@@ -2250,14 +2266,14 @@ mod tests {
                     .status()
                 {
                     Ok(status) if status.success() => {}
-                    other => eprintln!(
+                    other => drop_log(format!(
                         "BtrfsFixture: subvolume delete failed for {}: {other:?}",
                         subvol.display()
-                    ),
+                    )),
                 }
             }
             if let Err(error) = std::fs::remove_dir_all(&self.base) {
-                eprintln!("BtrfsFixture: base removal failed: {error}");
+                drop_log(format!("BtrfsFixture: base removal failed: {error}"));
             }
         }
     }
@@ -2308,6 +2324,12 @@ mod tests {
         );
         let mbase = scratch("overlay-btrfs");
         std::fs::create_dir(mbase.join("merged")).unwrap();
+        // Register before acquisition: mount() can establish the mount
+        // and still return Err during table/identity inspection, and the
+        // resulting unwind must find the watch already in place. A failed
+        // acquisition leaves no mount behind, so an unmatched watch is
+        // harmless — the drop check simply finds nothing mounted.
+        fx.watch(mbase.join("merged"));
         let mut guard = MountGuard::new(mbase.clone());
         guard
             .mount(
@@ -2326,7 +2348,6 @@ mod tests {
                 ],
             )
             .unwrap();
-        fx.watch(mbase.join("merged"));
         let merged = mbase.join("merged/lib.so");
         // The child mapping must be gone before cleanup: an open merged
         // mapping pins the mount and normal umount refuses (by design).
