@@ -71,6 +71,12 @@ A shared/unknown candidate set produces no definite CBOM asset. The selected
 Count bytes/hash/trust selection are recorded separately from library identity;
 no harvest/members bundle or authenticated build-input record is fabricated.
 
+Statically linked OpenSSL and vendored crypto (no libcrypto mapping) stay
+blind: with no probe surface the observer reports a static-candidate gap,
+never an inferred execution claim. Build-ID or symbol heuristics for such
+targets are explicitly out of scope until F-031/v0.7, and would ship only
+with published false-positive and unknown behavior.
+
 ## Count and target identity
 
 The observer pins and hashes the protected stock library. Before release it

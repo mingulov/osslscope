@@ -10,8 +10,8 @@ sites (4, 900 calls):
   site build:012345 file-offset=4096 gen=0: 500 calls, definite: AES-128-GCM (CIPHER) via default
   site build:012345 file-offset=8192 gen=0: 300 calls, definite: SHA-256 (DIGEST) via default
   site build:fedcba file-offset=4096 gen=0: 100 calls, AMBIGUOUS (2 candidates, attribution uncertain):
-    candidate: provider=build:fedcba class=default op=CIPHER funcid=21 algs=[AES-256-GCM]
-    candidate: provider=build:fedcba class=default op=CIPHER funcid=21 algs=[ARIA-256-GCM] weak
+    candidate: provider=build:fedcba class=default op=CIPHER funcid=FUNC21 algs=[AES-256-GCM]
+    candidate: provider=build:fedcba class=default op=CIPHER funcid=FUNC21 algs=[ARIA-256-GCM] weak
   site unverified:8 file-offset=12288 gen=0: 0 calls, quiet (no calls in window)
 
 coverage:

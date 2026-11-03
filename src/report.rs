@@ -368,6 +368,31 @@ pub(crate) fn op_display(id: u32) -> String {
         .unwrap_or_else(|| format!("OP{id}"))
 }
 
+/// (Op id, func id) → display name (`OSSL_FUNC_CIPHER_UPDATE` →
+/// `CIPHER_UPDATE`; human candidates only — JSON keeps exact
+/// numbers). Lookup is strictly op-qualified: funcid namespaces
+/// overlap across ops (every table restarts at 1), so an id known
+/// only under another op — or only as a core id — must NOT label
+/// this one. Unknown stays numeric and explicit (`FUNC21`).
+pub(crate) fn func_display(op_id: u32, func_id: u32) -> String {
+    let op_name = crate::kinds::OPS
+        .iter()
+        .find(|o| o.id == op_id)
+        .map(|o| o.name);
+    let hit = op_name.and_then(|op| {
+        crate::kinds::FUNCS
+            .iter()
+            .find(|f| f.op == Some(op) && f.id == func_id)
+    });
+    hit.map(|f| {
+        f.name
+            .strip_prefix("OSSL_FUNC_")
+            .unwrap_or(f.name)
+            .to_string()
+    })
+    .unwrap_or_else(|| format!("FUNC{func_id}"))
+}
+
 /// Thousands separator for call counts (kept: the v2 human
 /// renderer shares it).
 pub(crate) fn grouped(n: u64) -> String {
@@ -2242,7 +2267,7 @@ fn human_candidates(site: &SiteExecution, s: &mut String) {
             safe_display(&fp_short(&candidate.provider.0)),
             safe_display(&candidate.provider_class),
             op_display(candidate.op),
-            candidate.funcid,
+            func_display(candidate.op, candidate.funcid),
             safe_display(&candidate.algorithm_classes.join(", ")),
             if candidate.weak_alias { " weak" } else { "" },
         ));
@@ -3303,6 +3328,25 @@ mod tests {
                 "no absence claim without enumeration evidence"
             );
         }
+    }
+
+    #[test]
+    #[test]
+    fn func_display_is_op_qualified_with_numeric_fallback() {
+        // Known (op, funcid) pairs label; everything else stays
+        // numeric and explicit. CIPHER=2, DIGEST=1 (frozen OPS).
+        assert_eq!(func_display(2, 1), "CIPHER_NEWCTX");
+        assert_eq!(func_display(1, 2), "DIGEST_INIT");
+        // Unknown funcid under a known op: numeric, never a guess.
+        assert_eq!(func_display(2, 9999), "FUNC9999");
+        // Unknown op: numeric even when the funcid exists as core.
+        assert_eq!(func_display(9999, 21), "FUNC21");
+        // THE mislabel trap: 21 exists only as core CRYPTO_ZALLOC;
+        // under CIPHER it must NOT borrow that name.
+        assert_eq!(func_display(2, 21), "FUNC21");
+        // Cross-op borrowing is equally forbidden: DIGEST/1 is not
+        // CIPHER_NEWCTX.
+        assert_eq!(func_display(1, 1), "DIGEST_NEWCTX");
     }
 
     #[test]
