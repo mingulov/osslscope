@@ -438,6 +438,21 @@ fn pool_exhausted_reason() -> &'static str {
     "osslscope crypto watch: memory pool exhausted (admission blocked; no observation attempted)"
 }
 
+/// Help requested in flag position only: value-taking options consume
+/// the next token (from the parser's own VALUE_OPTIONS list), so
+/// flag-shaped values like `--module -h` never trigger help.
+fn help_requested(args: &[String]) -> bool {
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if inventory::cli::VALUE_OPTIONS.contains(&arg.as_str()) {
+            it.next();
+        } else if arg == "--help" || arg == "-h" {
+            return true;
+        }
+    }
+    false
+}
+
 fn observe(
     config: &CryptoWatchConfig,
     objects: FocusedObjects,
@@ -524,6 +539,11 @@ fn observe(
             for gap in &snapshot.snapshot.gaps {
                 out.emit(Record::Gap { gap })?;
             }
+            // Flush each sample's gap batch immediately (human-only;
+            // JSON never buffers): without this, gap-only samples
+            // accumulate silently until the end record. The buffer
+            // holds one sample's (limits-bounded) gap triples at most.
+            out.flush_gaps()?;
             let mut i = 0;
             while i < active.len() {
                 if let Some(reason) = departure(&active[i].identity, &snapshot.snapshot) {
@@ -542,10 +562,18 @@ fn observe(
                     continue;
                 }
                 if !eligible(p) {
-                    let uncertain = snapshot.snapshot.gaps.iter().any(|g| {
-                        (g.pid.is_none() || g.pid == Some(p.pid))
-                            && g.reason != GapReason::IdentityUnverified
-                    });
+                    // No-candidates is claimed only with full
+                    // visibility: any gap touching this process
+                    // (including IdentityUnverified, whose candidate
+                    // file never proved the mapping's backing) or any
+                    // module-selector filtering keeps visibility
+                    // unknown instead.
+                    let uncertain = !config.selection.modules.is_empty()
+                        || snapshot
+                            .snapshot
+                            .gaps
+                            .iter()
+                            .any(|g| g.pid.is_none() || g.pid == Some(p.pid));
                     out.emit(Record::Membership {
                         incarnation: &identity,
                         segment: 0,
@@ -705,7 +733,7 @@ pub fn run(args: &[String]) -> ExitCode {
     {
         return invalid();
     }
-    if args.iter().any(|s| s == "--help" || s == "-h") {
+    if help_requested(args) {
         println!(
             "usage: osslscope scan --watch --observe-crypto [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--interval S] [--duration S] [--json]"
         );
@@ -1101,6 +1129,39 @@ mod tests {
         assert!(
             text.find("gaps (").unwrap() < text.find("Tracing unavailable:").unwrap(),
             "block flushes before the next record, got: {text}"
+        );
+    }
+
+    #[test]
+    fn human_gap_batches_flush_per_sample() {
+        // Consecutive gap-only samples: each batch flushes its own
+        // block (no cross-sample accumulation).
+        let gap = inventory::Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: None,
+            reason: inventory::GapReason::Deadline,
+            errno: None,
+            actor_euid: None,
+        };
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+            pending_gaps: Vec::new(),
+        };
+        for _ in 0..2 {
+            out.emit(Record::Gap { gap: &gap }).unwrap();
+            out.emit(Record::Gap { gap: &gap }).unwrap();
+            out.flush_gaps().unwrap();
+        }
+        drop(out);
+        let text = String::from_utf8(bytes).unwrap();
+        assert_eq!(
+            text.matches("gaps (2 total in 1 group):").count(),
+            2,
+            "one block per sample batch, got: {text}"
         );
     }
 

@@ -682,8 +682,42 @@ fn human_watch_snapshot_prints_identity_totals() {
 }
 
 #[test]
-fn human_watch_states_blindness_exactly_once() {
-    // Crypto-free target over several snapshots: the boundary prints once.
+fn human_watch_with_gaps_never_claims_blindness() {
+    // Unprivileged snapshots carry gaps: the boundary stays silent
+    // across every sample (fail closed).
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = child.id().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--pid",
+            &pid,
+            "--interval",
+            "0.2",
+            "--duration",
+            "0.6",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Snapshot 2:"), "sampled twice, got: {text}");
+    assert!(
+        !text.contains("blindness:"),
+        "no absence claim under gaps, got: {text}"
+    );
+}
+
+#[test]
+fn human_watch_states_blindness_exactly_once_when_verified() {
+    // Root-only presence: verified gap-free snapshots state the
+    // boundary exactly once per run.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIP: verified scan needs root");
+        return;
+    }
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let pid = child.id().to_string();

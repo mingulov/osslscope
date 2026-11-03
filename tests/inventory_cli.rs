@@ -558,9 +558,32 @@ fn dead_pid_inspect_exit4_names_reason_on_stderr() {
 }
 
 #[test]
-fn human_scan_of_crypto_free_target_states_blindness() {
-    // Live sleep target: conclusive no-OpenSSL scan states the boundary.
-    // Settle first: fresh-spawn maps churn (Changed gaps veto the claim).
+fn human_scan_with_gaps_never_claims_blindness() {
+    // Unprivileged sleep scan carries gaps: absence stays
+    // inconclusive, so the boundary must stay silent (fail closed).
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = cli(&["scan", "--pid", &child.id().to_string()]);
+    child.kill().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("gaps ("),
+        "fixture precondition: gaps present, got: {text}"
+    );
+    assert!(
+        !text.contains("blindness:"),
+        "no absence claim under gaps, got: {text}"
+    );
+}
+
+#[test]
+fn human_scan_states_blindness_when_verified() {
+    // Root-only presence: a verified gap-free scan of a crypto-free
+    // target states the boundary.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIP: verified scan needs root");
+        return;
+    }
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let output = cli(&["scan", "--pid", &child.id().to_string()]);

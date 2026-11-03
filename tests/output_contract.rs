@@ -2316,9 +2316,8 @@ fn diagnostics_golden_pins_producer_literals() {
         "backing-changed:not-found".to_string(),
         "symbol-discovery:resolve-failed".to_string(),
     ];
-    doc.refusal_diagnostics = vec![
-        "limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string(),
-    ];
+    doc.refusal_diagnostics =
+        vec!["limit:dev=8 ino=100 kind=file_too_large bytes=2048 allowance=1024".to_string()];
     assert_golden(
         "report-v2-diagnostics.json",
         &String::from_utf8(render_json(&doc).unwrap()).unwrap(),

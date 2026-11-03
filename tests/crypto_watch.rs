@@ -1043,6 +1043,30 @@ fn observe_crypto_help_names_exit_codes() {
 }
 
 #[test]
+fn flag_shaped_module_value_is_not_help() {
+    // `-h` is an accepted module pathname value: it must reach the
+    // parser (exit 4 NDJSON here), never trigger help output.
+    let output = command(&[
+        "scan",
+        "--watch",
+        "--observe-crypto",
+        "--module",
+        "-h",
+        "--json",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout.lines().next().unwrap_or("").starts_with('{'),
+        "NDJSON preserved, got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("usage:"),
+        "no help text on the value path, got: {stdout}"
+    );
+}
+
+#[test]
 fn dead_pid_crypto_watch_exit4_names_reason_on_stderr() {
     // Deterministic exit 4: dead pid yields zero segments.
     let output = command(&[
@@ -1131,9 +1155,44 @@ fn human_watch_prints_identity_and_tracing_health() {
 }
 
 #[test]
-fn human_watch_states_blindness_and_blocker_before_samples() {
-    // Crypto-free target: the boundary is stated, and the tracing
-    // blocker precedes the first sample record.
+fn human_watch_with_gaps_never_claims_blindness() {
+    // Unprivileged target carries gaps: membership stays unknown and
+    // the boundary stays silent (fail closed). The tracing blocker
+    // still precedes the first sample record.
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !text.contains("blindness:"),
+        "no absence claim under gaps, got: {text}"
+    );
+    let blocker = text.find("Tracing unavailable:").expect("blocker printed");
+    let first_sample = text.find("Process ").expect("samples follow");
+    assert!(blocker < first_sample, "blocker must precede sampling");
+}
+
+#[test]
+fn human_watch_states_blindness_when_verified() {
+    // Root-only presence: verified gap-free ineligible processes
+    // state the boundary.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIP: verified scan needs root");
+        return;
+    }
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
     let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
@@ -1155,9 +1214,46 @@ fn human_watch_states_blindness_and_blocker_before_samples() {
         text.contains("blindness: no-mapped-openssl"),
         "blindness boundary stated, got: {text}"
     );
-    let blocker = text.find("Tracing unavailable:").expect("blocker printed");
-    let first_sample = text.find("Process ").expect("samples follow");
-    assert!(blocker < first_sample, "blocker must precede sampling");
+}
+
+#[test]
+fn module_selection_keeps_membership_unknown() {
+    // Even with the target's own exe selected (mapped, non-crypto):
+    // filtering vetoes the no-candidates claim on the JSON channel
+    // and the blindness line on the human channel.
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--module",
+            exe.to_str().unwrap(),
+            "--duration",
+            "1",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let rows = records(&output);
+    let membership: Vec<&serde_json::Value> =
+        rows.iter().filter(|r| r["kind"] == "membership").collect();
+    assert!(
+        !membership.is_empty(),
+        "fixture precondition: membership sampled, got: {rows:?}"
+    );
+    for row in membership {
+        assert_eq!(
+            row["reason"], "candidate_visibility_unknown",
+            "filtered scan never claims no-candidates, got: {row}"
+        );
+    }
 }
 
 #[test]
@@ -1188,5 +1284,28 @@ fn human_watch_coalesces_discovery_gaps() {
     assert!(
         !text.contains("Discovery gap pid="),
         "no per-gap lines remain, got: {text}"
+    );
+}
+
+#[test]
+fn human_gap_only_samples_flush_live_blocks() {
+    // Dead pid over several samples: each sample's gaps flush their
+    // own block (no end-of-run accumulation).
+    let output = command(&[
+        "scan",
+        "--watch",
+        "--observe-crypto",
+        "--pid",
+        "2147483647",
+        "--interval",
+        "0.2",
+        "--duration",
+        "0.6",
+    ]);
+    assert_eq!(output.status.code(), Some(4));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.matches("gaps (").count() >= 2,
+        "one block per sample, got: {text}"
     );
 }

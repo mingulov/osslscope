@@ -207,6 +207,21 @@ where
         .collect()
 }
 
+/// Fixed public token for a package-admission failure variant. The
+/// verdict line and stderr reason use this token — never the error's
+/// context, which can carry paths, raw OS text, or newlines (see
+/// package/trusted.rs). The full detail stays in the
+/// package-admission check row, where it already rendered before.
+fn package_error_token(error: &crate::package::PackageError) -> &'static str {
+    match error {
+        crate::package::PackageError::Unavailable { .. } => "unavailable package metadata",
+        crate::package::PackageError::Invalid { .. } => "invalid package metadata",
+        crate::package::PackageError::Untrusted { .. } => "untrusted package metadata",
+        crate::package::PackageError::Unreadable { .. } => "unreadable package metadata",
+        crate::package::PackageError::Mutated { .. } => "mutated package metadata",
+    }
+}
+
 /// Stderr reason for preflight exit 4 (sectioned + profiled): failed ids
 /// in render order, capped with an exact remainder count.
 pub(crate) fn failed_checks_reason(ids: &[&str]) -> String {
@@ -2999,10 +3014,14 @@ fn run_with_resolver(
                 );
             } else {
                 print!("{}", render_doctor_human(&sections, None));
-                println!("verdict: FAIL-CLOSED (admission refused: {error})");
+                println!(
+                    "verdict: FAIL-CLOSED (admission refused: {})",
+                    package_error_token(&error)
+                );
             }
             crate::report::err_line(&format!(
-                "osslscope doctor: package admission refused: {error} (no preflight checks ran)"
+                "osslscope doctor: package admission refused: {} (no preflight checks ran; see package-admission check above)",
+                package_error_token(&error)
             ));
             ExitCode::from(4)
         }
@@ -5756,6 +5775,21 @@ mod tests {
         assert!(
             long.contains("a, b, c") && long.contains("(+2 more)"),
             "first three listed with exact remainder, got: {long}"
+        );
+    }
+
+    #[test]
+    fn admission_token_never_carries_context() {
+        // Path, errno-text, and newline canaries: the token exposes the
+        // variant only, single-line, no context bytes.
+        let hostile = crate::package::PackageError::unavailable(
+            "missing /private/canary.o: permission denied (os error 13)\nsecond line",
+        );
+        let token = super::package_error_token(&hostile);
+        assert_eq!(token, "unavailable package metadata");
+        assert!(
+            !token.contains('/') && !token.contains('\n'),
+            "no path or newline escapes, got: {token}"
         );
     }
 

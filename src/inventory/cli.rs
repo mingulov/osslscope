@@ -922,33 +922,41 @@ mod tests {
     #[test]
     fn blindness_predicate_holds_only_on_conclusive_scans() {
         use std::process::Command;
-        // A live crypto-free target: mappings known, no OpenSSL kinds.
-        // Fresh-spawn churn (Changed gaps) correctly vetoes: settle, then
-        // rescan boundedly until the maps stop moving.
+        // A live crypto-free target scanned as-is: its gaps (identity
+        // unverified and friends) veto the claim — absence stays
+        // inconclusive whenever anything hid a mapping.
         let mut child = Command::new("sleep").arg("30").spawn().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
-        let mut scanned = None;
-        for _ in 0..5 {
-            let snap = super::super::snapshot(&super::super::SnapshotOptions {
-                pids: vec![child.id()],
-                limits: super::super::Limits::default(),
-            });
-            let settled = !snap
-                .gaps
-                .iter()
-                .any(|g| g.reason == super::super::GapReason::Changed);
-            scanned = Some(snap);
-            if settled {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
-        }
-        let scanned = scanned.unwrap();
+        let scanned = super::super::snapshot(&super::super::SnapshotOptions {
+            pids: vec![child.id()],
+            limits: super::super::Limits::default(),
+        });
         child.kill().unwrap();
         assert!(
-            super::super::snapshot_conclusively_without_openssl(&scanned),
-            "conclusive no-OpenSSL scan, gaps: {:?}",
-            scanned.gaps.iter().map(|g| g.reason).collect::<Vec<_>>()
+            !scanned.gaps.is_empty(),
+            "fixture precondition: unprivileged scan carries gaps"
+        );
+        assert!(
+            !super::super::snapshot_conclusively_without_openssl(&scanned),
+            "any gap vetoes the blindness claim"
+        );
+        // The same snapshot with gaps cleared (as a verified scan
+        // would produce): no OpenSSL kinds, nothing hidden — holds.
+        let mut cleared = scanned.clone();
+        cleared.gaps.clear();
+        assert!(
+            super::super::snapshot_conclusively_without_openssl(&cleared),
+            "gap-free no-OpenSSL scan holds"
+        );
+        // Module-selector scoping vetoes even the cleared snapshot: a
+        // filtered list is not a complete enumeration.
+        cleared
+            .scope_record
+            .modules
+            .push("selector-active".to_string());
+        assert!(
+            !super::super::snapshot_conclusively_without_openssl(&cleared),
+            "module selection vetoes the blindness claim"
         );
         // A dead target hides its mappings: inconclusive, never blind.
         let dead = super::super::snapshot(&super::super::SnapshotOptions {
@@ -966,48 +974,28 @@ mod tests {
     }
 
     #[test]
-    fn shared_gap_block_pins_exact_shape() {
-        use super::super::GapReason;
-        let block = super::super::gap_groups_block(
-            [
-                (GapReason::ProcessUnavailable.word(), Some(7), Some(9)),
-                (GapReason::ProcessUnavailable.word(), Some(7), Some(9)),
-                (GapReason::Deadline.word(), None, None),
-            ]
-            .into_iter(),
-            "",
+    fn preamble_states_blindness_on_conclusive_snapshot() {
+        // Render presence for the conclusive case (no deterministic
+        // gap-free scan exists unprivileged, so the cleared live
+        // snapshot stands in for a verified one).
+        use std::process::Command;
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut scanned = super::super::snapshot(&super::super::SnapshotOptions {
+            pids: vec![child.id()],
+            limits: super::super::Limits::default(),
+        });
+        child.kill().unwrap();
+        scanned.gaps.clear();
+        let preamble = scanned.human_preamble();
+        assert!(preamble.conclusively_without_openssl);
+        let mut buf = Vec::new();
+        super::render(&scanned, false, &mut buf, Some(&preamble)).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("blindness: no-mapped-openssl"),
+            "preamble states the boundary, got head: {}",
+            out.lines().take(6).collect::<Vec<_>>().join("\n")
         );
-        assert_eq!(
-            block,
-            "gaps (3 total in 2 groups):\n  deadline device=- pid=-: 1\n  process_unavailable device=7 pid=9: 2\n"
-        );
-        // Indented variant nests under streaming records.
-        let nested = super::super::gap_groups_block(
-            [(GapReason::Deadline.word(), None, None)].into_iter(),
-            "  ",
-        );
-        assert_eq!(
-            nested,
-            "  gaps (1 total in 1 group):\n    deadline device=- pid=-: 1\n"
-        );
-        assert_eq!(
-            block,
-            super::gap_block(&super::super::coalesce_gaps(&[
-                gap(GapReason::ProcessUnavailable, Some(7), Some(9)),
-                gap(GapReason::ProcessUnavailable, Some(7), Some(9)),
-                gap(GapReason::Deadline, None, None),
-            ]))
-        );
-
-        fn gap(reason: GapReason, device: Option<u64>, pid: Option<u32>) -> super::super::Gap {
-            super::super::Gap {
-                pid,
-                device,
-                inode: None,
-                reason,
-                errno: None,
-                actor_euid: None,
-            }
-        }
     }
 }

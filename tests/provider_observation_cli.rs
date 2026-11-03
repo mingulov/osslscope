@@ -586,9 +586,44 @@ fn human_snapshot_prints_identity_totals() {
 }
 
 #[test]
-fn human_watch_states_blindness_once_before_sampling() {
-    // Crypto-free target: the boundary prints once, before the first
-    // sample record.
+fn human_watch_with_gaps_never_claims_blindness() {
+    // Unprivileged initial snapshot carries gaps: the boundary stays
+    // silent (fail closed).
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        &child.id().to_string(),
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.3",
+    ]);
+    child.kill().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("snapshot 1:"),
+        "fixture precondition: sampled, got: {text}"
+    );
+    assert!(
+        !text.contains("blindness:"),
+        "no absence claim under gaps, got: {text}"
+    );
+}
+
+#[test]
+fn human_watch_states_blindness_once_before_sampling_when_verified() {
+    // Root-only presence: the verified boundary prints once, before
+    // the first sample record.
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("SKIP: verified scan needs root");
+        return;
+    }
     let mut child = std::process::Command::new("sleep")
         .arg("30")
         .spawn()

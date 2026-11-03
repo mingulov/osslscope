@@ -1780,15 +1780,10 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         } else {
             s.push_str("  none (no usable evidence)\n");
         }
-        // Blindness boundary: complete enumeration that found nothing
-        // mappable. Any gap (Partial) or engine evidence keeps
-        // absence inconclusive, so the line stays silent there.
-        if doc.status == Completeness::Complete
-            && doc.objects.is_empty()
-            && !doc.has_proved_engine_evidence()
-        {
-            s.push_str(crate::inventory::blindness_line());
-        }
+        // No blindness line here by design: no document field proves
+        // mapping enumeration ran (an empty Complete document carries
+        // no target evidence), so any absence claim would exceed the
+        // evidence. The gaps/reasons above already explain empty docs.
     }
     for site in &doc.sites {
         human_site(site, &mut s);
@@ -3293,20 +3288,21 @@ mod tests {
     }
 
     #[test]
-    fn blindness_prints_on_complete_empty_doc_only() {
-        // Complete enumeration that found nothing mappable states the
-        // boundary; any gap keeps absence inconclusive (no line).
-        let mut doc = capture::empty_document();
-        doc.status = Completeness::Complete;
-        assert!(
-            render_human(&doc).contains("blindness: no-mapped-openssl"),
-            "complete empty doc states blindness"
-        );
-        doc.status = Completeness::Partial { reasons: vec![] };
-        assert!(
-            !render_human(&doc).contains("blindness:"),
-            "partial doc stays inconclusive"
-        );
+    fn report_human_never_claims_blindness() {
+        // No document field proves mapping enumeration ran — not even
+        // status Complete — so the report renderer never states the
+        // blindness boundary. Gaps/reasons explain empty docs instead.
+        for status in [
+            Completeness::Complete,
+            Completeness::Partial { reasons: vec![] },
+        ] {
+            let mut doc = capture::empty_document();
+            doc.status = status;
+            assert!(
+                !render_human(&doc).contains("blindness:"),
+                "no absence claim without enumeration evidence"
+            );
+        }
     }
 
     #[test]

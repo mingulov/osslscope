@@ -270,6 +270,10 @@ fn doctor_bogus_objects_package_refusal_names_itself_on_stderr() {
         stderr.contains("package admission refused"),
         "stderr names the admission refusal, got:\n{stderr}"
     );
+    assert!(
+        !stderr.contains("nonexistent-osslscope"),
+        "reason carries the fixed token, never the path, got:\n{stderr}"
+    );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("verdict: FAIL-CLOSED (admission refused:"),

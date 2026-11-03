@@ -457,26 +457,26 @@ pub fn blindness_line() -> &'static str {
     "blindness: no-mapped-openssl (complete enumeration found no OpenSSL object; statically linked or vendored crypto invisible)\n"
 }
 
-/// True when the snapshot conclusively shows no mapped OpenSSL: zero
-/// OpenSSL-kind modules and no gap that could hide a mapping.
-/// [`GapReason::IdentityUnverified`] leaves the mapping known, so it
-/// does not veto; every other gap keeps absence inconclusive.
+/// True when the snapshot conclusively shows no mapped OpenSSL, and
+/// only then: zero OpenSSL-kind modules, zero gaps of any kind, and
+/// no module-selector scoping. Any gap vetoes — including
+/// [`GapReason::IdentityUnverified`], whose candidate file was never
+/// proven to be the mapped backing object, so its `Other` kind
+/// cannot exclude an OpenSSL mapping. Module selectors veto because
+/// the published list is filtered before this predicate runs: a
+/// scoped enumeration is not a complete one.
 pub fn snapshot_conclusively_without_openssl(snapshot: &Snapshot) -> bool {
-    let has_openssl = snapshot.processes.iter().flat_map(|p| &p.modules).any(|m| {
+    if !snapshot.gaps.is_empty() || !snapshot.scope_record.modules.is_empty() {
+        return false;
+    }
+    !snapshot.processes.iter().flat_map(|p| &p.modules).any(|m| {
         matches!(
             m.info.kind,
             ObjectKind::OpenSslCompatible
                 | ObjectKind::ProviderModule
                 | ObjectKind::OpenSslConsumer
         )
-    });
-    if has_openssl {
-        return false;
-    }
-    !snapshot
-        .gaps
-        .iter()
-        .any(|g| g.reason != GapReason::IdentityUnverified)
+    })
 }
 
 /// Human-preamble inputs for a [`Snapshot`] (see
