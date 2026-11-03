@@ -1105,6 +1105,101 @@ require-executed=["SHA2-256"]
     }
 
     #[test]
+    fn policy_v2_file_selectors_evaluate_with_violation_dominant_and() {
+        use crate::evidence::{
+            ATTRIBUTION_SCOPE_V1, AlgorithmSelectorEntry, AttributionBounds, CAPTURE_SCHEMA_V2_5,
+            ExecutionAttribution,
+        };
+        const OBJ: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const ID: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const ABSENT: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let path = std::env::temp_dir().join(format!(
+            "osslscope-check-policy-v2-{}.toml",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            format!(
+                "version = 2\ndeny-selector = [{{ object = \"{OBJ}\", id = \"{ID}\" }}]\nrequire-selector = [{{ object = \"{OBJ}\", id = \"{ABSENT}\" }}]\n"
+            ),
+        )
+        .unwrap();
+        let args: Vec<String> = ["--policy", &path.to_string_lossy(), "run", "--", "workload"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let parsed = parse(&args).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let rules = policy_rules(&parsed.rules);
+        assert_eq!(
+            rules,
+            vec![
+                crate::policy::PolicyRule::deny_selector(OBJ, ID),
+                crate::policy::PolicyRule::require_selector(OBJ, ABSENT),
+            ]
+        );
+        // Execution plane: entry OBJ/ID with 37 + 11 proved calls.
+        // Sites, rows, and the entry share the code-object identity.
+        let key = |offset: u64| crate::evidence::SiteKey {
+            object: crate::evidence::ObjectId(OBJ.to_string()),
+            device: 7,
+            inode: 9,
+            offset,
+        };
+        let mut document = doc(vec![
+            site(0x1000, 40, Vec::new()),
+            site(0x2000, 11, Vec::new()),
+            site(0x3000, 49, Vec::new()),
+        ]);
+        for (site, offset) in document.sites.iter_mut().zip([0x1000, 0x2000, 0x3000]) {
+            site.site = key(offset);
+        }
+        document.algorithm_selectors = vec![AlgorithmSelectorEntry {
+            object: crate::evidence::ObjectId(OBJ.to_string()),
+            operation: 3,
+            id: ID.to_string(),
+            canonical_name: None,
+        }];
+        let row = |offset: u64, segment: u64, calls: u64| ExecutionAttribution {
+            site: key(offset),
+            generation: 0,
+            segment,
+            start_ns: 1100,
+            end_ns: 1900,
+            calls,
+            provider_definition: None,
+            provider_instance: 9,
+            operation: 3,
+            function: 5,
+            selector: 0,
+            scope: ATTRIBUTION_SCOPE_V1.to_string(),
+        };
+        document.execution_attributions = vec![row(0x1000, 1, 37), row(0x2000, 2, 11)];
+        document.attribution_bounds = Some(AttributionBounds {
+            unresolved_calls: 52,
+            withheld_uncertain: 0,
+        });
+        document.schema = CAPTURE_SCHEMA_V2_5.to_string();
+        let verdict = crate::policy::evaluate_document(&rules, &document);
+        assert_eq!(
+            verdict.rules[0].verdict,
+            crate::evidence::RuleVerdict::Violation
+        );
+        assert_eq!(verdict.rules[0].bounds.definite, 48);
+        assert_eq!(
+            verdict.rules[1].verdict,
+            crate::evidence::RuleVerdict::Inconclusive,
+            "selector with no entry never passes or violates"
+        );
+        assert_eq!(verdict.rules[1].bounds.definite, 0);
+        assert_eq!(
+            verdict.overall(),
+            crate::policy::PolicyOutcome::Violation,
+            "AND composition: one violation dominates"
+        );
+    }
+
+    #[test]
     fn policy_path_is_loaded_only_after_argument_shape_validation() {
         let args: Vec<String> = [
             "--policy",

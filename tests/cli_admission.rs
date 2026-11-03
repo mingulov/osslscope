@@ -987,3 +987,83 @@ fn help_token_in_flag_position_is_help() {
     assert_eq!(run_inspect(&base_inspect(&["--help"])), ExitCode::SUCCESS);
     assert_eq!(run_inspect(&base_inspect(&["-h"])), ExitCode::SUCCESS);
 }
+
+struct PolicyStage {
+    dir: std::path::PathBuf,
+}
+
+impl PolicyStage {
+    fn fresh() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "osslscope-r07-policy-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self { dir }
+    }
+
+    fn write(&self, name: &str, bytes: &[u8]) -> String {
+        let path = self.dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        path.to_str().unwrap().to_string()
+    }
+}
+
+impl Drop for PolicyStage {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// F-006 pre-effect admission: malformed policy files are usage
+/// errors (exit 2) in the parser — before provider reads, BPF
+/// preparation, or child creation. The 2-vs-4 discriminator proves
+/// it: a valid policy on the same bogus paths reaches setup (4).
+#[test]
+fn malformed_policy_file_rejected_before_setup() {
+    const HEX64: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let stage = PolicyStage::fresh();
+    let bad_toml = stage.write("bad.toml", b"version = [\n");
+    let unknown_version = stage.write("unknown.toml", b"version = 99\n");
+    let v1_selectors = stage.write(
+        "v1sel.toml",
+        format!("version = 1\ndeny-selector = [{{object = \"{HEX64}\", id = \"{HEX64}\"}}]\n")
+            .as_bytes(),
+    );
+    for (name, path) in [
+        ("malformed TOML", bad_toml),
+        ("unknown version", unknown_version),
+        ("v1 carrying selectors", v1_selectors),
+    ] {
+        let args = base_capture(&[
+            "--policy",
+            &path,
+            "--require-executed",
+            "SHA256",
+            "run",
+            "--",
+            "/bin/true",
+        ]);
+        assert_eq!(run_check(&args), ExitCode::from(2), "{name} rejected");
+    }
+    // Positive control: a valid v1 policy parses and reaches setup
+    // (exit 4 on the bogus BPF objects — never 2, never a spawn).
+    let valid = stage.write("valid.toml", b"version = 1\ndeny-algorithm = [\"MD5\"]\n");
+    let args = base_capture(&[
+        "--policy",
+        &valid,
+        "--require-executed",
+        "SHA256",
+        "run",
+        "--",
+        "/bin/true",
+    ]);
+    assert_eq!(
+        run_check(&args),
+        ExitCode::from(4),
+        "valid policy reaches setup"
+    );
+}

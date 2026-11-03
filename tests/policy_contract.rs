@@ -3517,3 +3517,97 @@ fn selector_facts_survive_into_report_json() {
     let carried: u64 = rows.iter().map(|r| r["calls"].as_u64().unwrap()).sum();
     assert_eq!(carried, 48);
 }
+
+/// F-006 defensive exit order: usable evidence beats setup-no-verdict
+/// even in the combination `evaluate_document` never produces
+/// (NoVerdict ⟺ evidence-free fatal — H7 pins the reachable legs).
+/// Evidence must never be reportable as a setup failure.
+#[test]
+fn noverdict_outcome_with_usable_evidence_still_reports_tool_failure() {
+    let salvaged = doc(
+        vec![site_at(
+            1,
+            0,
+            7,
+            vec![cand(
+                "prov-default",
+                "default",
+                DIGEST,
+                7,
+                &["SHA2-256"],
+                false,
+            )],
+            CandidateCoverage::Complete,
+        )],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        exact_window(),
+        Some(FatalKind::Runtime("close_and_drain: boom".to_string())),
+    );
+    assert!(salvaged.has_usable_evidence());
+    assert_eq!(
+        exit_for(PolicyOutcome::NoVerdict, None, &salvaged, &ok_delivery()),
+        1,
+        "usable evidence is a tool failure, never a setup no-verdict"
+    );
+    // The reachable legs agree: evaluated rules still run on salvaged
+    // docs (H7), and the evidence-free leg stays 4 (fatal_capture).
+    let v = evaluate_document(
+        std::slice::from_ref(&PolicyRule::require_executed("SHA2-256")),
+        &salvaged,
+    );
+    assert_eq!(v.overall(), PolicyOutcome::Pass);
+    assert_eq!(exit_for(v.overall(), None, &salvaged, &ok_delivery()), 1);
+}
+
+/// F-006 AND composition: one inconclusive rule poisons an otherwise
+/// passing gate — pass is unanimous, never majority. (Violation
+/// dominance over inconclusive is pinned at the v2 file level.)
+#[test]
+fn mixed_pass_and_inconclusive_compose_to_inconclusive() {
+    // PARTIAL with a relevant loss: proved SHA2-256 use still passes,
+    // while unobserved AES-256-GCM can prove no absence (over a
+    // COMPLETE doc the same rule would violate — proved absent).
+    let d = doc(
+        vec![site_at(
+            1,
+            0,
+            7,
+            vec![cand(
+                "prov-default",
+                "default",
+                DIGEST,
+                7,
+                &["SHA2-256"],
+                false,
+            )],
+            CandidateCoverage::Complete,
+        )],
+        Vec::new(),
+        Vec::new(),
+        vec![loss_counter("discovery.table_aborted")],
+        exact_window(),
+        None,
+    );
+    assert!(matches!(d.status, Completeness::Partial { .. }));
+    let v = evaluate_document(
+        &[
+            PolicyRule::require_executed("SHA2-256"),
+            PolicyRule::require_executed("AES-256-GCM"),
+        ],
+        &d,
+    );
+    assert_eq!(v.rules[0].verdict, RuleVerdict::Pass);
+    assert_eq!(
+        v.rules[1].verdict,
+        RuleVerdict::Inconclusive,
+        "unobserved known algorithm proves no absence"
+    );
+    assert_eq!(v.overall(), PolicyOutcome::Inconclusive);
+    assert_eq!(
+        exit_for(v.overall(), Some(0), &d, &ok_delivery()),
+        11,
+        "poisoned gate exits 11, not 0"
+    );
+}
