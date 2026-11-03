@@ -1083,8 +1083,7 @@ fn subcommand_help_distinguishes_self_and_foreign_doctor() {
         "sub pointer must scope bare doctor to self, got: {help}"
     );
     assert!(
-        help.contains("'doctor --pid PID' probes foreign")
-            && help.contains("root/capable"),
+        help.contains("'doctor --pid PID' probes foreign") && help.contains("root/capable"),
         "sub pointer must route foreign targets at doctor --pid with the root/capable requirement, got: {help}"
     );
 }
