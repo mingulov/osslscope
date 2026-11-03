@@ -6,8 +6,9 @@ use osslscope::inventory::{
 };
 use sha2::{Digest as _, Sha256};
 use std::fs;
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::io::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -552,14 +553,267 @@ fn overlay_copyup_old_mapping_verifies_via_direct_lower_not_overlay() {
     assert_eq!(direct.info.sha256, digest(&lower));
 }
 
-// Catches early maps-device/inode deduplication across Btrfs subvolumes.
-// Prepare two different relevant ELF files externally in separate Btrfs
-// subvolumes with equal inode numbers; this test never creates subvolumes.
+/// Self-provisioning Btrfs fixture (T4, integration-local mirror of the
+/// backing unit fixture): subvolumes under a leased-TMPDIR base with
+/// reverse-order reclamation. Root + `btrfs` CLI + TMPDIR-on-btrfs required.
+struct BtrfsFixture(PathBuf, Vec<PathBuf>);
+impl BtrfsFixture {
+    fn create(names: &[&str]) -> Option<Self> {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("skip: btrfs subvolume control requires root");
+            return None;
+        }
+        if Command::new("btrfs").arg("--version").output().is_err() {
+            eprintln!("skip: btrfs CLI absent");
+            return None;
+        }
+        let probe = std::fs::File::open(std::env::temp_dir()).unwrap();
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: fstatfs initializes stat on success and borrows an open FD.
+        let is_btrfs = unsafe { libc::fstatfs(probe.as_raw_fd(), stat.as_mut_ptr()) == 0 }
+            && unsafe { stat.assume_init() }.f_type == 0x9123683e;
+        if !is_btrfs {
+            eprintln!("skip: TMPDIR is not on btrfs");
+            return None;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "osslscope-process-t4btrfs-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&base).unwrap();
+        let mut subvols = Vec::with_capacity(names.len());
+        for name in names {
+            let path = base.join(name);
+            let ok = Command::new("btrfs")
+                .args(["subvolume", "create"])
+                .arg(&path)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !ok {
+                eprintln!("skip: btrfs subvolume create failed for {}", path.display());
+                let _ = fs::remove_dir_all(&base);
+                return None;
+            }
+            subvols.push(path);
+        }
+        Some(Self(base, subvols))
+    }
+    /// Same-ino pair with distinct bytes across two subvolumes. Bases are
+    /// valid ELFs; variant `i` flips the `e_ident` padding byte so every
+    /// file stays parseable with a distinct digest.
+    fn colliding_pair(&self, a: &str, b: &str, base_a: &[u8], base_b: &[u8]) -> (PathBuf, PathBuf) {
+        let mut seen: Vec<(u64, PathBuf)> = Vec::new();
+        for i in 0..16u8 {
+            let mut bytes = base_a.to_vec();
+            bytes[9] = i;
+            let pa = self.0.join(a).join(format!("f{i}"));
+            fs::write(&pa, &bytes).unwrap();
+            let ino = pa.metadata().unwrap().ino();
+            if let Some((_, pb)) = seen.iter().find(|(n, _)| *n == ino) {
+                if pb.starts_with(self.0.join(b)) {
+                    return (pb.clone(), pa);
+                }
+            }
+            seen.push((ino, pa));
+            let mut bytes = base_b.to_vec();
+            bytes[9] = i.wrapping_add(0x80);
+            let pb = self.0.join(b).join(format!("g{i}"));
+            fs::write(&pb, &bytes).unwrap();
+            let ino = pb.metadata().unwrap().ino();
+            if let Some((_, pa)) = seen.iter().find(|(n, _)| *n == ino) {
+                if pa.starts_with(self.0.join(a)) {
+                    return (pa.clone(), pb);
+                }
+            }
+            seen.push((ino, pb));
+        }
+        panic!("no same-ino pair across fresh subvolumes after 16 files each");
+    }
+}
+impl Drop for BtrfsFixture {
+    fn drop(&mut self) {
+        for subvol in self.1.iter().rev() {
+            let _ = Command::new("btrfs")
+                .args(["subvolume", "delete"])
+                .arg(subvol)
+                .status();
+        }
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+// Catches a maps change landing inside one snapshot: the re-read fence
+// must record Changed and downgrade every module. Window test by nature:
+// the churn signal fires mid-parse (300 modules keep the window wide);
+// up to 3 attempts, pass on the first observed fence trip. A 3/3 miss is
+// a failure (window too narrow), never a skip.
 #[test]
-#[ignore = "requires externally prepared Btrfs collision paths in OSSL_INVENTORY_BTRFS_FIRST/SECOND"]
+#[ignore = "requires root map_files (T4)"]
+fn maps_churn_during_snapshot_downgrades_to_locator() {
+    if unsafe { libc::geteuid() } != 0 {
+        eprintln!("skip: root map_files required");
+        return;
+    }
+    let fixture = Fixture::new();
+    let base = fixture.build(
+        "PRIVATE_CANARY_churn",
+        "int OSSL_provider_init(void) { return 11; }",
+        true,
+    );
+    let base_bytes = fs::read(&base).unwrap();
+    // 300 distinct ELFs: e_ident padding flips keep every variant parseable.
+    let mut paths = Vec::with_capacity(301);
+    for i in 0..300u16 {
+        let mut bytes = base_bytes.clone();
+        bytes[9] = (i & 0xff) as u8;
+        bytes[10] = (i >> 8) as u8;
+        let path = fixture.0.join(format!("m{i}"));
+        fs::write(&path, &bytes).unwrap();
+        paths.push(path);
+    }
+    let mut churn_bytes = base_bytes.clone();
+    churn_bytes[9] = 0xcc;
+    churn_bytes[10] = 0xcc;
+    let churn_path = fixture.0.join("churn_extra");
+    fs::write(&churn_path, &churn_bytes).unwrap();
+    let executable = fixture.build(
+        "churn-child",
+        r#"
+            #include <sys/mman.h>
+            #include <sys/stat.h>
+            #include <fcntl.h>
+            #include <stdio.h>
+            #include <string.h>
+            #include <unistd.h>
+            static int mapone(const char *p) {
+                int fd = open(p, O_RDONLY); struct stat st;
+                if (fd < 0 || fstat(fd, &st)) return -1;
+                void *at = mmap(0, st.st_size, PROT_READ | PROT_EXEC, MAP_PRIVATE, fd, 0);
+                if (at == MAP_FAILED) return -1;
+                { volatile char t = ((char *)at)[0]; (void)t; }
+                close(fd); return 0;
+            }
+            int main(int argc, char **argv) {
+                for (int i = 1; i < argc - 1; ++i) if (mapone(argv[i])) return 2;
+                puts("ready"); fflush(stdout);
+                char line[16];
+                if (!fgets(line, sizeof line, stdin)) return 0;
+                if (!strncmp(line, "churn", 5)) {
+                    if (mapone(argv[argc-1])) return 3;
+                    puts("churned"); fflush(stdout);
+                }
+                while (getchar() != EOF) {}
+                return 0;
+            }
+        "#,
+        false,
+    );
+    // Calm control: without churn the corpus verifies (root map_files).
+    {
+        let mut child = Command::new(&executable)
+            .args(&paths)
+            .arg(&churn_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "ready\n");
+        let calm = snap(vec![child.id()], Limits::default());
+        let process = calm.processes.iter().find(|p| p.pid == child.id()).unwrap();
+        assert!(
+            process
+                .modules
+                .iter()
+                .any(|m| m.identity_status == IdentityStatus::Verified),
+            "calm control must verify: {calm:?}"
+        );
+        drop(child.stdin.take());
+        assert!(child.wait().unwrap().success());
+    }
+    // Churned attempts: pass on the first fence trip.
+    for attempt in 0..3 {
+        let mut child = Command::new(&executable)
+            .args(&paths)
+            .arg(&churn_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let mut stdin = child.stdin.take().unwrap();
+        let churned = std::thread::scope(|s| {
+            let probe = s.spawn(|| snap(vec![pid], Limits::default()));
+            std::thread::sleep(Duration::from_millis(200));
+            stdin.write_all(b"churn\n").unwrap();
+            stdin.flush().unwrap();
+            let mut ack = String::new();
+            stdout.read_line(&mut ack).unwrap();
+            assert_eq!(ack, "churned\n");
+            probe.join().unwrap()
+        });
+        drop(stdin);
+        assert!(child.wait().unwrap().success());
+        let process = churned.processes.iter().find(|p| p.pid == pid);
+        let tripped = churned.gaps.iter().any(|g| g.reason == GapReason::Changed)
+            && process.is_some_and(|p| {
+                p.modules
+                    .iter()
+                    .all(|m| m.identity_status != IdentityStatus::Verified)
+            });
+        if tripped {
+            return;
+        }
+        eprintln!("attempt {attempt}: churn missed the snapshot window, retrying");
+    }
+    panic!("maps churn missed the snapshot window 3/3: widen the corpus or the delay");
+}
+
+// Catches early maps-device/inode deduplication across Btrfs subvolumes.
+// Self-provisioned: two subvolumes with a same-ino, distinct-bytes pair
+// (operator may still pin paths via OSSL_INVENTORY_BTRFS_FIRST/SECOND).
+#[test]
+#[ignore = "requires root + btrfs subvolume control (T4; OSSL_INVENTORY_BTRFS_FIRST/SECOND override)"]
 fn btrfs_equal_maps_identity_preserves_distinct_native_backings() {
-    let paths = ["OSSL_INVENTORY_BTRFS_FIRST", "OSSL_INVENTORY_BTRFS_SECOND"]
-        .map(|name| PathBuf::from(std::env::var_os(name).expect("Btrfs input path required")));
+    // Self-provisioned unless the operator pins paths explicitly. Bases are
+    // compiled first so the pair files are valid ELFs with distinct bytes.
+    let mut _held = None;
+    let base_fixture = Fixture::new();
+    let paths = match (
+        std::env::var_os("OSSL_INVENTORY_BTRFS_FIRST"),
+        std::env::var_os("OSSL_INVENTORY_BTRFS_SECOND"),
+    ) {
+        (Some(a), Some(b)) => [PathBuf::from(a), PathBuf::from(b)],
+        _ => {
+            let fx = match BtrfsFixture::create(&["a", "b"]) {
+                Some(fx) => fx,
+                None => return,
+            };
+            let cloud = base_fixture.build(
+                "PRIVATE_CANARY_cloud",
+                "int OSSL_provider_init(void) { return 11; }",
+                true,
+            );
+            let rain = base_fixture.build(
+                "PRIVATE_CANARY_rain",
+                "int EVP_MD_fetch(void) { return 17; }",
+                true,
+            );
+            let base_a = fs::read(&cloud).unwrap();
+            let base_b = fs::read(&rain).unwrap();
+            let (p0, p1) = fx.colliding_pair("a", "b", &base_a, &base_b);
+            _held = Some(fx);
+            [p0, p1]
+        }
+    };
     let metadata = paths.each_ref().map(|path| fs::metadata(path).unwrap());
     assert_eq!(
         metadata[0].ino(),

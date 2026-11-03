@@ -1285,7 +1285,14 @@ mod tests {
     }
     impl MapChild {
         fn spawn(paths: &[std::path::PathBuf]) -> Self {
-            let mut child = Command::new("python3")
+            Self::spawn_via("python3", &[], paths)
+        }
+        fn spawn_in_new_mountns(paths: &[std::path::PathBuf]) -> Self {
+            Self::spawn_via("unshare", &["-m", "python3"], paths)
+        }
+        fn spawn_via(program: &str, prefix: &[&str], paths: &[std::path::PathBuf]) -> Self {
+            let mut child = Command::new(program)
+                .args(prefix)
                 .arg("-c")
                 .arg(
                     "import mmap,sys\nfiles=[open(p,'rb') for p in sys.argv[1:]]\nmaps=[mmap.mmap(f.fileno(),0,access=mmap.ACCESS_READ) for f in files]\n[t.__getitem__(0) for t in maps]\nprint('ready',flush=True)\nsys.stdin.read()\n",
@@ -1302,6 +1309,9 @@ mod tests {
             assert_eq!(line, "ready\n");
             let pid = child.id();
             Self { child, pid }
+        }
+        fn pid(&self) -> u32 {
+            self.pid
         }
         fn maps(&self) -> Vec<u8> {
             std::fs::read(format!("/proc/{}/maps", self.pid)).unwrap()
@@ -1533,11 +1543,25 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires externally prepared Btrfs collision paths in OSSL_INVENTORY_BTRFS_FIRST/SECOND + privilege (5E)"]
+    #[ignore = "requires root + btrfs subvolume control (T4; OSSL_INVENTORY_BTRFS_FIRST/SECOND override)"]
     fn btrfs_subvolume_cross_candidate_refuses() {
-        let paths = ["OSSL_INVENTORY_BTRFS_FIRST", "OSSL_INVENTORY_BTRFS_SECOND"].map(|name| {
-            std::path::PathBuf::from(std::env::var_os(name).expect("Btrfs input path required"))
-        });
+        // Self-provisioned unless the operator pins paths explicitly.
+        let mut _held = None;
+        let paths = match (
+            std::env::var_os("OSSL_INVENTORY_BTRFS_FIRST"),
+            std::env::var_os("OSSL_INVENTORY_BTRFS_SECOND"),
+        ) {
+            (Some(a), Some(b)) => [std::path::PathBuf::from(a), std::path::PathBuf::from(b)],
+            _ => {
+                let fx = match BtrfsFixture::create(&["a", "b"]) {
+                    Some(fx) => fx,
+                    None => return,
+                };
+                let (p0, p1) = fx.colliding_pair("a", "b");
+                _held = Some(fx);
+                [p0, p1]
+            }
+        };
         let metas = paths.each_ref().map(|p| std::fs::metadata(p).unwrap());
         assert_eq!(metas[0].ino(), metas[1].ino(), "fixture collision required");
         assert_ne!(metas[0].dev(), metas[1].dev(), "distinct natives required");
@@ -1565,6 +1589,123 @@ mod tests {
         );
         let own = File::open(&paths[0]).unwrap();
         verify_mapped_backing(&target, &range, &own).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires root + btrfs subvolume control (T4)"]
+    fn btrfs_snapshot_twin_cross_refuses_self_provisioned() {
+        let Some(mut fx) = BtrfsFixture::create(&["sv1"]) else {
+            return;
+        };
+        let bytes = vec![0x53u8; 4096];
+        let original = fx.write("sv1", "lib.so", &bytes);
+        let snap = fx.snapshot("sv1", "sv1snap");
+        let twin = snap.join("lib.so");
+        let meta_o = original.metadata().unwrap();
+        let meta_t = twin.metadata().unwrap();
+        assert_eq!(meta_o.ino(), meta_t.ino(), "snapshot twin shares ino");
+        assert_ne!(
+            meta_o.dev(),
+            meta_t.dev(),
+            "twin lives on a distinct native dev"
+        );
+        let child = MapChild::spawn(std::slice::from_ref(&original));
+        let range = child.range_of(&original);
+        let target = child.dir();
+        let cross = File::open(&twin).unwrap();
+        assert_eq!(
+            err_of(verify_mapped_backing(&target, &range, &cross)),
+            BackingError::Changed
+        );
+        let own = File::open(&original).unwrap();
+        verify_mapped_backing(&target, &range, &own).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires root map_files (T4)"]
+    fn deleted_mapped_library_verifies_by_retained_proof() {
+        let dir = scratch("deleted");
+        let path = dir.join("lib.so");
+        std::fs::write(&path, vec![0x44u8; 4096]).unwrap();
+        let meta_before = path.metadata().unwrap();
+        let child = MapChild::spawn(std::slice::from_ref(&path));
+        std::fs::remove_file(&path).unwrap();
+        let maps = String::from_utf8(child.maps()).unwrap();
+        assert!(
+            maps.contains(" (deleted)"),
+            "precondition: maps shows deletion"
+        );
+        let range = child.range_of(&path);
+        let target = child.dir();
+        // The range-bound entry needs the full VMA span (not the 1-byte
+        // probe range) and still binds the unlinked file.
+        let maps = child.maps();
+        let needle = path.to_string_lossy().into_owned();
+        let line = maps
+            .split(|b| *b == b'\n')
+            .find(|l| String::from_utf8_lossy(l).contains(&needle))
+            .unwrap();
+        let vma = parse_vma(line).unwrap();
+        let entry = format!(
+            "/proc/{}/map_files/{:x}-{:x}",
+            child.pid(),
+            vma.start,
+            vma.end
+        );
+        let candidate = File::open(&entry).unwrap();
+        let assoc = verify_mapped_backing(&target, &range, &candidate).unwrap();
+        assert_eq!(
+            assoc.object_identity(),
+            (meta_before.dev(), meta_before.ino())
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires root map_files (T4)"]
+    fn symlink_swap_candidate_before_verifies_after_refuses() {
+        let dir = scratch("symlink");
+        let a = dir.join("a");
+        let b = dir.join("b");
+        std::fs::write(&a, vec![0x41u8; 4096]).unwrap();
+        std::fs::write(&b, vec![0x41u8; 4096]).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        // The mapping resolves through the link: maps names the target.
+        let child = MapChild::spawn(std::slice::from_ref(&link));
+        let range = child.range_of(&a);
+        let target = child.dir();
+        let before = File::open(&link).unwrap();
+        verify_mapped_backing(&target, &range, &before).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        let after = File::open(&link).unwrap();
+        assert_eq!(
+            err_of(verify_mapped_backing(&target, &range, &after)),
+            BackingError::Changed
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires root map_files + mountns control (T4)"]
+    fn cross_mountns_target_verifies_by_proof() {
+        let dir = scratch("mntns");
+        let path = dir.join("lib.so");
+        std::fs::write(&path, vec![0x4du8; 4096]).unwrap();
+        let meta = path.metadata().unwrap();
+        let child = MapChild::spawn_in_new_mountns(std::slice::from_ref(&path));
+        // Precondition: the child really is in another mount namespace.
+        let mine = std::fs::read_link("/proc/self/ns/mnt").unwrap();
+        let theirs = std::fs::read_link(format!("/proc/{}/ns/mnt", child.pid())).unwrap();
+        assert_ne!(mine, theirs, "precondition: distinct mount namespaces");
+        let range = child.range_of(&path);
+        let target = child.dir();
+        let candidate = File::open(&path).unwrap();
+        let assoc = verify_mapped_backing(&target, &range, &candidate).unwrap();
+        assert_eq!(assoc.object_identity(), (meta.dev(), meta.ino()));
+        assoc.revalidate().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[derive(Debug)]
@@ -1817,6 +1958,106 @@ mod tests {
                     panic!("{error}");
                 }
             }
+        }
+    }
+
+    /// Self-provisioning Btrfs fixture (T4): subvolumes under a leased-TMPDIR
+    /// base, snapshots, and reverse-order reclamation. Root + `btrfs` CLI +
+    /// TMPDIR-on-btrfs required; anything else prints a skip and yields None.
+    /// Snapshots here are always siblings (never nested), so reverse
+    /// creation order is a valid deletion order.
+    struct BtrfsFixture {
+        base: std::path::PathBuf,
+        subvols: Vec<std::path::PathBuf>,
+    }
+    impl BtrfsFixture {
+        fn create(names: &[&str]) -> Option<Self> {
+            if unsafe { libc::geteuid() } != 0 {
+                eprintln!("skip: btrfs subvolume control requires root");
+                return None;
+            }
+            if Command::new("btrfs").arg("--version").output().is_err() {
+                eprintln!("skip: btrfs CLI absent");
+                return None;
+            }
+            let probe = File::open(std::env::temp_dir()).ok()?;
+            // BTRFS_SUPER_MAGIC, cf. direct_semantics().
+            if filesystem_type(&probe) != Some(0x9123683e) {
+                eprintln!("skip: TMPDIR is not on btrfs");
+                return None;
+            }
+            let base = scratch("t4btrfs");
+            let mut subvols = Vec::with_capacity(names.len());
+            for name in names {
+                let path = base.join(name);
+                let ok = Command::new("btrfs")
+                    .args(["subvolume", "create"])
+                    .arg(&path)
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !ok {
+                    eprintln!("skip: btrfs subvolume create failed for {}", path.display());
+                    let _ = std::fs::remove_dir_all(&base);
+                    return None;
+                }
+                subvols.push(path);
+            }
+            Some(Self { base, subvols })
+        }
+        fn write(&self, subvol: &str, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+            let path = self.base.join(subvol).join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        }
+        fn snapshot(&mut self, src: &str, dst: &str) -> std::path::PathBuf {
+            let from = self.base.join(src);
+            let to = self.base.join(dst);
+            let status = Command::new("btrfs")
+                .args(["subvolume", "snapshot"])
+                .arg(&from)
+                .arg(&to)
+                .status()
+                .unwrap();
+            assert!(status.success(), "btrfs snapshot failed");
+            self.subvols.push(to.clone());
+            to
+        }
+        /// Same-ino pair across two subvolumes: fresh subvolumes allocate
+        /// from the same start, so a bounded scan finds a collision fast.
+        /// Loud failure (not skip) when the filesystem disagrees.
+        fn colliding_pair(&self, a: &str, b: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+            use std::os::unix::fs::MetadataExt as _;
+            let mut seen: Vec<(u64, std::path::PathBuf)> = Vec::new();
+            for i in 0..16 {
+                let pa = self.write(a, &format!("f{i}"), &[0x41u8; 64]);
+                let ino = pa.metadata().unwrap().ino();
+                if let Some((_, pb)) = seen.iter().find(|(n, _)| *n == ino) {
+                    if pb.starts_with(self.base.join(b)) {
+                        return (pb.clone(), pa);
+                    }
+                }
+                seen.push((ino, pa));
+                let pb = self.write(b, &format!("g{i}"), &[0x42u8; 64]);
+                let ino = pb.metadata().unwrap().ino();
+                if let Some((_, pa)) = seen.iter().find(|(n, _)| *n == ino) {
+                    if pa.starts_with(self.base.join(a)) {
+                        return (pa.clone(), pb);
+                    }
+                }
+                seen.push((ino, pb));
+            }
+            panic!("no same-ino pair across fresh subvolumes after 16 files each");
+        }
+    }
+    impl Drop for BtrfsFixture {
+        fn drop(&mut self) {
+            for subvol in self.subvols.iter().rev() {
+                let _ = Command::new("btrfs")
+                    .args(["subvolume", "delete"])
+                    .arg(subvol)
+                    .status();
+            }
+            let _ = std::fs::remove_dir_all(&self.base);
         }
     }
 
