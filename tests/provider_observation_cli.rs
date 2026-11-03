@@ -580,3 +580,36 @@ fn human_snapshot_prints_identity_totals() {
         "identity totals on empty human snapshot, got: {text}"
     );
 }
+
+#[test]
+fn human_watch_states_blindness_once_before_sampling() {
+    // Crypto-free target: the boundary prints once, before the first
+    // sample record.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        &child.id().to_string(),
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.3",
+    ]);
+    child.kill().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    let pos = text
+        .find("blindness: no-mapped-openssl")
+        .expect("blocker printed");
+    let first_sample = text.find("snapshot 1:").expect("samples follow");
+    assert!(pos < first_sample, "blocker must precede sampling");
+    assert_eq!(
+        text.matches("blindness: no-mapped-openssl").count(),
+        1,
+        "boundary printed once, got: {text}"
+    );
+}

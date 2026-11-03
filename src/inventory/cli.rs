@@ -366,6 +366,9 @@ fn render(
             let (verified, locator) = pre.identity;
             writer.write_all(identity_line(verified, locator).as_bytes())?;
             writer.write_all(gap_block(&pre.gap_groups).as_bytes())?;
+            if pre.conclusively_without_openssl {
+                writer.write_all(super::blindness_line().as_bytes())?;
+            }
         }
     }
     serde_json::to_writer_pretty(&mut *writer, value).map_err(io::Error::other)?;
@@ -921,6 +924,52 @@ mod tests {
         assert_eq!(
             super::identity_line(3, 1),
             super::super::identity_totals_line(3, 1)
+        );
+    }
+
+    #[test]
+    fn blindness_predicate_holds_only_on_conclusive_scans() {
+        use std::process::Command;
+        // A live crypto-free target: mappings known, no OpenSSL kinds.
+        // Fresh-spawn churn (Changed gaps) correctly vetoes: settle, then
+        // rescan boundedly until the maps stop moving.
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let mut scanned = None;
+        for _ in 0..5 {
+            let snap = super::super::snapshot(&super::super::SnapshotOptions {
+                pids: vec![child.id()],
+                limits: super::super::Limits::default(),
+            });
+            let settled = !snap
+                .gaps
+                .iter()
+                .any(|g| g.reason == super::super::GapReason::Changed);
+            scanned = Some(snap);
+            if settled {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        let scanned = scanned.unwrap();
+        child.kill().unwrap();
+        assert!(
+            super::super::snapshot_conclusively_without_openssl(&scanned),
+            "conclusive no-OpenSSL scan, gaps: {:?}",
+            scanned.gaps.iter().map(|g| g.reason).collect::<Vec<_>>()
+        );
+        // A dead target hides its mappings: inconclusive, never blind.
+        let dead = super::super::snapshot(&super::super::SnapshotOptions {
+            pids: vec![2147483647],
+            limits: super::super::Limits::default(),
+        });
+        assert!(
+            !super::super::snapshot_conclusively_without_openssl(&dead),
+            "dead-pid gaps veto the blindness claim"
+        );
+        assert!(
+            super::super::blindness_line().contains("blindness: no-mapped-openssl"),
+            "shared blindness vocabulary pinned"
         );
     }
 }

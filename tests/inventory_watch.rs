@@ -680,3 +680,32 @@ fn human_watch_snapshot_prints_identity_totals() {
         "identity totals on human snapshots, got: {text}"
     );
 }
+
+#[test]
+fn human_watch_states_blindness_exactly_once() {
+    // Crypto-free target over several snapshots: the boundary prints once.
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = child.id().to_string();
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--pid",
+            &pid,
+            "--interval",
+            "0.2",
+            "--duration",
+            "0.6",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("Snapshot 2:"), "sampled twice, got: {text}");
+    assert_eq!(
+        text.matches("blindness: no-mapped-openssl").count(),
+        1,
+        "boundary printed once, got: {text}"
+    );
+}

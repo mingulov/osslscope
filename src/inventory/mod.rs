@@ -428,6 +428,7 @@ impl Snapshot {
         SnapshotPreamble {
             identity: self.identity_counts(),
             gap_groups: coalesce_gaps(&self.gaps),
+            conclusively_without_openssl: snapshot_conclusively_without_openssl(self),
         }
     }
 }
@@ -447,6 +448,37 @@ pub fn identity_totals_line(verified: usize, locator: usize) -> String {
     )
 }
 
+/// Shared human blindness boundary: stated only when the caller has
+/// conclusively established it (see
+/// [`snapshot_conclusively_without_openssl`]). Static/vendored
+/// crypto appear as the caveat (what would be invisible), never as
+/// a diagnosis: absence stays inconclusive everywhere else.
+pub fn blindness_line() -> &'static str {
+    "blindness: no-mapped-openssl (complete enumeration found no OpenSSL object; statically linked or vendored crypto invisible)\n"
+}
+
+/// True when the snapshot conclusively shows no mapped OpenSSL: zero
+/// OpenSSL-kind modules and no gap that could hide a mapping.
+/// [`GapReason::IdentityUnverified`] leaves the mapping known, so it
+/// does not veto; every other gap keeps absence inconclusive.
+pub fn snapshot_conclusively_without_openssl(snapshot: &Snapshot) -> bool {
+    let has_openssl = snapshot.processes.iter().flat_map(|p| &p.modules).any(|m| {
+        matches!(
+            m.info.kind,
+            ObjectKind::OpenSslCompatible
+                | ObjectKind::ProviderModule
+                | ObjectKind::OpenSslConsumer
+        )
+    });
+    if has_openssl {
+        return false;
+    }
+    !snapshot
+        .gaps
+        .iter()
+        .any(|g| g.reason != GapReason::IdentityUnverified)
+}
+
 /// Human-preamble inputs for a [`Snapshot`] (see
 /// [`Snapshot::human_preamble`]). A group is (reason, device, pid,
 /// exact count), sorted by (reason, device, pid) with absent ids
@@ -455,6 +487,7 @@ pub fn identity_totals_line(verified: usize, locator: usize) -> String {
 pub struct SnapshotPreamble {
     pub identity: (usize, usize),
     pub gap_groups: Vec<(GapReason, Option<u64>, Option<u32>, usize)>,
+    pub conclusively_without_openssl: bool,
 }
 
 /// Group gaps by (reason, device, pid) with exact counters

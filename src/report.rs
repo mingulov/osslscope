@@ -1779,6 +1779,15 @@ pub fn render_human(doc: &CaptureDocument) -> String {
         } else {
             s.push_str("  none (no usable evidence)\n");
         }
+        // Blindness boundary: complete enumeration that found nothing
+        // mappable. Any gap (Partial) or engine evidence keeps
+        // absence inconclusive, so the line stays silent there.
+        if doc.status == Completeness::Complete
+            && doc.objects.is_empty()
+            && !doc.has_proved_engine_evidence()
+        {
+            s.push_str(crate::inventory::blindness_line());
+        }
     }
     for site in &doc.sites {
         human_site(site, &mut s);
@@ -3205,6 +3214,23 @@ mod tests {
         assert!(
             human.contains("attach diagnostics:\n  - attach:busy"),
             "{human}"
+        );
+    }
+
+    #[test]
+    fn blindness_prints_on_complete_empty_doc_only() {
+        // Complete enumeration that found nothing mappable states the
+        // boundary; any gap keeps absence inconclusive (no line).
+        let mut doc = capture::empty_document();
+        doc.status = Completeness::Complete;
+        assert!(
+            render_human(&doc).contains("blindness: no-mapped-openssl"),
+            "complete empty doc states blindness"
+        );
+        doc.status = Completeness::Partial { reasons: vec![] };
+        assert!(
+            !render_human(&doc).contains("blindness:"),
+            "partial doc stays inconclusive"
         );
     }
 

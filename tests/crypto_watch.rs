@@ -1125,3 +1125,33 @@ fn human_watch_prints_identity_and_tracing_health() {
         "tracing health stated once, got: {text}"
     );
 }
+
+#[test]
+fn human_watch_states_blindness_and_blocker_before_samples() {
+    // Crypto-free target: the boundary is stated, and the tracing
+    // blocker precedes the first sample record.
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("blindness: no-mapped-openssl"),
+        "blindness boundary stated, got: {text}"
+    );
+    let blocker = text.find("Tracing unavailable:").expect("blocker printed");
+    let first_sample = text.find("Process ").expect("samples follow");
+    assert!(blocker < first_sample, "blocker must precede sampling");
+}

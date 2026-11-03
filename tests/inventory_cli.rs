@@ -552,3 +552,18 @@ fn dead_pid_inspect_exit4_names_reason_on_stderr() {
         String::from_utf8_lossy(&output.stdout)
     );
 }
+
+#[test]
+fn human_scan_of_crypto_free_target_states_blindness() {
+    // Live sleep target: conclusive no-OpenSSL scan states the boundary.
+    // Settle first: fresh-spawn maps churn (Changed gaps veto the claim).
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = cli(&["scan", "--pid", &child.id().to_string()]);
+    child.kill().unwrap();
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("blindness: no-mapped-openssl"),
+        "blindness boundary stated, got: {text}"
+    );
+}

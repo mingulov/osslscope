@@ -203,11 +203,20 @@ impl<W: Write> Output<'_, W> {
                 segment,
                 state,
                 reason,
-            } => writeln!(
-                w,
-                "Membership pid={} start={} segment={segment} state={state} reason={reason}; sampled",
-                i.pid, i.starttime
-            ),
+            } => {
+                writeln!(
+                    w,
+                    "Membership pid={} start={} segment={segment} state={state} reason={reason}; sampled",
+                    i.pid, i.starttime
+                )?;
+                // The !eligible-no-uncertainty reason (set at the
+                // Membership emission branch) carries the conclusive
+                // no-OpenSSL finding: state the shared boundary.
+                if *reason == "no_candidate_interfaces_in_sample" {
+                    w.write_all(inventory::blindness_line().as_bytes())?;
+                }
+                Ok(())
+            }
             Record::Limit {
                 incarnation: i,
                 reason,
@@ -981,6 +990,38 @@ mod tests {
             text.matches("op=").count(),
             1,
             "one op row for one id-bearing candidate, got: {text}"
+        );
+    }
+
+    #[test]
+    fn human_membership_states_blindness_when_no_candidates() {
+        // The ineligible-no-uncertainty reason (emitted at the !eligible
+        // branch) renders the shared blindness boundary in human output.
+        let identity = Incarnation {
+            pid: 42,
+            starttime: 123,
+            namespaces: inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        };
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+        };
+        out.emit(Record::Membership {
+            incarnation: &identity,
+            segment: 0,
+            state: "sampled",
+            reason: "no_candidate_interfaces_in_sample",
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("blindness: no-mapped-openssl"),
+            "blindness boundary stated, got: {text}"
         );
     }
 

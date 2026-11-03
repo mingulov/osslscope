@@ -528,6 +528,16 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
     if let Some(session) = &mut session {
         initial_batch = session.reconcile(&initial);
     }
+    // The startup blocker prints once, before the first sample record:
+    // the initial snapshot is the knowledge event.
+    if !options.json
+        && !cancel.load(Ordering::Relaxed)
+        && inventory::snapshot_conclusively_without_openssl(&initial)
+    {
+        stream
+            .writer
+            .write_all(inventory::blindness_line().as_bytes())?;
+    }
     stream.batch(
         initial_batch,
         Some(&initial),

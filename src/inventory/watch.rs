@@ -309,6 +309,7 @@ pub(super) fn run_formatted(
     let mut sequence = 0;
     let mut status = 4;
     let mut previous = None;
+    let mut blindness_printed = false;
     let mut end = WatchOutcome {
         schema_version: "osslscope.discovery.v1",
         mode: "watch",
@@ -357,6 +358,13 @@ pub(super) fn run_formatted(
             Some(duration) => scanner.snapshot_for(duration.saturating_sub(started.elapsed())),
             None => scanner.snapshot(),
         };
+        // The blindness boundary prints once per run, before the first
+        // sample that establishes it (a snapshot is the knowledge
+        // event: nothing is known at loop entry).
+        if human && !blindness_printed && super::snapshot_conclusively_without_openssl(&snapshot) {
+            writer.write_all(super::blindness_line().as_bytes())?;
+            blindness_printed = true;
+        }
         sequence += 1;
         status = snapshot.exit_code();
         let record = Record {
