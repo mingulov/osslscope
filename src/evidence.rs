@@ -372,9 +372,42 @@ impl GapCounter {
     }
 }
 
+/// 6A §1.3 owned-corpse wait span (N13): the monotonic-nanosecond
+/// interval the controller waited for an owned maps-empty target
+/// before retiring it. Endpoints, not a scalar: the span joins the
+/// evidence as an interval with cause `corpse_wait`, never an
+/// invented zero-count window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CorpseWaitSpan {
+    pub start_ns: u64,
+    pub end_ns: u64,
+}
+
+/// 6A §1.3 retirement membership leg (N13): the end-of-observation
+/// membership state of the captured target. `None` (absent) on
+/// every non-retired capture. Reason + window ride the typed
+/// [`GapReason::VisibilityLost`]; this record carries only the
+/// membership state (never double-reported).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MembershipRecord {
+    pub state: MembershipState,
+}
+
+/// Membership states a capture can retire into. Only corpse-expiry
+/// retirement exists today; the enum holds the vocabulary slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MembershipState {
+    Retired,
+}
+
 /// Typed reason a window is not COMPLETE.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GapReason {
+    VisibilityLost {
+        cause: String,
+        start_ns: u64,
+        end_ns: u64,
+    },
     UnknownDenominator {
         scope: String,
     },
@@ -974,6 +1007,9 @@ pub struct AttributionBounds {
 /// turns it into a [`CaptureDocument`].
 #[derive(Debug, Clone)]
 pub struct FinalizeInput {
+    /// 6A §1.3 owned-corpse retirement (N13): `Some` span retires
+    /// the capture with `VisibilityLost` + membership `Retired`.
+    pub corpse_wait: Option<CorpseWaitSpan>,
     pub window: CaptureWindow,
     pub sites: Vec<SiteExecution>,
     pub fenced: Vec<FencedGeneration>,
@@ -1100,6 +1136,14 @@ pub struct CaptureDocument {
     /// keeps its exact shape.
     #[serde(default)]
     pub refusal_diagnostics: Vec<String>,
+    /// 6A §1.3 retirement membership leg (N13): `Some(Retired)`
+    /// iff the controller retired the target (corpse-wait
+    /// expiry). Additive and old-reader-safe: missing in old
+    /// documents means non-retired. Set by [`finalize`] from
+    /// the corpse span; every existing producer keeps its exact
+    /// shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membership: Option<MembershipRecord>,
     /// Certified definite execution partitions (v2.5, optional —
     /// present iff the window ran the closed attribution collect
     /// and certified partitions). Projected post-finalization
@@ -1368,6 +1412,16 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
     if input.window.signal_cut {
         reasons.push(GapReason::SignalCut);
     }
+    // N13: owned-corpse retirement — the frozen §1.3 evidence
+    // (typed reason + interval window; the membership leg rides
+    // the document below). Never a bare counter.
+    if let Some(span) = input.corpse_wait {
+        reasons.push(GapReason::VisibilityLost {
+            cause: "corpse_wait".to_string(),
+            start_ns: span.start_ns,
+            end_ns: span.end_ns,
+        });
+    }
     reasons.sort();
     reasons.dedup();
 
@@ -1402,6 +1456,9 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         selected_objects: None,
         attach_diagnostics: Vec::new(),
         refusal_diagnostics: Vec::new(),
+        membership: input.corpse_wait.map(|_| MembershipRecord {
+            state: MembershipState::Retired,
+        }),
         execution_attributions: Vec::new(),
         algorithm_selectors: Vec::new(),
         attribution_bounds: None,
@@ -1737,6 +1794,7 @@ mod t5_schema_d_record_tests {
     #[test]
     fn stamp_context_upgrades_schema_only_with_sysctls() {
         let mut doc = finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 0,
                 requested_end_ns: 0,
@@ -1871,6 +1929,7 @@ mod t5_schema_d_record_tests {
         std::fs::remove_file(root.join("kernel/perf_event_paranoid")).unwrap();
         assert_eq!(retained.perf_event_paranoid, Some(4));
         let mut doc = finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 0,
                 requested_end_ns: 0,
@@ -1978,6 +2037,7 @@ mod bounded_projection_tests {
 
     fn doc_with(sites: Vec<SiteExecution>, rows: Vec<SiteAssociations>) -> CaptureDocument {
         let mut doc = finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 10,
                 requested_end_ns: 100,

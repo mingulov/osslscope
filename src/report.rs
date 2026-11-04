@@ -324,6 +324,7 @@ pub(crate) fn exit_reason_line(
             GapReason::StartupGap { .. } => "startup-gap",
             GapReason::TailGap { .. } => "tail-gap",
             GapReason::SignalCut => "signal-cut",
+            GapReason::VisibilityLost { .. } => "visibility-lost",
         }
     }
     match exit_code {
@@ -770,6 +771,7 @@ pub fn no_observation_document(failure: &capture::PreObservationFailure) -> Capt
         value: 1,
     });
     let mut document = finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 0,
@@ -1286,6 +1288,16 @@ fn gap_reason_json(reason: &GapReason) -> serde_json::Value {
             serde_json::json!({"kind": "tail-gap", "missing_ns": missing_ns})
         }
         GapReason::SignalCut => serde_json::json!({"kind": "signal-cut"}),
+        GapReason::VisibilityLost {
+            cause,
+            start_ns,
+            end_ns,
+        } => serde_json::json!({
+            "kind": "visibility-lost",
+            "cause": cause,
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+        }),
     }
 }
 
@@ -2352,6 +2364,14 @@ fn gap_reason_human(reason: &GapReason) -> String {
             format!("tail-gap: {missing_ns}ns unobserved at window end")
         }
         GapReason::SignalCut => "signal-cut: window ended by signal".to_string(),
+        GapReason::VisibilityLost {
+            cause,
+            start_ns,
+            end_ns,
+        } => format!(
+            "visibility-lost: {} [{start_ns},{end_ns}) unobserved (target retired)",
+            safe_display(cause)
+        ),
     }
 }
 
@@ -2391,6 +2411,7 @@ fn gap_reason_short(reason: &GapReason) -> String {
         GapReason::StartupGap { .. } => "startup-gap".to_string(),
         GapReason::TailGap { .. } => "tail-gap".to_string(),
         GapReason::SignalCut => "signal-cut".to_string(),
+        GapReason::VisibilityLost { cause, .. } => format!("visibility-lost:{cause}"),
     }
 }
 
@@ -2945,6 +2966,7 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
         CaptureWindow, FinalizeInput, LegacyCallPartition, OpensslVersion, TargetRecord, finalize,
     };
     finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 0,

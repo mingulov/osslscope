@@ -1319,6 +1319,12 @@ impl FocusedCounter {
         if self.retired {
             self.write("TARGET", 0, &(self.pid as u64).to_ne_bytes())?;
             self.retired = false;
+            // N2 bounded recovery: the retired→live reattach seals
+            // the suspend uncertainty span into the ledger and
+            // closes the fence edge, so post-recovery rows project
+            // instead of withholding against the old edge forever.
+            // A no-op without an armed fence.
+            self.fold.recover_fence();
         }
         Ok(())
     }

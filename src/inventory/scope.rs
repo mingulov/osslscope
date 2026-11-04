@@ -299,16 +299,17 @@ impl ScopedScanner {
                                 .collect::<BTreeSet<_>>()
                                 .len()
                     };
-                    // 6A: followed pids outside the stable set are
-                    // still classified (union coverage); only
-                    // undiscovered pids are stability-gated.
-                    let follow: BTreeSet<u32> = self.follow.iter().copied().collect();
-                    result
-                        .processes
-                        .retain(|p| stable.contains(&p.pid) || follow.contains(&p.pid));
-                    result
-                        .selected_pids
-                        .retain(|pid| stable.contains(pid) || follow.contains(pid));
+                    // N1: the stability gate admits ONLY stable
+                    // pids — followed pids were scanned (union
+                    // coverage above) but classification is not
+                    // proof of scoped membership. A followed
+                    // member that drifted between passes, or
+                    // moved out of the watched root, is
+                    // excluded here (D-record §§1.6, 2.4); the
+                    // coordinator retains it unknown or departs
+                    // it through the sample rules.
+                    result.processes.retain(|p| stable.contains(&p.pid));
+                    result.selected_pids.retain(|pid| stable.contains(pid));
                     // 6A stable-set sidecar: surviving pids map to
                     // their single directory identity (stable pids
                     // sit in exactly one identical directory in

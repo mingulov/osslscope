@@ -352,6 +352,7 @@ fn gap_relevant_to(area: RuleArea, reason: &GapReason) -> bool {
         GapReason::StartupGap { .. }
         | GapReason::TailGap { .. }
         | GapReason::SignalCut
+        | GapReason::VisibilityLost { .. }
         | GapReason::UnattributedCalls { .. } => true,
         // Any loss could drop tripwire data, so engine rules trust no
         // loss; engine-internal loss cannot hide provider execution.

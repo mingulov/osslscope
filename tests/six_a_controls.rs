@@ -757,31 +757,52 @@ fn control_2_thread_churn_preserves_tgid_counts() {
         return;
     }
     // Phase A (spin): 32 threads calling back-to-back for 2000 ms,
-    // all CONCURRENTLY. The harness writes the command without
-    // reading, dumps API_THREADS repeatedly across the spin (rows
-    // must appear: spinners overlap by the dozen), then drains the
-    // ack + report (exact N2 + spinner tids). Rows are transient
-    // (removed at depth 0), so one hit in ~14 dumps proves
-    // appearance; absence in every dump fails it.
+    // all CONCURRENTLY. N10 injection oracle: THREADS rows are
+    // persistent (BPF never removes them) and this operational
+    // fixture creates none naturally, so the harness injects a
+    // synthetic THREADS row for a live spinner tid and proves the
+    // host exit cleanup deletes it — present-after-inject
+    // (construction) implies absent-after-exit means the host
+    // deleted it (the only deleter). Then drains the ack + report
+    // (exact N2 + spinner tids).
     app.write_raw("A 32\n2000\n");
-    let spin_end = Instant::now() + Duration::from_millis(3400);
-    let mut saw_rows = false;
-    let mut dumped = false;
-    while Instant::now() < spin_end {
-        if let Some(keys) = bpftool_apithread_keys() {
-            dumped = true;
-            if keys.iter().any(|(tgid, _)| *tgid == pid) {
-                saw_rows = true;
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-    let spin_end_ns = monotonic_ns();
-    if !dumped {
+    std::thread::sleep(Duration::from_millis(500));
+    let live: Vec<u32> = task_tids(pid)
+        .into_iter()
+        .filter(|tid| *tid != pid)
+        .collect();
+    let Some(target) = live.first().copied() else {
         let _ = observer.kill();
         app.finish();
-        eprintln!("INCONCLUSIVE: API_THREADS spin dumps unreadable");
+        eprintln!("INCONCLUSIVE: no spinner tid to inject for");
+        return;
+    };
+    let threads_map = bpftool_map_ids("THREADS").filter(|ids| ids.len() == 1);
+    let injected = threads_map
+        .as_ref()
+        .is_some_and(|ids| inject_thread_row(&ids[0], pid, target));
+    if !injected {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: THREADS injection failed");
+        return;
+    }
+    let present = bpftool_thread_keys().is_some_and(|keys| {
+        keys.iter()
+            .any(|(tgid, tid)| *tgid == pid && *tid == target)
+    });
+    if !present {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: injected row never appeared");
+        return;
+    }
+    if !task_alive(pid, target) {
+        // The exit may have beaten the injection (cleanup already
+        // ran or never will for this row) — stimulus invalid.
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: injection target exited too early");
         return;
     }
     let Some(a_lines) = app.drain_ack() else {
@@ -813,32 +834,44 @@ fn control_2_thread_churn_preserves_tgid_counts() {
         );
         return;
     }
-    assert!(
-        saw_rows,
-        "no API_THREADS tid rows observed across the spin (vacuous oracle)"
-    );
-    let n_total = 1600u64.saturating_add(spin_done);
-    // End dump (spinners + K workers long exited; their transient
-    // rows pair-removed at depth 0 -- none may leak): per-tid, not
-    // zero-total, so fixture growth stays safe.
-    std::thread::sleep(Duration::from_secs(2));
-    let Some(end_keys) = bpftool_apithread_keys() else {
+    let spin_end_ns = monotonic_ns();
+    if !spin_tids.contains(&target) {
+        // The injection target is not a reported spinner (fixture
+        // skew) — the oracle has no proven exit to wait for.
         let _ = observer.kill();
         app.finish();
-        eprintln!("INCONCLUSIVE: API_THREADS end dump unreadable");
+        eprintln!("INCONCLUSIVE: injection target not a spinner");
+        return;
+    }
+    // The target exited after the injection (proven order: alive at
+    // inject, gone now) — its EXIT reached the drain and the host
+    // cleanup ran for it. Wait for the reaped task entry, bounded.
+    let reaped = Instant::now() + Duration::from_secs(10);
+    while task_alive(pid, target) && Instant::now() < reaped {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    if task_alive(pid, target) {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: injection target never reaped");
+        return;
+    }
+    let n_total = 1600u64.saturating_add(spin_done);
+    // N10 end dump: the injected row for the reaped target must be
+    // gone — BPF never deletes THREADS rows, so absence proves the
+    // host exit cleanup ran. (The verdict waits for the End row:
+    // a row that persists past a connector drop means delivery was
+    // never proven, not that cleanup failed.)
+    std::thread::sleep(Duration::from_secs(2));
+    let Some(end_keys) = bpftool_thread_keys() else {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: THREADS end dump unreadable");
         return;
     };
-    let end_mine: Vec<u32> = end_keys
+    let injected_leaked = end_keys
         .iter()
-        .filter(|(tgid, _)| *tgid == pid)
-        .map(|(_, tid)| *tid)
-        .collect();
-    for tid in k_tids.iter().chain(spin_tids.iter()) {
-        assert!(
-            !end_mine.contains(tid),
-            "exited tid {tid} row leaked: {end_mine:?}"
-        );
-    }
+        .any(|(tgid, tid)| *tgid == pid && *tid == target);
     // Independent ADMITTED == N gate (mandatory, never waived):
     // exactly the worker-reported EVP re-init passages admitted
     // (D-record correspondence; mismatch renders the control
@@ -858,6 +891,23 @@ fn control_2_thread_churn_preserves_tgid_counts() {
     let rows = read_rows(&out);
     app.finish();
     eprintln!("kinds: {:?}", kinds(&rows));
+    // N10 injection verdict: the injected row for the reaped
+    // target must be gone (host cleanup deleted it). A row that
+    // persists past connector drops is delivery-unproven
+    // (INCONCLUSIVE); a row that persists with clean delivery is a
+    // cleanup failure (FAIL).
+    if injected_leaked {
+        let drops = rows
+            .iter()
+            .find(|r| r["kind"] == "end")
+            .and_then(|r| r["signal_dropped"].as_u64())
+            .unwrap_or(0);
+        if drops > 0 {
+            eprintln!("INCONCLUSIVE: injected row persisted past {drops} drops");
+            return;
+        }
+        panic!("injected THREADS row for reaped tid {target} leaked (cleanup never deleted it)");
+    }
     assert_no_tid_attribution(&rows);
     // One continuous TGID segment (no restart on tid churn).
     let segments = segments_by_pid(&rows);
@@ -1380,6 +1430,10 @@ fn control_3_nonleader_exec_seals_without_origin() {
         eprintln!("INCONCLUSIVE: execs straddled a tick boundary");
         return;
     }
+    // N7 (§1.4 amendment): only the real readmission (epoch 2)
+    // carries `image_readmission` — the middle image (epoch 1,
+    // never observed) seals retired-only, without any admission
+    // claim.
     let readmits: Vec<&serde_json::Value> = rows
         .iter()
         .filter(|r| {
@@ -1388,28 +1442,52 @@ fn control_3_nonleader_exec_seals_without_origin() {
                 && r["detail"]["kind"] == "image_readmission"
         })
         .collect();
-    assert_eq!(readmits.len(), 2, "both execs must re-admit: {readmits:?}");
-    let epochs: BTreeSet<u64> = readmits
-        .iter()
-        .filter_map(|r| r["image_epoch"].as_u64())
-        .collect();
-    assert_eq!(epochs, BTreeSet::from([1, 2]), "epochs advance per exec");
+    assert_eq!(readmits.len(), 1, "only epoch 2 re-admits: {readmits:?}");
+    assert_eq!(readmits[0]["image_epoch"], 2);
+    assert_eq!(readmits[0]["state"], "observing");
     // Drain-order seals: the middle image (epoch 1, never observed --
-    // no session existed between the same-tick execs) admits and
-    // retires between the epoch-0 seal and the epoch-2 re-admission;
-    // only epochs 0 and 2 carry observations.
+    // no session existed between the same-tick execs) emits exactly
+    // one record — `Membership{retired, unobserved_transition,
+    // segment 0}` with the carried ledger — between the epoch-0
+    // seal and the epoch-2 re-admission; only epochs 0 and 2 carry
+    // observations.
+    let middle: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|r| r["incarnation"]["pid"] == pid && r["image_epoch"] == 1)
+        .collect();
+    assert_eq!(
+        middle.len(),
+        1,
+        "middle image emits exactly one record: {middle:?}"
+    );
+    assert_eq!(middle[0]["kind"], "membership");
+    assert_eq!(middle[0]["state"], "retired");
+    assert_eq!(middle[0]["reason"], "unobserved_transition");
+    assert_eq!(middle[0]["segment"], 0);
+    assert!(middle[0]["detail"].is_null());
+    assert!(middle[0]["loss"].is_object(), "carried ledger present");
     let pos = |pred: &dyn Fn(&serde_json::Value) -> bool| {
         rows.iter().position(pred).expect("ordered record")
     };
-    let seal0 = pos(&|r| r["kind"] == "process_observation" && r["image_epoch"] == 0);
-    let admit1 =
-        pos(&|r| r["kind"] == "membership" && r["image_epoch"] == 1 && r["state"] == "observing");
-    let retire1 =
-        pos(&|r| r["kind"] == "membership" && r["image_epoch"] == 1 && r["state"] == "retired");
-    let admit2 =
-        pos(&|r| r["kind"] == "membership" && r["image_epoch"] == 2 && r["state"] == "observing");
+    let seal0 = pos(&|r| {
+        r["kind"] == "process_observation"
+            && r["incarnation"]["pid"] == pid
+            && r["image_epoch"] == 0
+    });
+    let retire1 = pos(&|r| {
+        r["kind"] == "membership"
+            && r["incarnation"]["pid"] == pid
+            && r["image_epoch"] == 1
+            && r["state"] == "retired"
+    });
+    let admit2 = pos(&|r| {
+        r["kind"] == "membership"
+            && r["incarnation"]["pid"] == pid
+            && r["image_epoch"] == 2
+            && r["state"] == "observing"
+    });
     assert!(
-        seal0 < admit1 && admit1 < retire1 && retire1 < admit2,
+        seal0 < retire1 && retire1 < admit2,
         "middle image not sealed in drain order"
     );
     let mine = segments_by_pid(rows).remove(&pid).unwrap_or_default();
@@ -1586,12 +1664,15 @@ fn live_pids() -> usize {
 }
 
 /// Control 5 (PID reuse + adversarial): force recycling until the watched
-/// pid number is reused. Old incarnation retires first with
-/// `incarnation_changed` (prompt: receipt within 2 ticks of the oracle
-/// reuse instant); the new one joins as a stranger with empty history.
-/// Adversarial leg: the dead incarnation's EXIT is deliberately delivered
-/// after the pid number is recycled (SIGSTOP-held observer) -- it must
-/// quarantine, never retire the new member.
+/// pid number is reused. Old incarnation retires first (prompt: receipt
+/// within 2 ticks of the oracle reuse instant, in tick domain); the new
+/// one joins as a stranger with empty history. N12: the live leg
+/// accepts either correct seal (`incarnation_changed` when reuse wins
+/// the race, `event_exit` when a sample seals the death first).
+/// Adversarial leg: the dead incarnation's EXIT is deliberately
+/// delivered AFTER the replacement is admitted (SIGSTOP-held observer
+/// + fork bomblet ahead of the EXIT) -- it must quarantine as a
+/// thread-exit artifact, never retire the new member.
 #[test]
 fn control_5_pid_reuse_retires_before_stranger_join() {
     if live_pids() > 1500 {
@@ -1608,11 +1689,140 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
     };
     // Leg 1 (promptness, live observer): death + immediate reuse race.
     reuse_leg(&binary, false);
-    // Leg 2 (adversarial, SIGSTOP-held observer): the occupant's EXIT
-    // is queued while the observer is stopped and recycled + respawned
-    // past; first post-resume drain binds it against the recycled
-    // number -- Reused + quarantine, deterministically.
+    // Leg 2 (adversarial, SIGSTOP-held observer + bomblet): the
+    // occupant's EXIT queues BEHIND 320 bomblet datagrams while the
+    // observer is stopped; the first post-resume drain consumes
+    // bomblet only, the first post-resume sample seals the old
+    // incarnation (sample rules) and admits the replacement, and a
+    // later drain delivers the EXIT against the ADMITTED
+    // replacement -- artifact quarantine, deterministically.
     reuse_leg(&binary, true);
+}
+
+/// Resume the whole sudo+observer stack after a held leg's SIGSTOP
+/// (N12 helper, extracted verbatim): sudo suspends itself when its
+/// child stops (job-control emulation), so CONTing only the
+/// observer leaves sudo stopped -- it can never reap the observer
+/// and a later `wait()` hangs forever. CONT both, then poll both
+/// out of T (bounded; a stuck T here would hang the wait).
+fn resume_observer_stack(sudo_pid: u32, inner: u32) {
+    let cont = Command::new("sudo")
+        .args(["-n", "kill", "-CONT"])
+        .arg(inner.to_string())
+        .arg(sudo_pid.to_string())
+        .status()
+        .expect("spawn sudo kill -CONT");
+    assert!(
+        cont.success(),
+        "SIGCONT of observer {inner}/sudo {sudo_pid} failed"
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        let states: Vec<(u32, String)> = [inner, sudo_pid]
+            .iter()
+            .map(|p| {
+                let st = std::fs::read_to_string(format!("/proc/{p}/stat")).unwrap_or_default();
+                let s = st
+                    .rsplit(')')
+                    .next()
+                    .and_then(|s| s.split_whitespace().next())
+                    .unwrap_or("?")
+                    .to_string();
+                (*p, s)
+            })
+            .collect();
+        if states.iter().all(|(_, s)| s != "T") {
+            break;
+        }
+        assert!(
+            Instant::now() < end,
+            "observer stack stuck stopped after CONT: {states:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Raw fork child (N12 fast recycle): kill + reaping without `Child`.
+struct RawChild(u32);
+impl RawChild {
+    fn kill(&mut self) {
+        unsafe {
+            libc::kill(self.0 as i32, libc::SIGKILL);
+        }
+    }
+    fn wait(&mut self) {
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(self.0 as i32, &mut status, 0);
+        }
+    }
+}
+
+/// N12 fast pid recycle: tight fork loop until a child lands on
+/// `want`; the winner execs the eligible sleeper (holding the
+/// number atomically), losers `_exit` immediately. ~50µs per
+/// cycle (no exec except the winner) — recycling completes in a
+/// fraction of a sample gap WITHOUT the multi-second fork storm a
+/// spawn-per-pid loop causes (storm bind pressure stalls the
+/// sample clock ~3s, past the frozen 2-tick promptness bound).
+/// Returns (winner starttime, cycles). The child side uses only
+/// async-signal-safe calls (argv/envp prebuilt by the parent).
+fn recycle_pid_fast(
+    want: u32,
+    libcrypto: &str,
+    sleeper_secs: &str,
+    deadline: Instant,
+    cap: u32,
+) -> Option<(u64, u32)> {
+    use std::ffi::CString;
+    let sleep_path =
+        CString::new("/usr/bin/sleep").expect("sleep path should have no interior NUL");
+    let argv0 = CString::new("sleep").expect("argv0");
+    let argv1 = CString::new(sleeper_secs).expect("sleeper secs");
+    let preload =
+        CString::new(format!("LD_PRELOAD={libcrypto}")).expect("preload should have no NUL");
+    let argv = [argv0.as_ptr(), argv1.as_ptr(), std::ptr::null()];
+    let envp = [preload.as_ptr(), std::ptr::null()];
+    let mut cycles = 0u32;
+    loop {
+        if Instant::now() >= deadline || cycles >= cap {
+            return None;
+        }
+        cycles += 1;
+        let child = unsafe { libc::fork() };
+        if child < 0 {
+            return None;
+        }
+        if child == 0 {
+            let me = unsafe { libc::getpid() } as u32;
+            if me == want {
+                unsafe {
+                    libc::execve(sleep_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                    libc::_exit(127);
+                }
+            }
+            unsafe { libc::_exit(0) };
+        }
+        if child as u32 == want {
+            // Winner holds the number (exec'd sleeper — do NOT
+            // wait); verify it is really alive under our number.
+            if let Some(start) = starttime_of(want) {
+                return Some((start, cycles));
+            }
+            // Exec failed and the winner exited: the number is
+            // free again but the allocator moved on — reap the
+            // zombie and keep cycling (bounded).
+            let mut status = 0;
+            unsafe {
+                libc::waitpid(child, &mut status, 0);
+            }
+            continue;
+        }
+        let mut status = 0;
+        unsafe {
+            libc::waitpid(child, &mut status, 0);
+        }
+    }
 }
 
 /// One control-5 leg. `held`: SIGSTOP the observer across kill+respawn
@@ -1716,6 +1926,40 @@ fn reuse_leg(binary: &Path, held: bool) {
             Some("T"),
             "F14: observer {inner} not stopped (state {state:?}); held leg would be live"
         );
+        // N12 rephase: queue a fork bomblet AHEAD of the occupant's
+        // EXIT so the EXIT delivers AFTER the replacement is
+        // admitted. Each `true` child contributes one FORK + one
+        // EXIT datagram; 160 children = 320 datagrams ahead of the
+        // EXIT, and the port drains at most 256 per poll (FIFO) —
+        // so the first post-resume drain consumes bomblet only,
+        // the first post-resume sample seals the old incarnation
+        // and admits the replacement, and a later drain delivers
+        // the EXIT against the ADMITTED replacement (artifact
+        // quarantine). Premise: completions x 2 > 256, else the
+        // leg degrades to the old pre-admission delivery and must
+        // not run.
+        let mut bomblet_done = 0u32;
+        for _ in 0..160 {
+            let spawned = Command::new("true")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            let Ok(mut child) = spawned else {
+                break;
+            };
+            if child.wait().is_ok() {
+                bomblet_done += 1;
+            }
+        }
+        if bomblet_done * 2 <= 256 {
+            resume_observer_stack(observer.id(), inner);
+            let _ = observer.kill();
+            let _ = occupant.kill();
+            eprintln!("INCONCLUSIVE: bomblet shortfall ({bomblet_done}/160) cannot delay the EXIT");
+            return;
+        }
+        eprintln!("held bomblet queued {bomblet_done} children ahead of the EXIT");
     }
     occupant.kill().unwrap();
     occupant.wait().unwrap();
@@ -1727,86 +1971,30 @@ fn reuse_leg(binary: &Path, held: bool) {
         return;
     }
     let sleeper_secs = if held { "150" } else { "30" };
-    let mut reuser: Option<Child> = None;
     let reuse_deadline = Instant::now() + Duration::from_secs(60);
-    let mut spawns = 0u32;
-    let mut reused_start = 0u64;
-    while Instant::now() < reuse_deadline && spawns < 4096 {
-        spawns += 1;
-        let mut candidate = Command::new("env")
-            .arg(format!("LD_PRELOAD={libcrypto}"))
-            .arg("sleep")
-            .arg(sleeper_secs)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        if candidate.id() == pid {
-            reused_start = starttime_of(pid).unwrap_or(0);
-            reuser = Some(candidate);
-            break;
+    let recycled = recycle_pid_fast(pid, libcrypto, sleeper_secs, reuse_deadline, 4096);
+    let Some((reused_start, cycles)) = recycled else {
+        // N12: resume before leaving (a stopped orphaned
+        // observer would linger holding BPF + the squeeze).
+        if held {
+            if let Some(inner) = inner {
+                resume_observer_stack(observer.id(), inner);
+            }
         }
-        candidate.kill().unwrap();
-        candidate.wait().unwrap();
-    }
-    let mut reuser = match reuser {
-        Some(child) => child,
-        None => {
-            let _ = observer.kill();
-            eprintln!("INCONCLUSIVE: no reuse within {spawns} spawns");
-            return;
-        }
+        let _ = observer.kill();
+        eprintln!("INCONCLUSIVE: no reuse within 4096 fork cycles");
+        return;
     };
-    let reuse_at = Instant::now();
+    let mut reuser = RawChild(pid);
+    let reuse_ns = monotonic_ns();
     assert_ne!(reused_start, 0, "reused pid has no starttime?");
     assert_ne!(
         reused_start, old_start,
         "starttime did not advance on reuse"
     );
-    eprintln!("reused pid {pid} after {spawns} spawns (held={held})");
+    eprintln!("reused pid {pid} after {cycles} fork cycles (held={held})");
     if held {
-        let inner = inner.expect("held inner pid");
-        // Resume the WHOLE stack: sudo suspends itself when its child
-        // stops (job-control emulation), so CONTing only the observer
-        // leaves sudo stopped -- it can never reap the observer and the
-        // later `observer.wait()` hangs forever. CONT both, then poll
-        // both out of T (bounded; a stuck T here would hang the wait).
-        let sudo_pid = observer.id();
-        let cont = Command::new("sudo")
-            .args(["-n", "kill", "-CONT"])
-            .arg(inner.to_string())
-            .arg(sudo_pid.to_string())
-            .status()
-            .expect("spawn sudo kill -CONT");
-        assert!(
-            cont.success(),
-            "SIGCONT of observer {inner}/sudo {sudo_pid} failed"
-        );
-        let end = Instant::now() + Duration::from_secs(10);
-        loop {
-            let states: Vec<(u32, String)> = [inner, sudo_pid]
-                .iter()
-                .map(|p| {
-                    let st = std::fs::read_to_string(format!("/proc/{p}/stat")).unwrap_or_default();
-                    let s = st
-                        .rsplit(')')
-                        .next()
-                        .and_then(|s| s.split_whitespace().next())
-                        .unwrap_or("?")
-                        .to_string();
-                    (*p, s)
-                })
-                .collect();
-            if states.iter().all(|(_, s)| s != "T") {
-                break;
-            }
-            assert!(
-                Instant::now() < end,
-                "observer stack stuck stopped after CONT: {states:?}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        resume_observer_stack(observer.id(), inner.expect("held inner pid"));
     }
     // The observer may have exited during a slow respawn (duration is
     // observer-clock, the stop included) -- inconclusive, not failure.
@@ -1816,9 +2004,7 @@ fn reuse_leg(binary: &Path, held: bool) {
         return;
     }
     // Promptness (M10, live leg only -- the held observer was stopped,
-    // so harness-clock promptness is meaningless there): harness
-    // receipt of the retirement vs the oracle reuse instant, within
-    // 2 ticks + documented harness slack (loaded-box scan lag).
+    // so harness-clock promptness is meaningless there).
     if !held {
         let found = wait_for_record(&out, Duration::from_secs(30), &|r| {
             r["kind"] == "membership"
@@ -1826,24 +2012,39 @@ fn reuse_leg(binary: &Path, held: bool) {
                 && r["incarnation"]["starttime"] == old_start
                 && r["state"] == "retired"
         });
-        let Some((retire_row, receipt)) = found else {
+        let Some((retire_row, _receipt, receipt_ns)) = found else {
             let _ = observer.kill();
             let _ = reuser.kill();
             panic!("old incarnation never retired");
         };
-        assert_eq!(
-            retire_row["reason"], "incarnation_changed",
+        // N12: EITHER seal is correct. `incarnation_changed` when
+        // the reuse won the race (death + respawn inside one
+        // sample gap); `event_exit` when a sample sealed the death
+        // first (probe-Dead at seal proves the reuse had not
+        // completed yet — §1.3/§1.8). Forcing one path would need
+        // timing control the harness does not have (respawn
+        // latency vs the sample clock), so both are accepted.
+        let reason = retire_row["reason"].as_str().unwrap_or("?");
+        assert!(
+            reason == "incarnation_changed" || reason == "event_exit",
             "old incarnation retirement wrong: {retire_row}"
         );
-        let interval = start_clock(&read_rows_partial(&out))
-            .map(|(_, i)| i)
-            .unwrap_or(1_000_000_000);
-        let deadline = Duration::from_nanos(interval.saturating_mul(2))
-            .saturating_add(Duration::from_secs(10));
+        // Frozen promptness (D-record control 5: retirement within
+        // 2 ticks of oracle-observed reuse), checked in the
+        // observer's tick domain via the Start clock — no harness
+        // slack. For `event_exit` the seal structurally precedes
+        // reuse completion, so the same bound holds (receipt
+        // within a poll of the pre-reuse seal) and is checked
+        // uniformly.
+        let (origin, interval) = start_clock(&read_rows_partial(&out)).expect("start clock row");
+        let reuse_tick = tick_of(origin, interval, reuse_ns);
+        let receipt_tick = tick_of(origin, interval, receipt_ns);
         assert!(
-            receipt.saturating_duration_since(reuse_at) <= deadline,
-            "retirement not prompt: {:?} > {deadline:?}",
-            receipt.saturating_duration_since(reuse_at)
+            receipt_tick <= reuse_tick.saturating_add(2),
+            "retirement not prompt: receipt tick {receipt_tick} > reuse tick {reuse_tick} + 2"
+        );
+        eprintln!(
+            "live leg sealed via {reason} (receipt tick {receipt_tick}, reuse tick {reuse_tick})"
         );
     }
     let status = observer.wait().unwrap();
@@ -1855,23 +2056,50 @@ fn reuse_leg(binary: &Path, held: bool) {
     let _ = reuser.kill();
     let _ = reuser.wait();
     eprintln!("kinds: {:?}", kinds(&rows));
+    // N12 held guard: the rephase proves EXIT-after-admission only
+    // when no connector datagram was dropped — a dropped EXIT
+    // would make the quarantine assertion vacuous (bomblet exits
+    // quarantine too). Drops void the adversarial stimulus.
+    if held {
+        let drops = rows
+            .iter()
+            .find(|r| r["kind"] == "end")
+            .and_then(|e| e["session_loss"]["signal_dropped"].as_u64())
+            .unwrap_or(0);
+        if drops > 0 {
+            eprintln!(
+                "INCONCLUSIVE: held leg dropped {drops} connector datagrams (EXIT delivery unproven)"
+            );
+            return;
+        }
+    }
     let old_key = |r: &serde_json::Value| {
         r["incarnation"]["pid"] == pid as u64 && r["incarnation"]["starttime"] == old_start
     };
     let new_key = |r: &serde_json::Value| {
         r["incarnation"]["pid"] == pid as u64 && r["incarnation"]["starttime"] == reused_start
     };
-    // Old incarnation retired with incarnation_changed before any record
-    // for the new one.
+    // Old incarnation retired before any record for the new one —
+    // `incarnation_changed` on the held leg (reuse completed while
+    // stopped, so every post-resume sample sees the recycled
+    // number); either correct seal on the live leg (N12: the race
+    // decides, both seal correctly).
     let retire_seq = rows
         .iter()
         .position(|r| r["kind"] == "membership" && old_key(r) && r["state"] == "retired");
     let retire_reason = retire_seq.map(|i| rows[i]["reason"].as_str().unwrap_or("?"));
-    assert_eq!(
-        retire_reason,
-        Some("incarnation_changed"),
-        "old incarnation retirement wrong: {retire_reason:?}"
-    );
+    if held {
+        assert_eq!(
+            retire_reason,
+            Some("incarnation_changed"),
+            "old incarnation retirement wrong: {retire_reason:?}"
+        );
+    } else {
+        assert!(
+            retire_reason == Some("incarnation_changed") || retire_reason == Some("event_exit"),
+            "old incarnation retirement wrong: {retire_reason:?}"
+        );
+    }
     let first_new_seq = rows.iter().position(|r| {
         (r["kind"] == "membership" || r["kind"] == "process_observation") && new_key(r)
     });
@@ -1898,11 +2126,13 @@ fn reuse_leg(binary: &Path, held: bool) {
     if !held {
         assert!(old_total > 0, "occupant produced no counts (stimulus?)");
     } else {
-        // Held leg: the stop-gap socket Drops fence the old member's
-        // keys (F2 -- pre-gap baselines cannot span the gap), so its
-        // counts land in loss, not calls. Stimulus sanity here is
-        // calls==0 AND loss>0: the occupant was crypto-active (its
-        // counts were observed) and the fence held (none reported).
+        // Held leg: the post-resume reuse probe fences the old
+        // member at the pre-stop instant (F2 -- BPF kept counting
+        // across the stop gap, so the seal-time aggregates straddle
+        // the edge), so its counts land in loss, not calls.
+        // Stimulus sanity here is calls==0 AND loss>0: the occupant
+        // was crypto-active (its counts were observed) and the
+        // fence held (none reported).
         let old_loss = old_segs[0]["loss"]["loss"].as_u64().unwrap_or(0);
         assert_eq!(
             old_total, 0,
@@ -2036,15 +2266,13 @@ fn bpftool_admitted_total() -> Option<u64> {
     }
     found.then_some(total)
 }
-/// 6A direct map oracle (§1.2): `(tgid, tid)` keys present in the
-/// live API_THREADS map (24-byte `ApiThreadKey`: pid[0..4]
-/// tid[4..8] LE -- generation/cookie ignored). Rows are transient
-/// (removed when depth returns to 0): presence mid-spin proves
-/// appearance, absence at end proves removal. `None`
-/// (INCONCLUSIVE) when the oracle is unavailable or ambiguous
-/// (zero or several maps).
-fn bpftool_apithread_keys() -> Option<Vec<(u32, u32)>> {
-    let ids = bpftool_map_ids("API_THREADS")?;
+/// 6A direct map oracle (§1.2): `(tgid, tid)` keys present in a
+/// live pairing map. Both maps share the `(pid, tid)` 8-byte LE
+/// key prefix (`ThreadKey` / `ApiThreadKey` — generation/cookie
+/// ignored). `None` (INCONCLUSIVE) when the oracle is
+/// unavailable or ambiguous (zero or several maps).
+fn bpftool_pairing_keys(map: &str) -> Option<Vec<(u32, u32)>> {
+    let ids = bpftool_map_ids(map)?;
     if ids.len() != 1 {
         return None;
     }
@@ -2077,6 +2305,56 @@ fn bpftool_apithread_keys() -> Option<Vec<(u32, u32)>> {
     }
     Some(keys)
 }
+/// N10 persistent-cleanup oracle: `(tgid, tid)` keys present in
+/// the live THREADS map. THREADS rows are persistent — BPF never
+/// removes them (only the host exit cleanup deletes rows) — so
+/// the harness injects a synthetic row for a live tid and proves
+/// the host deleted it after the exit. (API_THREADS rows are
+/// transient — removed by BPF on normal return — so they cannot
+/// prove host cleanup.)
+fn bpftool_thread_keys() -> Option<Vec<(u32, u32)>> {
+    bpftool_pairing_keys("THREADS")
+}
+/// Live tids of `pid` (leader included) via the task dir.
+fn task_tids(pid: u32) -> Vec<u32> {
+    std::fs::read_dir(format!("/proc/{pid}/task"))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| e.file_name().to_string_lossy().parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+/// Whether `tid` still has a task entry under `pid`.
+fn task_alive(pid: u32, tid: u32) -> bool {
+    std::fs::metadata(format!("/proc/{pid}/task/{tid}")).is_ok()
+}
+/// Inject a synthetic zero-valued `ThreadKey(pid, tid, gen 0)` row
+/// into the THREADS map `id`. The host never reads these rows
+/// (cleanup-only) and BPF self-heals a zero state on the next
+/// hit, so the row is inert until the exit cleanup deletes it.
+fn inject_thread_row(map_id: &str, pid: u32, tid: u32) -> bool {
+    let mut key = Vec::with_capacity(16);
+    key.extend_from_slice(&pid.to_le_bytes());
+    key.extend_from_slice(&tid.to_le_bytes());
+    key.extend_from_slice(&0u64.to_le_bytes());
+    let value = [0u8; 16];
+    let hex: Vec<String> = key
+        .iter()
+        .chain(value.iter())
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    // bpftool takes one argv token per hex byte after each `hex`.
+    Command::new("sudo")
+        .args(["-n", "bpftool", "map", "update", "id", map_id])
+        .args(["key", "hex"])
+        .args(&hex[..16])
+        .args(["value", "hex"])
+        .args(&hex[16..])
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
 /// Tick clock from the `start` row (§7): `(run_origin_ns,
 /// interval_ns)`. `None` when the row is missing/malformed.
 fn start_clock(rows: &[serde_json::Value]) -> Option<(u64, u64)> {
@@ -2097,7 +2375,10 @@ fn tick_of(origin: u64, interval: u64, ns: u64) -> u64 {
 /// 6A interval-specific shortfall (M3): some lost window — the
 /// segment's own loss or the session carrier — intersects the
 /// stimulus tick span `[t0, t1]`. A shortfall explained only by an
-/// unknown marker elsewhere is NOT covered.
+/// unknown marker elsewhere is NOT covered. N11: actual
+/// intersection of the half-open loss window `[s, e)` with the
+/// inclusive stimulus span — no slack: a window starting one tick
+/// past the stimulus covers nothing in it.
 fn shortfall_covered(
     rows: &[serde_json::Value],
     segment: &serde_json::Value,
@@ -2125,9 +2406,7 @@ fn shortfall_covered(
             }
         }
     }
-    spans
-        .iter()
-        .any(|(s, e)| *s <= t1.saturating_add(1) && *e > t0)
+    spans.iter().any(|(s, e)| *s <= t1 && *e > t0)
 }
 /// Wait for the first record matching `pred`, returning the row and
 /// the harness receipt time (M10 promptness: receipt vs oracle
@@ -2136,14 +2415,17 @@ fn wait_for_record(
     outfile: &Path,
     timeout: Duration,
     pred: &dyn Fn(&serde_json::Value) -> bool,
-) -> Option<(serde_json::Value, Instant)> {
+) -> Option<(serde_json::Value, Instant, u64)> {
     let end = Instant::now() + timeout;
     while Instant::now() < end {
         let text = fs::read_to_string(outfile).unwrap_or_default();
         for line in text.lines() {
             if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
                 if pred(&row) {
-                    return Some((row, Instant::now()));
+                    // N12: receipt in both harness-clock (Instant)
+                    // and producer-clock (ns) domains — promptness
+                    // maps through the Start tick clock.
+                    return Some((row, Instant::now(), monotonic_ns()));
                 }
             }
         }
@@ -3169,6 +3451,8 @@ fn control_9b_cgroup_move_stays_with_unknown_window() {
     let root = PathBuf::from("/sys/fs/cgroup/ossl-6a-cgroup");
     let sub_a = root.join("sub_a");
     let sub_b = root.join("sub_b");
+    // N1: a sibling OUTSIDE the watched root for the move-out leg.
+    let outside = PathBuf::from("/sys/fs/cgroup/ossl-6a-outside");
     let sudo = |args: &[&str]| {
         Command::new("sudo")
             .arg("-n")
@@ -3177,11 +3461,12 @@ fn control_9b_cgroup_move_stays_with_unknown_window() {
             .unwrap()
             .success()
     };
-    for stale in [&sub_a, &sub_b, &root] {
+    for stale in [&sub_a, &sub_b, &root, &outside] {
         sudo(&["rmdir", &stale.to_string_lossy()]);
     }
     if !sudo(&["mkdir", "-p", &sub_a.to_string_lossy()])
         || !sudo(&["mkdir", "-p", &sub_b.to_string_lossy()])
+        || !sudo(&["mkdir", "-p", &outside.to_string_lossy()])
     {
         eprintln!("INCONCLUSIVE: cgroup delegation refused");
         return;
@@ -3207,6 +3492,7 @@ fn control_9b_cgroup_move_stays_with_unknown_window() {
         sudo(&["rmdir", &sub_a.to_string_lossy()]);
         sudo(&["rmdir", &sub_b.to_string_lossy()]);
         sudo(&["rmdir", &root.to_string_lossy()]);
+        sudo(&["rmdir", &outside.to_string_lossy()]);
         eprintln!("INCONCLUSIVE: cgroup placement refused");
         return;
     }
@@ -3220,7 +3506,7 @@ fn control_9b_cgroup_move_stays_with_unknown_window() {
             "--cgroup",
             &root.to_string_lossy(),
             "--duration",
-            "10",
+            "16",
             "--json",
         ],
         &out,
@@ -3239,14 +3525,29 @@ fn control_9b_cgroup_move_stays_with_unknown_window() {
         &format!("echo {pid} > {}", sub_b.join("cgroup.procs").display()),
     ]);
     std::thread::sleep(Duration::from_secs(3));
+    // N1 move-out leg (D-record §1.6): out of the watched root —
+    // the next stable sample drops the incarnation (departure),
+    // even though the member is followed. Settle three ticks so
+    // the excluded tick plus the departure tick both land.
+    let moved_out = sudo(&[
+        "sh",
+        "-c",
+        &format!("echo {pid} > {}", outside.join("cgroup.procs").display()),
+    ]);
+    std::thread::sleep(Duration::from_secs(4));
     let status = observer.wait().unwrap();
     let _ = member.kill();
     let _ = member.wait();
     sudo(&["rmdir", &sub_a.to_string_lossy()]);
     sudo(&["rmdir", &sub_b.to_string_lossy()]);
     sudo(&["rmdir", &root.to_string_lossy()]);
+    sudo(&["rmdir", &outside.to_string_lossy()]);
     if !moved {
         eprintln!("INCONCLUSIVE: cgroup move refused");
+        return;
+    }
+    if !moved_out {
+        eprintln!("INCONCLUSIVE: cgroup move-out refused");
         return;
     }
     assert!(
@@ -3297,6 +3598,30 @@ fn control_9b_cgroup_move_stays_with_unknown_window() {
         })
         .collect();
     assert!(!windows.is_empty(), "inter-tick move window not unknown");
+    // N1 move-out leg: leaving the watched root departs (the next
+    // stable sample drops the incarnation) — following never
+    // promotes the followed member into scoped membership. The
+    // retirement is a mid-run departure, not the end-of-run seal,
+    // and the incarnation is forgotten (never re-admitted outside
+    // its root).
+    let retires: Vec<&serde_json::Value> = rows
+        .iter()
+        .filter(|r| {
+            r["kind"] == "membership"
+                && r["incarnation"]["pid"] == pid as u64
+                && r["state"] == "retired"
+        })
+        .collect();
+    assert_eq!(
+        retires.len(),
+        1,
+        "move-out member must retire exactly once: {retires:?}"
+    );
+    assert_eq!(
+        retires[0]["reason"], "sampled_removal",
+        "move-out must depart, not seal at close: {}",
+        retires[0]["reason"]
+    );
 }
 
 /// Control 9c (namespace): mount-ns change retires the old incarnation and

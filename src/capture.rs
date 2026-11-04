@@ -51,10 +51,10 @@ use crate::discovery::session::{
 use crate::discovery::{coverage, elf, legacy, maps, onboard};
 use crate::evidence::{
     self, CandidateCoverage, CandidateIdentity, CaptureContext, CaptureDocument, CaptureWindow,
-    Completeness, CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation,
-    EngineWindow, ExpectedScope, FencedGeneration, FinalizeInput, GapCounter, GapReason,
-    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
-    SiteKey, TargetRecord,
+    Completeness, CorpseWaitSpan, CounterKind, CounterSource, CounterUnits, DispositionRecord,
+    EngineObservation, EngineWindow, ExpectedScope, FencedGeneration, FinalizeInput, GapCounter,
+    GapReason, LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage,
+    SiteExecution, SiteKey, TargetRecord,
 };
 use crate::scan::backend::{BackendAction as ScanAction, ScanBackend};
 use crate::scan::oracle::{Finding, Outcome as ScanOutcome, WalkDone};
@@ -464,6 +464,7 @@ pub struct Capture {
 /// captures always carry the finalized document).
 pub fn empty_document() -> CaptureDocument {
     evidence::finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 0,
@@ -6062,6 +6063,11 @@ struct RunnerState<D, B: CountBackend, L> {
     reaped_before_close: bool,
     signal_cut: bool,
     expired: bool,
+    /// 6A §1.3 owned-corpse retirement span (N13): `Some` iff the
+    /// corpse wait expired with the member still unreaped and maps
+    /// still empty. Flows into `FinalizeInput::corpse_wait` (typed
+    /// `VisibilityLost` reason + membership `Retired`).
+    corpse_wait: Option<CorpseWaitSpan>,
     fallback_partial: bool,
     window_start_ns: u64,
     requested_start_ns: u64,
@@ -6834,6 +6840,9 @@ where
                 return Ok(RoundAction::Closed);
             }
             let waited_from = self.clock.now();
+            // N13: monotonic endpoints for the frozen §1.3 corpse
+            // span (interval evidence, never a bare counter).
+            let wait_start_ns = self.clock.monotonic_ns();
             while self.clock.now().saturating_duration_since(waited_from) < CORPSE_WAIT {
                 self.clock.sleep(Duration::from_millis(1));
                 // Settle before each wait poll: the exit may land
@@ -6844,20 +6853,21 @@ where
                     return Ok(RoundAction::Closed);
                 }
             }
-            // 6A owned-corpse retirement (§1.3): the wait expired
-            // with the member still unreaped and maps still empty —
-            // retire with `visibility_lost` (sealed document via the
-            // close below; the loss counter marks the corpse span,
-            // never invented zero counts), instead of continuing
-            // into snapshot/fence processing. Retirement never
-            // signals: custody stays with the target state machine.
-            self.state.extra_counters.push(typed_counter(
-                "capture.corpse_wait_expired",
-                CounterKind::Loss,
-                CounterUnits::Events,
-                CounterSource::Lifecycle,
-                1,
-            ));
+            // 6A owned-corpse retirement (§1.3, N13): the wait
+            // expired with the member still unreaped and maps still
+            // empty — retire with `visibility_lost` (sealed document
+            // via the close below; the span joins the evidence as a
+            // typed interval with cause `corpse_wait` plus the
+            // membership `Retired` record, never invented zero
+            // counts), instead of continuing into snapshot/fence
+            // processing. Retirement never signals: custody stays
+            // with the target state machine.
+            let wait_end_ns = self.clock.monotonic_ns();
+            self.state.corpse_wait = Some(CorpseWaitSpan {
+                start_ns: wait_start_ns,
+                end_ns: wait_end_ns,
+            });
+            self.reason("visibility_lost");
             return Ok(RoundAction::Closed);
         }
         let mut fresh = HashSet::new();
@@ -7291,6 +7301,7 @@ where
         let recycled_start =
             effective_start_ns(self.state.window_start_ns, self.state.requested_start_ns);
         let mut document = evidence::finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: self.state.requested_start_ns,
                 requested_end_ns: requested_end,
@@ -7651,6 +7662,7 @@ fn open_runner_state<D, B: CountBackend, L: LifecyclePort, C: ClockPort>(
         reaped_before_close: false,
         signal_cut: false,
         expired: false,
+        corpse_wait: None,
         fallback_partial: false,
         window_start_ns: start_ns,
         requested_start_ns: if info.owned {
@@ -9614,6 +9626,9 @@ where
         );
         let call_partition = partition_calls(&drain.current, &drain.fenced, &legacy_files);
         let mut document = evidence::finalize(FinalizeInput {
+            // N13: owned-corpse retirement span (None on every
+            // non-retired capture).
+            corpse_wait: self.state.corpse_wait,
             window,
             sites: drain.current.clone(),
             fenced: drain.fenced.clone(),
@@ -9865,6 +9880,7 @@ where
                 GapReason::StartupGap { .. } => self.reason("startup-gap"),
                 GapReason::TailGap { .. } => self.reason("tail-gap"),
                 GapReason::SignalCut => self.reason("interrupted"),
+                GapReason::VisibilityLost { .. } => self.reason("visibility_lost"),
             }
         }
     }
@@ -10013,6 +10029,7 @@ fn recycled_capture(
 ) -> Capture {
     let requested_end = info.acquired_ns.saturating_add(duration_ns(cfg.duration));
     let mut document = evidence::finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: info.acquired_ns,
             requested_end_ns: requested_end,
@@ -15088,6 +15105,7 @@ pub(crate) mod tests {
         use super::*;
         use crate::count_session::{CountDelta, FakeCountBackend};
         use crate::evidence::FencedGeneration;
+        use crate::evidence::MembershipState;
         use std::cell::Cell;
 
         const TPID: u32 = 424242;
@@ -16873,6 +16891,7 @@ pub(crate) mod tests {
                     reaped_before_close: false,
                     signal_cut: false,
                     expired: false,
+                    corpse_wait: None,
                     fallback_partial: false,
                     window_start_ns: programmed.start_ns(),
                     requested_start_ns: requested_start,
@@ -19304,6 +19323,100 @@ pub(crate) mod tests {
                 &cancelled,
             )
             .expect("stubbed capture runs end to end")
+        }
+
+        #[test]
+        fn n13_owned_corpse_expiry_retires_visibility_lost_with_window_and_membership() {
+            // N13 (fails pre-fix): owned + empty maps + never-reaped
+            // ⇒ corpse-wait expiry retires with the frozen §1.3
+            // evidence — typed reason + interval window + membership
+            // record — never a bare loss counter, never invented
+            // counts.
+            let cfg = stub_config();
+            let mut info = stub_info();
+            info.owned = true;
+            info.kernel_release = "6.9.0-test".to_string();
+            info.acquired_wall = WallScriptClock::wall_at(0);
+            let clock = WallScriptClock::at(5_000_000_000);
+            // Empty maps: the owned target is a corpse. TargetStub
+            // never reaps (poll_exit always None), so the 100ms
+            // wait expires through the scripted clock.
+            let mut proc = ProcStub;
+            let cancelled = || false;
+            let count = CountSession::new(TPID, FakeCountBackend::new());
+            let cap = observe(
+                &cfg,
+                &info,
+                SessionSet {
+                    discovery: DiscoveryStub {
+                        finish_err: false,
+                        poll_err: false,
+                        dispatch_attached: false,
+                        trip_set: None,
+                    },
+                    count,
+                    target: TargetStub,
+                    lifecycle: LifecycleStub,
+                },
+                &clock,
+                &mut proc,
+                &cancelled,
+            )
+            .expect("stubbed corpse capture runs end to end");
+            // Reason + window: typed, interval-shaped, sane span.
+            let Completeness::Partial { reasons } = &cap.document.status else {
+                panic!("corpse expiry must be PARTIAL: {:?}", cap.document.status);
+            };
+            let found = reasons.iter().find_map(|r| match r {
+                GapReason::VisibilityLost {
+                    cause,
+                    start_ns,
+                    end_ns,
+                } => Some((cause.clone(), *start_ns, *end_ns)),
+                _ => None,
+            });
+            let Some((cause, start_ns, end_ns)) = found else {
+                panic!("typed visibility_lost reason missing: {reasons:?}");
+            };
+            assert_eq!(cause, "corpse_wait");
+            assert_eq!(
+                end_ns - start_ns,
+                100_000_000,
+                "span is exactly the 100ms wait"
+            );
+            assert!(
+                start_ns >= 5_000_000_000,
+                "span opens inside the window: {start_ns}"
+            );
+            // Membership leg: retired, exactly once.
+            assert_eq!(
+                cap.document.membership.map(|m| m.state),
+                Some(MembershipState::Retired),
+                "membership must retire"
+            );
+            // Compat vocabulary + outcome.
+            assert!(
+                cap.reasons.iter().any(|r| r == "visibility_lost"),
+                "compat reasons name the retirement: {:?}",
+                cap.reasons
+            );
+            assert!(
+                matches!(cap.outcome, Outcome::Partial),
+                "outcome: {:?}",
+                cap.outcome
+            );
+            // No counter substitute, no invented counts.
+            assert!(
+                !cap.document
+                    .counters
+                    .iter()
+                    .any(|c| c.name == "capture.corpse_wait_expired"),
+                "bare counter must not substitute for typed evidence"
+            );
+            assert!(
+                cap.document.sites.iter().all(|s| s.calls == 0),
+                "retirement claims no counts"
+            );
         }
 
         #[test]

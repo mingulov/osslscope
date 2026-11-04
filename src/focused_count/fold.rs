@@ -45,6 +45,12 @@ struct FenceState {
     post_gen: u32,
     withheld: u64,
     hw: BTreeMap<(u32, u32), u64>,
+    /// N2 recovery: the uncertainty span is sealed (its withheld
+    /// total + high-water stay in the ledger) and the edge is
+    /// closed — post-recovery rows project instead of
+    /// withholding. High-water routing for retired keys stays
+    /// active; a later `note_fence` re-arms with a fresh guard.
+    edge_closed: bool,
 }
 /// Bounded pure host folding and attachment admission. The install closure is
 /// called once per new physical site; a refusal never publishes a successful row.
@@ -88,9 +94,33 @@ impl CountFold {
     /// and proceeds unrotated — timestamps still protect, since
     /// merged post-edge hits only widen aggregates into straddling.
     pub(super) fn note_fence(&mut self, edge_ns: u64) -> u32 {
-        if let Some(post_gen) = self.fence.as_ref().map(|f| f.post_gen) {
-            let tighten = self.fence.as_ref().is_some_and(|f| edge_ns < f.edge_ns);
-            if tighten {
+        if let Some(f) = self.fence.as_ref() {
+            // N2 re-arm after recovery: the sealed history (withheld
+            // total + high-water) is kept, but the guard rotates
+            // fresh — reusing the first post-fence generation for
+            // new post-edge hits would alias two uncertainty spans
+            // under one high-water key.
+            if f.edge_closed {
+                let fenced_gen = self.generation;
+                let post_gen = match self.generation.checked_add(1) {
+                    Some(g) => g,
+                    None => {
+                        self.gap("focused_fence_gen_exhausted");
+                        fenced_gen
+                    }
+                };
+                self.generation = post_gen;
+                if let Some(f) = self.fence.as_mut() {
+                    f.edge_ns = edge_ns;
+                    f.fenced_gen = fenced_gen;
+                    f.post_gen = post_gen;
+                    f.edge_closed = false;
+                }
+                self.sweep_fence();
+                return post_gen;
+            }
+            let post_gen = f.post_gen;
+            if edge_ns < f.edge_ns {
                 if let Some(f) = self.fence.as_mut() {
                     f.edge_ns = edge_ns;
                 }
@@ -113,9 +143,20 @@ impl CountFold {
             post_gen,
             withheld: 0,
             hw: BTreeMap::new(),
+            edge_closed: false,
         });
         self.sweep_fence();
         post_gen
+    }
+    /// N2 bounded recovery: seal the uncertainty span into the
+    /// ledger (the withheld total + high-water persist and keep
+    /// reporting) and close the edge so post-recovery rows
+    /// project. Only the counter's retired→live reattach calls
+    /// this; every other post-fence path seals instead. Idempotent.
+    pub(super) fn recover_fence(&mut self) {
+        if let Some(f) = self.fence.as_mut() {
+            f.edge_closed = true;
+        }
     }
     /// Withhold every currently-straddling row (fence arm + edge
     /// tightening). Idempotent: withheld rows are removed, so a
@@ -295,6 +336,37 @@ impl CountFold {
                 cookie
             }
         };
+        // N3: a pinned reattach overwriting a retired same-site row
+        // conserves that row's key in the fence high-water (when a
+        // fence exists): a late first read of the old generation
+        // then accrues as withheld growth, never as foreign. The
+        // prior calls join the withheld total — the row is gone,
+        // so projection is impossible and dropping would violate
+        // conservation. Cap-checked before `install` (fail before
+        // side effects, like the byte charge above).
+        let overwrite = match (pinned, self.rows.get(&cookie)) {
+            (Some(_), Some(old))
+                if old.row.generation != self.generation && self.fence.is_some() =>
+            {
+                Some(((cookie, old.row.generation), old.row.calls))
+            }
+            _ => None,
+        };
+        let seed = match overwrite {
+            Some((key, calls))
+                if self
+                    .fence
+                    .as_ref()
+                    .is_some_and(|f| !f.hw.contains_key(&key)) =>
+            {
+                if self.fence.as_ref().map(|f| f.hw.len()).unwrap_or(0) >= self.limits.max_keys {
+                    return Err(CountFailure::Resource);
+                }
+                self.charge(96)?;
+                Some((key, calls))
+            }
+            _ => None,
+        };
         // Errors are returned to the owner, which records one failure gap.
         install(cookie, self.generation)?;
         self.rows.insert(
@@ -314,6 +386,12 @@ impl CountFold {
                 },
             },
         );
+        if let Some(((seed_cookie, seed_gen), seed_calls)) = seed {
+            if let Some(f) = self.fence.as_mut() {
+                f.withheld = f.withheld.saturating_add(seed_calls);
+                f.hw.insert((seed_cookie, seed_gen), seed_calls);
+            }
+        }
         self.session = Some(binding.session_generation);
         Ok((cookie, self.generation))
     }
@@ -424,8 +502,14 @@ impl CountFold {
         if matches!(action, RowAction::Set) {
             // 6A: a row observed straddling the fence edge is
             // withheld whole immediately (removed; later growth
-            // accrues via the high-water branch above).
-            let edge_ns = self.fence.as_ref().map(|f| f.edge_ns);
+            // accrues via the high-water branch above). N2: a
+            // closed (recovered) edge withholds nothing — the
+            // span is sealed and post-recovery rows project.
+            let edge_ns = self
+                .fence
+                .as_ref()
+                .filter(|f| !f.edge_closed)
+                .map(|f| f.edge_ns);
             if let Some(edge_ns) = edge_ns {
                 if last >= edge_ns && calls > 0 {
                     self.rows.remove(&cookie);
@@ -672,6 +756,270 @@ mod tests {
         );
         let keys = std::collections::BTreeSet::from([(cookie, generation)]);
         assert!(fold.validate_final_keys(&keys).is_ok());
+    }
+    #[test]
+    fn recovered_generation_projects_after_fence_recovery() {
+        // N2: suspend (fence + retire) seals the straddling
+        // aggregate; recovery reattaches the retained site under a
+        // fresh generation and closes the edge. Post-recovery rows
+        // project; the sealed span stays in the ledger.
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let site = SiteKey {
+            object: ObjectId("c".repeat(64)),
+            device: 1,
+            inode: 2,
+            offset: 3,
+        };
+        let binding = |session| SiteBinding {
+            site: site.clone(),
+            session_generation: session,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, gen1) = fold.attach(binding(1), |_, _| Ok(())).unwrap();
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 7,
+                first_ns: 2,
+                last_ns: 10,
+            }],
+        )
+        .unwrap();
+        fold.note_fence(5);
+        fold.fence().unwrap();
+        fold.recover_fence();
+        let (cookie2, gen3) = fold
+            .attach_pinned(binding(2), cookie, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(cookie2, cookie);
+        assert_ne!(gen3, gen1);
+        fold.observe(
+            cookie,
+            gen3,
+            &[CountValue {
+                count: 4,
+                first_ns: 20,
+                last_ns: 30,
+            }],
+        )
+        .unwrap();
+        let s = fold.sample();
+        assert_eq!(
+            s.fence_withheld, 7,
+            "pre-fence span sealed, not re-withheld"
+        );
+        assert_eq!(s.unattributed, 0, "no foreign leak");
+        let projected: u64 = s.sites.iter().map(|r| r.calls).sum();
+        assert_eq!(projected, 4, "post-recovery rows project");
+        // A late reread of the sealed key still accrues as withheld
+        // growth (zero delta), never as foreign.
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 7,
+                first_ns: 2,
+                last_ns: 10,
+            }],
+        )
+        .unwrap();
+        let s = fold.sample();
+        assert_eq!(s.fence_withheld, 7);
+        assert_eq!(s.unattributed, 0);
+    }
+    #[test]
+    fn unrecovered_reattach_keeps_withholding() {
+        // N2 mechanism pin: without the recovery step the edge stays
+        // armed and post-reattach rows keep withholding (fail-closed;
+        // recovery is what releases them).
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let site = SiteKey {
+            object: ObjectId("d".repeat(64)),
+            device: 1,
+            inode: 2,
+            offset: 3,
+        };
+        let binding = |session| SiteBinding {
+            site: site.clone(),
+            session_generation: session,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, gen1) = fold.attach(binding(1), |_, _| Ok(())).unwrap();
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 7,
+                first_ns: 2,
+                last_ns: 10,
+            }],
+        )
+        .unwrap();
+        fold.note_fence(5);
+        fold.fence().unwrap();
+        let (_, gen3) = fold
+            .attach_pinned(binding(2), cookie, |_, _| Ok(()))
+            .unwrap();
+        fold.observe(
+            cookie,
+            gen3,
+            &[CountValue {
+                count: 4,
+                first_ns: 20,
+                last_ns: 30,
+            }],
+        )
+        .unwrap();
+        let s = fold.sample();
+        assert_eq!(s.fence_withheld, 11, "unrecovered rows withhold");
+        assert!(s.sites.is_empty());
+    }
+    #[test]
+    fn second_fence_after_recovery_rotates_guard() {
+        // N2: a second suspend after recovery re-arms with a FRESH
+        // guard generation (never reuses the first post-fence
+        // generation) while keeping the sealed history.
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let site = SiteKey {
+            object: ObjectId("e".repeat(64)),
+            device: 1,
+            inode: 2,
+            offset: 3,
+        };
+        let binding = |session| SiteBinding {
+            site: site.clone(),
+            session_generation: session,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, gen1) = fold.attach(binding(1), |_, _| Ok(())).unwrap();
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 7,
+                first_ns: 2,
+                last_ns: 10,
+            }],
+        )
+        .unwrap();
+        let post1 = fold.note_fence(5);
+        fold.fence().unwrap();
+        fold.recover_fence();
+        let (_, gen3) = fold
+            .attach_pinned(binding(2), cookie, |_, _| Ok(()))
+            .unwrap();
+        fold.observe(
+            cookie,
+            gen3,
+            &[CountValue {
+                count: 4,
+                first_ns: 20,
+                last_ns: 30,
+            }],
+        )
+        .unwrap();
+        let post2 = fold.note_fence(25);
+        assert_ne!(post2, post1, "re-arm rotates the guard");
+        let s = fold.sample();
+        assert_eq!(s.fence_withheld, 11, "both spans sealed");
+        assert!(s.sites.is_empty());
+    }
+    #[test]
+    fn pinned_reattach_before_first_read_withholds_old_key() {
+        // N3: the old-generation aggregate is first read AFTER its
+        // pinned cookie is reattached. The retired key spans the
+        // edge, so it withholds — never foreign.
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let site = SiteKey {
+            object: ObjectId("f".repeat(64)),
+            device: 1,
+            inode: 2,
+            offset: 3,
+        };
+        let binding = |session| SiteBinding {
+            site: site.clone(),
+            session_generation: session,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, gen1) = fold.attach(binding(1), |_, _| Ok(())).unwrap();
+        fold.note_fence(5);
+        fold.fence().unwrap();
+        let (_, gen3) = fold
+            .attach_pinned(binding(2), cookie, |_, _| Ok(()))
+            .unwrap();
+        assert_ne!(gen3, gen1);
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 7,
+                first_ns: 2,
+                last_ns: 10,
+            }],
+        )
+        .unwrap();
+        let s = fold.sample();
+        assert_eq!(s.fence_withheld, 7, "straddling retired read withholds");
+        assert_eq!(s.unattributed, 0, "never foreign");
+    }
+    #[test]
+    fn pinned_overwrite_conserves_prior_calls() {
+        // N3: overwriting a retired row conserves its prior calls in
+        // the ledger (the row is gone, so projection is impossible;
+        // dropping would violate conservation). A later reread
+        // accrues only its delta.
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let site = SiteKey {
+            object: ObjectId("0".repeat(64)),
+            device: 1,
+            inode: 2,
+            offset: 3,
+        };
+        let binding = |session| SiteBinding {
+            site: site.clone(),
+            session_generation: session,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, gen1) = fold.attach(binding(1), |_, _| Ok(())).unwrap();
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 5,
+                first_ns: 2,
+                last_ns: 3,
+            }],
+        )
+        .unwrap();
+        fold.note_fence(5);
+        fold.fence().unwrap();
+        fold.attach_pinned(binding(2), cookie, |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(fold.sample().fence_withheld, 5, "prior calls conserved");
+        fold.observe(
+            cookie,
+            gen1,
+            &[CountValue {
+                count: 8,
+                first_ns: 2,
+                last_ns: 10,
+            }],
+        )
+        .unwrap();
+        let s = fold.sample();
+        assert_eq!(s.fence_withheld, 8, "reread accrues its delta only");
+        assert_eq!(s.unattributed, 0);
     }
     #[test]
     fn count_generation_exhaustion_is_permanent() {

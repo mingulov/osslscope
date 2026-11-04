@@ -282,6 +282,7 @@ pub fn project(
         }
     }
     let mut document = crate::evidence::finalize(FinalizeInput {
+        corpse_wait: None,
         window,
         sites: sample.sites,
         fenced: fenced
@@ -730,6 +731,57 @@ pub(crate) enum SessionProgress {
     Unverifiable,
 }
 impl FocusedSession {
+    /// Hollow session for coordinator unit tests (N7/N8b/N13): no
+    /// links, no maps, no custody — seal/close paths project empty
+    /// documents without touching BPF or `/proc`. Test-only; never
+    /// shipped (`#[cfg(test)]`).
+    #[cfg(test)]
+    pub(crate) fn hollow_for_coordinator_tests(
+        pid: u32,
+        starttime: u64,
+        namespaces: crate::inventory::NamespaceIds,
+        pool: &crate::observation_memory::MemoryPool,
+    ) -> Self {
+        Self {
+            gate: None,
+            counter: None,
+            session: None,
+            _foreign: None,
+            owned: None,
+            pid,
+            starttime,
+            namespaces,
+            scanner: crate::inventory::scope::ScopedScanner::new(
+                crate::inventory::scope::Selection {
+                    pids: vec![pid],
+                    ..Default::default()
+                },
+                crate::inventory::Limits::default(),
+            )
+            .expect("pid-only scanner selection"),
+            initial_metadata: None,
+            pending: None,
+            exec_pending: Vec::new(),
+            refresh_pending: Vec::new(),
+            last_clean_drain_ns: 0,
+            gaps: std::collections::BTreeSet::new(),
+            attach_diagnostics: std::collections::BTreeSet::new(),
+            engine: EnginePlane::new(),
+            state_bytes: 0,
+            inventory_gaps: 0,
+            sample: crate::focused_count::CountSample::default(),
+            next_snapshot: std::time::Instant::now(),
+            ready: false,
+            start_ns: 0,
+            deadline_ns: 0,
+            end: std::time::Instant::now(),
+            wall_start: None,
+            signal_cut: false,
+            workload_discarded: false,
+            sysctls: None,
+            _reservation: pool.reserve(1024).expect("hollow lease"),
+        }
+    }
     /// Persistent host ceilings plus bounded scanner/pins/argv, source bytes,
     /// and map payload/entry overhead. Temporary ELF bytes and parser metadata
     /// are leased separately on the same pool before allocation.
@@ -1931,13 +1983,21 @@ impl FocusedSession {
             .unwrap_or([0; 8])
     }
     /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
-    /// LOSS read sequences, `None` when no provider session
-    /// contributes (nothing to prove). The coordinator advances a
-    /// lane's baseline tick only past ticks every live session
-    /// read successfully, retaining the last successful baseline
-    /// through failures.
-    pub(crate) fn session_loss_read_seq(&self) -> Option<[u64; 8]> {
-        self.session.as_ref().map(|s| s.loss_read_seq())
+    /// (LOSS read sequence, containing tick), `None` when no
+    /// provider session contributes (nothing to prove). The
+    /// coordinator advances a lane's baseline tick only to the
+    /// oldest read tick across live sessions, retaining the last
+    /// successful baseline through failures.
+    pub(crate) fn session_loss_read_receipts(&self) -> Option<[(u64, u64); 8]> {
+        self.session.as_ref().map(|s| s.loss_read_receipts())
+    }
+    /// N4: install the coordinator's tick clock for receipt
+    /// stamping (called once at admission; no-op without a
+    /// provider session — nothing to stamp).
+    pub(crate) fn set_loss_tick_clock(&mut self, origin_ns: u64, tick_ns: u64) {
+        if let Some(s) = self.session.as_mut() {
+            s.set_loss_tick_clock(origin_ns, tick_ns);
+        }
     }
     /// 6A kernel-edge fence (§1.8): fence the counter (generation
     /// guard + withholding) and the provider session (BPF rows +
@@ -1957,10 +2017,16 @@ impl FocusedSession {
     }
     /// 6A thread-exit row cleanup (§1.2): drop a confirmed-dead
     /// tid's pairing rows; the TGID member and its counts survive.
-    /// No-op without a provider session (nothing to clean).
+    /// No-op without a provider session (nothing to clean). N10:
+    /// cleanup failures record a `BpfUnavailable` gap on the
+    /// segment document — a stale THREADS row can be adopted by a
+    /// recycled tid, so possible leftovers are uncertainty, never
+    /// silent.
     pub(crate) fn remove_thread_rows(&mut self, tid: u32) {
         if let Some(s) = &mut self.session {
-            s.remove_thread_rows(self.pid, tid);
+            if s.remove_thread_rows(self.pid, tid) > 0 {
+                self.gaps.insert(ObservationGap::BpfUnavailable);
+            }
         }
     }
     /// 6A suspension for retained-unknown members (§2.4): retire

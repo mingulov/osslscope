@@ -4,7 +4,10 @@ use super::{
     wire::{self, contract as c},
     *,
 };
-use crate::{inventory, loader};
+use crate::{
+    capture::{ClockPort as _, LiveClock},
+    inventory, loader,
+};
 use aya::maps::{
     Array, HashMap as BpfMap, Map, MapData, PerCpuArray, PerCpuHashMap, PerCpuValues, RingBuf,
 };
@@ -475,6 +478,16 @@ pub struct ProviderSession {
     /// coordinator retains the last successful baseline through
     /// failures rather than starting the next interval too late).
     loss_read_seq: [u64; 8],
+    /// N4: the containing tick of each lane's last successful read
+    /// (mapped through `loss_tick_clock` at read time). The
+    /// coordinator advances baselines to read ticks, never to the
+    /// evaluation tick. Zero until the first stamped read.
+    loss_read_tick: [u64; 8],
+    /// N4: the coordinator's tick clock (`run_origin_ns`,
+    /// `tick_ns`) for receipt stamping, set at admission. Reads
+    /// without a clock stamp tick 0 (fail-closed: the baseline
+    /// cannot advance past an unstamped read).
+    loss_tick_clock: Option<(u64, u64)>,
     last_drain: Instant,
     closed: bool,
 }
@@ -544,6 +557,71 @@ fn candidate_validation_result(
     }
     result
 }
+/// N12: asynchronous link-close worker. Retiring a dead target closes
+/// its link fds (~2 links x ~68 attachments); each close is a blocking
+/// kernel detach (tens of ms under load), so a synchronous retire stalls
+/// the poll path for seconds and blows the pid-reuse retirement
+/// promptness bound.
+/// The close itself is deferrable: link fds name kernel link OBJECTS (not
+/// paths), so a late close detaches exactly the retired links and can never
+/// alias a stranger's re-attached links; the epoch fence plus the middle
+/// seals already cover the window. Attachment Vecs are still emptied
+/// synchronously at the retire point, so userspace link accounting
+/// (`link_count`, `active_link_count`) is unchanged — only the kernel
+/// detach runs late, on the worker.
+/// Backpressure: the queue holds `FD_DROPPER_QUEUE` victims; when full
+/// (churn storm) or the worker is gone, the caller closes synchronously —
+/// the pre-N12 slow path. Always correct, fast in the common case.
+const FD_DROPPER_QUEUE: usize = 4;
+fn fd_dropper() -> &'static std::sync::mpsc::SyncSender<Vec<std::os::fd::OwnedFd>> {
+    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Vec<std::os::fd::OwnedFd>>> =
+        std::sync::OnceLock::new();
+    SENDER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(FD_DROPPER_QUEUE);
+        match std::thread::Builder::new()
+            .name("osslscope-fd-dropper".to_owned())
+            .spawn(move || {
+                for links in rx {
+                    drop(links);
+                }
+            }) {
+            Ok(_) => tx,
+            // `rx` drops with the un-spawned closure: the channel is
+            // disconnected, every send fails, and callers fall back
+            // to synchronous close. No panic, no thread, still correct.
+            Err(_) => tx,
+        }
+    })
+}
+fn offload_fd_drop(links: Vec<std::os::fd::OwnedFd>) {
+    if links.is_empty() {
+        return;
+    }
+    // Full queue or dead worker: `links` (inside the error value) drops
+    // here, synchronously — the pre-N12 behavior. Slow under overload,
+    // always correct.
+    let _ = fd_dropper().try_send(links);
+}
+/// Test-only barrier: queue a socket-pair half as a victim, then
+/// block until EOF proves the worker dropped it — and, by channel
+/// FIFO order, every victim queued before it. A dead worker fails
+/// the test via the read deadline instead of hanging the suite.
+/// Production never waits: promptness is the point.
+#[cfg(test)]
+pub(crate) fn flush_fd_drops() {
+    use std::io::Read as _;
+    use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+    let (link, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(link.into_raw_fd()) };
+    offload_fd_drop(vec![owned]);
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+        .unwrap();
+    let mut one = [0u8; 1];
+    match peer.read(&mut one) {
+        Ok(0) => {}
+        other => panic!("fd-dropper barrier failed: {other:?}"),
+    }
+}
 /// Shared retirement boundary for reconcile/acquisition failures and drain.
 /// The descriptor/map operation is supplied by the session; source ownership
 /// and pending assembler state have one production transition.
@@ -585,11 +663,21 @@ fn retire_source_owners(
     b.learned_sites.retain(|site| site.pid != pid);
     b.static_candidates.retain(|site| site.pid() != pid);
     if preserve {
+        // N12: ONE fd-dropper send per retire call. Per-attachment
+        // sends overflow the bounded queue and fall back to
+        // synchronous close — recreating the stall.
+        let mut doomed: Vec<std::os::fd::OwnedFd> = Vec::new();
         if let Some(target) = targets.remove(&pid) {
             for mut a in target.attachments {
-                // Close links while both mapped and original file owners are
-                // alive. Only original source identity survives the transition.
-                a.links.clear();
+                // N12: detach links while both mapped and original file
+                // owners are alive; only original source identity survives
+                // the transition. The Vec is emptied here (synchronously)
+                // but the kernel detach runs on the fd-dropper worker —
+                // closing ~136 links inline stalls the poll path for
+                // seconds and blows the reuse-retirement promptness
+                // bound. A late close still detaches exactly these
+                // links (fd identity, not path identity).
+                doomed.append(&mut a.links);
                 if let Some(original) = a.original.take() {
                     a.site = original;
                 }
@@ -599,25 +687,30 @@ fn retire_source_owners(
             }
         }
         for a in startup.get_mut(&pid).into_iter().flatten() {
-            a.links.clear();
+            // N12: same async-detach rationale as above.
+            doomed.append(&mut a.links);
             a.historical = true;
         }
+        offload_fd_drop(doomed);
         b.gap(ObservationGap::ProcessUnavailable);
         b.gap(ObservationGap::IntervalUnknown);
         b.gap(ObservationGap::FirstQueryUnknown);
         b.gap(ObservationGap::SamplingPartial);
     } else {
         aliases.retire(pid);
+        // N12: one send per retire (see above).
+        let mut doomed: Vec<std::os::fd::OwnedFd> = Vec::new();
         if let Some(rows) = startup.remove(&pid) {
-            for a in rows {
-                drop(a.links);
+            for mut a in rows {
+                doomed.append(&mut a.links);
             }
         }
         if let Some(target) = targets.remove(&pid) {
-            for a in target.attachments {
-                drop(a.links);
+            for mut a in target.attachments {
+                doomed.append(&mut a.links);
             }
         }
+        offload_fd_drop(doomed);
     }
     preserve
 }
@@ -809,6 +902,70 @@ fn reserve_map_capacity(
     budget.state(map_capacity)
 }
 
+/// N4: the nominal tick containing `ns` under the receipt clock —
+/// the §7 `Start` rule (instants before the origin saturate to
+/// tick 0). Receipt stamps use the observer's producer-clock
+/// domain, the same domain the coordinator's tick clock anchors.
+fn loss_tick_of(ns: u64, origin_ns: u64, tick_ns: u64) -> u64 {
+    ns.saturating_sub(origin_ns) / tick_ns.max(1)
+}
+
+/// N10: collect fallible map keys matching `matches`, counting
+/// enumeration errors as cleanup uncertainty (never silently
+/// skipped — a skipped key range can hide a live stale row).
+/// Returns the collected keys plus the error count; the caller
+/// removes the keys and adds deletion failures to the count.
+fn collect_dead_keys<K, E>(
+    keys: impl Iterator<Item = Result<K, E>>,
+    mut matches: impl FnMut(&K) -> bool,
+) -> (Vec<K>, u64) {
+    let mut dead = Vec::new();
+    let mut failures = 0u64;
+    for key in keys {
+        match key {
+            Ok(key) if matches(&key) => dead.push(key),
+            Ok(_) => {}
+            Err(_) => failures = failures.saturating_add(1),
+        }
+    }
+    (dead, failures)
+}
+
+/// N10 minimal thread-row map surface for exit cleanup: real BPF
+/// maps in production, fakes in tests. The shared default methods
+/// carry the counting logic (tested against fakes); each
+/// implementor supplies only a key snapshot plus single-key
+/// removal.
+trait ThreadRowMap<K> {
+    /// Snapshot every key (thread-row maps are 4096-entry
+    /// bounded; one key walk, identical to filtering inline).
+    /// Failures collapse to `Err(())` — cleanup only counts.
+    fn snapshot_keys(&self) -> Vec<Result<K, ()>>;
+    /// Remove one key; `Err(())` counts one cleanup failure.
+    fn remove_key(&mut self, key: &K) -> Result<(), ()>;
+    fn collect_dead(&self, matches: &mut impl FnMut(&K) -> bool) -> (Vec<K>, u64) {
+        collect_dead_keys(self.snapshot_keys().into_iter(), matches)
+    }
+    fn remove_dead(&mut self, keys: &[K]) -> u64 {
+        let mut failures = 0u64;
+        for key in keys {
+            if self.remove_key(key).is_err() {
+                failures = failures.saturating_add(1);
+            }
+        }
+        failures
+    }
+}
+
+impl<K: aya::Pod, V: aya::Pod> ThreadRowMap<K> for BpfMap<MapData, K, V> {
+    fn snapshot_keys(&self) -> Vec<Result<K, ()>> {
+        self.keys().map(|r| r.map_err(|_| ())).collect()
+    }
+    fn remove_key(&mut self, key: &K) -> Result<(), ()> {
+        self.remove(key).map_err(|_| ())
+    }
+}
+
 impl ProviderSession {
     /// Validate enclosing process and current membership, preserving the separate
     /// D3 membership epoch and mapped-object generation domains. This proves
@@ -998,6 +1155,8 @@ impl ProviderSession {
             last_loss: [0; 8],
             loss_totals: [0; 8],
             loss_read_seq: [0; 8],
+            loss_read_tick: [0; 8],
+            loss_tick_clock: None,
             last_drain: Instant::now(),
             closed: false,
         })
@@ -1223,12 +1382,21 @@ impl ProviderSession {
     pub(crate) fn loss_totals(&self) -> [u64; 8] {
         self.loss_totals
     }
+    /// N4: install the coordinator's tick clock for receipt
+    /// stamping (called once at admission). Each successful LOSS
+    /// read then stamps its own containing tick, so a read
+    /// evaluated a tick late still anchors the baseline to its
+    /// own tick.
+    pub(crate) fn set_loss_tick_clock(&mut self, origin_ns: u64, tick_ns: u64) {
+        self.loss_tick_clock = Some((origin_ns, tick_ns.max(1)));
+    }
     /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
-    /// read sequences, one bump per successful LOSS map read. The
-    /// coordinator advances a lane's baseline tick only past ticks
-    /// every live session read successfully.
-    pub(crate) fn loss_read_seq(&self) -> [u64; 8] {
-        self.loss_read_seq
+    /// (read sequence, containing tick), one bump+stamp per
+    /// successful LOSS map read. The coordinator advances a lane's
+    /// baseline tick only to the oldest read tick across live
+    /// sessions.
+    pub(crate) fn loss_read_receipts(&self) -> [(u64, u64); 8] {
+        std::array::from_fn(|i| (self.loss_read_seq[i], self.loss_read_tick[i]))
     }
     /// 6A kernel-edge fence (§1.8): stop the BPF plane for `pid`
     /// (members/config/ranges rows removed, best-effort — the
@@ -1269,26 +1437,26 @@ impl ProviderSession {
     /// per key (a row re-created after our removal belongs to a
     /// live recycled tid and self-heals on its next hit; orphaned
     /// PENDING frames stay BPF-bounded and fail visible on cookie
-    /// mismatch, never silently).
-    pub(crate) fn remove_thread_rows(&mut self, pid: u32, tid: u32) {
-        let dead: Vec<c::ThreadKey> = self
+    /// mismatch, never silently). Returns the cleanup-failure
+    /// count (enumeration + deletion); the caller records a
+    /// nonzero count as uncertainty — an accepted exit must never
+    /// leave possible stale rows unrecorded.
+    pub(crate) fn remove_thread_rows(&mut self, pid: u32, tid: u32) -> u64 {
+        // N10: every cleanup failure counts (enumeration errors +
+        // deletion failures) — the caller records nonzero counts
+        // as uncertainty. Removal stays best-effort per key; the
+        // shared trait methods carry the tested logic.
+        let (dead, mut failures) = self
             .threads
-            .keys()
-            .flatten()
-            .filter(|key| key.pid == pid && key.tid == tid)
-            .collect();
-        for key in dead {
-            let _ = self.threads.remove(&key);
-        }
-        let dead_api: Vec<c::ApiThreadKey> = self
+            .collect_dead(&mut |key| key.pid == pid && key.tid == tid);
+        failures = failures.saturating_add(self.threads.remove_dead(&dead));
+        let (dead_api, api_failures) = self
             .api_threads
-            .keys()
-            .flatten()
-            .filter(|key| key.thread.pid == pid && key.thread.tid == tid)
-            .collect();
-        for key in dead_api {
-            let _ = self.api_threads.remove(&key);
-        }
+            .collect_dead(&mut |key| key.thread.pid == pid && key.thread.tid == tid);
+        failures = failures
+            .saturating_add(api_failures)
+            .saturating_add(self.api_threads.remove_dead(&dead_api));
+        failures
     }
     /// 6A suspension for retained-unknown members (§2.4): evict the
     /// live target into the `refreshing` handoff WITHOUT gaps or
@@ -1903,6 +2071,15 @@ impl ProviderSession {
             match self.loss.get(&(index as u32), 0) {
                 Ok(values) => {
                     self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
+                    // N4: stamp the read's containing tick (0
+                    // without a clock — fail-closed: an unstamped
+                    // read cannot advance the baseline).
+                    self.loss_read_tick[index] = self
+                        .loss_tick_clock
+                        .map(|(origin, tick_ns)| {
+                            loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns)
+                        })
+                        .unwrap_or(0);
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
                         self.loss_totals[index] =
@@ -2497,10 +2674,14 @@ impl ProviderSession {
     }
     fn retire_startup(&mut self, pid: u32) {
         if let Some(attachments) = self.startup.remove(&pid) {
-            for a in attachments {
+            // N12: one send per retire (see `offload_fd_drop`).
+            let mut doomed: Vec<std::os::fd::OwnedFd> = Vec::new();
+            for mut a in attachments {
                 let _ = self.config.remove(&a.cookie);
-                drop(a.links);
+                // Config removal keeps its order ahead of the close.
+                doomed.append(&mut a.links);
             }
+            offload_fd_drop(doomed);
         }
     }
     /// Retain typed startup sources without arming an argument reader or
@@ -3583,6 +3764,87 @@ fn object_id(site: &VerifiedSite) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// N10 fake thread-row map: BTreeMap rows plus injectable
+    /// enumeration/deletion failures, exercising the shared
+    /// cleanup logic without BPF.
+    struct FakeRowMap {
+        rows: std::collections::BTreeMap<u32, u32>,
+        enum_err_at: Option<usize>,
+        remove_err_on: Option<u32>,
+    }
+    impl super::ThreadRowMap<u32> for FakeRowMap {
+        fn snapshot_keys(&self) -> Vec<Result<u32, ()>> {
+            let mut out = Vec::new();
+            for (pos, key) in self.rows.keys().enumerate() {
+                if self.enum_err_at == Some(pos) {
+                    out.push(Err(()));
+                }
+                out.push(Ok(*key));
+            }
+            out
+        }
+        fn remove_key(&mut self, key: &u32) -> Result<(), ()> {
+            if self.remove_err_on == Some(*key) {
+                return Err(());
+            }
+            self.rows.remove(key);
+            Ok(())
+        }
+    }
+    #[test]
+    fn thread_row_cleanup_counts_all_failures() {
+        // N10 error handling: enumeration errors and deletion
+        // failures both count as cleanup uncertainty; matching
+        // keys remove, others (and failed removals) stay.
+        let mut map = FakeRowMap {
+            rows: [(1, 10), (2, 20), (3, 30)].into_iter().collect(),
+            enum_err_at: Some(1),
+            remove_err_on: Some(2),
+        };
+        let (dead, enum_failures) = map.collect_dead(&mut |k| *k != 3);
+        assert_eq!(dead, vec![1, 2]);
+        assert_eq!(enum_failures, 1, "one enumeration error");
+        let del_failures = map.remove_dead(&dead);
+        assert_eq!(del_failures, 1, "one deletion failure");
+        assert_eq!(
+            map.rows.keys().copied().collect::<Vec<_>>(),
+            vec![2, 3],
+            "failed removal + non-match stay"
+        );
+        let mut clean = FakeRowMap {
+            rows: [(7, 70)].into_iter().collect(),
+            enum_err_at: None,
+            remove_err_on: None,
+        };
+        let (dead, enum_failures) = clean.collect_dead(&mut |_| true);
+        assert_eq!((&dead, enum_failures), (&vec![7], 0));
+        assert_eq!(clean.remove_dead(&dead), 0);
+        assert!(clean.rows.is_empty());
+    }
+    #[test]
+    fn collect_dead_keys_counts_enum_errors() {
+        // N10: enumeration errors count as cleanup uncertainty
+        // (never silently skipped); only matching keys collect.
+        let keys = vec![Ok(1u32), Err("boom"), Ok(2), Ok(3)];
+        let (dead, failures) = super::collect_dead_keys(keys.into_iter(), |k| *k != 3);
+        assert_eq!(dead, vec![1, 2]);
+        assert_eq!(failures, 1, "one enumeration error");
+        let clean: Vec<Result<u32, &str>> = vec![Ok(4u32)];
+        let (dead, failures) = super::collect_dead_keys(clean.into_iter(), |_| true);
+        assert_eq!(dead, vec![4]);
+        assert_eq!(failures, 0);
+    }
+    #[test]
+    fn loss_tick_of_pins_containing_tick() {
+        // N4: receipt stamps map a read instant to its containing
+        // nominal tick (§7 Start rule); pre-origin instants
+        // saturate to 0.
+        assert_eq!(super::loss_tick_of(999, 1000, 100), 0);
+        assert_eq!(super::loss_tick_of(1000, 1000, 100), 0);
+        assert_eq!(super::loss_tick_of(1099, 1000, 100), 0);
+        assert_eq!(super::loss_tick_of(1100, 1000, 100), 1);
+        assert_eq!(super::loss_tick_of(2500, 1000, 100), 15);
+    }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation object"]
     fn native_final_cut_delete_failure_read_failure_and_expired_drain() {
@@ -14258,6 +14520,10 @@ mod startup_api_controls {
                 "retirement orphaned a pending alias boundary"
             );
             use std::io::Read;
+            // N12: link detach runs on the fd-dropper worker; the
+            // barrier proves the retire's victim closed (FIFO)
+            // before asserting EOF.
+            flush_fd_drops();
             assert_eq!(
                 fixture.link_peer.read(&mut [0]).unwrap(),
                 0,

@@ -452,6 +452,7 @@ fn observe_profiled<T: TargetPort, B: CountBackend, C: ClockPort>(
         }
     });
     let mut document = evidence::finalize(FinalizeInput {
+        corpse_wait: None,
         window,
         sites: drain.current.clone(),
         fenced: drain.fenced.clone(),

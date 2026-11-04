@@ -897,6 +897,7 @@ mod tests {
 
     fn doc(sites: Vec<SiteExecution>) -> CaptureDocument {
         crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 1_000,
                 requested_end_ns: 2_000,
@@ -1356,6 +1357,7 @@ require-executed=["SHA2-256"]
             &clean_doc,
         );
         let gappy = crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 1_000,
                 requested_end_ns: 2_000,
@@ -1433,6 +1435,7 @@ require-executed=["SHA2-256"]
     #[test]
     fn fatal_has_no_verdict() {
         let fatal = crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 1_000,
                 requested_end_ns: 2_000,
@@ -1573,6 +1576,7 @@ require-executed=["SHA2-256"]
         let mut fen = site(9, 50, vec![cand("p", "default", 2, 21, &["DES"], true)]);
         fen.generation = 0;
         let mixed = crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 1_000,
                 requested_end_ns: 2_000,
@@ -1764,6 +1768,7 @@ require-executed=["SHA2-256"]
         ];
         let doc_of = |rules: &[PolicyRule]| {
             let input = FinalizeInput {
+                corpse_wait: None,
                 window: CaptureWindow {
                     requested_start_ns: 0,
                     requested_end_ns: 100,

@@ -44,6 +44,29 @@ const DEFERRED_MARKS: usize = 4;
 const FOLLOW_CAP: usize = 1024;
 const PENDING_EPOCH_CAP: usize = 1024;
 const PENDING_DROPS_CAP: usize = 4096;
+// N8d staging byte account (implementation charges, pinned by
+// `staging_charges_cover_worst_case_entries`): every staging
+// store holds a run-lifetime pool lease computed from its cap ×
+// flat worst-case entry —
+// follow_pending: u32 key + (triple ≤64 B + parent + tick) +
+// map-node slack ≤ 256 B/entry → 256 KiB;
+// pending_epoch: key + (epoch + FULL 64-window MemberLedger
+// ≤1576 B inline+heap + readmit ctx) + slack ≤ 2 KiB/entry → 2
+// MiB (a full stash otherwise retains >1.5 MiB past its session
+// leases with no charge);
+// pending_drops: one owned LimitRec ≤ 256 B/entry → 1 MiB.
+// Per-active flags (exec/exit/retire/unsteady/ignored, ≤
+// max_active entries each) ride the coordinator lease's scalar
+// spare. Coordinator plane total = 256 KiB coordinator + args +
+// 256 KiB deferred + 2 KiB session-loss + staging, all inside
+// the 256 MiB global pool.
+const FOLLOW_ENTRY_BYTES: usize = 256;
+const FOLLOW_BYTES: usize = FOLLOW_CAP * FOLLOW_ENTRY_BYTES;
+const PENDING_EPOCH_ENTRY_BYTES: usize = 2 << 10;
+const PENDING_EPOCH_BYTES: usize = PENDING_EPOCH_CAP * PENDING_EPOCH_ENTRY_BYTES;
+const PENDING_DROP_ENTRY_BYTES: usize = 256;
+const PENDING_DROPS_BYTES: usize = PENDING_DROPS_CAP * PENDING_DROP_ENTRY_BYTES;
+const STAGING_BYTES: usize = FOLLOW_BYTES + PENDING_EPOCH_BYTES + PENDING_DROPS_BYTES;
 // 6A per-tick machine-path bound (§3.3): at most 1024 Limit
 // envelopes per tick, retained entries first (their per-tick
 // record is frozen), then oldest-first queued drop records.
@@ -387,6 +410,11 @@ struct DeferredEntry {
     readmit: Option<ReadmitCtx>,
     carried_loss: u64,
     carried_deferred: DeferredSpan,
+    /// N6 exact lifetime window (§1.8): the observer's producer-clock
+    /// read at deferral. A timestamped event binds to this entry
+    /// only inside `[admit_ns, now]` (trust-gated) — a delayed
+    /// previous-occupant event can never advance it.
+    admit_ns: u64,
 }
 /// 6A admission-attempt context (shared borrows only; admitted pids
 /// return via `admitted` for the caller's port bookkeeping).
@@ -566,6 +594,24 @@ struct LimitRec {
     at_tick: u64,
     deferred: Option<DeferredSpan>,
 }
+/// N9: a row's count is failed when a BPF/read-side failure
+/// invalidates it — `map` failures (including failed final reads,
+/// which carry `entries: 0` placeholders, never counts) or
+/// counter saturation. Pairing/in-flight nuances
+/// (`depth`/`unpaired`/`tail`/`unsupported_return`) leave the
+/// entry-probe count exact and are not failures.
+fn api_row_failed(row: &serde_json::Value) -> bool {
+    row["gaps"]["map"].as_u64().unwrap_or(0) > 0
+        || row["gaps"]["saturated"].as_bool().unwrap_or(false)
+}
+/// N9: the row is inside the proven domain — attached (observed)
+/// and failure-free. Gapless legacy shapes count as attached.
+fn api_row_available(row: &serde_json::Value) -> bool {
+    if row.get("gaps").is_none() {
+        return true;
+    }
+    !row["gaps"]["not_attached"].as_bool().unwrap_or(false) && !api_row_failed(row)
+}
 impl<W: Write> Output<'_, W> {
     fn emit(&mut self, record: Record<'_>) -> io::Result<()> {
         if !self.json {
@@ -625,6 +671,27 @@ impl<W: Write> Output<'_, W> {
                 .write_all(inventory::blindness_line().as_bytes())?;
         }
         Ok(())
+    }
+    /// N7 middle-image seal (§1.4 amendment): an image that never
+    /// had a session emits ONLY this retired record — segment 0,
+    /// the carried incarnation ledger, no admission claim, no
+    /// counts claim. Shared by the sample path and the close path.
+    fn emit_middle_seal(
+        &mut self,
+        identity: &Incarnation,
+        middle_epoch: u64,
+        ledger: &MemberLedger,
+    ) -> io::Result<()> {
+        self.emit_membership(
+            identity,
+            0,
+            "retired",
+            "unobserved_transition",
+            middle_epoch,
+            None,
+            LossSummary::from_ledger(ledger),
+            false,
+        )
     }
     /// 6A: emit one batch of deferral records — human groups
     /// past 8 rows, JSON emits one envelope each, in batch order
@@ -864,14 +931,33 @@ impl<W: Write> Output<'_, W> {
                             .try_fold(0u64, |n, r| n.checked_add(r["calls"].as_u64()?))
                     })
                     .flatten();
-                let api = (!affected)
-                    .then(|| {
-                        d["api_activity"].as_array().and_then(|rows| {
-                            rows.iter()
-                                .try_fold(0u64, |n, r| n.checked_add(r["entries"].as_u64()?))
-                        })
-                    })
-                    .flatten();
+                // N9: the api total sums the PROVEN domain only —
+                // attached, failure-free rows. Any failed row, any
+                // unparseable attached row, or an empty proven
+                // domain renders the total unknown (a zero over
+                // gap-marked rows would assert unobserved counts).
+                let api = if affected {
+                    None
+                } else if let Some(rows) = d["api_activity"].as_array() {
+                    let mut sum = Some(0u64);
+                    let mut any_attached = false;
+                    for row in rows {
+                        if api_row_failed(row) {
+                            sum = None;
+                        }
+                        if !api_row_available(row) {
+                            continue;
+                        }
+                        any_attached = true;
+                        sum = match (sum, row["entries"].as_u64()) {
+                            (Some(acc), Some(entries)) => acc.checked_add(entries),
+                            _ => None,
+                        };
+                    }
+                    if any_attached { sum } else { None }
+                } else {
+                    None
+                };
                 let total =
                     |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into());
                 writeln!(
@@ -915,11 +1001,19 @@ impl<W: Write> Output<'_, W> {
                         continue;
                     };
                     // 6A unknown rendering (§4.3): unavailable
-                    // entries are unknown, never zero.
-                    let entries = row["entries"]
-                        .as_u64()
-                        .map(|n| n.to_string())
-                        .unwrap_or_else(|| "unknown".into());
+                    // entries are unknown, never zero. N9: a row is
+                    // unavailable when the segment is affected or
+                    // the row itself is outside the proven domain
+                    // (never attached, or failed) — row gaps are
+                    // consulted, never bypassed.
+                    let entries = if affected || !api_row_available(row) {
+                        "unknown".to_string()
+                    } else {
+                        row["entries"]
+                            .as_u64()
+                            .map(|n| n.to_string())
+                            .unwrap_or_else(|| "unknown".into())
+                    };
                     writeln!(w, "  api={} entries={entries}", api.export_name())?;
                 }
                 if rows("api_activity").len() > ROWS {
@@ -1227,6 +1321,38 @@ fn exe_identity(pid: u32) -> Option<(u64, u64)> {
 fn tick_of(ns: u64, origin: u64, tick_ns: u64) -> u64 {
     ns.saturating_sub(origin) / tick_ns.max(1)
 }
+/// N4 pure receipt advance (§4.1 `[S,T+1)` rule): `None` when any
+/// live session's lane sequence is unmoved (a stalled session
+/// blocks the advance); otherwise the tick the baseline may
+/// advance to — the OLDEST successful read's containing tick
+/// across receipts (never the evaluation tick: loss after the
+/// read but still in its tick stays covered). Vacuous (no live
+/// sessions, or none contributing) advances to the evaluation
+/// tick, preserving quiet-tick progress.
+fn lane_advance(
+    eval_tick: u64,
+    lane: usize,
+    seen: &[[u64; 8]],
+    receipts: &[Option<[(u64, u64); 8]>],
+) -> Option<u64> {
+    let mut advance = eval_tick;
+    let mut any = false;
+    for (consumed, receipt) in seen.iter().zip(receipts.iter()) {
+        match receipt {
+            None => {}
+            Some(receipt) if receipt[lane].0 > consumed[lane] => {
+                advance = if any {
+                    advance.min(receipt[lane].1)
+                } else {
+                    receipt[lane].1
+                };
+                any = true;
+            }
+            Some(_) => return None,
+        }
+    }
+    Some(advance)
+}
 /// 6A whole-sample failure (§2.4): a global deadline/read/cgroup
 /// limit fails the tick for every member (unknown, not removed).
 fn whole_sample_failed(snapshot: &Snapshot) -> bool {
@@ -1451,9 +1577,28 @@ fn bind_event<W: Write>(
             // sweep never double-advances; eligibility is re-proved
             // at the next sweep. Mismatches quarantine.
             if let Some(key) = run.deferred.keys().find(|k| k.pid == subject).cloned() {
-                let identity = run.deferred.get(&key).map(|e| e.identity.clone());
-                match (identity, verify_triple(subject)) {
-                    (Some(known), Some(now)) if now == known && event.tgid == subject => {
+                let bound = run
+                    .deferred
+                    .get(&key)
+                    .map(|e| (e.identity.clone(), e.admit_ns));
+                match (bound, verify_triple(subject)) {
+                    (Some((known, admit_ns)), Some(now))
+                        if now == known && event.tgid == subject =>
+                    {
+                        // N6 exact lifetime window (§1.8): a trusted
+                        // timestamp binds only inside `[admit_ns,
+                        // now]` — a delayed previous-occupant exec
+                        // quarantines instead of advancing the
+                        // replacement's epoch.
+                        if trust_reviewed {
+                            if let Some(ts) = event.timestamp_ns {
+                                let now_ns = LiveClock.monotonic_ns();
+                                if ts < admit_ns || ts > now_ns {
+                                    quarantine(run);
+                                    return Ok(());
+                                }
+                            }
+                        }
                         let entry = run.deferred.get_mut(&key).expect("bound entry");
                         entry.image_epoch = entry.image_epoch.saturating_add(1);
                         entry.exe = exe_identity(subject);
@@ -1817,6 +1962,15 @@ impl RunState {
         self.origin_ns
             .saturating_add(tick.saturating_mul(self.tick_ns))
     }
+    /// N5 closing tick: `current_tick` is assigned at sample open,
+    /// so close-time detection (close drain, final sealing) needs
+    /// its own elapsed-derived tick — otherwise a closing delta
+    /// lands in the last sample's tick and excludes the affected
+    /// tail. Never moves backward.
+    fn refresh_close_tick(&mut self, now_ns: u64) {
+        let close_tick = tick_of(now_ns, self.origin_ns, self.tick_ns);
+        self.current_tick = self.current_tick.max(close_tick);
+    }
     /// 6A loss propagation (§4.1): every open ledger (live member or
     /// deferred entry) gets the baseline-to-detection window, and
     /// the session carrier keeps it (sealed ledgers ride the
@@ -1851,20 +2005,26 @@ impl RunState {
     /// the high-water propagate baseline-to-detection windows
     /// `[S, T+1)` (`S` = tick of the last successful read, widening
     /// across skipped ticks); drain residue marks the current tick
-    /// while backpressured. Baseline ticks advance ONLY past ticks
-    /// every live session read successfully (per-session/lane
-    /// receipts): failed reads retain the last successful baseline
-    /// so the next detection starts at the frozen `[S, T+1)`, never
-    /// after the failure. Detection itself runs every tick over the
-    /// best-known cumulative totals.
+    /// while backpressured. Baseline ticks advance ONLY to the
+    /// oldest successful read's containing tick across live
+    /// sessions (per-session/lane receipts): failed reads retain
+    /// the last successful baseline so the next detection starts
+    /// at the frozen `[S, T+1)`, never after the failure — and a
+    /// read evaluated a tick late never skips its own tick.
+    /// Detection itself runs every tick over the best-known
+    /// cumulative totals.
     fn update_loss_baselines(&mut self, tick_pending: u64) {
         let tick = self.current_tick;
         let first = self.prev_tick.is_none();
         let ring = self.live_ring();
-        let seqs: Vec<Option<[u64; 8]>> = self
+        // N4: receipts carry (sequence, containing tick); the
+        // baseline advances to the oldest READ tick, never to the
+        // evaluation tick.
+        let seen: Vec<[u64; 8]> = self.active.iter().map(|a| a.loss_seen).collect();
+        let receipts: Vec<Option<[(u64, u64); 8]>> = self
             .active
             .iter()
-            .map(|a| a.session.session_loss_read_seq())
+            .map(|a| a.session.session_loss_read_receipts())
             .collect();
         for (i, live) in ring.iter().enumerate() {
             let s = if first { tick } else { self.consumed_tick[i] };
@@ -1872,18 +2032,15 @@ impl RunState {
                 self.propagate(s, tick + 1, LossCause::RingLoss);
                 self.ring_hw[i] = *live;
             }
-            let fresh = self
-                .active
-                .iter()
-                .zip(seqs.iter())
-                .all(|(a, seq)| seq.is_none_or(|seq| seq[i] > a.loss_seen[i]));
-            if fresh {
-                for (a, seq) in self.active.iter_mut().zip(seqs.iter()) {
-                    if let Some(seq) = seq {
-                        a.loss_seen[i] = seq[i];
+            if let Some(advance) = lane_advance(tick, i, &seen, &receipts) {
+                for (a, receipt) in self.active.iter_mut().zip(receipts.iter()) {
+                    if let Some(receipt) = receipt {
+                        a.loss_seen[i] = receipt[i].0;
                     }
                 }
-                self.consumed_tick[i] = tick;
+                // Baselines are monotone (D-record §4.1): the clamp
+                // enforces it even against a stale read tick.
+                self.consumed_tick[i] = self.consumed_tick[i].max(advance);
             }
         }
         if tick_pending > 0 {
@@ -2227,18 +2384,33 @@ impl RunState {
     /// exec-readmit contexts are staging state (cap
     /// `PENDING_EPOCH_CAP`). Overflow drops the OLDEST context —
     /// its incarnation re-enters as a fresh candidate (the seal
-    /// already carried its ledger, so nothing is silent; only the
-    /// epoch continuity is lost, under documented pathological
-    /// churn).
-    fn stash_pending_epoch(&mut self, key: DeferredKey, ctx: (u64, MemberLedger, ReadmitCtx)) {
+    /// already carried its ledger). N8a: the eviction is VISIBLE —
+    /// each dropped context emits a `MembershipUnknown` gap naming
+    /// its pid (the epoch continuity is lost, explicitly, under
+    /// documented pathological churn) — never a silent eviction.
+    fn stash_pending_epoch<W: Write>(
+        &mut self,
+        out: &mut Output<'_, W>,
+        key: DeferredKey,
+        ctx: (u64, MemberLedger, ReadmitCtx),
+    ) -> io::Result<()> {
         self.pending_epoch.insert(key, ctx);
         while self.pending_epoch.len() > PENDING_EPOCH_CAP {
-            if let Some(oldest) = self.pending_epoch.keys().next().cloned() {
-                self.pending_epoch.remove(&oldest);
-            } else {
+            let Some(oldest) = self.pending_epoch.keys().next().cloned() else {
                 break;
-            }
+            };
+            self.pending_epoch.remove(&oldest);
+            let gap = inventory::Gap {
+                pid: Some(oldest.pid),
+                device: None,
+                inode: None,
+                reason: GapReason::MembershipUnknown,
+                errno: None,
+                actor_euid: None,
+            };
+            out.emit(Record::Gap { gap: &gap })?;
         }
+        Ok(())
     }
     /// 6A per-root ignored-descendant volume (§1.7): delivered
     /// births that resolve to death gaps (never followed).
@@ -2291,7 +2463,7 @@ impl RunState {
             spec.record,
             lease,
         ) {
-            Ok(session) => {
+            Ok(mut session) => {
                 self.segments += 1;
                 let segment = self.segments;
                 out.emit_membership(
@@ -2305,7 +2477,13 @@ impl RunState {
                     false,
                 )?;
                 admitted.push(spec.identity.pid);
-                let loss_seen = session.session_loss_read_seq().unwrap_or([0; 8]);
+                // N4: stamp receipts with this run's tick clock so
+                // baselines advance to read ticks, not eval ticks.
+                session.set_loss_tick_clock(self.origin_ns, self.tick_ns);
+                let loss_seen = session
+                    .session_loss_read_receipts()
+                    .map(|receipts| receipts.map(|(seq, _)| seq))
+                    .unwrap_or([0; 8]);
                 self.active.push(Active {
                     identity: spec.identity,
                     segment,
@@ -2395,6 +2573,7 @@ impl RunState {
                 readmit,
                 carried_loss,
                 carried_deferred,
+                admit_ns: LiveClock.monotonic_ns(),
             },
         );
         while self.deferred.len() > DEFERRED_CAP {
@@ -2617,8 +2796,15 @@ impl RunState {
             // queue is full (a drop record must never go silent for
             // lack of room). Unclassified newcomers stay covered by
             // this tick's Discovery records and classify next tick.
+            // N8b: the pause itself is VISIBLE — a session-carrier
+            // `membership_unknown` window covers the unclassified
+            // newcomers (otherwise-unrecorded activity, §4.1).
+            // Carrier-only: open members' observation is unaffected
+            // by the classification pause.
             if self.pending_drops.len() >= PENDING_DROPS_CAP && self.deferred.len() >= DEFERRED_CAP
             {
+                self.carrier
+                    .append(tick, tick.saturating_add(1), LossCause::MembershipUnknown);
                 break;
             }
             let identity = Incarnation::from(record);
@@ -2800,12 +2986,12 @@ impl RunState {
         // context (alive but unscanned/ineligible), or drop it
         // (dead/reused). The first seal consumes the live session
         // (sealed segment + `Membership{retired}`); every further
-        // witnessed exec seals its middle image the same way —
-        // admission (`image_readmission`) plus retirement — except
-        // no `ProcessObservation` exists for an image no session
-        // ever observed (middle records carry segment 0 and the
-        // carried incarnation ledger; their lifetimes sit inside
-        // the transition window).
+        // witnessed exec seals its middle image with ONLY
+        // `Membership{retired, unobserved_transition}` (§1.4
+        // amendment: no session ever observed a middle image, so
+        // no admission claim, no `ProcessObservation`, no counts
+        // claim — segment 0 with the carried incarnation ledger;
+        // lifetimes sit inside the transition window).
         let flagged: Vec<u32> = self.exec_flags.keys().copied().collect();
         for pid in flagged {
             let Some((fence_tick, witness_ts, count)) = self.exec_flags.get(&pid).copied() else {
@@ -2829,31 +3015,7 @@ impl RunState {
             self.seal_fold(outcome.loss_totals);
             for middle in 1..count.max(1) {
                 let middle_epoch = epoch.saturating_add(middle);
-                out.emit_membership(
-                    &identity,
-                    0,
-                    "observing",
-                    "sampled_admission",
-                    middle_epoch,
-                    Some(TransitionDetail {
-                        kind: "image_readmission",
-                        at_tick: tick,
-                        edge_ns: None,
-                        tid: None,
-                    }),
-                    LossSummary::from_ledger(&outcome.ledger),
-                    false,
-                )?;
-                out.emit_membership(
-                    &identity,
-                    0,
-                    "retired",
-                    "duration",
-                    middle_epoch,
-                    None,
-                    LossSummary::from_ledger(&outcome.ledger),
-                    false,
-                )?;
+                out.emit_middle_seal(&identity, middle_epoch, &outcome.ledger)?;
             }
             let stash = ReadmitCtx {
                 retire_ns: outcome.retire_ns,
@@ -2867,9 +3029,10 @@ impl RunState {
             // `sampled` membership, no liveness-stash split).
             if failed {
                 self.stash_pending_epoch(
+                    out,
                     DeferredKey::from(&identity),
                     (next_epoch, outcome.ledger, stash),
-                );
+                )?;
                 continue;
             }
             match snapshot.processes.iter().find(|p| p.pid == pid) {
@@ -2879,9 +3042,10 @@ impl RunState {
                         // the context lives here first and the
                         // readmit clears it on success.
                         self.stash_pending_epoch(
+                            out,
                             DeferredKey::from(&identity),
                             (next_epoch, outcome.ledger.clone(), stash),
-                        );
+                        )?;
                         self.readmit(
                             out,
                             identity.clone(),
@@ -2918,23 +3082,26 @@ impl RunState {
                             sampled_blind(ctx.selection, snapshot, identity.pid),
                         )?;
                         self.stash_pending_epoch(
+                            out,
                             DeferredKey::from(&identity),
                             (next_epoch, outcome.ledger, stash),
-                        );
+                        )?;
                     }
                 }
                 _ => match probe_liveness(pid) {
                     Liveness::Alive(now) if now == identity => {
                         self.stash_pending_epoch(
+                            out,
                             DeferredKey::from(&identity),
                             (next_epoch, outcome.ledger, stash),
-                        );
+                        )?;
                     }
                     Liveness::Unknown => {
                         self.stash_pending_epoch(
+                            out,
                             DeferredKey::from(&identity),
                             (next_epoch, outcome.ledger, stash),
-                        );
+                        )?;
                     }
                     _ => {}
                 },
@@ -3549,9 +3716,11 @@ fn observe(
         // 6A close-drain evaluation (§4.1): newly folded closing loss
         // needs the same covering intervals as per-tick loss — the
         // session carrier plus every still-open ledger — before the
-        // seals below close those ledgers.
+        // seals below close those ledgers. N5: detection runs at
+        // the elapsed-derived close tick, not the last sample's.
         let tick_pending = run.drain_pending.saturating_sub(run.pending_mark);
         run.pending_mark = run.drain_pending;
+        run.refresh_close_tick(LiveClock.monotonic_ns());
         run.update_loss_baselines(tick_pending);
         run.update_lane_baselines();
     }
@@ -3588,31 +3757,7 @@ fn observe(
         // the run ends inside the transition window).
         for middle in 1..count.max(1) {
             let middle_epoch = epoch.saturating_add(middle);
-            out.emit_membership(
-                &identity,
-                0,
-                "observing",
-                "sampled_admission",
-                middle_epoch,
-                Some(TransitionDetail {
-                    kind: "image_readmission",
-                    at_tick: tick,
-                    edge_ns: None,
-                    tid: None,
-                }),
-                LossSummary::from_ledger(&outcome.ledger),
-                false,
-            )?;
-            out.emit_membership(
-                &identity,
-                0,
-                "retired",
-                "duration",
-                middle_epoch,
-                None,
-                LossSummary::from_ledger(&outcome.ledger),
-                false,
-            )?;
+            out.emit_middle_seal(&identity, middle_epoch, &outcome.ledger)?;
         }
     }
     let flagged: Vec<u32> = run.retire_flags.keys().copied().collect();
@@ -3681,6 +3826,8 @@ fn observe(
     // sealing join the cumulative ring here, so the evaluators run
     // once more — seal-folded loss reaches the session carrier
     // (sealed ledgers ride the carrier; they are never revised).
+    // N5: same elapsed-derived close tick as the close drain.
+    run.refresh_close_tick(LiveClock.monotonic_ns());
     run.update_loss_baselines(0);
     run.update_lane_baselines();
     out.flush_gaps()?;
@@ -3781,6 +3928,13 @@ pub fn run(args: &[String]) -> ExitCode {
     };
     let Some(_session_loss) = pool.reserve(SESSION_LOSS_BYTES) else {
         crate::report::err_line("osslscope crypto watch: pool exhausted (session loss)");
+        return ExitCode::from(4);
+    };
+    // N8d: the staging plane (followed births, pending epoch
+    // ledgers, queued drop records) holds a run-lifetime lease —
+    // staging past session ceilings can no longer escape the pool.
+    let Some(_staging) = pool.reserve(STAGING_BYTES) else {
+        crate::report::err_line("osslscope crypto watch: pool exhausted (staging stores)");
         return ExitCode::from(4);
     };
     let options = match inventory::cli::parse_crypto_watch(&args[1..]) {
@@ -3994,6 +4148,100 @@ mod tests {
         assert!(
             deferred.contains("physical_entries=unknown api_entries=unknown"),
             "deferred totals are unknown: {deferred}"
+        );
+    }
+    #[test]
+    fn human_api_rows_honor_unavailable_shape() {
+        // N9: production unavailable rows (entries 0 +
+        // not_attached) and failed final reads (entries 0 +
+        // gaps.map=1) render entries=unknown — and poison the api
+        // total — even with an otherwise empty ledger. The shapes
+        // below mirror `ApiActivityRow::unavailable` and the
+        // failed-final-read row byte for byte.
+        let identity = Incarnation {
+            pid: 42,
+            starttime: 123,
+            namespaces: inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        };
+        let unavailable = serde_json::json!({
+            "api": 20, "entries": 0,
+            "observed_success": 0, "observed_failure": 0,
+            "verification_mismatch": 0, "unsupported": 0,
+            "gaps": {"map": 0, "depth": 0, "unpaired": 0, "tail": 0,
+                     "unsupported_return": 0, "saturated": false,
+                     "not_attached": true, "attachment": true, "finality": true}
+        });
+        let failed_read = serde_json::json!({
+            "api": 21, "entries": 0,
+            "observed_success": 0, "observed_failure": 0,
+            "verification_mismatch": 0, "unsupported": 0,
+            "gaps": {"map": 1, "depth": 0, "unpaired": 0, "tail": 0,
+                     "unsupported_return": 0, "saturated": false,
+                     "not_attached": false, "attachment": true, "finality": true}
+        });
+        let clean_row = serde_json::json!({
+            "api": 22, "entries": 3,
+            "observed_success": 3, "observed_failure": 0,
+            "verification_mismatch": 0, "unsupported": 0,
+            "gaps": {"map": 0, "depth": 0, "unpaired": 0, "tail": 0,
+                     "unsupported_return": 0, "saturated": false,
+                     "not_attached": false, "attachment": true, "finality": true}
+        });
+        let render = |rows: Vec<serde_json::Value>| {
+            let document = serde_json::json!({
+                "sites": [], "fenced": [],
+                "api_activity": rows,
+                "objects": [{}],
+                "completeness": {"counters": []}
+            });
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: false,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+            };
+            out.emit(Record::ProcessObservation {
+                incarnation: &identity,
+                segment: 4,
+                retirement: "duration",
+                document: &document,
+                image_epoch: 0,
+                loss: LossSummary::empty(),
+            })
+            .unwrap();
+            drop(out);
+            String::from_utf8(bytes).unwrap()
+        };
+        let text = render(vec![unavailable, failed_read]);
+        let api_lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.trim_start().starts_with("api="))
+            .collect();
+        assert_eq!(api_lines.len(), 2, "both rows render: {text}");
+        for line in &api_lines {
+            assert!(
+                line.contains("entries=unknown"),
+                "unavailable row must not print zero: {line}"
+            );
+        }
+        assert!(
+            text.contains("api_entries=unknown"),
+            "gap-marked rows poison the api total: {text}"
+        );
+        let clean = render(vec![clean_row]);
+        assert!(
+            clean.contains("entries=3"),
+            "proven rows stay numeric: {clean}"
+        );
+        assert!(
+            clean.contains("api_entries=3"),
+            "proven total stays numeric: {clean}"
         );
     }
     #[test]
@@ -4560,6 +4808,402 @@ mod tests {
         assert_eq!(wire[0].cause, "ring_loss");
     }
     #[test]
+    fn receipt_advance_uses_read_tick_not_eval_tick() {
+        // N4: a read in tick 0 evaluated in tick 1 advances the
+        // baseline to 0 (the read's containing tick), never to 1 —
+        // loss after the read but still in tick 0 stays covered
+        // ([0,4), not [1,4)).
+        let seen = [[0u64; 8]];
+        let receipts = [Some([(1u64, 0u64); 8])];
+        assert_eq!(super::lane_advance(1, 3, &seen, &receipts), Some(0));
+    }
+    #[test]
+    fn receipt_advance_vacuous_min_and_stall() {
+        // N4: no sessions advances to the evaluation tick
+        // (quiet-tick progress, as before); several sessions take
+        // the OLDEST read tick; a stalled session blocks.
+        let empty: [[u64; 8]; 0] = [];
+        let no_receipts: [Option<[(u64, u64); 8]>; 0] = [];
+        assert_eq!(super::lane_advance(5, 0, &empty, &no_receipts), Some(5));
+        let none = [None, None];
+        assert_eq!(super::lane_advance(5, 0, &empty[..0], &none), Some(5));
+        let seen = [[0u64; 8], [0u64; 8]];
+        let receipts = [Some([(1u64, 4u64); 8]), Some([(1u64, 2u64); 8])];
+        assert_eq!(super::lane_advance(5, 0, &seen, &receipts), Some(2));
+        let stalled = [Some([(1u64, 4u64); 8]), Some([(0u64, 2u64); 8])];
+        assert_eq!(super::lane_advance(5, 0, &seen, &stalled), None);
+    }
+    #[test]
+    fn deferred_exec_checks_entry_lifetime_lower_bound() {
+        // N6: a delayed exec for a previous occupant (trusted
+        // timestamp before the deferred entry's lifetime) must
+        // quarantine — never advance the replacement's epoch. A
+        // timestamp inside the lifetime still advances.
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let key = DeferredKey::from(&identity);
+        let entry = || DeferredEntry {
+            identity: identity.clone(),
+            image_epoch: 0,
+            first_tick: 0,
+            last_tick: 0,
+            ticks: 1,
+            reason: "active_limit",
+            marks: WindowStore::new(DEFERRED_MARKS),
+            exe: None,
+            readmit: None,
+            carried_loss: 0,
+            carried_deferred: DeferredSpan::default(),
+            admit_ns: LiveClock.monotonic_ns(),
+        };
+        let exec = |ts: Option<u64>| crate::capture::LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid,
+            timestamp_ns: ts,
+            tgid: pid,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
+        };
+        // Stale: timestamp predates the entry — quarantine, no advance.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.deferred.insert(key.clone(), entry());
+        let admit = run.deferred.get(&key).expect("entry").admit_ns;
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        super::bind_event(&mut run, &mut sink, &exec(Some(admit - 1)), true).unwrap();
+        assert_eq!(
+            run.deferred.get(&key).expect("entry").image_epoch,
+            0,
+            "stale exec advanced the replacement epoch"
+        );
+        assert_eq!(run.unattributed, 1, "stale exec not quarantined");
+        // Inside the lifetime: advances exactly once.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.deferred.insert(key.clone(), entry());
+        let admit = run.deferred.get(&key).expect("entry").admit_ns;
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        super::bind_event(&mut run, &mut sink, &exec(Some(admit)), true).unwrap();
+        assert_eq!(
+            run.deferred.get(&key).expect("entry").image_epoch,
+            1,
+            "in-lifetime exec did not advance"
+        );
+        assert_eq!(run.unattributed, 0);
+    }
+    #[test]
+    fn closing_loss_uses_close_tick_not_last_sample_tick() {
+        // N5: closing loss detected after the last sample opened
+        // anchors to the elapsed-derived close tick, not the stale
+        // sample tick — the affected tail stays covered.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 7;
+        run.prev_tick = Some(7);
+        run.update_lane_baselines();
+        assert!(run.carrier.wire().is_empty());
+        run.signal_dropped = 3;
+        run.refresh_close_tick(10);
+        run.update_lane_baselines();
+        let wire = run.carrier.wire();
+        assert_eq!(wire.len(), 1, "one covering window, got {wire:?}");
+        assert_eq!((wire[0].start_tick, wire[0].end_tick), (7, 11));
+        assert_eq!(wire[0].cause, "connector_drops");
+    }
+    /// Hollow member for coordinator unit tests (N7/N8b/N13):
+    /// fabricated identity + hollow session (no BPF, no custody).
+    fn hollow_active(
+        pool: &MemoryPool,
+        pid: u32,
+        starttime: u64,
+        namespaces: inventory::NamespaceIds,
+    ) -> Active {
+        Active {
+            identity: Incarnation {
+                pid,
+                starttime,
+                namespaces: namespaces.clone(),
+            },
+            segment: 1,
+            image_epoch: 0,
+            session: FocusedSession::hollow_for_coordinator_tests(pid, starttime, namespaces, pool),
+            ledger: MemberLedger::empty(),
+            admit_ns: 0,
+            suspended: false,
+            cgroup: None,
+            grace_noted: None,
+            loss_seen: [0; 8],
+        }
+    }
+    #[test]
+    fn middle_image_seals_retired_only_without_admission() {
+        // N7 (§1.4 amendment): with two execs before any readmission,
+        // the middle image (never observed — no session, no
+        // eligibility proof) emits ONLY `Membership{retired,
+        // unobserved_transition}` — no `observing` admission claim,
+        // no `ProcessObservation`, no `SessionGap`.
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let pid = std::process::id();
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            resolve_paths: false,
+            limits: inventory::Limits::default(),
+        });
+        let record = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("own record")
+            .clone();
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 5;
+        run.prev_tick = Some(4);
+        run.active.push(hollow_active(
+            &pool,
+            pid,
+            record.starttime,
+            record.namespaces.clone(),
+        ));
+        run.exec_flags.insert(pid, (5, None, 2));
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count: Arc::from([]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation: 0,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            tracing: false,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let mut admitted = Vec::new();
+        run.sample_members(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let middle: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["incarnation"]["pid"] == pid as u64 && r["image_epoch"] == 1)
+            .collect();
+        assert_eq!(
+            middle.len(),
+            1,
+            "middle image emits exactly one record: {middle:?}"
+        );
+        assert_eq!(middle[0]["kind"], "membership");
+        assert_eq!(middle[0]["state"], "retired");
+        assert_eq!(middle[0]["reason"], "unobserved_transition");
+        assert_eq!(middle[0]["segment"], 0);
+        assert!(middle[0]["detail"].is_null());
+        assert!(middle[0]["loss"].is_object(), "carried ledger present");
+    }
+    #[test]
+    fn pending_epoch_overflow_eviction_is_visible() {
+        // N8a: the pending-epoch stash never silently evicts — the
+        // dropped oldest context emits a `MembershipUnknown` gap
+        // naming its pid (its incarnation re-enters as a fresh
+        // candidate; the epoch discontinuity is explicit).
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        for i in 0..PENDING_EPOCH_CAP {
+            let identity = Incarnation {
+                pid: 1000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.pending_epoch.insert(
+                DeferredKey::from(&identity),
+                (
+                    1,
+                    MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
+        assert_eq!(run.pending_epoch.len(), PENDING_EPOCH_CAP);
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let fresh = Incarnation {
+            pid: 999_999,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        run.stash_pending_epoch(
+            &mut sink,
+            DeferredKey::from(&fresh),
+            (
+                2,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        )
+        .unwrap();
+        drop(sink);
+        assert_eq!(run.pending_epoch.len(), PENDING_EPOCH_CAP);
+        assert!(run.pending_epoch.contains_key(&DeferredKey::from(&fresh)));
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "one visible eviction, got {rows:?}");
+        assert_eq!(rows[0]["kind"], "gap");
+        assert_eq!(rows[0]["gap"]["reason"], "membership_unknown");
+        assert_eq!(rows[0]["gap"]["pid"], 1000, "oldest evicted");
+    }
+    #[test]
+    fn backpressure_pause_carries_named_window() {
+        // N8b: when a full drop queue pauses newcomer
+        // classification, the pause is VISIBLE — a session-carrier
+        // `membership_unknown` window covers the unclassified
+        // newcomers (otherwise-unrecorded activity, §4.1).
+        // Carrier-only: open members are unaffected.
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        run.prev_tick = Some(5);
+        for i in 0..DEFERRED_CAP {
+            let identity = Incarnation {
+                pid: 200_000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.deferred.insert(
+                DeferredKey::from(&identity),
+                DeferredEntry {
+                    identity,
+                    image_epoch: 0,
+                    first_tick: 6,
+                    last_tick: 6,
+                    ticks: 1,
+                    reason: "active_limit",
+                    marks: WindowStore::new(DEFERRED_MARKS),
+                    exe: None,
+                    readmit: None,
+                    carried_loss: 0,
+                    carried_deferred: DeferredSpan::default(),
+                    admit_ns: 0,
+                },
+            );
+        }
+        for i in 0..PENDING_DROPS_CAP {
+            run.pending_drops.push_back(LimitRec {
+                incarnation: Incarnation {
+                    pid: 300_000 + i as u32,
+                    starttime: 1,
+                    namespaces: namespaces.clone(),
+                },
+                reason: "deferred_limit",
+                at_tick: 6,
+                deferred: None,
+            });
+        }
+        assert_eq!(run.deferred.len(), DEFERRED_CAP);
+        assert_eq!(run.pending_drops.len(), PENDING_DROPS_CAP);
+        let pid = std::process::id();
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            resolve_paths: false,
+            limits: inventory::Limits::default(),
+        });
+        assert!(snapshot.processes.iter().any(|p| p.pid == pid));
+        let objects = FocusedObjects {
+            observation: Arc::from([0u8; 8]),
+            count: Arc::from([0u8; 8]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation: 0,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            tracing: true,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let mut admitted = Vec::new();
+        run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        assert!(run.active.is_empty(), "nothing admitted under backpressure");
+        assert_eq!(run.deferred.len(), DEFERRED_CAP, "nothing queued");
+        let wire = run.carrier.wire();
+        assert!(
+            wire.iter().any(|w| {
+                w.cause == "membership_unknown" && w.start_tick == 6 && w.end_tick == 7
+            }),
+            "backpressure pause has no named window: {wire:?}"
+        );
+    }
+    #[test]
     fn deferred_spans_merge_by_union() {
         let full = DeferredSpan {
             ticks: 3,
@@ -4723,6 +5367,116 @@ mod tests {
             assert!(row["deferred"].is_object());
         }
         assert!(run.pending_drops.is_empty());
+    }
+    #[test]
+    fn close_flush_exceeds_per_tick_budget_by_amendment() {
+        // N8c (§3.3 amendment): close is not a tick — the close
+        // flush emits every still-queued drop in one batch (here
+        // past the 1024/tick bound), oldest-first, each stamped
+        // with the emitting close tick and its sealed span.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 9;
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        for pid in 0..(DEFERRED_CAP as u32 + LIMIT_TICK_BUDGET as u32 + 7) {
+            run.queue_insert(
+                Incarnation {
+                    pid: 100_000 + pid,
+                    starttime: 1,
+                    namespaces: namespaces.clone(),
+                },
+                None,
+                "active_limit",
+            );
+        }
+        assert_eq!(run.deferred.len(), DEFERRED_CAP);
+        assert_eq!(run.pending_drops.len(), LIMIT_TICK_BUDGET + 7);
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        run.emit_pending_drops_all(&mut out).unwrap();
+        drop(out);
+        let text = String::from_utf8(bytes).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), LIMIT_TICK_BUDGET + 7, "complete flush");
+        for row in &rows {
+            assert_eq!(row["kind"], "limit");
+            assert_eq!(row["reason"], "deferred_limit");
+            assert_eq!(row["at_tick"], 9, "emitting close tick");
+            assert!(row["deferred"].is_object(), "sealed span rides along");
+        }
+        // Same-starttime pids queue ascending, so each insert past
+        // the cap evicts itself — oldest-first drain replays pids
+        // ascending from the first evicted.
+        let first = 100_000 + DEFERRED_CAP as u64;
+        assert_eq!(rows[0]["incarnation"]["pid"], first);
+        assert_eq!(
+            rows[rows.len() - 1]["incarnation"]["pid"],
+            first + LIMIT_TICK_BUDGET as u64 + 6
+        );
+        assert!(run.pending_drops.is_empty());
+    }
+    #[test]
+    fn staging_charges_cover_worst_case_entries() {
+        // N8d: every staging store is charged against the pool with
+        // a computed byte bound — the flat per-entry charges must
+        // cover the worst-case entry (inline + heap + map-node
+        // slack). BTreeMap node slack is generous: nodes hold ~11
+        // entries, so amortized overhead is a few bytes.
+        const BTREE_SLACK: usize = 128;
+        let incarnation = std::mem::size_of::<Incarnation>();
+        // follow_pending: u32 key + (triple, parent, tick).
+        let follow_entry = 4 + incarnation + 8 + 8 + BTREE_SLACK;
+        assert!(
+            follow_entry <= FOLLOW_ENTRY_BYTES,
+            "follow entry {follow_entry} exceeds flat {FOLLOW_ENTRY_BYTES}"
+        );
+        assert_eq!(FOLLOW_BYTES, FOLLOW_CAP * FOLLOW_ENTRY_BYTES);
+        // pending_epoch: key + (epoch, full 64-window ledger, ctx).
+        let epoch_entry = std::mem::size_of::<DeferredKey>()
+            + 8
+            + std::mem::size_of::<MemberLedger>()
+            + std::mem::size_of::<ReadmitCtx>()
+            + WINDOW_CAP * std::mem::size_of::<CompactWindow>()
+            + BTREE_SLACK;
+        assert!(
+            epoch_entry <= PENDING_EPOCH_ENTRY_BYTES,
+            "epoch entry {epoch_entry} exceeds flat {PENDING_EPOCH_ENTRY_BYTES}"
+        );
+        assert_eq!(
+            PENDING_EPOCH_BYTES,
+            PENDING_EPOCH_CAP * PENDING_EPOCH_ENTRY_BYTES
+        );
+        // pending_drops: one owned LimitRec per queued drop.
+        let drop_entry = std::mem::size_of::<LimitRec>() + 64;
+        assert!(
+            drop_entry <= PENDING_DROP_ENTRY_BYTES,
+            "drop entry {drop_entry} exceeds flat {PENDING_DROP_ENTRY_BYTES}"
+        );
+        assert_eq!(
+            PENDING_DROPS_BYTES,
+            PENDING_DROPS_CAP * PENDING_DROP_ENTRY_BYTES
+        );
+        assert_eq!(
+            STAGING_BYTES,
+            FOLLOW_BYTES + PENDING_EPOCH_BYTES + PENDING_DROPS_BYTES
+        );
+        // The staging plane fits the global pool beside the frozen
+        // coordinator + deferred + session-loss leases.
+        assert!(
+            COORDINATOR_BYTES + DEFERRED_BYTES + SESSION_LOSS_BYTES + STAGING_BYTES < GLOBAL_BYTES
+        );
     }
     #[test]
     fn crypto_end_reason_names_segment_outcome() {

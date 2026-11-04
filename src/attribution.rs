@@ -1978,6 +1978,7 @@ mod tests {
             finalize,
         };
         finalize(FinalizeInput {
+            corpse_wait: None,
             window: CaptureWindow {
                 requested_start_ns: 1,
                 requested_end_ns: 2,

@@ -9905,6 +9905,7 @@ fn g1_target_read_before_seal_timestamp_after_seal_adapts_actual_terminal() {
     assert_eq!((bound.start_ns, bound.deadline_ns), (1000, 2000));
     window.count_admission = Some(bound);
     let mut document = evidence::finalize(FinalizeInput {
+        corpse_wait: None,
         window,
         sites: terminal.retained_drain.current.clone(),
         fenced: terminal.retained_drain.fenced.clone(),
