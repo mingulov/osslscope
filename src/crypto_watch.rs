@@ -2396,6 +2396,53 @@ impl RunState {
                         let entry = self.deferred.remove(&key).expect("swept entry");
                         self.emit_removal(out, &entry, epoch, "ineligible")?;
                         self.removed.ineligible = self.removed.ineligible.saturating_add(1);
+                        // R6-2a: the SAME live incarnation leaves the
+                        // queue but stays alive — its exec
+                        // continuation (if any) re-stashes for the
+                        // eligibility return (updated epoch + sealed
+                        // span + loss + readmit context, like the
+                        // R5-2a overflow path). Without this the
+                        // return manufactures 0/0. An entry with no
+                        // continuation leaves only its removal
+                        // record (its 0/0 is honest).
+                        if let Some(rctx) = entry.readmit {
+                            if self.peek_exec_ctx(&key).is_none() {
+                                let own = DeferredSpan {
+                                    ticks: entry
+                                        .ticks
+                                        .saturating_add(tick.saturating_sub(entry.last_tick)),
+                                    first_tick: entry.first_tick,
+                                    last_tick: tick,
+                                };
+                                let mut windows = WindowStore::new(WINDOW_CAP);
+                                for w in entry.marks.windows.iter() {
+                                    windows.append(w.start_tick, w.end_tick, w.cause);
+                                }
+                                windows.coalesced =
+                                    windows.coalesced.saturating_add(entry.marks.coalesced);
+                                let ledger = MemberLedger {
+                                    loss: entry.carried_loss,
+                                    deferred: merge_deferred_spans(entry.carried_deferred, own),
+                                    windows,
+                                };
+                                if entry.tombstoned {
+                                    // The tombstone flag's
+                                    // announcement promise rides the
+                                    // re-stash (the admission it was
+                                    // saved for never comes).
+                                    emit_membership_unknown_gap(out, entry.identity.pid)?;
+                                }
+                                self.stash_pending_epoch(out, key, (epoch, ledger, rctx))?;
+                            } else {
+                                // Defensive-unreachable (same proof
+                                // as the overflow path): a queued
+                                // incarnation's stash was consumed
+                                // at queue time; the live stash is
+                                // fresher and wins, gapped.
+                                debug_assert!(false, "swept victim key already stashed");
+                                emit_membership_unknown_gap(out, entry.identity.pid)?;
+                            }
+                        }
                         continue;
                     }
                     let entry = self.deferred.get_mut(&key).expect("swept entry");
@@ -2407,12 +2454,19 @@ impl RunState {
                     entry.last_tick = tick;
                 }
                 Some(_) => {
+                    // R6-2a: reuse DISCARDS the continuation (the
+                    // incarnation is gone — the number now names a
+                    // stranger; resuming the old history under it
+                    // would corrupt the new incarnation).
                     let entry = self.deferred.remove(&key).expect("swept entry");
                     self.emit_removal(out, &entry, image_epoch, "incarnation_changed")?;
                     self.removed.reused = self.removed.reused.saturating_add(1);
                 }
                 None => match probe_liveness(pid) {
                     Liveness::Dead => {
+                        // R6-2a: death DISCARDS the continuation
+                        // (the incarnation is gone — nothing
+                        // returns to resume it).
                         let entry = self.deferred.remove(&key).expect("swept entry");
                         self.emit_removal(out, &entry, image_epoch, "sampled_removal")?;
                         self.removed.exited = self.removed.exited.saturating_add(1);
@@ -2427,6 +2481,8 @@ impl RunState {
                         entry.last_tick = tick;
                     }
                     Liveness::Alive(_) => {
+                        // R6-2a: reuse DISCARDS (same as above —
+                        // the incarnation is gone).
                         let entry = self.deferred.remove(&key).expect("swept entry");
                         self.emit_removal(out, &entry, image_epoch, "incarnation_changed")?;
                         self.removed.reused = self.removed.reused.saturating_add(1);
@@ -3305,6 +3361,20 @@ impl RunState {
             // untracing, or capped) sample must neither announce
             // nor consume it.
             let stashed = self.peek_exec_ctx(&stash_key);
+            // R6-2b (extends R5-2b): the ambiguity refusal precedes
+            // EVERY path emitting an empty sampled ledger — a
+            // forgotten ineligible (or untracing) incarnation is
+            // refused with a visible record, never a fabricated
+            // 0/0 `sampled` row. Remembered carriers (stashed)
+            // sample their history below; genuinely-new (no
+            // amnesia) sample honest 0/0.
+            if stashed.is_none() && self.epoch_amnesia {
+                out.emit(Record::SessionGap {
+                    incarnation: &identity,
+                    reason: "history_ambiguous",
+                })?;
+                continue;
+            }
             if !eligible(record) {
                 let (epoch, loss) = match &stashed {
                     Some(stashed) => (stashed.ctx.0, LossSummary::from_ledger(&stashed.ctx.1)),
@@ -3346,21 +3416,11 @@ impl RunState {
                 )?;
                 continue;
             }
-            // R5-2b: triple-churn amnesia makes EVERY fresh
-            // stranger ambiguous — it may be the forgotten
-            // incarnation, and no mark can distinguish it. Refuse
-            // the admission with a visible record (never a
-            // manufactured 0/0, marked or not; no open attempted,
-            // nothing queued — a queued 0/0 would manufacture on
-            // the next tick). History-carriers (stashed) queue or
-            // admit normally: their history is known.
-            if stashed.is_none() && self.epoch_amnesia {
-                out.emit(Record::SessionGap {
-                    incarnation: &identity,
-                    reason: "history_ambiguous",
-                })?;
-                continue;
-            }
+            // R5-2b refusal hoisted above (R6-2b): a fresh
+            // stranger under amnesia never reaches here (refused
+            // before the sampled branches); reaching here unstashed
+            // means genuinely-new (no amnesia — the empty ledger
+            // below is honest).
             if self.active.len() >= ctx.max_active {
                 self.queue_insert(out, identity, stashed, "active_limit")?;
                 continue;
@@ -4084,6 +4144,10 @@ fn observe(
                 run.resolve_follow_pending(&mut out, &snapshot.snapshot)?;
                 run.scan_admit(&mut out, &snapshot.snapshot, &ctx, &mut admitted)?;
             }
+            // R6-3: drain live-path deferred closes when capacity
+            // frees (covers all-suspended ticks with no session
+            // reconcile; live sessions also drain in reconcile).
+            crate::provider_observation::session::drain_deferred_offpath();
             // 6A stashed refresh details: same-state records carrying
             // the transition (tick-quantized for determinism).
             for pid in std::mem::take(&mut run.pending_details) {
@@ -4314,6 +4378,8 @@ fn observe(
     }
     // Deferred close: every entry still deferred emits
     // `deferred_removed` (cancel/timeout path vs natural expiry).
+    // R6-2a: run-end DISCARDS continuations (the run ends — no
+    // readmission follows, so nothing resumes them).
     let close_reason = if cancel.load(Ordering::Relaxed) {
         "cancelled"
     } else {
@@ -4354,6 +4420,9 @@ fn observe(
     // ledgers already rode the seals; nothing is reborn).
     run.evicted_epoch.clear();
     run.epoch_tombstones.clear();
+    // R6-3: run-end flush of live-path deferred closes (terminal —
+    // no more polling, so bounded synchronous close is allowed).
+    crate::provider_observation::session::flush_deferred_offpath_sync();
     // 6A seal-fold evaluation (§4.1): final ring reads folded during
     // sealing join the cumulative ring here, so the evaluators run
     // once more — seal-folded loss reaches the session carrier
@@ -6252,6 +6321,194 @@ mod tests {
         child.wait().ok();
     }
     #[test]
+    fn amnesia_refuses_forgotten_ineligible_sample() {
+        // R6-2b: ambiguity refusal precedes the sampled-membership
+        // emission — a forgotten ineligible incarnation (amnesia,
+        // no stash) is REFUSED with `history_ambiguous`, never a
+        // fabricated 0/0 `sampled` row. Remembered carriers still
+        // sample their history (41/40); genuinely-new (no amnesia)
+        // still sample honest 0/0.
+        fn ineligible_snapshot(pids: &[(u32, u64)]) -> inventory::Snapshot {
+            let processes: Vec<inventory::ProcessRecord> = pids
+                .iter()
+                .map(|(pid, starttime)| inventory::ProcessRecord {
+                    interval: inventory::CaptureInterval {
+                        started_unix_ms: None,
+                        finished_unix_ms: None,
+                        elapsed_ns: 0,
+                    },
+                    namespaces: inventory::NamespaceIds {
+                        pid: None,
+                        mount: None,
+                    },
+                    pid: *pid,
+                    starttime: *starttime,
+                    modules: Vec::new(),
+                    provider_activation: inventory::ObservationState::Unknown,
+                    provider_interfaces: inventory::ObservationState::Unknown,
+                    execution: inventory::ObservationState::Unknown,
+                })
+                .collect();
+            for record in &processes {
+                assert!(!eligible(record), "synthetic must be ineligible (premise)");
+            }
+            inventory::Snapshot {
+                interval: inventory::CaptureInterval {
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ns: 0,
+                },
+                scope_record: inventory::ScopeRecord::default(),
+                schema_version: "crypto-watch-test".to_owned(),
+                mode: inventory::SnapshotMode::Snapshot,
+                scope: inventory::Scope::Pids,
+                selected_pids: pids.iter().map(|(pid, _)| *pid).collect(),
+                processes,
+                gaps: Vec::new(),
+                totals: inventory::WorkTotals {
+                    processes_attempted: pids.len(),
+                    objects_attempted: 0,
+                    objects_inspected: 0,
+                    read_bytes: 0,
+                },
+                limits: inventory::Limits::default(),
+                capabilities: inventory::Capabilities {
+                    inventory: inventory::InventoryState::Complete,
+                    provider_activation: inventory::ObservationState::Unknown,
+                    provider_interfaces: inventory::ObservationState::Unknown,
+                    execution: inventory::ObservationState::Unknown,
+                },
+                resolve: Default::default(),
+                cgroup_identity: std::collections::BTreeMap::new(),
+            }
+        }
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let objects = FocusedObjects {
+            observation: Arc::from([0u8; 8]),
+            count: Arc::from([0u8; 8]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        // Amnesiac run: forgotten 4242 (no stash) + remembered
+        // 4343 (stashed 41/40), both ineligible.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        run.epoch_amnesia = true;
+        let remembered = Incarnation {
+            pid: 4343,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 40;
+        run.pending_epoch.insert(
+            DeferredKey::from(&remembered),
+            (
+                41,
+                ledger,
+                ReadmitCtx {
+                    retire_ns: 5,
+                    seal_tick: 2,
+                    witness_ts: Some(6),
+                },
+            ),
+        );
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation: 0,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            tracing: true,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let snapshot = ineligible_snapshot(&[(4242, 1), (4343, 1)]);
+        let mut bytes = Vec::new();
+        let mut sink = sink_into(&mut bytes);
+        let mut admitted = Vec::new();
+        run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let refused: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| {
+                r["kind"] == "session_gap"
+                    && r["incarnation"]["pid"] == 4242
+                    && r["reason"] == "history_ambiguous"
+            })
+            .collect();
+        assert_eq!(
+            refused.len(),
+            1,
+            "forgotten ineligible owes exactly one refusal, got {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r["kind"] != "membership"
+                || r["incarnation"]["pid"] != 4242
+                || r["state"] != "sampled"),
+            "forgotten ineligible must never sample (not even 0/0), got {rows:?}"
+        );
+        let sampled: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| {
+                r["kind"] == "membership"
+                    && r["incarnation"]["pid"] == 4343
+                    && r["state"] == "sampled"
+            })
+            .collect();
+        assert_eq!(sampled.len(), 1, "remembered must sample, got {rows:?}");
+        assert_eq!(sampled[0]["image_epoch"], 41, "epoch reset, got {rows:?}");
+        assert_eq!(sampled[0]["loss"]["loss"], 40, "loss reset, got {rows:?}");
+        // Genuinely-new run (no amnesia): ineligible 4444 samples
+        // honest 0/0 (no refusal — nothing forgotten).
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        assert!(!run.epoch_amnesia, "fresh run has no amnesia (premise)");
+        let snapshot = ineligible_snapshot(&[(4444, 1)]);
+        let mut bytes = Vec::new();
+        let mut sink = sink_into(&mut bytes);
+        let mut admitted = Vec::new();
+        run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let sampled: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| {
+                r["kind"] == "membership"
+                    && r["incarnation"]["pid"] == 4444
+                    && r["state"] == "sampled"
+            })
+            .collect();
+        assert_eq!(
+            sampled.len(),
+            1,
+            "genuinely-new ineligible must sample honest 0/0, got {rows:?}"
+        );
+        assert_eq!(sampled[0]["image_epoch"], 0, "honest 0/0, got {rows:?}");
+        assert_eq!(sampled[0]["loss"]["loss"], 0, "honest 0/0, got {rows:?}");
+        assert!(
+            rows.iter().all(|r| r["kind"] != "session_gap"),
+            "genuinely-new must not refuse, got {rows:?}"
+        );
+    }
+    #[test]
     fn failed_admission_keeps_tombstone() {
         // R4-3: the consume rides ADMISSION SUCCESS — a failed
         // open (SessionGap) keeps the tombstone for retry (an
@@ -6454,6 +6711,155 @@ mod tests {
         assert_eq!(
             announced, 1,
             "tombstoned drop owes exactly one announcement, got {rows:?}"
+        );
+    }
+    #[test]
+    fn live_ineligible_removal_preserves_continuation() {
+        // R6-2a: a LIVE ineligible removal (same incarnation, triple
+        // matches, record ineligible) carrying an exec-readmission
+        // context must re-stash the continuation — updated epoch
+        // (the sweep's exe re-proof already bumped it) + sealed
+        // deferred span + loss + readmit context — so the return
+        // resumes history (never 0/0). Death/reuse/run-end removal
+        // may discard (the incarnation is gone — see the sweep).
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let live_exe = super::exe_identity(pid).expect("own exe");
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        let mut marks = WindowStore::new(DEFERRED_MARKS);
+        marks.append(2, 4, LossCause::RingLoss);
+        let key = DeferredKey::from(&identity);
+        run.deferred.insert(
+            key.clone(),
+            DeferredEntry {
+                identity: identity.clone(),
+                image_epoch: 41,
+                first_tick: 4,
+                last_tick: 5,
+                ticks: 2,
+                reason: "active_limit",
+                marks,
+                // Bogus exe forces the re-proof bump (41 -> 42):
+                // the live exe differs, so the sweep advances.
+                exe: Some((0, 0)),
+                readmit: Some(ReadmitCtx {
+                    retire_ns: 5,
+                    seal_tick: 2,
+                    witness_ts: Some(6),
+                }),
+                carried_loss: 40,
+                carried_deferred: DeferredSpan {
+                    ticks: 10,
+                    first_tick: 1,
+                    last_tick: 3,
+                },
+                admit_ns: 0,
+                tombstoned: false,
+            },
+        );
+        assert_ne!(Some((0, 0)), Some(live_exe), "bump premise");
+        // Ineligible record under the exact live triple (no
+        // candidate interfaces — modules empty).
+        let record = ProcessRecord {
+            interval: inventory::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            },
+            namespaces: identity.namespaces.clone(),
+            pid,
+            starttime: identity.starttime,
+            modules: Vec::new(),
+            provider_activation: inventory::ObservationState::Unknown,
+            provider_interfaces: inventory::ObservationState::Unknown,
+            execution: inventory::ObservationState::Unknown,
+        };
+        assert!(
+            Incarnation::from(&record) == identity,
+            "synthetic record must match the live triple (premise)"
+        );
+        assert!(!eligible(&record), "record must be ineligible (premise)");
+        let snapshot = Snapshot {
+            interval: inventory::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            },
+            scope_record: inventory::ScopeRecord::default(),
+            schema_version: "crypto-watch-test".to_owned(),
+            mode: inventory::SnapshotMode::Snapshot,
+            scope: inventory::Scope::Pids,
+            selected_pids: vec![pid],
+            processes: vec![record],
+            gaps: Vec::new(),
+            totals: inventory::WorkTotals {
+                processes_attempted: 1,
+                objects_attempted: 0,
+                objects_inspected: 0,
+                read_bytes: 0,
+            },
+            limits: inventory::Limits::default(),
+            capabilities: inventory::Capabilities {
+                inventory: inventory::InventoryState::Complete,
+                provider_activation: inventory::ObservationState::Unknown,
+                provider_interfaces: inventory::ObservationState::Unknown,
+                execution: inventory::ObservationState::Unknown,
+            },
+            resolve: Default::default(),
+            cgroup_identity: std::collections::BTreeMap::new(),
+        };
+        let mut bytes = Vec::new();
+        let mut sink = sink_into(&mut bytes);
+        run.sweep_deferred(&mut sink, &snapshot).unwrap();
+        assert!(
+            !run.deferred.contains_key(&key),
+            "ineligible live entry must leave the queue"
+        );
+        let back = run.peek_exec_ctx(&key).expect(
+            "live ineligibility removal must preserve the continuation (not epoch 0/loss 0)",
+        );
+        assert_eq!(back.ctx.0, 42, "updated epoch must ride the re-stash");
+        assert_eq!(back.ctx.1.loss, 40, "loss reset across live removal");
+        assert_eq!(back.ctx.2.seal_tick, 2, "readmit context must ride along");
+        assert!(!back.tombstoned, "lossless entry stays lossless");
+        assert!(
+            !run.epoch_amnesia,
+            "live removal preserves — nothing forgotten"
+        );
+        // Sealed span: carried (10/[1,3]) unions own (3/[4,6]) —
+        // own ticks = 2 + (6 - 5), last = sweep tick.
+        assert_eq!(
+            back.ctx.1.deferred,
+            DeferredSpan {
+                ticks: 13,
+                first_tick: 1,
+                last_tick: 6,
+            },
+            "sealed deferred span must ride the re-stash"
+        );
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let removed: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| {
+                r["kind"] == "membership"
+                    && r["incarnation"]["pid"] == pid
+                    && r["state"] == "deferred_removed"
+            })
+            .collect();
+        assert_eq!(
+            removed.len(),
+            1,
+            "removal owes exactly one record, got {rows:?}"
+        );
+        assert_eq!(
+            removed[0]["image_epoch"], 42,
+            "removal carries the updated epoch, got {rows:?}"
         );
     }
     #[test]

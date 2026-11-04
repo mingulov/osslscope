@@ -3043,6 +3043,80 @@ mod forwarder_tests;
 #[cfg(test)]
 pub(super) mod fixture_support {
     use super::*;
+    /// R6-1 test staging: flip the exe stamp to a bogus value so
+    /// `exec_witnessed()` fires (live pidfd, matching triple, moved
+    /// exe) without a real exec. The incarnation still validates
+    /// for liveness — only the image identity flips.
+    pub fn stage_exec_flip(process: &mut VerifiedProcess) {
+        let old = &process.process;
+        let bogus = Stamp {
+            native: u64::MAX,
+            inode: u64::MAX,
+            size: u64::MAX,
+            mode: u32::MAX,
+            links: u64::MAX,
+            mt: i64::MAX,
+            mn: i64::MAX,
+            ct: i64::MAX,
+            cn: i64::MAX,
+        };
+        assert!(
+            bogus != old.exe_stamp,
+            "bogus exe stamp must differ (premise)"
+        );
+        process.process = Rc::new(Process {
+            _admission: None,
+            directory: old.directory.try_clone().unwrap(),
+            pid: old.pid,
+            pidfd: old.pidfd.try_clone().unwrap(),
+            executable: old.executable.try_clone().unwrap(),
+            exe_stamp: bogus,
+            starttime: old.starttime,
+            namespaces: old.namespaces.clone(),
+        });
+        process.revalidated_at.set(None);
+        assert!(
+            process.exec_witnessed(),
+            "staged exec must witness (premise)"
+        );
+    }
+    /// R6-1 test staging: drop one executable file-backed row from
+    /// the stored maps snapshot so the live maps read as
+    /// added-rows-only (dlopen shape) without touching the live
+    /// process. Triple + file stamps still validate; only the row
+    /// set grows.
+    pub fn stage_additive_rows(process: &mut VerifiedProcess) {
+        let stored: Vec<u8> = process.maps.as_ref().clone();
+        let mut lines: Vec<&[u8]> = stored.split(|b| *b == b'\n').collect();
+        let victim = lines
+            .iter()
+            .position(|line| matches!(parse_mapping(line), Ok(Some(_))))
+            .expect("stored maps must hold an executable row (premise)");
+        lines.remove(victim);
+        let mut trimmed = Vec::with_capacity(stored.len());
+        for (i, line) in lines.iter().enumerate() {
+            if i > 0 {
+                trimmed.push(b'\n');
+            }
+            trimmed.extend_from_slice(line);
+        }
+        process.maps = Rc::new(trimmed);
+        process.revalidated_at.set(None);
+        assert_eq!(
+            process.revalidate(),
+            Err(ObservationGap::ProcessChanged),
+            "staged additive rows must read ProcessChanged (premise)"
+        );
+        assert_eq!(
+            process.additive_verdict(),
+            Ok(AdditiveVerdict::AddedRowsOnly),
+            "staged rows must verdict AddedRowsOnly (premise)"
+        );
+        assert!(
+            !process.exec_witnessed(),
+            "additive staging must not witness exec (premise)"
+        );
+    }
     pub fn lose_mapped_process_directory(process: &mut VerifiedProcess) {
         let old = &process.process;
         process.process = Rc::new(Process {
