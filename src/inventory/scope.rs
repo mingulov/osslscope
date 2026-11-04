@@ -53,6 +53,12 @@ struct ModuleSelector {
 /// Resources are bounded by the supplied limits; no target code is loaded.
 pub struct ScopedScanner {
     pids: Vec<u32>,
+    /// 6A followed pids (coordinator-owned): event births + stranger
+    /// execs + live members queued for classification. UNIONED with
+    /// the preserved discovery scope below — following NEVER narrows
+    /// discovery (an unrelated process moving into the watched
+    /// cgroup, or a system-scan process, stays discoverable).
+    follow: Vec<u32>,
     cgroup: Option<File>,
     modules: Vec<ModuleSelector>,
     limits: Limits,
@@ -145,6 +151,7 @@ impl ScopedScanner {
         };
         Ok(Self {
             pids: selection.pids,
+            follow: Vec::new(),
             cgroup,
             modules,
             limits,
@@ -162,12 +169,15 @@ impl ScopedScanner {
     pub(crate) fn set_memory_pool(&mut self, memory: crate::observation_memory::MemoryPool) {
         self.scan_state.memory = Some(memory);
     }
-    /// 6A membership following: replace the scanned PID selection
-    /// (user selection ∪ followed incarnations, coordinator-owned,
-    /// sorted). Takes effect on the next snapshot; the scan cache
-    /// and cursor survive selection churn.
+    /// 6A membership following: replace the FOLLOWED pid set (live
+    /// members ∪ deferred ∪ followed-but-unclassified,
+    /// coordinator-owned, sorted). The original discovery scope
+    /// (`pids` + cgroup + modules from construction) is preserved:
+    /// followed pids are unioned with discovery, never intersected
+    /// (D-record §§1.1, 1.6). Takes effect on the next snapshot;
+    /// the scan cache and cursor survive selection churn.
     pub(crate) fn set_pids(&mut self, pids: Vec<u32>) {
-        self.pids = pids;
+        self.follow = pids;
     }
     pub(crate) fn snapshot_for(&mut self, timeout: std::time::Duration) -> Snapshot {
         let original = self.limits.timeout;
@@ -218,6 +228,11 @@ impl ScopedScanner {
             Ok(value) => value,
             Err(reason) => return self.failed(reason, &clock, budget.bytes),
         };
+        // 6A: the discovery scope is the CONSTRUCTION selection
+        // (pids × cgroup intersection when both were selected);
+        // followed pids are UNIONED (classification coverage), never
+        // intersected — following must not narrow discovery (§§1.1,
+        // 1.6). `selected` below is the original pid selection only.
         let pids = match &before {
             Some(membership) => {
                 let selected: BTreeSet<_> = self.pids.iter().copied().collect();
@@ -227,22 +242,35 @@ impl ScopedScanner {
                     .flatten()
                     .copied()
                     .filter(|pid| selected.is_empty() || selected.contains(pid))
+                    .chain(self.follow.iter().copied())
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect()
             }
-            None => self.pids.clone(),
+            None => self
+                .pids
+                .iter()
+                .copied()
+                .chain(self.follow.iter().copied())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
         };
         let mut limits = self.limits.clone();
         limits.max_read_bytes = limits.max_read_bytes.saturating_sub(budget.bytes);
         limits.timeout = limits.timeout.saturating_sub(budget.started.elapsed());
+        // 6A: system discovery is decided by the CONSTRUCTION
+        // selection alone — following never flips a system scan into
+        // a pid-restricted one (the unioned `pids` above only matter
+        // when the scan is already pid-scoped).
+        let system = self.pids.is_empty() && self.cgroup.is_none();
         let mut result = procfs::snapshot_reused(
             &SnapshotOptions {
                 pids,
                 limits,
                 resolve_paths: self.resolve_paths,
             },
-            self.pids.is_empty() && self.cgroup.is_none(),
+            system,
             !self.modules.is_empty(),
             &mut self.scan_state,
         );
@@ -271,8 +299,16 @@ impl ScopedScanner {
                                 .collect::<BTreeSet<_>>()
                                 .len()
                     };
-                    result.processes.retain(|p| stable.contains(&p.pid));
-                    result.selected_pids.retain(|pid| stable.contains(pid));
+                    // 6A: followed pids outside the stable set are
+                    // still classified (union coverage); only
+                    // undiscovered pids are stability-gated.
+                    let follow: BTreeSet<u32> = self.follow.iter().copied().collect();
+                    result
+                        .processes
+                        .retain(|p| stable.contains(&p.pid) || follow.contains(&p.pid));
+                    result
+                        .selected_pids
+                        .retain(|pid| stable.contains(pid) || follow.contains(pid));
                     // 6A stable-set sidecar: surviving pids map to
                     // their single directory identity (stable pids
                     // sit in exactly one identical directory in
@@ -896,5 +932,54 @@ mod observation_tests {
         );
         drop(full);
         assert!(pool.reserve(256 << 20).is_some());
+    }
+    #[test]
+    fn following_unions_with_preserved_discovery_scope() {
+        // 6A §§1.1, 1.6: `set_pids` unions followed pids with the
+        // construction-time discovery scope — it never narrows it.
+        // System selection stays system-wide; pid selection gains
+        // the followed pids without losing its own.
+        let mut first = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut second = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let present =
+            |snap: &super::Snapshot, pid: u32| snap.processes.iter().any(|p| p.pid == pid);
+        // System scope: the followed pid is covered AND the scan
+        // stays system-wide (an unrelated process is discovered).
+        let mut scanner = ScopedScanner::new(Selection::default(), Limits::default()).unwrap();
+        scanner.set_pids(vec![first.id()]);
+        let snap = scanner.snapshot();
+        assert!(present(&snap, first.id()), "followed pid classified");
+        assert!(
+            snap.processes.len() > 1,
+            "system discovery narrowed to the followed set"
+        );
+        // Pid scope: construction pids plus followed pids (union).
+        let mut scanner = ScopedScanner::new(
+            Selection {
+                pids: vec![first.id()],
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        scanner.set_pids(vec![second.id()]);
+        let snap = scanner.snapshot();
+        assert!(present(&snap, first.id()), "construction scope kept");
+        assert!(present(&snap, second.id()), "followed pid unioned");
+        first.kill().unwrap();
+        first.wait().unwrap();
+        second.kill().unwrap();
+        second.wait().unwrap();
     }
 }

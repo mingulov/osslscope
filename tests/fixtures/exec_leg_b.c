@@ -1,8 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  * Control 3/4 post-exec leg: re-establishes the instrumented provider,
- * performs exact post-exec calls split across a GO gate (pre/post
- * re-admission), then either exits or (adversarial leg) execs onward.
- * argv: [logpath, provider_path, go3path, mode, next...].
+ * waits for the re-admission gate, then performs exact post-exec calls
+ * (all post-admission, so the per-leg ADMITTED gates are exact), then
+ * either exits or (adversarial leg) execs onward IMMEDIATELY (same-tick
+ * double exec: no calls, no gate wait between the two execs).
+ * argv: [logpath, provider_path, go3path, go4path, mode, next...].
  * mode: end|exec. Logs post-exec exe identity + exact call counts. */
 #include <openssl/provider.h>
 #include <openssl/evp.h>
@@ -57,19 +59,21 @@ static void *worker_exec(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 5) return 2;
-    const char *logpath = argv[1], *provider_path = argv[2], *go3 = argv[3];
-    int onward = !strcmp(argv[4], "exec");
-    if (strcmp(argv[4], "end") && !onward) return 2;
-    g_next_argv = onward ? &argv[5] : NULL;
-    g_next = onward ? argv[5] : NULL;
+    if (argc < 6) return 2;
+    const char *logpath = argv[1], *provider_path = argv[2], *go3 = argv[3], *go4 = argv[4];
+    int onward = !strcmp(argv[5], "exec");
+    if (strcmp(argv[5], "end") && !onward) return 2;
+    g_next_argv = onward ? &argv[6] : NULL;
+    g_next = onward ? argv[6] : NULL;
     void *module = dlopen(provider_path, RTLD_NOW | RTLD_LOCAL);
     if (!module) return 3;
     OSSL_provider_init_fn *init = (OSSL_provider_init_fn *)dlsym(module, "OSSL_provider_init");
     void (*count_mode)(int) = (void (*)(int))dlsym(module, "fixture_count_mode");
     uint64_t (*count_read)(void) = (uint64_t (*)(void))dlsym(module, "fixture_count_read");
     if (!init || !count_mode || !count_read) return 4;
-    count_mode(1);
+    /* count_mode 0: the queried callback is the probed plain
+     * digest_init (D-record correspondence). */
+    count_mode(0);
     OSSL_LIB_CTX *ctx = OSSL_LIB_CTX_new();
     if (!ctx) return 5;
     if (!OSSL_PROVIDER_add_builtin(ctx, "private-fixture-provider", init)) return 6;
@@ -87,27 +91,42 @@ int main(int argc, char **argv) {
     if (!log) return 10;
     setvbuf(log, NULL, _IONBF, 0);
     g_log = log;
+    /* Observed crypto (F14): EVP re-inits with a digest fetched
+     * from the fixture provider (private ctx, sole provider).
+     * Fetch + mdctx + prime here at startup (pre-b0: startup
+     * precedes the postexec sync the harness baselines after);
+     * only the 500 post-go3 inits run inside the B window. */
+    EVP_MD *evp_md = EVP_MD_fetch(ctx, "SHA256", NULL);
+    EVP_MD_CTX *evp_ctx = EVP_MD_CTX_new();
+    if (!evp_md || !evp_ctx) return 12;
+    if (EVP_DigestInit_ex2(evp_ctx, evp_md, NULL) != 1) return 13;
+    (void)callback;
     struct stat exe;
     if (stat("/proc/self/exe", &exe) != 0) return 11;
     fprintf(log, "postexec %d %llu %llu\n",
             (int)getpid(), (unsigned long long)exe.st_dev, (unsigned long long)exe.st_ino);
-    for (int i = 0; i < 200; ++i)
-        if (callback(NULL, NULL) != 1) return 12;
-    fprintf(log, "calls_b1 %llu\n", (unsigned long long)count_read());
-    pthread_t worker = 0;
     if (onward) {
+        /* Adversarial: exec onward immediately (same tick as the
+         * first exec -- no calls, no gate wait between them). */
+        pthread_t worker;
         if (pthread_create(&worker, NULL, worker_exec, NULL) != 0) return 13;
-    }
-    if (!wait_go(go3)) { fprintf(log, "go3_timeout\n"); return 14; }
-    for (int i = 0; i < 300; ++i)
-        if (callback(NULL, NULL) != 1) return 12;
-    fprintf(log, "calls_b %llu\n", (unsigned long long)count_read());
-    if (onward) {
         g_go_exec = 1;
         pthread_join(worker, NULL);
         return 15; /* unreachable: the worker execs */
     }
+    if (!wait_go(go3)) { fprintf(log, "go3_timeout\n"); return 14; }
+    int done_b = 0;
+    for (int i = 0; i < 500; ++i)
+        if (EVP_DigestInit_ex2(evp_ctx, evp_md, NULL) == 1) done_b++;
+    fprintf(log, "calls_b %d %llu\n", done_b, now_ns());
+    /* Hold for the harness B-final map dump (deterministic window:
+     * the process stays alive with its maps until GO4). */
+    if (!wait_go(go4)) { fprintf(log, "go4_timeout\n"); return 14; }
     fprintf(log, "leg_b_done\n");
     fclose(log);
-    return 0;
+    /* Clean exit with ZERO libcrypto passages: _exit skips exit
+     * destructors (whose provider-teardown + allocator calls would
+     * otherwise execute probed sites AFTER the stimulus window and
+     * over-attribute epoch 1). The observer seals on the EXIT edge. */
+    _exit(0);
 }

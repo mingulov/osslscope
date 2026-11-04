@@ -81,7 +81,9 @@ int main(int argc, char **argv) {
     void (*count_mode)(int) = (void (*)(int))dlsym(module, "fixture_count_mode");
     uint64_t (*count_read)(void) = (uint64_t (*)(void))dlsym(module, "fixture_count_read");
     if (!init || !count_mode || !count_read) return 4;
-    count_mode(1);
+    /* count_mode 0: the queried callback is the probed plain
+     * digest_init (D-record correspondence). */
+    count_mode(0);
     OSSL_LIB_CTX *ctx = OSSL_LIB_CTX_new();
     if (!ctx) return 5;
     if (!OSSL_PROVIDER_add_builtin(ctx, "private-fixture-provider", init)) return 6;
@@ -99,12 +101,24 @@ int main(int argc, char **argv) {
     if (!log) return 10;
     setvbuf(log, NULL, _IONBF, 0);
     g_log = log;
+    /* Observed crypto (F14): EVP re-inits with a digest fetched
+     * from the fixture provider (private ctx, sole provider).
+     * Fetch + mdctx + prime here at startup (pre-baseline, and
+     * pre-attach for leg A): each counted re-init passes one
+     * site per plane exactly once. Only the 500 inits run
+     * inside the harness baseline window. */
+    EVP_MD *evp_md = EVP_MD_fetch(ctx, "SHA256", NULL);
+    EVP_MD_CTX *evp_ctx = EVP_MD_CTX_new();
+    if (!evp_md || !evp_ctx) return 12;
+    if (EVP_DigestInit_ex2(evp_ctx, evp_md, NULL) != 1) return 13;
+    (void)callback;
     fprintf(log, "ready %d %d\n", (int)getpid(), (int)leg_tid());
     log_tasks(log);
     if (!wait_go(go1)) { fprintf(log, "go1_timeout\n"); return 11; }
+    int done_a = 0;
     for (int i = 0; i < 500; ++i)
-        if (callback(NULL, NULL) != 1) return 12;
-    fprintf(log, "calls_a %llu\n", (unsigned long long)count_read());
+        if (EVP_DigestInit_ex2(evp_ctx, evp_md, NULL) == 1) done_a++;
+    fprintf(log, "calls_a %d\n", done_a);
     pthread_t worker = 0;
     if (nonleader) {
         if (pthread_create(&worker, NULL, worker_exec, NULL) != 0) return 13;

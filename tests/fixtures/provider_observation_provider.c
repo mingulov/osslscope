@@ -4,6 +4,7 @@
 #include <openssl/core.h>
 #include <openssl/core_dispatch.h>
 #include <openssl/core_names.h>
+#include <openssl/params.h>
 #include <stddef.h>
 #include <stdint.h>
 static int volatile_table;
@@ -25,10 +26,51 @@ __attribute__((noinline)) int fixture_count_entry(void *ctx, const OSSL_PARAM pa
 static void *newctx(void *ctx) { return ctx; }
 static void freectx(void *ctx) { (void)ctx; }
 static int digest_init(void *ctx, const OSSL_PARAM params[]) { (void)ctx; (void)params; return 1; }
+static int digest_update(void *ctx, const unsigned char *in, size_t inl) { (void)ctx; (void)in; (void)inl; return 1; }
+static int digest_final(void *ctx, unsigned char *out, size_t *outl, size_t outsz) { (void)ctx; (void)out; (void)outsz; if (outl) *outl = 0; return 1; }
+/* Fetchable-digest support (6A controls 2-4, 9a): libcrypto fetch
+ * requires update/final plus cacheable size constants (alg-level
+ * get_params; ctx-level get_ctx_params is served too). The
+ * unknown-ID 9999 entry stays: fetch tolerates it, and it keeps
+ * exercising the observer's unknown-function tolerance. */
+static const OSSL_PARAM gettable_params[] = {
+    OSSL_PARAM_size_t(OSSL_DIGEST_PARAM_BLOCK_SIZE, NULL),
+    OSSL_PARAM_size_t(OSSL_DIGEST_PARAM_SIZE, NULL),
+    OSSL_PARAM_END
+};
+static const OSSL_PARAM *digest_gettable_params(void *provctx) {
+    (void)provctx; return gettable_params;
+}
+static int digest_get_params(OSSL_PARAM params[]) {
+    OSSL_PARAM *p;
+    p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_BLOCK_SIZE);
+    if (p && !OSSL_PARAM_set_size_t(p, 64)) return 0;
+    p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_SIZE);
+    if (p && !OSSL_PARAM_set_size_t(p, 32)) return 0;
+    return 1;
+}
+static const OSSL_PARAM *digest_gettable_ctx_params(void *cctx, void *provctx) {
+    (void)cctx; (void)provctx; return gettable_params;
+}
+static int digest_get_ctx_params(void *cctx, OSSL_PARAM params[]) {
+    OSSL_PARAM *p;
+    (void)cctx;
+    p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_BLOCK_SIZE);
+    if (p && !OSSL_PARAM_set_size_t(p, 64)) return 0;
+    p = OSSL_PARAM_locate(params, OSSL_DIGEST_PARAM_SIZE);
+    if (p && !OSSL_PARAM_set_size_t(p, 32)) return 0;
+    return 1;
+}
 static const OSSL_DISPATCH implementation[] = {
     { OSSL_FUNC_DIGEST_NEWCTX, (void (*)(void))newctx },
     { OSSL_FUNC_DIGEST_INIT, (void (*)(void))digest_init },
+    { OSSL_FUNC_DIGEST_UPDATE, (void (*)(void))digest_update },
+    { OSSL_FUNC_DIGEST_FINAL, (void (*)(void))digest_final },
     { OSSL_FUNC_DIGEST_FREECTX, (void (*)(void))freectx },
+    { OSSL_FUNC_DIGEST_GETTABLE_CTX_PARAMS, (void (*)(void))digest_gettable_ctx_params },
+    { OSSL_FUNC_DIGEST_GET_CTX_PARAMS, (void (*)(void))digest_get_ctx_params },
+    { OSSL_FUNC_DIGEST_GETTABLE_PARAMS, (void (*)(void))digest_gettable_params },
+    { OSSL_FUNC_DIGEST_GET_PARAMS, (void (*)(void))digest_get_params },
     { 9999, (void (*)(void))digest_init },
     { 0, NULL }
 };

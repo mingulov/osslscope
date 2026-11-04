@@ -1304,15 +1304,17 @@ pub enum LifecycleKind {
 ///
 /// The 6A (†) fields are additive: the connector payload/envelope already
 /// delivers every value and current session readers ignore the fields
-/// (D-record §1.8). `tgid`/`cpu`/`seq` are zero on polling paths (no
-/// producer); `parent_tgid` is the witnessing root on polling paths.
+/// (D-record §1.8). Polling supplies `tgid` from its census (only
+/// `cpu`/`seq` stay zero — synthetic events carry no kernel
+/// coordinates); `parent_tgid` is the witnessing root on polling paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleEvent {
     pub kind: LifecycleKind,
     pub pid: u32,
     /// Producer timestamp only; polling has no event timestamp.
     pub timestamp_ns: Option<u64>,
-    /// 6A: event thread-group id (payload word, zero on polling paths).
+    /// 6A: event thread-group id (payload word on the kernel path,
+    /// census TGID on polling paths).
     pub tgid: u32,
     /// 6A: parent thread-group id for Fork/ThreadBirth (payload word;
     /// witnessing root on polling paths, zero for Exec/Exit).
@@ -6842,6 +6844,21 @@ where
                     return Ok(RoundAction::Closed);
                 }
             }
+            // 6A owned-corpse retirement (§1.3): the wait expired
+            // with the member still unreaped and maps still empty —
+            // retire with `visibility_lost` (sealed document via the
+            // close below; the loss counter marks the corpse span,
+            // never invented zero counts), instead of continuing
+            // into snapshot/fence processing. Retirement never
+            // signals: custody stays with the target state machine.
+            self.state.extra_counters.push(typed_counter(
+                "capture.corpse_wait_expired",
+                CounterKind::Loss,
+                CounterUnits::Events,
+                CounterSource::Lifecycle,
+                1,
+            ));
+            return Ok(RoundAction::Closed);
         }
         let mut fresh = HashSet::new();
         for m in &live {
@@ -16632,6 +16649,48 @@ pub(crate) mod tests {
         }
 
         struct ProcStub;
+        /// 6A §1.3: `ProcStub` models EMPTY maps — an owned capture
+        /// over it is a corpse (retires at `CORPSE_WAIT` expiry).
+        /// Wall-pair tests need a LIVE owned target (non-empty
+        /// maps), so they run over this stub instead. Assertions
+        /// unchanged: the contract under test is wall-edge reuse,
+        /// not corpse behavior.
+        struct ProcStubLive;
+        impl ProcPort for ProcStubLive {
+            fn read_maps(&mut self, _pid: u32) -> anyhow::Result<Vec<maps::Mapping>> {
+                Ok(vec![maps::Mapping {
+                    start: 0x1000,
+                    end: 0x2000,
+                    x: true,
+                    offset: 0,
+                    dev: "00:00".to_string(),
+                    ino: 1,
+                    path: String::new(),
+                }])
+            }
+            fn read_file(&mut self, _path: &str) -> anyhow::Result<Vec<u8>> {
+                anyhow::bail!("unstubbed")
+            }
+            fn read_file_bound(
+                &mut self,
+                _path: &str,
+                _max_bytes: usize,
+            ) -> std::io::Result<(Arc<[u8]>, (u64, u64))> {
+                Err(std::io::Error::new(std::io::ErrorKind::Other, "unstubbed"))
+            }
+            fn stat_file(&mut self, _path: &str) -> Option<FileStat> {
+                None
+            }
+            fn read_exe(&mut self, _pid: u32) -> Option<PathBuf> {
+                None
+            }
+            fn file_len(&mut self, _path: &str) -> Option<u64> {
+                None
+            }
+            fn read_comm(&mut self, _pid: u32) -> Option<String> {
+                None
+            }
+        }
         impl ProcPort for ProcStub {
             fn read_maps(&mut self, _pid: u32) -> anyhow::Result<Vec<maps::Mapping>> {
                 Ok(Vec::new())
@@ -19223,7 +19282,7 @@ pub(crate) mod tests {
             info.kernel_release = "6.9.0-test".to_string();
             info.acquired_wall = acquired_wall;
             let clock = WallScriptClock::at(5_000_000_000);
-            let mut proc = ProcStub;
+            let mut proc = ProcStubLive;
             let cancelled = || false;
             let count = CountSession::new(TPID, FakeCountBackend::new());
             observe(

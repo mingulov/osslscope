@@ -31,13 +31,19 @@ pub(super) struct Row {
 /// failed to re-observe keeps its last-good `last_ns`; if that were
 /// `>= edge_ns` the row would already be withheld, so surviving
 /// stale rows are provably pre-edge and safe to project.
+/// Conservation key: every withheld aggregate keeps its ACTUAL
+/// `(cookie, generation)` in `hw` — retirement (`fence`) may have
+/// advanced the fold generation before the kernel-edge fence armed,
+/// so keying removals under `fenced_gen` would double-count a final
+/// reread (withheld once + foreign once). `hw` membership is the
+/// withheld-growth test: a re-observed withheld key accrues deltas
+/// as withheld under its own generation, never as foreign.
 #[derive(Clone)]
 struct FenceState {
     edge_ns: u64,
     fenced_gen: u32,
     post_gen: u32,
     withheld: u64,
-    withheld_cookies: std::collections::BTreeSet<u32>,
     hw: BTreeMap<(u32, u32), u64>,
 }
 /// Bounded pure host folding and attachment admission. The install closure is
@@ -106,7 +112,6 @@ impl CountFold {
             fenced_gen,
             post_gen,
             withheld: 0,
-            withheld_cookies: std::collections::BTreeSet::new(),
             hw: BTreeMap::new(),
         });
         self.sweep_fence();
@@ -120,18 +125,17 @@ impl CountFold {
             Some(f) => f.edge_ns,
             None => return,
         };
-        let straddling: Vec<(u32, u64)> = self
+        let straddling: Vec<(u32, u32, u64)> = self
             .rows
             .iter()
             .filter(|(_, r)| r.row.last_ns >= edge_ns && r.row.calls > 0)
-            .map(|(&cookie, r)| (cookie, r.row.calls))
+            .map(|(&cookie, r)| (cookie, r.row.generation, r.row.calls))
             .collect();
-        for (cookie, calls) in straddling {
+        for (cookie, generation, calls) in straddling {
             self.rows.remove(&cookie);
             if let Some(f) = self.fence.as_mut() {
                 f.withheld = f.withheld.saturating_add(calls);
-                f.withheld_cookies.insert(cookie);
-                f.hw.insert((cookie, f.fenced_gen), calls);
+                f.hw.insert((cookie, generation), calls);
             }
         }
     }
@@ -361,18 +365,19 @@ impl CountFold {
         // 6A fence routing (before the row/foreign split): post-edge
         // keys under the rotated guard, and later growth of removed
         // straddling rows, accrue high-water deltas as withheld —
-        // never foreign, never projected. Stale generations fall
-        // through to today's high-water behavior (idempotent).
-        if let Some((post_gen, fenced_gen, removed)) = self.fence.as_ref().map(|f| {
+        // never foreign, never projected. Withheld growth is tested
+        // by `hw` membership under the key's ACTUAL generation (a
+        // retired row's generation predates `fenced_gen`). Stale
+        // generations fall through to today's high-water behavior
+        // (idempotent).
+        if let Some((post_gen, fenced_gen, withheld_key)) = self.fence.as_ref().map(|f| {
             (
                 f.post_gen,
                 f.fenced_gen,
-                f.withheld_cookies.contains(&cookie),
+                f.hw.contains_key(&(cookie, generation)),
             )
         }) {
-            if (generation == post_gen && generation != fenced_gen)
-                || (generation == fenced_gen && removed)
-            {
+            if (generation == post_gen && generation != fenced_gen) || withheld_key {
                 if self
                     .fence
                     .as_ref()
@@ -426,7 +431,6 @@ impl CountFold {
                     self.rows.remove(&cookie);
                     if let Some(f) = self.fence.as_mut() {
                         f.withheld = f.withheld.saturating_add(calls);
-                        f.withheld_cookies.insert(cookie);
                         f.hw.insert((cookie, generation), calls);
                     }
                 }
@@ -480,6 +484,8 @@ impl CountFold {
     /// A closed final enumeration must include every previously observed key.
     /// Counts are never deleted in this producer, including fenced generations.
     /// A missing row cannot be filled from a live cached prefix.
+    /// 6A: withheld high-water keys are observed keys too — withholding
+    /// removed their rows, but the producer still holds their counts.
     pub(super) fn validate_final_keys(
         &self,
         keys: &std::collections::BTreeSet<(u32, u32)>,
@@ -488,6 +494,10 @@ impl CountFold {
             row.row.calls > 0 && !keys.contains(&(cookie, row.row.generation))
         }) || self.foreign.keys().any(|key| !keys.contains(key))
             || self.engine.keys().any(|key| !keys.contains(key))
+            || self.fence.as_ref().is_some_and(|f| {
+                f.hw.keys()
+                    .any(|key| f.hw.get(key).is_some_and(|&calls| calls > 0) && !keys.contains(key))
+            })
         {
             return Err(CountFailure::Read);
         }
@@ -595,6 +605,73 @@ mod tests {
             fold.attach_pinned(binding, super::super::ENGINE_COOKIE_BASE, |_, _| Ok(())),
             Err(CountFailure::Resource)
         );
+    }
+    #[test]
+    fn fence_conserves_across_retired_generations() {
+        // 6A fence conservation: a row retired (generation advanced
+        // by `fence`) before the kernel-edge fence keeps its ACTUAL
+        // generation in the withheld high-water — a final reread of
+        // the unchanged key accrues a zero delta as withheld, never
+        // a second copy as foreign/unattributed.
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let binding = SiteBinding {
+            site: SiteKey {
+                object: ObjectId("a".repeat(64)),
+                device: 1,
+                inode: 2,
+                offset: 3,
+            },
+            session_generation: 1,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, generation) = fold.attach(binding, |_, _| Ok(())).unwrap();
+        let value = CountValue {
+            count: 7,
+            first_ns: 2,
+            last_ns: 10,
+        };
+        fold.observe(cookie, generation, &[value]).unwrap();
+        fold.fence().unwrap();
+        fold.note_fence(5);
+        fold.observe(cookie, generation, &[value]).unwrap();
+        let s = fold.sample();
+        assert_eq!(s.fence_withheld, 7, "withheld once");
+        assert_eq!(s.unattributed, 0, "no foreign double-count");
+    }
+    #[test]
+    fn withheld_keys_need_final_enumeration() {
+        // Withholding removes the row but the producer never deletes
+        // counts: a closed final enumeration missing a withheld key
+        // fails validation like any other missing key.
+        let mut fold = CountFold::new(CountLimits::default()).unwrap();
+        let binding = SiteBinding {
+            site: SiteKey {
+                object: ObjectId("b".repeat(64)),
+                device: 1,
+                inode: 2,
+                offset: 3,
+            },
+            session_generation: 1,
+            mapping_generation: 1,
+            candidates: vec![],
+            installed_ns: 1,
+        };
+        let (cookie, generation) = fold.attach(binding, |_, _| Ok(())).unwrap();
+        let value = CountValue {
+            count: 7,
+            first_ns: 2,
+            last_ns: 10,
+        };
+        fold.observe(cookie, generation, &[value]).unwrap();
+        fold.note_fence(5);
+        assert_eq!(
+            fold.validate_final_keys(&Default::default()),
+            Err(CountFailure::Read)
+        );
+        let keys = std::collections::BTreeSet::from([(cookie, generation)]);
+        assert!(fold.validate_final_keys(&keys).is_ok());
     }
     #[test]
     fn count_generation_exhaustion_is_permanent() {

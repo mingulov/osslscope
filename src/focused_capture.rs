@@ -741,7 +741,14 @@ impl FocusedSession {
         if objects.observation.len() > 16 << 20 || objects.count.len() > 16 << 20 {
             bail!("focused companion capacity exceeded");
         }
-        let mut bytes = (104usize << 20) + objects.observation.len() + objects.count.len();
+        // 6A admitted-member ledger storage (§3.1, frozen): each
+        // member ledger holds at most 64 lost windows in the compact
+        // 24 B layout plus scalars (1576 B ≤ 2 KiB), charged to the
+        // session lease as `LEDGER_BYTES = 2 KiB` per admitted
+        // member.
+        const LEDGER_BYTES: usize = 2 << 10;
+        let mut bytes =
+            (104usize << 20) + objects.observation.len() + objects.count.len() + LEDGER_BYTES;
         // Borrowed maps are charged once, by the session-side owner: when a
         // session companion exists the counter shares its producer/source
         // maps instead of creating them. Standalone counters (no session
@@ -897,6 +904,10 @@ impl FocusedSession {
             // The exports bound derives from the Api vocabulary (6A):
             // `exports` is deduplicated over variants, so our own
             // snapshots always fit; only forged metadata can exceed it.
+            // Stale-bound history (disclosure): 16 entries
+            // (pre-Oct-28) → 46 (Oct-28 312cf3f) → `Api::COUNT`
+            // (70 current variants); the live count keeps the bound
+            // exact as variants churn.
             if owned.1.is_some()
                 || expected.pid != pid
                 || expected.modules.len() > 256
@@ -1707,6 +1718,15 @@ impl FocusedSession {
                         self.refresh_pending.push(ns);
                     }
                 }
+                // 6A timestamp-less exec fencing (§1.8): a batch that
+                // detects an exec fences BEFORE it is applied, using
+                // the PRECEDING clean instant — the counter folds
+                // below (and the coordinator's later
+                // `note_kernel_edge(None)`) must see the pre-detect
+                // edge, never this batch's end.
+                if !batch.exec_witnesses.is_empty() {
+                    self.note_kernel_edge(None);
+                }
                 self.apply_batch(batch, tick_end, cancel)?;
             }
             self.plan_engine_probes(records, tick_end, cancel);
@@ -1740,9 +1760,20 @@ impl FocusedSession {
                     self.refresh_pending.push(ns);
                 }
             }
+            // 6A timestamp-less exec fencing (§1.8): an
+            // exec-detecting drain is NOT clean — fence before
+            // applying (preceding clean instant) and leave
+            // `last_clean_drain_ns` at the previous clean drain.
+            // Only a witness-free drain advances the clean instant.
+            let detecting = !batch.exec_witnesses.is_empty();
+            if detecting {
+                self.note_kernel_edge(None);
+            }
             self.apply_batch(batch, tick_end, cancel)?;
-            if let Ok(ns) = now_ns() {
-                self.last_clean_drain_ns = ns;
+            if !detecting {
+                if let Ok(ns) = now_ns() {
+                    self.last_clean_drain_ns = ns;
+                }
             }
         }
         self.signal_cut |= cancel.load(Ordering::Relaxed);
@@ -1899,12 +1930,22 @@ impl FocusedSession {
             .map(|s| s.loss_totals())
             .unwrap_or([0; 8])
     }
+    /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
+    /// LOSS read sequences, `None` when no provider session
+    /// contributes (nothing to prove). The coordinator advances a
+    /// lane's baseline tick only past ticks every live session
+    /// read successfully, retaining the last successful baseline
+    /// through failures.
+    pub(crate) fn session_loss_read_seq(&self) -> Option<[u64; 8]> {
+        self.session.as_ref().map(|s| s.loss_read_seq())
+    }
     /// 6A kernel-edge fence (§1.8): fence the counter (generation
     /// guard + withholding) and the provider session (BPF rows +
     /// post-edge record filter) at `edge_ns`. `None` resolves to
-    /// the previous completed drain's read instant (conservative:
-    /// the edge may be as old as the last drain). One-way;
-    /// earliest edge wins at both layers.
+    /// the previous CLEAN drain's read instant — an exec-detecting
+    /// drain never advances it (conservative: the edge may be as
+    /// old as the last clean drain). One-way; earliest edge wins
+    /// at both layers.
     pub(crate) fn note_kernel_edge(&mut self, edge_ns: Option<u64>) {
         let edge = edge_ns.unwrap_or(self.last_clean_drain_ns);
         if let Some(c) = &mut self.counter {
@@ -1912,6 +1953,14 @@ impl FocusedSession {
         }
         if let Some(s) = &mut self.session {
             s.fence_target(self.pid, edge);
+        }
+    }
+    /// 6A thread-exit row cleanup (§1.2): drop a confirmed-dead
+    /// tid's pairing rows; the TGID member and its counts survive.
+    /// No-op without a provider session (nothing to clean).
+    pub(crate) fn remove_thread_rows(&mut self, tid: u32) {
+        if let Some(s) = &mut self.session {
+            s.remove_thread_rows(self.pid, tid);
         }
     }
     /// 6A suspension for retained-unknown members (§2.4): retire
@@ -1926,6 +1975,18 @@ impl FocusedSession {
         if let Some(s) = &mut self.session {
             s.suspend_target(self.pid);
         }
+    }
+    /// 6A suspension under membership uncertainty (§§1.6, 2.4):
+    /// fence at the uncertainty edge FIRST (inter-tick aggregates
+    /// withhold whole into conserved loss — an unknown-window
+    /// annotation alone never satisfies the attribution
+    /// prohibition), then suspend as above. The provider fence
+    /// clears after the first clean post-recovery drain (bounded
+    /// window, not a pre-seal fence); the counter re-attaches
+    /// under a fresh generation on recovery.
+    pub(crate) fn suspend_retained_with_edge(&mut self, edge_ns: u64) {
+        self.note_kernel_edge(Some(edge_ns));
+        self.suspend_retained();
     }
     /// 6A seal after a kernel-edge fence: late/resolve fence, then
     /// the normal close drain (withholding applies throughout).

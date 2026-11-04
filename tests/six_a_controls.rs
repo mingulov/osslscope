@@ -18,6 +18,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
@@ -199,6 +200,33 @@ impl FixtureSession {
         assert!(!text.is_empty(), "fixture stdout ended early");
         text.trim_end().to_string()
     }
+    /// Send a command plus extra argument lines (e.g. `K` reads two);
+    /// returns non-ack output lines. Panics unless the ack reports success.
+    fn cmd2(&mut self, command: &str, args: &[&str]) -> Vec<String> {
+        use std::io::Write;
+        let mut text = format!("{command}\n");
+        for arg in args {
+            text.push_str(arg);
+            text.push('\n');
+        }
+        self.child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+        let mut out = Vec::new();
+        loop {
+            let line = self.line();
+            if let Some(ack) = line.strip_prefix("ack ") {
+                let fields: Vec<&str> = ack.split_whitespace().collect();
+                assert_eq!(fields.len(), 7, "malformed ack: {line}");
+                assert_eq!(fields[1], "1", "fixture command failed: {command}: {line}");
+                return out;
+            }
+            out.push(line);
+        }
+    }
     /// Send one command line; returns non-ack output lines. Panics unless
     /// the ack reports success.
     fn cmd(&mut self, command: &str) -> Vec<String> {
@@ -221,10 +249,40 @@ impl FixtureSession {
             out.push(text);
         }
     }
-    fn counter(&mut self) -> u64 {
-        let lines = self.cmd("R");
-        assert_eq!(lines.len(), 1);
-        lines[0].strip_prefix("counter ").unwrap().parse().unwrap()
+    /// Write a command without reading (the caller dumps maps
+    /// across the fixture's work, then drains with `drain_ack`).
+    fn write_raw(&mut self, text: &str) {
+        use std::io::Write;
+        self.child
+            .stdin
+            .as_mut()
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+    /// Drain lines until the ack; `None` on fixture failure or EOF
+    /// (the caller goes INCONCLUSIVE -- fixture-side fault).
+    fn drain_ack(&mut self) -> Option<Vec<String>> {
+        let mut out = Vec::new();
+        loop {
+            let mut text = String::new();
+            use std::io::BufRead;
+            if self.reader.read_line(&mut text).ok()? == 0 {
+                return None;
+            }
+            let text = text.trim_end().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            if let Some(ack) = text.strip_prefix("ack ") {
+                let fields: Vec<&str> = ack.split_whitespace().collect();
+                if fields.len() != 7 || fields[1] != "1" {
+                    return None;
+                }
+                return Some(out);
+            }
+            out.push(text);
+        }
     }
     fn finish(mut self) {
         use std::io::Write;
@@ -565,56 +623,6 @@ fn segment_calls(segment: &serde_json::Value) -> Option<u64> {
     Some(total)
 }
 
-/// True when the row carries any explicit unknown marker (loss summary with
-/// content, lost windows, or session-loss intervals).
-fn has_unknown_marker(row: &serde_json::Value) -> bool {
-    let loss = &row["loss"];
-    if loss.is_object() {
-        if loss["loss"].as_u64().unwrap_or(0) > 0 {
-            return true;
-        }
-        if loss["coalesced"].as_u64().unwrap_or(0) > 0 {
-            return true;
-        }
-        if loss["lost_windows"]
-            .as_array()
-            .is_some_and(|w| !w.is_empty())
-        {
-            return true;
-        }
-        if loss["deferred"]["ticks"].as_u64().unwrap_or(0) > 0 {
-            return true;
-        }
-    }
-    let session = &row["session_loss"];
-    if session.is_object() {
-        if session["lost_intervals"]
-            .as_array()
-            .is_some_and(|w| !w.is_empty())
-        {
-            return true;
-        }
-        for key in [
-            "signal_dropped",
-            "scan_loss",
-            "signal_prefix_unwitnessed",
-            "drain_pending",
-            "unattributed_events",
-        ] {
-            if session[key].as_u64().unwrap_or(0) > 0 {
-                return true;
-            }
-        }
-        if session["ring"]
-            .as_array()
-            .is_some_and(|r| r.iter().any(|v| v.as_u64().unwrap_or(0) > 0))
-        {
-            return true;
-        }
-    }
-    false
-}
-
 /// Every `tid` value in the stream must be null (no thread-origin evidence,
 /// no per-tid billing — §1.8/§4.1).
 fn assert_no_tid_attribution(rows: &[serde_json::Value]) {
@@ -642,9 +650,28 @@ fn assert_no_tid_attribution(rows: &[serde_json::Value]) {
     }
 }
 
-/// Control 2 (thread): tid churn while the TGID performs exactly N
-/// fixture-counted calls. TGID segment stays continuous; N conserves
-/// without any per-tid billing.
+/// Control 2 (thread + §1.2 row oracle): 16 sequential crypto workers
+/// (1600 counted calls, every call inside a churned thread) plus a
+/// 32-thread concurrent spin (exact rc-reported N2, all spinners live
+/// at once so their transient per-tid rows overlap). TGID segment
+/// stays continuous; N = 1600 + N2 conserves across all tid deaths
+/// without per-tid billing; the independent ADMITTED gate establishes
+/// N; the direct map oracle proves tid rows appear (mid-spin) and
+/// disappear (end).
+///
+/// D-record correspondence discipline: every counted call is a
+/// libcrypto EVP re-init with a digest fetched from the fixture
+/// provider (private ctx, count_mode 0 -- `P` is never sent),
+/// passing one site per plane exactly once (libcrypto EVP entry
+/// -> transient per-tid API_THREADS rows; fixture digest_init ->
+/// ADMITTED/COUNTS). `I` loads, fetches, and primes the EVP pool
+/// pre-observer; the stimulus window then holds ONLY the N counted
+/// re-inits (no queries, no exit cleanup -- the fixture `_exit`s):
+/// the ADMITTED delta MUST equal N exactly, else INCONCLUSIVE
+/// (stimulus invalid). Tid rows live in API_THREADS (keyed
+/// (tgid,tid,generation,cookie); created on entry, removed when
+/// depth returns to 0 -- transient by design, never billed
+/// per-tid, §4.1).
 #[test]
 fn control_2_thread_churn_preserves_tgid_counts() {
     let Some(stage) = stage_privileged_binary() else {
@@ -653,7 +680,9 @@ fn control_2_thread_churn_preserves_tgid_counts() {
     let binary = stage.binary.clone();
     let dir = fresh_dir("thread");
     let mut app = FixtureSession::start(&dir);
-    for setup in ["P", "I", "Q", "Z"] {
+    // `I` loads the provider, fetches the digest, and primes the
+    // EVP pool (all arming passages pre-observer).
+    for setup in ["I"] {
         app.cmd(setup);
     }
     let pid = app.pid();
@@ -668,7 +697,7 @@ fn control_2_thread_churn_preserves_tgid_counts() {
             "--pid",
             &pid.to_string(),
             "--duration",
-            "9",
+            "26",
             "--json",
         ],
         &out,
@@ -687,20 +716,138 @@ fn control_2_thread_churn_preserves_tgid_counts() {
     }
     assert!(started, "observer never started");
     assert!(attached, "sites never attached");
-    let churned: usize = ["W 8", "C 1000", "W 8", "C 1000"]
-        .into_iter()
-        .map(|command| {
-            app.cmd(command)
-                .iter()
-                .filter(|line| line.starts_with("thread "))
-                .count()
-        })
-        .sum();
-    let oracle = app.counter();
-    if churned < 16 || oracle != 2000 {
+    // ADMITTED baseline: the fixture is idle (setup precedes the
+    // uprobes, so nothing fired yet).
+    let Some(admitted0) = bpftool_admitted_total() else {
         let _ = observer.kill();
         app.finish();
-        eprintln!("INCONCLUSIVE: churn={churned} counter={oracle}");
+        eprintln!("INCONCLUSIVE: ADMITTED baseline unreadable");
+        return;
+    };
+    // Phase K: 16 sequential crypto workers x 100 calls (1600 counted
+    // calls, every one inside a thread that then exits). N comes from
+    // the workers' rc-checked completion reports (EVP re-inits, not
+    // the fixture counter -- count_mode is 0).
+    let k_start_ns = monotonic_ns();
+    let k_lines = app.cmd2("K 16", &["100"]);
+    let mut k_tids = Vec::new();
+    let mut k_done = 0u64;
+    for line in &k_lines {
+        if let Some(rest) = line.strip_prefix("thread ") {
+            let mut parts = rest.split_whitespace();
+            if let (Some(tid), Some(_)) = (parts.next(), parts.next()) {
+                if let Ok(tid) = tid.parse::<u32>() {
+                    k_tids.push(tid);
+                }
+            }
+        }
+        if let Some(rest) = line.strip_prefix("calls K ") {
+            if let Some(done) = rest.split_whitespace().nth(1) {
+                k_done = done.parse().unwrap_or(0);
+            }
+        }
+    }
+    if k_tids.len() != 16 || k_done != 1600 {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!(
+            "INCONCLUSIVE: K churn produced {} tids, {k_done}/1600 calls",
+            k_tids.len()
+        );
+        return;
+    }
+    // Phase A (spin): 32 threads calling back-to-back for 2000 ms,
+    // all CONCURRENTLY. The harness writes the command without
+    // reading, dumps API_THREADS repeatedly across the spin (rows
+    // must appear: spinners overlap by the dozen), then drains the
+    // ack + report (exact N2 + spinner tids). Rows are transient
+    // (removed at depth 0), so one hit in ~14 dumps proves
+    // appearance; absence in every dump fails it.
+    app.write_raw("A 32\n2000\n");
+    let spin_end = Instant::now() + Duration::from_millis(3400);
+    let mut saw_rows = false;
+    let mut dumped = false;
+    while Instant::now() < spin_end {
+        if let Some(keys) = bpftool_apithread_keys() {
+            dumped = true;
+            if keys.iter().any(|(tgid, _)| *tgid == pid) {
+                saw_rows = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    let spin_end_ns = monotonic_ns();
+    if !dumped {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: API_THREADS spin dumps unreadable");
+        return;
+    }
+    let Some(a_lines) = app.drain_ack() else {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: spin phase failed (fixture)");
+        return;
+    };
+    let mut spin_tids = Vec::new();
+    let mut spin_done = 0u64;
+    for line in &a_lines {
+        if let Some(rest) = line.strip_prefix("thread ") {
+            if let Some(tid) = rest.split_whitespace().next().and_then(|t| t.parse().ok()) {
+                spin_tids.push(tid);
+            }
+        }
+        if let Some(rest) = line.strip_prefix("calls A ") {
+            if let Some(done) = rest.split_whitespace().nth(1) {
+                spin_done = done.parse().unwrap_or(0);
+            }
+        }
+    }
+    if spin_tids.len() != 32 || spin_done == 0 {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!(
+            "INCONCLUSIVE: spin produced {} tids, {spin_done} calls",
+            spin_tids.len()
+        );
+        return;
+    }
+    assert!(
+        saw_rows,
+        "no API_THREADS tid rows observed across the spin (vacuous oracle)"
+    );
+    let n_total = 1600u64.saturating_add(spin_done);
+    // End dump (spinners + K workers long exited; their transient
+    // rows pair-removed at depth 0 -- none may leak): per-tid, not
+    // zero-total, so fixture growth stays safe.
+    std::thread::sleep(Duration::from_secs(2));
+    let Some(end_keys) = bpftool_apithread_keys() else {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: API_THREADS end dump unreadable");
+        return;
+    };
+    let end_mine: Vec<u32> = end_keys
+        .iter()
+        .filter(|(tgid, _)| *tgid == pid)
+        .map(|(_, tid)| *tid)
+        .collect();
+    for tid in k_tids.iter().chain(spin_tids.iter()) {
+        assert!(
+            !end_mine.contains(tid),
+            "exited tid {tid} row leaked: {end_mine:?}"
+        );
+    }
+    // Independent ADMITTED == N gate (mandatory, never waived):
+    // exactly the worker-reported EVP re-init passages admitted
+    // (D-record correspondence; mismatch renders the control
+    // INCONCLUSIVE -- stimulus invalid).
+    let admitted1 = bpftool_admitted_total();
+    if admitted1 != Some(admitted0.saturating_add(n_total)) {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: admitted={admitted1:?} base={admitted0} n={n_total}");
         return;
     }
     let status = observer.wait().unwrap();
@@ -725,27 +872,90 @@ fn control_2_thread_churn_preserves_tgid_counts() {
         })
         .count();
     assert_eq!(observing, 1, "TGID re-admitted during churn");
-    // Conservation: attributed == N, else shortfall explicit in unknown.
+    // The probed site carries exactly N: among the provider module's
+    // sites, exactly one fired (the plain digest_init -- query,
+    // teardown and allocator sites are quiet: Q precedes the uprobes,
+    // the fixture `_exit`s). This pins the counts to the probed
+    // symbol, not incidental libcrypto work.
+    let provider_ino = fs::metadata(dir.join("provider.so"))
+        .ok()
+        .map(|m| m.ino() as u64);
+    let mut probed_sites = 0u32;
+    let mut probed_calls = 0u64;
+    let mut all_sites = mine[0]["document"]["sites"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    for epoch in mine[0]["document"]["fenced"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        all_sites.extend(epoch["sites"].as_array().cloned().unwrap_or_default());
+    }
+    for site in &all_sites {
+        if Some(site["inode"].as_u64().unwrap_or(0)) == provider_ino
+            && site["calls"].as_u64().unwrap_or(0) > 0
+        {
+            probed_sites += 1;
+            probed_calls = probed_calls.saturating_add(site["calls"].as_u64().unwrap_or(0));
+        }
+    }
+    assert_eq!(
+        probed_sites, 1,
+        "probed-site shape wrong: {probed_sites} provider sites fired"
+    );
+    assert_eq!(
+        probed_calls, n_total,
+        "probed site attributed {probed_calls}, N={n_total}"
+    );
+    // Conservation with interval-specific shortfall accounting: any
+    // shortfall sits in windows covering the stimulus span (K start
+    // through spin end), never in quiet or elsewhere.
     let total = segment_calls(mine[0]).expect("segment calls sum");
-    assert!(total <= 2000, "over-attribution: {total} > 2000");
-    if total != 2000 {
+    assert!(total <= n_total, "over-attribution: {total} > {n_total}");
+    if total != n_total {
+        let Some((origin, interval)) = start_clock(&rows) else {
+            panic!("shortfall {total}/{n_total} with unreadable tick clock");
+        };
+        let t0 = tick_of(origin, interval, k_start_ns);
+        let t1 = tick_of(origin, interval, spin_end_ns);
         assert!(
-            rows.iter().any(has_unknown_marker),
-            "shortfall {total}/2000 sits in quiet, not unknown"
+            shortfall_covered(&rows, mine[0], t0.min(t1), t0.max(t1)),
+            "shortfall {total}/{n_total} not covered over stimulus ticks {t0}..{t1}"
         );
     }
 }
 
-/// One exec-leg run: returns (fixture log, observer rows). Signals GO1 after
-/// attach, GO2 after A calls complete, GO3 after the epoch-1 re-admission
-/// (or a bounded wait on RED code where it never lands).
-fn run_exec_legs(
-    dir: &Path,
-    binary: &Path,
-    mode: &str,
-    onward: bool,
-    duration: u64,
-) -> (String, Vec<serde_json::Value>) {
+/// CLOCK_MONOTONIC in ns (test-side tick phasing -- same domain as the
+/// observer's `run_origin_ns` and the fixtures' `now_ns`).
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(ts.tv_nsec as u64)
+}
+
+/// One exec-leg run: returns the fixture log, observer rows, and the
+/// per-leg ADMITTED baselines/finals (`None` when the oracle is
+/// unavailable -- the caller goes INCONCLUSIVE, never waives).
+/// Signals GO1 after attach, GO2 after A calls complete (timed just
+/// inside a tick boundary on the adversarial leg, so both execs land
+/// in the same tick), GO3 after the epoch-1 re-admission + second
+/// attach, GO4 after the B-final dump (leg B holds its maps open).
+struct ExecLegs {
+    log: String,
+    rows: Vec<serde_json::Value>,
+    admitted_a0: Option<u64>,
+    admitted_a1: Option<u64>,
+    admitted_b0: Option<u64>,
+    admitted_b1: Option<u64>,
+}
+fn run_exec_legs(dir: &Path, binary: &Path, mode: &str, onward: bool, duration: u64) -> ExecLegs {
     let leg_a = compile_c(
         dir,
         &["exec_leg_a.c"],
@@ -769,6 +979,7 @@ fn run_exec_legs(
     let go1 = dir.join(format!("go1_{mode}"));
     let go2 = dir.join(format!("go2_{mode}"));
     let go3 = dir.join(format!("go3_{mode}"));
+    let go4 = dir.join(format!("go4_{mode}"));
     let out = dir.join(format!("exec_{mode}.json"));
     let err = dir.join(format!("exec_{mode}.stderr"));
     let mut command = Command::new(&leg_a);
@@ -781,7 +992,8 @@ fn run_exec_legs(
         .arg(&leg_b)
         .arg(&log)
         .arg(&provider)
-        .arg(&go3);
+        .arg(&go3)
+        .arg(&go4);
     if onward {
         let leg_c = compile_c(
             dir,
@@ -833,6 +1045,7 @@ fn run_exec_legs(
         );
     assert!(started, "observer never started");
     assert!(attached, "sites never attached");
+    let admitted_a0 = bpftool_admitted_total();
     fs::write(&go1, b"go").unwrap();
     // Wait for A calls, then release the exec.
     let end = Instant::now() + Duration::from_secs(30);
@@ -845,6 +1058,19 @@ fn run_exec_legs(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    let admitted_a1 = bpftool_admitted_total();
+    if onward {
+        // Same-tick adversarial timing: release GO2 ~100ms inside a
+        // fresh tick (both execs land ~100ms apart in the same
+        // 1s tick; the post-hoc tick check inconclusives on a
+        // scheduling stall past the boundary).
+        if let Some((origin, interval)) = start_clock(&read_rows_partial(&out)) {
+            let now = monotonic_ns();
+            let phase = now.saturating_sub(origin) % interval;
+            let sleep_ns = interval.saturating_sub(phase).saturating_add(100_000_000);
+            std::thread::sleep(Duration::from_nanos(sleep_ns.min(2_000_000_000)));
+        }
+    }
     fs::write(&go2, b"go").unwrap();
     // Wait for the post-exec leg, then for the epoch-1 re-admission.
     let end = Instant::now() + Duration::from_secs(30);
@@ -856,6 +1082,35 @@ fn run_exec_legs(
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
+    }
+    if onward {
+        // Adversarial: no gates between the execs -- wait for the
+        // third leg's arrival, then run to duration.
+        let end = Instant::now() + Duration::from_secs(30);
+        while !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains("postexec2 ")
+        {
+            if Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let status = observer.wait().unwrap();
+        assert!(
+            matches!(status.code(), Some(0 | 3 | 4)),
+            "observer failed: {status:?}"
+        );
+        let rows = read_rows(&out);
+        let _ = legs.wait();
+        return ExecLegs {
+            log: fs::read_to_string(&log).unwrap_or_default(),
+            rows,
+            admitted_a0,
+            admitted_a1,
+            admitted_b0: None,
+            admitted_b1: None,
+        };
     }
     let end = Instant::now() + Duration::from_secs(8);
     while Instant::now() < end {
@@ -870,7 +1125,7 @@ fn run_exec_legs(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    // Second attach line (new session armed) before the counted B2 calls.
+    // Second attach line (new session armed) before the counted B calls.
     let end = Instant::now() + Duration::from_secs(10);
     while Instant::now() < end {
         let text = fs::read_to_string(&err).unwrap_or_default();
@@ -880,7 +1135,21 @@ fn run_exec_legs(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    let admitted_b0 = bpftool_admitted_total();
     fs::write(&go3, b"go").unwrap();
+    // B-final dump while leg B holds its maps (GO4 releases it).
+    let end = Instant::now() + Duration::from_secs(30);
+    while !fs::read_to_string(&log)
+        .unwrap_or_default()
+        .contains("calls_b ")
+    {
+        if Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let admitted_b1 = bpftool_admitted_total();
+    fs::write(&go4, b"go").unwrap();
     let status = observer.wait().unwrap();
     assert!(
         matches!(status.code(), Some(0 | 3 | 4)),
@@ -888,7 +1157,14 @@ fn run_exec_legs(
     );
     let rows = read_rows(&out);
     let _ = legs.wait();
-    (fs::read_to_string(&log).unwrap_or_default(), rows)
+    ExecLegs {
+        log: fs::read_to_string(&log).unwrap_or_default(),
+        rows,
+        admitted_a0,
+        admitted_a1,
+        admitted_b0,
+        admitted_b1,
+    }
 }
 
 /// Normalized membership/observation shape sequence (volatile ids, ticks and
@@ -946,9 +1222,10 @@ fn control_3_nonleader_exec_seals_without_origin() {
     for mode in ["nonleader", "leader"] {
         let sub = dir.join(mode);
         fs::create_dir_all(&sub).unwrap();
-        let (log, rows) = run_exec_legs(&sub, &binary, mode, false, 16);
-        eprintln!("{mode} kinds: {:?}", kinds(&rows));
-        assert_no_tid_attribution(&rows);
+        let legs = run_exec_legs(&sub, &binary, mode, false, 20);
+        let (log, rows) = (&legs.log, &legs.rows);
+        eprintln!("{mode} kinds: {:?}", kinds(rows));
+        assert_no_tid_attribution(rows);
         let pid: u64 = log
             .lines()
             .find_map(|l| {
@@ -958,6 +1235,21 @@ fn control_3_nonleader_exec_seals_without_origin() {
             .expect("fixture ready line");
         assert!(log.contains("calls_a 500"), "A calls incomplete: {log}");
         assert!(log.contains("calls_b 500"), "B calls incomplete: {log}");
+        // Independent per-leg ADMITTED gates (mandatory, never
+        // waived): A admitted exactly its 500 pre-exec calls; B
+        // admitted exactly its 500 post-admission calls.
+        let gate_a = legs
+            .admitted_a0
+            .zip(legs.admitted_a1)
+            .map(|(b, f)| f.saturating_sub(b));
+        let gate_b = legs
+            .admitted_b0
+            .zip(legs.admitted_b1)
+            .map(|(b, f)| f.saturating_sub(b));
+        if gate_a != Some(500) || gate_b != Some(500) {
+            eprintln!("INCONCLUSIVE: ADMITTED-A={gate_a:?} ADMITTED-B={gate_b:?}");
+            return;
+        }
         let exec_tid: u32 = log
             .lines()
             .find_map(|l| {
@@ -977,7 +1269,7 @@ fn control_3_nonleader_exec_seals_without_origin() {
             );
         }
         // Sealed epoch 0 carries exactly the pre-exec calls (no crossing).
-        let segments = segments_by_pid(&rows);
+        let segments = segments_by_pid(rows);
         let mine = segments.get(&pid).cloned().unwrap_or_default();
         let epoch0: Vec<&&serde_json::Value> =
             mine.iter().filter(|s| s["image_epoch"] == 0).collect();
@@ -985,9 +1277,18 @@ fn control_3_nonleader_exec_seals_without_origin() {
         let old = segment_calls(epoch0[0]).expect("epoch-0 calls sum");
         assert!(old <= 500, "post-edge attribution to epoch 0: {old} > 500");
         if old != 500 {
+            let (origin, interval) = start_clock(rows).expect("tick clock");
+            let exec_ns: u64 = log
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("exec ")
+                        .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+                })
+                .expect("exec instant");
+            let te = tick_of(origin, interval, exec_ns);
             assert!(
-                rows.iter().any(has_unknown_marker),
-                "epoch-0 shortfall {old}/500 is quiet, not unknown"
+                shortfall_covered(rows, epoch0[0], te.saturating_sub(1), te),
+                "epoch-0 shortfall {old}/500 not covered over A ticks"
             );
         }
         // Fresh epoch-1 re-admission: same key, advanced epoch, no origin.
@@ -1017,17 +1318,22 @@ fn control_3_nonleader_exec_seals_without_origin() {
         assert_eq!(epoch1.len(), 1, "epoch 1 not sealed once: {mine:?}");
         let new = segment_calls(epoch1[0]).expect("epoch-1 calls sum");
         assert!(new <= 500, "epoch 1 inherited pre-exec counts: {new}");
-        // Bounded + explicit (the D-record requires no post-edge
-        // attribution to the old epoch with straddlers withheld, not
-        // exact epoch-1 conservation; see the epoch-1 note in
-        // control 4 for the fixture-counting gap).
         if new != 500 {
+            let (origin, interval) = start_clock(rows).expect("tick clock");
+            let calls_b_ns: u64 = log
+                .lines()
+                .find_map(|l| {
+                    l.strip_prefix("calls_b ")
+                        .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+                })
+                .expect("calls_b instant");
+            let tb = tick_of(origin, interval, calls_b_ns);
             assert!(
-                rows.iter().any(has_unknown_marker),
-                "epoch-1 shortfall {new}/500 is quiet"
+                shortfall_covered(rows, epoch1[0], tb.saturating_sub(1), tb),
+                "epoch-1 shortfall {new}/500 not covered over B ticks"
             );
         }
-        shapes.insert(mode, epoch_shape(&rows, pid));
+        shapes.insert(mode, epoch_shape(rows, pid));
     }
     // Counterexample leg: leader and non-leader shapes are identical.
     assert_eq!(
@@ -1035,18 +1341,17 @@ fn control_3_nonleader_exec_seals_without_origin() {
         "exec origin distinguished: {:?} vs {:?}",
         shapes["nonleader"], shapes["leader"]
     );
-    // Adversarial leg: a second exec within the same tick seals twice.
-    // Duration 24 (not 18): the second exec lands ~tick 14 after
-    // session-setup stalls, and the re-admission setup needs whole
-    // seconds on top — 18s ends mid-setup (setup_deadline gaps).
+    // Adversarial leg: a second exec within the SAME tick (no gates,
+    // no waiting between the execs) seals both images in drain order.
     let sub = dir.join("adversarial");
     fs::create_dir_all(&sub).unwrap();
-    let (log, rows) = run_exec_legs(&sub, &binary, "nonleader", true, 24);
+    let legs = run_exec_legs(&sub, &binary, "nonleader", true, 24);
+    let (log, rows) = (&legs.log, &legs.rows);
     assert!(
         log.contains("postexec2 "),
         "second exec never landed: {log}"
     );
-    assert_no_tid_attribution(&rows);
+    assert_no_tid_attribution(rows);
     let pid: u64 = log
         .lines()
         .find_map(|l| {
@@ -1054,6 +1359,27 @@ fn control_3_nonleader_exec_seals_without_origin() {
                 .and_then(|r| r.split_whitespace().next()?.parse().ok())
         })
         .expect("fixture ready line");
+    // Same-tick stimulus proof (fixture instants through the Start
+    // clock); a scheduling stall past the boundary inconclusives.
+    let (origin, interval) = start_clock(rows).expect("tick clock");
+    let exec1_ns: u64 = log
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("exec ")
+                .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+        })
+        .expect("exec instant");
+    let exec2_ns: u64 = log
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("exec2 ")
+                .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+        })
+        .expect("exec2 instant");
+    if tick_of(origin, interval, exec1_ns) != tick_of(origin, interval, exec2_ns) {
+        eprintln!("INCONCLUSIVE: execs straddled a tick boundary");
+        return;
+    }
     let readmits: Vec<&serde_json::Value> = rows
         .iter()
         .filter(|r| {
@@ -1068,6 +1394,30 @@ fn control_3_nonleader_exec_seals_without_origin() {
         .filter_map(|r| r["image_epoch"].as_u64())
         .collect();
     assert_eq!(epochs, BTreeSet::from([1, 2]), "epochs advance per exec");
+    // Drain-order seals: the middle image (epoch 1, never observed --
+    // no session existed between the same-tick execs) admits and
+    // retires between the epoch-0 seal and the epoch-2 re-admission;
+    // only epochs 0 and 2 carry observations.
+    let pos = |pred: &dyn Fn(&serde_json::Value) -> bool| {
+        rows.iter().position(pred).expect("ordered record")
+    };
+    let seal0 = pos(&|r| r["kind"] == "process_observation" && r["image_epoch"] == 0);
+    let admit1 =
+        pos(&|r| r["kind"] == "membership" && r["image_epoch"] == 1 && r["state"] == "observing");
+    let retire1 =
+        pos(&|r| r["kind"] == "membership" && r["image_epoch"] == 1 && r["state"] == "retired");
+    let admit2 =
+        pos(&|r| r["kind"] == "membership" && r["image_epoch"] == 2 && r["state"] == "observing");
+    assert!(
+        seal0 < admit1 && admit1 < retire1 && retire1 < admit2,
+        "middle image not sealed in drain order"
+    );
+    let mine = segments_by_pid(rows).remove(&pid).unwrap_or_default();
+    let observed: BTreeSet<u64> = mine
+        .iter()
+        .filter_map(|s| s["image_epoch"].as_u64())
+        .collect();
+    assert_eq!(observed, BTreeSet::from([0, 2]), "middle image observed?!");
 }
 
 /// Control 4 (exec): leader exec to a different image seals counts,
@@ -1079,9 +1429,10 @@ fn control_4_leader_exec_readmits_same_key() {
     };
     let binary = stage.binary.clone();
     let dir = fresh_dir("exec4");
-    let (log, rows) = run_exec_legs(&dir, &binary, "leader", false, 16);
-    eprintln!("kinds: {:?}", kinds(&rows));
-    assert_no_tid_attribution(&rows);
+    let legs = run_exec_legs(&dir, &binary, "leader", false, 20);
+    let (log, rows) = (&legs.log, &legs.rows);
+    eprintln!("kinds: {:?}", kinds(rows));
+    assert_no_tid_attribution(rows);
     let pid: u64 = log
         .lines()
         .find_map(|l| {
@@ -1092,7 +1443,21 @@ fn control_4_leader_exec_readmits_same_key() {
     assert!(log.contains("calls_a 500"), "A calls incomplete: {log}");
     assert!(log.contains("calls_b 500"), "B calls incomplete: {log}");
     assert!(log.contains("postexec "), "exec oracle missing: {log}");
-    let segments = segments_by_pid(&rows);
+    // Independent per-leg ADMITTED gates (mandatory, never waived).
+    let gate_a = legs
+        .admitted_a0
+        .zip(legs.admitted_a1)
+        .map(|(b, f)| f.saturating_sub(b));
+    let gate_b = legs
+        .admitted_b0
+        .zip(legs.admitted_b1)
+        .map(|(b, f)| f.saturating_sub(b));
+    if gate_a != Some(500) || gate_b != Some(500) {
+        eprintln!("INCONCLUSIVE: ADMITTED-A={gate_a:?} ADMITTED-B={gate_b:?}");
+        return;
+    }
+    let (origin, interval) = start_clock(rows).expect("tick clock");
+    let segments = segments_by_pid(rows);
     let mine = segments.get(&pid).cloned().unwrap_or_default();
     assert_eq!(mine.len(), 2, "both image epochs must seal: {mine:?}");
     // Same incarnation key across the exec; epochs 0 then 1.
@@ -1105,25 +1470,39 @@ fn control_4_leader_exec_readmits_same_key() {
     epochs.sort_unstable();
     assert_eq!(epochs, vec![0, 1]);
     // Old image sealed with conserved counts; new image counts only B.
-    let total0 = segment_calls(mine.iter().find(|s| s["image_epoch"] == 0).unwrap()).unwrap();
+    // Shortfalls carry interval-specific covering windows (M3).
+    let seg0 = mine.iter().find(|s| s["image_epoch"] == 0).unwrap();
+    let total0 = segment_calls(seg0).unwrap();
     assert!(total0 <= 500, "epoch 0 over-attributed: {total0}");
     if total0 != 500 {
+        let exec_ns: u64 = log
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("exec ")
+                    .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+            })
+            .expect("exec instant");
+        let te = tick_of(origin, interval, exec_ns);
         assert!(
-            rows.iter().any(has_unknown_marker),
-            "epoch-0 shortfall {total0}/500 is quiet"
+            shortfall_covered(rows, seg0, te.saturating_sub(1), te),
+            "epoch-0 shortfall {total0}/500 not covered over A ticks"
         );
     }
-    let total1 = segment_calls(mine.iter().find(|s| s["image_epoch"] == 1).unwrap()).unwrap();
-    // Bounded + explicit, mirroring epoch 0 (the D-record requires
-    // "≤ B with any shortfall explicit", not exact conservation:
-    // fixture direct-callback counting is a pre-existing observer
-    // gap — zero in every flow — so strict [300,500] cannot pass
-    // and is not D-record-grounded).
+    let seg1 = mine.iter().find(|s| s["image_epoch"] == 1).unwrap();
+    let total1 = segment_calls(seg1).unwrap();
     assert!(total1 <= 500, "epoch 1 over-attributed: {total1}");
     if total1 != 500 {
+        let calls_b_ns: u64 = log
+            .lines()
+            .find_map(|l| {
+                l.strip_prefix("calls_b ")
+                    .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+            })
+            .expect("calls_b instant");
+        let tb = tick_of(origin, interval, calls_b_ns);
         assert!(
-            rows.iter().any(has_unknown_marker),
-            "epoch-1 shortfall {total1}/500 is quiet"
+            shortfall_covered(rows, seg1, tb.saturating_sub(1), tb),
+            "epoch-1 shortfall {total1}/500 not covered over B ticks"
         );
     }
     // Loss ledger carried forward by reference: epoch-1 records carry loss.
@@ -1208,8 +1587,11 @@ fn live_pids() -> usize {
 
 /// Control 5 (PID reuse + adversarial): force recycling until the watched
 /// pid number is reused. Old incarnation retires first with
-/// `incarnation_changed`; the new one joins as a stranger with empty
-/// history; delayed exits never retire the new member.
+/// `incarnation_changed` (prompt: receipt within 2 ticks of the oracle
+/// reuse instant); the new one joins as a stranger with empty history.
+/// Adversarial leg: the dead incarnation's EXIT is deliberately delivered
+/// after the pid number is recycled (SIGSTOP-held observer) -- it must
+/// quarantine, never retire the new member.
 #[test]
 fn control_5_pid_reuse_retires_before_stranger_join() {
     if live_pids() > 1500 {
@@ -1224,13 +1606,26 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         eprintln!("INCONCLUSIVE: pid_max squeeze refused");
         return;
     };
-    let dir = fresh_dir("reuse");
+    // Leg 1 (promptness, live observer): death + immediate reuse race.
+    reuse_leg(&binary, false);
+    // Leg 2 (adversarial, SIGSTOP-held observer): the occupant's EXIT
+    // is queued while the observer is stopped and recycled + respawned
+    // past; first post-resume drain binds it against the recycled
+    // number -- Reused + quarantine, deterministically.
+    reuse_leg(&binary, true);
+}
+
+/// One control-5 leg. `held`: SIGSTOP the observer across kill+respawn
+/// (delayed-EXIT delivery); otherwise live (promptness measurable).
+fn reuse_leg(binary: &Path, held: bool) {
+    let tag = if held { "reuse-held" } else { "reuse-live" };
+    let dir = fresh_dir(tag);
     let out = dir.join("watch.json");
     let err = dir.join("watch.stderr");
     // Occupant: eligible + crypto-active (its counts must NOT leak).
     let mut occupant = Command::new("openssl")
         .args([
-            "speed", "-elapsed", "-seconds", "60", "-evp", "SHA512", "-bytes", "64",
+            "speed", "-elapsed", "-seconds", "240", "-evp", "SHA512", "-bytes", "64",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1239,8 +1634,9 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         .unwrap();
     let pid = occupant.id();
     let old_start = starttime_of(pid).expect("occupant starttime");
+    let duration = if held { "90" } else { "18" };
     let mut observer = spawn_observer_stderr(
-        &binary,
+        binary,
         &[
             "scan",
             "--watch",
@@ -1248,7 +1644,7 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
             "--pid",
             &pid.to_string(),
             "--duration",
-            "18",
+            duration,
             "--json",
         ],
         &out,
@@ -1269,17 +1665,68 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
     assert!(attached, "sites never attached");
     std::thread::sleep(Duration::from_secs(2));
     // Death + reuse: SIGKILL the occupant, then respawn light eligible
-    // sleepers until the pid number is recycled (bounded).
+    // sleepers until the pid number is recycled (bounded). Held leg:
+    // the observer (inner pid under sudo) is SIGSTOPped first, so the
+    // occupant's EXIT queues in the connector socket until SIGCONT.
+    let inner = held.then(|| child_pid(observer.id())).flatten();
+    if held {
+        let Some(inner) = inner else {
+            let _ = observer.kill();
+            let _ = occupant.kill();
+            eprintln!("INCONCLUSIVE: observer inner pid not found");
+            return;
+        };
+        // F14/M10: the freeze MUST be real. The observer runs as root
+        // under the sudo harness, so a direct `kill(pid, SIGSTOP)` from
+        // the test process fails EPERM -- and the unchecked return used
+        // to turn this leg into a second live leg silently (the EXIT
+        // drained pre-respawn, no quarantine exercised, yet the
+        // incarnation_changed assertion still passed via the storm-delayed
+        // seal). Route the stop through `sudo -n kill`, assert its exit
+        // status, and verify state T from /proc before the kill.
+        // Safety: never SIGSTOP an arbitrary pid on a harness bug --
+        // confirm the target is the observer binary first.
+        let cmdline = std::fs::read_to_string(format!("/proc/{inner}/cmdline"))
+            .unwrap_or_default()
+            .replace('\0', " ");
+        assert!(
+            cmdline.contains("osslscope"),
+            "F14: stop target {inner} is not the observer ({cmdline:?})"
+        );
+        let stop = Command::new("sudo")
+            .args(["-n", "kill", "-STOP"])
+            .arg(inner.to_string())
+            .status()
+            .expect("spawn sudo kill -STOP");
+        assert!(
+            stop.success(),
+            "F14: SIGSTOP of observer {inner} failed; held leg would be live"
+        );
+        // Settle: the stop must precede the kill (else the EXIT drains
+        // live and the leg degrades to the live race).
+        std::thread::sleep(Duration::from_millis(500));
+        let st =
+            std::fs::read_to_string(format!("/proc/{inner}/stat")).expect("read observer stat");
+        let state = st
+            .rsplit(')')
+            .next()
+            .and_then(|s| s.split_whitespace().next());
+        assert_eq!(
+            state,
+            Some("T"),
+            "F14: observer {inner} not stopped (state {state:?}); held leg would be live"
+        );
+    }
     occupant.kill().unwrap();
     occupant.wait().unwrap();
     assert!(!alive(pid), "occupant survived SIGKILL?");
-    let death = Instant::now();
     let libcrypto = "/usr/lib/x86_64-linux-gnu/libcrypto.so.3";
     if !Path::new(libcrypto).is_file() {
         let _ = observer.kill();
         eprintln!("INCONCLUSIVE: {libcrypto} missing");
         return;
     }
+    let sleeper_secs = if held { "150" } else { "30" };
     let mut reuser: Option<Child> = None;
     let reuse_deadline = Instant::now() + Duration::from_secs(60);
     let mut spawns = 0u32;
@@ -1289,7 +1736,7 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         let mut candidate = Command::new("env")
             .arg(format!("LD_PRELOAD={libcrypto}"))
             .arg("sleep")
-            .arg("30")
+            .arg(sleeper_secs)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -1317,10 +1764,88 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         reused_start, old_start,
         "starttime did not advance on reuse"
     );
-    eprintln!(
-        "reused pid {pid} after {spawns} spawns ({:?} post-death)",
-        reuse_at - death
-    );
+    eprintln!("reused pid {pid} after {spawns} spawns (held={held})");
+    if held {
+        let inner = inner.expect("held inner pid");
+        // Resume the WHOLE stack: sudo suspends itself when its child
+        // stops (job-control emulation), so CONTing only the observer
+        // leaves sudo stopped -- it can never reap the observer and the
+        // later `observer.wait()` hangs forever. CONT both, then poll
+        // both out of T (bounded; a stuck T here would hang the wait).
+        let sudo_pid = observer.id();
+        let cont = Command::new("sudo")
+            .args(["-n", "kill", "-CONT"])
+            .arg(inner.to_string())
+            .arg(sudo_pid.to_string())
+            .status()
+            .expect("spawn sudo kill -CONT");
+        assert!(
+            cont.success(),
+            "SIGCONT of observer {inner}/sudo {sudo_pid} failed"
+        );
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            let states: Vec<(u32, String)> = [inner, sudo_pid]
+                .iter()
+                .map(|p| {
+                    let st = std::fs::read_to_string(format!("/proc/{p}/stat")).unwrap_or_default();
+                    let s = st
+                        .rsplit(')')
+                        .next()
+                        .and_then(|s| s.split_whitespace().next())
+                        .unwrap_or("?")
+                        .to_string();
+                    (*p, s)
+                })
+                .collect();
+            if states.iter().all(|(_, s)| s != "T") {
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "observer stack stuck stopped after CONT: {states:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    // The observer may have exited during a slow respawn (duration is
+    // observer-clock, the stop included) -- inconclusive, not failure.
+    if observer.try_wait().ok().flatten().is_some() {
+        let _ = reuser.kill();
+        eprintln!("INCONCLUSIVE: observer exited before reuse completed");
+        return;
+    }
+    // Promptness (M10, live leg only -- the held observer was stopped,
+    // so harness-clock promptness is meaningless there): harness
+    // receipt of the retirement vs the oracle reuse instant, within
+    // 2 ticks + documented harness slack (loaded-box scan lag).
+    if !held {
+        let found = wait_for_record(&out, Duration::from_secs(30), &|r| {
+            r["kind"] == "membership"
+                && r["incarnation"]["pid"] == pid as u64
+                && r["incarnation"]["starttime"] == old_start
+                && r["state"] == "retired"
+        });
+        let Some((retire_row, receipt)) = found else {
+            let _ = observer.kill();
+            let _ = reuser.kill();
+            panic!("old incarnation never retired");
+        };
+        assert_eq!(
+            retire_row["reason"], "incarnation_changed",
+            "old incarnation retirement wrong: {retire_row}"
+        );
+        let interval = start_clock(&read_rows_partial(&out))
+            .map(|(_, i)| i)
+            .unwrap_or(1_000_000_000);
+        let deadline = Duration::from_nanos(interval.saturating_mul(2))
+            .saturating_add(Duration::from_secs(10));
+        assert!(
+            receipt.saturating_duration_since(reuse_at) <= deadline,
+            "retirement not prompt: {:?} > {deadline:?}",
+            receipt.saturating_duration_since(reuse_at)
+        );
+    }
     let status = observer.wait().unwrap();
     assert!(
         matches!(status.code(), Some(0 | 3 | 4)),
@@ -1337,7 +1862,7 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         r["incarnation"]["pid"] == pid as u64 && r["incarnation"]["starttime"] == reused_start
     };
     // Old incarnation retired with incarnation_changed before any record
-    // for the new one; retirement prompt (wall bound ≈ 2 ticks + slack).
+    // for the new one.
     let retire_seq = rows
         .iter()
         .position(|r| r["kind"] == "membership" && old_key(r) && r["state"] == "retired");
@@ -1355,7 +1880,7 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         "new incarnation records precede the old retirement"
     );
     // New incarnation: own segment, empty sealed history, zero counts
-    // (sleep: no crypto — nothing inherited from the old >0 segment).
+    // (sleep: no crypto -- nothing inherited from the old >0 segment).
     let segments = segments_by_pid(&rows);
     let all = segments.get(&(pid as u64)).cloned().unwrap_or_default();
     let old_segs: Vec<&&serde_json::Value> = all
@@ -1370,7 +1895,24 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
     assert_eq!(new_segs.len(), 1, "new segment missing: {all:?}");
     let old_total = segment_calls(old_segs[0]).expect("old calls sum");
     let new_total = segment_calls(new_segs[0]).expect("new calls sum");
-    assert!(old_total > 0, "occupant produced no counts (stimulus?)");
+    if !held {
+        assert!(old_total > 0, "occupant produced no counts (stimulus?)");
+    } else {
+        // Held leg: the stop-gap socket Drops fence the old member's
+        // keys (F2 -- pre-gap baselines cannot span the gap), so its
+        // counts land in loss, not calls. Stimulus sanity here is
+        // calls==0 AND loss>0: the occupant was crypto-active (its
+        // counts were observed) and the fence held (none reported).
+        let old_loss = old_segs[0]["loss"]["loss"].as_u64().unwrap_or(0);
+        assert_eq!(
+            old_total, 0,
+            "held old member leaked fenced counts as calls: {old_total}"
+        );
+        assert!(
+            old_loss > 0,
+            "held old member shows no fenced loss (stimulus?)"
+        );
+    }
     assert_eq!(
         new_total, 0,
         "new incarnation inherited counts: {new_total}"
@@ -1385,8 +1927,9 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         Some(0),
         "new incarnation inherited loss count"
     );
-    // Adversarial: no delayed exit retired the new member early — its only
-    // retirement is the end-of-observation one.
+    // Adversarial: the delayed exit never retired the new member -- its
+    // only retirement is the end-of-observation one. Held leg: the
+    // delayed EXIT deterministically quarantined (unattributed >= 1).
     let new_retires: Vec<&serde_json::Value> = rows
         .iter()
         .filter(|r| r["kind"] == "membership" && new_key(r) && r["state"] == "retired")
@@ -1397,12 +1940,217 @@ fn control_5_pid_reuse_retires_before_stranger_join() {
         "new member retirement wrong: {new_retires:?}"
     );
     assert_eq!(new_retires[0]["reason"], "duration");
+    if held {
+        let unattributed = rows
+            .iter()
+            .find(|r| r["kind"] == "end")
+            .and_then(|e| e["session_loss"]["unattributed_events"].as_u64())
+            .unwrap_or(0);
+        assert!(
+            unattributed >= 1,
+            "delayed EXIT never quarantined (unattributed={unattributed})"
+        );
+    }
 }
 
 /// Harness-side connector Drops oracle: sum of Drops over every netlink
 /// socket owned by `pid` (the observer's connector socket is the only one
 /// under fork pressure). Test-owned `/proc` reads, distinct from the
 /// observer's `socket_drops` path.
+/// Live BPF map ids for one map name (harness-owned bpftool path,
+/// distinct from the observer's reads).
+fn bpftool_map_ids(name: &str) -> Option<Vec<String>> {
+    let list = Command::new("sudo")
+        .args(["-n", "bpftool", "map", "list"])
+        .output()
+        .ok()?;
+    if !list.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&list.stdout);
+    let mut ids = Vec::new();
+    for line in text.lines() {
+        // Continuation lines (key/value details) carry no id -- skip,
+        // never bail (bailing voids the whole oracle).
+        let Some((id, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if rest.contains(&format!("name {name} ")) {
+            ids.push(id.trim().to_string());
+        }
+    }
+    (!ids.is_empty()).then_some(ids)
+}
+/// 6A independent admission gate (D-record acceptance table): the
+/// harness-owned BPF ADMITTED ledger (per-cpu array, key 0) summed
+/// over live ADMITTED maps — distinct from the observer's
+/// projection. `None` (INCONCLUSIVE) when bpftool is unavailable,
+/// no map answers, or the map count is ambiguous (stale maps from
+/// a crashed run would corrupt the gate).
+fn bpftool_admitted_total() -> Option<u64> {
+    let ids = bpftool_map_ids("ADMITTED")?;
+    if ids.len() != 1 {
+        return None;
+    }
+    let dump = Command::new("sudo")
+        .args(["-n", "bpftool", "map", "dump", "id", &ids[0], "-j"])
+        .output()
+        .ok()?;
+    if !dump.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&dump.stdout).ok()?;
+    let mut total = 0u64;
+    let mut found = false;
+    for entry in json.as_array().cloned().unwrap_or_default() {
+        let is_zero = entry["key"].as_u64().is_some_and(|k| k == 0)
+            || entry["key"]
+                .as_array()
+                .is_some_and(|b| b.iter().all(|x| x.as_str().is_some_and(|s| s == "0x00")));
+        if !is_zero {
+            continue;
+        }
+        for cpu in entry["values"].as_array().cloned().unwrap_or_default() {
+            // BTF-less per-cpu u64 renders as an 8-byte LE array,
+            // never a JSON number (a bare `as_u64` reads 0 forever).
+            if let Some(v) = cpu["value"].as_u64() {
+                total = total.saturating_add(v);
+                found = true;
+                continue;
+            }
+            let bytes: Vec<u8> = cpu["value"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|x| {
+                    x.as_str()
+                        .and_then(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+                })
+                .collect();
+            if bytes.len() == 8 {
+                total = total.saturating_add(u64::from_le_bytes(bytes[..8].try_into().unwrap()));
+                found = true;
+            }
+        }
+    }
+    found.then_some(total)
+}
+/// 6A direct map oracle (§1.2): `(tgid, tid)` keys present in the
+/// live API_THREADS map (24-byte `ApiThreadKey`: pid[0..4]
+/// tid[4..8] LE -- generation/cookie ignored). Rows are transient
+/// (removed when depth returns to 0): presence mid-spin proves
+/// appearance, absence at end proves removal. `None`
+/// (INCONCLUSIVE) when the oracle is unavailable or ambiguous
+/// (zero or several maps).
+fn bpftool_apithread_keys() -> Option<Vec<(u32, u32)>> {
+    let ids = bpftool_map_ids("API_THREADS")?;
+    if ids.len() != 1 {
+        return None;
+    }
+    let dump = Command::new("sudo")
+        .args(["-n", "bpftool", "map", "dump", "id", &ids[0], "-j"])
+        .output()
+        .ok()?;
+    if !dump.status.success() {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_slice(&dump.stdout).ok()?;
+    let mut keys = Vec::new();
+    for entry in json.as_array().cloned().unwrap_or_default() {
+        let bytes: Vec<u8> = entry["key"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|x| {
+                x.as_str()
+                    .and_then(|s| u8::from_str_radix(s.trim_start_matches("0x"), 16).ok())
+            })
+            .collect();
+        if bytes.len() < 8 {
+            continue;
+        }
+        let pid = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        let tid = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+        keys.push((pid, tid));
+    }
+    Some(keys)
+}
+/// Tick clock from the `start` row (§7): `(run_origin_ns,
+/// interval_ns)`. `None` when the row is missing/malformed.
+fn start_clock(rows: &[serde_json::Value]) -> Option<(u64, u64)> {
+    let start = rows.iter().find(|r| r["kind"] == "start")?;
+    let origin = start["run_origin_ns"].as_u64()?;
+    let secs = start["poll_interval"]["secs"].as_u64()?;
+    let nanos = start["poll_interval"]["nanos"].as_u64()?;
+    let interval = secs.saturating_mul(1_000_000_000).saturating_add(nanos);
+    if interval == 0 {
+        return None;
+    }
+    Some((origin, interval))
+}
+/// Map a producer-clock instant to its tick (§7 `Start` rule).
+fn tick_of(origin: u64, interval: u64, ns: u64) -> u64 {
+    ns.saturating_sub(origin) / interval
+}
+/// 6A interval-specific shortfall (M3): some lost window — the
+/// segment's own loss or the session carrier — intersects the
+/// stimulus tick span `[t0, t1]`. A shortfall explained only by an
+/// unknown marker elsewhere is NOT covered.
+fn shortfall_covered(
+    rows: &[serde_json::Value],
+    segment: &serde_json::Value,
+    t0: u64,
+    t1: u64,
+) -> bool {
+    let mut spans = Vec::new();
+    for w in segment["loss"]["lost_windows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        if let (Some(s), Some(e)) = (w["start_tick"].as_u64(), w["end_tick"].as_u64()) {
+            spans.push((s, e));
+        }
+    }
+    if let Some(end) = rows.iter().find(|r| r["kind"] == "end") {
+        for w in end["session_loss"]["lost_intervals"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            if let (Some(s), Some(e)) = (w["start_tick"].as_u64(), w["end_tick"].as_u64()) {
+                spans.push((s, e));
+            }
+        }
+    }
+    spans
+        .iter()
+        .any(|(s, e)| *s <= t1.saturating_add(1) && *e > t0)
+}
+/// Wait for the first record matching `pred`, returning the row and
+/// the harness receipt time (M10 promptness: receipt vs oracle
+/// instants on the harness clock).
+fn wait_for_record(
+    outfile: &Path,
+    timeout: Duration,
+    pred: &dyn Fn(&serde_json::Value) -> bool,
+) -> Option<(serde_json::Value, Instant)> {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        let text = fs::read_to_string(outfile).unwrap_or_default();
+        for line in text.lines() {
+            if let Ok(row) = serde_json::from_str::<serde_json::Value>(line) {
+                if pred(&row) {
+                    return Some((row, Instant::now()));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
 /// Harness-side LOSS lane-0 high-water: sums key-0 values over all live
 /// `LOSS` BPF maps (one per session) via bpftool. The D-record leg-B
 /// oracle (direct map read, independent of the observer's own
@@ -1418,7 +2166,9 @@ fn bpftool_loss_lane0() -> Option<u64> {
     let text = String::from_utf8_lossy(&list.stdout);
     let mut ids = Vec::new();
     for line in text.lines() {
-        let (id, rest) = line.split_once(':')?;
+        let Some((id, rest)) = line.split_once(':') else {
+            continue;
+        };
         if rest.contains("name LOSS ") {
             ids.push(id.trim().to_string());
         }
@@ -2288,7 +3038,10 @@ fn control_9a_dynamic_module_refreshes_additively() {
     // A second provider file (distinct inode → distinct module).
     let provider2 = dir.join("provider2.so");
     fs::copy(dir.join("provider.so"), &provider2).unwrap();
-    for setup in ["P", "I", "Q", "Z"] {
+    // `I` loads the provider, fetches the digest, and primes the
+    // EVP pool (count_mode stays 0 -- no `P`: the probed site is
+    // the plain digest_init).
+    for setup in ["I"] {
         app.cmd(setup);
     }
     let pid = app.pid();
@@ -2322,20 +3075,44 @@ fn control_9a_dynamic_module_refreshes_additively() {
     }
     assert!(started, "observer never started");
     assert!(attached, "sites never attached");
-    app.cmd("C 500");
+    let admitted0 = bpftool_admitted_total();
+    let first_c = app.cmd("C 500");
     let dlopen_lines = app.cmd(&format!("O {}", provider2.display()));
     assert!(
         dlopen_lines.iter().any(|l| l.ends_with(" 1")),
         "dlopen failed: {dlopen_lines:?}"
     );
-    app.cmd("C 500");
-    let oracle = app.counter();
-    if oracle != 1000 {
+    let second_c = app.cmd("C 500");
+    let admitted1 = bpftool_admitted_total();
+    // N from the rc-checked completion reports (EVP re-inits, not
+    // the fixture counter -- count_mode is 0).
+    let calls_done = |lines: &[String]| -> u64 {
+        lines
+            .iter()
+            .find_map(|l| {
+                l.strip_prefix("calls C ")
+                    .and_then(|r| r.split_whitespace().nth(1)?.parse().ok())
+            })
+            .unwrap_or(0)
+    };
+    let oracle = calls_done(&first_c) + calls_done(&second_c);
+    // Independent ADMITTED == N gate (mandatory, never waived): all
+    // 1000 calls post-admission.
+    if oracle != 1000
+        || admitted0.is_none()
+        || admitted1 != admitted0.map(|b| b.saturating_add(1000))
+    {
         let _ = observer.kill();
         app.finish();
-        eprintln!("INCONCLUSIVE: counter = {oracle}");
+        eprintln!("INCONCLUSIVE: completed={oracle} admitted={admitted0:?}->{admitted1:?}");
         return;
     }
+    let calls_ns = |lines: &[String]| -> Option<u64> {
+        lines.iter().find_map(|l| {
+            l.strip_prefix("calls C ")
+                .and_then(|r| r.split_whitespace().nth(2)?.parse().ok())
+        })
+    };
     let status = observer.wait().unwrap();
     assert!(
         matches!(status.code(), Some(0 | 3 | 4)),
@@ -2351,9 +3128,12 @@ fn control_9a_dynamic_module_refreshes_additively() {
     let total = segment_calls(mine[0]).expect("segment calls sum");
     assert!(total <= 1000, "over-attribution: {total} > 1000");
     if total != 1000 {
+        let (origin, interval) = start_clock(&rows).expect("tick clock");
+        let t0 = tick_of(origin, interval, calls_ns(&first_c).expect("C1 instant"));
+        let t1 = tick_of(origin, interval, calls_ns(&second_c).expect("C2 instant"));
         assert!(
-            rows.iter().any(has_unknown_marker),
-            "shortfall {total}/1000 is quiet, not unknown"
+            shortfall_covered(&rows, mine[0], t0.min(t1), t0.max(t1)),
+            "shortfall {total}/1000 not covered over stimulus ticks {t0}..{t1}"
         );
     }
     // The additive refresh is explicit: same-state record carrying the
@@ -2720,10 +3500,24 @@ fn control_9d_cancel_drains_deferred_backlog() {
     assert!(!removed.is_empty(), "backlog silently dropped on cancel");
     for row in &removed {
         assert_eq!(row["reason"], "cancelled");
+        // M5: sealed spans are positive with coherent bounds (no
+        // vacuous alternative -- ticks > 0, first <= last, ticks
+        // within the bound span).
+        let span = &row["loss"]["deferred"];
+        let ticks = span["ticks"].as_u64().unwrap_or(0);
+        let first = span["first_tick"].as_u64();
+        let last = span["last_tick"].as_u64();
+        assert!(ticks > 0, "removed entry without sealed span: {row}");
+        let (Some(first), Some(last)) = (first, last) else {
+            panic!("removed entry without span bounds: {row}");
+        };
         assert!(
-            row["loss"]["deferred"]["ticks"].as_u64().unwrap_or(0) > 0
-                || row["loss"]["deferred"]["first_tick"].is_u64(),
-            "removed entry without sealed span: {row}"
+            first <= last,
+            "removed entry with incoherent span bounds: {row}"
+        );
+        assert!(
+            ticks <= last.saturating_sub(first).saturating_add(1),
+            "removed entry ticks exceed its span: {row}"
         );
     }
     assert_eq!(

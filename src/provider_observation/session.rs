@@ -26,6 +26,9 @@ unsafe impl aya::Pod for c::Namespace {}
 unsafe impl aya::Pod for c::Range {}
 unsafe impl aya::Pod for c::RangeKey {}
 unsafe impl aya::Pod for c::ApiAggregate {}
+unsafe impl aya::Pod for c::ThreadKey {}
+unsafe impl aya::Pod for c::Thread {}
+unsafe impl aya::Pod for c::ApiThreadKey {}
 #[derive(Default)]
 pub struct ObservationBatch {
     pub facts: Vec<ObservationFact>,
@@ -391,6 +394,12 @@ pub struct ProviderSession {
     events: RingBuf<MapData>,
     config: BpfMap<MapData, u64, c::Config>,
     members: BpfMap<MapData, u32, c::Member>,
+    /// 6A thread-row cleanup handles (§1.2): host-side removal of a
+    /// confirmed-dead tid's pairing rows (THREADS + API_THREADS).
+    /// PENDING frames are left to the BPF bound (the rule removes
+    /// the tid row only).
+    threads: BpfMap<MapData, c::ThreadKey, c::Thread>,
+    api_threads: BpfMap<MapData, c::ApiThreadKey, c::Thread>,
     ranges: BpfMap<MapData, c::RangeKey, c::Range>,
     loss: PerCpuArray<MapData, u64>,
     api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate>,
@@ -417,6 +426,17 @@ pub struct ProviderSession {
     /// whole by the `fenced` timestamp rule. Read once at segment
     /// seal into the member loss ledger.
     fence_withheld: u64,
+    /// 6A bounded uncertainty windows (§§1.6, 2.4): pids whose
+    /// provider fence clears after the next CLEAN backlog drain.
+    /// A fenced-then-evicted target (cgroup move, exclusion,
+    /// failed-tick suspend) re-adds through the refresh handoff;
+    /// the re-add flags the pid here (the fence stays armed for
+    /// the backlog: uncertain-span records withhold as conserved
+    /// loss, certain pre-edge records bind), and the drain end
+    /// clears the fence so post-recovery records flow again.
+    /// Pre-seal fences (exec/exit/reuse) never flag: the member
+    /// seals instead of resuming.
+    unfence_after_drain: BTreeSet<u32>,
     roles: Roles,
     aliases: super::assembly::Sequences,
     budget: ObservationBudget,
@@ -449,6 +469,12 @@ pub struct ProviderSession {
     /// coordinator attributes these per incarnation; only deltas ever
     /// accumulate here (map counters are monotonic).
     loss_totals: [u64; 8],
+    /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
+    /// read sequence, bumped on every SUCCESSFUL per-lane LOSS map
+    /// read (failed reads gap instead and leave the sequence — the
+    /// coordinator retains the last successful baseline through
+    /// failures rather than starting the next interval too late).
+    loss_read_seq: [u64; 8],
     last_drain: Instant,
     closed: bool,
 }
@@ -935,6 +961,10 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             members: BpfMap::try_from(map(&loaded, "MEMBERS")?)
                 .map_err(|_| ObservationGap::InvalidObject)?,
+            threads: BpfMap::try_from(map(&loaded, "THREADS")?)
+                .map_err(|_| ObservationGap::InvalidObject)?,
+            api_threads: BpfMap::try_from(map(&loaded, "API_THREADS")?)
+                .map_err(|_| ObservationGap::InvalidObject)?,
             ranges: BpfMap::try_from(map(&loaded, "RANGES")?)
                 .map_err(|_| ObservationGap::InvalidObject)?,
             loss: PerCpuArray::try_from(map(&loaded, "LOSS")?)
@@ -949,6 +979,7 @@ impl ProviderSession {
             exec_sealed: BTreeSet::new(),
             fenced: BTreeMap::new(),
             fence_withheld: 0,
+            unfence_after_drain: BTreeSet::new(),
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
             setup_state_spent: budget.spent_state(),
@@ -966,6 +997,7 @@ impl ProviderSession {
             learned: BTreeSet::new(),
             last_loss: [0; 8],
             loss_totals: [0; 8],
+            loss_read_seq: [0; 8],
             last_drain: Instant::now(),
             closed: false,
         })
@@ -1191,6 +1223,13 @@ impl ProviderSession {
     pub(crate) fn loss_totals(&self) -> [u64; 8] {
         self.loss_totals
     }
+    /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
+    /// read sequences, one bump per successful LOSS map read. The
+    /// coordinator advances a lane's baseline tick only past ticks
+    /// every live session read successfully.
+    pub(crate) fn loss_read_seq(&self) -> [u64; 8] {
+        self.loss_read_seq
+    }
     /// 6A kernel-edge fence (§1.8): stop the BPF plane for `pid`
     /// (members/config/ranges rows removed, best-effort — the
     /// timestamp filter below is the real guard) and arm the
@@ -1219,6 +1258,37 @@ impl ProviderSession {
     /// 6A provider-plane fence conservation, taken once at seal.
     pub(crate) fn take_fence_withheld(&mut self) -> u64 {
         std::mem::take(&mut self.fence_withheld)
+    }
+    /// 6A thread-exit row cleanup (§1.2): remove a
+    /// CONFIRMED-DEAD tid's pairing rows (THREADS + API_THREADS,
+    /// every generation — stale rows must never be adopted by a
+    /// recycled tid number). The TGID member, its rows and its
+    /// counts are untouched. Binding safety is the CALLER's
+    /// contract: absence-confirming Exit (fresh triple + task-dir
+    /// absence + window coverage) — removal itself is best-effort
+    /// per key (a row re-created after our removal belongs to a
+    /// live recycled tid and self-heals on its next hit; orphaned
+    /// PENDING frames stay BPF-bounded and fail visible on cookie
+    /// mismatch, never silently).
+    pub(crate) fn remove_thread_rows(&mut self, pid: u32, tid: u32) {
+        let dead: Vec<c::ThreadKey> = self
+            .threads
+            .keys()
+            .flatten()
+            .filter(|key| key.pid == pid && key.tid == tid)
+            .collect();
+        for key in dead {
+            let _ = self.threads.remove(&key);
+        }
+        let dead_api: Vec<c::ApiThreadKey> = self
+            .api_threads
+            .keys()
+            .flatten()
+            .filter(|key| key.thread.pid == pid && key.thread.tid == tid)
+            .collect();
+        for key in dead_api {
+            let _ = self.api_threads.remove(&key);
+        }
     }
     /// 6A suspension for retained-unknown members (§2.4): evict the
     /// live target into the `refreshing` handoff WITHOUT gaps or
@@ -1661,6 +1731,13 @@ impl ProviderSession {
             }
             return Err(g);
         }
+        // 6A bounded uncertainty window: a fenced pid that re-adds
+        // through the refresh handoff keeps its fence for exactly
+        // one clean backlog drain (uncertain-span records withhold,
+        // certain pre-edge records bind), then flows again.
+        if self.fenced.contains_key(&pid) {
+            self.unfence_after_drain.insert(pid);
+        }
         b.gap(ObservationGap::FirstQueryUnknown);
         b.gap(ObservationGap::SamplingPartial);
         Ok(())
@@ -1788,9 +1865,15 @@ impl ProviderSession {
                 }
             }
         }
+        // 6A bounded uncertainty windows clear only after a CLEAN
+        // backlog drain (ring exhausted): an overrun/limit break
+        // leaves un-consumed backlog for the next drain, which must
+        // still run under the fence.
+        let mut drained_clean = true;
         loop {
             if Instant::now() >= deadline {
                 b.gap(ObservationGap::DrainOverrun);
+                drained_clean = false;
                 break;
             }
             let event = match self.events.next() {
@@ -1807,12 +1890,19 @@ impl ProviderSession {
             }
             if self.emitted >= self.budget.limits.max_facts {
                 b.gap(ObservationGap::FactLimit);
+                drained_clean = false;
                 break;
+            }
+        }
+        if drained_clean {
+            for pid in std::mem::take(&mut self.unfence_after_drain) {
+                self.fenced.remove(&pid);
             }
         }
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
                 Ok(values) => {
+                    self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
                         self.loss_totals[index] =
