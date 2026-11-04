@@ -449,6 +449,10 @@ pub struct ProviderSession {
     /// the first acquisition's permanent spend.
     setup_state_spent: usize,
     setup_reads_spent: u64,
+    /// R3-2: lazy release gate — an idle retire arms (spend held
+    /// while the worker holds the links); each reconcile polls
+    /// and releases to the setup floors on worker-confirmed close.
+    release_gate: ReleaseGate,
     next_cookie: u64,
     /// First typed cookie. Cookies partition the (cookie, process, image)
     /// bind space across both programs: the counter mints u32
@@ -569,62 +573,510 @@ fn candidate_validation_result(
 /// synchronously at the retire point, so userspace link accounting
 /// (`link_count`, `active_link_count`) is unchanged — only the kernel
 /// detach runs late, on the worker.
-/// Backpressure: the queue holds `FD_DROPPER_QUEUE` victims; when full
-/// (churn storm) or the worker is gone, the caller closes synchronously —
-/// the pre-N12 slow path. Always correct, fast in the common case.
+/// R3-6/R3-7: the worker is an `FdDropper` (one process-global plus
+/// test-local instances). Fallback policy, in order: bounded queue →
+/// bounded spillover (burst absorption, worker-drained) → synchronous
+/// close with visible accounting (storm overflow or dead worker +
+/// failed respawn — slow, always correct). A dead sender is never
+/// permanent: every offload retries the spawn.
 const FD_DROPPER_QUEUE: usize = 4;
-fn fd_dropper() -> &'static std::sync::mpsc::SyncSender<Vec<std::os::fd::OwnedFd>> {
-    static SENDER: std::sync::OnceLock<std::sync::mpsc::SyncSender<Vec<std::os::fd::OwnedFd>>> =
-        std::sync::OnceLock::new();
-    SENDER.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(FD_DROPPER_QUEUE);
-        match std::thread::Builder::new()
-            .name("osslscope-fd-dropper".to_owned())
-            .spawn(move || {
-                for links in rx {
-                    drop(links);
-                }
-            }) {
-            Ok(_) => tx,
-            // `rx` drops with the un-spawned closure: the channel is
-            // disconnected, every send fails, and callers fall back
-            // to synchronous close. No panic, no thread, still correct.
-            Err(_) => tx,
+/// R3-2/R3-7: max links per worker message (one retire's victims
+/// split into bounded batches so the backlog budget stays
+/// justifiable — see `worker_batch_bytes`).
+const DROP_LINKS_PER_MESSAGE: usize = 256;
+/// R3-7: spillover capacity in MESSAGES (burst absorption past a
+/// full queue; the worker drains it every iteration). Max worker
+/// backlog = queue + in-flight + spillover messages.
+const DROP_SPILLOVER_MSGS: usize = 8;
+/// R3-2: program/link margin inside the per-message backlog
+/// charge — ≤256 link objects (×1 KiB: a `bpf_link` + fd table is
+/// ~400 B) plus ≤128 pinned programs (×16 KiB: a typical uprobe
+/// program + JIT image is 4–12 KiB). 256 KiB + 2 MiB = 2.25 MiB,
+/// rounded to 4 MiB (~1.8× margin over the estimates).
+const DROP_PROGLINK_MARGIN_BYTES: usize = 4 << 20;
+/// R3-2: fallback per-message charge when the map dimensions are
+/// uncomputable (cpu-count failure or arithmetic overflow — the
+/// charge must never fail; the fallback over-charges into honest
+/// backpressure instead of under-charging into a hole).
+const DROP_BATCH_FALLBACK_BYTES: usize = 64 << 20;
+/// R3-2: per-message kernel-retention charge — the session maps
+/// at real dimensions (queued links pin programs, programs pin
+/// maps) plus the program/link margin. Charged at offload,
+/// released at actual close; the coordinator's run-lifetime
+/// backlog guard tops up from the live total before every
+/// admission.
+fn worker_batch_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let max_cpus = crate::focused_count::CountLimits::default().max_cpus;
+        let Ok(cpus) = aya::util::nr_cpus() else {
+            return DROP_BATCH_FALLBACK_BYTES;
+        };
+        if cpus == 0 {
+            return DROP_BATCH_FALLBACK_BYTES;
         }
+        let mut maps = 0usize;
+        for spec in specs() {
+            let Some(bytes) = spec.reservation_bytes(cpus.min(max_cpus)) else {
+                return DROP_BATCH_FALLBACK_BYTES;
+            };
+            let Some(sum) = maps.checked_add(bytes) else {
+                return DROP_BATCH_FALLBACK_BYTES;
+            };
+            maps = sum;
+        }
+        maps.checked_add(DROP_PROGLINK_MARGIN_BYTES)
+            .unwrap_or(DROP_BATCH_FALLBACK_BYTES)
     })
 }
-fn offload_fd_drop(links: Vec<std::os::fd::OwnedFd>) {
-    if links.is_empty() {
-        return;
-    }
-    // Full queue or dead worker: `links` (inside the error value) drops
-    // here, synchronously — the pre-N12 behavior. Slow under overload,
-    // always correct.
-    let _ = fd_dropper().try_send(links);
+/// R3-2: live worker-backlog charge (all sessions' queued,
+/// in-flight and spilled batches) for the coordinator's
+/// admission guard.
+pub(crate) fn worker_backlog_charged() -> usize {
+    fd_dropper()
+        .shared
+        .backlog_charged
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
-/// Test-only barrier: queue a socket-pair half as a victim, then
-/// block until EOF proves the worker dropped it — and, by channel
-/// FIFO order, every victim queued before it. A dead worker fails
-/// the test via the read deadline instead of hanging the suite.
-/// Production never waits: promptness is the point.
+/// R3-2: non-blocking barrier waiter (release gating): the
+/// waiter outlives reconciles; the queued barrier acks into it
+/// once the worker has closed every predecessor.
+struct BarrierWait {
+    rx: std::sync::mpsc::Receiver<()>,
+}
+/// Barrier waiter state.
+enum BarrierState {
+    Pending,
+    Done,
+}
+impl BarrierWait {
+    fn poll(&self) -> BarrierState {
+        match self.rx.try_recv() {
+            Ok(()) => BarrierState::Done,
+            Err(std::sync::mpsc::TryRecvError::Empty) => BarrierState::Pending,
+            // Worker gone: the channel disconnect dropped every
+            // queued predecessor (their fds closed with the dead
+            // queue) — the wait is satisfied, not stuck.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => BarrierState::Done,
+        }
+    }
+}
+/// R3-2: session-level lazy release gate — an idle retire ARMS
+/// (spend stays charged: the worker still holds the links) and
+/// each reconcile POLLS: on worker-confirmed close (barrier ack)
+/// the caller releases to floors. Non-blocking: a full queue or
+/// dead worker simply stays armed for the next reconcile (spend
+/// held = conservative, admissions may honestly wait).
+struct ReleaseGate {
+    state: ReleaseState,
+}
+enum ReleaseState {
+    Clean,
+    Armed,
+    Waiting(BarrierWait),
+}
+impl ReleaseGate {
+    fn new() -> Self {
+        Self {
+            state: ReleaseState::Clean,
+        }
+    }
+    /// Arm on a victim-detaching retire: enqueue the proving
+    /// barrier EAGERLY (it postdates this retire's victims even
+    /// when a stale waiter exists — the orphan acks into void).
+    /// Eager arming converges without a death-free window: a
+    /// failed re-add's own victim-retire re-proves immediately
+    /// instead of orphaning proof forever. Full queue or dead
+    /// worker parks in Armed (the next poll retries).
+    fn arm(&mut self, dropper: &FdDropper) {
+        match dropper.barrier_enqueue() {
+            Some(wait) => self.state = ReleaseState::Waiting(wait),
+            None => self.state = ReleaseState::Armed,
+        }
+    }
+    /// Poll once per reconcile: true releases (caller drops to
+    /// floors). `idle` re-checks idleness at release time — a
+    /// non-idle reconcile vetoes but KEEPS a proven waiter (every
+    /// victim-queue re-arms, so a kept waiter is never stale; the
+    /// dead spend rides to the next idle with its proof intact).
+    fn poll(&mut self, idle: bool, dropper: &FdDropper) -> bool {
+        match std::mem::replace(&mut self.state, ReleaseState::Clean) {
+            ReleaseState::Clean => false,
+            ReleaseState::Armed => match dropper.barrier_enqueue() {
+                Some(wait) => {
+                    self.state = ReleaseState::Waiting(wait);
+                    false
+                }
+                None => {
+                    self.state = ReleaseState::Armed;
+                    false
+                }
+            },
+            ReleaseState::Waiting(wait) => match wait.poll() {
+                BarrierState::Pending => {
+                    self.state = ReleaseState::Waiting(wait);
+                    false
+                }
+                BarrierState::Done => {
+                    if idle {
+                        true
+                    } else {
+                        // Vetoed with proof held: the next idle
+                        // poll releases without re-enqueueing.
+                        self.state = ReleaseState::Waiting(wait);
+                        false
+                    }
+                }
+            },
+        }
+    }
+}
+/// Worker mailbox: link batches close in FIFO order; a `Barrier`
+/// carries a rendezvous ack the worker sends AFTER dropping every
+/// predecessor (R3-6 — the ack proves traversal).
+enum DropperMsg {
+    Links(Vec<OwnedFd>),
+    Barrier(std::sync::mpsc::SyncSender<()>),
+}
+/// Worker-spawn backend: production spawns the close thread;
+/// tests inject gates, recorders and failures. `Ok` means a live
+/// worker drains `rx` (and the shared spillover); `Err` means no
+/// worker (callers degrade to synchronous close and retry the
+/// spawn on the next offload).
+type DropperSpawn = Box<
+    dyn Fn(std::sync::mpsc::Receiver<DropperMsg>, std::sync::Arc<DropperShared>) -> Result<(), ()>
+        + Send
+        + Sync,
+>;
+/// Process-wide worker state: counters (visible accounting for
+/// every fallback path) plus the bounded spillover. All interior
+/// mutability is thread-safe; the worker thread only touches this
+/// (never session budgets — those stay single-threaded).
+struct DropperShared {
+    spillover: std::sync::Mutex<(Vec<Vec<OwnedFd>>, usize)>,
+    offloaded_fds: std::sync::atomic::AtomicU64,
+    spilled_fds: std::sync::atomic::AtomicU64,
+    sync_full_fds: std::sync::atomic::AtomicU64,
+    sync_dead_fds: std::sync::atomic::AtomicU64,
+    respawns: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    flushes: std::sync::atomic::AtomicU64,
+    /// R3-2: kernel-retention bytes currently held by queued,
+    /// in-flight and spilled batches (charged at offload,
+    /// released at actual close — worker-confirmed).
+    backlog_charged: std::sync::atomic::AtomicUsize,
+}
+impl DropperShared {
+    fn new() -> Self {
+        Self {
+            spillover: std::sync::Mutex::new((Vec::new(), 0)),
+            offloaded_fds: std::sync::atomic::AtomicU64::new(0),
+            spilled_fds: std::sync::atomic::AtomicU64::new(0),
+            sync_full_fds: std::sync::atomic::AtomicU64::new(0),
+            sync_dead_fds: std::sync::atomic::AtomicU64::new(0),
+            respawns: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            flushes: std::sync::atomic::AtomicU64::new(0),
+            backlog_charged: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+/// One link-close worker: a bounded queue, a spawn backend (for
+/// respawn after worker death) and shared counters. The
+/// process-global instance serves all sessions; tests build local
+/// instances with controlled workers.
+struct FdDropper {
+    shared: std::sync::Arc<DropperShared>,
+    sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<DropperMsg>>>,
+    spawn: DropperSpawn,
+    queue_bound: usize,
+    spillover_msgs: usize,
+}
+impl FdDropper {
+    fn production() -> Self {
+        Self::with_spawner(
+            Box::new(|rx, shared| {
+                std::thread::Builder::new()
+                    .name("osslscope-fd-dropper".to_owned())
+                    .spawn(move || Self::worker_loop(rx, shared))
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }),
+            FD_DROPPER_QUEUE,
+            DROP_SPILLOVER_MSGS,
+        )
+    }
+    fn with_spawner(spawn: DropperSpawn, queue_bound: usize, spillover_msgs: usize) -> Self {
+        let shared = std::sync::Arc::new(DropperShared::new());
+        let (tx, rx) = std::sync::mpsc::sync_channel(queue_bound.max(1));
+        let sender = match spawn(rx, shared.clone()) {
+            Ok(()) => Some(tx),
+            // No worker: `None` degrades every offload to
+            // synchronous close — retried (never permanent).
+            Err(()) => None,
+        };
+        Self {
+            shared,
+            sender: std::sync::Mutex::new(sender),
+            spawn,
+            queue_bound: queue_bound.max(1),
+            spillover_msgs,
+        }
+    }
+    /// Production worker loop: FIFO close, spillover drained every
+    /// iteration (burst absorption converges), final drain on
+    /// channel disconnect so test-local spillover never leaks. A
+    /// barrier drains the spillover FIRST, then acks — the ack
+    /// proves every predecessor (channel + spilled) closed.
+    fn worker_loop(
+        rx: std::sync::mpsc::Receiver<DropperMsg>,
+        shared: std::sync::Arc<DropperShared>,
+    ) {
+        use std::sync::atomic::Ordering::Relaxed;
+        for msg in rx {
+            match msg {
+                DropperMsg::Links(links) => {
+                    shared
+                        .backlog_charged
+                        .fetch_sub(worker_batch_bytes(), Relaxed);
+                    drop(links);
+                }
+                DropperMsg::Barrier(ack) => {
+                    Self::drain_spillover(&shared);
+                    let _ = ack.send(());
+                }
+            }
+            Self::drain_spillover(&shared);
+        }
+        Self::drain_spillover(&shared);
+    }
+    fn drain_spillover(shared: &DropperShared) {
+        let (spilled, charged) =
+            std::mem::take(&mut *shared.spillover.lock().unwrap_or_else(|e| e.into_inner()));
+        shared
+            .backlog_charged
+            .fetch_sub(charged, std::sync::atomic::Ordering::Relaxed);
+        drop(spilled);
+    }
+    fn sender(&self) -> Option<std::sync::mpsc::SyncSender<DropperMsg>> {
+        self.sender
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+    /// Offload one retire's victims (prompt path — never blocks):
+    /// split into bounded messages, queue-first, spillover past a
+    /// full queue, synchronous close (counted by cause) only past
+    /// a full spillover or a dead worker with a failed respawn.
+    fn offload(&self, links: Vec<OwnedFd>) {
+        let mut pending = links;
+        while !pending.is_empty() {
+            let n = pending.len().min(DROP_LINKS_PER_MESSAGE);
+            let chunk: Vec<OwnedFd> = pending.drain(..n).collect();
+            self.send_one(chunk);
+        }
+    }
+    fn send_one(&self, chunk: Vec<OwnedFd>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = chunk.len() as u64;
+        let Some(tx) = self.sender() else {
+            self.respawn_or_sync(chunk);
+            return;
+        };
+        match tx.try_send(DropperMsg::Links(chunk)) {
+            Ok(()) => {
+                self.shared.offloaded_fds.fetch_add(n, Relaxed);
+                self.shared
+                    .backlog_charged
+                    .fetch_add(worker_batch_bytes(), Relaxed);
+            }
+            Err(std::sync::mpsc::TrySendError::Full(DropperMsg::Links(chunk))) => {
+                self.spill_or_sync(chunk)
+            }
+            Err(std::sync::mpsc::TrySendError::Disconnected(DropperMsg::Links(chunk))) => {
+                self.respawn_or_sync(chunk)
+            }
+            // Only Links is ever sent here; any future shape
+            // degrades to synchronous close by dropping the
+            // message (safe, uncounted — provably unreachable).
+            Err(std::sync::mpsc::TrySendError::Full(other))
+            | Err(std::sync::mpsc::TrySendError::Disconnected(other)) => drop(other),
+        }
+    }
+    /// R3-7 spillover: a full queue absorbs into the bounded
+    /// spillover (prompt, worker-drained, charged) — synchronous
+    /// close only past a full spillover (sustained storm past
+    /// queue + spillover batches; slow, counted, always correct).
+    fn spill_or_sync(&self, chunk: Vec<OwnedFd>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = chunk.len() as u64;
+        let mut spill = self
+            .shared
+            .spillover
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if spill.0.len() < self.spillover_msgs {
+            spill.0.push(chunk);
+            spill.1 = spill.1.saturating_add(worker_batch_bytes());
+            self.shared.spilled_fds.fetch_add(n, Relaxed);
+            self.shared
+                .backlog_charged
+                .fetch_add(worker_batch_bytes(), Relaxed);
+        } else {
+            drop(spill);
+            drop(chunk);
+            self.shared.sync_full_fds.fetch_add(n, Relaxed);
+        }
+    }
+    /// R3-7 respawn: a dead worker (or a never-spawned one) retries
+    /// the spawn on every offload — a dead sender is never
+    /// permanent. One post-respawn send attempt; anything past it
+    /// degrades to spillover or counted synchronous close (no
+    /// unbounded recursion: at most one respawn per offload call).
+    fn respawn_or_sync(&self, chunk: Vec<OwnedFd>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = chunk.len() as u64;
+        if self.respawn() {
+            if let Some(tx) = self.sender() {
+                match tx.try_send(DropperMsg::Links(chunk)) {
+                    Ok(()) => {
+                        self.shared.offloaded_fds.fetch_add(n, Relaxed);
+                        self.shared
+                            .backlog_charged
+                            .fetch_add(worker_batch_bytes(), Relaxed);
+                        return;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(DropperMsg::Links(chunk))) => {
+                        self.spill_or_sync(chunk);
+                        return;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(DropperMsg::Links(chunk))) => {
+                        drop(chunk);
+                        self.shared.sync_dead_fds.fetch_add(n, Relaxed);
+                        return;
+                    }
+                    Err(std::sync::mpsc::TrySendError::Full(other))
+                    | Err(std::sync::mpsc::TrySendError::Disconnected(other)) => {
+                        drop(other);
+                        return;
+                    }
+                }
+            }
+        }
+        drop(chunk);
+        self.shared.sync_dead_fds.fetch_add(n, Relaxed);
+    }
+    /// R3-2: enqueue one barrier WITHOUT blocking (release
+    /// gating on the poll path): `Some` waiter on success, `None`
+    /// on a full queue (caller retries on a later reconcile) or
+    /// an unrespawnable worker. One respawn attempt per call.
+    fn barrier_enqueue(&self) -> Option<BarrierWait> {
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let barrier = DropperMsg::Barrier(ack_tx);
+        let tx = match self.sender() {
+            Some(tx) => tx,
+            None => {
+                if !self.respawn() {
+                    return None;
+                }
+                self.sender()?
+            }
+        };
+        match tx.try_send(barrier) {
+            Ok(()) => Some(BarrierWait { rx: ack_rx }),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => None,
+            Err(std::sync::mpsc::TrySendError::Disconnected(barrier)) => {
+                if !self.respawn() {
+                    return None;
+                }
+                match self.sender()?.try_send(barrier) {
+                    Ok(()) => Some(BarrierWait { rx: ack_rx }),
+                    Err(_) => None,
+                }
+            }
+        }
+    }
+    /// Attempt a worker (re)spawn: new channel, backend spawn,
+    /// sender swap. Concurrent callers may spawn extras; losers
+    /// exit when their channel disconnects (their sender is
+    /// dropped). Returns true when a live worker drains the
+    /// CURRENT sender.
+    fn respawn(&self) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (tx, rx) = std::sync::mpsc::sync_channel(self.queue_bound);
+        if (self.spawn)(rx, self.shared.clone()).is_err() {
+            return false;
+        }
+        *self.sender.lock().unwrap_or_else(|e| e.into_inner()) = Some(tx);
+        self.shared.respawns.fetch_add(1, Relaxed);
+        true
+    }
+    /// Test-only barrier: an acknowledgement that MUST traverse
+    /// the worker (R3-6) — the ack proves every predecessor
+    /// closed. On a full queue the barrier retries (never closes
+    /// inline: that false-passes); on a dead worker it respawns.
+    /// Explicit timeout: `Err` on expiry (never a false pass).
+    /// Production never waits: promptness is the point.
+    #[cfg(test)]
+    fn flush_timeout(&self, timeout: Duration) -> Result<(), ()> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel::<()>(1);
+        let deadline = Instant::now() + timeout;
+        let mut barrier = DropperMsg::Barrier(ack_tx);
+        loop {
+            if Instant::now() >= deadline {
+                return Err(());
+            }
+            let tx = match self.sender() {
+                Some(tx) => tx,
+                None => {
+                    self.respawn();
+                    std::thread::sleep(Duration::from_millis(1));
+                    continue;
+                }
+            };
+            match tx.try_send(barrier) {
+                Ok(()) => break,
+                Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                    barrier = m;
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(m)) => {
+                    barrier = m;
+                    self.respawn();
+                }
+            }
+        }
+        let remain = deadline.saturating_duration_since(Instant::now());
+        match ack_rx.recv_timeout(remain) {
+            Ok(()) => {
+                self.shared.flushes.fetch_add(1, Relaxed);
+                Ok(())
+            }
+            Err(_) => Err(()),
+        }
+    }
+}
+fn fd_dropper() -> &'static FdDropper {
+    static DROPPER: std::sync::OnceLock<FdDropper> = std::sync::OnceLock::new();
+    DROPPER.get_or_init(FdDropper::production)
+}
+fn offload_fd_drop(links: Vec<OwnedFd>) {
+    fd_dropper().offload(links);
+}
 #[cfg(test)]
 pub(crate) fn flush_fd_drops() {
-    use std::io::Read as _;
-    use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
-    let (link, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(link.into_raw_fd()) };
-    offload_fd_drop(vec![owned]);
-    peer.set_read_timeout(Some(std::time::Duration::from_secs(10)))
-        .unwrap();
-    let mut one = [0u8; 1];
-    match peer.read(&mut one) {
-        Ok(0) => {}
-        other => panic!("fd-dropper barrier failed: {other:?}"),
-    }
+    fd_dropper()
+        .flush_timeout(Duration::from_secs(60))
+        .expect("fd-dropper barrier failed");
 }
 /// Shared retirement boundary for reconcile/acquisition failures and drain.
 /// The descriptor/map operation is supplied by the session; source ownership
 /// and pending assembler state have one production transition.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one coherent retirement transition"
+)]
 fn retire_source_owners(
     (startup, targets): (
         &mut BTreeMap<u32, Vec<Attachment>>,
@@ -636,6 +1088,7 @@ fn retire_source_owners(
     gap: ObservationGap,
     b: &mut ObservationBatch,
     disarm: impl FnOnce(&[Attachment], Option<&Target>) -> Result<(), ObservationGap>,
+    offload: impl FnOnce(Vec<std::os::fd::OwnedFd>),
 ) -> bool {
     let rows: &[Attachment] = startup.get(&pid).map_or(&[], Vec::as_slice);
     // A resolver can record an earlier confirmed failure before a subsequent
@@ -657,9 +1110,17 @@ fn retire_source_owners(
             }
         }
     };
-    if let Err(gap) = disarm(rows, targets.get(&pid)) {
-        b.gap(gap);
-    }
+    // R3-1: async detach requires PROVEN disarm — a failed
+    // CONFIG/MEMBERS deletion leaves old probes armed, and a gap
+    // record does not disarm them. Un-disarmed victims keep
+    // synchronous detach below (slow, always safe).
+    let disarmed = match disarm(rows, targets.get(&pid)) {
+        Ok(()) => true,
+        Err(gap) => {
+            b.gap(gap);
+            false
+        }
+    };
     b.learned_sites.retain(|site| site.pid != pid);
     b.static_candidates.retain(|site| site.pid() != pid);
     if preserve {
@@ -691,7 +1152,13 @@ fn retire_source_owners(
             doomed.append(&mut a.links);
             a.historical = true;
         }
-        offload_fd_drop(doomed);
+        // R3-1: offload only on proven disarm; a failed disarm
+        // detaches synchronously (the probes may still be armed).
+        if disarmed {
+            offload(doomed);
+        } else {
+            drop(doomed);
+        }
         b.gap(ObservationGap::ProcessUnavailable);
         b.gap(ObservationGap::IntervalUnknown);
         b.gap(ObservationGap::FirstQueryUnknown);
@@ -710,7 +1177,13 @@ fn retire_source_owners(
                 doomed.append(&mut a.links);
             }
         }
-        offload_fd_drop(doomed);
+        // R3-1: offload only on proven disarm; a failed disarm
+        // detaches synchronously (the probes may still be armed).
+        if disarmed {
+            offload(doomed);
+        } else {
+            drop(doomed);
+        }
     }
     preserve
 }
@@ -1140,6 +1613,7 @@ impl ProviderSession {
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
             setup_state_spent: budget.spent_state(),
+            release_gate: ReleaseGate::new(),
             setup_reads_spent: budget.spent_reads(),
             budget,
             next_cookie: 1,
@@ -1320,6 +1794,16 @@ impl ProviderSession {
             return false;
         }
         self.refreshing.remove(&pid);
+        // R3-2: victim check BEFORE the retire removes the rows
+        // (the gate arms below only when links detach).
+        let had_victims = self
+            .targets
+            .get(&pid)
+            .is_some_and(|t| t.attachments.iter().any(|a| !a.links.is_empty()))
+            || self
+                .startup
+                .get(&pid)
+                .is_some_and(|rows| rows.iter().any(|a| !a.links.is_empty()));
         let preserve = retire_source_owners(
             (&mut self.startup, &mut self.targets),
             &mut self.aliases,
@@ -1355,19 +1839,28 @@ impl ProviderSession {
                     Ok(())
                 }
             },
+            offload_fd_drop,
         );
-        // Retire-time budget release: when no attachment remains live
-        // anywhere, the retired acquisition's permanent spend is dead —
-        // return to the setup watermark so a re-add can re-acquire.
-        // Guarded to the fully-idle case: live attachments elsewhere
-        // still own their spend, and per-target accounting would be
-        // needed to release partially (all current CLI flows retire
-        // the single live target here).
-        if self.targets.is_empty() && self.startup.values().all(|rows| rows.is_empty()) {
-            let floor = self.setup_state_spent;
-            self.budget.release_state_to_floor(floor);
-            let reads_floor = self.setup_reads_spent;
-            self.budget.release_reads_to_floor(reads_floor);
+        // Retire-time budget release (R3-2: lazy, worker-gated):
+        // a retire that detaches victims ARMS the release gate —
+        // the worker may hold the retired links (kernel programs
+        // /maps pinned past close), so the spend stays charged
+        // until a reconcile observes the worker-confirmed close
+        // (barrier ack) and returns to the setup watermark for
+        // re-acquire. Arming is victim-gated (not idle-gated): a
+        // retire during Waiting re-arms past the stale barrier
+        // (its victims postdate it), while a victimless retire
+        // must NOT re-arm (a failed re-add's empty retire would
+        // orphan the proving barrier every reconcile and the
+        // release would never converge). The poll-time idle veto
+        // (not the arming) guards live spend — per-target
+        // accounting would be needed to release partially (all
+        // current CLI flows retire the single live target here).
+        // Disarm-failed victims close synchronously (no queue) but
+        // still arm — one harmless extra round-trip on a rare
+        // failure path (the disarm result stays inside the retire).
+        if had_victims {
+            self.release_gate.arm(fd_dropper());
         }
         preserve
     }
@@ -1493,6 +1986,17 @@ impl ProviderSession {
         if self.closed || self.final_drain || !self.gate.admitting() {
             b.gap(ObservationGap::Invalidated);
             return b;
+        }
+        // R3-2: worker-gated lazy release — an armed gate releases
+        // to the setup floors only on worker-confirmed close of
+        // the retired links (non-blocking; a full queue or dead
+        // worker simply defers to the next reconcile).
+        let idle = self.targets.is_empty() && self.startup.values().all(|rows| rows.is_empty());
+        if self.release_gate.poll(idle, fd_dropper()) {
+            let floor = self.setup_state_spent;
+            self.budget.release_state_to_floor(floor);
+            let reads_floor = self.setup_reads_spent;
+            self.budget.release_reads_to_floor(reads_floor);
         }
         let invalid_refresh: Vec<_> = self
             .refreshing
@@ -2673,15 +3177,52 @@ impl ProviderSession {
             .map_err(|_| ObservationGap::BpfUnavailable)
     }
     fn retire_startup(&mut self, pid: u32) {
-        if let Some(attachments) = self.startup.remove(&pid) {
+        let queued = Self::retire_startup_with(
+            &mut self.startup,
+            pid,
+            |cookie| self.config.remove(cookie).is_ok(),
+            offload_fd_drop,
+        );
+        // R3-2: queued startup victims re-arm past any stale
+        // barrier like any retire's (the poll-time veto guards
+        // live spend, not the arming). Sync-closed or victimless
+        // detaches need no barrier.
+        if queued {
+            self.release_gate.arm(fd_dropper());
+        }
+    }
+    /// R3-1: startup-only retirement with injectable CONFIG
+    /// disarm (fault injection for the failure path — a failed
+    /// disarm keeps synchronous detach, never async offload).
+    /// Returns true when victims were QUEUED (disarmed, non-empty
+    /// — the R3-2 arming signal; sync-closed or empty detaches
+    /// need no barrier).
+    fn retire_startup_with(
+        startup: &mut BTreeMap<u32, Vec<Attachment>>,
+        pid: u32,
+        mut disarm_cookie: impl FnMut(&u64) -> bool,
+        offload: impl FnOnce(Vec<std::os::fd::OwnedFd>),
+    ) -> bool {
+        if let Some(attachments) = startup.remove(&pid) {
             // N12: one send per retire (see `offload_fd_drop`).
             let mut doomed: Vec<std::os::fd::OwnedFd> = Vec::new();
+            let mut disarmed = true;
             for mut a in attachments {
-                let _ = self.config.remove(&a.cookie);
+                // R3-1: a failed CONFIG deletion keeps synchronous
+                // detach (a gap record alone does not disarm).
+                disarmed &= disarm_cookie(&a.cookie);
                 // Config removal keeps its order ahead of the close.
                 doomed.append(&mut a.links);
             }
-            offload_fd_drop(doomed);
+            let queued = disarmed && !doomed.is_empty();
+            if disarmed {
+                offload(doomed);
+            } else {
+                drop(doomed);
+            }
+            queued
+        } else {
+            false
         }
     }
     /// Retain typed startup sources without arming an argument reader or
@@ -3833,6 +4374,403 @@ mod tests {
         let (dead, failures) = super::collect_dead_keys(clean.into_iter(), |_| true);
         assert_eq!(dead, vec![4]);
         assert_eq!(failures, 0);
+    }
+    /// R3-6/R3-7 test worker: one message per gate release (the
+    /// test parks the worker by withholding releases — a held
+    /// worker plus a filled queue, deterministically, no timing).
+    /// Each receipt signals `taken` so the test can stage
+    /// queue-full states exactly (block on the signal, never spin
+    /// on a sleep).
+    fn gated_spawner(
+        gate: std::sync::mpsc::Receiver<()>,
+        taken: std::sync::mpsc::Sender<()>,
+    ) -> super::DropperSpawn {
+        let gate = std::sync::Mutex::new(Some((gate, taken)));
+        Box::new(move |rx, shared| {
+            let pair = gate.lock().unwrap_or_else(|e| e.into_inner()).take();
+            std::thread::spawn(move || {
+                for msg in rx {
+                    if let Some((g, taken)) = &pair {
+                        taken.send(()).ok();
+                        g.recv().ok();
+                    }
+                    match msg {
+                        super::DropperMsg::Links(links) => {
+                            // Mirror the production loop's charge
+                            // release (test workers stand in for it).
+                            shared.backlog_charged.fetch_sub(
+                                super::worker_batch_bytes(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            drop(links);
+                        }
+                        super::DropperMsg::Barrier(ack) => {
+                            super::FdDropper::drain_spillover(&shared);
+                            ack.send(()).ok();
+                        }
+                    }
+                    super::FdDropper::drain_spillover(&shared);
+                }
+                super::FdDropper::drain_spillover(&shared);
+            });
+            Ok(())
+        })
+    }
+    /// R3-7 test worker: records message sizes, then closes.
+    fn recording_spawner(
+        recorded: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+    ) -> super::DropperSpawn {
+        Box::new(move |rx, shared| {
+            let recorded = recorded.clone();
+            std::thread::spawn(move || {
+                for msg in rx {
+                    match msg {
+                        super::DropperMsg::Links(links) => {
+                            recorded
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .push(links.len());
+                            shared.backlog_charged.fetch_sub(
+                                super::worker_batch_bytes(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            drop(links);
+                        }
+                        super::DropperMsg::Barrier(ack) => {
+                            super::FdDropper::drain_spillover(&shared);
+                            ack.send(()).ok();
+                        }
+                    }
+                    super::FdDropper::drain_spillover(&shared);
+                }
+                super::FdDropper::drain_spillover(&shared);
+            });
+            Ok(())
+        })
+    }
+    fn socket_fd() -> (std::os::fd::OwnedFd, std::os::unix::net::UnixStream) {
+        use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+        let (link, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let owned = unsafe { std::os::fd::OwnedFd::from_raw_fd(link.into_raw_fd()) };
+        (owned, peer)
+    }
+    fn assert_open(peer: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read as _;
+        assert_eq!(
+            peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "fd closed while it must stay open"
+        );
+    }
+    fn assert_closed(peer: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read as _;
+        assert_eq!(
+            peer.read(&mut [0]).unwrap(),
+            0,
+            "fd still open after its close was proven"
+        );
+    }
+    #[test]
+    fn r36_barrier_traverses_worker_on_full_queue() {
+        // R3-6: on a full queue the barrier MUST traverse the
+        // worker — closing it inline false-passes (EOF proves
+        // nothing about earlier queued victims). Held worker +
+        // filled queue: the flush times out (explicit failure,
+        // victim still open), then succeeds after release (victim
+        // closed — traversal proven).
+        use std::sync::atomic::Ordering::Relaxed;
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper = super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 2, 2);
+        let (victim, mut peer) = socket_fd();
+        dropper.offload(vec![victim]);
+        // The worker takes the victim, then parks on the gate
+        // (block on the receipt signal — setup sync, no sleeps);
+        // two more messages then fill the 2-slot queue exactly.
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes the victim");
+        let mut fillers = Vec::new();
+        for _ in 0..2 {
+            let (fd, peer) = socket_fd();
+            fillers.push(peer);
+            dropper.offload(vec![fd]);
+        }
+        assert_eq!(dropper.shared.offloaded_fds.load(Relaxed), 3);
+        // Full queue + parked worker: the flush MUST time out (not
+        // false-pass) and the victim MUST stay open.
+        let expired = dropper.flush_timeout(std::time::Duration::from_millis(200));
+        assert!(expired.is_err(), "flush false-passed on a full queue");
+        assert_open(&mut peer);
+        // Release everything (victim + 2 queued + barrier): the
+        // flush succeeds and the victim is proven closed.
+        for _ in 0..4 {
+            gate_tx.send(()).unwrap();
+        }
+        dropper
+            .flush_timeout(std::time::Duration::from_secs(10))
+            .expect("barrier must traverse after release");
+        assert_closed(&mut peer);
+        // Only the traversed barrier counts (the timed-out attempt
+        // never false-passes, so it never counts).
+        assert_eq!(dropper.shared.flushes.load(Relaxed), 1);
+    }
+    #[test]
+    fn r37_queue_saturation_spills_not_stalls() {
+        // R3-7: a full queue spills into the bounded spillover
+        // (prompt, worker-drained) instead of closing
+        // synchronously on the caller.
+        use std::sync::atomic::Ordering::Relaxed;
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper = super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 1, 2);
+        let (first, _first_peer) = socket_fd();
+        dropper.offload(vec![first]);
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes the first");
+        let (second, _second_peer) = socket_fd();
+        dropper.offload(vec![second]);
+        // Worker holds the first; the 1-slot queue holds the
+        // second; this third offload must spill (victim open).
+        let (spilled, mut peer) = socket_fd();
+        dropper.offload(vec![spilled]);
+        assert_open(&mut peer);
+        assert_eq!(dropper.shared.spilled_fds.load(Relaxed), 1);
+        assert_eq!(dropper.shared.sync_full_fds.load(Relaxed), 0);
+        for _ in 0..3 {
+            gate_tx.send(()).unwrap();
+        }
+        dropper
+            .flush_timeout(std::time::Duration::from_secs(10))
+            .expect("flush after release");
+        assert_closed(&mut peer);
+    }
+    #[test]
+    fn r37_spawn_failure_degrades_then_respawns() {
+        // R3-7: spawn failure degrades to counted synchronous
+        // close — and a dead sender is never permanent: the next
+        // offload retries the spawn.
+        use std::sync::atomic::Ordering::Relaxed;
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = fail.clone();
+        let spawner: super::DropperSpawn = Box::new(move |rx, shared| {
+            if flag.load(Relaxed) {
+                return Err(());
+            }
+            std::thread::spawn(move || super::FdDropper::worker_loop(rx, shared));
+            Ok(())
+        });
+        let dropper = super::FdDropper::with_spawner(spawner, 2, 2);
+        let (doomed, mut peer) = socket_fd();
+        dropper.offload(vec![doomed]);
+        assert_closed(&mut peer);
+        assert_eq!(dropper.shared.sync_dead_fds.load(Relaxed), 1);
+        // The spawner heals: the next offload respawns and the
+        // fast path returns (routed to the queue — openness is
+        // racy against a live worker, so routing counters prove
+        // it, not the fd state).
+        fail.store(false, Relaxed);
+        let (saved, mut peer) = socket_fd();
+        dropper.offload(vec![saved]);
+        assert_eq!(dropper.shared.respawns.load(Relaxed), 1);
+        assert_eq!(dropper.shared.offloaded_fds.load(Relaxed), 1);
+        assert_eq!(dropper.shared.sync_dead_fds.load(Relaxed), 1);
+        dropper
+            .flush_timeout(std::time::Duration::from_secs(10))
+            .expect("flush after respawn");
+        assert_closed(&mut peer);
+    }
+    #[test]
+    fn r37_offload_chunks_bounded_messages() {
+        // R3-7/R3-2: one retire's victims split into bounded
+        // (≤256-link) messages so the backlog budget stays
+        // justifiable.
+        let recorded = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dropper = super::FdDropper::with_spawner(recording_spawner(recorded.clone()), 16, 8);
+        let mut peers = Vec::new();
+        let mut links = Vec::new();
+        for _ in 0..300 {
+            let (fd, peer) = socket_fd();
+            links.push(fd);
+            peers.push(peer);
+        }
+        dropper.offload(links);
+        dropper
+            .flush_timeout(std::time::Duration::from_secs(10))
+            .expect("flush");
+        let recorded = recorded.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // The trailing barrier is not a Links message (worker ack,
+        // unrecorded) — every recorded batch is bounded.
+        assert!(!recorded.is_empty());
+        assert!(
+            recorded.iter().all(|&n| n <= super::DROP_LINKS_PER_MESSAGE),
+            "unbounded batch: {recorded:?}"
+        );
+        assert_eq!(
+            recorded.iter().sum::<usize>(),
+            300,
+            "all links delivered: {recorded:?}"
+        );
+    }
+    #[test]
+    fn worker_backlog_charge_covers_maps_plus_margin() {
+        // R3-2: the per-message charge is exactly the session maps
+        // at real dimensions plus the program/link margin — the
+        // formula never silently shrinks (the 64 MiB fallback only
+        // fires when the dimensions are uncomputable, unreachable
+        // on a live machine).
+        let max_cpus = crate::focused_count::CountLimits::default().max_cpus;
+        let cpus = aya::util::nr_cpus().expect("cpu count").min(max_cpus);
+        assert!(cpus > 0);
+        let mut maps = 0usize;
+        for spec in super::specs() {
+            maps = maps
+                .checked_add(spec.reservation_bytes(cpus).expect("map dims"))
+                .expect("map sum");
+        }
+        assert_eq!(
+            super::worker_batch_bytes(),
+            maps.checked_add(super::DROP_PROGLINK_MARGIN_BYTES).unwrap(),
+        );
+    }
+    #[test]
+    fn r32_backlog_charges_actual_queue() {
+        // R3-2: queued, in-flight and spilled batches charge
+        // kernel retention (released at actual close —
+        // worker-confirmed, not at offload).
+        use std::sync::atomic::Ordering::Relaxed;
+        let batch = super::worker_batch_bytes();
+        assert!(batch > 0);
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper = super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 2, 2);
+        let mut peers = Vec::new();
+        let offload_one = |dropper: &super::FdDropper, peers: &mut Vec<_>| {
+            let (fd, peer) = socket_fd();
+            peers.push(peer);
+            dropper.offload(vec![fd]);
+        };
+        offload_one(&dropper, &mut peers);
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes the first");
+        offload_one(&dropper, &mut peers);
+        offload_one(&dropper, &mut peers);
+        // In-flight + 2 queued = 3 messages charged.
+        assert_eq!(dropper.shared.backlog_charged.load(Relaxed), 3 * batch);
+        // A fourth spills (queue full) — still charged.
+        offload_one(&dropper, &mut peers);
+        assert_eq!(dropper.shared.backlog_charged.load(Relaxed), 4 * batch);
+        // Release everything (3 channel messages + the barrier):
+        // the worker closes it all and the charge returns to zero.
+        for _ in 0..4 {
+            gate_tx.send(()).unwrap();
+        }
+        dropper
+            .flush_timeout(std::time::Duration::from_secs(10))
+            .expect("flush after release");
+        assert_eq!(dropper.shared.backlog_charged.load(Relaxed), 0);
+    }
+    /// Bounded completion wait: polls until the gate releases
+    /// (the worker WILL ack — releases buffer — so the outcome
+    /// never depends on timing; the cap only bounds breakage).
+    fn wait_for_release(gate: &mut super::ReleaseGate, dropper: &super::FdDropper) {
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !gate.poll(true, dropper) {
+            assert!(
+                std::time::Instant::now() < until,
+                "proven close must release"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    #[test]
+    fn r32_release_gate_defers_to_worker_confirmed_close() {
+        // R3-2: the gate arms at idle-retire (spend held) and
+        // releases only on worker-confirmed close (barrier ack) —
+        // never on hope, never blocking the poll path.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper = super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 2, 2);
+        let mut gate = super::ReleaseGate::new();
+        assert!(!gate.poll(true, &dropper), "clean gate must not release");
+        // Arming enqueues eagerly (no poll needed for proof to
+        // start traversing).
+        gate.arm(&dropper);
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes the eager barrier");
+        // Idle but worker unproven: no release (stays armed).
+        assert!(!gate.poll(true, &dropper), "release before worker proof");
+        assert!(!gate.poll(true, &dropper), "gate must stay armed");
+        // A non-idle reconcile vetoes but KEEPS the waiter (proof
+        // held — the next idle poll releases without
+        // re-enqueueing, so exactly one barrier traverses).
+        assert!(!gate.poll(false, &dropper), "non-idle must veto");
+        assert!(!gate.poll(true, &dropper), "veto must keep waiting");
+        gate_tx.send(()).unwrap();
+        wait_for_release(&mut gate, &dropper);
+        assert!(
+            taken_rx
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "veto must not re-enqueue a second barrier"
+        );
+        assert!(!gate.poll(true, &dropper), "gate disarms after release");
+    }
+    #[test]
+    fn r32_release_gate_retries_past_full_queue() {
+        // R3-2: a full queue (or dead worker) keeps the gate armed
+        // without blocking — the release converges on a later
+        // reconcile once the worker drains.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper = super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 1, 0);
+        // Park the worker on a victim, then fill the 1-slot queue
+        // AND the (zero) spillover: the barrier cannot enqueue.
+        let (victim, _peer) = socket_fd();
+        dropper.offload(vec![victim]);
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes the victim");
+        let (filler, _peer) = socket_fd();
+        dropper.offload(vec![filler]);
+        let mut gate = super::ReleaseGate::new();
+        gate.arm(&dropper);
+        assert!(!gate.poll(true, &dropper), "full queue must defer");
+        assert!(!gate.poll(true, &dropper), "gate must stay armed");
+        // Release the worker (victim + filler + barrier): polls
+        // converge to release once the barrier traverses.
+        for _ in 0..3 {
+            gate_tx.send(()).unwrap();
+        }
+        wait_for_release(&mut gate, &dropper);
+    }
+    #[test]
+    fn r32_release_gate_rearms_past_stale_barrier() {
+        // R3-2: a retire during Waiting re-arms EAGERLY — its
+        // victims postdate the old barrier, so the gate drops the
+        // stale waiter and enqueues a fresh barrier immediately
+        // (two barriers traverse; the orphan acks into void). No
+        // poll is needed between the retire and the fresh proof.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper = super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 2, 2);
+        let mut gate = super::ReleaseGate::new();
+        gate.arm(&dropper);
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes barrier#1");
+        // A retire lands while Waiting: eager re-arm, no poll.
+        gate.arm(&dropper);
+        gate_tx.send(()).unwrap();
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes barrier#2 (re-armed, no poll)");
+        gate_tx.send(()).unwrap();
+        wait_for_release(&mut gate, &dropper);
     }
     #[test]
     fn loss_tick_of_pins_containing_tick() {
@@ -14263,6 +15201,121 @@ mod startup_api_controls {
         }
     }
     #[test]
+    fn failed_disarm_keeps_synchronous_detach() {
+        // R3-1: a failed disarm (CONFIG/MEMBERS deletion error)
+        // must NOT offload — un-disarmed probes stay armed until
+        // the deferred close, and a gap record does not disarm
+        // them. The retire keeps synchronous detach here: EOF with
+        // no flush, and the offload spy never fires.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(false);
+        let pid = fixture.child.pid();
+        let mut aliases = super::super::assembly::Sequences::default();
+        let mut batch = ObservationBatch::default();
+        let mut spy_called = false;
+        let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
+        let preserve = retire_source_owners(
+            (&mut fixture.startup, &mut fixture.targets),
+            &mut aliases,
+            pid,
+            None,
+            ObservationGap::ProcessChanged,
+            &mut batch,
+            |_, _| Err(ObservationGap::Invalidated),
+            |links| {
+                spy_called = true;
+                captured = links;
+            },
+        );
+        assert!(!preserve);
+        assert!(!spy_called, "failed disarm must not offload");
+        assert!(captured.is_empty(), "spy must hold nothing");
+        use std::io::Read;
+        assert_eq!(
+            fixture.link_peer.read(&mut [0]).unwrap(),
+            0,
+            "failed disarm must close synchronously (no flush)"
+        );
+    }
+    #[test]
+    fn proven_disarm_offloads_asynchronously() {
+        // R3-1 companion: proven disarm keeps the fast path — the
+        // retire offloads (spy fires) and the link stays open
+        // until the worker (or the test, here) closes it.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(false);
+        let pid = fixture.child.pid();
+        let mut aliases = super::super::assembly::Sequences::default();
+        let mut batch = ObservationBatch::default();
+        let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
+        let preserve = retire_source_owners(
+            (&mut fixture.startup, &mut fixture.targets),
+            &mut aliases,
+            pid,
+            None,
+            ObservationGap::ProcessChanged,
+            &mut batch,
+            |_, _| Ok(()),
+            |links| {
+                captured = links;
+            },
+        );
+        assert!(!preserve);
+        assert_eq!(captured.len(), 1, "proven disarm must offload");
+        use std::io::Read;
+        assert_eq!(
+            fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "offloaded link must stay open until closed"
+        );
+        drop(captured);
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+    }
+    #[test]
+    fn retire_startup_config_failure_closes_synchronously() {
+        // R3-1: `retire_startup` ignores CONFIG deletion errors on
+        // BASE — the failure path must keep synchronous detach
+        // (fault injected through the disarm closure).
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(false);
+        let pid = fixture.child.pid();
+        let mut spy_called = false;
+        ProviderSession::retire_startup_with(
+            &mut fixture.startup,
+            pid,
+            |_| false,
+            |links| {
+                spy_called = true;
+                drop(links);
+            },
+        );
+        assert!(!spy_called, "failed CONFIG disarm must not offload");
+        use std::io::Read;
+        assert_eq!(
+            fixture.link_peer.read(&mut [0]).unwrap(),
+            0,
+            "failed CONFIG disarm must close synchronously"
+        );
+        // Success companion: proven disarm offloads.
+        let mut fixture = reconcile_fixture(false);
+        let pid = fixture.child.pid();
+        let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
+        ProviderSession::retire_startup_with(
+            &mut fixture.startup,
+            pid,
+            |_| true,
+            |links| {
+                captured = links;
+            },
+        );
+        assert_eq!(captured.len(), 1, "proven disarm must offload");
+        assert_eq!(
+            fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+        );
+        drop(captured);
+    }
+    #[test]
     fn final_cut_mixed_sources_require_each_attachments_own_terminal_authority() {
         let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
         for case in ["live", "terminal", "permanent", "nonterminal-unavailable"] {
@@ -14498,6 +15551,7 @@ mod startup_api_controls {
                     code_ranges = 0;
                     Ok(())
                 },
+                offload_fd_drop,
             );
             assert!(
                 kept,
@@ -14646,7 +15700,8 @@ mod startup_api_controls {
                         Some(&fixture.record),
                         gap,
                         &mut batch,
-                        |_, _| Ok(())
+                        |_, _| Ok(()),
+                        offload_fd_drop
                     ),
                     "generic failure became historical authority: case={case}, adopted={adopted}"
                 );
@@ -14722,6 +15777,7 @@ mod startup_api_controls {
                 gap,
                 &mut batch,
                 |_, _| Ok(()),
+                offload_fd_drop,
             );
             if confirmed.is_some() {
                 assert!(
@@ -14807,7 +15863,8 @@ mod startup_api_controls {
                     None,
                     later,
                     &mut batch,
-                    |_, _| Ok(())
+                    |_, _| Ok(()),
+                    offload_fd_drop
                 ),
                 "cached confirmed {confirmed:?} was lost behind later unavailability"
             );
@@ -14870,6 +15927,7 @@ mod startup_api_controls {
                 setup.err().unwrap_or(unavailable),
                 &mut batch,
                 |_, _| Ok(()),
+                offload_fd_drop,
             );
             if confirmed.is_some() {
                 assert!(
@@ -14925,7 +15983,8 @@ mod startup_api_controls {
                 None,
                 ObservationGap::ProcessUnavailable,
                 &mut batch,
-                |_, _| Ok(())
+                |_, _| Ok(()),
+                offload_fd_drop
             ),
             "an unavailable error cannot substitute for an independently terminal original pidfd"
         );
@@ -14990,6 +16049,7 @@ mod startup_api_controls {
                 ObservationGap::ProcessUnavailable,
                 &mut batch,
                 |_, _| Ok(()),
+                offload_fd_drop,
             );
             if expected == ObservationGap::ProcessUnavailable {
                 assert!(
@@ -17460,19 +18520,19 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
             &mut ObservationBatch::default(),
         );
         assert!(session.targets.is_empty(), "retire must drop the target");
-        // Mechanism: with nothing live, retire releases acquisition
-        // spend back to the setup watermark. Standing setup leases stay
-        // live (their guards subtract on drop), so the release keeps
-        // floor + reserved, never below.
+        // Mechanism (R3-2: lazy, worker-gated): the retire ARMS the
+        // release gate but holds the spend — the worker still owns
+        // the retired links, so an immediate release would free
+        // budget against live kernel retention.
         assert_eq!(
             session.budget.state_spent_test(),
-            session.setup_state_spent + session.budget.reserved_test(),
-            "retire must release non-reserved acquisition spend to the setup watermark"
+            spent_after_attach,
+            "retire must hold spend until worker-confirmed close"
         );
         assert_eq!(
             session.budget.spent_reads(),
-            session.setup_reads_spent,
-            "retire must release read spend to the setup watermark"
+            reads_after_attach,
+            "retire must hold read spend until worker-confirmed close"
         );
         let records2 = inventory::snapshot(&inventory::SnapshotOptions {
             pids: vec![pid],
@@ -17480,12 +18540,48 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
         })
         .processes;
         assert_eq!(records2.len(), 1);
+        // First post-retire reconcile: the gate enqueues its
+        // barrier (no release yet — the worker is still closing),
+        // so the re-add still starves on the tight ceiling (held
+        // spend + one attach > spent + attach/2, always).
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let first_retry = session.reconcile_records(&records2);
+        assert!(
+            !session.targets.get(&pid).is_some_and(|t| t.ready),
+            "re-add before worker-confirmed close must starve; gaps={:?}",
+            first_retry.gaps
+        );
+        // The test barrier proves the worker drained (including
+        // our gate barrier — FIFO). The second reconcile observes
+        // the ack, releases to the watermark (floor + reserved —
+        // standing setup leases stay live), and the re-add fits
+        // (watermark + reserved + one attach <= ceiling) and
+        // re-spends exactly. The READY target is the release
+        // proof: without the release the ceiling arithmetic
+        // forbids it.
+        flush_fd_drops();
         session.set_deadline(Instant::now() + Duration::from_secs(120));
         let second = session.reconcile_records(&records2);
         assert!(
             session.targets.get(&pid).is_some_and(|t| t.ready),
-            "re-add after retire must re-acquire a ready target; gaps={:?}",
+            "re-add after worker-confirmed close must re-acquire a ready target; gaps={:?}",
             second.gaps
+        );
+        // Re-spend is ~one attach (retained cross-retire state
+        // may shave bytes — the ceiling still proves the release:
+        // held spend + one attach never fits).
+        let re_spent = session.budget.state_spent_test();
+        assert!(
+            re_spent <= spent_after_attach && spent_after_attach - re_spent < attach_spend / 10,
+            "released budget must re-spend about one attach: {re_spent} vs {spent_after_attach}"
+        );
+        // Same tolerance for reads (the starved first retry may
+        // itself spend reads before the release lands).
+        let re_read = session.budget.spent_reads();
+        let reads_attach = reads_after_attach - session.setup_reads_spent;
+        assert!(
+            re_read.abs_diff(reads_after_attach) < reads_attach / 10,
+            "released read budget must re-spend about one attach: {re_read} vs {reads_after_attach}"
         );
         child.finish_observation().unwrap();
     }

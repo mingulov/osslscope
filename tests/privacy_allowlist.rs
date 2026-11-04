@@ -1486,6 +1486,7 @@ fn attach_diagnostics_vocabulary_has_no_pathnames() {
         "backing-changed:not-found",
     ];
     let mut doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 0,
@@ -1592,6 +1593,7 @@ fn refusal_diagnostics_shape_is_numeric_only() {
         "limit:dev=8 ino=200 kind=over_allowance bytes=1536 allowance=1024",
     ];
     let mut doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 0,

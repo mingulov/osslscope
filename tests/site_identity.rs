@@ -233,6 +233,7 @@ fn fire(session: &mut CountSession<FakeCountBackend>, cookie: u32, now_ns: u64, 
 
 fn finalize_doc(sites: Vec<SiteExecution>) -> CaptureDocument {
     finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 1_000,
             requested_end_ns: 2_000,

@@ -12,7 +12,7 @@ use crate::{
         self, GapReason, NamespaceId, ProcessRecord, Snapshot,
         scope::{ScopedScanner, Selection},
     },
-    observation_memory::MemoryPool,
+    observation_memory::{MemoryLease, MemoryPool},
     provider_observation::{cli::Signals, objects::read_triple},
 };
 use serde::Serialize;
@@ -28,10 +28,19 @@ const GLOBAL_BYTES: usize = 256 << 20;
 // Four active slots, identity envelopes, serde's streaming stack, IO buffer,
 // scalar records and a spare limit gap. Document storage stays in its session.
 const COORDINATOR_BYTES: usize = 256 << 10;
-// 6A run-lifetime leases (§3.1, frozen byte account): the deferred queue
-// (1024 × 256 B) and the session-loss carrier (64 × 24 B + fold count)
-// hold SEPARATE additive leases beside the coordinator lease.
-const DEFERRED_BYTES: usize = 256 << 10;
+// 6A run-lifetime leases (§3.1 byte account): the deferred queue
+// (1024 × `DEFERRED_ENTRY_BYTES`) and the session-loss carrier (64 ×
+// 24 B + fold count) hold SEPARATE additive leases beside the
+// coordinator lease. R3-5: the per-entry flat is 768 B, not 256 —
+// the REAL entry costs 248 B inline + 64 B key + 96 B marks heap
+// (measured on this toolchain, pinned by
+// `staging_charges_cover_worst_case_entries`), so 256 undercharges
+// by ≥152 KiB at cap. NOTE for R4: the D-record §3.1 byte account
+// still says 1024 × 256 B — this charge needs a ratification
+// amendment (no D-record edits allowed in the fix round that set
+// it). The pool fit below is re-pinned, not assumed.
+const DEFERRED_ENTRY_BYTES: usize = 768;
+const DEFERRED_BYTES: usize = DEFERRED_CAP * DEFERRED_ENTRY_BYTES;
 const SESSION_LOSS_BYTES: usize = 2 << 10;
 // 6A queue/ledger caps (§3.1/§4.1, frozen).
 const DEFERRED_CAP: usize = 1024;
@@ -58,7 +67,7 @@ const PENDING_DROPS_CAP: usize = 4096;
 // Per-active flags (exec/exit/retire/unsteady/ignored, ≤
 // max_active entries each) ride the coordinator lease's scalar
 // spare. Coordinator plane total = 256 KiB coordinator + args +
-// 256 KiB deferred + 2 KiB session-loss + staging, all inside
+// 768 KiB deferred + 2 KiB session-loss + staging, all inside
 // the 256 MiB global pool.
 const FOLLOW_ENTRY_BYTES: usize = 256;
 const FOLLOW_BYTES: usize = FOLLOW_CAP * FOLLOW_ENTRY_BYTES;
@@ -66,7 +75,21 @@ const PENDING_EPOCH_ENTRY_BYTES: usize = 2 << 10;
 const PENDING_EPOCH_BYTES: usize = PENDING_EPOCH_CAP * PENDING_EPOCH_ENTRY_BYTES;
 const PENDING_DROP_ENTRY_BYTES: usize = 256;
 const PENDING_DROPS_BYTES: usize = PENDING_DROPS_CAP * PENDING_DROP_ENTRY_BYTES;
-const STAGING_BYTES: usize = FOLLOW_BYTES + PENDING_EPOCH_BYTES + PENDING_DROPS_BYTES;
+// R3-4b: demoted-context table (same value shape and cap as the
+// primary stash) plus the epoch-tombstone set (key only + slack,
+// 64 B key → 256 B flat). Both ride the staging lease and the
+// layout pin below.
+const EVICTED_EPOCH_CAP: usize = PENDING_EPOCH_CAP;
+const EVICTED_EPOCH_ENTRY_BYTES: usize = PENDING_EPOCH_ENTRY_BYTES;
+const EVICTED_EPOCH_BYTES: usize = EVICTED_EPOCH_CAP * EVICTED_EPOCH_ENTRY_BYTES;
+const EPOCH_TOMBSTONE_CAP: usize = PENDING_EPOCH_CAP;
+const EPOCH_TOMBSTONE_ENTRY_BYTES: usize = 256;
+const EPOCH_TOMBSTONE_BYTES: usize = EPOCH_TOMBSTONE_CAP * EPOCH_TOMBSTONE_ENTRY_BYTES;
+const STAGING_BYTES: usize = FOLLOW_BYTES
+    + PENDING_EPOCH_BYTES
+    + PENDING_DROPS_BYTES
+    + EVICTED_EPOCH_BYTES
+    + EPOCH_TOMBSTONE_BYTES;
 // 6A per-tick machine-path bound (§3.3): at most 1024 Limit
 // envelopes per tick, retained entries first (their per-tick
 // record is frozen), then oldest-first queued drop records.
@@ -349,6 +372,14 @@ struct SessionLoss {
     drain_pending: u64,
     polling_fallback: bool,
     unattributed_events: u64,
+    /// R3-9: EXIT events quarantined as live-member artifacts —
+    /// the subject pid had an ADMITTED member whose triple matched
+    /// the fresh probe (delivery proven post-admission; the EXIT
+    /// belongs to a previous incarnation or a dead thread, never
+    /// to the live member). This counter proves the control-5
+    /// held-leg binding scenario; `unattributed_events` alone
+    /// cannot (it also counts pre-admission quarantines).
+    admitted_exit_artifacts: u64,
     lost_intervals: Vec<LostWindow>,
     coalesced: u64,
 }
@@ -388,7 +419,7 @@ impl From<&Incarnation> for DeferredKey {
         }
     }
 }
-/// 6A deferred-queue entry (§3.2.5, ≤256 B accounted): the triple,
+/// 6A deferred-queue entry (§3.2.5, ≤768 B accounted): the triple,
 /// image epoch, deferral accumulator, binding reason, up to 4 loss
 /// marks and the fold count, plus the exe identity for lossless
 /// deferred-exec detection (re-proof, not attribution) and the
@@ -1076,7 +1107,7 @@ impl<W: Write> Output<'_, W> {
                     .fold(0, |a, b| a.saturating_add(*b));
                 writeln!(
                     w,
-                    "Crypto watch end: reason={reason} segments={segments} peak_accounted_bytes={peak_accounted_bytes} peak_deferred_depth={peak_deferred_depth} deferred_drops={deferred_drops} deferred_removed={}/{}/{}/{} signal_dropped={} scan_loss={} prefix_unwitnessed={} drain_pending={} unattributed={} ring_loss={} lost_intervals={} polling_fallback={} coverage={coverage}; unsampled membership and unobserved activity remain unknown",
+                    "Crypto watch end: reason={reason} segments={segments} peak_accounted_bytes={peak_accounted_bytes} peak_deferred_depth={peak_deferred_depth} deferred_drops={deferred_drops} deferred_removed={}/{}/{}/{} signal_dropped={} scan_loss={} prefix_unwitnessed={} drain_pending={} unattributed={} admitted_exit_artifacts={} ring_loss={} lost_intervals={} polling_fallback={} coverage={coverage}; unsampled membership and unobserved activity remain unknown",
                     deferred_removed.exited,
                     deferred_removed.reused,
                     deferred_removed.ineligible,
@@ -1086,6 +1117,7 @@ impl<W: Write> Output<'_, W> {
                     session_loss.signal_prefix_unwitnessed,
                     session_loss.drain_pending,
                     session_loss.unattributed_events,
+                    session_loss.admitted_exit_artifacts,
                     ring,
                     session_loss.lost_intervals.len(),
                     session_loss.polling_fallback
@@ -1457,6 +1489,34 @@ fn drain_port<W: Write>(
     }
     Ok(())
 }
+/// R3-4b: a stash key is sweep-dead when its triple is provably
+/// dead or reused (the ledger already rode the sealed segment).
+/// Unknown liveness retains (an unreadable `/proc` entry is not
+/// death) — same rule for all three stash tables.
+fn stash_key_dead(key: &DeferredKey) -> bool {
+    match probe_liveness(key.pid) {
+        Liveness::Alive(now)
+            if now.starttime == key.starttime && now.namespaces == key.namespaces =>
+        {
+            false
+        }
+        Liveness::Unknown => false,
+        Liveness::Dead | Liveness::Alive(_) => true,
+    }
+}
+/// R3-4b: one visible `MembershipUnknown` gap naming `pid`
+/// (epoch-history demotion/drop/restart accounting — never silent).
+fn emit_membership_unknown_gap<W: Write>(out: &mut Output<'_, W>, pid: u32) -> io::Result<()> {
+    let gap = inventory::Gap {
+        pid: Some(pid),
+        device: None,
+        inode: None,
+        reason: GapReason::MembershipUnknown,
+        errno: None,
+        actor_euid: None,
+    };
+    out.emit(Record::Gap { gap: &gap })
+}
 /// 6A event binding (§1.8): presence binds by fresh triple, window
 /// and tgid; exit only confirms revalidation-observed absence; a
 /// birth event never self-identifies (verification carries); an
@@ -1613,8 +1673,20 @@ fn bind_event<W: Write>(
                 // post-exec group cross-check (the payload word
                 // EQUALS the surviving tgid, §1.8) and lifetime
                 // coverage; unverifiable subjects quarantine.
+                // R3-4a: a stashed incarnation advances first (the
+                // second exec seals the stashed image as an
+                // unobserved middle and moves the stash on).
                 match verify_triple(subject) {
                     Some(identity) if event.tgid == subject => {
+                        match run.advance_stash_for_exec(
+                            out,
+                            &identity,
+                            event.timestamp_ns,
+                            trust_reviewed,
+                        )? {
+                            StashAdvance::Stale => return Ok(()),
+                            StashAdvance::None | StashAdvance::Advanced => {}
+                        }
                         run.follow_insert(out, subject, identity, None)?;
                     }
                     _ => quarantine(run),
@@ -1688,8 +1760,14 @@ fn bind_event<W: Write>(
                     }
                     Liveness::Alive(now) if now == identity => {
                         // Thread-exit artifact (frozen rationale):
-                        // member untouched, counted once.
+                        // member untouched, counted once. R3-9: this
+                        // arm PROVES post-admission delivery — the
+                        // EXIT met a live admitted member — so it
+                        // also counts the binding proof (the Reused
+                        // and unmatched arms do not: delivery there
+                        // precedes admission).
                         quarantine(run);
+                        run.admitted_exit_artifacts = run.admitted_exit_artifacts.saturating_add(1);
                     }
                     Liveness::Alive(_) => {
                         // Reuse: the old incarnation retires
@@ -1828,6 +1906,18 @@ struct ReadmitCtx {
     seal_tick: u64,
     witness_ts: Option<u64>,
 }
+/// R3-4a: outcome of advancing a stashed readmit context for a
+/// witnessed second exec.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StashAdvance {
+    /// No stash for this incarnation (plain stranger follow).
+    None,
+    /// Stash advanced + middle image sealed (caller still follows).
+    Advanced,
+    /// Stale trusted timestamp: quarantined, stash untouched, no
+    /// follow (the event binds to nothing — never applied).
+    Stale,
+}
 /// 6A coordinator run state: observed set, deferred queue, loss
 /// baselines, per-tick flags and end tallies.
 struct RunState {
@@ -1839,6 +1929,18 @@ struct RunState {
     /// Exec-sealed incarnations awaiting readmit: key → (next
     /// epoch, carried ledger, readmit context).
     pending_epoch: BTreeMap<DeferredKey, (u64, MemberLedger, ReadmitCtx)>,
+    /// R3-4b: demoted readmit contexts — `pending_epoch` overflow
+    /// victims keep their incarnation-wide history HERE (same
+    /// value shape, same cap) instead of being deleted. No silent
+    /// epoch-0 rebirth: readmission consults this table when the
+    /// primary stash misses.
+    evicted_epoch: BTreeMap<DeferredKey, (u64, MemberLedger, ReadmitCtx)>,
+    /// R3-4b: incarnations whose epoch history was fully dropped
+    /// (both tables overflowed under pathological churn). A later
+    /// admission announces the restart with a visible gap — never
+    /// a silent epoch-0 rebirth. Swept on death/reuse like the
+    /// stash tables.
+    epoch_tombstones: BTreeSet<DeferredKey>,
     segments: u64,
     current_tick: u64,
     prev_tick: Option<u64>,
@@ -1863,6 +1965,13 @@ struct RunState {
     drain_pending: u64,
     carrier: WindowStore,
     unattributed: u64,
+    /// R3-9: live-member EXIT artifacts (see `SessionLoss`).
+    admitted_exit_artifacts: u64,
+    /// R3-2: run-lifetime worker-backlog guard — topped up from
+    /// the live backlog before every admission so queued link
+    /// batches (kernel retention past their sessions) stay
+    /// charged in the global pool.
+    backlog_guard: Option<MemoryLease>,
     polling: bool,
     /// `drain_pending` at the last sample (per-tick residue gauge).
     pending_mark: u64,
@@ -1904,6 +2013,8 @@ impl RunState {
             deferred: BTreeMap::new(),
             follow_pending: BTreeMap::new(),
             pending_epoch: BTreeMap::new(),
+            evicted_epoch: BTreeMap::new(),
+            epoch_tombstones: BTreeSet::new(),
             segments: 0,
             current_tick: 0,
             prev_tick: None,
@@ -1938,6 +2049,8 @@ impl RunState {
             drain_pending: 0,
             carrier: WindowStore::new(WINDOW_CAP),
             unattributed: 0,
+            admitted_exit_artifacts: 0,
+            backlog_guard: None,
             polling: false,
             pending_mark: 0,
             pending_drops: VecDeque::new(),
@@ -2264,17 +2377,26 @@ impl RunState {
     /// provably dead or reused (their ledger already rode the
     /// sealed segment; nothing further is owed). Unknown liveness
     /// RETAINS the context (recovery retries next tick — an
-    /// unreadable `/proc` entry is not death).
+    /// unreadable `/proc` entry is not death). R3-4b: covers the
+    /// primary stash, the demoted table and the tombstones — no
+    /// table keeps residue for a dead incarnation.
     fn sweep_pending_epoch(&mut self) {
         let keys: Vec<DeferredKey> = self.pending_epoch.keys().cloned().collect();
         for key in keys {
-            match probe_liveness(key.pid) {
-                Liveness::Alive(now)
-                    if now.starttime == key.starttime && now.namespaces == key.namespaces => {}
-                Liveness::Unknown => {}
-                Liveness::Dead | Liveness::Alive(_) => {
-                    self.pending_epoch.remove(&key);
-                }
+            if stash_key_dead(&key) {
+                self.pending_epoch.remove(&key);
+            }
+        }
+        let keys: Vec<DeferredKey> = self.evicted_epoch.keys().cloned().collect();
+        for key in keys {
+            if stash_key_dead(&key) {
+                self.evicted_epoch.remove(&key);
+            }
+        }
+        let keys: Vec<DeferredKey> = self.epoch_tombstones.iter().cloned().collect();
+        for key in keys {
+            if stash_key_dead(&key) {
+                self.epoch_tombstones.remove(&key);
             }
         }
     }
@@ -2399,7 +2521,9 @@ impl RunState {
             let Some(oldest) = self.pending_epoch.keys().next().cloned() else {
                 break;
             };
-            self.pending_epoch.remove(&oldest);
+            let Some(victim) = self.pending_epoch.remove(&oldest) else {
+                break;
+            };
             let gap = inventory::Gap {
                 pid: Some(oldest.pid),
                 device: None,
@@ -2409,8 +2533,137 @@ impl RunState {
                 actor_euid: None,
             };
             out.emit(Record::Gap { gap: &gap })?;
+            // R3-4b: the victim's history demotes (preserved), it
+            // is not deleted — a PID-only gap never authorizes
+            // epoch reuse.
+            self.demote_evicted(out, oldest, victim)?;
         }
         Ok(())
+    }
+    /// R3-4b: read the stashed exec-readmit context for `key`
+    /// (primary stash, else the demoted table). Cloned: the caller
+    /// consumes on success and retries on failure.
+    fn peek_exec_ctx(&self, key: &DeferredKey) -> Option<(u64, MemberLedger, ReadmitCtx)> {
+        self.pending_epoch
+            .get(key)
+            .or_else(|| self.evicted_epoch.get(key))
+            .cloned()
+    }
+    /// R3-4b: consume the stashed exec-readmit context for `key`
+    /// from whichever table holds it.
+    fn consume_exec_ctx(&mut self, key: &DeferredKey) {
+        self.pending_epoch.remove(key);
+        self.evicted_epoch.remove(key);
+    }
+    /// R3-4b: announce a fresh-epoch admission for an incarnation
+    /// whose epoch history was fully dropped (tombstoned): one
+    /// visible gap, then the tombstone is gone (announced once).
+    /// Returns true when a restart was announced.
+    fn note_fresh_admission<W: Write>(
+        &mut self,
+        out: &mut Output<'_, W>,
+        identity: &Incarnation,
+    ) -> io::Result<bool> {
+        if !self.epoch_tombstones.remove(&DeferredKey::from(identity)) {
+            return Ok(false);
+        }
+        emit_membership_unknown_gap(out, identity.pid)?;
+        Ok(true)
+    }
+    /// R3-4a: advance a stashed readmit context for a witnessed
+    /// second exec (stranger path): the stashed image was never
+    /// observed, so it seals as an unobserved middle (§1.4
+    /// amendment — drain order holds: first seal < this middle <
+    /// the future readmission) and the stash moves to the next
+    /// epoch with the newest witness. Consults the primary stash
+    /// first, then the demoted table (advanced in place — no
+    /// promotion cascade under pressure). A trusted timestamp
+    /// predating the stashed seal is a stale previous-occupant
+    /// event (N6 exact window): quarantine, never apply.
+    fn advance_stash_for_exec<W: Write>(
+        &mut self,
+        out: &mut Output<'_, W>,
+        identity: &Incarnation,
+        ts: Option<u64>,
+        trust_reviewed: bool,
+    ) -> io::Result<StashAdvance> {
+        let key = DeferredKey::from(identity);
+        let in_pending = self.pending_epoch.contains_key(&key);
+        let in_evicted = !in_pending && self.evicted_epoch.contains_key(&key);
+        if !in_pending && !in_evicted {
+            return Ok(StashAdvance::None);
+        }
+        let (epoch, ledger, ctx) = if in_pending {
+            self.pending_epoch.get(&key).expect("probed stash").clone()
+        } else {
+            self.evicted_epoch.get(&key).expect("probed stash").clone()
+        };
+        if trust_reviewed && ts.is_some_and(|ts| ts < ctx.retire_ns) {
+            self.unattributed = self.unattributed.saturating_add(1);
+            return Ok(StashAdvance::Stale);
+        }
+        out.emit_middle_seal(identity, epoch, &ledger)?;
+        let slot = if in_pending {
+            self.pending_epoch.get_mut(&key).expect("probed stash")
+        } else {
+            self.evicted_epoch.get_mut(&key).expect("probed stash")
+        };
+        slot.0 = epoch.saturating_add(1);
+        slot.2.witness_ts = ts;
+        Ok(StashAdvance::Advanced)
+    }
+    /// R3-4b: demote a stash-overflow victim into the evicted
+    /// table (history preserved, not deleted). A full evicted
+    /// table drops ITS oldest into a tombstone (visible gap now,
+    /// restart announced at admission); a full tombstone set drops
+    /// its oldest with a visible gap (triple-churn residual: three
+    /// visible gaps precede any such incarnation, documented in
+    /// the T7.2 fix-3 report).
+    fn demote_evicted<W: Write>(
+        &mut self,
+        out: &mut Output<'_, W>,
+        key: DeferredKey,
+        ctx: (u64, MemberLedger, ReadmitCtx),
+    ) -> io::Result<()> {
+        self.evicted_epoch.insert(key, ctx);
+        while self.evicted_epoch.len() > EVICTED_EPOCH_CAP {
+            let Some(oldest) = self.evicted_epoch.keys().next().cloned() else {
+                break;
+            };
+            self.evicted_epoch.remove(&oldest);
+            self.epoch_tombstones.insert(oldest.clone());
+            while self.epoch_tombstones.len() > EPOCH_TOMBSTONE_CAP {
+                let Some(ancient) = self.epoch_tombstones.iter().next().cloned() else {
+                    break;
+                };
+                self.epoch_tombstones.remove(&ancient);
+                emit_membership_unknown_gap(out, ancient.pid)?;
+            }
+            emit_membership_unknown_gap(out, oldest.pid)?;
+        }
+        Ok(())
+    }
+    /// R3-2: reserve one session's pool lease with the live
+    /// worker backlog charged first (guard top-up): `backlog` is
+    /// the caller-observed `worker_backlog_charged` (a parameter,
+    /// not a global read, so tests stay deterministic). `None`
+    /// refuses the admission — pool too tight to even account the
+    /// backlog (honest backpressure, never a hole).
+    fn reserve_session(
+        &mut self,
+        pool: &MemoryPool,
+        reservation: usize,
+        backlog: usize,
+    ) -> Option<MemoryLease> {
+        // Free the stale guard BEFORE topping up (a new-guard
+        // reserve against the old guard's spend would spuriously
+        // fail on tight pools). A failed top-up refuses the
+        // admission with the backlog transiently uncharged — safe:
+        // nothing new is retained, and the next admission retries.
+        self.backlog_guard = None;
+        let guard = pool.reserve(backlog)?;
+        self.backlog_guard = Some(guard);
+        pool.reserve(reservation)
     }
     /// 6A per-root ignored-descendant volume (§1.7): delivered
     /// births that resolve to death gaps (never followed).
@@ -2558,7 +2811,7 @@ impl RunState {
                 DeferredSpan::default(),
             ),
         };
-        self.pending_epoch.remove(&key);
+        self.consume_exec_ctx(&key);
         self.deferred.insert(
             key.clone(),
             DeferredEntry {
@@ -2676,7 +2929,10 @@ impl RunState {
                 }
                 continue;
             }
-            let Some(lease) = ctx.pool.reserve(ctx.reservation) else {
+            // R3-2: the session lease reserves behind the live
+            // worker-backlog charge (queued batches stay pooled).
+            let backlog = crate::provider_observation::session::worker_backlog_charged();
+            let Some(lease) = self.reserve_session(ctx.pool, ctx.reservation, backlog) else {
                 if let Some(entry) = self.deferred.get_mut(&key) {
                     entry.reason = "global_state_limit";
                 }
@@ -2808,10 +3064,14 @@ impl RunState {
                 break;
             }
             let identity = Incarnation::from(record);
-            let exec_ctx = self
-                .pending_epoch
-                .get(&DeferredKey::from(&identity))
-                .cloned();
+            let stash_key = DeferredKey::from(&identity);
+            let exec_ctx = self.peek_exec_ctx(&stash_key);
+            if exec_ctx.is_none() {
+                // R3-4b: a fresh-epoch admission for an incarnation
+                // whose history was fully dropped announces the
+                // restart (no silent epoch-0 rebirth).
+                self.note_fresh_admission(out, &identity)?;
+            }
             if !eligible(record) {
                 let (epoch, loss) = match &exec_ctx {
                     Some((epoch, ledger, _)) => (*epoch, LossSummary::from_ledger(ledger)),
@@ -2857,7 +3117,10 @@ impl RunState {
                 self.queue_insert(identity, exec_ctx, "active_limit");
                 continue;
             }
-            let Some(lease) = ctx.pool.reserve(ctx.reservation) else {
+            // R3-2: the session lease reserves behind the live
+            // worker-backlog charge (queued batches stay pooled).
+            let backlog = crate::provider_observation::session::worker_backlog_charged();
+            let Some(lease) = self.reserve_session(ctx.pool, ctx.reservation, backlog) else {
                 self.queue_insert(identity, exec_ctx, "global_state_limit");
                 continue;
             };
@@ -2908,7 +3171,7 @@ impl RunState {
                 // exec-readmits keep theirs (retry next tick);
                 // fresh candidates are forgotten (rediscovery
                 // retries).
-                self.pending_epoch.remove(&DeferredKey::from(&identity));
+                self.consume_exec_ctx(&DeferredKey::from(&identity));
             }
         }
         self.peak_depth = self.peak_depth.max(self.deferred.len() as u64);
@@ -2939,7 +3202,10 @@ impl RunState {
         if self.active.len() >= ctx.max_active {
             return Ok(());
         }
-        let Some(lease) = ctx.pool.reserve(ctx.reservation) else {
+        // R3-2: the session lease reserves behind the live
+        // worker-backlog charge (queued batches stay pooled).
+        let backlog = crate::provider_observation::session::worker_backlog_charged();
+        let Some(lease) = self.reserve_session(ctx.pool, ctx.reservation, backlog) else {
             return Ok(());
         };
         self.try_admit(
@@ -3061,7 +3327,7 @@ impl RunState {
                         // readmit succeeding means the member is
                         // back; clear the pre-stash then.
                         if self.active.iter().any(|a| a.identity == identity) {
-                            self.pending_epoch.remove(&DeferredKey::from(&identity));
+                            self.consume_exec_ctx(&DeferredKey::from(&identity));
                         }
                     } else {
                         let reason = if !ctx.tracing {
@@ -3397,6 +3663,7 @@ fn observe(
                     drain_pending: 0,
                     polling_fallback: false,
                     unattributed_events: 0,
+                    admitted_exit_artifacts: 0,
                     lost_intervals: Vec::new(),
                     coalesced: 0,
                 },
@@ -3822,6 +4089,11 @@ fn observe(
         out.emit(Record::Gap { gap: &gap })?;
     }
     run.pending_epoch.clear();
+    // R3-4b: the run ends — no readmission follows, so demoted
+    // contexts and tombstones retire with the primary stash (their
+    // ledgers already rode the seals; nothing is reborn).
+    run.evicted_epoch.clear();
+    run.epoch_tombstones.clear();
     // 6A seal-fold evaluation (§4.1): final ring reads folded during
     // sealing join the cumulative ring here, so the evaluators run
     // once more — seal-folded loss reaches the session carrier
@@ -3844,6 +4116,7 @@ fn observe(
         drain_pending: run.drain_pending,
         polling_fallback: run.polling,
         unattributed_events: run.unattributed,
+        admitted_exit_artifacts: run.admitted_exit_artifacts,
         lost_intervals: run.carrier.wire(),
         coalesced: run.carrier.coalesced,
     };
@@ -5104,6 +5377,483 @@ mod tests {
         assert_eq!(rows[0]["gap"]["pid"], 1000, "oldest evicted");
     }
     #[test]
+    fn stranger_exec_advances_pending_stash_with_middle_seal() {
+        // R3-4a: epoch 0 execs into an ineligible image (stash 1);
+        // a second exec into an eligible image arrives before
+        // readmission. The stranger path must advance the stash to
+        // 2 AND seal image 1 as an unobserved middle — readmission
+        // reporting 1 with no middle seal invents continuity.
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let key = DeferredKey::from(&identity);
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 7;
+        let retire = LiveClock.monotonic_ns();
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.pending_epoch.insert(
+            key.clone(),
+            (
+                1,
+                ledger,
+                ReadmitCtx {
+                    retire_ns: retire,
+                    seal_tick: 3,
+                    witness_ts: Some(retire),
+                },
+            ),
+        );
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let event = crate::capture::LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid,
+            timestamp_ns: Some(LiveClock.monotonic_ns()),
+            tgid: pid,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
+        };
+        super::bind_event(&mut run, &mut sink, &event, true).unwrap();
+        drop(sink);
+        assert_eq!(
+            run.pending_epoch.get(&key).map(|c| c.0),
+            Some(2),
+            "second exec must advance the stash"
+        );
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let middle: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["kind"] == "membership" && r["image_epoch"] == 1)
+            .collect();
+        assert_eq!(middle.len(), 1, "one middle seal, got {rows:?}");
+        assert_eq!(middle[0]["state"], "retired");
+        assert_eq!(middle[0]["reason"], "unobserved_transition");
+        assert_eq!(
+            middle[0]["loss"]["loss"], 7,
+            "middle seal carries the stash ledger"
+        );
+    }
+    #[test]
+    fn stranger_exec_with_stale_trusted_ts_quarantines() {
+        // R3-4a/N6: a stranger exec with a trusted timestamp
+        // predating the stashed seal (delayed previous-occupant
+        // event) quarantines — it must not advance the stash or
+        // seal a middle image.
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let key = DeferredKey::from(&identity);
+        let retire = LiveClock.monotonic_ns();
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.pending_epoch.insert(
+            key.clone(),
+            (
+                1,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: retire,
+                    seal_tick: 3,
+                    witness_ts: Some(retire),
+                },
+            ),
+        );
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let event = crate::capture::LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid,
+            timestamp_ns: Some(retire - 1),
+            tgid: pid,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
+        };
+        super::bind_event(&mut run, &mut sink, &event, true).unwrap();
+        drop(sink);
+        assert_eq!(run.unattributed, 1, "stale exec not quarantined");
+        assert_eq!(
+            run.pending_epoch.get(&key).map(|c| c.0),
+            Some(1),
+            "stale exec advanced the stash"
+        );
+        assert!(bytes.is_empty(), "stale exec emitted records");
+    }
+    #[test]
+    fn r32_reserve_session_charges_backlog_first() {
+        // R3-2: the admission reserve tops up the backlog guard
+        // BEFORE the session lease — a backlog that crowds the
+        // pool refuses the admission (honest backpressure); a
+        // fitting backlog coexists with the lease; a drained
+        // backlog shrinks the guard on the next admission.
+        let pool = MemoryPool::new(100);
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        // 60 + 50 > 100: refused (the guard top-up fails first).
+        assert!(run.reserve_session(&pool, 60, 50).is_none());
+        // 60 + 40 == 100: admitted; guard + lease exhaust it.
+        let lease = run.reserve_session(&pool, 60, 40).expect("fits");
+        assert!(pool.reserve(1).is_none(), "guard + lease exhaust the pool");
+        drop(lease);
+        // Backlog drained: the guard shrinks (60 + 0) and room
+        // returns.
+        let lease = run.reserve_session(&pool, 60, 0).expect("fits after drain");
+        assert!(pool.reserve(40).is_some(), "drained guard frees room");
+        drop(lease);
+    }
+    #[test]
+    fn exit_against_live_admitted_member_counts_artifact() {
+        // R3-9: an EXIT naming an ADMITTED member whose triple
+        // matches the fresh probe (the control-5 held-leg binding:
+        // EXIT delivered after the replacement admitted)
+        // quarantines as a live-member artifact — counted
+        // separately from unmatched quarantines so the binding
+        // scenario is PROVEN, not assumed from queue depth.
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.active.push(hollow_active(
+            &pool,
+            identity.pid,
+            identity.starttime,
+            identity.namespaces.clone(),
+        ));
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let event = crate::capture::LifecycleEvent {
+            kind: LifecycleKind::Exit,
+            pid,
+            timestamp_ns: None,
+            tgid: pid,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
+        };
+        super::bind_event(&mut run, &mut sink, &event, true).unwrap();
+        drop(sink);
+        assert_eq!(run.unattributed, 1, "artifact not quarantined");
+        assert_eq!(
+            run.admitted_exit_artifacts, 1,
+            "EXIT-against-admitted-member not proven"
+        );
+        assert!(
+            !run.exit_flags.contains_key(&pid),
+            "artifact must not flag the live member"
+        );
+        // The unmatched twin: no admitted member — quarantines
+        // WITHOUT the artifact proof.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        super::bind_event(&mut run, &mut sink, &event, true).unwrap();
+        drop(sink);
+        assert_eq!(run.unattributed, 1);
+        assert_eq!(
+            run.admitted_exit_artifacts, 0,
+            "pre-admission quarantine must not prove binding"
+        );
+    }
+    #[test]
+    fn pending_epoch_eviction_preserves_history_for_readmit() {
+        // R3-4b: stash overflow demotes (not deletes) the oldest
+        // context — readmission still finds its epoch + ledger, so
+        // no silent epoch-0 rebirth. The N8a eviction gap stays.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        for i in 0..PENDING_EPOCH_CAP {
+            let identity = Incarnation {
+                pid: 1000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            let mut ledger = MemberLedger::empty();
+            ledger.loss = 40 + i as u64;
+            run.pending_epoch.insert(
+                DeferredKey::from(&identity),
+                (
+                    41,
+                    ledger,
+                    ReadmitCtx {
+                        retire_ns: 5,
+                        seal_tick: 2,
+                        witness_ts: Some(6),
+                    },
+                ),
+            );
+        }
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let fresh = Incarnation {
+            pid: 999_999,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        run.stash_pending_epoch(
+            &mut sink,
+            DeferredKey::from(&fresh),
+            (
+                2,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        )
+        .unwrap();
+        drop(sink);
+        let oldest = Incarnation {
+            pid: 1000,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        let (epoch, ledger, ctx) = run
+            .peek_exec_ctx(&DeferredKey::from(&oldest))
+            .expect("evicted history preserved");
+        assert_eq!(epoch, 41, "epoch lost across eviction");
+        assert_eq!(ledger.loss, 40, "ledger lost across eviction");
+        assert_eq!((ctx.seal_tick, ctx.witness_ts), (2, Some(6)));
+        run.consume_exec_ctx(&DeferredKey::from(&oldest));
+        assert!(
+            run.peek_exec_ctx(&DeferredKey::from(&oldest)).is_none(),
+            "consumed context lingers"
+        );
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "N8a gap stays, got {rows:?}");
+        assert_eq!(rows[0]["gap"]["reason"], "membership_unknown");
+    }
+    #[test]
+    fn double_eviction_announces_epoch_restart() {
+        // R3-4b: when BOTH stash tables overflow, the fully
+        // dropped incarnation is tombstoned — its next admission
+        // announces the epoch restart with a visible gap (once),
+        // never a silent epoch-0 rebirth.
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        for i in 0..PENDING_EPOCH_CAP {
+            let identity = Incarnation {
+                pid: 1000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.pending_epoch.insert(
+                DeferredKey::from(&identity),
+                (
+                    1,
+                    MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
+        for i in 0..EVICTED_EPOCH_CAP {
+            let identity = Incarnation {
+                pid: 5000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.evicted_epoch.insert(
+                DeferredKey::from(&identity),
+                (
+                    3,
+                    MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let fresh = Incarnation {
+            pid: 999_999,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        run.stash_pending_epoch(
+            &mut sink,
+            DeferredKey::from(&fresh),
+            (
+                2,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        )
+        .unwrap();
+        // The demoted stash victim (pid 1000) cascades: the full
+        // demoted table drops its key-smallest entry — the
+        // just-demoted pid 1000 itself (key order, like N8a: all
+        // share starttime 1, so the smallest pid drops) — into a
+        // tombstone. Announced, not silent.
+        let dropped = Incarnation {
+            pid: 1000,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        assert!(
+            run.peek_exec_ctx(&DeferredKey::from(&dropped)).is_none(),
+            "fully-dropped history must not read back"
+        );
+        let kept = Incarnation {
+            pid: 5000,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        assert_eq!(
+            run.peek_exec_ctx(&DeferredKey::from(&kept)).map(|c| c.0),
+            Some(3),
+            "demoted history must survive the cascade"
+        );
+        let announced = run.note_fresh_admission(&mut sink, &dropped).unwrap();
+        assert!(announced, "epoch restart must be announced");
+        let announced_again = run.note_fresh_admission(&mut sink, &dropped).unwrap();
+        assert!(!announced_again, "restart announced once");
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Three visible gaps name pid 1000: the N8a stash
+        // eviction, the demoted-table drop, and the restart
+        // announcement — every history loss is on the record.
+        let pid_gaps = rows
+            .iter()
+            .filter(|r| {
+                r["kind"] == "gap"
+                    && r["gap"]["reason"] == "membership_unknown"
+                    && r["gap"]["pid"] == 1000
+            })
+            .count();
+        assert_eq!(pid_gaps, 3, "restart gap missing, got {rows:?}");
+    }
+    #[test]
+    fn epoch_sweep_drops_dead_evicted_and_tombstones() {
+        // R3-4b: the readmit-context sweep covers all three
+        // tables — dead/reused incarnations leave no residue;
+        // live ones (and unreadable ones) are retained.
+        let mut child = std::process::Command::new("/bin/true")
+            .spawn()
+            .expect("spawn true");
+        let dead_pid = child.id();
+        child.wait().expect("reap true");
+        assert!(matches!(
+            super::probe_liveness(dead_pid),
+            super::Liveness::Dead
+        ));
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        let dead = Incarnation {
+            pid: dead_pid,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        let pid = std::process::id();
+        let live = super::verify_triple(pid).expect("own triple");
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        for table in [&mut run.pending_epoch, &mut run.evicted_epoch] {
+            table.insert(
+                DeferredKey::from(&dead),
+                (
+                    1,
+                    MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+            table.insert(
+                DeferredKey::from(&live),
+                (
+                    1,
+                    MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
+        run.epoch_tombstones.insert(DeferredKey::from(&dead));
+        run.epoch_tombstones.insert(DeferredKey::from(&live));
+        run.sweep_pending_epoch();
+        assert!(!run.pending_epoch.contains_key(&DeferredKey::from(&dead)));
+        assert!(!run.evicted_epoch.contains_key(&DeferredKey::from(&dead)));
+        assert!(!run.epoch_tombstones.contains(&DeferredKey::from(&dead)));
+        assert!(run.pending_epoch.contains_key(&DeferredKey::from(&live)));
+        assert!(run.evicted_epoch.contains_key(&DeferredKey::from(&live)));
+        assert!(run.epoch_tombstones.contains(&DeferredKey::from(&live)));
+    }
+    #[test]
     fn backpressure_pause_carries_named_window() {
         // N8b: when a full drop queue pauses newcomer
         // classification, the pause is VISIBLE — a session-carrier
@@ -5468,10 +6218,54 @@ mod tests {
             PENDING_DROPS_BYTES,
             PENDING_DROPS_CAP * PENDING_DROP_ENTRY_BYTES
         );
+        // R3-4b demoted table: same value shape as the primary
+        // stash, same flat.
+        let evicted_entry = std::mem::size_of::<DeferredKey>()
+            + 8
+            + std::mem::size_of::<MemberLedger>()
+            + std::mem::size_of::<ReadmitCtx>()
+            + WINDOW_CAP * std::mem::size_of::<CompactWindow>()
+            + BTREE_SLACK;
+        assert!(
+            evicted_entry <= EVICTED_EPOCH_ENTRY_BYTES,
+            "evicted entry {evicted_entry} exceeds flat {EVICTED_EPOCH_ENTRY_BYTES}"
+        );
+        assert_eq!(
+            EVICTED_EPOCH_BYTES,
+            EVICTED_EPOCH_CAP * EVICTED_EPOCH_ENTRY_BYTES
+        );
+        // R3-4b tombstones: key only + node slack.
+        let tombstone_entry = std::mem::size_of::<DeferredKey>() + BTREE_SLACK;
+        assert!(
+            tombstone_entry <= EPOCH_TOMBSTONE_ENTRY_BYTES,
+            "tombstone entry {tombstone_entry} exceeds flat {EPOCH_TOMBSTONE_ENTRY_BYTES}"
+        );
+        assert_eq!(
+            EPOCH_TOMBSTONE_BYTES,
+            EPOCH_TOMBSTONE_CAP * EPOCH_TOMBSTONE_ENTRY_BYTES
+        );
         assert_eq!(
             STAGING_BYTES,
-            FOLLOW_BYTES + PENDING_EPOCH_BYTES + PENDING_DROPS_BYTES
+            FOLLOW_BYTES
+                + PENDING_EPOCH_BYTES
+                + PENDING_DROPS_BYTES
+                + EVICTED_EPOCH_BYTES
+                + EPOCH_TOMBSTONE_BYTES
         );
+        // R3-5: the deferred store is pinned here too — no store
+        // escapes the layout pin. The REAL entry cost is inline
+        // struct + map key + marks heap (up to DEFERRED_MARKS
+        // compact windows; the Vec never holds more than the cap,
+        // so capacity stays within the bound) + node slack.
+        let deferred_entry = std::mem::size_of::<DeferredEntry>()
+            + std::mem::size_of::<DeferredKey>()
+            + DEFERRED_MARKS * std::mem::size_of::<CompactWindow>()
+            + BTREE_SLACK;
+        assert!(
+            deferred_entry <= DEFERRED_ENTRY_BYTES,
+            "deferred entry {deferred_entry} exceeds flat {DEFERRED_ENTRY_BYTES}"
+        );
+        assert_eq!(DEFERRED_BYTES, DEFERRED_CAP * DEFERRED_ENTRY_BYTES);
         // The staging plane fits the global pool beside the frozen
         // coordinator + deferred + session-loss leases.
         assert!(

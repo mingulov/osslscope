@@ -232,6 +232,7 @@ fn site_with_calls(
 
 fn complete_doc(sites: Vec<SiteExecution>) -> CaptureDocument {
     finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites,
         fenced: Vec::new(),
@@ -437,6 +438,7 @@ fn synonyms_match_every_admitted_spelling() {
     let (candidates, coverage) = adapt_one(&staged, &live, KEM_OP, &label, weak, &status, 0x400);
     let site = site_with_calls(&staged, 0x400, candidates, coverage, 7);
     let doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: vec![FencedGeneration {
@@ -467,6 +469,7 @@ fn synonyms_match_every_admitted_spelling() {
     let (mut doc, _, _, _) = doc_for_alias("syn-partial", DIGEST_OP, "SHA2-256:SHA256", 0x500);
     // Force PARTIAL with a relevant loss counter.
     doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: doc.sites.clone(),
         fenced: Vec::new(),

@@ -766,6 +766,21 @@ fn control_2_thread_churn_preserves_tgid_counts() {
     // deleted it (the only deleter). Then drains the ack + report
     // (exact N2 + spinner tids).
     app.write_raw("A 32\n2000\n");
+    // R3-8 transient track (restored alongside the injection
+    // oracle — both properties matter): API_THREADS rows must
+    // APPEAR during the spin (spinners overlap by the dozen).
+    // Rows are transient (BPF removes them at depth 0), so one
+    // hit in the spin dumps proves appearance; the ack waits
+    // buffered while the harness dumps.
+    let spin_end = Instant::now() + Duration::from_millis(3400);
+    let mut saw_rows = false;
+    let mut dumped = false;
+    if let Some(keys) = bpftool_apithread_keys() {
+        dumped = true;
+        if keys.iter().any(|(tgid, _)| *tgid == pid) {
+            saw_rows = true;
+        }
+    }
     std::thread::sleep(Duration::from_millis(500));
     let live: Vec<u32> = task_tids(pid)
         .into_iter()
@@ -805,6 +820,23 @@ fn control_2_thread_churn_preserves_tgid_counts() {
         eprintln!("INCONCLUSIVE: injection target exited too early");
         return;
     }
+    // R3-8: keep dumping across the spin — appearance needs a
+    // single hit; the loop exits early on it.
+    while !saw_rows && Instant::now() < spin_end {
+        std::thread::sleep(Duration::from_millis(250));
+        if let Some(keys) = bpftool_apithread_keys() {
+            dumped = true;
+            if keys.iter().any(|(tgid, _)| *tgid == pid) {
+                saw_rows = true;
+            }
+        }
+    }
+    if !dumped {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: API_THREADS spin dumps unreadable");
+        return;
+    }
     let Some(a_lines) = app.drain_ack() else {
         let _ = observer.kill();
         app.finish();
@@ -834,6 +866,10 @@ fn control_2_thread_churn_preserves_tgid_counts() {
         );
         return;
     }
+    assert!(
+        saw_rows,
+        "no API_THREADS tid rows observed across the spin (vacuous oracle)"
+    );
     let spin_end_ns = monotonic_ns();
     if !spin_tids.contains(&target) {
         // The injection target is not a reported spinner (fixture
@@ -872,6 +908,26 @@ fn control_2_thread_churn_preserves_tgid_counts() {
     let injected_leaked = end_keys
         .iter()
         .any(|(tgid, tid)| *tgid == pid && *tid == target);
+    // R3-8 transient track: exited tids' API_THREADS rows are gone
+    // at end (BPF pair-removes them at depth 0) — per-tid, not
+    // zero-total, so fixture growth stays safe.
+    let Some(api_end_keys) = bpftool_apithread_keys() else {
+        let _ = observer.kill();
+        app.finish();
+        eprintln!("INCONCLUSIVE: API_THREADS end dump unreadable");
+        return;
+    };
+    let api_end_mine: Vec<u32> = api_end_keys
+        .iter()
+        .filter(|(tgid, _)| *tgid == pid)
+        .map(|(_, tid)| *tid)
+        .collect();
+    for tid in k_tids.iter().chain(spin_tids.iter()) {
+        assert!(
+            !api_end_mine.contains(tid),
+            "exited tid {tid} API_THREADS row leaked: {api_end_mine:?}"
+        );
+    }
     // Independent ADMITTED == N gate (mandatory, never waived):
     // exactly the worker-reported EVP re-init passages admitted
     // (D-record correspondence; mismatch renders the control
@@ -897,11 +953,7 @@ fn control_2_thread_churn_preserves_tgid_counts() {
     // (INCONCLUSIVE); a row that persists with clean delivery is a
     // cleanup failure (FAIL).
     if injected_leaked {
-        let drops = rows
-            .iter()
-            .find(|r| r["kind"] == "end")
-            .and_then(|r| r["signal_dropped"].as_u64())
-            .unwrap_or(0);
+        let drops = end_signal_dropped(&rows);
         if drops > 0 {
             eprintln!("INCONCLUSIVE: injected row persisted past {drops} drops");
             return;
@@ -1825,6 +1877,32 @@ fn recycle_pid_fast(
     }
 }
 
+/// R3-9: wait for the recycled winner to complete its exec (comm ==
+/// `want`, same incarnation). `recycle_pid_fast` returns when the
+/// number is held, which races the winner's exec — a sample that
+/// sees the pre-exec image breaks the staged ordering, so the
+/// control never proceeds on an unexec'd winner.
+fn wait_for_exec_comm(pid: u32, start: u64, want: &str, timeout: Duration) -> bool {
+    let end = Instant::now() + timeout;
+    while Instant::now() < end {
+        if starttime_of(pid) != Some(start) {
+            return false;
+        }
+        if let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            let comm = st.split('(').nth(1).and_then(|s| s.rsplit(')').next());
+            if comm == Some(want) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    starttime_of(pid) == Some(start)
+        && std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|st| st.split('(').nth(1)?.rsplit(')').next().map(|c| c == want))
+            .unwrap_or(false)
+}
+
 /// One control-5 leg. `held`: SIGSTOP the observer across kill+respawn
 /// (delayed-EXIT delivery); otherwise live (promptness measurable).
 fn reuse_leg(binary: &Path, held: bool) {
@@ -1937,7 +2015,11 @@ fn reuse_leg(binary: &Path, held: bool) {
         // the EXIT against the ADMITTED replacement (artifact
         // quarantine). Premise: completions x 2 > 256, else the
         // leg degrades to the old pre-admission delivery and must
-        // not run.
+        // not run. R3-9: the staging above is necessary but not
+        // proof — the verdict asserts `admitted_exit_artifacts >=
+        // 1`, which ONLY the post-admission artifact arm counts
+        // (a pre-admission quarantine leaves it at zero and fails
+        // the control instead of passing vacuously).
         let mut bomblet_done = 0u32;
         for _ in 0..160 {
             let spawned = Command::new("true")
@@ -1985,8 +2067,25 @@ fn reuse_leg(binary: &Path, held: bool) {
         eprintln!("INCONCLUSIVE: no reuse within 4096 fork cycles");
         return;
     };
-    let mut reuser = RawChild(pid);
+    // The oracle-observed reuse instant is recycle return (the
+    // pid reallocation), not exec completion — stamp it before
+    // the exec wait below.
     let reuse_ns = monotonic_ns();
+    // R3-9: the winner must complete its exec BEFORE any sample
+    // can see it — recycle-before-exec-completion breaks the
+    // staged ordering (a pre-exec image is ineligible, so the
+    // first sample would stash instead of admitting).
+    if !wait_for_exec_comm(pid, reused_start, "sleep", Duration::from_secs(10)) {
+        if held {
+            if let Some(inner) = inner {
+                resume_observer_stack(observer.id(), inner);
+            }
+        }
+        let _ = observer.kill();
+        eprintln!("INCONCLUSIVE: recycled winner never exec'd the sleeper");
+        return;
+    }
+    let mut reuser = RawChild(pid);
     assert_ne!(reused_start, 0, "reused pid has no starttime?");
     assert_ne!(
         reused_start, old_start,
@@ -2061,11 +2160,7 @@ fn reuse_leg(binary: &Path, held: bool) {
     // would make the quarantine assertion vacuous (bomblet exits
     // quarantine too). Drops void the adversarial stimulus.
     if held {
-        let drops = rows
-            .iter()
-            .find(|r| r["kind"] == "end")
-            .and_then(|e| e["session_loss"]["signal_dropped"].as_u64())
-            .unwrap_or(0);
+        let drops = end_signal_dropped(&rows);
         if drops > 0 {
             eprintln!(
                 "INCONCLUSIVE: held leg dropped {drops} connector datagrams (EXIT delivery unproven)"
@@ -2171,14 +2266,26 @@ fn reuse_leg(binary: &Path, held: bool) {
     );
     assert_eq!(new_retires[0]["reason"], "duration");
     if held {
-        let unattributed = rows
-            .iter()
-            .find(|r| r["kind"] == "end")
+        let end = rows.iter().find(|r| r["kind"] == "end");
+        let unattributed = end
             .and_then(|e| e["session_loss"]["unattributed_events"].as_u64())
             .unwrap_or(0);
         assert!(
             unattributed >= 1,
             "delayed EXIT never quarantined (unattributed={unattributed})"
+        );
+        // R3-9: the binding proof — the delayed EXIT must have met
+        // the ADMITTED replacement (live-member artifact), not
+        // quarantined pre-admission. Queue depth alone proves
+        // nothing; a zero here fails the control (the scenario did
+        // not stage), it never passes vacuously.
+        let artifacts = end
+            .and_then(|e| e["session_loss"]["admitted_exit_artifacts"].as_u64())
+            .unwrap_or(0);
+        assert!(
+            artifacts >= 1,
+            "delayed EXIT never bound post-admission (admitted_exit_artifacts={artifacts}): \
+             the replacement was not admitted before the EXIT drained"
         );
     }
 }
@@ -2315,6 +2422,13 @@ fn bpftool_pairing_keys(map: &str) -> Option<Vec<(u32, u32)>> {
 fn bpftool_thread_keys() -> Option<Vec<(u32, u32)>> {
     bpftool_pairing_keys("THREADS")
 }
+/// R3-8 transient oracle: `(tgid, tid)` keys present in the live
+/// API_THREADS map. Rows are transient (BPF removes them on
+/// normal return): appearance during the spin proves the oracle
+/// is live; per-tid absence at end proves no transient leak.
+fn bpftool_apithread_keys() -> Option<Vec<(u32, u32)>> {
+    bpftool_pairing_keys("API_THREADS")
+}
 /// Live tids of `pid` (leader included) via the task dir.
 fn task_tids(pid: u32) -> Vec<u32> {
     std::fs::read_dir(format!("/proc/{pid}/task"))
@@ -2371,6 +2485,30 @@ fn start_clock(rows: &[serde_json::Value]) -> Option<(u64, u64)> {
 /// Map a producer-clock instant to its tick (§7 `Start` rule).
 fn tick_of(origin: u64, interval: u64, ns: u64) -> u64 {
     ns.saturating_sub(origin) / interval
+}
+/// R3-8: connector-drop guard — drops live under
+/// `End.session_loss.signal_dropped`.
+fn end_signal_dropped(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .find(|r| r["kind"] == "end")
+        .and_then(|e| e["session_loss"]["signal_dropped"].as_u64())
+        .unwrap_or(0)
+}
+#[test]
+fn r38_end_drops_read_session_loss_path() {
+    // R3-8: the drop guard reads
+    // `End.session_loss.signal_dropped` — a top-level-only read
+    // sees zero and misclassifies a delivery-unproven survivor as
+    // a cleanup failure.
+    let rows = vec![serde_json::json!({
+        "kind": "end",
+        "session_loss": { "signal_dropped": 3 },
+    })];
+    assert_eq!(end_signal_dropped(&rows), 3);
+    let rows = vec![serde_json::json!({ "kind": "end", "session_loss": {} })];
+    assert_eq!(end_signal_dropped(&rows), 0);
+    let rows = vec![serde_json::json!({ "kind": "start" })];
+    assert_eq!(end_signal_dropped(&rows), 0);
 }
 /// 6A interval-specific shortfall (M3): some lost window — the
 /// segment's own loss or the session carrier — intersects the
@@ -3927,6 +4065,7 @@ fn shapes_6a_additive_records_conform() {
         "signal_prefix_unwitnessed",
         "drain_pending",
         "unattributed_events",
+        "admitted_exit_artifacts",
         "coalesced",
     ] {
         assert!(session[key].is_u64(), "session_loss.{key}: {session}");

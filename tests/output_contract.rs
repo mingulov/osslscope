@@ -125,6 +125,7 @@ fn loss_counter(name: &str, source: CounterSource, value: u64) -> GapCounter {
 
 fn input_base() -> FinalizeInput {
     FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 100,
@@ -6665,4 +6666,126 @@ fn v24_api_failure_subsets_are_disjoint_and_cannot_overflow() {
             "overlapping failure subsets accepted"
         );
     }
+}
+
+// ---------------------------------------------------------------- R3-3
+
+/// Corpse-retirement fixture: an owned corpse that expired its
+/// wait — PARTIAL with the typed `visibility-lost` reason and the
+/// `Retired` membership leg.
+fn corpse_doc_fixture() -> CaptureDocument {
+    use osslscope::evidence::CorpseWaitSpan;
+    let mut input = input_base();
+    input.corpse_wait = Some(CorpseWaitSpan {
+        start_ns: 10,
+        end_ns: 110,
+    });
+    // v2.7 inherits the v2.6 coarse-version rule (live captures
+    // coarsen via `accumulate_openssl_family`; patch strings are a
+    // pre-2.6 fixture shape).
+    input.openssl = OpensslVersion::verified("3.5".to_string());
+    finalize_honest(input)
+}
+
+#[test]
+fn r33_corpse_retirement_renders_membership_and_validates() {
+    // R3-3: the ACTUAL rendered artifact (not the model) must carry
+    // the membership leg and validate against the current schema —
+    // the `visibility-lost` reason needs a schema alternative and
+    // the minor version must claim the new keys.
+    use osslscope::evidence::CAPTURE_SCHEMA_V2_7;
+    let doc = corpse_doc_fixture();
+    assert_eq!(
+        doc.schema, CAPTURE_SCHEMA_V2_7,
+        "corpse docs must claim the minor that carries membership"
+    );
+    let v = json_of(&doc);
+    assert_eq!(
+        v["membership"]["state"], "retired",
+        "rendered artifact omits the membership leg: {v}"
+    );
+    let reasons = v["completeness"]["reasons"]
+        .as_array()
+        .expect("reasons array");
+    assert!(
+        reasons.iter().any(|r| r["kind"] == "visibility-lost"),
+        "rendered artifact omits the visibility-lost reason"
+    );
+    validate_v2(&v).expect("corpse artifact must validate");
+    check_v2_semantics(&v).expect("corpse artifact must stay semantic-clean");
+    assert!(
+        check_version_v2(v["schema_version"].as_str().unwrap()),
+        "new minor must pass the old major gate"
+    );
+    // Retained compatibility: an old-shaped document (no
+    // membership, no new reason) still validates — the additions
+    // are optional keys only.
+    let mut old = v.clone();
+    old["schema_version"] = Value::from("observed-crypto-v2.4");
+    old.as_object_mut().unwrap().remove("membership");
+    let kept: Vec<Value> = reasons
+        .iter()
+        .filter(|r| r["kind"] != "visibility-lost")
+        .cloned()
+        .collect();
+    old["completeness"]["reasons"] = Value::from(kept);
+    old["completeness"]["status"] = Value::from("COMPLETE");
+    validate_v2(&old).expect("old-shaped doc must keep validating");
+}
+
+/// Pre-v2.7 field-level reader: no `membership` field, reasons read
+/// opaquely (kind matched as data, not as a typed enum).
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct Pre27CorpseReader {
+    schema_version: String,
+    completeness: Pre27Completeness,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct Pre27Completeness {
+    status: String,
+    reasons: Vec<Value>,
+}
+
+#[test]
+fn r33_old_field_reader_tolerates_corpse_keys() {
+    // R3-3: an old field-level reader (unknown keys ignored, new
+    // reason kinds carried as data) parses the v2.7 artifact —
+    // tolerance demonstrated, not assumed.
+    let v = json_of(&corpse_doc_fixture());
+    let back: Pre27CorpseReader =
+        serde_json::from_value(v).expect("old field reader parses v2.7 bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.7");
+    assert_eq!(back.completeness.status, "PARTIAL");
+    assert!(
+        back.completeness
+            .reasons
+            .iter()
+            .any(|r| r["kind"] == "visibility-lost" && r["cause"] == "corpse_wait"),
+        "new reason kind must survive as data"
+    );
+}
+
+#[test]
+fn r33_strict_v24_reader_rejects_only_new_vocabulary() {
+    // R3-3: the strict old reader rejects the v2.7 artifact (the
+    // documented minor-version contract, cf.
+    // `strict_old_reader_rejects_v25`) — and ONLY at the new
+    // vocabulary, proving nothing else in the artifact broke old
+    // readers.
+    let v = json_of(&corpse_doc_fixture());
+    let error = validate_v2_with_schema(V24_SCHEMA_JSON, &v).unwrap_err();
+    assert_eq!(error.path, "$.completeness.reasons[0]");
+    assert!(error.message.contains("no anyOf branch matched"), "{error}");
+    // Past the new reason, the ONLY other rejection is the new
+    // `membership` key — nothing else in the artifact broke old
+    // readers.
+    let mut and_membership = v.clone();
+    and_membership["completeness"]["reasons"] = Value::from(Vec::<Value>::new());
+    and_membership["completeness"]["status"] = Value::from("COMPLETE");
+    let error = validate_v2_with_schema(V24_SCHEMA_JSON, &and_membership).unwrap_err();
+    assert_eq!(error.path, "$.membership");
+    assert!(error.message.contains("forbidden"), "{error}");
 }

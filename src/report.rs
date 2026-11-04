@@ -621,8 +621,8 @@ impl Prepared {
 use crate::evidence::CaptureDocument;
 use crate::evidence::{
     CandidateCoverage, Completeness, CounterKind, CounterSource, CounterUnits, DispositionOutcome,
-    EngineWindow, ExpectedScope, FatalKind, GapReason, OpensslVersionState, PolicyVerdict,
-    RuleVerdict, SiteExecution, SiteKey,
+    EngineWindow, ExpectedScope, FatalKind, GapReason, MembershipState, OpensslVersionState,
+    PolicyVerdict, RuleVerdict, SiteExecution, SiteKey,
 };
 
 /// Primary artifact format for [`OutputRequest`].
@@ -1655,6 +1655,18 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     }
     if let Some(count) = &doc.count_object {
         out["count_object"] = serde_json::json!(count);
+    }
+    // R3-3 (v2.7): the retirement membership leg renders only when
+    // recorded (same optional-key rule — state only; reason +
+    // window ride the `visibility-lost` reason, never
+    // double-reported). The match is exhaustive so a future state
+    // forces a schema + renderer update (fail-closed, never a
+    // silent new word).
+    if let Some(membership) = &doc.membership {
+        let state = match membership.state {
+            MembershipState::Retired => "retired",
+        };
+        out["membership"] = serde_json::json!({ "state": state });
     }
     out
 }

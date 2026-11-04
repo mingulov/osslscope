@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4, observed-crypto-v2.5 when the window certified execution attribution, or observed-crypto-v2.6 when a sysctl context was sampled. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4, observed-crypto-v2.5 when the window certified execution attribution, observed-crypto-v2.6 when a sysctl context was sampled, or observed-crypto-v2.7 when the capture retired an owned corpse. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
@@ -500,6 +500,15 @@
           "discovered": { "$ref": "#/$defs/u64" },
           "attached": { "$ref": "#/$defs/u64" }
         }
+      }
+    },
+    "membership": {
+      "description": "End-of-observation membership state (v2.7, owned-corpse retirement only). Omitted when never recorded. State only — reason and window ride the visibility-lost reason.",
+      "type": "object",
+      "required": ["state"],
+      "additionalProperties": false,
+      "properties": {
+        "state": { "enum": ["retired"] }
       }
     },
     "disposition": {
@@ -1232,6 +1241,17 @@
           "additionalProperties": false,
           "properties": {
             "kind": { "const": "signal-cut" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["kind", "cause", "start_ns", "end_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "kind": { "const": "visibility-lost" },
+            "cause": { "type": "string", "minLength": 1 },
+            "start_ns": { "$ref": "#/$defs/u64" },
+            "end_ns": { "$ref": "#/$defs/u64" }
           }
         }
       ]

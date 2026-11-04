@@ -852,6 +852,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
     const FP_A: &str = "build:aaaa0123456789aaaa0123456789aaaa0123456789aaaa0123456789";
     const FP_B: &str = "build:bbbb0123456789bbbb0123456789bbbb0123456789bbbb0123456789";
     let input = FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 0,
             requested_end_ns: 30_000_000_000,

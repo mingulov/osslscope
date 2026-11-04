@@ -103,6 +103,7 @@ fn doc(
     fatal: Option<FatalKind>,
 ) -> CaptureDocument {
     finalize(FinalizeInput {
+        corpse_wait: None,
         window,
         sites,
         fenced,
@@ -1140,6 +1141,7 @@ fn attach_zero_with_proved_engine_evidence_reports_violation() {
         window: EngineWindow::InWindow,
     };
     let doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -1164,6 +1166,7 @@ fn attach_zero_with_proved_engine_evidence_reports_violation() {
     // Control: the same fatal without ENGINE evidence stays
     // no-verdict (the gate still holds for evidence-free fatals).
     let bare = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -1201,6 +1204,7 @@ fn attach_zero_engine_doc() -> CaptureDocument {
         window: EngineWindow::InWindow,
     };
     finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -1280,6 +1284,7 @@ fn p2_engine_fatal_renders_honest_wording() {
     );
     // Control: bare AttachZero keeps the refusal wording.
     let bare = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -1365,6 +1370,7 @@ fn p2_recycled_and_environment_never_evaluate() {
             window: EngineWindow::InWindow,
         };
         let doc = finalize(FinalizeInput {
+            corpse_wait: None,
             window: exact_window(),
             sites: Vec::new(),
             fenced: Vec::new(),
@@ -2043,6 +2049,7 @@ fn engine_obs(
 /// COMPLETE document carrying typed ENGINE observations (no sites).
 fn engine_doc(obs: Vec<EngineObservation>) -> CaptureDocument {
     finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -2259,6 +2266,7 @@ fn real_engine_doc(scripts: Vec<PollScript>, objects: Vec<ObjectRecord>) -> Capt
     let (obs, unkeyed) = collector.build(&objects);
     assert_eq!(unkeyed, 0, "scripted hits must key: {unkeyed} unkeyed");
     let mut doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -2676,6 +2684,7 @@ fn engine_runtime_salvage_evaluates() {
     assert_eq!(unkeyed, 0);
     assert_eq!(obs.len(), 1);
     let doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: Vec::new(),
         fenced: Vec::new(),
@@ -2768,6 +2777,7 @@ fn engine_unrelated_provider_calls_pass_and_conserve() {
     // Provider-dispatch executions are not ENGINE evidence, and
     // ENGINE observations never join provider totals.
     let doc = finalize(FinalizeInput {
+        corpse_wait: None,
         window: exact_window(),
         sites: vec![site_at(
             1,

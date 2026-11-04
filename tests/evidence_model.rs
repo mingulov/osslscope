@@ -78,6 +78,7 @@ fn clean_window() -> CaptureWindow {
 
 fn clean_input(sites: Vec<SiteExecution>) -> FinalizeInput {
     FinalizeInput {
+        corpse_wait: None,
         window: clean_window(),
         sites,
         fenced: Vec::new(),

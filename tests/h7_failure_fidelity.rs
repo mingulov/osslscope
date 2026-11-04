@@ -98,6 +98,7 @@ fn site_with(
 
 fn doc_with(sites: Vec<SiteExecution>, fatal: Option<FatalKind>) -> CaptureDocument {
     finalize(FinalizeInput {
+        corpse_wait: None,
         window: CaptureWindow {
             requested_start_ns: 1_000,
             requested_end_ns: 2_000,

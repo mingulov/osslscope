@@ -39,6 +39,15 @@ pub const CAPTURE_SCHEMA_V2_5: &str = "observed-crypto-v2.5";
 /// 2.4/2.5 documents stay valid.
 pub const CAPTURE_SCHEMA_V2_6: &str = "observed-crypto-v2.6";
 
+/// Schema identity for owned-corpse retirement documents (v2.7,
+/// R3-3): the producer upgrades to this identity exactly when the
+/// capture retired an owned corpse (`FinalizeInput::corpse_wait`
+/// is `Some` — the typed `visibility-lost` reason plus the
+/// `Retired` membership leg). [`finalize`] sets it; see the
+/// `membership` property and the `visibility-lost` reason
+/// alternative in `schemas/observed-crypto-v2.json`.
+pub const CAPTURE_SCHEMA_V2_7: &str = "observed-crypto-v2.7";
+
 /// Scope token for a certified execution attribution: an observed
 /// successful fetch of an exact spelling returned a method, and
 /// the consuming API used that method under the public-reference
@@ -552,7 +561,12 @@ pub fn parse_sysctl_value(text: &str) -> Option<i64> {
 /// go through here so the schema rule has one home.
 pub fn stamp_context(doc: &mut CaptureDocument, context: CaptureContext) {
     if context.sysctls.is_some() {
-        doc.schema = CAPTURE_SCHEMA_V2_6.to_string();
+        // R3-3: never downgrade a newer minor's claim — a v2.7
+        // corpse document with a sysctl context keeps v2.7 (its
+        // keys are the newer vocabulary; readers gate majors).
+        if doc.schema != CAPTURE_SCHEMA_V2_7 {
+            doc.schema = CAPTURE_SCHEMA_V2_6.to_string();
+        }
     }
     doc.context = Some(context);
 }
@@ -1430,12 +1444,20 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         None if reasons.is_empty() => Completeness::Complete,
         None => Completeness::Partial { reasons },
     };
+    // R3-3: corpse-retirement documents carry v2.7-only keys
+    // (the `visibility-lost` reason + the membership leg), so they
+    // claim v2.7 — a v2.4 claim would lie about the content.
+    let schema = if input.corpse_wait.is_some() {
+        CAPTURE_SCHEMA_V2_7
+    } else {
+        CAPTURE_SCHEMA_V2
+    };
     CaptureDocument {
         candidate_associations: Vec::new(),
         algorithm_identities: Vec::new(),
         site_provenance: Vec::new(),
         api_activity: Vec::new(),
-        schema: CAPTURE_SCHEMA_V2.to_string(),
+        schema: schema.to_string(),
         package_build: None,
         count_object: None,
         status,
