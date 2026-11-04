@@ -2328,6 +2328,28 @@ impl ProviderSession {
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) -> RetireOutcome {
         self.retire_for_gap(pid, None, ObservationGap::Invalidated, b)
     }
+    /// R6-1 keep-first (controller fixup): record a deferred
+    /// retire's operation — the FIRST specific operation wins.
+    /// This mirrors the no-deferral caller priority exactly: without
+    /// saturation the first firing site completes, removes the
+    /// target, and later sites skip it; with saturation the first
+    /// deferral's op must likewise survive later same-tick (or
+    /// later-tick, while saturated) deferrals. A later plain
+    /// deferral never downgrades a specific op, and a later
+    /// specific op never displaces an earlier specific op (an
+    /// unconditional overwrite would lose an exec seal when an
+    /// additive verdict fires after a deferred exec on the same
+    /// kept target).
+    fn record_pending_op(&mut self, pid: u32, gap: ObservationGap, op: PendingOp) {
+        self.pending_retire
+            .entry(pid)
+            .and_modify(|p| {
+                if matches!(p.op, PendingOp::Plain) {
+                    *p = PendingRetire { gap, op };
+                }
+            })
+            .or_insert(PendingRetire { gap, op });
+    }
     fn retire_for_gap(
         &mut self,
         pid: u32,
@@ -2393,15 +2415,13 @@ impl ProviderSession {
             // R5-3: persist the retry intent (with the retire's
             // gap for the retry) — the next reconcile drains it
             // FIRST, before validation/readiness shortcuts.
-            // R6-1: keep-first — an earlier caller this tick may
-            // have already preserved a specific operation (exec /
-            // additive / refresh); a later plain deferral must
-            // not downgrade it. Specific callers overwrite below
-            // with their operation after the retire returns.
-            self.pending_retire.entry(pid).or_insert(PendingRetire {
-                gap,
-                op: PendingOp::Plain,
-            });
+            // R6-1 keep-first (controller fixup): an earlier caller
+            // may have already preserved a specific operation (exec
+            // / additive / refresh); a later plain deferral must
+            // not downgrade it. Specific callers record below with
+            // their operation after the retire returns (same
+            // keep-first rule — first specific op wins).
+            self.record_pending_op(pid, gap, PendingOp::Plain);
             fd_dropper().note_deferred(links);
             return outcome;
         }
@@ -2809,13 +2829,7 @@ impl ProviderSession {
                     if matches!(outcome, RetireOutcome::Deferred(_)) {
                         let edge = LiveClock.monotonic_ns();
                         self.fence_target(pid, edge);
-                        self.pending_retire.insert(
-                            pid,
-                            PendingRetire {
-                                gap,
-                                op: PendingOp::Exec { edge_ns: edge },
-                            },
-                        );
+                        self.record_pending_op(pid, gap, PendingOp::Exec { edge_ns: edge });
                     } else {
                         self.exec_sealed.insert(pid);
                         b.exec_witnesses.push(pid);
@@ -2840,12 +2854,10 @@ impl ProviderSession {
                     // exactly once); the drain recomputes the
                     // handoff from the kept target.
                     if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
-                        self.pending_retire.insert(
+                        self.record_pending_op(
                             pid,
-                            PendingRetire {
-                                gap: ObservationGap::Invalidated,
-                                op: PendingOp::Additive,
-                            },
+                            ObservationGap::Invalidated,
+                            PendingOp::Additive,
                         );
                     } else {
                         self.refreshing.insert(pid, retained);
@@ -2907,13 +2919,7 @@ impl ProviderSession {
             // once — the R6-1 twin of the additive path); the
             // drain recomputes the handoff from the kept target.
             if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
-                self.pending_retire.insert(
-                    pid,
-                    PendingRetire {
-                        gap: ObservationGap::Invalidated,
-                        op: PendingOp::Refresh,
-                    },
-                );
+                self.record_pending_op(pid, ObservationGap::Invalidated, PendingOp::Refresh);
             } else {
                 self.refreshing.insert(pid, retained);
                 b.refreshed_processes.push(pid);
@@ -3263,13 +3269,7 @@ impl ProviderSession {
                         if matches!(outcome, RetireOutcome::Deferred(_)) {
                             let edge = LiveClock.monotonic_ns();
                             self.fence_target(pid, edge);
-                            self.pending_retire.insert(
-                                pid,
-                                PendingRetire {
-                                    gap,
-                                    op: PendingOp::Exec { edge_ns: edge },
-                                },
-                            );
+                            self.record_pending_op(pid, gap, PendingOp::Exec { edge_ns: edge });
                         } else {
                             self.exec_sealed.insert(pid);
                             b.exec_witnesses.push(pid);
@@ -3296,12 +3296,10 @@ impl ProviderSession {
                         // reconcile's drain hands off + notifies
                         // exactly once).
                         if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
-                            self.pending_retire.insert(
+                            self.record_pending_op(
                                 pid,
-                                PendingRetire {
-                                    gap: ObservationGap::Invalidated,
-                                    op: PendingOp::Additive,
-                                },
+                                ObservationGap::Invalidated,
+                                PendingOp::Additive,
                             );
                         } else {
                             self.refreshing.insert(pid, retained);
@@ -17666,6 +17664,117 @@ mod startup_api_controls {
         );
         live.flush_timeout(std::time::Duration::from_secs(10))
             .expect("worker proves the retry close");
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r61_dual_verdict_keeps_first_specific_op() {
+        // R6-1 keep-first (controller fixup): a drain-side additive
+        // deferral followed by a reconcile exec deferral (the exe
+        // flips between drain and reconcile, mid-saturation) must
+        // keep the FIRST specific operation (additive — mirroring
+        // the no-deferral priority, where the drain-side additive
+        // completes first and the reconcile exec path skips the gone
+        // target). An unconditional overwrite would record Exec and
+        // lose the additive handoff; the drain retry must hand off
+        // + notify exactly once with no exec seal.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        objects::fixture_support::stage_additive_rows(
+            &mut session.targets.get_mut(&pid).unwrap().process,
+        );
+        let saturated: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        // Drain-side additive defers first (op=Additive).
+        super::with_test_dropper(saturated, || {
+            session.drain(Instant::now() + Duration::from_secs(30))
+        });
+        assert_eq!(
+            session.pending_retire.get(&pid).map(|p| p.op),
+            Some(super::PendingOp::Additive),
+            "drain-side additive must defer first (premise), got {:?}",
+            session.pending_retire.get(&pid)
+        );
+        assert!(
+            session.targets.contains_key(&pid),
+            "deferred additive must keep its target (premise)"
+        );
+        // The exe flips between drain and reconcile.
+        objects::fixture_support::stage_exec_flip(
+            &mut session.targets.get_mut(&pid).unwrap().process,
+        );
+        assert!(
+            session.targets[&pid].process.exec_witnessed(),
+            "exec must witness after the flip (premise)"
+        );
+        // Reconcile exec defers second — keep-first keeps Additive.
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let first = super::with_test_dropper(saturated, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            session.fenced.contains_key(&pid),
+            "reconcile exec path must have deferred second (premise — else keep-first untested)"
+        );
+        assert_eq!(
+            session.pending_retire.get(&pid).map(|p| p.op),
+            Some(super::PendingOp::Additive),
+            "first specific op (additive) must survive the later exec deferral, got {:?}",
+            session.pending_retire.get(&pid)
+        );
+        assert!(
+            first.exec_witnesses.is_empty(),
+            "deferred exec seals nothing yet (premise)"
+        );
+        assert!(
+            first.additive_refreshes.is_empty(),
+            "deferred additive notifies nothing yet (premise)"
+        );
+        // Live retry: additive effects exactly once, no exec seal.
+        let live: &'static super::FdDropper = Box::leak(Box::new(super::FdDropper::production()));
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let retry = super::with_test_dropper(live, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            session.pending_retire.is_empty(),
+            "retry must clear the pending set (stranded: {:?})",
+            session.pending_retire
+        );
+        assert_eq!(
+            retry.additive_refreshes,
+            vec![pid],
+            "additive retry must notify exactly once, got {:?}",
+            retry.additive_refreshes
+        );
+        assert!(
+            retry.exec_witnesses.is_empty(),
+            "additive won — no exec seal (matches no-deferral priority), got {:?}",
+            retry.exec_witnesses
+        );
+        // The flip invalidates the handoff incarnation, so the
+        // invalid-refresh loop (shared code, not deferral-
+        // dependent) retires it right after the drain inserts it:
+        // a refresh handoff cannot survive an exec, deferred or
+        // not. The keep-first guarantee is the recorded op + the
+        // exactly-once notification above.
+        assert!(
+            !session.refreshing.contains_key(&pid),
+            "flipped handoff must invalidate (matches no-deferral)"
+        );
+        live.flush_timeout(std::time::Duration::from_secs(10))
+            .expect("worker proves the retry close");
+        use std::io::Read as _;
         assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
     }
     #[test]
