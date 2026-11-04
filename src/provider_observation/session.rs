@@ -2623,9 +2623,11 @@ impl ProviderSession {
     /// recorded `PendingOp::Exec`). The focused layer latches
     /// this hold from every fresh batch: while held, witness-free
     /// drains must not advance the clean instant past the
-    /// deferred exec, so the retry-time fence still uses the
-    /// DETECTION instant's preceding-clean edge. Releases on
-    /// retry completion (pending cleared) or stale-marker drop.
+    /// deferred exec, so the completion-time fence still uses
+    /// the DETECTION instant's preceding-clean edge. R8-1:
+    /// releases only by completion (live retry or stale-marker
+    /// completion both seal + witness); silent stale-marker
+    /// drops are non-Exec ops only.
     pub(crate) fn exec_fence_held(&self) -> bool {
         self.pending_retire
             .values()
@@ -2729,16 +2731,44 @@ impl ProviderSession {
     ) -> Vec<u32> {
         let mut drained_skip = Vec::new();
         for pid in self.pending_retire.keys().copied().collect::<Vec<_>>() {
-            // Stale marker (retired + gone via another path):
-            // drop it silently — the deferral and the other
-            // retire both emitted; nothing is outstanding.
+            // Stale marker (retired + gone via another path).
             let live = self.targets.contains_key(&pid)
                 || self
                     .startup
                     .get(&pid)
                     .is_some_and(|rows| rows.iter().any(|a| !a.historical));
             if !live {
-                self.pending_retire.remove(&pid);
+                // R8-1: a stale marker is NOT always silent — a
+                // recorded Exec is a KNOWN observed image change
+                // whose seal + witness is still outstanding (only
+                // the detection signal emitted). Every suspension
+                // path funnels through `suspend_target`, which
+                // evicts the target but keeps the pending marker,
+                // so a suspended deferred exec lands here on
+                // recovery: COMPLETE it now (mirror the live-retry
+                // Exec effects — seal + witness + the ORIGINAL
+                // deferral gap; the `fenced` edge is untouched,
+                // armed at deferral, earliest-wins) and consume
+                // the suspension handoff (a sealed image never
+                // re-adds via its pre-seal retained incarnation).
+                // Exactly-once: the marker is gone, so no later
+                // retry can re-fire; the handoff is gone, so the
+                // invalid-refresh loop below cannot re-fire for
+                // this pid either (and it only records gaps, never
+                // witnesses). The hold release is legitimate —
+                // completion (the witness rides this batch), not
+                // cancellation. Non-Exec ops keep the silent drop
+                // (their deferral and the other retire both
+                // emitted; nothing is outstanding for them).
+                if let Some(pending) = self.pending_retire.remove(&pid) {
+                    if matches!(pending.op, PendingOp::Exec { .. }) {
+                        self.exec_sealed.insert(pid);
+                        b.exec_witnesses.push(pid);
+                        b.gap(pending.gap);
+                        b.gap(ObservationGap::IntervalUnknown);
+                        self.refreshing.remove(&pid);
+                    }
+                }
                 self.pending_startup.remove(&pid);
                 continue;
             }
@@ -18098,6 +18128,160 @@ mod startup_api_controls {
             .expect("worker proves the retry close");
         use std::io::Read as _;
         assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r81_suspended_exec_completes_on_recovery() {
+        // R8-1: a deferred exec (positively observed exe-stamp
+        // flip, saturated retirement) that is suspended before
+        // its retry (whole-sample failure → `suspend_target`,
+        // which evicts the target but keeps the pending
+        // marker) must COMPLETE on the recovery reconcile —
+        // seal + witness exactly once — not drop silently via
+        // the stale-marker branch. The suspension handoff is
+        // consumed (a sealed image never re-adds via its
+        // pre-seal incarnation); the ORIGINAL deferral-time
+        // fence edge survives (earliest-wins against the
+        // suspension edge); the hold release is completion
+        // (the witness rides this batch), not cancellation.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        super::clear_deferred_offpath_for_test();
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        objects::fixture_support::stage_exec_flip(
+            &mut session.targets.get_mut(&pid).unwrap().process,
+        );
+        let saturated: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let first = super::with_test_dropper(saturated, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            !session.pending_retire.is_empty(),
+            "exec retire must defer under saturation (premise)"
+        );
+        assert!(
+            matches!(
+                session.pending_retire.get(&pid).map(|p| p.op),
+                Some(super::PendingOp::Exec { .. })
+            ),
+            "deferred op must be Exec (premise), got {:?}",
+            session.pending_retire.get(&pid)
+        );
+        assert_eq!(
+            first.exec_deferred,
+            vec![pid],
+            "deferral batch must signal the exec detection (premise), got {:?}",
+            first.exec_deferred
+        );
+        assert!(
+            first.exec_witnesses.is_empty(),
+            "deferred exec seals nothing yet (premise)"
+        );
+        assert!(
+            session.exec_fence_held(),
+            "exec fence stays held while the retry is outstanding (premise)"
+        );
+        assert!(
+            session.fenced.contains_key(&pid),
+            "deferred exec must fence at deferral (premise)"
+        );
+        let deferral_edge = session.fenced[&pid];
+        // Production failed-branch suspension
+        // (`suspend_retained_with_edge`): fence at the
+        // uncertainty edge FIRST, then suspend. The deferral
+        // edge is older, so earliest-wins keeps it.
+        let suspension_edge = deferral_edge.saturating_add(1_000_000_000);
+        super::with_test_dropper(saturated, || {
+            session.fence_target(pid, suspension_edge);
+            session.suspend_target(pid);
+        });
+        assert!(
+            !session.targets.contains_key(&pid),
+            "suspend must evict the target (premise)"
+        );
+        assert!(
+            session.refreshing.contains_key(&pid),
+            "suspend must keep the refresh handoff (premise)"
+        );
+        assert!(
+            session.exec_fence_held(),
+            "the hold must survive suspension (marker kept)"
+        );
+        assert_eq!(
+            session.fenced.get(&pid),
+            Some(&deferral_edge),
+            "suspension must not move the deferral fence (earliest wins)"
+        );
+        // Recovery reconcile: the stale marker must COMPLETE
+        // (seal + witness), not drop silently.
+        let live: &'static super::FdDropper = Box::leak(Box::new(super::FdDropper::production()));
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let recovery = super::with_test_dropper(live, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            session.pending_retire.is_empty(),
+            "recovery must clear the pending set (stranded: {:?})",
+            session.pending_retire
+        );
+        assert!(
+            session.exec_sealed.contains(&pid),
+            "suspended exec must seal on recovery (pending=0, sealed={:?}, witnesses={:?})",
+            session.exec_sealed,
+            recovery.exec_witnesses
+        );
+        assert_eq!(
+            recovery.exec_witnesses,
+            vec![pid],
+            "suspended exec must witness exactly once on recovery, got {:?}",
+            recovery.exec_witnesses
+        );
+        assert!(
+            !session.exec_fence_held(),
+            "hold releases on completion (witness above, not cancellation)"
+        );
+        assert!(
+            !session.refreshing.contains_key(&pid),
+            "sealed image must consume the suspension handoff"
+        );
+        assert_eq!(
+            session.fenced.get(&pid),
+            Some(&deferral_edge),
+            "completion must keep the ORIGINAL deferral-time fence edge"
+        );
+        assert!(
+            recovery.gaps.contains(&ObservationGap::ProcessChanged),
+            "completion reports the preserved gap, got {:?}",
+            recovery.gaps
+        );
+        // A further reconcile must not duplicate the witness
+        // (marker gone ⇒ no retry; handoff gone ⇒ the
+        // invalid-refresh loop cannot re-fire for this pid).
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let third = super::with_test_dropper(live, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            third.exec_witnesses.is_empty(),
+            "exec effects must fire exactly once (duplicated: {:?})",
+            third.exec_witnesses
+        );
+        live.flush_timeout(std::time::Duration::from_secs(10))
+            .expect("worker proves the suspend close");
+        use std::io::Read as _;
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+        super::clear_deferred_offpath_for_test();
     }
     /// R7-3: restore the unset cleanup allowance even on panic
     /// (serial-test isolation — the allowance is global).
