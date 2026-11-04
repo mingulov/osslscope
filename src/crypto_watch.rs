@@ -2029,9 +2029,12 @@ struct RunState {
     /// R4-3: triple-churn amnesia — set once a tombstone
     /// summary itself is forgotten (tombstone-table overflow).
     /// Monotonic: the forgotten incarnation may reappear at any
-    /// later tick, so every later fresh admission carries an
-    /// unknown-history marker instead of a silent epoch-0
-    /// rebirth.
+    /// later tick. R5-2b: while latched, every ambiguous fresh
+    /// stranger is REFUSED (`SessionGap{history_ambiguous}`) —
+    /// no mark can distinguish the forgotten incarnation from a
+    /// genuinely new one, so no fresh 0/0 is manufactured at
+    /// all. Queued-fresh heads (known-fresh before the latch)
+    /// still admit with the unknown-history marker.
     epoch_amnesia: bool,
     segments: u64,
     current_tick: u64,
@@ -2675,9 +2678,12 @@ impl RunState {
     /// R4-3: admission-success bookkeeping — consume the stashed
     /// context and announce a tombstone-summary admission (the
     /// windows folded through the lossy summary) or an amnesiac
-    /// fresh admission (history possibly forgotten) with one
-    /// visible gap. Called ONLY on actual admission success —
+    /// QUEUED-fresh admission (history possibly forgotten) with
+    /// one visible gap. Called ONLY on actual admission success —
     /// never on a pre-admission sample, never on a failed open.
+    /// R5-2b: stranger-fresh newcomers are refused before any
+    /// admission, so only queued-fresh heads take the amnesiac
+    /// arm.
     fn note_admitted<W: Write>(
         &mut self,
         out: &mut Output<'_, W>,
@@ -2691,10 +2697,11 @@ impl RunState {
         }
         Ok(())
     }
-    /// R4-3: triple-churn amnesia marker — a fresh admission
-    /// after forgotten history carries an unknown-history
-    /// window over the run so far (never a silent epoch-0
-    /// rebirth with an empty ledger).
+    /// R4-3: triple-churn amnesia marker — a QUEUED-fresh
+    /// head (known-fresh before the latch) admitted after
+    /// forgotten history carries an unknown-history window over
+    /// the run so far. R5-2b: stranger-fresh newcomers are
+    /// refused outright and never reach this marker.
     fn apply_amnesia(amnesia: bool, ledger: &mut MemberLedger, tick: u64) {
         if amnesia {
             ledger
@@ -2765,9 +2772,9 @@ impl RunState {
     /// epoch + loss history, visible gap now, compression
     /// announced at admission); a full tombstone table forgets
     /// its oldest summary with a visible gap AND latches the
-    /// triple-churn amnesia flag (every later fresh admission
-    /// carries an unknown-history marker — forgotten history
-    /// never re-authorizes a silent epoch-0 rebirth).
+    /// triple-churn amnesia flag (R5-2b: every later ambiguous
+    /// fresh stranger is refused — forgotten history never
+    /// re-authorizes a manufactured epoch-0 rebirth).
     fn demote_evicted<W: Write>(
         &mut self,
         out: &mut Output<'_, W>,
@@ -2926,24 +2933,32 @@ impl RunState {
     /// forward (localized loss + prior deferred span exact; sealed
     /// windows folded through the frozen coalescing rule into the
     /// 4-mark store, visible via `coalesced_loss`, never silently
-    /// truncated) — or is forgotten with the drop. Retained
-    /// entries emit their per-tick `Limit` at flush time from the
-    /// live queue; drop records queue oldest-first in
-    /// `pending_drops` (the per-tick budget may defer them — the
-    /// caller applies backpressure when the queue is full).
-    fn queue_insert(
+    /// truncated). R5-2a: an overflow victim carrying an exec
+    /// continuation re-stashes into the readmit stash (epoch +
+    /// loss + spans forward for the incarnation's return — its
+    /// own span unions into the carried ledger like a retained
+    /// head's, and a tombstoned victim's announcement promise
+    /// rides the re-stash, exactly once); only a victim with no
+    /// continuation (readmit `None`) leaves nothing but its drop
+    /// record. Retained entries emit their per-tick `Limit` at
+    /// flush time from the live queue; drop records queue
+    /// oldest-first in `pending_drops` (the per-tick budget may
+    /// defer them — the caller applies backpressure when the
+    /// queue is full).
+    fn queue_insert<W: Write>(
         &mut self,
+        out: &mut Output<'_, W>,
         identity: Incarnation,
         stashed: Option<StashedCtx>,
         reason: &'static str,
-    ) {
+    ) -> io::Result<()> {
         let tick = self.current_tick;
         let key = DeferredKey::from(&identity);
         if self.deferred.contains_key(&key) {
             if let Some(entry) = self.deferred.get_mut(&key) {
                 entry.reason = reason;
             }
-            return;
+            return Ok(());
         }
         let (epoch, marks, readmit, carried_loss, carried_deferred, tombstoned) = match stashed {
             Some(stashed) => {
@@ -2993,7 +3008,7 @@ impl RunState {
             },
         );
         while self.deferred.len() > DEFERRED_CAP {
-            let (_, dropped) = self.deferred.pop_last().expect("overflow entry");
+            let (vkey, dropped) = self.deferred.pop_last().expect("overflow entry");
             let own = DeferredSpan {
                 ticks: dropped
                     .ticks
@@ -3002,14 +3017,55 @@ impl RunState {
                 last_tick: tick,
             };
             self.pending_drops.push_back(LimitRec {
-                incarnation: dropped.identity,
+                incarnation: dropped.identity.clone(),
                 reason: "deferred_limit",
                 at_tick: tick,
                 deferred: Some(merge_deferred_spans(dropped.carried_deferred, own)),
             });
             self.drops = self.drops.saturating_add(1);
+            // R5-2a: the victim's exec continuation (if any)
+            // re-stashes for the incarnation's return — epoch +
+            // loss + spans forward (the own span unions into the
+            // carried ledger like a retained head's). A victim
+            // with no continuation leaves only its drop record
+            // (its 0/0 is honest — it never held history).
+            if let Some(rctx) = dropped.readmit {
+                if self.peek_exec_ctx(&vkey).is_none() {
+                    let mut windows = WindowStore::new(WINDOW_CAP);
+                    for w in dropped.marks.windows.iter() {
+                        windows.append(w.start_tick, w.end_tick, w.cause);
+                    }
+                    windows.coalesced = windows.coalesced.saturating_add(dropped.marks.coalesced);
+                    let ledger = MemberLedger {
+                        loss: dropped.carried_loss,
+                        deferred: merge_deferred_spans(dropped.carried_deferred, own),
+                        windows,
+                    };
+                    if dropped.tombstoned {
+                        // The tombstone flag's announcement
+                        // promise rides the re-stash: the
+                        // admission it was saved for will never
+                        // come, so the queue-time fold is
+                        // announced here — exactly once, never
+                        // silent, never twice.
+                        emit_membership_unknown_gap(out, dropped.identity.pid)?;
+                    }
+                    self.stash_pending_epoch(out, vkey, (dropped.image_epoch, ledger, rctx))?;
+                } else {
+                    // Defensive-unreachable: a queued
+                    // incarnation's stash was consumed at queue
+                    // time, and no seal path re-stashes under a
+                    // queued key. The live stash is fresher
+                    // (every exec advances the epoch) and wins;
+                    // the victim's older history is gapped, never
+                    // silent.
+                    debug_assert!(false, "queue-drop victim key already stashed");
+                    emit_membership_unknown_gap(out, dropped.identity.pid)?;
+                }
+            }
         }
         self.peak_depth = self.peak_depth.max(self.deferred.len() as u64);
+        Ok(())
     }
     /// 6A per-tick deferral emission (§3.3): one `Limit` per RETAINED
     /// deferred incarnation (by key, with its current binding
@@ -3290,15 +3346,30 @@ impl RunState {
                 )?;
                 continue;
             }
+            // R5-2b: triple-churn amnesia makes EVERY fresh
+            // stranger ambiguous — it may be the forgotten
+            // incarnation, and no mark can distinguish it. Refuse
+            // the admission with a visible record (never a
+            // manufactured 0/0, marked or not; no open attempted,
+            // nothing queued — a queued 0/0 would manufacture on
+            // the next tick). History-carriers (stashed) queue or
+            // admit normally: their history is known.
+            if stashed.is_none() && self.epoch_amnesia {
+                out.emit(Record::SessionGap {
+                    incarnation: &identity,
+                    reason: "history_ambiguous",
+                })?;
+                continue;
+            }
             if self.active.len() >= ctx.max_active {
-                self.queue_insert(identity, stashed, "active_limit");
+                self.queue_insert(out, identity, stashed, "active_limit")?;
                 continue;
             }
             // R3-2: the session lease reserves behind the live
             // worker-backlog charge (queued batches stay pooled).
             let backlog = crate::provider_observation::session::worker_backlog_charged();
             let Some(lease) = self.reserve_session(ctx.pool, ctx.reservation, backlog) else {
-                self.queue_insert(identity, stashed, "global_state_limit");
+                self.queue_insert(out, identity, stashed, "global_state_limit")?;
                 continue;
             };
             let was_tombstoned = stashed.as_ref().is_some_and(|s| s.tombstoned);
@@ -3330,8 +3401,11 @@ impl RunState {
                     )
                 }
                 None => {
-                    // R4-3: a fresh admission after forgotten
-                    // history carries the amnesia marker.
+                    // R5-2b: reachable only WITHOUT amnesia (a
+                    // fresh stranger under amnesia is refused
+                    // above) — a genuinely-new incarnation, so
+                    // the empty ledger is honest and the marker
+                    // below is a no-op.
                     let mut ledger = MemberLedger::empty();
                     Self::apply_amnesia(self.epoch_amnesia, &mut ledger, tick);
                     (0, None, ledger, 0)
@@ -6290,21 +6364,140 @@ mod tests {
         child.wait().ok();
     }
     #[test]
-    fn tombstone_overflow_fails_conservative() {
-        // R4-3: tombstone-table overflow forgets a summary with a
-        // visible gap AND latches amnesia — every later fresh
-        // admission carries an unknown-history marker (window +
-        // gap), never a silent epoch-0 rebirth. The latch is
-        // monotonic (the forgotten incarnation may reappear at
-        // any later tick).
+    fn queue_drop_restashes_continuation_for_return() {
+        // R5-2a: a queue-overflow victim carrying an exec
+        // continuation (epoch/loss/spans) re-stashes into the
+        // readmit stash instead of vanishing with only a
+        // span-carrying drop record — the incarnation's return
+        // resumes its history (never 0/0, never silent,
+        // amnesia unlatched: nothing was forgotten). The
+        // tombstoned victim's announcement promise rides the
+        // re-stash (exactly one gap — the admission it was
+        // saved for will never come).
         let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
         let namespaces = inventory::NamespaceIds {
             pid: None,
             mount: None,
         };
-        for i in 0..EPOCH_TOMBSTONE_CAP {
+        let mut bytes = Vec::new();
+        let mut sink = sink_into(&mut bytes);
+        for i in 0..DEFERRED_CAP {
             let identity = Incarnation {
-                pid: 7000 + i as u32,
+                pid: 1 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.queue_insert(&mut sink, identity, None, "active_limit")
+                .unwrap();
+        }
+        assert_eq!(run.deferred.len(), DEFERRED_CAP);
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 40;
+        ledger.windows.append(3, 5, LossCause::RingLoss);
+        ledger.windows.append(9, 12, LossCause::ScanLoss);
+        let summary = TombstoneSummary::summarize(
+            41,
+            &ledger,
+            ReadmitCtx {
+                retire_ns: 5,
+                seal_tick: 2,
+                witness_ts: Some(6),
+            },
+        );
+        let dropped = Incarnation {
+            pid: 99_999,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        run.queue_insert(
+            &mut sink,
+            dropped.clone(),
+            Some(StashedCtx {
+                ctx: summary.materialize(),
+                tombstoned: true,
+            }),
+            "active_limit",
+        )
+        .unwrap();
+        assert_eq!(run.deferred.len(), DEFERRED_CAP);
+        assert_eq!(run.pending_drops.len(), 1, "drop record queued");
+        assert_eq!(run.pending_drops[0].incarnation.pid, 99_999);
+        let back = run
+            .peek_exec_ctx(&DeferredKey::from(&dropped))
+            .expect("queue drop must preserve the continuation (not epoch 0/loss 0)");
+        assert_eq!(back.ctx.0, 41, "epoch reset across queue drop");
+        assert_eq!(back.ctx.1.loss, 40, "loss reset across queue drop");
+        assert_eq!(back.ctx.2.seal_tick, 2, "readmit context must ride along");
+        assert!(
+            !back.tombstoned,
+            "re-stash promotes to the lossless primary stash (the fold stays data-visible)"
+        );
+        assert!(
+            !run.epoch_amnesia,
+            "queue drop preserves — nothing forgotten"
+        );
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let announced = rows
+            .iter()
+            .filter(|r| {
+                r["kind"] == "gap"
+                    && r["gap"]["reason"] == "membership_unknown"
+                    && r["gap"]["pid"] == 99_999
+            })
+            .count();
+        assert_eq!(
+            announced, 1,
+            "tombstoned drop owes exactly one announcement, got {rows:?}"
+        );
+    }
+    #[test]
+    fn tombstone_overflow_fails_conservative() {
+        // R5-2b (rewritten — the R4-3 marker tail checked the
+        // wrong thing): tombstone-table overflow forgets a
+        // summary with a visible gap AND latches amnesia — and
+        // every later ambiguous fresh readmission is REFUSED
+        // with a visible `SessionGap{history_ambiguous}` (never
+        // a manufactured 0/0, marked or not). The latch is
+        // monotonic (the forgotten incarnation may reappear at
+        // any later tick). Both capacity variants refuse: with
+        // room (no open attempted) and under pressure (not
+        // queued).
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        // The forgotten incarnation K: known epoch 41 / loss 40,
+        // key-smallest so the cascade forgets exactly it.
+        let forgotten = Incarnation {
+            pid: 4242,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 40;
+        run.epoch_tombstones.insert(
+            DeferredKey::from(&forgotten),
+            TombstoneSummary::summarize(
+                41,
+                &ledger,
+                ReadmitCtx {
+                    retire_ns: 5,
+                    seal_tick: 2,
+                    witness_ts: Some(6),
+                },
+            ),
+        );
+        for i in 0..(EPOCH_TOMBSTONE_CAP - 1) {
+            let identity = Incarnation {
+                pid: 5000 + i as u32,
                 starttime: 1,
                 namespaces: namespaces.clone(),
             };
@@ -6323,7 +6516,7 @@ mod tests {
         }
         for i in 0..EVICTED_EPOCH_CAP {
             let identity = Incarnation {
-                pid: 5000 + i as u32,
+                pid: 6000 + i as u32,
                 starttime: 1,
                 namespaces: namespaces.clone(),
             };
@@ -6351,7 +6544,7 @@ mod tests {
             terminal: false,
         };
         let fresh = Incarnation {
-            pid: 999_998,
+            pid: 99_999,
             starttime: 1,
             namespaces: namespaces.clone(),
         };
@@ -6369,13 +6562,9 @@ mod tests {
             ),
         )
         .unwrap();
-        // The cascade forgets the key-smallest summary (the
-        // just-demoted pid 5000): forgotten, flagged, gapped.
-        let forgotten = Incarnation {
-            pid: 5000,
-            starttime: 1,
-            namespaces: namespaces.clone(),
-        };
+        // The cascade forgets the key-smallest summary (K, pid
+        // 4242 — its 41/40 is unretainable): forgotten, flagged,
+        // gapped.
         assert!(
             run.peek_exec_ctx(&DeferredKey::from(&forgotten)).is_none(),
             "forgotten summary reads back"
@@ -6386,40 +6575,16 @@ mod tests {
             EPOCH_TOMBSTONE_CAP,
             "tombstone table must stay capped"
         );
-        // A later fresh admission announces (gap) and marks (window).
-        let newcomer = Incarnation {
-            pid: 424_242,
-            starttime: 9,
-            namespaces: namespaces.clone(),
-        };
-        run.note_admitted(&mut sink, &newcomer, false, true)
-            .unwrap();
-        assert!(run.epoch_amnesia, "amnesia must be monotonic");
-        let mut ledger = MemberLedger::empty();
-        RunState::apply_amnesia(run.epoch_amnesia, &mut ledger, 6);
-        assert_eq!(ledger.windows.windows.len(), 1);
-        assert_eq!(
-            (
-                ledger.windows.windows[0].start_tick,
-                ledger.windows.windows[0].end_tick,
-                ledger.windows.windows[0].cause,
-            ),
-            (0, 7, LossCause::MembershipUnknown),
-            "amnesia window must cover the run so far"
-        );
-        let mut clean = MemberLedger::empty();
-        RunState::apply_amnesia(false, &mut clean, 6);
-        assert!(clean.windows.windows.is_empty(), "no amnesia, no marker");
         drop(sink);
-        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+        let demote_rows: Vec<serde_json::Value> = String::from_utf8(bytes)
             .unwrap()
             .lines()
             .map(|l| serde_json::from_str(l).unwrap())
             .collect();
-        // Two gaps name pid 5000 (demote-drop + overflow-forget),
-        // one names the amnesiac newcomer.
-        for (pid, want) in [(5000, 2), (424_242, 1)] {
-            let n = rows
+        // One gap names the demote-drop (pid 6000), one the
+        // overflow-forget (K, pid 4242).
+        for (pid, want) in [(6000, 1), (4242, 1)] {
+            let n = demote_rows
                 .iter()
                 .filter(|r| {
                     r["kind"] == "gap"
@@ -6427,7 +6592,153 @@ mod tests {
                         && r["gap"]["pid"] == pid
                 })
                 .count();
-            assert_eq!(n, want, "gap census wrong for {pid}, got {rows:?}");
+            assert_eq!(n, want, "gap census wrong for {pid}, got {demote_rows:?}");
+        }
+        // K returns (synthetic eligible record under its exact
+        // key): readmission is REFUSED with a visible record —
+        // never a silent (or marked) 0/0. Both capacities.
+        fn synthetic_snapshot(pid: u32, starttime: u64) -> inventory::Snapshot {
+            let module = inventory::ModuleRecord {
+                info: inventory::ModuleInfo {
+                    sha256: String::new(),
+                    device: 0,
+                    inode: 0,
+                    size_bytes: 0,
+                    architecture: inventory::Architecture::X86_64,
+                    kind: inventory::ObjectKind::OpenSslConsumer,
+                    exports: Vec::new(),
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                },
+                identity_status: inventory::IdentityStatus::Verified,
+            };
+            let record = inventory::ProcessRecord {
+                interval: inventory::CaptureInterval {
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ns: 0,
+                },
+                namespaces: inventory::NamespaceIds {
+                    pid: None,
+                    mount: None,
+                },
+                pid,
+                starttime,
+                modules: vec![module],
+                provider_activation: inventory::ObservationState::Unknown,
+                provider_interfaces: inventory::ObservationState::Unknown,
+                execution: inventory::ObservationState::Unknown,
+            };
+            inventory::Snapshot {
+                interval: inventory::CaptureInterval {
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ns: 0,
+                },
+                scope_record: inventory::ScopeRecord::default(),
+                schema_version: "crypto-watch-test".to_owned(),
+                mode: inventory::SnapshotMode::Snapshot,
+                scope: inventory::Scope::Pids,
+                selected_pids: vec![pid],
+                processes: vec![record],
+                gaps: Vec::new(),
+                totals: inventory::WorkTotals {
+                    processes_attempted: 1,
+                    objects_attempted: 0,
+                    objects_inspected: 0,
+                    read_bytes: 0,
+                },
+                limits: inventory::Limits::default(),
+                capabilities: inventory::Capabilities {
+                    inventory: inventory::InventoryState::Complete,
+                    provider_activation: inventory::ObservationState::Unknown,
+                    provider_interfaces: inventory::ObservationState::Unknown,
+                    execution: inventory::ObservationState::Unknown,
+                },
+                resolve: Default::default(),
+                cgroup_identity: std::collections::BTreeMap::new(),
+            }
+        }
+        let snapshot = synthetic_snapshot(4242, 1);
+        assert!(
+            eligible(&snapshot.processes[0]),
+            "synthetic K record must be eligible (premise)"
+        );
+        assert!(
+            DeferredKey::from(&Incarnation::from(&snapshot.processes[0]))
+                == DeferredKey::from(&forgotten),
+            "synthetic K record must match the forgotten key (premise)"
+        );
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let objects = FocusedObjects {
+            observation: Arc::from([0u8; 8]),
+            count: Arc::from([0u8; 8]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        for (case, max_active) in [("room", 4), ("full", 0)] {
+            let ctx = AdmitCtx {
+                pool: &pool,
+                objects: &objects,
+                reservation: 0,
+                deadline: Instant::now() + Duration::from_secs(60),
+                cancel: &cancel,
+                tracing: true,
+                trust_reviewed: false,
+                selection: &selection,
+                max_active,
+            };
+            let mut bytes = Vec::new();
+            let mut sink = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: true,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+            };
+            let mut admitted = Vec::new();
+            run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+                .unwrap();
+            assert!(admitted.is_empty(), "{case}: forgotten K must not admit");
+            assert!(run.active.is_empty(), "{case}: forgotten K must not admit");
+            assert!(
+                !run.deferred.contains_key(&DeferredKey::from(&forgotten)),
+                "{case}: forgotten K must not queue (a queued 0/0 is a delayed manufacture)"
+            );
+            assert!(run.epoch_amnesia, "{case}: amnesia must be monotonic");
+            drop(sink);
+            let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let refused: Vec<&serde_json::Value> = rows
+                .iter()
+                .filter(|r| {
+                    r["kind"] == "session_gap"
+                        && r["incarnation"]["pid"] == 4242
+                        && r["reason"] == "history_ambiguous"
+                })
+                .collect();
+            assert_eq!(
+                refused.len(),
+                1,
+                "{case}: K owes exactly one visible refusal, got {rows:?}"
+            );
+            assert!(
+                rows.iter().all(|r| r["kind"] != "membership"
+                    || r["incarnation"]["pid"] != 4242
+                    || r["state"] != "observing"),
+                "{case}: K must never observe, got {rows:?}"
+            );
+            assert!(
+                rows.iter().all(|r| r["kind"] != "session_gap"
+                    || r["incarnation"]["pid"] != 4242
+                    || r["reason"] != "acquisition_unavailable"),
+                "{case}: refusal precedes any open attempt, got {rows:?}"
+            );
         }
     }
     #[test]
@@ -6788,6 +7099,18 @@ mod tests {
         assert_eq!(merge_deferred_spans(DeferredSpan::default(), own), own);
         assert_eq!(merge_deferred_spans(full, DeferredSpan::default()), full);
     }
+    /// R5-2: throwaway JSON sink for `queue_insert` callers
+    /// whose drops emit nothing (fresh victims / no overflow).
+    fn sink_into(bytes: &mut Vec<u8>) -> Output<'_, Vec<u8>> {
+        Output {
+            writer: bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        }
+    }
     #[test]
     fn queued_exec_readmit_carries_full_ledger() {
         // §4.1 incarnation-wide ledger: queueing an exec-readmit
@@ -6833,14 +7156,18 @@ mod tests {
             seal_tick: 4,
             witness_ts: None,
         };
+        let mut bytes = Vec::new();
+        let mut sink = sink_into(&mut bytes);
         run.queue_insert(
+            &mut sink,
             identity.clone(),
             Some(StashedCtx {
                 ctx: (1, ledger, rctx),
                 tombstoned: false,
             }),
             "active_limit",
-        );
+        )
+        .unwrap();
         let key = DeferredKey::from(&identity);
         let entry = run.deferred.get(&key).expect("queued entry");
         assert_eq!(entry.carried_loss, 7);
@@ -6883,8 +7210,11 @@ mod tests {
             pid: None,
             mount: None,
         };
+        let mut bytes = Vec::new();
+        let mut out = sink_into(&mut bytes);
         for pid in 0..(DEFERRED_CAP as u32 + 3) {
             run.queue_insert(
+                &mut out,
                 Incarnation {
                     pid: 100_000 + pid,
                     starttime: 1,
@@ -6892,20 +7222,19 @@ mod tests {
                 },
                 None,
                 "active_limit",
-            );
+            )
+            .unwrap();
         }
         assert_eq!(run.deferred.len(), DEFERRED_CAP);
         assert_eq!(run.pending_drops.len(), 3);
         assert_eq!(run.drops, 3);
-        let mut bytes = Vec::new();
-        let mut out = Output {
-            writer: &mut bytes,
-            sequence: 0,
-            json: true,
-            pending_gaps: Vec::new(),
-            resolve_paths: false,
-            terminal: false,
-        };
+        drop(out);
+        assert!(
+            bytes.is_empty(),
+            "fresh-victim drops emit no gaps, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let mut out = sink_into(&mut bytes);
         run.emit_limit_tick(&mut out).unwrap();
         drop(out);
         let text = String::from_utf8(bytes).unwrap();
@@ -6949,8 +7278,11 @@ mod tests {
             pid: None,
             mount: None,
         };
+        let mut bytes = Vec::new();
+        let mut out = sink_into(&mut bytes);
         for pid in 0..(DEFERRED_CAP as u32 + LIMIT_TICK_BUDGET as u32 + 7) {
             run.queue_insert(
+                &mut out,
                 Incarnation {
                     pid: 100_000 + pid,
                     starttime: 1,
@@ -6958,19 +7290,18 @@ mod tests {
                 },
                 None,
                 "active_limit",
-            );
+            )
+            .unwrap();
         }
         assert_eq!(run.deferred.len(), DEFERRED_CAP);
         assert_eq!(run.pending_drops.len(), LIMIT_TICK_BUDGET + 7);
-        let mut bytes = Vec::new();
-        let mut out = Output {
-            writer: &mut bytes,
-            sequence: 0,
-            json: true,
-            pending_gaps: Vec::new(),
-            resolve_paths: false,
-            terminal: false,
-        };
+        drop(out);
+        assert!(
+            bytes.is_empty(),
+            "fresh-victim drops emit no gaps, got {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let mut out = sink_into(&mut bytes);
         run.emit_pending_drops_all(&mut out).unwrap();
         drop(out);
         let text = String::from_utf8(bytes).unwrap();

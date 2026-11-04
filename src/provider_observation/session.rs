@@ -413,6 +413,21 @@ pub struct ProviderSession {
     // Replaces (never adds to) an admitted target during metadata-only refresh.
     // The shared process lease still bounds this map and any Count site owners.
     refreshing: BTreeMap<u32, objects::ProcessIncarnation>,
+    /// R5-3: pids with a deferred retire awaiting retry (the
+    /// retire's gap rides along for the retry). Recorded at
+    /// deferral, cleared at completion — both inside
+    /// `retire_for_gap`, so EVERY deferral site lands here and
+    /// no completed retire lingers. Drained FIRST every
+    /// reconcile, before validation/readiness shortcuts (a
+    /// cleared validation must not strand a disarmed target —
+    /// the ready fast path would skip it forever).
+    pending_retire: BTreeMap<u32, ObservationGap>,
+    /// R5-3: pids with a deferred STARTUP retire awaiting retry
+    /// (startup-only rows — recorded/cleared inside
+    /// `retire_startup`, drained with the target set; a pid in
+    /// both sets retries via the target path, which covers its
+    /// startup rows too).
+    pending_startup: BTreeSet<u32>,
     /// 6A exec-sealed pids (§1.4): image retired by an exe-stamp flip
     /// this session already reported via `exec_witnesses`. The
     /// coordinator owns the post-exec re-admission (new segment);
@@ -808,13 +823,14 @@ struct DropperShared {
     /// charged via the held session spend, never synced on the
     /// poll path).
     deferred_fds: std::sync::atomic::AtomicU64,
-    /// R4-4: session-teardown links closed by a detached closer
-    /// thread (saturated at seal — off the poll path).
-    drop_detached_fds: std::sync::atomic::AtomicU64,
-    /// R4-4: session-teardown links closed synchronously
-    /// (disarm failure (R3-1 safety) or closer-thread spawn
-    /// failure only — counted backstops).
+    /// R5-1: session-teardown links closed by the charged
+    /// synchronous backstop (worker saturation or disarm
+    /// failure (R3-1 safety) — counted, close-then-release).
     drop_sync_fds: std::sync::atomic::AtomicU64,
+    /// R5-1: suspension links closed by the charged synchronous
+    /// backstop (disarm failure (R3-1 safety) or worker
+    /// saturation — counted, close-then-release).
+    suspend_sync_fds: std::sync::atomic::AtomicU64,
     respawns: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     flushes: std::sync::atomic::AtomicU64,
@@ -832,8 +848,8 @@ impl DropperShared {
             sync_full_fds: std::sync::atomic::AtomicU64::new(0),
             sync_dead_fds: std::sync::atomic::AtomicU64::new(0),
             deferred_fds: std::sync::atomic::AtomicU64::new(0),
-            drop_detached_fds: std::sync::atomic::AtomicU64::new(0),
             drop_sync_fds: std::sync::atomic::AtomicU64::new(0),
+            suspend_sync_fds: std::sync::atomic::AtomicU64::new(0),
             respawns: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             flushes: std::sync::atomic::AtomicU64::new(0),
@@ -967,6 +983,20 @@ impl FdDropper {
         let (spilled, charged) =
             std::mem::take(&mut *shared.spillover.lock().unwrap_or_else(|e| e.into_inner()));
         Self::release_spilled_observed(spilled, charged, shared, || {});
+    }
+    /// R5-1: charged synchronous close of one off-path
+    /// batch — drop FIRST, then release (R4-2a order: the
+    /// retention stays charged until the close completes, so no
+    /// admission samples zero backlog against live links). The
+    /// caller pre-charged exactly one batch (R4-2b order); the
+    /// `on_closed` hook is empty in production (tests observe
+    /// the between-close-and-release instant through it).
+    fn close_charged_sync(links: Vec<OwnedFd>, shared: &DropperShared, on_closed: impl FnOnce()) {
+        drop(links);
+        on_closed();
+        shared
+            .backlog_charged
+            .fetch_sub(worker_batch_bytes(), std::sync::atomic::Ordering::Relaxed);
     }
     fn sender(&self) -> Option<std::sync::mpsc::SyncSender<DropperMsg>> {
         self.sender
@@ -1244,9 +1274,38 @@ impl FdDropper {
         }
     }
 }
+/// R5-1 test seam: an installed local dropper replaces the
+/// process-global worker for session paths (`retire_for_gap`,
+/// `retire_startup`, `suspend_target`, teardown) so saturation is
+/// deterministic — filling the production worker's spillover
+/// against its live drain would race. Serial tests only
+/// (`RUST_TEST_THREADS=1`); installed/scoped via
+/// `with_test_dropper` (reset on scope exit, including panic).
+/// Absent from non-test builds; production always uses the global.
+#[cfg(test)]
+static TEST_DROPPER: std::sync::Mutex<Option<&'static FdDropper>> = std::sync::Mutex::new(None);
 fn fd_dropper() -> &'static FdDropper {
+    #[cfg(test)]
+    if let Some(dropper) = *TEST_DROPPER.lock().unwrap_or_else(|e| e.into_inner()) {
+        return dropper;
+    }
     static DROPPER: std::sync::OnceLock<FdDropper> = std::sync::OnceLock::new();
     DROPPER.get_or_init(FdDropper::production)
+}
+/// R5-1: run `f` with session paths bound to the local `dropper`
+/// (see `TEST_DROPPER`). The previous binding (none, in serial
+/// tests) restores when the scope exits.
+#[cfg(test)]
+fn with_test_dropper<R>(dropper: &'static FdDropper, f: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *TEST_DROPPER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+    *TEST_DROPPER.lock().unwrap_or_else(|e| e.into_inner()) = Some(dropper);
+    let _reset = Reset;
+    f()
 }
 fn offload_fd_drop(links: Vec<OwnedFd>) {
     fd_dropper().offload(links);
@@ -1483,9 +1542,10 @@ fn disarm_pid_rows(
     combine_disarm(member, configs, range_results).is_ok()
 }
 /// R4-4: teardown collector — drain one pid's retained links
-/// WITHOUT closing them (the close always leaves the poll path:
-/// worker offload, else a detached closer thread). Returns the
-/// collected links; attachments are left emptied.
+/// WITHOUT closing them (the close leaves through the shared
+/// off-path helper: worker offload, else a charged synchronous
+/// backstop). Returns the collected links; attachments are left
+/// emptied.
 fn drain_pid_links(
     startup: &mut BTreeMap<u32, Vec<Attachment>>,
     targets: &mut BTreeMap<u32, Target>,
@@ -1923,6 +1983,8 @@ impl ProviderSession {
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
+            pending_retire: BTreeMap::new(),
+            pending_startup: BTreeSet::new(),
             exec_sealed: BTreeSet::new(),
             fenced: BTreeMap::new(),
             fence_withheld: 0,
@@ -2107,6 +2169,11 @@ impl ProviderSession {
     ) -> RetireOutcome {
         if self.final_drain {
             self.final_refusals.insert(pid, gap);
+            // R5-3: the seal discharges any pending retry intent
+            // administratively (the final teardown collects every
+            // pid's links directly — no reconcile will drain).
+            self.pending_retire.remove(&pid);
+            self.pending_startup.remove(&pid);
             b.gap(gap);
             return RetireOutcome::Retired(false);
         }
@@ -2155,9 +2222,20 @@ impl ProviderSession {
         // (no victims detached) and every caller skips its
         // post-retire bookkeeping.
         if let RetireOutcome::Deferred(links) = outcome {
+            // R5-3: persist the retry intent (with the retire's
+            // gap for the retry) — the next reconcile drains it
+            // FIRST, before validation/readiness shortcuts.
+            self.pending_retire.insert(pid, gap);
             fd_dropper().note_deferred(links);
             return outcome;
         }
+        // R5-3: completion clears the target retry intent
+        // (every deferral site funnels through here, so the
+        // pending set is exactly the outstanding deferred
+        // retires). The startup marker is the startup path's
+        // own: a preserving retire keeps historical rows for
+        // the startup retry to collect.
+        self.pending_retire.remove(&pid);
         self.refreshing.remove(&pid);
         // Retire-time budget release (R3-2: lazy, worker-gated):
         // a retire that detaches victims ARMS the release gate —
@@ -2280,21 +2358,112 @@ impl ProviderSession {
     /// window itself is recorded in the coordinator's loss ledger,
     /// never as a session gap.
     pub(crate) fn suspend_target(&mut self, pid: u32) {
-        let Some(target) = self.targets.remove(&pid) else {
+        let Some(mut target) = self.targets.remove(&pid) else {
             return;
         };
         let retained = target.process.retained_incarnation();
-        let _ = self.members.remove(&pid);
-        for a in &target.attachments {
-            let _ = self.config.remove(&a.cookie);
+        // R5-4: verdict the disarm through the shared helper
+        // (R4-1: absence is disarmed — same rows as before:
+        // members + per-cookie configs + per-index ranges) and
+        // close through the shared off-path helper (worker
+        // offload when it absorbs — charged + barrier-tracked —
+        // else the counted charged-sync backstop). Custody is
+        // unchanged (refreshing handoff; aliases and learned
+        // sites untouched; no gaps — the unknown window stays
+        // the coordinator's ledger entry). Session spend is
+        // unchanged too (suspend releases nothing today, so
+        // nothing arms — only the close moves off-path).
+        let disarmed = disarm_pid_rows(
+            &mut self.members,
+            &mut self.config,
+            &mut self.ranges,
+            pid,
+            &[],
+            Some(&target),
+        );
+        let mut links = Vec::new();
+        for a in target.attachments.iter_mut() {
+            links.append(&mut a.links);
         }
-        for index in 0..target.ranges {
-            let _ = self.ranges.remove(&c::RangeKey {
-                pid,
-                index: index as u32,
-            });
-        }
+        Self::close_offpath_links(disarmed, links, &fd_dropper().shared.suspend_sync_fds);
         self.refreshing.insert(pid, retained);
+    }
+    /// R5-3: drain deferred retirements FIRST every reconcile (see
+    /// the call site). The retry-or-rearm decision, made explicit
+    /// per pid: the drain always RETRIES the retire — re-arm is
+    /// rejected by design (restoring disarmed rows would need
+    /// row-rebuild machinery; retire+re-add reuses the proven
+    /// retire, release-gate and admission machinery, and the
+    /// churn is gap-visible). A completed retry mirrors the
+    /// reconcile retire loop exactly (transient preservation +
+    /// detection gaps); a re-deferral keeps its marker
+    /// (re-recorded by the choke point) for the next reconcile.
+    fn drain_pending_retires(
+        &mut self,
+        records: &[inventory::ProcessRecord],
+        b: &mut ObservationBatch,
+    ) {
+        for pid in self.pending_retire.keys().copied().collect::<Vec<_>>() {
+            // Stale marker (retired + gone via another path):
+            // drop it silently — the deferral and the other
+            // retire both emitted; nothing is outstanding.
+            let live = self.targets.contains_key(&pid)
+                || self
+                    .startup
+                    .get(&pid)
+                    .is_some_and(|rows| rows.iter().any(|a| !a.historical));
+            if !live {
+                self.pending_retire.remove(&pid);
+                self.pending_startup.remove(&pid);
+                continue;
+            }
+            let gap = self.pending_retire[&pid];
+            // Mirror the reconcile retire loop: transient-budget
+            // preservation BEFORE the retire (a lease-preserving
+            // re-add instead of ProcessLimit starvation).
+            let preserved = if transient_budget_gap(gap) {
+                self.targets
+                    .get(&pid)
+                    .map(|t| t.process.retained_incarnation())
+            } else {
+                None
+            };
+            let record = records.iter().find(|r| r.pid == pid);
+            let outcome = self.retire_for_gap(pid, record, gap, b);
+            // Completion clears the marker (inside
+            // `retire_for_gap`); a re-deferral re-records it for
+            // the next reconcile.
+            if !matches!(outcome, RetireOutcome::Deferred(_)) {
+                if let Some(retained) = preserved {
+                    self.refreshing.insert(pid, retained);
+                }
+                b.gap(gap);
+                b.gap(ObservationGap::IntervalUnknown);
+            }
+        }
+        for pid in self.pending_startup.iter().copied().collect::<Vec<_>>() {
+            // A still-pending target retry covers this pid's
+            // startup rows too (retiring them separately would
+            // split-brain the kept target) — skip until the
+            // target path clears.
+            if self.pending_retire.contains_key(&pid) {
+                continue;
+            }
+            let live = self
+                .startup
+                .get(&pid)
+                .is_some_and(|rows| rows.iter().any(|a| !a.historical));
+            if !live {
+                self.pending_startup.remove(&pid);
+                continue;
+            }
+            let outcome = self.retire_startup(pid, b);
+            // Mirror the drain loop: a completed startup retire
+            // drops the pid's assembly state.
+            if !matches!(outcome, StartupRetire::Deferred(_)) {
+                self.aliases.retire(pid);
+            }
+        }
     }
     pub(crate) fn reconcile_records(
         &mut self,
@@ -2305,6 +2474,13 @@ impl ProviderSession {
             b.gap(ObservationGap::Invalidated);
             return b;
         }
+        // R5-3: pending retries drain FIRST — before the release
+        // poll, before validation, before the ready fast path. A
+        // cleared validation must not strand a disarmed target
+        // (the fast path would skip it forever): the deferred
+        // retire is re-driven here, every reconcile, until it
+        // completes.
+        self.drain_pending_retires(records, &mut b);
         // R3-2: worker-gated lazy release — an armed gate releases
         // to the setup floors only on worker-confirmed close of
         // the retired links (non-blocking; a full queue or dead
@@ -3568,10 +3744,16 @@ impl ProviderSession {
         // retry (visible gap here; the validation loop re-fires
         // it next drain).
         if let StartupRetire::Deferred(links) = outcome {
+            // R5-3: persist the startup retry intent (a cleared
+            // validation must not strand disarmed rows — the
+            // next reconcile drains it first).
+            self.pending_startup.insert(pid);
             fd_dropper().note_deferred(links);
             b.gap(ObservationGap::SamplingPartial);
             return outcome;
         }
+        // R5-3: completion clears the startup retry intent.
+        self.pending_startup.remove(&pid);
         // R3-2: queued startup victims re-arm past any stale
         // barrier like any retire's (the poll-time veto guards
         // live spend, not the arming). Sync-closed or victimless
@@ -3581,23 +3763,33 @@ impl ProviderSession {
         }
         outcome
     }
-    /// R4-4: close teardown-collected links off the poll path —
-    /// worker offload when it absorbs, else a detached closer
-    /// thread. A failed disarm (R3-1 safety: the probes may
-    /// still be armed) or a closer-thread spawn failure falls
-    /// back to counted synchronous close. Never panics (called
-    /// from `Drop` — every step is fallible-safe).
-    fn close_teardown_links(disarmed: bool, links: Vec<OwnedFd>) {
-        use std::sync::atomic::Ordering::Relaxed;
+    /// R5-1: shared off-path close for teardown + suspend —
+    /// worker offload when it absorbs (charged + barrier-tracked
+    /// like any retire), else a CHARGED synchronous close
+    /// (close-then-release per batch, counted by cause in
+    /// `sync_fds`). Bounded: zero new threads (the closer
+    /// population is the one worker); accounted: the retention
+    /// stays charged until the close completes on every arm;
+    /// tracked: worker closes are barrier-covered, synchronous
+    /// closes are proven at return. A failed disarm (R3-1
+    /// safety: the probes may still be armed) bypasses the probe
+    /// and always takes the charged-sync arm. Never panics
+    /// (called from `Drop` — every step is fallible-safe).
+    /// Same-thread contract (inherited from R4-4): the
+    /// probe→offload pair is exact on the coordinator poll
+    /// thread (the worker only frees); concurrently racing
+    /// library sessions could interleave into `offload`'s own
+    /// backstops (pre-existing property, out of scope).
+    fn close_offpath_links(
+        disarmed: bool,
+        links: Vec<OwnedFd>,
+        sync_fds: &std::sync::atomic::AtomicU64,
+    ) {
         if links.is_empty() {
             return;
         }
         if !disarmed {
-            fd_dropper()
-                .shared
-                .drop_sync_fds
-                .fetch_add(links.len() as u64, Relaxed);
-            drop(links);
+            Self::close_charged_sync_all(links, sync_fds);
             return;
         }
         let dropper = fd_dropper();
@@ -3605,20 +3797,26 @@ impl ProviderSession {
             dropper.offload(links);
             return;
         }
-        let n = links.len() as u64;
-        match std::thread::Builder::new()
-            .name("osslscope-drop-closer".to_owned())
-            .spawn(move || drop(links))
-        {
-            Ok(_) => {
-                dropper.shared.drop_detached_fds.fetch_add(n, Relaxed);
-            }
-            // Spawn failed: the un-run closure (with its links)
-            // drops here — counted synchronous close
-            // (recovery-oriented: thread exhaustion frees fds).
-            Err(_) => {
-                dropper.shared.drop_sync_fds.fetch_add(n, Relaxed);
-            }
+        Self::close_charged_sync_all(links, sync_fds);
+    }
+    /// R5-1: charged synchronous close of all `links`, one
+    /// pre-charged batch at a time (R4-2b charge order,
+    /// R4-2a close order — see `close_charged_sync`), counted by
+    /// cause. The teardown/suspend saturation backstop: honest
+    /// backpressure (charged) with at-return proof (tracked).
+    fn close_charged_sync_all(links: Vec<OwnedFd>, sync_fds: &std::sync::atomic::AtomicU64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dropper = fd_dropper();
+        let mut pending = links;
+        while !pending.is_empty() {
+            let n = pending.len().min(DROP_LINKS_PER_MESSAGE);
+            let chunk: Vec<OwnedFd> = pending.drain(..n).collect();
+            dropper
+                .shared
+                .backlog_charged
+                .fetch_add(worker_batch_bytes(), Relaxed);
+            FdDropper::close_charged_sync(chunk, &dropper.shared, || {});
+            sync_fds.fetch_add(n as u64, Relaxed);
         }
     }
     /// R3-1: startup-only retirement with injectable CONFIG
@@ -4468,10 +4666,10 @@ impl ProviderSession {
 impl Drop for ProviderSession {
     fn drop(&mut self) {
         if self.final_drain || !self.gate.admitting() {
-            // R4-4 teardown: disarm every pid, then close
-            // off-path (worker preferred, detached thread past
-            // saturation — never a synchronous clear on the
-            // teardown path).
+            // R5-1 teardown: disarm every pid, then close
+            // through the shared off-path helper (worker
+            // preferred, charged synchronous backstop past
+            // saturation — bounded, accounted and proven).
             let pids: Vec<_> = self
                 .targets
                 .keys()
@@ -4489,7 +4687,7 @@ impl Drop for ProviderSession {
                     self.targets.get(&pid),
                 );
                 let links = drain_pid_links(&mut self.startup, &mut self.targets, pid);
-                Self::close_teardown_links(disarmed, links);
+                Self::close_offpath_links(disarmed, links, &fd_dropper().shared.drop_sync_fds);
             }
             return;
         }
@@ -4501,14 +4699,15 @@ impl Drop for ProviderSession {
             .collect();
         let mut b = ObservationBatch::default();
         for pid in pids {
-            // R4-4: a retire deferred at seal keeps its target —
-            // collect the pinned links for a detached close (the
-            // session is dying; no retry is possible). The
-            // deferred rows are already disarmed (the retire
-            // disarms before probing), so the late close is safe.
+            // R5-1: a retire deferred at seal keeps its target —
+            // collect the pinned links for the shared off-path
+            // close (the session is dying; no retry is
+            // possible). The deferred rows are already disarmed
+            // (the retire disarms before probing), so the late
+            // close is safe.
             if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
                 let links = drain_pid_links(&mut self.startup, &mut self.targets, pid);
-                Self::close_teardown_links(true, links);
+                Self::close_offpath_links(true, links, &fd_dropper().shared.drop_sync_fds);
             }
         }
     }
@@ -5426,6 +5625,151 @@ mod tests {
             0,
             "sync-dead must roll back its pre-charge"
         );
+    }
+    /// R5-1: a genuinely saturated dropper — spillover full (one
+    /// batch held + charged, worker-less) — so the off-path
+    /// saturation test probes REAL saturation. Twin of
+    /// `startup_api_controls::spill_exhausted_dropper` (kept
+    /// local: no shared test-helper churn).
+    fn saturated_spill_dropper() -> super::FdDropper {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dropper = super::FdDropper::with_spawner(Box::new(|_, _| Err(())), 1, 1);
+        let fd: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        {
+            let mut spill = dropper
+                .shared
+                .spillover
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            spill.0.push(vec![fd]);
+            spill.1 = spill.1.saturating_add(super::worker_batch_bytes());
+        }
+        dropper
+            .shared
+            .backlog_charged
+            .fetch_add(super::worker_batch_bytes(), Relaxed);
+        assert!(
+            !dropper.can_absorb_links(1),
+            "exhausted dropper must probe false (premise)"
+        );
+        dropper
+    }
+    #[test]
+    fn r51_charged_sync_releases_charge_after_close() {
+        // R5-1: the off-path charged synchronous close drops
+        // FIRST, then releases (R4-2a order) — at the instant the
+        // peer observes EOF the charge is still held (a pre-close
+        // release lets another admission sample zero backlog
+        // against live kernel retention). The hook sleeps to prove
+        // the charge holds ACROSS the close duration (controlled
+        // slow close, deterministic — same thread, no timing race).
+        use std::sync::atomic::Ordering::Relaxed;
+        let shared = std::sync::Arc::new(super::DropperShared::new());
+        let batch = super::worker_batch_bytes();
+        shared.backlog_charged.fetch_add(batch, Relaxed);
+        let (fd, mut peer) = socket_fd();
+        super::FdDropper::close_charged_sync(vec![fd], &shared, || {
+            assert_closed(&mut peer);
+            assert_eq!(
+                shared.backlog_charged.load(Relaxed),
+                batch,
+                "charge released before the close completed"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            assert_eq!(
+                shared.backlog_charged.load(Relaxed),
+                batch,
+                "charge released during the close"
+            );
+        });
+        assert_eq!(shared.backlog_charged.load(Relaxed), 0);
+    }
+    #[test]
+    fn r51_saturated_teardown_closes_charged_and_proven() {
+        // R5-1: a SATURATED teardown (spillover full, worker-less)
+        // closes inline, charged across the close (close-then-
+        // release) and proven at return — never an uncharged,
+        // untracked detached thread. Deterministic: the counters
+        // (not timing) distinguish the paths.
+        use std::sync::atomic::Ordering::Relaxed;
+        let dropper: &'static super::FdDropper = Box::leak(Box::new(saturated_spill_dropper()));
+        super::with_test_dropper(dropper, || {
+            let (fd, mut peer) = socket_fd();
+            super::ProviderSession::close_offpath_links(
+                true,
+                vec![fd],
+                &dropper.shared.drop_sync_fds,
+            );
+            assert_closed(&mut peer);
+            assert_eq!(
+                dropper.shared.drop_sync_fds.load(Relaxed),
+                1,
+                "saturated teardown must take the counted charged-sync backstop"
+            );
+            // No detached closer exists anymore (the R4-4 spawn is
+            // deleted — a thread per saturated teardown cannot
+            // recur): closed-at-return plus the backstop count
+            // prove the routing.
+            // The spill-fill charge (1 batch) is untouched; the
+            // teardown's own charge released after its close.
+            assert_eq!(
+                dropper.shared.backlog_charged.load(Relaxed),
+                super::worker_batch_bytes()
+            );
+        });
+    }
+    #[test]
+    fn r51_queued_teardown_joins_completion_tracking() {
+        // R5-1: an ABSORBABLE teardown offloads to the worker
+        // (charged while open) and joins completion tracking: the
+        // barrier cannot ack while the victim is open (no
+        // ack-while-open), the backlog stays nonzero while the
+        // victim is open (no zero-while-open), and the release
+        // proves the close (ack + zero + EOF together).
+        use std::sync::atomic::Ordering::Relaxed;
+        let batch = super::worker_batch_bytes();
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let dropper: &'static super::FdDropper = Box::leak(Box::new(
+            super::FdDropper::with_spawner(gated_spawner(gate_rx, taken_tx), 2, 2),
+        ));
+        super::with_test_dropper(dropper, || {
+            let (fd, mut peer) = socket_fd();
+            super::ProviderSession::close_offpath_links(
+                true,
+                vec![fd],
+                &dropper.shared.drop_sync_fds,
+            );
+            taken_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("worker takes the teardown victim");
+            assert_open(&mut peer);
+            assert_eq!(
+                dropper.shared.backlog_charged.load(Relaxed),
+                batch,
+                "queued teardown must stay charged while open"
+            );
+            assert!(
+                dropper
+                    .flush_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "barrier must not ack while the teardown victim is open"
+            );
+            assert_open(&mut peer);
+            // Release every parked message: the victim, the
+            // timed-out flush's stale barrier (acked into void),
+            // and the final flush's barrier (the gate parks per
+            // message, barriers included).
+            for _ in 0..3 {
+                gate_tx.send(()).unwrap();
+            }
+            dropper
+                .flush_timeout(std::time::Duration::from_secs(10))
+                .expect("flush after release");
+            assert_eq!(dropper.shared.backlog_charged.load(Relaxed), 0);
+            assert_closed(&mut peer);
+            assert_eq!(dropper.shared.drop_sync_fds.load(Relaxed), 0);
+        });
     }
     #[test]
     fn r44_can_absorb_tracks_exhaustion() {
@@ -16581,10 +16925,297 @@ mod startup_api_controls {
         );
     }
     #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r53_deferred_retire_retries_on_next_reconcile() {
+        // R5-3: a retire deferred past worker saturation (via the
+        // prearm event-path caller — a roles conflict retires a
+        // HEALTHY target) persists its retry intent: the next
+        // reconcile re-retires FIRST, before validation skips the
+        // healthy-but-disarmed target via the ready fast path —
+        // instead of stranding it disarmed forever.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        // Premise: the healthy target reconciles clean — kept and
+        // ready (validation passes, the fast path skips it).
+        let kept = session.reconcile_records(std::slice::from_ref(&fixture.record));
+        assert!(
+            session.targets.get(&pid).is_some_and(|t| t.ready),
+            "healthy target must reconcile clean (premise), gaps={:?}",
+            kept.gaps
+        );
+        assert!(
+            session.pending_retire.is_empty(),
+            "no deferral before saturation (premise)"
+        );
+        // Fresh candidates for the conflicting prearm (the child
+        // is still held, so the query site resolves again).
+        // Opened by path — a second `file()` would rewrite the
+        // input and flip the mapped process's file stamp
+        // (ObjectChanged), rescuing the strand this test stages.
+        let tmp = ObservationBudget::default();
+        let cands = objects::startup_candidates(
+            objects::StartupProcess::held(&fixture.child).unwrap(),
+            std::fs::File::open(fixture._file.input_path()).unwrap(),
+            &tmp,
+            None,
+        )
+        .unwrap()
+        .apis;
+        assert!(
+            !cands.is_empty(),
+            "conflicting prearm needs candidates (premise)"
+        );
+        // Poison the query site's role: the prearm below observes
+        // the same key under its real id and conflicts.
+        let site = session.targets[&pid].attachments[0].site.clone();
+        let key = super::role_site(pid, fixture.record.starttime, &site);
+        let observed = session
+            .roles
+            .observe(key, super::c::PUBLIC_QUERY + 1000, &session.budget);
+        assert_eq!(observed, Ok(true), "role poison must stick (premise)");
+        // Deferral, through the prearm event-path caller, under a
+        // genuinely saturated worker (spillover full, worker-less).
+        let saturated: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let conflict = super::with_test_dropper(saturated, || {
+            session.prearm_startup(
+                cands,
+                Instant::now() + Duration::from_secs(5),
+                &cancel,
+                super::PrearmLinks::Reserve,
+            )
+        });
+        assert!(
+            matches!(conflict, Err(ObservationGap::AmbiguousSite)),
+            "poisoned prearm must conflict, got {conflict:?}"
+        );
+        assert_eq!(
+            session.pending_retire.get(&pid),
+            Some(&ObservationGap::Invalidated),
+            "deferral must persist the retry intent with its gap"
+        );
+        assert!(
+            session.targets.contains_key(&pid),
+            "deferred retire must keep its target"
+        );
+        use std::io::Read;
+        assert_eq!(
+            fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "deferred link must stay open"
+        );
+        // Clear: a live worker drains — the next reconcile
+        // re-retires from the pending set FIRST (not stranded).
+        let live: &'static super::FdDropper = Box::leak(Box::new(super::FdDropper::production()));
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let batch = super::with_test_dropper(live, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            session.pending_retire.is_empty(),
+            "retry must clear the pending set (stranded: {:?})",
+            session.pending_retire
+        );
+        // The retry re-retires the kept target (generation 19 is
+        // gone); the re-add loop then re-acquires the live child
+        // (fresh generation 1 — the pre-exec record carries the
+        // test binary's acquirable modules).
+        assert_eq!(
+            session.targets.get(&pid).map(|t| t.generation),
+            Some(1),
+            "retry must re-retire the kept target (stranded gen 19)"
+        );
+        assert!(
+            batch.gaps.contains(&ObservationGap::Invalidated),
+            "retry reports its retire gap, got {:?}",
+            batch.gaps
+        );
+        assert!(
+            !session.release_gate.released(),
+            "victim-detaching retry must arm the release gate"
+        );
+        live.flush_timeout(std::time::Duration::from_secs(10))
+            .expect("worker proves the retry close");
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r54_suspend_offloads_close_off_poll_path() {
+        // R5-4: suspension moves the link close off the poll path
+        // (worker offload, charged + barrier-tracked) while
+        // keeping its custody (refreshing handoff; aliases and
+        // learned sites untouched) and emitting no gaps. The
+        // unknown window stays the coordinator's ledger entry —
+        // the session side is unchanged apart from the close.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        session.learned.insert((pid, 1, 2, 3, 4));
+        // Parked worker: holds the first message unclosed until
+        // released, then drains normally (resawns drain plainly).
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel();
+        let (taken_tx, taken_rx) = std::sync::mpsc::channel();
+        let gate = std::sync::Mutex::new(Some((gate_rx, taken_tx)));
+        let parked: &'static super::FdDropper =
+            Box::leak(Box::new(super::FdDropper::with_spawner(
+                Box::new(move |rx, shared| {
+                    let pair = gate.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    std::thread::spawn(move || {
+                        let mut first = true;
+                        for msg in rx {
+                            if first {
+                                first = false;
+                                if let Some((g, taken)) = &pair {
+                                    taken.send(()).ok();
+                                    g.recv().ok();
+                                }
+                            }
+                            match msg {
+                                super::DropperMsg::Links(links) => {
+                                    super::FdDropper::release_links_observed(links, &shared, || {});
+                                }
+                                super::DropperMsg::Barrier(ack) => {
+                                    super::FdDropper::drain_spillover(&shared);
+                                    let _ = ack.send(());
+                                }
+                            }
+                            super::FdDropper::drain_spillover(&shared);
+                        }
+                        super::FdDropper::drain_spillover(&shared);
+                    });
+                    Ok(())
+                }),
+                2,
+                2,
+            )));
+        let elapsed = super::with_test_dropper(parked, || {
+            let start = Instant::now();
+            session.suspend_target(pid);
+            start.elapsed()
+        });
+        // Prompt return (bounded — documents intent; the open /
+        // charged / pends asserts below discriminate, since fast
+        // fixture FDs close fast on every path).
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "suspend must not block the poll path, took {elapsed:?}"
+        );
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        // Discriminators: the links close ELSEWHERE (still open
+        // here), charged, while custody is kept.
+        assert_eq!(
+            fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "suspended links must close off the poll path (still open here)"
+        );
+        assert_eq!(
+            parked.shared.backlog_charged.load(Relaxed),
+            super::worker_batch_bytes(),
+            "suspended links must stay charged while open"
+        );
+        assert!(
+            !session.targets.contains_key(&pid),
+            "suspend must evict the target"
+        );
+        assert!(
+            session.refreshing.contains_key(&pid),
+            "suspend must keep the refresh handoff (custody)"
+        );
+        assert!(
+            session.learned.contains(&(pid, 1, 2, 3, 4)),
+            "suspend must keep learned sites (custody)"
+        );
+        taken_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("worker takes the suspended victim");
+        assert!(
+            parked
+                .flush_timeout(std::time::Duration::from_millis(100))
+                .is_err(),
+            "barrier must not ack while the suspended victim is open"
+        );
+        gate_tx.send(()).unwrap();
+        parked
+            .flush_timeout(std::time::Duration::from_secs(10))
+            .expect("worker proves the suspend close");
+        assert_eq!(parked.shared.backlog_charged.load(Relaxed), 0);
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+        assert_eq!(parked.shared.suspend_sync_fds.load(Relaxed), 0);
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r54_suspend_saturated_closes_charged_inline() {
+        // R5-4 backstop guard: past worker saturation suspension
+        // closes inline — charged across the close, counted,
+        // custody kept (honest backpressure with at-return proof,
+        // the same bar as the teardown backstop).
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        let exhausted: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        super::with_test_dropper(exhausted, || {
+            session.suspend_target(pid);
+        });
+        use std::io::Read as _;
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+        assert_eq!(
+            exhausted.shared.suspend_sync_fds.load(Relaxed),
+            1,
+            "saturated suspend must take the counted charged-sync backstop"
+        );
+        assert_eq!(
+            exhausted.shared.backlog_charged.load(Relaxed),
+            super::worker_batch_bytes(),
+            "spill-fill charge untouched; the suspend charge released after its close"
+        );
+        assert!(
+            !session.targets.contains_key(&pid),
+            "suspend must evict the target"
+        );
+        assert!(
+            session.refreshing.contains_key(&pid),
+            "suspend must keep the refresh handoff (custody)"
+        );
+    }
+    #[test]
     fn r44_drop_collects_links_without_closing() {
         // R4-4: session teardown collects retained links WITHOUT
-        // closing them — the close itself always leaves the poll
-        // path (worker offload, else a detached closer thread).
+        // closing them — the close itself leaves through the
+        // shared off-path helper (worker offload, else a charged
+        // synchronous backstop).
         let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let mut fixture = reconcile_fixture(true);
         let pid = fixture.child.pid();

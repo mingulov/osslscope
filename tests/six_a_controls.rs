@@ -2186,15 +2186,32 @@ fn reuse_leg(binary: &Path, held: bool) {
     let _ = reuser.kill();
     let _ = reuser.wait();
     eprintln!("kinds: {:?}", kinds(&rows));
-    // N12 held guard: the rephase proves EXIT-after-admission only
-    // when no connector datagram was dropped — a dropped EXIT
-    // would make the quarantine assertion vacuous (bomblet exits
-    // quarantine too). Drops void the adversarial stimulus.
+    // R5(f) held guard (redesigned — option (ii)): unrelated
+    // connector drops no longer void the leg. The verdict below
+    // asserts `admitted_exit_artifacts >= 1`, which proves the
+    // PARTICULAR post-admission EXIT — not absence-of-drops:
+    // the artifact arm fires only for an EXIT whose subject pid
+    // names a live ADMITTED member with a matching fresh triple,
+    // and in this leg that can only be the occupant's EXIT (the
+    // observer follows the single `--pid` selection: bomblet
+    // `true` children are ineligible and recycle losers live
+    // ~50µs while stopped, so neither is ever admitted; the
+    // winner holds the number alive past observer exit, so no
+    // second EXIT for the number exists). Drops of storm
+    // datagrams can only fail the leg (a dropped occupant EXIT
+    // leaves the counter at zero), never pass it vacuously.
+    // The void path remains ONLY as the genuine-unprovable
+    // fallback: artifact absent AND drops present (the EXIT may
+    // have been dropped). Artifact absent with zero drops falls
+    // through and FAILS (delivery fully observed — the scenario
+    // did not stage or the product regressed).
     if held {
         let drops = end_signal_dropped(&rows);
-        if drops > 0 {
+        let artifacts = end_admitted_exit_artifacts(&rows);
+        eprintln!("held leg: signal_dropped={drops} admitted_exit_artifacts={artifacts}");
+        if artifacts == 0 && drops > 0 {
             eprintln!(
-                "INCONCLUSIVE: held leg dropped {drops} connector datagrams (EXIT delivery unproven)"
+                "INCONCLUSIVE: held leg cannot prove the delayed EXIT (no post-admission artifact; {drops} connector datagrams dropped)"
             );
             return;
         }
@@ -2309,10 +2326,10 @@ fn reuse_leg(binary: &Path, held: bool) {
         // the ADMITTED replacement (live-member artifact), not
         // quarantined pre-admission. Queue depth alone proves
         // nothing; a zero here fails the control (the scenario did
-        // not stage), it never passes vacuously.
-        let artifacts = end
-            .and_then(|e| e["session_loss"]["admitted_exit_artifacts"].as_u64())
-            .unwrap_or(0);
+        // not stage), it never passes vacuously. R5(f): this
+        // verdict now EXECUTES decisively (unrelated drops no
+        // longer void the leg — see the guard above).
+        let artifacts = end_admitted_exit_artifacts(&rows);
         assert!(
             artifacts >= 1,
             "delayed EXIT never bound post-admission (admitted_exit_artifacts={artifacts}): \
@@ -2523,6 +2540,16 @@ fn end_signal_dropped(rows: &[serde_json::Value]) -> u64 {
     rows.iter()
         .find(|r| r["kind"] == "end")
         .and_then(|e| e["session_loss"]["signal_dropped"].as_u64())
+        .unwrap_or(0)
+}
+/// R5(f): the held leg's specific-EXIT proof — post-admission
+/// EXIT artifacts quarantined against a live admitted member
+/// (pid + fresh-triple bound; see the guard site for why only
+/// the occupant's EXIT can increment it in this leg).
+fn end_admitted_exit_artifacts(rows: &[serde_json::Value]) -> u64 {
+    rows.iter()
+        .find(|r| r["kind"] == "end")
+        .and_then(|e| e["session_loss"]["admitted_exit_artifacts"].as_u64())
         .unwrap_or(0)
 }
 #[test]

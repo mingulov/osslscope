@@ -170,6 +170,13 @@ data_target: .quad 0
         fs::write(self.directory.join("input.so"), &self.image).unwrap();
         File::open(self.directory.join("input.so")).unwrap()
     }
+    /// R5-3: read-only handle to the written input — unlike
+    /// `file()`, opening by path rewrites nothing, so a mapped
+    /// process's file stamp stays valid across repeated
+    /// candidate scans in one test.
+    pub fn input_path(&self) -> std::path::PathBuf {
+        self.directory.join("input.so")
+    }
     pub fn size(&mut self, name: &str, size: u64) {
         let at = self.symbols[name] + 16;
         self.image[at..at + 8].copy_from_slice(&size.to_le_bytes());
