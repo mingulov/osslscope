@@ -76,14 +76,17 @@ const PENDING_EPOCH_BYTES: usize = PENDING_EPOCH_CAP * PENDING_EPOCH_ENTRY_BYTES
 const PENDING_DROP_ENTRY_BYTES: usize = 256;
 const PENDING_DROPS_BYTES: usize = PENDING_DROPS_CAP * PENDING_DROP_ENTRY_BYTES;
 // R3-4b: demoted-context table (same value shape and cap as the
-// primary stash) plus the epoch-tombstone set (key only + slack,
-// 64 B key → 256 B flat). Both ride the staging lease and the
-// layout pin below.
+// primary stash) plus the epoch-tombstone table (R4-3: key +
+// bounded conservative summary, below). Both ride the staging
+// lease and the layout pin below. The tombstone flat doubles to
+// 512 B to carry the summary while the cap halves to 512 — the
+// table total stays 256 KiB, so the staging account (5.5 MiB)
+// and the §3.1 amendment are unchanged.
 const EVICTED_EPOCH_CAP: usize = PENDING_EPOCH_CAP;
 const EVICTED_EPOCH_ENTRY_BYTES: usize = PENDING_EPOCH_ENTRY_BYTES;
 const EVICTED_EPOCH_BYTES: usize = EVICTED_EPOCH_CAP * EVICTED_EPOCH_ENTRY_BYTES;
-const EPOCH_TOMBSTONE_CAP: usize = PENDING_EPOCH_CAP;
-const EPOCH_TOMBSTONE_ENTRY_BYTES: usize = 256;
+const EPOCH_TOMBSTONE_CAP: usize = 512;
+const EPOCH_TOMBSTONE_ENTRY_BYTES: usize = 512;
 const EPOCH_TOMBSTONE_BYTES: usize = EPOCH_TOMBSTONE_CAP * EPOCH_TOMBSTONE_ENTRY_BYTES;
 const STAGING_BYTES: usize = FOLLOW_BYTES
     + PENDING_EPOCH_BYTES
@@ -446,6 +449,11 @@ struct DeferredEntry {
     /// only inside `[admit_ns, now]` (trust-gated) — a delayed
     /// previous-occupant event can never advance it.
     admit_ns: u64,
+    /// R4-3: this entry carries a tombstone summary (consumed at
+    /// queue time) — its admission announces the compression
+    /// with one visible gap (the announcement rides the
+    /// admission, never the queueing).
+    tombstoned: bool,
 }
 /// 6A admission-attempt context (shared borrows only; admitted pids
 /// return via `admitted` for the caller's port bookkeeping).
@@ -1918,6 +1926,82 @@ enum StashAdvance {
     /// follow (the event binds to nothing — never applied).
     Stale,
 }
+/// R4-3: bounded conservative summary of a twice-evicted readmit
+/// context — the known epoch, the exact loss/deferred totals,
+/// the readmit context, and the ledger windows folded through
+/// the frozen coalescing rule into a single `coalesced_loss`
+/// cover span (+ the fold count). Readmission resumes from the
+/// summary (epoch/loss continue, never reset to 0/0); the
+/// admission announces the compression with one visible gap.
+/// Fixed size (no heap): key + summary + node slack fit the
+/// 512 B flat (see the staging layout pin).
+#[derive(Clone)]
+struct TombstoneSummary {
+    epoch: u64,
+    loss: u64,
+    deferred: DeferredSpan,
+    retire_ns: u64,
+    seal_tick: u64,
+    witness_ts: Option<u64>,
+    /// Folded cover span `[start, end)` over the dropped windows
+    /// (`None` when the ledger held no windows).
+    span: Option<(u64, u64)>,
+    coalesced: u64,
+}
+impl TombstoneSummary {
+    fn summarize(epoch: u64, ledger: &MemberLedger, ctx: ReadmitCtx) -> Self {
+        let mut span: Option<(u64, u64)> = None;
+        for w in ledger.windows.windows.iter() {
+            span = Some(match span {
+                None => (w.start_tick, w.end_tick),
+                Some((s, e)) => (s.min(w.start_tick), e.max(w.end_tick)),
+            });
+        }
+        Self {
+            epoch,
+            loss: ledger.loss,
+            deferred: ledger.deferred,
+            retire_ns: ctx.retire_ns,
+            seal_tick: ctx.seal_tick,
+            witness_ts: ctx.witness_ts,
+            span,
+            coalesced: ledger
+                .windows
+                .coalesced
+                .saturating_add(ledger.windows.windows.len() as u64),
+        }
+    }
+    fn materialize(&self) -> (u64, MemberLedger, ReadmitCtx) {
+        let mut windows = WindowStore::new(WINDOW_CAP);
+        if let Some((s, e)) = self.span {
+            windows.append(s, e, LossCause::CoalescedLoss);
+        }
+        windows.coalesced = self.coalesced;
+        (
+            self.epoch,
+            MemberLedger {
+                loss: self.loss,
+                deferred: self.deferred,
+                windows,
+            },
+            ReadmitCtx {
+                retire_ns: self.retire_ns,
+                seal_tick: self.seal_tick,
+                witness_ts: self.witness_ts,
+            },
+        )
+    }
+}
+/// R4-3: stashed readmit context with its provenance — a
+/// tombstone summary consumes only on actual admission success
+/// (its announcement rides the admission, never a pre-admission
+/// sample), and a pending/evicted hit drops any same-key
+/// tombstone as stale (same-key stash entries are always
+/// fresher — every exec advances the epoch).
+struct StashedCtx {
+    ctx: (u64, MemberLedger, ReadmitCtx),
+    tombstoned: bool,
+}
 /// 6A coordinator run state: observed set, deferred queue, loss
 /// baselines, per-tick flags and end tallies.
 struct RunState {
@@ -1935,12 +2019,20 @@ struct RunState {
     /// epoch-0 rebirth: readmission consults this table when the
     /// primary stash misses.
     evicted_epoch: BTreeMap<DeferredKey, (u64, MemberLedger, ReadmitCtx)>,
-    /// R3-4b: incarnations whose epoch history was fully dropped
-    /// (both tables overflowed under pathological churn). A later
-    /// admission announces the restart with a visible gap — never
-    /// a silent epoch-0 rebirth. Swept on death/reuse like the
+    /// R4-3: twice-evicted readmit contexts as bounded
+    /// conservative summaries (key → known epoch + loss
+    /// history, never a bare key). Readmission resumes from
+    /// the summary; the admission announces the compression
+    /// with one visible gap. Swept on death/reuse like the
     /// stash tables.
-    epoch_tombstones: BTreeSet<DeferredKey>,
+    epoch_tombstones: BTreeMap<DeferredKey, TombstoneSummary>,
+    /// R4-3: triple-churn amnesia — set once a tombstone
+    /// summary itself is forgotten (tombstone-table overflow).
+    /// Monotonic: the forgotten incarnation may reappear at any
+    /// later tick, so every later fresh admission carries an
+    /// unknown-history marker instead of a silent epoch-0
+    /// rebirth.
+    epoch_amnesia: bool,
     segments: u64,
     current_tick: u64,
     prev_tick: Option<u64>,
@@ -2014,7 +2106,8 @@ impl RunState {
             follow_pending: BTreeMap::new(),
             pending_epoch: BTreeMap::new(),
             evicted_epoch: BTreeMap::new(),
-            epoch_tombstones: BTreeSet::new(),
+            epoch_tombstones: BTreeMap::new(),
+            epoch_amnesia: false,
             segments: 0,
             current_tick: 0,
             prev_tick: None,
@@ -2393,7 +2486,7 @@ impl RunState {
                 self.evicted_epoch.remove(&key);
             }
         }
-        let keys: Vec<DeferredKey> = self.epoch_tombstones.iter().cloned().collect();
+        let keys: Vec<DeferredKey> = self.epoch_tombstones.keys().cloned().collect();
         for key in keys {
             if stash_key_dead(&key) {
                 self.epoch_tombstones.remove(&key);
@@ -2516,6 +2609,10 @@ impl RunState {
         key: DeferredKey,
         ctx: (u64, MemberLedger, ReadmitCtx),
     ) -> io::Result<()> {
+        // R4-3: the new stash supersedes any same-key tombstone
+        // (the stashed exec is newer, so its epoch is higher —
+        // the summary is stale and must not resurrect later).
+        self.epoch_tombstones.remove(&key);
         self.pending_epoch.insert(key, ctx);
         while self.pending_epoch.len() > PENDING_EPOCH_CAP {
             let Some(oldest) = self.pending_epoch.keys().next().cloned() else {
@@ -2540,35 +2637,70 @@ impl RunState {
         }
         Ok(())
     }
-    /// R3-4b: read the stashed exec-readmit context for `key`
-    /// (primary stash, else the demoted table). Cloned: the caller
-    /// consumes on success and retries on failure.
-    fn peek_exec_ctx(&self, key: &DeferredKey) -> Option<(u64, MemberLedger, ReadmitCtx)> {
-        self.pending_epoch
-            .get(key)
-            .or_else(|| self.evicted_epoch.get(key))
-            .cloned()
+    /// R4-3: read the stashed exec-readmit context for `key`
+    /// (primary stash, else the demoted table, else the
+    /// tombstone summary — materialized). Cloned: the caller
+    /// consumes on admission success and retries on failure. A
+    /// pending/evicted hit wins over any same-key tombstone
+    /// (always fresher — every exec advances the epoch).
+    fn peek_exec_ctx(&self, key: &DeferredKey) -> Option<StashedCtx> {
+        if let Some(ctx) = self.pending_epoch.get(key) {
+            return Some(StashedCtx {
+                ctx: ctx.clone(),
+                tombstoned: false,
+            });
+        }
+        if let Some(ctx) = self.evicted_epoch.get(key) {
+            return Some(StashedCtx {
+                ctx: ctx.clone(),
+                tombstoned: false,
+            });
+        }
+        self.epoch_tombstones.get(key).map(|summary| StashedCtx {
+            ctx: summary.materialize(),
+            tombstoned: true,
+        })
     }
-    /// R3-4b: consume the stashed exec-readmit context for `key`
-    /// from whichever table holds it.
+    /// R4-3: consume the stashed exec-readmit context for `key`
+    /// from whichever table holds it. A same-key tombstone is
+    /// always dropped too — either it was just consumed live
+    /// (tombstone admission, announced by the caller) or it is
+    /// stale (a pending/evicted hit is fresher) — either way it
+    /// must not resurrect later.
     fn consume_exec_ctx(&mut self, key: &DeferredKey) {
         self.pending_epoch.remove(key);
         self.evicted_epoch.remove(key);
+        self.epoch_tombstones.remove(key);
     }
-    /// R3-4b: announce a fresh-epoch admission for an incarnation
-    /// whose epoch history was fully dropped (tombstoned): one
-    /// visible gap, then the tombstone is gone (announced once).
-    /// Returns true when a restart was announced.
-    fn note_fresh_admission<W: Write>(
+    /// R4-3: admission-success bookkeeping — consume the stashed
+    /// context and announce a tombstone-summary admission (the
+    /// windows folded through the lossy summary) or an amnesiac
+    /// fresh admission (history possibly forgotten) with one
+    /// visible gap. Called ONLY on actual admission success —
+    /// never on a pre-admission sample, never on a failed open.
+    fn note_admitted<W: Write>(
         &mut self,
         out: &mut Output<'_, W>,
         identity: &Incarnation,
-    ) -> io::Result<bool> {
-        if !self.epoch_tombstones.remove(&DeferredKey::from(identity)) {
-            return Ok(false);
+        tombstoned: bool,
+        fresh: bool,
+    ) -> io::Result<()> {
+        self.consume_exec_ctx(&DeferredKey::from(identity));
+        if tombstoned || (fresh && self.epoch_amnesia) {
+            emit_membership_unknown_gap(out, identity.pid)?;
         }
-        emit_membership_unknown_gap(out, identity.pid)?;
-        Ok(true)
+        Ok(())
+    }
+    /// R4-3: triple-churn amnesia marker — a fresh admission
+    /// after forgotten history carries an unknown-history
+    /// window over the run so far (never a silent epoch-0
+    /// rebirth with an empty ledger).
+    fn apply_amnesia(amnesia: bool, ledger: &mut MemberLedger, tick: u64) {
+        if amnesia {
+            ledger
+                .windows
+                .append(0, tick.saturating_add(1), LossCause::MembershipUnknown);
+        }
     }
     /// R3-4a: advance a stashed readmit context for a witnessed
     /// second exec (stranger path): the stashed image was never
@@ -2576,10 +2708,13 @@ impl RunState {
     /// amendment — drain order holds: first seal < this middle <
     /// the future readmission) and the stash moves to the next
     /// epoch with the newest witness. Consults the primary stash
-    /// first, then the demoted table (advanced in place — no
-    /// promotion cascade under pressure). A trusted timestamp
-    /// predating the stashed seal is a stale previous-occupant
-    /// event (N6 exact window): quarantine, never apply.
+    /// first, then the demoted table, then the tombstone summary
+    /// (R4-3: advanced in place like the rest — a tombstoned
+    /// incarnation's second exec still seals its middle and
+    /// advances; no promotion cascade under pressure). A trusted
+    /// timestamp predating the stashed seal is a stale
+    /// previous-occupant event (N6 exact window): quarantine,
+    /// never apply.
     fn advance_stash_for_exec<W: Write>(
         &mut self,
         out: &mut Output<'_, W>,
@@ -2590,35 +2725,49 @@ impl RunState {
         let key = DeferredKey::from(identity);
         let in_pending = self.pending_epoch.contains_key(&key);
         let in_evicted = !in_pending && self.evicted_epoch.contains_key(&key);
-        if !in_pending && !in_evicted {
+        let in_tomb = !in_pending && !in_evicted && self.epoch_tombstones.contains_key(&key);
+        if !in_pending && !in_evicted && !in_tomb {
             return Ok(StashAdvance::None);
         }
         let (epoch, ledger, ctx) = if in_pending {
             self.pending_epoch.get(&key).expect("probed stash").clone()
-        } else {
+        } else if in_evicted {
             self.evicted_epoch.get(&key).expect("probed stash").clone()
+        } else {
+            self.epoch_tombstones
+                .get(&key)
+                .expect("probed stash")
+                .materialize()
         };
         if trust_reviewed && ts.is_some_and(|ts| ts < ctx.retire_ns) {
             self.unattributed = self.unattributed.saturating_add(1);
             return Ok(StashAdvance::Stale);
         }
         out.emit_middle_seal(identity, epoch, &ledger)?;
-        let slot = if in_pending {
-            self.pending_epoch.get_mut(&key).expect("probed stash")
+        if in_pending {
+            let slot = self.pending_epoch.get_mut(&key).expect("probed stash");
+            slot.0 = epoch.saturating_add(1);
+            slot.2.witness_ts = ts;
+        } else if in_evicted {
+            let slot = self.evicted_epoch.get_mut(&key).expect("probed stash");
+            slot.0 = epoch.saturating_add(1);
+            slot.2.witness_ts = ts;
         } else {
-            self.evicted_epoch.get_mut(&key).expect("probed stash")
-        };
-        slot.0 = epoch.saturating_add(1);
-        slot.2.witness_ts = ts;
+            let summary = self.epoch_tombstones.get_mut(&key).expect("probed stash");
+            summary.epoch = epoch.saturating_add(1);
+            summary.witness_ts = ts;
+        }
         Ok(StashAdvance::Advanced)
     }
-    /// R3-4b: demote a stash-overflow victim into the evicted
+    /// R4-3: demote a stash-overflow victim into the evicted
     /// table (history preserved, not deleted). A full evicted
-    /// table drops ITS oldest into a tombstone (visible gap now,
-    /// restart announced at admission); a full tombstone set drops
-    /// its oldest with a visible gap (triple-churn residual: three
-    /// visible gaps precede any such incarnation, documented in
-    /// the T7.2 fix-3 report).
+    /// table compacts ITS oldest into a tombstone summary (known
+    /// epoch + loss history, visible gap now, compression
+    /// announced at admission); a full tombstone table forgets
+    /// its oldest summary with a visible gap AND latches the
+    /// triple-churn amnesia flag (every later fresh admission
+    /// carries an unknown-history marker — forgotten history
+    /// never re-authorizes a silent epoch-0 rebirth).
     fn demote_evicted<W: Write>(
         &mut self,
         out: &mut Output<'_, W>,
@@ -2630,13 +2779,17 @@ impl RunState {
             let Some(oldest) = self.evicted_epoch.keys().next().cloned() else {
                 break;
             };
-            self.evicted_epoch.remove(&oldest);
-            self.epoch_tombstones.insert(oldest.clone());
+            let Some(victim) = self.evicted_epoch.remove(&oldest) else {
+                break;
+            };
+            let summary = TombstoneSummary::summarize(victim.0, &victim.1, victim.2);
+            self.epoch_tombstones.insert(oldest.clone(), summary);
             while self.epoch_tombstones.len() > EPOCH_TOMBSTONE_CAP {
-                let Some(ancient) = self.epoch_tombstones.iter().next().cloned() else {
+                let Some(ancient) = self.epoch_tombstones.keys().next().cloned() else {
                     break;
                 };
                 self.epoch_tombstones.remove(&ancient);
+                self.epoch_amnesia = true;
                 emit_membership_unknown_gap(out, ancient.pid)?;
             }
             emit_membership_unknown_gap(out, oldest.pid)?;
@@ -2781,7 +2934,7 @@ impl RunState {
     fn queue_insert(
         &mut self,
         identity: Incarnation,
-        exec_ctx: Option<(u64, MemberLedger, ReadmitCtx)>,
+        stashed: Option<StashedCtx>,
         reason: &'static str,
     ) {
         let tick = self.current_tick;
@@ -2792,8 +2945,9 @@ impl RunState {
             }
             return;
         }
-        let (epoch, marks, readmit, carried_loss, carried_deferred) = match exec_ctx {
-            Some((epoch, ledger, rctx)) => {
+        let (epoch, marks, readmit, carried_loss, carried_deferred, tombstoned) = match stashed {
+            Some(stashed) => {
+                let (epoch, ledger, rctx) = stashed.ctx;
                 let mut marks = WindowStore::new(DEFERRED_MARKS);
                 let mut carried = ledger.windows.windows.clone();
                 carried.sort_by_key(|w| (w.start_tick, w.end_tick));
@@ -2801,7 +2955,14 @@ impl RunState {
                     marks.append(w.start_tick, w.end_tick, w.cause);
                 }
                 marks.coalesced = marks.coalesced.saturating_add(ledger.windows.coalesced);
-                (epoch, marks, Some(rctx), ledger.loss, ledger.deferred)
+                (
+                    epoch,
+                    marks,
+                    Some(rctx),
+                    ledger.loss,
+                    ledger.deferred,
+                    stashed.tombstoned,
+                )
             }
             None => (
                 0,
@@ -2809,6 +2970,7 @@ impl RunState {
                 None,
                 0,
                 DeferredSpan::default(),
+                false,
             ),
         };
         self.consume_exec_ctx(&key);
@@ -2827,6 +2989,7 @@ impl RunState {
                 carried_loss,
                 carried_deferred,
                 admit_ns: LiveClock.monotonic_ns(),
+                tombstoned,
             },
         );
         while self.deferred.len() > DEFERRED_CAP {
@@ -2974,6 +3137,15 @@ impl RunState {
                 deferred: merge_deferred_spans(entry.carried_deferred, own),
                 windows: marks,
             };
+            // R4-3: a fully-fresh entry admitted after forgotten
+            // history carries the amnesia marker (a queued
+            // exec-readmit — readmit `Some`, tombstoned or not —
+            // has known history and needs none).
+            let fresh_head = entry.readmit.is_none();
+            if fresh_head {
+                Self::apply_amnesia(self.epoch_amnesia, &mut ledger, tick);
+            }
+            let flagged_head = entry.tombstoned;
             let (detail, floor) = match entry.readmit {
                 // Queued exec-readmit: the image transition defines
                 // the admission (the deferral span still rides
@@ -3029,11 +3201,17 @@ impl RunState {
             if !admitted_now {
                 // Open failed: back to the queue head with its
                 // history (retry next tick; the SessionGap is this
-                // tick's record, not a Limit).
+                // tick's record, not a Limit). The tombstone flag
+                // rides along — the announcement waits for the
+                // admission that eventually succeeds.
                 let mut back = entry;
                 back.last_tick = tick;
                 let rekey = DeferredKey::from(&identity);
                 self.deferred.insert(rekey, back);
+            } else {
+                // R4-3: the announcement rides the admission
+                // (tombstone compression or amnesiac fresh).
+                self.note_admitted(out, &identity, flagged_head, fresh_head)?;
             }
         }
         let mut newcomers: Vec<&ProcessRecord> = snapshot
@@ -3065,16 +3243,15 @@ impl RunState {
             }
             let identity = Incarnation::from(record);
             let stash_key = DeferredKey::from(&identity);
-            let exec_ctx = self.peek_exec_ctx(&stash_key);
-            if exec_ctx.is_none() {
-                // R3-4b: a fresh-epoch admission for an incarnation
-                // whose history was fully dropped announces the
-                // restart (no silent epoch-0 rebirth).
-                self.note_fresh_admission(out, &identity)?;
-            }
+            // R4-3: peek only — a tombstone summary consumes on
+            // actual admission success (or into a queued entry),
+            // never on a pre-admission sample: an ineligible (or
+            // untracing, or capped) sample must neither announce
+            // nor consume it.
+            let stashed = self.peek_exec_ctx(&stash_key);
             if !eligible(record) {
-                let (epoch, loss) = match &exec_ctx {
-                    Some((epoch, ledger, _)) => (*epoch, LossSummary::from_ledger(ledger)),
+                let (epoch, loss) = match &stashed {
+                    Some(stashed) => (stashed.ctx.0, LossSummary::from_ledger(&stashed.ctx.1)),
                     None => (0, LossSummary::empty()),
                 };
                 // Machine-record reason (base logic, frozen): only
@@ -3100,7 +3277,7 @@ impl RunState {
                 continue;
             }
             if !ctx.tracing {
-                let epoch = exec_ctx.as_ref().map(|c| c.0).unwrap_or(0);
+                let epoch = stashed.as_ref().map(|s| s.ctx.0).unwrap_or(0);
                 out.emit_membership(
                     &identity,
                     0,
@@ -3114,18 +3291,21 @@ impl RunState {
                 continue;
             }
             if self.active.len() >= ctx.max_active {
-                self.queue_insert(identity, exec_ctx, "active_limit");
+                self.queue_insert(identity, stashed, "active_limit");
                 continue;
             }
             // R3-2: the session lease reserves behind the live
             // worker-backlog charge (queued batches stay pooled).
             let backlog = crate::provider_observation::session::worker_backlog_charged();
             let Some(lease) = self.reserve_session(ctx.pool, ctx.reservation, backlog) else {
-                self.queue_insert(identity, exec_ctx, "global_state_limit");
+                self.queue_insert(identity, stashed, "global_state_limit");
                 continue;
             };
-            let (epoch, detail, ledger, floor) = match exec_ctx {
-                Some((epoch, mut ledger, rctx)) => {
+            let was_tombstoned = stashed.as_ref().is_some_and(|s| s.tombstoned);
+            let was_fresh = stashed.is_none();
+            let (epoch, detail, ledger, floor) = match stashed {
+                Some(stashed) => {
+                    let (epoch, mut ledger, rctx) = stashed.ctx;
                     if rctx.seal_tick < tick {
                         ledger.windows.append(
                             rctx.seal_tick.saturating_add(1),
@@ -3149,7 +3329,13 @@ impl RunState {
                         rctx.retire_ns.saturating_add(1),
                     )
                 }
-                None => (0, None, MemberLedger::empty(), 0),
+                None => {
+                    // R4-3: a fresh admission after forgotten
+                    // history carries the amnesia marker.
+                    let mut ledger = MemberLedger::empty();
+                    Self::apply_amnesia(self.epoch_amnesia, &mut ledger, tick);
+                    (0, None, ledger, 0)
+                }
             };
             let admitted_now = self.try_admit(
                 out,
@@ -3167,11 +3353,11 @@ impl RunState {
                 admitted,
             )?;
             if admitted_now {
-                // Readmit consumed its context. Failed
-                // exec-readmits keep theirs (retry next tick);
-                // fresh candidates are forgotten (rediscovery
-                // retries).
-                self.consume_exec_ctx(&DeferredKey::from(&identity));
+                // R4-3: the consume + announcement ride the
+                // admission. Failed exec-readmits keep theirs
+                // (retry next tick); fresh candidates are
+                // forgotten (rediscovery retries).
+                self.note_admitted(out, &identity, was_tombstoned, was_fresh)?;
             }
         }
         self.peak_depth = self.peak_depth.max(self.deferred.len() as u64);
@@ -5128,6 +5314,7 @@ mod tests {
             carried_loss: 0,
             carried_deferred: DeferredSpan::default(),
             admit_ns: LiveClock.monotonic_ns(),
+            tombstoned: false,
         };
         let exec = |ts: Option<u64>| crate::capture::LifecycleEvent {
             kind: LifecycleKind::Exec,
@@ -5648,9 +5835,11 @@ mod tests {
             starttime: 1,
             namespaces: namespaces.clone(),
         };
-        let (epoch, ledger, ctx) = run
+        let stashed = run
             .peek_exec_ctx(&DeferredKey::from(&oldest))
             .expect("evicted history preserved");
+        assert!(!stashed.tombstoned, "demoted hit mislabeled tombstoned");
+        let (epoch, ledger, ctx) = stashed.ctx;
         assert_eq!(epoch, 41, "epoch lost across eviction");
         assert_eq!(ledger.loss, 40, "ledger lost across eviction");
         assert_eq!((ctx.seal_tick, ctx.witness_ts), (2, Some(6)));
@@ -5669,10 +5858,11 @@ mod tests {
     }
     #[test]
     fn double_eviction_announces_epoch_restart() {
-        // R3-4b: when BOTH stash tables overflow, the fully
-        // dropped incarnation is tombstoned — its next admission
-        // announces the epoch restart with a visible gap (once),
-        // never a silent epoch-0 rebirth.
+        // R4-3: when BOTH stash tables overflow, the victim's
+        // known epoch + loss history survive in a bounded
+        // tombstone summary (never reset to 0/0) — and its next
+        // admission announces the compression with a visible gap
+        // (once), riding the admission itself.
         let mut run = RunState::new(BTreeSet::new(), 0, 1);
         let namespaces = inventory::NamespaceIds {
             pid: None,
@@ -5684,15 +5874,27 @@ mod tests {
                 starttime: 1,
                 namespaces: namespaces.clone(),
             };
+            // The demotion victim (pid 1000, key-smallest) carries
+            // known epoch 41 / loss 40 — the history R4-3 must
+            // preserve across the double eviction.
+            let (epoch, mut ledger) = if i == 0 {
+                let mut ledger = MemberLedger::empty();
+                ledger.loss = 40;
+                ledger.windows.append(3, 5, LossCause::RingLoss);
+                ledger.windows.append(9, 12, LossCause::ScanLoss);
+                (41, ledger)
+            } else {
+                (1, MemberLedger::empty())
+            };
             run.pending_epoch.insert(
                 DeferredKey::from(&identity),
                 (
-                    1,
-                    MemberLedger::empty(),
+                    epoch,
+                    ledger,
                     ReadmitCtx {
-                        retire_ns: 0,
-                        seal_tick: 0,
-                        witness_ts: None,
+                        retire_ns: 5,
+                        seal_tick: 2,
+                        witness_ts: Some(6),
                     },
                 ),
             );
@@ -5748,15 +5950,35 @@ mod tests {
         // demoted table drops its key-smallest entry — the
         // just-demoted pid 1000 itself (key order, like N8a: all
         // share starttime 1, so the smallest pid drops) — into a
-        // tombstone. Announced, not silent.
+        // tombstone summary. Preserved, not reset.
         let dropped = Incarnation {
             pid: 1000,
             starttime: 1,
             namespaces: namespaces.clone(),
         };
-        assert!(
-            run.peek_exec_ctx(&DeferredKey::from(&dropped)).is_none(),
-            "fully-dropped history must not read back"
+        let stashed = run
+            .peek_exec_ctx(&DeferredKey::from(&dropped))
+            .expect("tombstoned history must survive (not epoch 0/loss 0)");
+        assert!(stashed.tombstoned, "double-evicted hit must be tombstoned");
+        let (epoch, ledger, ctx) = stashed.ctx;
+        assert_eq!(epoch, 41, "epoch reset across double eviction");
+        assert_eq!(ledger.loss, 40, "loss reset across double eviction");
+        assert_eq!((ctx.seal_tick, ctx.witness_ts), (2, Some(6)));
+        // The two windows folded into one coalesced cover span.
+        assert_eq!(ledger.windows.windows.len(), 1);
+        assert_eq!(
+            ledger.windows.windows[0].cause,
+            LossCause::CoalescedLoss,
+            "folded span must speak the coalescing vocabulary"
+        );
+        assert_eq!(
+            (
+                ledger.windows.windows[0].start_tick,
+                ledger.windows.windows[0].end_tick,
+                ledger.windows.coalesced,
+            ),
+            (3, 12, 2),
+            "cover span must span the folded windows"
         );
         let kept = Incarnation {
             pid: 5000,
@@ -5764,14 +5986,20 @@ mod tests {
             namespaces: namespaces.clone(),
         };
         assert_eq!(
-            run.peek_exec_ctx(&DeferredKey::from(&kept)).map(|c| c.0),
+            run.peek_exec_ctx(&DeferredKey::from(&kept))
+                .map(|s| s.ctx.0),
             Some(3),
             "demoted history must survive the cascade"
         );
-        let announced = run.note_fresh_admission(&mut sink, &dropped).unwrap();
-        assert!(announced, "epoch restart must be announced");
-        let announced_again = run.note_fresh_admission(&mut sink, &dropped).unwrap();
-        assert!(!announced_again, "restart announced once");
+        // The announcement rides the admission: consuming the
+        // tombstone for pid 1000's admission emits the third
+        // gap; a later fresh admission announces nothing more.
+        run.note_admitted(&mut sink, &dropped, true, false).unwrap();
+        assert!(
+            run.peek_exec_ctx(&DeferredKey::from(&dropped)).is_none(),
+            "consumed tombstone lingers"
+        );
+        run.note_admitted(&mut sink, &dropped, false, true).unwrap();
         drop(sink);
         let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
             .unwrap()
@@ -5790,6 +6018,577 @@ mod tests {
             })
             .count();
         assert_eq!(pid_gaps, 3, "restart gap missing, got {rows:?}");
+    }
+    #[test]
+    fn tombstone_summary_roundtrip() {
+        // R4-3: the bounded summary keeps the known epoch, the
+        // exact loss/deferred totals and the readmit context,
+        // and folds the windows into one coalesced cover span (+
+        // the fold count) through the frozen vocabulary.
+        let mut windows = WindowStore::new(WINDOW_CAP);
+        windows.append(3, 5, LossCause::RingLoss);
+        windows.append(9, 12, LossCause::ScanLoss);
+        windows.coalesced = 4;
+        let ledger = MemberLedger {
+            loss: 40,
+            deferred: DeferredSpan {
+                ticks: 2,
+                first_tick: 1,
+                last_tick: 7,
+            },
+            windows,
+        };
+        let summary = TombstoneSummary::summarize(
+            41,
+            &ledger,
+            ReadmitCtx {
+                retire_ns: 5,
+                seal_tick: 2,
+                witness_ts: Some(6),
+            },
+        );
+        assert_eq!((summary.epoch, summary.loss), (41, 40));
+        assert_eq!(summary.deferred, ledger.deferred);
+        assert_eq!(summary.span, Some((3, 12)));
+        assert_eq!(summary.coalesced, 6);
+        let (epoch, resumed, ctx) = summary.materialize();
+        assert_eq!(epoch, 41);
+        assert_eq!(resumed.loss, 40);
+        assert_eq!(resumed.deferred, ledger.deferred);
+        assert_eq!(
+            (ctx.retire_ns, ctx.seal_tick, ctx.witness_ts),
+            (5, 2, Some(6))
+        );
+        assert_eq!(resumed.windows.windows.len(), 1);
+        assert_eq!(resumed.windows.windows[0].cause, LossCause::CoalescedLoss);
+        assert_eq!(resumed.windows.coalesced, 6);
+        // Empty ledger: no span, count preserved.
+        let summary = TombstoneSummary::summarize(
+            3,
+            &MemberLedger::empty(),
+            ReadmitCtx {
+                retire_ns: 0,
+                seal_tick: 0,
+                witness_ts: None,
+            },
+        );
+        assert_eq!(summary.span, None);
+        let (_, resumed, _) = summary.materialize();
+        assert!(resumed.windows.windows.is_empty());
+        assert_eq!(resumed.windows.coalesced, 0);
+    }
+    #[test]
+    fn tombstone_survives_ineligible_sample() {
+        // R4-3: an ineligible sample for a tombstoned incarnation
+        // displays the summary's epoch/loss (not 0/0) and
+        // NEITHER announces NOR consumes the tombstone — the
+        // announcement rides the admission, never a pre-admission
+        // sample.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            resolve_paths: false,
+            limits: inventory::Limits::default(),
+        });
+        let record = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("sleep record")
+            .clone();
+        assert!(!eligible(&record), "sleep must be ineligible (premise)");
+        let identity = Incarnation::from(&record);
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 40;
+        run.epoch_tombstones.insert(
+            DeferredKey::from(&identity),
+            TombstoneSummary::summarize(
+                41,
+                &ledger,
+                ReadmitCtx {
+                    retire_ns: 5,
+                    seal_tick: 2,
+                    witness_ts: Some(6),
+                },
+            ),
+        );
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let objects = FocusedObjects {
+            observation: Arc::from([0u8; 8]),
+            count: Arc::from([0u8; 8]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation: 0,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            tracing: true,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let mut admitted = Vec::new();
+        run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        assert!(
+            run.epoch_tombstones
+                .contains_key(&DeferredKey::from(&identity)),
+            "ineligible sample consumed the tombstone"
+        );
+        assert!(admitted.is_empty(), "ineligible sample admitted");
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let sampled: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["kind"] == "membership" && r["state"] == "sampled")
+            .collect();
+        assert_eq!(sampled.len(), 1, "one sampled row, got {rows:?}");
+        assert_eq!(sampled[0]["image_epoch"], 41, "epoch reset, got {rows:?}");
+        assert_eq!(sampled[0]["loss"]["loss"], 40, "loss reset, got {rows:?}");
+        assert!(
+            rows.iter().all(|r| r["kind"] != "gap"),
+            "pre-admission sample announced, got {rows:?}"
+        );
+        child.kill().ok();
+        child.wait().ok();
+    }
+    #[test]
+    fn failed_admission_keeps_tombstone() {
+        // R4-3: the consume rides ADMISSION SUCCESS — a failed
+        // open (SessionGap) keeps the tombstone for retry (an
+        // eligible record + broken objects force the failure
+        // deterministically).
+        let mut child = std::process::Command::new("python3")
+            .args(["-c", "import ssl, time; time.sleep(30)"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn ssl sleeper");
+        let pid = child.id();
+        // Bounded wait for the `import ssl` (libssl mapping) —
+        // the snapshot must observe the eligible modules, and
+        // the import lands in ms (the cap only bounds breakage).
+        let until = Instant::now() + Duration::from_secs(10);
+        let snapshot = loop {
+            let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+                pids: vec![pid],
+                resolve_paths: false,
+                limits: inventory::Limits::default(),
+            });
+            let eligible_now = snapshot
+                .processes
+                .iter()
+                .find(|p| p.pid == pid)
+                .is_some_and(eligible);
+            if eligible_now || Instant::now() >= until {
+                break snapshot;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let record = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("ssl record")
+            .clone();
+        assert!(eligible(&record), "ssl child must be eligible (premise)");
+        let identity = Incarnation::from(&record);
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.current_tick = 6;
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 40;
+        run.epoch_tombstones.insert(
+            DeferredKey::from(&identity),
+            TombstoneSummary::summarize(
+                41,
+                &ledger,
+                ReadmitCtx {
+                    retire_ns: 5,
+                    seal_tick: 2,
+                    witness_ts: Some(6),
+                },
+            ),
+        );
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let objects = FocusedObjects {
+            observation: Arc::from([0u8; 8]),
+            count: Arc::from([0u8; 8]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation: 0,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            tracing: true,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let mut admitted = Vec::new();
+        run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        assert!(
+            run.epoch_tombstones
+                .contains_key(&DeferredKey::from(&identity)),
+            "failed admission consumed the tombstone"
+        );
+        assert!(admitted.is_empty(), "broken objects admitted");
+        assert!(run.active.is_empty(), "broken objects admitted");
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            rows.iter().any(|r| r["kind"] == "session_gap"),
+            "failed open owes a SessionGap, got {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| r["kind"] != "gap"),
+            "failed admission announced, got {rows:?}"
+        );
+        child.kill().ok();
+        child.wait().ok();
+    }
+    #[test]
+    fn tombstone_overflow_fails_conservative() {
+        // R4-3: tombstone-table overflow forgets a summary with a
+        // visible gap AND latches amnesia — every later fresh
+        // admission carries an unknown-history marker (window +
+        // gap), never a silent epoch-0 rebirth. The latch is
+        // monotonic (the forgotten incarnation may reappear at
+        // any later tick).
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        for i in 0..EPOCH_TOMBSTONE_CAP {
+            let identity = Incarnation {
+                pid: 7000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.epoch_tombstones.insert(
+                DeferredKey::from(&identity),
+                TombstoneSummary::summarize(
+                    1,
+                    &MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
+        for i in 0..EVICTED_EPOCH_CAP {
+            let identity = Incarnation {
+                pid: 5000 + i as u32,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            };
+            run.evicted_epoch.insert(
+                DeferredKey::from(&identity),
+                (
+                    3,
+                    MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
+        assert!(!run.epoch_amnesia, "amnesia latches only on overflow");
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let fresh = Incarnation {
+            pid: 999_998,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        run.demote_evicted(
+            &mut sink,
+            DeferredKey::from(&fresh),
+            (
+                2,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        )
+        .unwrap();
+        // The cascade forgets the key-smallest summary (the
+        // just-demoted pid 5000): forgotten, flagged, gapped.
+        let forgotten = Incarnation {
+            pid: 5000,
+            starttime: 1,
+            namespaces: namespaces.clone(),
+        };
+        assert!(
+            run.peek_exec_ctx(&DeferredKey::from(&forgotten)).is_none(),
+            "forgotten summary reads back"
+        );
+        assert!(run.epoch_amnesia, "overflow must latch amnesia");
+        assert_eq!(
+            run.epoch_tombstones.len(),
+            EPOCH_TOMBSTONE_CAP,
+            "tombstone table must stay capped"
+        );
+        // A later fresh admission announces (gap) and marks (window).
+        let newcomer = Incarnation {
+            pid: 424_242,
+            starttime: 9,
+            namespaces: namespaces.clone(),
+        };
+        run.note_admitted(&mut sink, &newcomer, false, true)
+            .unwrap();
+        assert!(run.epoch_amnesia, "amnesia must be monotonic");
+        let mut ledger = MemberLedger::empty();
+        RunState::apply_amnesia(run.epoch_amnesia, &mut ledger, 6);
+        assert_eq!(ledger.windows.windows.len(), 1);
+        assert_eq!(
+            (
+                ledger.windows.windows[0].start_tick,
+                ledger.windows.windows[0].end_tick,
+                ledger.windows.windows[0].cause,
+            ),
+            (0, 7, LossCause::MembershipUnknown),
+            "amnesia window must cover the run so far"
+        );
+        let mut clean = MemberLedger::empty();
+        RunState::apply_amnesia(false, &mut clean, 6);
+        assert!(clean.windows.windows.is_empty(), "no amnesia, no marker");
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        // Two gaps name pid 5000 (demote-drop + overflow-forget),
+        // one names the amnesiac newcomer.
+        for (pid, want) in [(5000, 2), (424_242, 1)] {
+            let n = rows
+                .iter()
+                .filter(|r| {
+                    r["kind"] == "gap"
+                        && r["gap"]["reason"] == "membership_unknown"
+                        && r["gap"]["pid"] == pid
+                })
+                .count();
+            assert_eq!(n, want, "gap census wrong for {pid}, got {rows:?}");
+        }
+    }
+    #[test]
+    fn stale_tombstone_dies_with_fresher_ctx() {
+        // R4-3: a same-key stash entry is always fresher than a
+        // tombstone (every exec advances the epoch) — peek
+        // prefers it, and consume/stash drop the stale summary
+        // (no resurrection of regressed history).
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let namespaces = inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        let identity = Incarnation {
+            pid: 4242,
+            starttime: 7,
+            namespaces: namespaces.clone(),
+        };
+        let key = DeferredKey::from(&identity);
+        run.epoch_tombstones.insert(
+            key.clone(),
+            TombstoneSummary::summarize(
+                5,
+                &MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        );
+        run.pending_epoch.insert(
+            key.clone(),
+            (
+                9,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        );
+        let stashed = run.peek_exec_ctx(&key).expect("stashed ctx");
+        assert!(!stashed.tombstoned, "fresher stash must win");
+        assert_eq!(stashed.ctx.0, 9);
+        run.consume_exec_ctx(&key);
+        assert!(
+            run.peek_exec_ctx(&key).is_none(),
+            "stale tombstone resurrected after consume"
+        );
+        // A new stash supersedes a same-key tombstone outright.
+        run.epoch_tombstones.insert(
+            key.clone(),
+            TombstoneSummary::summarize(
+                5,
+                &MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        );
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        run.stash_pending_epoch(
+            &mut sink,
+            key.clone(),
+            (
+                11,
+                MemberLedger::empty(),
+                ReadmitCtx {
+                    retire_ns: 0,
+                    seal_tick: 0,
+                    witness_ts: None,
+                },
+            ),
+        )
+        .unwrap();
+        assert!(
+            !run.epoch_tombstones.contains_key(&key),
+            "stash must supersede the stale tombstone"
+        );
+        assert_eq!(run.peek_exec_ctx(&key).map(|s| s.ctx.0), Some(11));
+    }
+    #[test]
+    fn stranger_exec_advances_tombstoned_stash_with_middle_seal() {
+        // R4-3: a tombstoned incarnation's second exec (stranger
+        // path) seals the unobserved middle from the summary
+        // ledger and advances the summary in place — like the
+        // primary and demoted stashes, no promotion cascade.
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let key = DeferredKey::from(&identity);
+        let mut ledger = MemberLedger::empty();
+        ledger.loss = 7;
+        let retire = LiveClock.monotonic_ns();
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.epoch_tombstones.insert(
+            key.clone(),
+            TombstoneSummary::summarize(
+                1,
+                &ledger,
+                ReadmitCtx {
+                    retire_ns: retire,
+                    seal_tick: 3,
+                    witness_ts: Some(retire),
+                },
+            ),
+        );
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let event = crate::capture::LifecycleEvent {
+            kind: LifecycleKind::Exec,
+            pid,
+            timestamp_ns: Some(LiveClock.monotonic_ns()),
+            tgid: pid,
+            parent_tgid: 0,
+            cpu: 0,
+            seq: 0,
+        };
+        super::bind_event(&mut run, &mut sink, &event, true).unwrap();
+        drop(sink);
+        assert_eq!(
+            run.epoch_tombstones.get(&key).map(|s| s.epoch),
+            Some(2),
+            "second exec must advance the tombstone"
+        );
+        assert!(run.pending_epoch.is_empty(), "no promotion cascade");
+        assert!(run.evicted_epoch.is_empty(), "no promotion cascade");
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let middle: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["kind"] == "membership" && r["image_epoch"] == 1)
+            .collect();
+        assert_eq!(middle.len(), 1, "one middle seal, got {rows:?}");
+        assert_eq!(middle[0]["state"], "retired");
+        assert_eq!(middle[0]["reason"], "unobserved_transition");
+        assert_eq!(
+            middle[0]["loss"]["loss"], 7,
+            "middle seal carries the summary ledger"
+        );
     }
     #[test]
     fn epoch_sweep_drops_dead_evicted_and_tombstones() {
@@ -5843,15 +6642,27 @@ mod tests {
                 ),
             );
         }
-        run.epoch_tombstones.insert(DeferredKey::from(&dead));
-        run.epoch_tombstones.insert(DeferredKey::from(&live));
+        for key in [DeferredKey::from(&dead), DeferredKey::from(&live)] {
+            run.epoch_tombstones.insert(
+                key,
+                TombstoneSummary::summarize(
+                    1,
+                    &MemberLedger::empty(),
+                    ReadmitCtx {
+                        retire_ns: 0,
+                        seal_tick: 0,
+                        witness_ts: None,
+                    },
+                ),
+            );
+        }
         run.sweep_pending_epoch();
         assert!(!run.pending_epoch.contains_key(&DeferredKey::from(&dead)));
         assert!(!run.evicted_epoch.contains_key(&DeferredKey::from(&dead)));
-        assert!(!run.epoch_tombstones.contains(&DeferredKey::from(&dead)));
+        assert!(!run.epoch_tombstones.contains_key(&DeferredKey::from(&dead)));
         assert!(run.pending_epoch.contains_key(&DeferredKey::from(&live)));
         assert!(run.evicted_epoch.contains_key(&DeferredKey::from(&live)));
-        assert!(run.epoch_tombstones.contains(&DeferredKey::from(&live)));
+        assert!(run.epoch_tombstones.contains_key(&DeferredKey::from(&live)));
     }
     #[test]
     fn backpressure_pause_carries_named_window() {
@@ -5889,6 +6700,7 @@ mod tests {
                     carried_loss: 0,
                     carried_deferred: DeferredSpan::default(),
                     admit_ns: 0,
+                    tombstoned: false,
                 },
             );
         }
@@ -6021,7 +6833,14 @@ mod tests {
             seal_tick: 4,
             witness_ts: None,
         };
-        run.queue_insert(identity.clone(), Some((1, ledger, rctx)), "active_limit");
+        run.queue_insert(
+            identity.clone(),
+            Some(StashedCtx {
+                ctx: (1, ledger, rctx),
+                tombstoned: false,
+            }),
+            "active_limit",
+        );
         let key = DeferredKey::from(&identity);
         let entry = run.deferred.get(&key).expect("queued entry");
         assert_eq!(entry.carried_loss, 7);
@@ -6234,8 +7053,13 @@ mod tests {
             EVICTED_EPOCH_BYTES,
             EVICTED_EPOCH_CAP * EVICTED_EPOCH_ENTRY_BYTES
         );
-        // R3-4b tombstones: key only + node slack.
-        let tombstone_entry = std::mem::size_of::<DeferredKey>() + BTREE_SLACK;
+        // R4-3 tombstones: key + bounded summary (fixed
+        // size, no heap) + node slack. The flat doubles to 512
+        // B while the cap halves to 512 — the table total is
+        // unchanged (asserted below with the staging sum).
+        let tombstone_entry = std::mem::size_of::<DeferredKey>()
+            + std::mem::size_of::<TombstoneSummary>()
+            + BTREE_SLACK;
         assert!(
             tombstone_entry <= EPOCH_TOMBSTONE_ENTRY_BYTES,
             "tombstone entry {tombstone_entry} exceeds flat {EPOCH_TOMBSTONE_ENTRY_BYTES}"
