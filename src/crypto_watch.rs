@@ -4066,6 +4066,18 @@ fn observe(
     let mut admitted: Vec<u32> = Vec::new();
     while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
         let now = Instant::now();
+        // R7-3: reset the per-tick global cleanup allowance FIRST
+        // (before any admission/poll arms links): live links
+        // across members plus global deferred closes must leave
+        // room for every new arm, so a live-path close never hits
+        // the cap-hit sync arm (arms past the allowance refuse
+        // with LinkLimit instead).
+        crate::provider_observation::session::reset_cleanup_allowance(
+            run.active
+                .iter()
+                .map(|a| a.session.provider_live_links())
+                .sum(),
+        );
         // (1) 6A event drain, every iteration: loss lanes fold and
         // events bind (fences/flags/candidates/gaps/quarantine).
         // Revalidation runs between event application (here) and

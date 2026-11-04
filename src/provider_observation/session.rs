@@ -53,6 +53,15 @@ pub struct ObservationBatch {
     /// candidate; the session never re-adds these pids itself
     /// (`exec_sealed`).
     pub exec_witnesses: Vec<u32>,
+    /// R7-1 deferred-exec DETECTION signal: pids whose exec was
+    /// detected but whose retire deferred this batch (fresh
+    /// detections only — witnesses still ride retry completion
+    /// via `exec_witnesses`). The focused layer fences its count
+    /// plane IMMEDIATELY on this signal, using the preceding-clean
+    /// edge, and freezes its clean instant while the session holds
+    /// the fence (`exec_fence_held`) — a witness-free drain must
+    /// not advance the clean instant past a deferred exec.
+    pub exec_deferred: Vec<u32>,
     /// 6A additive module refreshes (§1.2 late modules): pids whose
     /// binding refreshed over added-only rows this reconcile
     /// (distinct from `refreshed_processes`, which also covers
@@ -1339,11 +1348,18 @@ struct DeferredBatch {
 /// frees, barrier-tracked); flushed synchronously at run end
 /// (terminal, at-return proof).
 static DEFERRED_OFFPATH: std::sync::Mutex<Vec<DeferredBatch>> = std::sync::Mutex::new(Vec::new());
-/// R6-3: deferred-close link cap (16 batches × 256). Covers a burst
-/// of full suspends/seals while the worker stalls transiently
-/// (≤4 members/tick × a few ticks); past it (pathological
-/// worker stall/death) the caller falls back to charged sync close
-/// (blocking, counted — safety over promptness).
+/// R6-3: deferred-close link cap (4096 links total — at most 16
+/// full 256-link batches, but separate small deferrals can create
+/// more than 16 stored batches; charging uses each deferral's
+/// actual chunk count, `ceil(len/256)`). Covers a burst of full
+/// suspends/seals while the worker stalls transiently (≤4
+/// members/tick × a few ticks). R7-3: the per-tick cleanup
+/// allowance reserves this capacity at arm time, so the cap-hit
+/// charged-sync arm below stays unreachable on live paths under
+/// the coordinator (proof in the fix report); the arm itself is
+/// retained for terminal flush, disarm-failure cleanup, and
+/// direct (non-coordinator) session use — distinct cases, each
+/// counted.
 const DEFERRED_MAX_LINKS: usize = 4096;
 /// R6-3: defer disarmed links past saturation (live path — never
 /// blocks the poll path). Pre-charges the batches on the live
@@ -1429,15 +1445,84 @@ pub(crate) fn flush_deferred_offpath_sync() {
         fd_dropper().shared.drop_sync_fds.fetch_add(n, Relaxed);
     }
 }
-/// R6-3 test seam: deferred link count (intent persistence proof).
-#[cfg(test)]
-fn deferred_offpath_len_for_test() -> usize {
+/// R6-3: deferred link count (intent persistence proof).
+fn deferred_offpath_len() -> usize {
     DEFERRED_OFFPATH
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .iter()
         .map(|b| b.links.len())
         .sum()
+}
+/// R6-3 test seam: deferred link count (intent persistence proof).
+#[cfg(test)]
+fn deferred_offpath_len_for_test() -> usize {
+    deferred_offpath_len()
+}
+/// R7-3 per-tick global cleanup allowance: links the sessions
+/// may still arm before live+deferred would reach
+/// `DEFERRED_MAX_LINKS`. The coordinator resets it every tick
+/// from exact sums (live links across members + global
+/// deferred); every link-minting gate consumes its mint, and an
+/// arm that would exceed the allowance refuses with LinkLimit
+/// instead of growing live past cleanup capacity — so a
+/// live-path close always finds deferral room and the cap-hit
+/// charged-sync arm stays unreachable on live paths (proof in
+/// the report; terminal flush + disarm-failure paths keep their
+/// sync arms — distinct cases below). `None` = unset:
+/// non-coordinator use (direct sessions, tests) allows — only
+/// the coordinator sets `Some` (same-thread contract, like the
+/// R4-4 probe: one coordinator poll thread consumes per tick;
+/// closes conserve-or-shrink live+deferred without refunding,
+/// so within-tick staleness is conservative-only).
+static CLEANUP_ALLOWANCE: std::sync::Mutex<Option<usize>> = std::sync::Mutex::new(None);
+/// R7-3: links refused by the cleanup allowance (cumulative,
+/// visible record of reservation refusals).
+static CLEANUP_REFUSED_LINKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// R7-3: reset the per-tick cleanup allowance (coordinator tick
+/// top, before any admission/poll arms links):
+/// `DEFERRED_MAX_LINKS - live - deferred`, saturating.
+pub(crate) fn reset_cleanup_allowance(total_live_links: usize) {
+    let used = total_live_links.saturating_add(deferred_offpath_len());
+    let allowance = DEFERRED_MAX_LINKS.saturating_sub(used.min(DEFERRED_MAX_LINKS));
+    *CLEANUP_ALLOWANCE.lock().unwrap_or_else(|e| e.into_inner()) = Some(allowance);
+}
+/// R7-3: consume `new_links` of cleanup allowance for an arm.
+/// Unset allows (non-coordinator use); otherwise admits iff it
+/// fits, counting refusals. A consume-then-fail (later attach
+/// check fails) leaks until the next tick reset — bounded,
+/// conservative-only.
+fn try_reserve_cleanup_capacity(new_links: usize) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut slot = CLEANUP_ALLOWANCE.lock().unwrap_or_else(|e| e.into_inner());
+    match *slot {
+        None => true,
+        Some(remaining) => {
+            if remaining >= new_links {
+                *slot = Some(remaining - new_links);
+                true
+            } else {
+                CLEANUP_REFUSED_LINKS.fetch_add(new_links as u64, Relaxed);
+                false
+            }
+        }
+    }
+}
+/// R7-3 test seam: read the cleanup allowance.
+#[cfg(test)]
+fn cleanup_allowance_for_test() -> Option<usize> {
+    *CLEANUP_ALLOWANCE.lock().unwrap_or_else(|e| e.into_inner())
+}
+/// R7-3 test seam: set the cleanup allowance (`None` restores
+/// the unset state — serial-test isolation).
+#[cfg(test)]
+fn set_cleanup_allowance_for_test(allowance: Option<usize>) {
+    *CLEANUP_ALLOWANCE.lock().unwrap_or_else(|e| e.into_inner()) = allowance;
+}
+/// R7-3 test seam: cumulative cleanup-refused links.
+#[cfg(test)]
+fn cleanup_refused_links_for_test() -> u64 {
+    CLEANUP_REFUSED_LINKS.load(std::sync::atomic::Ordering::Relaxed)
 }
 /// R6-3 test seam: drop all deferred batches, releasing their
 /// charges (serial-test isolation — production drains/flushes).
@@ -1544,6 +1629,20 @@ enum PendingOp {
 struct PendingRetire {
     gap: ObservationGap,
     op: PendingOp,
+}
+/// R7-2 EXEC SUPERSEDES: whether an incoming op displaces the
+/// recorded op (see `record_pending_op`). Incoming Exec wins
+/// over any non-Exec op; a recorded Exec never yields (first
+/// edge wins); a specific op upgrades Plain; among non-Exec
+/// ops the first record stands. (Plain, Plain) refreshes the
+/// gap (the choke point re-records every deferral).
+fn pending_op_supersedes(existing: PendingOp, incoming: PendingOp) -> bool {
+    match (existing, incoming) {
+        (PendingOp::Exec { .. }, _) => false,
+        (_, PendingOp::Exec { .. }) => true,
+        (PendingOp::Plain, _) => true,
+        _ => false,
+    }
 }
 #[allow(
     clippy::too_many_arguments,
@@ -2182,7 +2281,7 @@ impl ProviderSession {
             closed: false,
         })
     }
-    fn link_count(&self) -> usize {
+    pub(crate) fn link_count(&self) -> usize {
         // Live links only: legacy attachment links plus every link the
         // source owner adopted (the acquired legacy pair and all typed
         // pairs): the owner is the sole retainer of acquired links through
@@ -2241,6 +2340,14 @@ impl ProviderSession {
             .saturating_add(2)
             > self.budget.limits.max_links
         {
+            return Err(ObservationGap::LinkLimit);
+        }
+        // R7-3: reserve cleanup capacity for the pair — an arm
+        // that would exceed the live+deferred reservation refuses
+        // with LinkLimit instead of growing live past cleanup
+        // capacity. Reserve-only prearms mint nothing (their
+        // conversion consumes at its own gate).
+        if create_links && !try_reserve_cleanup_capacity(2) {
             return Err(ObservationGap::LinkLimit);
         }
         self.budget.state(512 + advertisers.len() * 96)?;
@@ -2328,23 +2435,23 @@ impl ProviderSession {
     fn retire(&mut self, pid: u32, b: &mut ObservationBatch) -> RetireOutcome {
         self.retire_for_gap(pid, None, ObservationGap::Invalidated, b)
     }
-    /// R6-1 keep-first (controller fixup): record a deferred
-    /// retire's operation — the FIRST specific operation wins.
-    /// This mirrors the no-deferral caller priority exactly: without
-    /// saturation the first firing site completes, removes the
-    /// target, and later sites skip it; with saturation the first
-    /// deferral's op must likewise survive later same-tick (or
-    /// later-tick, while saturated) deferrals. A later plain
-    /// deferral never downgrades a specific op, and a later
-    /// specific op never displaces an earlier specific op (an
-    /// unconditional overwrite would lose an exec seal when an
-    /// additive verdict fires after a deferred exec on the same
-    /// kept target).
+    /// R7-2 EXEC SUPERSEDES (revises the R6-1 keep-first
+    /// fixup): record a deferred retire's operation. An incoming
+    /// Exec displaces any non-Exec op — a KNOWN observed image
+    /// change (witnessed + provider-fenced at deferral) cannot be
+    /// cancelled by an obsolete same-member/same-image refresh,
+    /// whose handoff would invalidate against the flipped
+    /// incarnation anyway. A recorded Exec is never displaced by
+    /// anything (an additive verdict firing after a deferred exec
+    /// on the same kept target must not lose the seal); among
+    /// non-Exec ops first-wins stands (a later plain deferral
+    /// never downgrades a specific op). See
+    /// `pending_op_supersedes` (unit-tested matrix).
     fn record_pending_op(&mut self, pid: u32, gap: ObservationGap, op: PendingOp) {
         self.pending_retire
             .entry(pid)
             .and_modify(|p| {
-                if matches!(p.op, PendingOp::Plain) {
+                if pending_op_supersedes(p.op, op) {
                     *p = PendingRetire { gap, op };
                 }
             })
@@ -2415,12 +2522,12 @@ impl ProviderSession {
             // R5-3: persist the retry intent (with the retire's
             // gap for the retry) — the next reconcile drains it
             // FIRST, before validation/readiness shortcuts.
-            // R6-1 keep-first (controller fixup): an earlier caller
-            // may have already preserved a specific operation (exec
-            // / additive / refresh); a later plain deferral must
-            // not downgrade it. Specific callers record below with
-            // their operation after the retire returns (same
-            // keep-first rule — first specific op wins).
+            // R7-2 exec-supersedes: an earlier caller may have
+            // already preserved a specific operation (exec /
+            // additive / refresh); a later plain deferral must not
+            // downgrade it. Specific callers record below with
+            // their operation after the retire returns (incoming
+            // Exec displaces non-Exec; otherwise first-wins).
             self.record_pending_op(pid, gap, PendingOp::Plain);
             fd_dropper().note_deferred(links);
             return outcome;
@@ -2511,6 +2618,18 @@ impl ProviderSession {
     /// 6A provider-plane fence conservation, taken once at seal.
     pub(crate) fn take_fence_withheld(&mut self) -> u64 {
         std::mem::take(&mut self.fence_withheld)
+    }
+    /// R7-1: true while a deferred exec retry is outstanding (a
+    /// recorded `PendingOp::Exec`). The focused layer latches
+    /// this hold from every fresh batch: while held, witness-free
+    /// drains must not advance the clean instant past the
+    /// deferred exec, so the retry-time fence still uses the
+    /// DETECTION instant's preceding-clean edge. Releases on
+    /// retry completion (pending cleared) or stale-marker drop.
+    pub(crate) fn exec_fence_held(&self) -> bool {
+        self.pending_retire
+            .values()
+            .any(|p| matches!(p.op, PendingOp::Exec { .. }))
     }
     /// 6A thread-exit row cleanup (§1.2): remove a
     /// CONFIRMED-DEAD tid's pairing rows (THREADS + API_THREADS,
@@ -2659,7 +2778,11 @@ impl ProviderSession {
                 // double-emit. Exec seals + witnesses (fence rode
                 // the deferral); additive/refresh hand off +
                 // notify (no gaps, like the original); plain
-                // preserves transient + gaps.
+                // preserves transient + gaps. R7-2: a superseded
+                // op's retry emits the EXEC effects and drops the
+                // obsolete additive/refresh effects (their handoff
+                // would invalidate against the flipped incarnation
+                // anyway — no handoff is inserted here).
                 match pending.op {
                     PendingOp::Exec { .. } => {
                         self.exec_sealed.insert(pid);
@@ -2825,11 +2948,16 @@ impl ProviderSession {
                     // deferred interval NOW (earliest edge wins —
                     // the later focused-layer fence cannot narrow
                     // it); the gaps report the detection either
-                    // way.
+                    // way. R7-1: the batch also signals the
+                    // DETECTION (`exec_deferred`) so the focused
+                    // count fence arms with the preceding-clean
+                    // edge immediately — the witness still rides
+                    // retry completion.
                     if matches!(outcome, RetireOutcome::Deferred(_)) {
                         let edge = LiveClock.monotonic_ns();
                         self.fence_target(pid, edge);
                         self.record_pending_op(pid, gap, PendingOp::Exec { edge_ns: edge });
+                        b.exec_deferred.push(pid);
                     } else {
                         self.exec_sealed.insert(pid);
                         b.exec_witnesses.push(pid);
@@ -3265,11 +3393,14 @@ impl ProviderSession {
                         // R6-1: a deferred drain-side exec preserves
                         // its operation + fences the deferred
                         // interval NOW (the next reconcile's drain
-                        // seals exactly once).
+                        // seals exactly once). R7-1: the batch also
+                        // signals the DETECTION (`exec_deferred`)
+                        // for the immediate focused count fence.
                         if matches!(outcome, RetireOutcome::Deferred(_)) {
                             let edge = LiveClock.monotonic_ns();
                             self.fence_target(pid, edge);
                             self.record_pending_op(pid, gap, PendingOp::Exec { edge_ns: edge });
+                            b.exec_deferred.push(pid);
                         } else {
                             self.exec_sealed.insert(pid);
                             b.exec_witnesses.push(pid);
@@ -3713,6 +3844,12 @@ impl ProviderSession {
             {
                 return Err(ObservationGap::LinkLimit);
             }
+            // R7-3: reserve cleanup capacity for the registered
+            // pair below (the attach_pair gate covers its own pair
+            // separately — each mint consumes exactly once).
+            if !try_reserve_cleanup_capacity(2) {
+                return Err(ObservationGap::LinkLimit);
+            }
             self.budget.state(512 + 96)?;
             site.revalidate_object()?;
             let cookie = self.next_typed_cookie;
@@ -4072,11 +4209,18 @@ impl ProviderSession {
     /// coordinator poll thread (the worker only frees);
     /// concurrently racing library sessions could interleave into
     /// `offload`'s own backstops (pre-existing property, out of
-    /// scope). Liveness audit (R6-3): suspend (poll-path live),
+    /// scope). Liveness audit (R7-3): suspend (poll-path live),
     /// Drop finalized (live member seals run on the poll thread —
     /// deferred, run-end flush closes), Drop seal-time (live) —
-    /// ALL live callers defer; only the run-end flush, cap-hit
-    /// stall and disarm failure close synchronously.
+    /// ALL live callers defer, and the R7-3 arm-time reservation
+    /// keeps deferral room for them (cap-hit unreachable on live
+    /// paths under the coordinator). The synchronous arms that
+    /// remain are exactly: the run-end flush
+    /// (`flush_deferred_offpath_sync`, terminal post-observation),
+    /// genuine disarm-failure cleanup (R3-1 safety: probes may
+    /// still be armed — `!disarmed` above), the retained cap-hit
+    /// backstop below (terminal/disarm/direct-use safety net),
+    /// and the retire path's disarm-failed victims.
     fn close_offpath_links(
         disarmed: bool,
         links: Vec<OwnedFd>,
@@ -4569,6 +4713,17 @@ impl ProviderSession {
                     if live_links.checked_add(2).ok_or(ObservationGap::LinkLimit)? > max_links {
                         owner.note_refusal(format!(
                             "link budget refused: attachment {}/{} needs 2 more within {max_links}",
+                            index + 1,
+                            scopes.len(),
+                        ));
+                        return Err(ObservationGap::LinkLimit);
+                    }
+                    // R7-3: reserve cleanup capacity for the pair
+                    // (refusal is partial-order-safe: earlier pairs
+                    // consumed exactly their mints).
+                    if !try_reserve_cleanup_capacity(2) {
+                        owner.note_refusal(format!(
+                            "cleanup capacity refused: attachment {}/{} needs 2 more within {DEFERRED_MAX_LINKS} live+deferred",
                             index + 1,
                             scopes.len(),
                         ));
@@ -6009,7 +6164,10 @@ mod tests {
         super::clear_deferred_offpath_for_test();
         let dropper: &'static super::FdDropper = Box::leak(Box::new(saturated_spill_dropper()));
         super::with_test_dropper(dropper, || {
-            // Fill the deferral exactly (4096 links = 16 batches).
+            // Fill the deferral exactly (4096 links in one call =
+            // 16 full 256-link batches; separate small deferrals
+            // could store more batches — charging uses each
+            // deferral's actual chunk count).
             let mut fill = Vec::new();
             for _ in 0..super::DEFERRED_MAX_LINKS {
                 fill.push(std::fs::File::open("/dev/null").unwrap().into());
@@ -17668,16 +17826,18 @@ mod startup_api_controls {
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation object"]
-    fn r61_dual_verdict_keeps_first_specific_op() {
-        // R6-1 keep-first (controller fixup): a drain-side additive
-        // deferral followed by a reconcile exec deferral (the exe
-        // flips between drain and reconcile, mid-saturation) must
-        // keep the FIRST specific operation (additive — mirroring
-        // the no-deferral priority, where the drain-side additive
-        // completes first and the reconcile exec path skips the gone
-        // target). An unconditional overwrite would record Exec and
-        // lose the additive handoff; the drain retry must hand off
-        // + notify exactly once with no exec seal.
+    fn r72_dual_verdict_exec_supersedes_additive() {
+        // R7-2 EXEC SUPERSEDES (revises the R6-1 keep-first fixup):
+        // a drain-side additive deferral followed by a reconcile
+        // exec deferral (the exe flips between drain and reconcile,
+        // mid-saturation) must record EXEC — the later exec is a
+        // KNOWN observed image change (witnessed + provider-fenced
+        // at deferral) that the obsolete additive refresh (same
+        // member/image) cannot cancel. The retry emits the exec
+        // effects (seal + witness with the ORIGINAL deferral-time
+        // edge) exactly once and drops the obsolete additive
+        // effects (their handoff would invalidate against the
+        // flipped incarnation anyway).
         let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
         let mut fixture = reconcile_fixture(true);
         let pid = fixture.child.pid();
@@ -17717,21 +17877,24 @@ mod startup_api_controls {
             session.targets[&pid].process.exec_witnessed(),
             "exec must witness after the flip (premise)"
         );
-        // Reconcile exec defers second — keep-first keeps Additive.
+        // Reconcile exec defers second — exec supersedes Additive.
         session.set_deadline(Instant::now() + Duration::from_secs(120));
         let first = super::with_test_dropper(saturated, || {
             session.reconcile_records(std::slice::from_ref(&fixture.record))
         });
         assert!(
             session.fenced.contains_key(&pid),
-            "reconcile exec path must have deferred second (premise — else keep-first untested)"
+            "reconcile exec path must have deferred second (premise — else supersede untested)"
         );
-        assert_eq!(
-            session.pending_retire.get(&pid).map(|p| p.op),
-            Some(super::PendingOp::Additive),
-            "first specific op (additive) must survive the later exec deferral, got {:?}",
+        assert!(
+            matches!(
+                session.pending_retire.get(&pid).map(|p| p.op),
+                Some(super::PendingOp::Exec { .. })
+            ),
+            "incoming exec must displace the obsolete additive op, got {:?}",
             session.pending_retire.get(&pid)
         );
+        let deferral_edge = session.fenced[&pid];
         assert!(
             first.exec_witnesses.is_empty(),
             "deferred exec seals nothing yet (premise)"
@@ -17740,7 +17903,9 @@ mod startup_api_controls {
             first.additive_refreshes.is_empty(),
             "deferred additive notifies nothing yet (premise)"
         );
-        // Live retry: additive effects exactly once, no exec seal.
+        // Live retry: EXEC effects exactly once (seal + witness
+        // with the original deferral-time edge); the obsolete
+        // additive notification is dropped.
         let live: &'static super::FdDropper = Box::leak(Box::new(super::FdDropper::production()));
         session.set_deadline(Instant::now() + Duration::from_secs(120));
         let retry = super::with_test_dropper(live, || {
@@ -17752,30 +17917,388 @@ mod startup_api_controls {
             session.pending_retire
         );
         assert_eq!(
-            retry.additive_refreshes,
+            retry.exec_witnesses,
             vec![pid],
-            "additive retry must notify exactly once, got {:?}",
+            "exec retry must seal + witness exactly once, got {:?}",
+            retry.exec_witnesses
+        );
+        assert!(
+            retry.additive_refreshes.is_empty(),
+            "superseded additive must not notify, got {:?}",
             retry.additive_refreshes
         );
         assert!(
-            retry.exec_witnesses.is_empty(),
-            "additive won — no exec seal (matches no-deferral priority), got {:?}",
-            retry.exec_witnesses
+            session.exec_sealed.contains(&pid),
+            "exec retry must seal the image"
         );
-        // The flip invalidates the handoff incarnation, so the
-        // invalid-refresh loop (shared code, not deferral-
-        // dependent) retires it right after the drain inserts it:
-        // a refresh handoff cannot survive an exec, deferred or
-        // not. The keep-first guarantee is the recorded op + the
-        // exactly-once notification above.
+        assert_eq!(
+            session.fenced.get(&pid),
+            Some(&deferral_edge),
+            "retry must keep the ORIGINAL deferral-time fence edge"
+        );
+        // The obsolete additive handoff is dropped, not inserted:
+        // the flip invalidates the handoff incarnation anyway (the
+        // invalid-refresh loop would retire it right after any
+        // insert — shared code, not deferral-dependent).
         assert!(
             !session.refreshing.contains_key(&pid),
-            "flipped handoff must invalidate (matches no-deferral)"
+            "superseded handoff must be absent (would invalidate)"
         );
         live.flush_timeout(std::time::Duration::from_secs(10))
             .expect("worker proves the retry close");
         use std::io::Read as _;
         assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+    }
+    #[test]
+    fn r72_pending_op_supersede_matrix() {
+        // R7-2 EXEC SUPERSEDES rule matrix (pure helper — every
+        // ordering, including Exec-recorded-then-additive, where
+        // Exec sticks): incoming Exec displaces any non-Exec op; a
+        // recorded Exec is never displaced; a specific op upgrades
+        // Plain; among non-Exec ops first-wins stands.
+        use super::{PendingOp, pending_op_supersedes as sup};
+        let exec = PendingOp::Exec { edge_ns: 7 };
+        for existing in [PendingOp::Plain, PendingOp::Additive, PendingOp::Refresh] {
+            assert!(
+                sup(existing, exec),
+                "incoming exec must displace {existing:?}"
+            );
+        }
+        for incoming in [
+            PendingOp::Plain,
+            PendingOp::Additive,
+            PendingOp::Refresh,
+            PendingOp::Exec { edge_ns: 9 },
+        ] {
+            assert!(
+                !sup(exec, incoming),
+                "recorded exec must stick against {incoming:?}"
+            );
+        }
+        for specific in [PendingOp::Additive, PendingOp::Refresh] {
+            assert!(
+                sup(PendingOp::Plain, specific),
+                "specific {specific:?} must upgrade plain"
+            );
+            assert!(
+                !sup(specific, PendingOp::Plain),
+                "plain must never downgrade {specific:?}"
+            );
+        }
+        assert!(
+            !sup(PendingOp::Additive, PendingOp::Refresh),
+            "additive-then-refresh keeps additive"
+        );
+        assert!(
+            !sup(PendingOp::Refresh, PendingOp::Additive),
+            "refresh-then-additive keeps refresh"
+        );
+        assert!(
+            !sup(PendingOp::Additive, PendingOp::Additive)
+                && !sup(PendingOp::Refresh, PendingOp::Refresh),
+            "same non-exec op re-records idempotently"
+        );
+        assert!(
+            sup(PendingOp::Plain, PendingOp::Plain),
+            "plain re-deferral refreshes the gap"
+        );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r71_deferred_exec_signals_detection_before_witness() {
+        // R7-1 detection/completion split: a deferred exec must
+        // signal its DETECTION immediately (`exec_deferred` on the
+        // deferral batch + `exec_fence_held` while the retry is
+        // outstanding) so the focused count fence arms with the
+        // preceding-clean edge at deferral time — not at retry
+        // time. Witnesses still ride retry completion only.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        objects::fixture_support::stage_exec_flip(
+            &mut session.targets.get_mut(&pid).unwrap().process,
+        );
+        let saturated: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let first = super::with_test_dropper(saturated, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert!(
+            !session.pending_retire.is_empty(),
+            "exec retire must defer under saturation (premise)"
+        );
+        assert_eq!(
+            first.exec_deferred,
+            vec![pid],
+            "deferral batch must signal the exec detection, got {:?}",
+            first.exec_deferred
+        );
+        assert!(
+            first.exec_witnesses.is_empty(),
+            "witnesses ride retry completion, not deferral"
+        );
+        assert!(
+            session.exec_fence_held(),
+            "exec fence stays held while the retry is outstanding"
+        );
+        // A witness-free reconcile while saturated re-defers: the
+        // detection signal re-fires (fresh detection on the kept
+        // target) and the hold persists — the focused clean
+        // instant must not advance past the exec meanwhile.
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let second = super::with_test_dropper(saturated, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert_eq!(
+            second.exec_deferred,
+            vec![pid],
+            "re-deferral must re-signal the detection, got {:?}",
+            second.exec_deferred
+        );
+        assert!(
+            second.exec_witnesses.is_empty(),
+            "still no witness before the retry completes"
+        );
+        assert!(
+            session.exec_fence_held(),
+            "hold persists across witness-free reconciles"
+        );
+        // Live retry: witness exactly once, hold released, no
+        // further detection signal (fresh detections only).
+        let live: &'static super::FdDropper = Box::leak(Box::new(super::FdDropper::production()));
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        let retry = super::with_test_dropper(live, || {
+            session.reconcile_records(std::slice::from_ref(&fixture.record))
+        });
+        assert_eq!(
+            retry.exec_witnesses,
+            vec![pid],
+            "exec retry must witness exactly once, got {:?}",
+            retry.exec_witnesses
+        );
+        assert!(
+            retry.exec_deferred.is_empty(),
+            "retry completion carries the witness, not a detection signal"
+        );
+        assert!(
+            !session.exec_fence_held(),
+            "hold releases when the retry completes"
+        );
+        live.flush_timeout(std::time::Duration::from_secs(10))
+            .expect("worker proves the retry close");
+        use std::io::Read as _;
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+    }
+    /// R7-3: restore the unset cleanup allowance even on panic
+    /// (serial-test isolation — the allowance is global).
+    struct AllowanceGuard;
+    impl Drop for AllowanceGuard {
+        fn drop(&mut self) {
+            super::set_cleanup_allowance_for_test(None);
+        }
+    }
+    #[test]
+    fn r73_cleanup_allowance_reserve_refuse_reset() {
+        // R7-3 mechanism (no privileges): the per-tick cleanup
+        // allowance admits arms while live+deferred+new fits the
+        // deferred cap and refuses past it (counted); unset
+        // (non-coordinator use) allows; reset recomputes from
+        // exact live + deferred sums.
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = AllowanceGuard;
+        super::clear_deferred_offpath_for_test();
+        super::set_cleanup_allowance_for_test(None);
+        assert!(
+            super::try_reserve_cleanup_capacity(super::DEFERRED_MAX_LINKS),
+            "unset allowance must allow (non-coordinator use)"
+        );
+        super::set_cleanup_allowance_for_test(Some(3));
+        assert!(
+            super::try_reserve_cleanup_capacity(2),
+            "2 within 3 must admit"
+        );
+        let refused_before = super::cleanup_refused_links_for_test();
+        assert!(
+            !super::try_reserve_cleanup_capacity(2),
+            "2 past the remaining 1 must refuse"
+        );
+        assert_eq!(
+            super::cleanup_refused_links_for_test(),
+            refused_before + 2,
+            "refusals must count the refused links"
+        );
+        assert!(
+            super::try_reserve_cleanup_capacity(1),
+            "the remaining 1 must still admit"
+        );
+        assert!(
+            !super::try_reserve_cleanup_capacity(1),
+            "exhausted allowance must refuse"
+        );
+        // Reset is deferred-aware: 1024 deferred + 100 live leaves
+        // 2972 admittable.
+        let exhausted: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        super::with_test_dropper(exhausted, || {
+            let mut fill = Vec::new();
+            for _ in 0..1024 {
+                fill.push(std::fs::File::open("/dev/null").unwrap().into());
+            }
+            let deferred_fds = std::sync::atomic::AtomicU64::new(0);
+            super::defer_offpath_links(fill, &deferred_fds).expect("room");
+            super::reset_cleanup_allowance(100);
+            assert_eq!(
+                super::cleanup_allowance_for_test(),
+                Some(2972),
+                "reset must recompute 4096 - 1024 deferred - 100 live"
+            );
+            assert!(
+                super::try_reserve_cleanup_capacity(2972),
+                "recomputed allowance must admit exactly"
+            );
+            assert!(
+                !super::try_reserve_cleanup_capacity(1),
+                "past the recomputed allowance must refuse"
+            );
+        });
+        super::clear_deferred_offpath_for_test();
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn r73_saturated_arms_refuse_and_never_sync() {
+        // R7-3 enforcement (live session): with the worker
+        // saturated and the deferral filled toward the cap, a
+        // further re-arm must REFUSE (LinkLimit gap + counted)
+        // instead of growing live past cleanup capacity — and the
+        // live-path closes must defer (never synchronous).
+        // Pre-fix this sequence re-arms without bound and the next
+        // cap-hit live close takes the blocking charged-sync arm
+        // (see `r51_saturated_teardown_closes_charged_and_proven`
+        // for the backstop placement + R7's 2.2 s measurement).
+        use std::sync::atomic::Ordering::Relaxed;
+        let _guard = AllowanceGuard;
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        super::clear_deferred_offpath_for_test();
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut session = ProviderSession::open_budgeted(
+            ObservationBudget::new(ObservationLimits::default()),
+            &object,
+        )
+        .unwrap();
+        session.set_deadline(Instant::now() + Duration::from_secs(120));
+        session.targets = std::mem::take(&mut fixture.targets);
+        session.startup = std::mem::take(&mut fixture.startup);
+        assert_eq!(session.link_count(), 1, "fixture premise: one live link");
+        let saturated: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        super::with_test_dropper(saturated, || {
+            // Fill toward the cap: 4094 deferred + 1 live leaves
+            // allowance 1 — a 2-link re-arm cannot fit. Chunked
+            // into ≤256-link batches (one chunk each) so the
+            // live worker can drain every batch at cleanup (the
+            // drain only pops batches that fit worker capacity).
+            for chunk in 0..16 {
+                let n = if chunk < 15 { 256 } else { 254 };
+                let mut fill = Vec::new();
+                for _ in 0..n {
+                    fill.push(std::fs::File::open("/dev/null").unwrap().into());
+                }
+                super::ProviderSession::close_offpath_links(
+                    true,
+                    fill,
+                    &saturated.shared.drop_sync_fds,
+                    &saturated.shared.drop_deferred_fds,
+                );
+            }
+            assert_eq!(
+                super::deferred_offpath_len_for_test(),
+                super::DEFERRED_MAX_LINKS - 2,
+                "fill premise"
+            );
+            super::reset_cleanup_allowance(session.link_count());
+            assert_eq!(
+                super::cleanup_allowance_for_test(),
+                Some(1),
+                "allowance premise: 4096 - 4094 deferred - 1 live"
+            );
+            // Suspend closes the live link into the deferral
+            // (4095/4096 — fits, never sync); closes do not
+            // refund the allowance (conservative until reset).
+            session.suspend_target(pid);
+            assert_eq!(
+                saturated.shared.suspend_sync_fds.load(Relaxed),
+                0,
+                "suspend must defer, never sync"
+            );
+            assert_eq!(
+                super::deferred_offpath_len_for_test(),
+                super::DEFERRED_MAX_LINKS - 1,
+                "suspend must defer its link"
+            );
+            use std::io::Read as _;
+            assert_eq!(
+                fixture.link_peer.read(&mut [0]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock,
+                "suspended link must stay open (deferred)"
+            );
+            // Re-arm attempt: a 2-link attach cannot fit the
+            // remaining allowance 1 — refuse with LinkLimit.
+            let refused_before = super::cleanup_refused_links_for_test();
+            session.set_deadline(Instant::now() + Duration::from_secs(120));
+            let batch = session.reconcile_records(std::slice::from_ref(&fixture.record));
+            assert!(
+                batch.gaps.contains(&ObservationGap::LinkLimit),
+                "re-arm past cleanup capacity must refuse visibly, got {:?}",
+                batch.gaps
+            );
+            assert!(
+                super::cleanup_refused_links_for_test() > refused_before,
+                "re-arm refusal must count the refused links"
+            );
+            assert_eq!(session.link_count(), 0, "refused re-arm must mint no links");
+            assert_eq!(
+                saturated.shared.drop_sync_fds.load(Relaxed),
+                0,
+                "no live-path close may take the sync arm"
+            );
+        });
+        // A live worker drains the whole deferral (closes proved).
+        // The drain is single-pass (no worker wait), so alternate
+        // drain + barrier flush until the deferral empties.
+        let live: &'static super::FdDropper = Box::leak(Box::new(super::FdDropper::production()));
+        let mut drained_total = 0;
+        for _ in 0..8 {
+            drained_total += super::with_test_dropper(live, || super::drain_deferred_offpath());
+            live.flush_timeout(std::time::Duration::from_secs(30))
+                .expect("worker proves the drained closes");
+            if super::deferred_offpath_len_for_test() == 0 {
+                break;
+            }
+        }
+        assert_eq!(
+            drained_total,
+            super::DEFERRED_MAX_LINKS - 1,
+            "drain must offload every deferred batch"
+        );
+        assert_eq!(
+            super::deferred_offpath_len_for_test(),
+            0,
+            "deferral must empty"
+        );
+        use std::io::Read as _;
+        assert_eq!(fixture.link_peer.read(&mut [0]).unwrap(), 0);
+        super::clear_deferred_offpath_for_test();
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh observation object"]

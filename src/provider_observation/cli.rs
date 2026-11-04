@@ -422,6 +422,7 @@ impl<W: Write> Stream<'_, W> {
             api_activity: _,
             refreshed_processes: _,
             exec_witnesses: _,
+            exec_deferred: _,
             additive_refreshes: _,
         } = batch;
         if let Some(snapshot) = snapshot {

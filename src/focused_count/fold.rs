@@ -1029,4 +1029,49 @@ mod tests {
         assert_eq!(fold.fence(), Err(CountFailure::Resource));
         assert_eq!(fold.generation, 0);
     }
+    #[test]
+    fn r71_fence_edge_decides_straddling_aggregate() {
+        // R7-1 stake: an aggregate spanning 110–190 with 10 calls
+        // (exec at 150) withholds whole under the DETECTION-time
+        // preceding-clean fence (edge 100: 0 calls projected /
+        // 10 withheld) but stays projectable under a RETRY-time
+        // fence (edge 300: 10 projected / 0 withheld). The bridge
+        // must therefore fence at detection, never at retry
+        // completion; a witness-free drain must not advance the
+        // clean instant past a deferred exec.
+        for (edge, want_calls, want_withheld) in [(100u64, 0u64, 10u64), (300, 10, 0)] {
+            let mut fold = CountFold::new(CountLimits::default()).unwrap();
+            let binding = SiteBinding {
+                site: SiteKey {
+                    object: ObjectId("e".repeat(64)),
+                    device: 1,
+                    inode: 2,
+                    offset: 3,
+                },
+                session_generation: 1,
+                mapping_generation: 1,
+                candidates: vec![],
+                installed_ns: 1,
+            };
+            let (cookie, generation) = fold.attach(binding, |_, _| Ok(())).unwrap();
+            fold.observe(
+                cookie,
+                generation,
+                &[CountValue {
+                    count: 10,
+                    first_ns: 110,
+                    last_ns: 190,
+                }],
+            )
+            .unwrap();
+            fold.note_fence(edge);
+            let s = fold.sample();
+            let calls: u64 = s.sites.iter().map(|r| r.calls).sum();
+            assert_eq!(
+                (calls, s.fence_withheld),
+                (want_calls, want_withheld),
+                "fence edge {edge}"
+            );
+        }
+    }
 }

@@ -701,6 +701,15 @@ pub(crate) struct FocusedSession {
     /// the conservative edge when a witness carries no trusted
     /// timestamp (§1.8). Starts at session start.
     last_clean_drain_ns: u64,
+    /// R7-1 deferred-exec hold latch: true while the session
+    /// holds a deferred exec retry (`exec_fence_held`, latched
+    /// from every fresh batch). While latched, witness-free
+    /// drains are NOT clean — the clean instant stays frozen at
+    /// the pre-detection edge so the retry-time fence uses the
+    /// DETECTION instant's preceding-clean edge, never the retry
+    /// instant. Releases when the retry completes (witness) or
+    /// the session drops the hold (stale-marker unlink).
+    exec_fence_pending: bool,
     gaps: BTreeSet<ObservationGap>,
     /// Shaped attach/backing diagnostics: link failures drained from
     /// the counter plus batch refusals (R06 rule: sorted + deduped
@@ -764,6 +773,7 @@ impl FocusedSession {
             exec_pending: Vec::new(),
             refresh_pending: Vec::new(),
             last_clean_drain_ns: 0,
+            exec_fence_pending: false,
             gaps: std::collections::BTreeSet::new(),
             attach_diagnostics: std::collections::BTreeSet::new(),
             engine: EnginePlane::new(),
@@ -1232,6 +1242,7 @@ impl FocusedSession {
             exec_pending: Vec::new(),
             refresh_pending: Vec::new(),
             last_clean_drain_ns: start_ns,
+            exec_fence_pending: false,
             gaps,
             attach_diagnostics: BTreeSet::new(),
             engine: EnginePlane::new(),
@@ -1758,26 +1769,16 @@ impl FocusedSession {
             }
             if let Some(s) = &mut self.session {
                 let batch = s.reconcile_records(records);
+                // R7-1: read the live deferred-exec hold with the
+                // fresh batch (the session borrow ends here).
+                let held = s.exec_fence_held();
                 // 6A: fresh-reconcile signals only (pending
                 // re-drives must not duplicate them).
-                for pid in batch.exec_witnesses.iter().copied() {
-                    if !self.exec_pending.contains(&pid) {
-                        self.exec_pending.push(pid);
-                    }
-                }
+                self.note_batch_exec_signals(&batch, held);
                 if batch.additive_refreshes.contains(&self.pid) {
                     if let Ok(ns) = now_ns() {
                         self.refresh_pending.push(ns);
                     }
-                }
-                // 6A timestamp-less exec fencing (§1.8): a batch that
-                // detects an exec fences BEFORE it is applied, using
-                // the PRECEDING clean instant — the counter folds
-                // below (and the coordinator's later
-                // `note_kernel_edge(None)`) must see the pre-detect
-                // edge, never this batch's end.
-                if !batch.exec_witnesses.is_empty() {
-                    self.note_kernel_edge(None);
                 }
                 self.apply_batch(batch, tick_end, cancel)?;
             }
@@ -1798,35 +1799,19 @@ impl FocusedSession {
         }
         if let Some(s) = &mut self.session {
             let batch = s.drain((Instant::now() + DRAIN).min(tick_end));
+            // R7-1: read the live deferred-exec hold with the
+            // fresh batch (the session borrow ends here).
+            let held = s.exec_fence_held();
             // 6A: drain batches carry the same fresh signals as
             // reconcile batches (the drain wins the race for maps
             // changes); collect them identically or drain-detected
             // execs and refreshes are silently dropped.
-            for pid in batch.exec_witnesses.iter().copied() {
-                if !self.exec_pending.contains(&pid) {
-                    self.exec_pending.push(pid);
-                }
-            }
             if batch.additive_refreshes.contains(&self.pid) {
                 if let Ok(ns) = now_ns() {
                     self.refresh_pending.push(ns);
                 }
             }
-            // 6A timestamp-less exec fencing (§1.8): an
-            // exec-detecting drain is NOT clean — fence before
-            // applying (preceding clean instant) and leave
-            // `last_clean_drain_ns` at the previous clean drain.
-            // Only a witness-free drain advances the clean instant.
-            let detecting = !batch.exec_witnesses.is_empty();
-            if detecting {
-                self.note_kernel_edge(None);
-            }
-            self.apply_batch(batch, tick_end, cancel)?;
-            if !detecting {
-                if let Ok(ns) = now_ns() {
-                    self.last_clean_drain_ns = ns;
-                }
-            }
+            self.apply_drain_batch(batch, held, tick_end, cancel)?;
         }
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         if self.signal_cut {
@@ -1982,6 +1967,13 @@ impl FocusedSession {
             .map(|s| s.loss_totals())
             .unwrap_or([0; 8])
     }
+    /// R7-3: live provider-session links (the deferral's future
+    /// clients — counter/ENGINE links close on their own paths
+    /// and never enter the deferred set). The coordinator sums
+    /// this across members for the per-tick cleanup allowance.
+    pub(crate) fn provider_live_links(&self) -> usize {
+        self.session.as_ref().map(|s| s.link_count()).unwrap_or(0)
+    }
     /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
     /// (LOSS read sequence, containing tick), `None` when no
     /// provider session contributes (nothing to prove). The
@@ -1998,6 +1990,53 @@ impl FocusedSession {
         if let Some(s) = self.session.as_mut() {
             s.set_loss_tick_clock(origin_ns, tick_ns);
         }
+    }
+    /// R7-1 fresh-batch exec fence bridge (called for every
+    /// FRESH reconcile/drain batch — pending re-drives must not
+    /// duplicate signals, as before). A batch that DETECTS an
+    /// exec — a completion witness OR a deferred-detection
+    /// signal — fences BEFORE it is applied, using the PRECEDING
+    /// clean instant. Witnesses collect into `exec_pending` for
+    /// the coordinator seal; detections never seal (the witness
+    /// still rides retry completion). `held` is the session's
+    /// live `exec_fence_held`, latched here: while latched, the
+    /// batch counts as detecting even when witness-free, so the
+    /// drain must not advance the clean instant past a deferred
+    /// exec. Returns true when this batch is detecting.
+    fn note_batch_exec_signals(&mut self, batch: &ObservationBatch, held: bool) -> bool {
+        let signaled = !batch.exec_witnesses.is_empty() || !batch.exec_deferred.is_empty();
+        let detecting = signaled || self.exec_fence_pending;
+        for pid in batch.exec_witnesses.iter().copied() {
+            if !self.exec_pending.contains(&pid) {
+                self.exec_pending.push(pid);
+            }
+        }
+        if signaled {
+            self.note_kernel_edge(None);
+        }
+        self.exec_fence_pending = held;
+        detecting
+    }
+    /// R7-1 drain-batch funnel: exec-fence bridge, then apply,
+    /// then the clean-instant advance (a detecting drain — fresh
+    /// signal or latched hold — leaves `last_clean_drain_ns` at
+    /// the previous clean drain; only a clean unheld drain
+    /// advances it).
+    fn apply_drain_batch(
+        &mut self,
+        batch: ObservationBatch,
+        held: bool,
+        tick_end: Instant,
+        cancel: &AtomicBool,
+    ) -> anyhow::Result<()> {
+        let detecting = self.note_batch_exec_signals(&batch, held);
+        self.apply_batch(batch, tick_end, cancel)?;
+        if !detecting {
+            if let Ok(ns) = now_ns() {
+                self.last_clean_drain_ns = ns;
+            }
+        }
+        Ok(())
     }
     /// 6A kernel-edge fence (§1.8): fence the counter (generation
     /// guard + withholding) and the provider session (BPF rows +
@@ -3907,5 +3946,107 @@ mod session_tests {
         // vehicle before reporting.
         crate::target::kill_test_child(vehicle, Duration::from_secs(5));
         verdict
+    }
+}
+
+#[cfg(test)]
+mod r71_tests {
+    use super::*;
+    use crate::observation_memory::MemoryPool;
+
+    fn hollow(pool: &MemoryPool) -> FocusedSession {
+        let mut session = FocusedSession::hollow_for_coordinator_tests(
+            7,
+            1,
+            crate::inventory::NamespaceIds::default(),
+            pool,
+        );
+        session.last_clean_drain_ns = 100;
+        session
+    }
+
+    fn batch(exec_witnesses: Vec<u32>, exec_deferred: Vec<u32>) -> ObservationBatch {
+        ObservationBatch {
+            exec_witnesses,
+            exec_deferred,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn r71_deferred_exec_fences_at_detection_and_freezes_clean() {
+        // R7-1 bridge (headless hollow session): a deferred-exec
+        // detection batch fences immediately (detecting) WITHOUT
+        // sealing (no exec_pending — witnesses still ride retry
+        // completion); witness-free batches while the hold
+        // persists stay detecting (the drain must not advance the
+        // clean instant past the exec); the retry witness seals
+        // and releases; only then does a clean drain advance.
+        let cancel = AtomicBool::new(false);
+        let tick_end = Instant::now() + Duration::from_secs(10);
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        // Detection: fence now, seal nothing, latch the hold.
+        assert!(
+            session.note_batch_exec_signals(&batch(vec![], vec![7]), true),
+            "deferred detection must fence immediately"
+        );
+        assert!(session.exec_fence_pending, "detection must latch the hold");
+        assert!(
+            session.exec_pending.is_empty(),
+            "detection must not seal (witnesses ride completion)"
+        );
+        session
+            .apply_drain_batch(batch(vec![], vec![7]), true, tick_end, &cancel)
+            .unwrap();
+        assert_eq!(
+            session.last_clean_drain_ns, 100,
+            "detecting drain must not advance the clean instant"
+        );
+        // Witness-free while held: still detecting, still frozen.
+        assert!(
+            session.note_batch_exec_signals(&batch(vec![], vec![]), true),
+            "held witness-free batch must stay detecting"
+        );
+        session
+            .apply_drain_batch(batch(vec![], vec![]), true, tick_end, &cancel)
+            .unwrap();
+        assert_eq!(
+            session.last_clean_drain_ns, 100,
+            "held witness-free drain must not advance past the exec"
+        );
+        // Retry witness: seal + release; the drain stays detecting.
+        assert!(
+            session.note_batch_exec_signals(&batch(vec![7], vec![]), false),
+            "witness batch must fence"
+        );
+        assert_eq!(
+            session.exec_pending,
+            vec![7],
+            "witness must seal exactly once"
+        );
+        assert!(
+            !session.exec_fence_pending,
+            "completion must release the hold"
+        );
+        session
+            .apply_drain_batch(batch(vec![7], vec![]), false, tick_end, &cancel)
+            .unwrap();
+        assert_eq!(
+            session.last_clean_drain_ns, 100,
+            "witness drain must not advance (preceding-clean edge)"
+        );
+        // Clean and unheld: advance resumes.
+        assert!(
+            !session.note_batch_exec_signals(&batch(vec![], vec![]), false),
+            "clean unheld batch must not fence"
+        );
+        session
+            .apply_drain_batch(batch(vec![], vec![]), false, tick_end, &cancel)
+            .unwrap();
+        assert!(
+            session.last_clean_drain_ns > 100,
+            "clean unheld drain must advance the clean instant"
+        );
     }
 }
