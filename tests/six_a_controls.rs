@@ -1877,6 +1877,17 @@ fn recycle_pid_fast(
     }
 }
 
+/// Comm field of a `/proc/<pid>/stat` line: between the first
+/// `(` and the LAST `)` (comm itself may contain parens). One
+/// helper for both `wait_for_exec_comm` checks — the bug being
+/// fixed here WAS the two spots sharing the state-parse idiom
+/// (`rsplit(')').next()`, which yields the post-comm remainder,
+/// never the comm), so a second inline path would re-invite it.
+fn stat_comm(st: &str) -> Option<&str> {
+    let (_, after_open) = st.split_once('(')?;
+    let (comm, _) = after_open.rsplit_once(')')?;
+    Some(comm)
+}
 /// R3-9: wait for the recycled winner to complete its exec (comm ==
 /// `want`, same incarnation). `recycle_pid_fast` returns when the
 /// number is held, which races the winner's exec — a sample that
@@ -1889,8 +1900,7 @@ fn wait_for_exec_comm(pid: u32, start: u64, want: &str, timeout: Duration) -> bo
             return false;
         }
         if let Ok(st) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            let comm = st.split('(').nth(1).and_then(|s| s.rsplit(')').next());
-            if comm == Some(want) {
+            if stat_comm(&st) == Some(want) {
                 return true;
             }
         }
@@ -1899,8 +1909,24 @@ fn wait_for_exec_comm(pid: u32, start: u64, want: &str, timeout: Duration) -> bo
     starttime_of(pid) == Some(start)
         && std::fs::read_to_string(format!("/proc/{pid}/stat"))
             .ok()
-            .and_then(|st| st.split('(').nth(1)?.rsplit(')').next().map(|c| c == want))
+            .and_then(|st| stat_comm(&st).map(|c| c == want))
             .unwrap_or(false)
+}
+#[test]
+fn stat_comm_parses_between_first_open_and_last_close_paren() {
+    // Controller fixup: `wait_for_exec_comm` used the state-parse
+    // idiom (`rsplit(')').next()`), which yields the post-comm
+    // stat remainder — control 5 went INCONCLUSIVE on every leg.
+    // The comm sits between the first `(` and the last `)`.
+    assert_eq!(stat_comm("123 (sleep) S 1 2 3"), Some("sleep"));
+    assert_eq!(stat_comm("123 (a)b) S 1"), Some("a)b"));
+    assert_eq!(stat_comm("123 (x(y)z) R 0"), Some("x(y)z"));
+    assert_eq!(stat_comm("no parens here"), None);
+    assert_eq!(stat_comm("123 (unterminated S 1"), None);
+    let live = std::fs::read_to_string("/proc/self/stat").expect("own stat");
+    // The harness binary is `six_a_controls-<hash>`; comm truncates
+    // to 15 bytes.
+    assert_eq!(stat_comm(&live), Some("six_a_controls-"));
 }
 
 /// One control-5 leg. `held`: SIGSTOP the observer across kill+respawn
@@ -2075,6 +2101,7 @@ fn reuse_leg(binary: &Path, held: bool) {
     // can see it — recycle-before-exec-completion breaks the
     // staged ordering (a pre-exec image is ineligible, so the
     // first sample would stash instead of admitting).
+    let exec_wait_start = Instant::now();
     if !wait_for_exec_comm(pid, reused_start, "sleep", Duration::from_secs(10)) {
         if held {
             if let Some(inner) = inner {
@@ -2085,6 +2112,10 @@ fn reuse_leg(binary: &Path, held: bool) {
         eprintln!("INCONCLUSIVE: recycled winner never exec'd the sleeper");
         return;
     }
+    eprintln!(
+        "winner exec observed after {:?} (held={held})",
+        exec_wait_start.elapsed()
+    );
     let mut reuser = RawChild(pid);
     assert_ne!(reused_start, 0, "reused pid has no starttime?");
     assert_ne!(
