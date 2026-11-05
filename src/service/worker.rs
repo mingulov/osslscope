@@ -342,13 +342,20 @@ impl Diagnostics {
                 for line in rx.iter() {
                     if abandon_w.load(Ordering::Acquire) {
                         // Drop the queue (counted) and exit: drain
-                        // without writing.
-                        let mut n = 1u64;
-                        while rx.try_recv().is_ok() {
-                            n += 1;
+                        // without writing. Empty vectors are the
+                        // abandonment wake itself, never
+                        // diagnostics — counted out.
+                        let mut n = u64::from(!line.is_empty());
+                        while let Ok(queued) = rx.try_recv() {
+                            n += u64::from(!queued.is_empty());
                         }
                         dropped_w.fetch_add(n, Ordering::Relaxed);
                         return;
+                    }
+                    if line.is_empty() {
+                        // Abandonment wake observed without the
+                        // flag (ordering race) — not a diagnostic.
+                        continue;
                     }
                     // ONE write() per line, NO retry, NO O_NONBLOCK
                     // claim: boundedness comes from detachment +

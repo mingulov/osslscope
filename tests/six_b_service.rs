@@ -227,9 +227,25 @@ fn sixb_one_window_finalizes() {
     let win = dir.join("window-0000000000.json");
     assert!(win.is_file(), "window 0 published, dir: {dir:?}");
     let body = std::fs::read_to_string(&win).unwrap();
-    assert!(body.contains("\"service-window-v1\""), "envelope schema");
+    // Strict structural parse (regression pin for the splice: the
+    // file MUST be valid JSON with the `crypto_watch` key present —
+    // substring checks pass on malformed files).
+    let doc: serde_json::Value = serde_json::from_str(&body).expect("window 0 is valid JSON");
+    assert_eq!(doc["schema"], "service-window-v1", "envelope schema");
+    assert_eq!(doc["seq"], 0, "window seq");
+    assert!(doc["crypto_watch"].is_array(), "crypto_watch array present");
+    assert!(doc["window"].is_object(), "window span present");
+    assert!(doc["document"].is_object(), "snapshot document present");
     assert!(dir.join("sequence.json").is_file(), "sequence state");
+    let seq_body = std::fs::read_to_string(dir.join("sequence.json")).unwrap();
+    let _: serde_json::Value = serde_json::from_str(&seq_body).expect("sequence is valid JSON");
     assert!(dir.join("run-summary.json").is_file(), "run summary");
+    let sum_body = std::fs::read_to_string(dir.join("run-summary.json")).unwrap();
+    let sum: serde_json::Value = serde_json::from_str(&sum_body).expect("summary is valid JSON");
+    assert_eq!(sum["schema"], "service-run-v1", "summary schema");
+    // Clean close drops no diagnostics (the abandonment wake is not
+    // a diagnostic — regression pin).
+    assert_eq!(sum["diagnostics_dropped"], 0, "no drops on clean close");
 }
 
 /// Second coordinator on a live out-DIR refuses pre-start (exit 2).

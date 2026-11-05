@@ -2126,10 +2126,11 @@ fn mid_window_publish(
     let envelope_value = serde_json::to_value(&envelope).unwrap_or(serde_json::Value::Null);
     let mut bytes = serde_json::to_vec(&envelope_value).unwrap_or_default();
     // Byte-verbatim `crypto_watch[]` splice: serde renders the empty
-    // vec deterministically as `"crypto_watch":[]` — replace those
-    // exact bytes with the assembled array. The search pattern is
-    // provably structural (string values render with ESCAPED quotes,
-    // so no value can match the unescaped pattern).
+    // vec deterministically as `"crypto_watch":[]` — replace the
+    // trailing `[]` (KEY PRESERVED) with the assembled array. The
+    // search pattern is provably structural (string values render
+    // with ESCAPED quotes, so no value can match the unescaped
+    // pattern).
     const NEEDLE: &[u8] = b"\"crypto_watch\":[]";
     let mut array = Vec::with_capacity(assembled.array_inner.len() + 2);
     array.push(b'[');
@@ -2137,7 +2138,8 @@ fn mid_window_publish(
     array.push(b']');
     let mut spliced = false;
     if let Some(pos) = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
-        bytes.splice(pos..pos + NEEDLE.len(), array.iter().copied());
+        let arr = pos + NEEDLE.len() - 2;
+        bytes.splice(arr..arr + 2, array.iter().copied());
         spliced = true;
     }
     if !spliced {
