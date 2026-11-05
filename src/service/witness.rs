@@ -827,7 +827,7 @@ impl Observer {
         let stopsig = libc::WSTOPSIG(status);
         let event = (status >> 16) & 0xffff;
         if event != 0 {
-            if event == libc::PTRACE_EVENT_VFORK_DONE as i32 {
+            if event == libc::PTRACE_EVENT_VFORK_DONE {
                 // Vfork completion: the birth was already handled
                 // at the VFORK event; nothing to option.
                 self.cont(pid, 0);
