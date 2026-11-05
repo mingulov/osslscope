@@ -185,6 +185,48 @@ pub(crate) fn load(path: &Path) -> Result<RuleSet, String> {
     admit(&bytes)
 }
 
+/// 6B §3 snapshot admission: the version, digest, merged rule count
+/// and `RuleSet` all derive from ONE immutable byte snapshot (read
+/// exactly once by the caller). The file is never reopened to obtain
+/// identity: labeling policy A with policy B's hash is
+/// unconstructable.
+pub(crate) struct SnapshotAdmission {
+    /// Hex SHA-256 over the snapshot bytes.
+    pub sha256: String,
+    /// Admitted version (1 or 2).
+    pub version: i64,
+    /// Merged rule-instance count (the 1024-rule count).
+    pub rule_count: usize,
+    /// `merge(RuleSet::default(), candidate)`.
+    pub ruleset: RuleSet,
+}
+
+/// Admit one immutable snapshot through the exact current path
+/// (`admit`, then `merge` over a default base for the count,
+/// frozen-registry, hex64 and contradiction checks).
+pub(crate) fn admit_snapshot(bytes: &[u8]) -> Result<SnapshotAdmission, String> {
+    let candidate = admit(bytes)?;
+    // `admit` already proved UTF-8 + version ∈ {1, 2}; re-probe the
+    // SAME bytes for the recorded version (never a reopen).
+    let text = std::str::from_utf8(bytes).map_err(|_| "policy file must be UTF-8")?;
+    let probe: VersionProbe = toml::from_str(text).map_err(|error| locate(error, bytes))?;
+    let ruleset = merge(RuleSet::default(), candidate)?;
+    let rule_count = ruleset.require_provider.len()
+        + ruleset.deny_provider.len()
+        + ruleset.deny_algorithm.len()
+        + ruleset.require_executed.len()
+        + ruleset.deny_selector.len()
+        + ruleset.require_selector.len()
+        + usize::from(ruleset.deny_engine)
+        + usize::from(ruleset.deny_weak);
+    Ok(SnapshotAdmission {
+        sha256: crate::kinds::prov_hash(bytes),
+        version: probe.version,
+        rule_count,
+        ruleset,
+    })
+}
+
 fn validate_names(rules: &RuleSet) -> Result<(), String> {
     for (field, names) in [
         ("require-provider", &rules.require_provider),

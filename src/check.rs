@@ -29,7 +29,9 @@ use std::time::Duration;
 
 /// Map CLI rules to typed policy rules through the single
 /// [`PolicyRule`] constructors (evaluation order below).
-fn policy_rules(rules: &RuleSet) -> Vec<PolicyRule> {
+/// Shared with the 6B service coordinator (same lowering — one rule
+/// site, no divergent evaluation order).
+pub(crate) fn policy_rules(rules: &RuleSet) -> Vec<PolicyRule> {
     let mut out = Vec::new();
     for p in &rules.require_provider {
         out.push(PolicyRule::require_provider(p));

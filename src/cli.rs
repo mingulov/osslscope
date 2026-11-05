@@ -141,11 +141,15 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
             ScanRoute::Inventory => crate::inventory::cli::run(cmd, &argv[1..]),
         },
         "alias-audit" => crate::aliases::run(&argv[1..]),
+        "service" => crate::service::run(&argv[1..]),
+        "service-witness" => crate::service::witness_cli::run(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
         "check" => crate::check::run(&argv[1..]),
         "help" | "--help" | "-h" => {
             println!("osslscope — non-interposing OpenSSL observer");
-            println!("usage: osslscope <scan|inspect|doctor|report|check|alias-audit> [args]");
+            println!(
+                "usage: osslscope <scan|inspect|doctor|report|check|alias-audit|service> [args]"
+            );
             println!(
                 "  doctor       inventory, companion integrity and functional tracing preflight"
             );
@@ -153,6 +157,9 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
                 "  report       observe learned callbacks in one selected PID or foreground run"
             );
             println!("  check        policy gate over a window (CI use; exits 10 on violation)");
+            println!(
+                "  service      bounded-window continuous observation service (see: service --help)"
+            );
             println!("  alias-audit  group a harvest doc's rows by shared address");
             println!(
                 "  report/check use --pid PID or run -- COMMAND; --libcrypto selects legacy diagnostics"

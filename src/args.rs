@@ -14,6 +14,11 @@ pub const MAX_TIMEOUT_SECS: f64 = 120.0;
 pub const MAX_SETTLE_SECS: f64 = 30.0;
 /// Drain-grace bound.
 pub const MAX_GRACE_SECS: f64 = 30.0;
+/// 6B stream-rotation interval bound (F-015 24 h run).
+pub const MAX_ROTATE_INTERVAL_SECS: f64 = 86400.0;
+/// 6B service sampling-interval floor (mirrors
+/// `WatchOptions::validate`: 50 ms ..= 3600 s).
+pub const MIN_INTERVAL_SECS: f64 = 0.05;
 
 /// Placeholder stored wherever a target command line used to be
 /// copied (R07: no raw argv in artifacts; pid/comm/exe identity still
@@ -23,21 +28,31 @@ pub const REDACTED_CMDLINE: &str = "(argv-redacted)";
 /// Parse a `--duration`/`--timeout`/`--settle`/`--grace` value into a
 /// `Duration`. `flag` is the CLI spelling (leading dashes optional).
 /// Ranges: duration (0,3600], timeout [0,120], settle [0,30], grace
-/// [0,30]. Non-finite, out-of-range, and positive-but-rounding-to-zero
-/// inputs are `Err` (the caller exits 2 before any target/BPF side
-/// effect). Conversion happens only after validation, so values that
-/// used to panic `Duration::from_secs_f64` (e.g. `1e30`) cannot reach it.
+/// [0,30], window (0,3600], interval [0.05,3600], rotate-interval
+/// (0,86400]. Non-finite, out-of-range, and
+/// positive-but-rounding-to-zero inputs are `Err` (the caller exits 2
+/// before any target/BPF side effect). Conversion happens only after
+/// validation, so values that used to panic `Duration::from_secs_f64`
+/// (e.g. `1e30`) cannot reach it.
 pub fn parse_seconds(flag: &str, value: &str) -> Result<Duration, String> {
     let v: f64 = value.parse().map_err(|_| format!("{flag} needs seconds"))?;
     let name = flag.trim_start_matches('-');
-    let (allow_zero, max) = match name {
-        "duration" => (false, MAX_DURATION_SECS),
-        "timeout" => (true, MAX_TIMEOUT_SECS),
-        "settle" => (true, MAX_SETTLE_SECS),
-        "grace" => (true, MAX_GRACE_SECS),
+    // 6B adds exactly three arms (D-record §1.1): `window`,
+    // `interval` (with a nonzero floor), `rotate-interval`. Old arms
+    // keep `min == 0.0`, which leaves their behavior identical.
+    let (allow_zero, max, min) = match name {
+        "duration" => (false, MAX_DURATION_SECS, 0.0),
+        "timeout" => (true, MAX_TIMEOUT_SECS, 0.0),
+        "settle" => (true, MAX_SETTLE_SECS, 0.0),
+        "grace" => (true, MAX_GRACE_SECS, 0.0),
+        "window" => (false, MAX_DURATION_SECS, 0.0),
+        "interval" => (false, MAX_DURATION_SECS, MIN_INTERVAL_SECS),
+        "rotate-interval" => (false, MAX_ROTATE_INTERVAL_SECS, 0.0),
         _ => return Err(format!("{flag}: unknown time flag")),
     };
-    let range_msg = if allow_zero {
+    let range_msg = if min > 0.0 {
+        format!("{flag} must be >= {min} seconds and <= {max} seconds")
+    } else if allow_zero {
         format!("{flag} must be >= 0 seconds and <= {max} seconds")
     } else {
         format!("{flag} must be > 0 seconds and <= {max} seconds")
@@ -54,7 +69,7 @@ pub fn parse_seconds(flag: &str, value: &str) -> Result<Duration, String> {
     if v == 0.0 && significand.bytes().any(|b| matches!(b, b'1'..=b'9')) {
         return Err(range_msg);
     }
-    if v < 0.0 || v > max || (!allow_zero && v == 0.0) {
+    if v < 0.0 || v > max || v < min || (!allow_zero && v == 0.0) {
         return Err(range_msg);
     }
     // Bounded and finite: infallible (only NaN/inf/u64-overflow panic).
