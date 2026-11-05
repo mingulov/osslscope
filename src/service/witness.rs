@@ -465,7 +465,11 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
             // lost containment), fails loud.
             let transient_gone = Observer::tolerate_seize_error(&e, pid, explicit.contains(&pid));
             if transient_gone {
-                eprintln!("witness: enumerated {pid} already gone (ESRCH)");
+                if e.raw_os_error() == Some(libc::ESRCH) {
+                    eprintln!("witness: enumerated {pid} already gone (ESRCH)");
+                } else {
+                    eprintln!("witness: enumerated {pid} dead-or-zombie, tolerated ({e})");
+                }
             } else {
                 eprintln!("witness: cannot seize {pid}: {e}");
                 std::process::exit(2);
@@ -500,7 +504,13 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
                         // enumerated newcomer is a death race, noted;
                         // anything else is a containment failure.
                         if Observer::tolerate_seize_error(&e, pid, false) {
-                            eprintln!("witness: newcomer {pid} already gone (ESRCH)");
+                            if e.raw_os_error() == Some(libc::ESRCH) {
+                                eprintln!("witness: newcomer {pid} already gone (ESRCH)");
+                            } else {
+                                eprintln!(
+                                    "witness: newcomer {pid} dead-or-zombie, tolerated ({e})"
+                                );
+                            }
                         } else {
                             eprintln!("witness: newcomer {pid} escaped (seize failed: {e})");
                             std::process::exit(3);
@@ -580,12 +590,22 @@ impl Observer {
     }
 
     fn seize(&mut self, pid: i32) -> std::io::Result<()> {
-        // SAFETY: seize + setoptions on a target pid.
-        let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) };
+        // SEIZE attaches WITHOUT stopping the target, and SETOPTIONS
+        // on a running tracee fails ESRCH — so options ride the
+        // SEIZE `data` word (atomic attach+options, no stop-dance,
+        // no fork-event escape window). A post-SEIZE SETOPTIONS
+        // call here would self-inflict ESRCH on every live target
+        // (dry-run root cause: startup "already gone" on live
+        // workload, then EPERM re-seize at re-enumeration).
+        let opts = (libc::PTRACE_O_TRACECLONE
+            | libc::PTRACE_O_TRACEFORK
+            | libc::PTRACE_O_TRACEVFORK) as libc::c_ulong;
+        // SAFETY: seize+options on a target pid; `data` carries
+        // SETOPTIONS bits.
+        let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, opts as *mut libc::c_void) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
-        self.set_options(pid)?;
         self.traced.insert(pid);
         Ok(())
     }
@@ -785,6 +805,111 @@ mod tests {
         // ENOENT against a live target fails loud (wrong errno).
         let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
         assert!(!Observer::tolerate_seize_error(&enoent, 1, false));
+    }
+
+    /// Live-seize pin (dry-run regression): SEIZE must attach AND
+    /// arm fork-following atomically. The first cut called
+    /// SETOPTIONS after SEIZE on a still-running target, which
+    /// fails ESRCH — startup then "tolerated" a live attach and
+    /// re-enumeration died EPERM. Parent→child ptrace needs no
+    /// privilege (Yama parent exemption); when the sandbox denies
+    /// ptrace outright (seccomp), this pins nothing and returns.
+    #[test]
+    fn seize_live_child_attaches_with_fork_events() {
+        // SAFETY: fork; the child touches no Rust state — sleeps,
+        // forks once, sleeps, exits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed");
+        if child == 0 {
+            unsafe {
+                libc::sleep(2);
+                if libc::fork() == 0 {
+                    libc::_exit(0);
+                }
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+        let log = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut obs = Observer {
+            log,
+            traced: HashSet::new(),
+            pending_initial: HashSet::new(),
+            last_sender: HashMap::new(),
+        };
+        match obs.seize(child) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::EPERM) => {
+                // Sandbox without ptrace: a first-seize EPERM on
+                // our own live child can only be environmental.
+                eprintln!("seize test: ptrace denied, skipping live pin");
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                }
+                drain_reap();
+                return;
+            }
+            Err(e) => panic!("seize of live child must succeed: {e}"),
+        }
+        assert!(obs.traced.contains(&child));
+        // A second seize proves kernel-level attach (already traced).
+        let err = obs.seize(child).expect_err("re-seize must fail EPERM");
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        // Drain stops until the child's FORK event lands (options
+        // live from the attach instant — no escape window).
+        let mut saw_fork = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !saw_fork && std::time::Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            if got <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            if got == child && libc::WIFSTOPPED(status) {
+                let event = (status >> 16) & 0xffff;
+                if event == libc::PTRACE_EVENT_FORK as i32 {
+                    saw_fork = true;
+                }
+            }
+            obs.handle_wait(got, status);
+        }
+        // Cleanup either way: detach, kill, reap to ECHILD.
+        unsafe {
+            libc::ptrace(libc::PTRACE_DETACH, child, 0, 0);
+            libc::kill(child, libc::SIGKILL);
+        }
+        drain_reap();
+        assert!(saw_fork, "no FORK event within 15 s — options not armed");
+    }
+
+    /// Reap until no children/tracees remain (or 10 s pass).
+    /// Stopped tracees are detached (detach resumes them) so their
+    /// exits become reapable — otherwise ECHILD never arrives.
+    fn drain_reap() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::time::Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            if got < 0 {
+                return; // ECHILD: nothing left.
+            }
+            if got == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                continue;
+            }
+            if libc::WIFSTOPPED(status) {
+                // SAFETY: detach a stopped tracee, resuming it.
+                unsafe {
+                    libc::ptrace(libc::PTRACE_DETACH, got, 0, 0);
+                }
+            }
+        }
     }
 
     fn strict_untouched_passes() {
