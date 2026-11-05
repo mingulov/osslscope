@@ -1,0 +1,4123 @@
+//! SPDX-License-Identifier: GPL-3.0-or-later
+//! §2 coordinator: windows, boundaries, the run loop.
+//!
+//! Phases (frozen order): pre-start admission (exit 2, no side
+//! effects) → lock → quota latch → recovery (§4.4) → engine open
+//! (W4: ONE engine per run) → window tiling (§2) → close (§7) →
+//! summary + the §7.3 fold. Every blocking op runs on a §7.2
+//! control worker (startup under `--timeout`, close under
+//! `--grace` sub-deadlines, in-run boundaries under `--timeout`
+//! with the shared cancel flag — the D-record binds startup and
+//! close explicitly; the in-run bound is T7.4's, reported).
+//!
+//! Stderr discipline: pre-start exit-2 usage errors print
+//! synchronously (the run — and its diagnostics worker — never
+//! started); every run-lifetime line goes through the §7.2
+//! diagnostics worker.
+
+use crate::crypto_watch::ServiceEngine;
+use crate::service::cli::{Format, ServiceConfig};
+use crate::service::envelope::{
+    AccumExceeded, CloseOp, OpOutcome, RunSummary, Spilled, TapRecovered, TickSpan, WindowEnvelope,
+    WindowSpan,
+};
+use crate::service::exit::{RunToolFailure, WindowExit};
+use crate::service::publish::{AttemptKey, PublishStep};
+use crate::service::queue::StreamQueue;
+use crate::service::recovery::{Recovery, Refusal, recover};
+use crate::service::retain::{
+    enforce_retention, rotate_file, rotation_due, unlatched_defense_blocks, write_latch,
+};
+use crate::service::signals::{Signal, SignalFd};
+use crate::service::snapshot::{Snapshot, WindowCtx, produce};
+use crate::service::staging::{Carry, Staging, TickDecision, TickPiece, assemble_crypto_watch};
+use crate::service::state::{
+    AbandonReason, DirLock, PolicyIdentity, PolicyRejection, PolicyStatus, Reservation,
+    ReservationState, RunId, SCHEMA_POLICY, SequenceState, clean_tmps, monotonic_ns, rotated_name,
+    scan_highest_seq, sync_dir, wall_ns, window_name, write_state,
+};
+use crate::service::stream::{Tap, resolve_stream};
+use crate::service::worker::{
+    Control, DestClass, Destination, Diagnostics, Gate, WorkerOut, outcome_of, push_accounting,
+    run_under_control, view_slot,
+};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+/// `osslscope service` entry: parse, admit, run, exit per §7.3.
+pub fn run(args: &[String]) -> ExitCode {
+    match crate::service::cli::parse(args) {
+        Err(help) if help == "__help__" => {
+            print!("{}", crate::service::cli::USAGE);
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            crate::report::err_line(&format!("osslscope service: {reason}"));
+            ExitCode::from(2)
+        }
+        Ok(cfg) => run_service(cfg),
+    }
+}
+
+/// Engine duration: the service runs until canceled — the engine's
+/// own deadline only bounds its sample waits, so park it a decade
+/// out (well inside `Instant` range; cancel always wins first).
+const ENGINE_DURATION: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+
+/// The 6A engine-state cap (mirrors the private
+/// `crypto_watch::GLOBAL_BYTES` 256 MiB — the service pool is the
+/// same budget the 6A path uses).
+const POOL_BYTES: usize = 256 << 20;
+
+/// Pump cadence quanta (mirrors the 6A 25 ms loop sleep; here the
+/// quantum is a signalfd wait so signals stay synchronous).
+const PUMP_QUANTUM: Duration = Duration::from_millis(25);
+
+/// Pre-start refusal (exit 2, decided before any window opens —
+/// synchronous CLI usage error, pre-worker by construction).
+fn refuse2(msg: &str) -> ExitCode {
+    crate::report::err_line(&format!("osslscope service: {msg}"));
+    ExitCode::from(2)
+}
+
+/// One diagnostic event through the §7.2 diagnostics worker
+/// (§1.5 shape per `--format`).
+fn diag_line(diag: &Diagnostics, format: &Format, level: &str, msg: &str) {
+    let bounded = crate::report::bound_line(msg);
+    let line = match format {
+        Format::Json => {
+            let at = wall_ns().unwrap_or(0);
+            format!(
+                "{{\"at_wall_ns\":{at},\"level\":\"{level}\",\"msg\":{}}}",
+                serde_json::to_string(&bounded).unwrap_or_default()
+            )
+        }
+        Format::Human => format!("osslscope: {bounded}"),
+    };
+    diag.emit(line.as_bytes());
+}
+
+/// Reserved out-DIR filenames (§4.1 sink-alias admission).
+fn is_reserved_sink_name(name: &str) -> bool {
+    matches!(
+        name,
+        "sequence.json"
+            | "policy-status.json"
+            | "run-summary.json"
+            | "quota-stop.json"
+            | "service.lock"
+    ) || crate::service::state::parse_window_seq(name).is_some()
+        || crate::service::state::is_rotated_name(name)
+}
+
+/// (device, inode) identity of a path (follows the §4.1 alias rule
+/// — hard links share identity).
+fn dev_ino_of(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+/// Pre-start sink admission (§4.1) on the RESOLVED active file.
+/// Returns the resolved tap path. Refusals are exit 2.
+fn admit_sink(out: &Path, stream: Option<&Path>) -> Result<Option<PathBuf>, String> {
+    let Some(given) = stream else {
+        return Ok(None);
+    };
+    let resolved = resolve_stream(given).map_err(|e| format!("--stream: {e}"))?;
+    // The resolved file itself must not be a directory/socket/device
+    // (only a regular file or FIFO opens; a missing path is created
+    // at open — its parent must exist).
+    if let Ok(meta) = std::fs::symlink_metadata(&resolved) {
+        use std::os::unix::fs::FileTypeExt;
+        let ft = meta.file_type();
+        if ft.is_dir() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
+            return Err("--stream must resolve to a regular file or FIFO".to_string());
+        }
+        if ft.is_symlink() {
+            return Err("--stream must not be a symlink".to_string());
+        }
+        // Alias check: the resolved existing file must not share
+        // identity with any out-DIR evidence/state/latch/lock entry.
+        if let Some(id) = dev_ino_of(&resolved) {
+            let entries = std::fs::read_dir(out).map_err(|e| format!("--out unreadable: {e}"))?;
+            for entry in entries.flatten() {
+                if dev_ino_of(&entry.path()) == Some(id) {
+                    return Err("--stream aliases out-DIR evidence or state".to_string());
+                }
+            }
+        }
+    } else if let Some(parent) = resolved.parent() {
+        if !parent.is_dir() {
+            return Err("--stream parent directory does not exist".to_string());
+        }
+    }
+    if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
+        if is_reserved_sink_name(name) {
+            return Err("--stream filename is reserved".to_string());
+        }
+    }
+    Ok(Some(resolved))
+}
+
+/// Live run state (owned by the coordinator; destructured at exit
+/// into the summary + the §7.3 fold).
+struct Run {
+    cfg: ServiceConfig,
+    run_id: RunId,
+    tag: String,
+    generation: u64,
+    out: PathBuf,
+    diag: Diagnostics,
+    _lock: DirLock,
+    signals: SignalFd,
+    cancel: AtomicBool,
+    engine: ServiceEngine,
+    /// Pool-budget guards (companion bytes; sessions lease from the
+    /// engine's clone of the same pool).
+    _leases: Vec<crate::observation_memory::MemoryLease>,
+    /// Signal state: first cancel latched, double-signal latched.
+    cancel_latched: bool,
+    double_signal: bool,
+    /// SIGHUP reload pending (consumed at the next boundary, §3).
+    reload_pending: bool,
+    /// Policy state (§3).
+    policy: PolicyState,
+    /// Stream state (§5.2/§5.3/§6.1 — `None` without `--stream`).
+    stream: Option<StreamState>,
+    /// Window-cycle state (§2/§4.3/§5.1) — `None` before the first
+    /// open and after the final seal (no such instant mid-run).
+    cycle: Option<Cycle>,
+    /// Summary accumulators (§7.3).
+    summary: SummaryAccum,
+    /// Finalized windows' fold inputs (§7.3).
+    windows: Vec<WindowExit>,
+    /// First finalized seq (summary `first_seq`).
+    first_seq: Option<u64>,
+    /// Run-level tool failure (the §7.3 priority-4 1-group).
+    tool_failure: Option<RunToolFailure>,
+    /// Window origin: the 6A `Start.run_origin_ns` tick anchor +
+    /// requested-start[run-first] (T00 rule, §2).
+    origin_ns: u64,
+    /// Engine tick length (ns).
+    tick_ns: u64,
+    /// Coordinator admission-tick index (u64 per run, §5.1).
+    tick_id: u64,
+    /// Least (pid, starttime) over the RUN's observed members (the
+    /// empty-window target fallback, §11.1).
+    run_member_floor: Option<(u32, u64)>,
+    /// Leaked spill tmps awaiting absorb-retry (next boundary).
+    pending_spill_unlinks: Vec<PathBuf>,
+    /// Output-format alias (diagnostics shape).
+    format: Format,
+}
+
+/// Active/pending policy (§3: at most one pending candidate).
+struct PolicyState {
+    active: Option<PolicyIdentity>,
+    active_rules: Option<crate::policy_config::RuleSet>,
+    pending: Option<PendingPolicy>,
+    displaced: u64,
+    adopted: u64,
+    rejected: u64,
+    last_rejection: Option<PolicyRejection>,
+}
+
+/// One pending candidate (snapshot bytes already admitted —
+/// adoption at the next window open needs no re-read).
+struct PendingPolicy {
+    ident: PolicyIdentity,
+    rules: crate::policy_config::RuleSet,
+}
+
+/// Stream tap + queue + ledger (§§5.2–5.3, 6.1, 7.2).
+struct StreamState {
+    tap_path: PathBuf,
+    tap: Tap,
+    queue: StreamQueue,
+    /// Rotation clock: the file's first ASSIGNED record instant.
+    first_record_wall: Option<std::time::Instant>,
+    /// Assigned seq span of the ACTIVE file (window-ref seqs +
+    /// drop-marker at_seqs; extended by reconciled tails, §6.1).
+    active_first: Option<u64>,
+    active_last: Option<u64>,
+    /// Records assigned (for the span extension audit).
+    active_records: u64,
+    /// In-flight tap ops (cutoff-frozen dispatch records, §7.2).
+    inflight: Vec<crate::service::stream::InflightRecord>,
+    next_op_id: u64,
+    /// Awaiting rotation-tail reconcile (last boundary's rename).
+    pending_reconcile: Option<PendingRotation>,
+}
+
+/// Per-window cycle state (§§2, 4.3, 5.1).
+struct Cycle {
+    /// The window currently open.
+    seq: u64,
+    requested_start_ns: u64,
+    requested_end_ns: u64,
+    effective_start_ns: u64,
+    /// Open baseline (the chained close snapshot, §5.1).
+    open: Snapshot,
+    /// Staging account (carried tick preloaded at open).
+    staging: Staging,
+    /// Current tick piece (admission in progress).
+    piece: TickPiece,
+    /// Carry into the NEXT window (set by the budget decision).
+    carry_out: Option<Carry>,
+    /// Carried INTO this window: `(from_seq, tick_id)` — the valid
+    /// carried records count at assemble time (never predicted).
+    carried_in: Option<(u64, u64)>,
+    /// Admission-tick id at window open (the empty-window
+    /// `tick_span` fallback — the ticks that elapsed, honestly).
+    open_tick_id: u64,
+    /// Coordinator-recorded FIRST fatal this window (event order).
+    fatal: Option<crate::evidence::FatalKind>,
+    /// Single-tick exceed note (§5.1).
+    accum_exceeded: Option<AccumExceeded>,
+    /// Whether this window cut on accumulation (carries into the
+    /// close decision + the `windows_cut_accum` count).
+    accum_cut: bool,
+}
+
+/// Run-summary accumulators (§7.3 — everything the fold + the
+/// summary file need).
+struct SummaryAccum {
+    abandoned: Vec<crate::service::envelope::AbandonedNote>,
+    abandoned_overflow: u64,
+    commit_recovered: Option<crate::service::envelope::CommitRecovered>,
+    orphan_cut_tail: Option<crate::service::envelope::OrphanCutTail>,
+    durability_uncertain: Option<crate::service::envelope::DurabilityUncertain>,
+    final_close_completed_ns: Option<u64>,
+    close_unmeasured: Vec<u64>,
+    windows_cut_accum: u64,
+    quota_exceeded: Option<crate::service::envelope::QuotaExceeded>,
+    tap_recovered: TapRecovered,
+    tap_uncertain: Vec<crate::service::envelope::TapUncertain>,
+    tap_uncertain_overflow: crate::service::envelope::UncertainOverflow,
+    rotation_tail: Vec<crate::service::envelope::RotationTail>,
+    rotation_tail_overflow: u64,
+    close_accounting: Vec<CloseOp>,
+    close_accounting_overflow: u64,
+    /// Pending sealed close instant (the §4.3 1b seal value —
+    /// the first monotonic read after the last commit fsync).
+    pending_close_completed: Option<u64>,
+    /// Last step-5 commit instant this run (never consumed — the
+    /// summary's `final_close_completed_ns` fallback for ends
+    /// without a seal: "the first read after the last commit
+    /// fsync", §4.3).
+    last_commit_ts: Option<u64>,
+    /// Retained reservation/evidence for the exit path.
+    last_seq: Option<u64>,
+}
+
+impl SummaryAccum {
+    fn new() -> Self {
+        Self {
+            abandoned: Vec::new(),
+            abandoned_overflow: 0,
+            commit_recovered: None,
+            orphan_cut_tail: None,
+            durability_uncertain: None,
+            final_close_completed_ns: None,
+            close_unmeasured: Vec::new(),
+            windows_cut_accum: 0,
+            quota_exceeded: None,
+            tap_recovered: TapRecovered::default(),
+            tap_uncertain: Vec::new(),
+            tap_uncertain_overflow: crate::service::envelope::UncertainOverflow::default(),
+            rotation_tail: Vec::new(),
+            rotation_tail_overflow: 0,
+            close_accounting: Vec::new(),
+            close_accounting_overflow: 0,
+            pending_close_completed: None,
+            last_commit_ts: None,
+            last_seq: None,
+        }
+    }
+
+    /// Cap `abandoned[]` at the most recent 4096 + overflow (§6.2).
+    fn push_abandoned(&mut self, note: crate::service::envelope::AbandonedNote) {
+        self.abandoned.push(note);
+        while self.abandoned.len() > 4096 {
+            self.abandoned.remove(0);
+            self.abandoned_overflow += 1;
+        }
+    }
+}
+
+/// One §7.2 worker op: run under `budget` + `cancel`, record the
+/// coordinator-observed outcome in `close_accounting`, and emit
+/// one bounded diagnostic on anything but `Done`.
+#[allow(clippy::too_many_arguments)]
+fn run_op<T, F>(
+    diag: &Diagnostics,
+    format: &Format,
+    accum: &mut SummaryAccum,
+    cancel: &AtomicBool,
+    op_name: &str,
+    dest: Destination,
+    budget: Duration,
+    op: F,
+) -> Control<T>
+where
+    T: Send + 'static,
+    F: FnOnce(Gate) -> WorkerOut<T> + Send + 'static,
+{
+    let control = run_under_control(dest, budget, cancel, op);
+    let outcome = outcome_of(&control);
+    if outcome != OpOutcome::Done {
+        diag_line(
+            diag,
+            format,
+            "warn",
+            &format!("op {op_name} ended {outcome:?}"),
+        );
+    }
+    push_accounting(
+        &mut accum.close_accounting,
+        &mut accum.close_accounting_overflow,
+        op_name.to_string(),
+        outcome,
+    );
+    control
+}
+
+/// State-file destination key (per-destination registry, §7.2).
+fn state_dest(name: &str) -> Destination {
+    Destination {
+        class: DestClass::StateMut,
+        key: format!("state:{name}"),
+    }
+}
+
+/// Mutable-state write (§4.2 discipline: tmp+rename+fsync+dirsync)
+/// as a worker-op closure body. Returns the IO result for the
+/// coordinator to judge (a `Failed` op outcome is recorded by the
+/// caller from the returned `Err`).
+fn write_state_body(
+    dir: PathBuf,
+    name: String,
+    tag: String,
+    bytes: Vec<u8>,
+) -> std::io::Result<()> {
+    write_state(&dir, &name, &tag, &bytes)
+}
+
+/// Timestamped state write: the worker takes the FIRST monotonic
+/// read immediately after its commit fsync returns (the §4.3
+/// close-completion numerator — coordinator-side reads would add
+/// join-poll latency; the oracle measures sub-second closes).
+fn write_state_ts(
+    dir: &Path,
+    name: &str,
+    tag: &str,
+    bytes: &[u8],
+) -> (std::io::Result<()>, Option<u64>) {
+    match write_state(dir, name, tag, bytes) {
+        Ok(()) => (Ok(()), Some(monotonic_ns())),
+        Err(e) => (Err(e), None),
+    }
+}
+
+/// Reconciled state write (§7.2 STATE rule): attempt on a fenced
+/// worker; on abandonment, poll for unregister, re-read the file,
+/// and re-apply once when the transition is not reflected.
+/// Returns `(Ok(true), ts)` when the file reflects the transition
+/// (written or converged), `(Ok(false), _)` when it verifiably
+/// does not (caller judges the tool failure), `Err` for IO errors
+/// on the deciding attempt.
+fn state_write_reconciled(
+    run: &mut Run,
+    op_name: &str,
+    file: &str,
+    bytes: Vec<u8>,
+    budget: Duration,
+) -> (Result<bool, std::io::Error>, Option<u64>) {
+    let dest = state_dest(file);
+    // Attempt 1 (fenced worker with the pre-mutation re-check).
+    let first = {
+        let (out, tag) = (run.out.clone(), run.tag.clone());
+        let file = file.to_string();
+        let bytes = bytes.clone();
+        run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            op_name,
+            dest.clone(),
+            budget,
+            move |gate| {
+                if gate.abandoned() {
+                    return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
+                }
+                WorkerOut::value(write_state_ts(&out, &file, &tag, &bytes))
+            },
+        )
+    };
+    match first {
+        Control::Done((Ok(()), ts)) => return (Ok(true), ts),
+        Control::Done((Err(e), _)) => {
+            // Verifiable non-reflection can only be claimed after a
+            // re-read (a post-check completion may still land) —
+            // fall through to reconcile like an abandonment, but
+            // remember the IO error for the final judgment.
+            let _ = e;
+        }
+        _ => {}
+    }
+    // Abandonment/error: poll for unregister, then re-read (the
+    // re-read is itself a worker op — §7.2 lists reads; a distinct
+    // slot so a still-registered writer never refuses it). A
+    // reflected transition converges (the detached worker's
+    // post-check completion won the race, §7.2).
+    if !poll_unregister(&dest, Duration::from_secs(1)) {
+        diag_line(
+            &run.diag,
+            &run.format,
+            "warn",
+            &format!("{op_name}: worker still registered"),
+        );
+    }
+    let reread = {
+        let (out, file) = (run.out.clone(), file.to_string());
+        run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            op_name,
+            Destination {
+                class: DestClass::StateMut,
+                key: format!("reread-{file}"),
+            },
+            budget,
+            move |_gate| WorkerOut::value(std::fs::read(out.join(&file)).ok()),
+        )
+    };
+    // A failed re-read re-applies blind: the transition is an
+    // idempotent set-operation (identical bytes ⟹ identical result),
+    // so a redundant re-application converges harmlessly.
+    if matches!(reread, Control::Done(Some(ref b)) if *b == bytes) {
+        return (Ok(true), None);
+    }
+    // Re-apply once via a fresh worker (the slot is consumed, so a
+    // successor registers — reconcile-before-next-use, §7.2).
+    let second = {
+        let (out, tag) = (run.out.clone(), run.tag.clone());
+        let file = file.to_string();
+        run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            op_name,
+            dest.clone(),
+            budget,
+            move |gate| {
+                if gate.abandoned() {
+                    return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
+                }
+                WorkerOut::value(write_state_ts(&out, &file, &tag, &bytes))
+            },
+        )
+    };
+    match second {
+        Control::Done((Ok(()), ts)) => (Ok(true), ts),
+        Control::Done((Err(e), _)) => (Err(e), None),
+        _ => (Ok(false), None),
+    }
+}
+
+/// Run the service (parsed config → pre-start → run → exit).
+fn run_service(cfg: ServiceConfig) -> ExitCode {
+    // Signals first: block TERM/INT/HUP process-wide so every later
+    // thread (workers, engine) inherits the mask; all handling is
+    // synchronous through the signalfd (§§3, 7.1).
+    let signals = match SignalFd::install() {
+        Ok(s) => s,
+        Err(e) => return refuse2(&format!("signals unavailable: {e}")),
+    };
+    // The out-DIR is the unit of durability (§4) — create it when
+    // missing (T7.4's: a service that cannot create its workspace
+    // cannot run; refusal here would strand fresh deploys).
+    if let Err(e) = std::fs::create_dir_all(&cfg.out) {
+        return refuse2(&format!("--out not creatable: {e}"));
+    }
+    // Sink admission (§4.1) — usage check before the lock.
+    let stream_path = match admit_sink(&cfg.out, cfg.stream.as_deref()) {
+        Ok(p) => p,
+        Err(reason) => return refuse2(&reason),
+    };
+    // `--reset-sequence` refuses when windows exist (exit 2); the
+    // state rewrite itself runs under the lock below.
+    if cfg.reset_sequence {
+        match scan_highest_seq(&cfg.out) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return refuse2("--reset-sequence refuses: out-DIR holds windows");
+            }
+            Err(e) => return refuse2(&format!("out-DIR unreadable: {e}")),
+        }
+    }
+    let run_id = match RunId::current() {
+        Ok(id) => id,
+        Err(e) => return refuse2(&format!("run identity unreadable: {e}")),
+    };
+    let tag = run_id.tag();
+    let started_wall_ns = wall_ns().unwrap_or(0);
+    let lock = match DirLock::take(&cfg.out, &run_id, started_wall_ns) {
+        Ok(l) => l,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return refuse2("out-DIR locked");
+        }
+        Err(e) => return refuse2(&format!("lock failed: {e}")),
+    };
+    let diag = Diagnostics::spawn();
+    let format = cfg.format;
+    let mut accum = SummaryAccum::new();
+    let cancel = AtomicBool::new(false);
+    // Startup deadline: recovery reads, first reserve, first
+    // admission run on workers under `--timeout` (§7.2). Signals
+    // arriving mid-startup queue in the mask (none lost) and are
+    // consumed at the first run-loop poll.
+    let startup_deadline = Instant::now() + cfg.timeout;
+    let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
+    // `--reset-sequence`: fresh state, generation+1, reserved null,
+    // policy-status untouched (§4.3).
+    if cfg.reset_sequence {
+        let dir = cfg.out.clone();
+        let control: Control<std::io::Result<()>> = run_op(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            "reset_sequence_write",
+            state_dest("sequence.json"),
+            startup_budget(),
+            move |gate| {
+                let old_gen = std::fs::read(dir.join("sequence.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<SequenceState>(&b).ok())
+                    .map(|s| s.generation)
+                    .unwrap_or(0);
+                // Fenced re-check before the ONE state mutation.
+                if gate.abandoned() {
+                    return WorkerOut::value(Err(std::io::Error::other("abandoned")));
+                }
+                let mut fresh = SequenceState::fresh(
+                    RunId {
+                        pid: 0,
+                        starttime: 0,
+                        boot_id: String::new(),
+                    },
+                    wall_ns().unwrap_or(0),
+                );
+                fresh.generation = old_gen.saturating_add(1);
+                fresh.next_seq = 0;
+                fresh.reserved = None;
+                let bytes = serde_json::to_vec(&fresh).map_err(std::io::Error::other);
+                let out = match bytes {
+                    Ok(b) => {
+                        let _ = crate::service::state::check_state_cap(&b);
+                        write_state_body(dir, "sequence.json".to_string(), "reset".to_string(), b)
+                    }
+                    Err(e) => Err(e),
+                };
+                WorkerOut::value(out)
+            },
+        );
+        match control {
+            Control::Done(Ok(())) => {}
+            Control::Done(Err(e)) => {
+                let _ = diag.abandon(Duration::from_millis(200));
+                crate::report::err_line(&format!("osslscope service: reset failed: {e}"));
+                return ExitCode::from(4);
+            }
+            _ => {
+                let _ = diag.abandon(Duration::from_millis(200));
+                crate::report::err_line("osslscope service: reset timed out");
+                return ExitCode::from(4);
+            }
+        }
+    }
+    startup_recovery(
+        cfg,
+        stream_path,
+        run_id,
+        tag,
+        lock,
+        diag,
+        accum,
+        cancel,
+        signals,
+        startup_deadline,
+    )
+}
+
+/// Pre-run exit-4 (synchronous stderr — the run never opened, so no
+/// worker could drain; the diagnostics worker is abandoned).
+fn prestart_exit4(diag: Diagnostics, msg: &str) -> ExitCode {
+    let _ = diag.abandon(Duration::from_millis(200));
+    crate::report::err_line(&format!("osslscope service: {msg}"));
+    ExitCode::from(4)
+}
+
+/// Startup recovery (§4.4 frozen order): quota latch → clean tmps →
+/// read state → scan → read summary → unlatched defense → recover.
+/// Refusals exit here; clean recovery proceeds to engine open.
+#[allow(clippy::too_many_arguments)]
+fn startup_recovery(
+    cfg: ServiceConfig,
+    stream_path: Option<PathBuf>,
+    run_id: RunId,
+    tag: String,
+    lock: DirLock,
+    diag: Diagnostics,
+    mut accum: SummaryAccum,
+    cancel: AtomicBool,
+    signals: SignalFd,
+    startup_deadline: Instant,
+) -> ExitCode {
+    let format = cfg.format;
+    let out = cfg.out.clone();
+    let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
+    // Quota-stop latch (§6.2): present → re-evaluate from live disk
+    // truth (NON-deleting — a latch-hold exits 4 byte-identical).
+    let latch: Control<Option<Vec<u8>>> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "startup_latch_probe",
+        state_dest("quota-stop.json"),
+        startup_budget(),
+        {
+            let out = out.clone();
+            move |_gate| WorkerOut::value(std::fs::read(out.join("quota-stop.json")).ok())
+        },
+    );
+    let Control::Done(latch_bytes) = latch else {
+        return prestart_exit4(diag, "startup timed out");
+    };
+    if latch_bytes.is_some() {
+        let probe: Control<(bool, bool)> = run_op(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            "startup_quota_probe",
+            state_dest("quota-probe"),
+            startup_budget(),
+            {
+                let out = out.clone();
+                let (rw, rb) = (cfg.retain_windows, cfg.retain_bytes);
+                move |_gate| WorkerOut::value(crate::service::retain::quota_state(&out, rw, rb))
+            },
+        );
+        let Control::Done((over, deletable)) = probe else {
+            return prestart_exit4(diag, "startup timed out");
+        };
+        if over && !deletable {
+            return prestart_exit4(diag, "quota stop latched");
+        }
+        // Quota clears (or deletion can proceed at the first
+        // boundary — the latch's un-deletable premise is moot):
+        // unlink the latch (+dirsync) and start normally.
+        let clear: Control<std::io::Result<()>> = run_op(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            "startup_latch_clear",
+            state_dest("quota-stop.json"),
+            startup_budget(),
+            {
+                let out = out.clone();
+                move |gate| {
+                    if gate.abandoned() {
+                        return WorkerOut::value(Err(std::io::Error::other("abandoned")));
+                    }
+                    let r = crate::service::retain::clear_latch(&out).and_then(|_| sync_dir(&out));
+                    WorkerOut::value(r)
+                }
+            },
+        );
+        match clear {
+            Control::Done(Ok(())) => {}
+            Control::Done(Err(e)) => {
+                diag_line(&diag, &format, "warn", &format!("latch clear failed: {e}"));
+            }
+            _ => return prestart_exit4(diag, "startup timed out"),
+        }
+    }
+    // Stale tmp cleanup (§4.2 — under the §4.1 lock, no live run
+    // races this).
+    let cleaned: Control<std::io::Result<u64>> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "startup_clean_tmps",
+        Destination {
+            class: DestClass::Delete,
+            key: "startup-tmps".to_string(),
+        },
+        startup_budget(),
+        {
+            let out = out.clone();
+            move |_gate| WorkerOut::value(clean_tmps(&out))
+        },
+    );
+    let Control::Done(Ok(_)) = cleaned else {
+        return prestart_exit4(diag, "startup timed out");
+    };
+    // State reads (one worker op, three reads; parsing is
+    // in-memory and non-blocking).
+    type StartupReads = (Option<Vec<u8>>, Option<u64>, Option<Vec<u8>>);
+    let reads: Control<StartupReads> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "startup_state_reads",
+        state_dest("startup-reads"),
+        startup_budget(),
+        {
+            let out = out.clone();
+            move |_gate| {
+                let seq = std::fs::read(out.join("sequence.json")).ok();
+                let highest = scan_highest_seq(&out).unwrap_or(None);
+                let summary = std::fs::read(out.join("run-summary.json")).ok();
+                WorkerOut::value((seq, highest, summary))
+            }
+        },
+    );
+    let Control::Done((seq_bytes, highest, summary_bytes)) = reads else {
+        return prestart_exit4(diag, "startup timed out");
+    };
+    let (state, state_missing) = match seq_bytes {
+        Some(b) => match serde_json::from_slice::<SequenceState>(&b) {
+            Ok(s) => (Some(s), false),
+            Err(_) => return prestart_exit4(diag, "sequence state missing"),
+        },
+        None => (None, highest.is_some()),
+    };
+    let prev_summary: Option<RunSummary> =
+        summary_bytes.and_then(|b| serde_json::from_slice::<RunSummary>(&b).ok());
+    // Unlatched-stop defense (§6.2 — after state+summary are read,
+    // before any reserve, before any window; zero bytes on refusal).
+    if latch_bytes.is_none() {
+        let probe: Control<(bool, bool)> = run_op(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            "startup_quota_probe",
+            state_dest("quota-probe"),
+            startup_budget(),
+            {
+                let out = out.clone();
+                let (rw, rb) = (cfg.retain_windows, cfg.retain_bytes);
+                move |_gate| WorkerOut::value(crate::service::retain::quota_state(&out, rw, rb))
+            },
+        );
+        let Control::Done((over, deletable)) = probe else {
+            return prestart_exit4(diag, "startup timed out");
+        };
+        if over && !deletable {
+            let expected_gen = state.as_ref().map(|s| s.generation).unwrap_or(0);
+            // The recovered state's run_id names the dead run (the
+            // identity binding needs the state; without state the
+            // summary cannot verify — clause (b)).
+            let blocks = match state.as_ref() {
+                Some(s) => {
+                    unlatched_defense_blocks(prev_summary.as_ref(), &s.run_id, expected_gen, true)
+                }
+                None => true,
+            };
+            if blocks {
+                return prestart_exit4(diag, "quota stop defense (unlatched)");
+            }
+        }
+    }
+    // Recovery proper (§4.4 — pure over the reads above).
+    let recovery = recover(
+        &out,
+        state.as_ref(),
+        state_missing,
+        highest,
+        prev_summary.as_ref(),
+    );
+    match recovery.refuse {
+        Some(Refusal::SequenceStateMissing) => {
+            return prestart_exit4(diag, "sequence state missing");
+        }
+        Some(Refusal::Integrity(reason)) => {
+            let _ = diag.abandon(Duration::from_millis(200));
+            crate::report::err_line(&format!("osslscope service: integrity refusal: {reason}"));
+            return ExitCode::from(1);
+        }
+        Some(Refusal::Exhausted) => {
+            // TERMINAL row: the abandoned note is history-preserved
+            // in THIS run's summary, then refuse (exit 1).
+            return terminal_refusal(cfg, run_id, tag, diag, accum, recovery);
+        }
+        None => {}
+    }
+    // Adopt the recovery notes into this run's summary accumulators.
+    if let Some(note) = recovery.abandoned {
+        accum.push_abandoned(note);
+    }
+    accum.commit_recovered = recovery.commit_recovered;
+    accum.orphan_cut_tail = recovery.orphan_cut_tail;
+    accum.close_unmeasured.extend(recovery.close_unmeasured);
+    let generation = state.as_ref().map(|s| s.generation).unwrap_or(0);
+    let carried_close_completed = state.as_ref().and_then(|s| s.close_completed_ns);
+    open_engine(
+        cfg,
+        stream_path,
+        run_id,
+        tag,
+        lock,
+        diag,
+        accum,
+        cancel,
+        signals,
+        startup_deadline,
+        generation,
+        recovery.next_seq,
+        carried_close_completed,
+    )
+}
+
+/// TERMINAL refusal (§4.4 row): the `abandoned` note is
+/// history-preserved in this run's summary, then exit 1 with the
+/// "sequence exhausted" diagnostic + summary note.
+fn terminal_refusal(
+    cfg: ServiceConfig,
+    run_id: RunId,
+    tag: String,
+    diag: Diagnostics,
+    mut accum: SummaryAccum,
+    recovery: Recovery,
+) -> ExitCode {
+    let format = cfg.format;
+    let out = cfg.out.clone();
+    let generation = recovery
+        .abandoned
+        .as_ref()
+        .map(|n| n.generation)
+        .or_else(|| recovery.reconciled.as_ref().map(|r| r.generation))
+        .unwrap_or(0);
+    if let Some(note) = recovery.abandoned {
+        accum.push_abandoned(note);
+    }
+    accum.orphan_cut_tail.clone_from(&recovery.orphan_cut_tail);
+    accum.close_unmeasured.extend(recovery.close_unmeasured);
+    let mut summary = RunSummary::blank(run_id, generation, 0);
+    summary.abandoned = std::mem::take(&mut accum.abandoned);
+    summary.abandoned_overflow = accum.abandoned_overflow;
+    summary.orphan_cut_tail = accum.orphan_cut_tail.clone();
+    summary.close_unmeasured = std::mem::take(&mut accum.close_unmeasured);
+    summary.close_accounting = std::mem::take(&mut accum.close_accounting);
+    summary.close_accounting_overflow = accum.close_accounting_overflow;
+    summary.exit = 1;
+    let bytes = serde_json::to_vec(&summary).unwrap_or_default();
+    let cancel = AtomicBool::new(false);
+    let control: Control<std::io::Result<()>> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "terminal_summary_write",
+        state_dest("run-summary.json"),
+        Duration::from_secs(10),
+        {
+            move |gate| {
+                if gate.abandoned() {
+                    return WorkerOut::value(Err(std::io::Error::other("abandoned")));
+                }
+                WorkerOut::value(write_state_body(
+                    out,
+                    "run-summary.json".to_string(),
+                    tag,
+                    bytes,
+                ))
+            }
+        },
+    );
+    if !matches!(control, Control::Done(Ok(()))) {
+        diag_line(&diag, &format, "warn", "terminal summary write failed");
+    }
+    let _ = diag.abandon(Duration::from_millis(200));
+    crate::report::err_line("osslscope service: sequence exhausted");
+    ExitCode::from(1)
+}
+
+/// Read one policy-file snapshot with the exact §3 open discipline
+/// (`O_NONBLOCK | O_CLOEXEC`, regular file only, 64 KiB + 1 probe
+/// byte). Returns the immutable bytes (identity derives from THESE
+/// bytes only — the file is never reopened).
+fn read_policy_snapshot(path: &Path) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| "cannot open policy file".to_string())?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "cannot inspect policy file".to_string())?;
+    if !metadata.is_file() {
+        return Err("policy file must be a regular file".to_string());
+    }
+    let mut bytes = Vec::with_capacity(65_537);
+    file.take(65_537)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "cannot read policy file".to_string())?;
+    Ok(bytes)
+}
+
+/// Zero counts + ledgers of the run-open acquisition snapshot (§11.1
+/// fresh-run rule: membership + gauges from the read, counts/ledgers
+/// from true zero — `[attach, acq]` hits are run-observed evidence
+/// attributed to the first window, never subtracted away).
+fn zero_acquisition_baseline(snap: &mut Snapshot) {
+    use crate::service::snapshot::LossView;
+    for m in &mut snap.members {
+        for s in &mut m.sites {
+            s.calls = 0;
+        }
+        m.loss = LossView {
+            loss: 0,
+            deferred_ticks: 0,
+            deferred_first: 0,
+            deferred_last: 0,
+            lost: Vec::new(),
+            coalesced: 0,
+        };
+        m.ring = [0; 8];
+        m.gaps.clear();
+        m.engine.clear();
+    }
+    snap.run = crate::service::snapshot::RunTallies::default();
+}
+
+/// Requested span for window `seq` (tiling from the run origin —
+/// saturating at `u64::MAX`, §4.2; unreachable in practice).
+fn requested_span(origin_ns: u64, first_seq: u64, seq: u64, window_ns: u64) -> (u64, u64) {
+    let steps = seq.saturating_sub(first_seq);
+    let start = origin_ns.saturating_add(steps.saturating_mul(window_ns));
+    let end = start.saturating_add(window_ns);
+    (start, end)
+}
+
+/// Engine open (W4: ONE engine per run) + the initial policy +
+/// first reserve/open + run assembly. Hands the live `Run` to the
+/// window loop.
+#[allow(clippy::too_many_arguments)]
+fn open_engine(
+    cfg: ServiceConfig,
+    stream_path: Option<PathBuf>,
+    run_id: RunId,
+    tag: String,
+    lock: DirLock,
+    diag: Diagnostics,
+    mut accum: SummaryAccum,
+    cancel: AtomicBool,
+    signals: SignalFd,
+    startup_deadline: Instant,
+    generation: u64,
+    first_seq: u64,
+    carried_close_completed: Option<u64>,
+) -> ExitCode {
+    let format = cfg.format;
+    let out = cfg.out.clone();
+    let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
+    // Initial `--policy` (§3 — the identical snapshot path: read
+    // once, admit, adopt at the first window open; invalid ⟹
+    // observe-only + the full rejection recording, never a start
+    // refusal — the §3 invalid rule with no old policy).
+    let mut policy = PolicyState {
+        active: None,
+        active_rules: None,
+        pending: None,
+        displaced: 0,
+        adopted: 0,
+        rejected: 0,
+        last_rejection: None,
+    };
+    if let Some(path) = cfg.policy.clone() {
+        let path_for_worker = path.clone();
+        let read: Control<Result<Vec<u8>, String>> = run_op(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            "startup_policy_read",
+            state_dest("policy-read"),
+            startup_budget(),
+            move |_gate| WorkerOut::value(read_policy_snapshot(&path_for_worker)),
+        );
+        match read {
+            Control::Done(Ok(bytes)) => match crate::policy_config::admit_snapshot(&bytes) {
+                Ok(admission) => {
+                    policy.active = Some(PolicyIdentity {
+                        path: path.to_string_lossy().into_owned(),
+                        sha256: admission.sha256,
+                        version: admission.version,
+                        rule_count: admission.rule_count,
+                        adopted_seq: Some(first_seq),
+                    });
+                    policy.active_rules = Some(admission.ruleset);
+                    policy.adopted += 1;
+                }
+                Err(reason) => {
+                    policy.rejected += 1;
+                    policy.last_rejection = Some(PolicyRejection {
+                        at_wall_ns: wall_ns().unwrap_or(0),
+                        reason: crate::report::bound_line(&reason),
+                        attempted_path: path.to_string_lossy().into_owned(),
+                        attempted_sha256: Some(crate::kinds::prov_hash(&bytes)),
+                    });
+                    diag_line(
+                        &diag,
+                        &format,
+                        "warn",
+                        &format!("osslscope: policy reload rejected: {reason}"),
+                    );
+                }
+            },
+            Control::Done(Err(reason)) => {
+                policy.rejected += 1;
+                policy.last_rejection = Some(PolicyRejection {
+                    at_wall_ns: wall_ns().unwrap_or(0),
+                    reason: crate::report::bound_line(&reason),
+                    attempted_path: path.to_string_lossy().into_owned(),
+                    attempted_sha256: None,
+                });
+                diag_line(
+                    &diag,
+                    &format,
+                    "warn",
+                    &format!("osslscope: policy reload rejected: {reason}"),
+                );
+            }
+            _ => return prestart_exit4(diag, "startup timed out"),
+        }
+        // Initial `policy-status.json` (mutable-state discipline).
+        let status = PolicyStatus {
+            schema: SCHEMA_POLICY.to_string(),
+            active: policy.active.clone(),
+            pending_valid: None,
+            pending_displaced: 0,
+            last_rejection: policy.last_rejection.clone(),
+        };
+        let bytes = serde_json::to_vec(&status).unwrap_or_default();
+        let put: Control<std::io::Result<()>> = run_op(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            "startup_policy_status_write",
+            state_dest("policy-status.json"),
+            startup_budget(),
+            {
+                let (out, tag) = (out.clone(), tag.clone());
+                move |gate| {
+                    if gate.abandoned() {
+                        return WorkerOut::value(Err(std::io::Error::other("abandoned")));
+                    }
+                    WorkerOut::value(write_state_body(
+                        out,
+                        "policy-status.json".to_string(),
+                        tag,
+                        bytes,
+                    ))
+                }
+            },
+        );
+        match put {
+            Control::Done(Ok(())) => {}
+            Control::Done(Err(e)) => {
+                diag_line(
+                    &diag,
+                    &format,
+                    "warn",
+                    &format!("policy status write failed: {e}"),
+                );
+            }
+            _ => return prestart_exit4(diag, "startup timed out"),
+        }
+    }
+    // Engine pool + companions (mirrors the 6A `run` setup: resolve
+    // or degrade to passive inventory — an unprivileged run with no
+    // companions observes membership without tracing, never fails).
+    let pool = crate::observation_memory::MemoryPool::new(POOL_BYTES);
+    let resolving = pool.reserve(64 << 20);
+    let objects = match crate::package::commands::resolve_focused_objects(None, None) {
+        Ok(o) => o,
+        Err(_) => {
+            use sha2::{Digest, Sha256};
+            crate::focused_capture::FocusedObjects {
+                observation: std::sync::Arc::from([]),
+                count: std::sync::Arc::from([]),
+                count_sha256: Sha256::digest([]).into(),
+            }
+        }
+    };
+    drop(resolving);
+    let object_bytes = objects.observation.len() + objects.count.len();
+    let mut leases = Vec::new();
+    match pool.reserve(object_bytes) {
+        Some(lease) => leases.push(lease),
+        None => return prestart_exit4(diag, "engine pool exhausted"),
+    }
+    let engine_config = crate::crypto_watch::CryptoWatchConfig {
+        selection: crate::inventory::scope::Selection {
+            pids: cfg.pids.clone(),
+            cgroup: cfg.cgroup.clone(),
+            modules: cfg.modules.clone(),
+            resolve_paths: false,
+        },
+        max_active: crate::crypto_watch::CryptoWatchConfig::default().max_active,
+        max_state_bytes: POOL_BYTES,
+        duration: ENGINE_DURATION,
+        interval: cfg.interval,
+        resolve_paths: false,
+        terminal: false,
+    };
+    // Engine open (coordinator-direct: `ServiceEngine` holds the
+    // `!Send` pool — the §7.2 worker list governs the service's
+    // FILE IO; engine calls inherit 6A's synchronous discipline,
+    // bounded by their own timeouts + the shared cancel flag).
+    let opened = match ServiceEngine::open(&engine_config, objects, &pool, true, None) {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = diag.abandon(Duration::from_millis(200));
+            crate::report::err_line(&format!("osslscope service: engine open failed: {e}"));
+            return ExitCode::from(4);
+        }
+    };
+    let engine = match opened.engine {
+        Some(engine) => engine,
+        None => {
+            // Scope unavailable pre-loop (mirrors the 6A exit-4):
+            // the setup bytes ride the diagnostics worker (the
+            // stderr log keeps them — no window exists to carry
+            // them), then exit 4 with a summary.
+            for line in opened
+                .setup_bytes
+                .split(|b| *b == b'\n')
+                .filter(|l| !l.is_empty())
+            {
+                diag.emit(line);
+            }
+            return prestart_exit4(diag, "scope unavailable");
+        }
+    };
+    let origin_ns = engine.run_origin_ns();
+    let tick_ns = engine.tick_ns();
+    open_first_window(
+        cfg,
+        stream_path,
+        run_id,
+        tag,
+        lock,
+        diag,
+        accum,
+        cancel,
+        signals,
+        startup_deadline,
+        generation,
+        first_seq,
+        carried_close_completed,
+        policy,
+        leases,
+        engine,
+        opened.setup_bytes,
+        origin_ns,
+        tick_ns,
+    )
+}
+
+/// First-window open: the acquisition snapshot (§11.1 fresh-run
+/// rule — flip to the opening seq when nonzero, then zero
+/// counts/ledgers), the step-1a reservation, the step-1b open flip,
+/// setup-bytes staging (tick 0 opens the first window, §11), and
+/// `Run` assembly. Hands the live run to the window loop.
+#[allow(clippy::too_many_arguments)]
+fn open_first_window(
+    cfg: ServiceConfig,
+    stream_path: Option<PathBuf>,
+    run_id: RunId,
+    tag: String,
+    lock: DirLock,
+    diag: Diagnostics,
+    mut accum: SummaryAccum,
+    cancel: AtomicBool,
+    signals: SignalFd,
+    startup_deadline: Instant,
+    generation: u64,
+    first_seq: u64,
+    carried_close_completed: Option<u64>,
+    policy: PolicyState,
+    leases: Vec<crate::observation_memory::MemoryLease>,
+    engine: ServiceEngine,
+    setup_bytes: Vec<u8>,
+    origin_ns: u64,
+    tick_ns: u64,
+) -> ExitCode {
+    let format = cfg.format;
+    let out = cfg.out.clone();
+    let window_ns = cfg.window.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let (req_start, req_end) = requested_span(origin_ns, first_seq, first_seq, window_ns);
+    // Acquisition snapshot: flip the bound epoch to the opening
+    // seq (no-op when zero — fresh maps already read 0), then zero
+    // counts/ledgers per the fresh-run rule. The sealed read of
+    // this call is open-side garbage by construction — `produce`
+    // only consumes close-side sealed bounds.
+    let mut acquisition = if first_seq == 0 {
+        engine.snapshot(None)
+    } else {
+        engine.snapshot(Some(first_seq))
+    };
+    zero_acquisition_baseline(&mut acquisition);
+    // Step 1a (first window): reserve BEFORE the window opens,
+    // carrying `close_completed_ns` forward unchanged.
+    let reservation = Reservation {
+        seq: first_seq,
+        run_id: run_id.clone(),
+        generation,
+        requested_start_ns: req_start,
+        requested_end_ns: req_end,
+        state: ReservationState::Open,
+        reason: None,
+        started: false,
+    };
+    let state = SequenceState {
+        schema: crate::service::state::SCHEMA_SEQ.to_string(),
+        generation,
+        next_seq: first_seq,
+        updated_wall_ns: wall_ns().unwrap_or(0),
+        close_completed_ns: carried_close_completed,
+        exhausted: false,
+        run_id: run_id.clone(),
+        reserved: Some(reservation),
+    };
+    let bytes = serde_json::to_vec(&state).unwrap_or_default();
+    let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
+    let put: Control<std::io::Result<()>> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "reserve_first_window",
+        state_dest("sequence.json"),
+        startup_budget(),
+        {
+            let (out, tag) = (out.clone(), tag.clone());
+            move |gate| {
+                if gate.abandoned() {
+                    return WorkerOut::value(Err(std::io::Error::other("abandoned")));
+                }
+                WorkerOut::value(write_state_body(
+                    out,
+                    "sequence.json".to_string(),
+                    tag,
+                    bytes,
+                ))
+            }
+        },
+    );
+    match put {
+        Control::Done(Ok(())) => {}
+        Control::Done(Err(e)) => {
+            let msg = format!("first reserve failed: {e}");
+            return write_abandoned_summary_and_exit(
+                cfg, run_id, tag, diag, accum, generation, origin_ns, &msg, 4,
+            );
+        }
+        _ => return prestart_exit4(diag, "startup timed out"),
+    }
+    // Step 1b (first window): flip `started` (no previous close to
+    // seal — the field stays as recovery left it).
+    let state = SequenceState {
+        reserved: Some(Reservation {
+            seq: first_seq,
+            run_id: run_id.clone(),
+            generation,
+            requested_start_ns: req_start,
+            requested_end_ns: req_end,
+            state: ReservationState::Open,
+            reason: None,
+            started: true,
+        }),
+        updated_wall_ns: wall_ns().unwrap_or(0),
+        ..state
+    };
+    let bytes = serde_json::to_vec(&state).unwrap_or_default();
+    let put: Control<std::io::Result<()>> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "open_first_window",
+        state_dest("sequence.json"),
+        startup_budget(),
+        {
+            let (out, tag) = (out.clone(), tag.clone());
+            move |gate| {
+                if gate.abandoned() {
+                    return WorkerOut::value(Err(std::io::Error::other("abandoned")));
+                }
+                WorkerOut::value(write_state_body(
+                    out,
+                    "sequence.json".to_string(),
+                    tag,
+                    bytes,
+                ))
+            }
+        },
+    );
+    match put {
+        Control::Done(Ok(())) => {}
+        Control::Done(Err(e)) => {
+            let msg = format!("first open failed: {e}");
+            return write_abandoned_summary_and_exit(
+                cfg, run_id, tag, diag, accum, generation, origin_ns, &msg, 4,
+            );
+        }
+        _ => return prestart_exit4(diag, "startup timed out"),
+    }
+    // Setup bytes open the first window's tick 0 (§11: `Start`
+    // opens the run's first window). Spill-capable from the first
+    // byte (the same admission path as every tick).
+    let mut staging = Staging::new();
+    let mut piece = TickPiece::open(0);
+    for line in setup_bytes.split(|b| *b == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        if staging
+            .admit_record(&mut piece, &out, &tag, line, 0)
+            .is_err()
+        {
+            return prestart_exit4(diag, "staging setup records failed");
+        }
+    }
+    // Tick 0 admits unconditionally (a Carry with empty staging
+    // would fabricate an empty window — the first tick is always
+    // consumed; §5.1 admitted-first accounting).
+    staging.admit_piece(piece);
+    let piece = TickPiece::open(1);
+    let stream = stream_path.clone().map(|tap_path| StreamState {
+        tap_path,
+        tap: Tap::pending(),
+        queue: StreamQueue::new(cfg.queue_bytes, cfg.queue_events),
+        first_record_wall: None,
+        active_first: None,
+        active_last: None,
+        active_records: 0,
+        inflight: Vec::new(),
+        next_op_id: 1,
+        pending_reconcile: None,
+    });
+    let cycle = Cycle {
+        seq: first_seq,
+        requested_start_ns: req_start,
+        requested_end_ns: req_end,
+        effective_start_ns: req_start,
+        open: acquisition,
+        staging,
+        piece,
+        carry_out: None,
+        carried_in: None,
+        open_tick_id: 0,
+        fatal: None,
+        accum_exceeded: None,
+        accum_cut: false,
+    };
+    let run = Run {
+        cfg,
+        run_id,
+        tag,
+        generation,
+        out,
+        diag,
+        _lock: lock,
+        signals,
+        cancel,
+        engine,
+        _leases: leases,
+        cancel_latched: false,
+        double_signal: false,
+        reload_pending: false,
+        policy,
+        stream,
+        cycle: Some(cycle),
+        summary: accum,
+        windows: Vec::new(),
+        first_seq: None,
+        tool_failure: None,
+        origin_ns,
+        tick_ns,
+        tick_id: 1,
+        run_member_floor: None,
+        pending_spill_unlinks: Vec::new(),
+        format,
+    };
+    run_loop(run)
+}
+
+/// Consume synchronously-polled signals (§§3, 7.1): TERM is the
+/// cancel edge (second TERM mid-close is the double-signal
+/// abandon); HUP is the reload flag (consumed at the next
+/// boundary, never mid-window).
+fn consume_signals(run: &mut Run, sigs: Vec<Signal>) {
+    for sig in sigs {
+        match sig {
+            Signal::Term => {
+                if run.cancel_latched {
+                    run.double_signal = true;
+                }
+                run.cancel_latched = true;
+                run.cancel.store(true, Ordering::Release);
+            }
+            Signal::Hup => {
+                run.reload_pending = true;
+            }
+        }
+    }
+}
+
+/// Enter the close (§7.1): the latched run cancel stops the
+/// ENGINE (admission + drain promptness), never the close
+/// mechanics — close worker ops run under grace/timeout
+/// sub-deadline budgets on a fresh gate, or a signal-cut close
+/// would cancel its own publish + summary. `cancel_latched` keeps
+/// the interruption fact for the §7.3 fold. No-op in-run (the
+/// latch is only set on the signal/pump-failure paths, which
+/// always close next).
+fn close_gate(run: &mut Run) {
+    run.cancel.store(false, Ordering::Release);
+}
+
+/// In-run boundary worker budget (T7.4's: the D-record binds
+/// startup (`--timeout`) and close (`--grace`) explicitly; in-run
+/// boundaries share the startup bound but never block signal
+/// polling past one slice — Expired reconciles + retries at the
+/// next boundary, DIR publish/commit excepted per their rules).
+/// Takes the timeout by value (a field copy — no whole-`Run`
+/// borrow inside worker-op argument lists).
+fn boundary_budget(timeout: Duration) -> Duration {
+    timeout.min(Duration::from_secs(5))
+}
+
+/// Boundary outcome: continue the loop with the run, or exit.
+enum BoundaryOut {
+    Continue(Box<Run>),
+    Exit(ExitCode),
+}
+
+/// The window loop: pump the engine (§7.2 quanta with sync signal
+/// polls), stage records per tick (§5.1), and close windows at
+/// requested ends, budget cuts, or cancel (signal cut, §7.1).
+fn run_loop(mut run: Run) -> ExitCode {
+    loop {
+        let sigs = run.signals.drain();
+        consume_signals(&mut run, sigs);
+        if run.double_signal {
+            return double_signal_exit(run);
+        }
+        // One engine pump (coordinator-direct per the §7.2
+        // implementability boundary — engine calls inherit 6A's
+        // synchronous discipline; the shared cancel flag stops
+        // admission promptly).
+        let it = match run.engine.pump_iteration(&run.cancel) {
+            Ok(it) => it,
+            Err(e) => {
+                // Pump failure (unreachable in practice — the pump
+                // writes into a `Vec`): record the FIRST fatal and
+                // stop after this window (cut + close + summary).
+                diag_line(
+                    &run.diag,
+                    &run.format,
+                    "error",
+                    &format!("engine pump failed: {e}"),
+                );
+                if let Some(cycle) = run.cycle.as_mut() {
+                    if cycle.fatal.is_none() {
+                        cycle.fatal = Some(crate::evidence::FatalKind::Runtime(
+                            "engine pump failed".into(),
+                        ));
+                    }
+                }
+                run.cancel_latched = true;
+                run.cancel.store(true, Ordering::Release);
+                return close_final_window(run);
+            }
+        };
+        // Stage this pump's records into the current tick piece
+        // (the record pull discipline: ONE unrendered record held
+        // at a time — split lines borrow from `it.bytes`, each
+        // rendered + staging/spill-decided + dropped before the
+        // next pull).
+        let tick = run.tick_id;
+        let mut spill_failed = false;
+        if let Some(cycle) = run.cycle.as_mut() {
+            for line in it.bytes.split(|b| *b == b'\n') {
+                if line.is_empty() {
+                    continue;
+                }
+                if cycle
+                    .staging
+                    .admit_record(&mut cycle.piece, &run.out, &run.tag, line, tick)
+                    .is_err()
+                {
+                    spill_failed = true;
+                    break;
+                }
+            }
+        }
+        if spill_failed {
+            // Spill-write failure (disk-full family — the record can
+            // neither stage nor spill): Control-2 pre-publish
+            // disposition — abandon with reason + persisted bounds,
+            // resume N+1 at the next start.
+            return abandon_window(run, AbandonReason::DiskFull, None);
+        }
+        // Sample edge = tick end: run the §5.1 budget decision.
+        if it.sample_fired {
+            let decision = {
+                let cycle = run.cycle.as_ref().expect("window open in run loop");
+                let d = cycle.staging.decide_tick(&cycle.piece, cycle.seq);
+                // A Carry with EMPTY staging would fabricate an
+                // empty window — the first tick is always consumed
+                // (§5.1 admitted-first accounting).
+                match d {
+                    TickDecision::Carry
+                        if cycle.staging.staged.is_empty() && cycle.staging.spilled.is_empty() =>
+                    {
+                        TickDecision::Admit
+                    }
+                    other => other,
+                }
+            };
+            match decision {
+                TickDecision::Admit => {
+                    let cycle = run.cycle.as_mut().expect("window open in run loop");
+                    let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
+                    cycle.staging.admit_piece(piece);
+                    run.tick_id += 1;
+                }
+                TickDecision::Carry => {
+                    let cycle = run.cycle.as_mut().expect("window open in run loop");
+                    let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
+                    let from_seq = cycle.seq;
+                    cycle.carry_out = Some(Staging::carry_piece(piece, from_seq));
+                    cycle.accum_cut = true;
+                    run.summary.windows_cut_accum += 1;
+                    run.tick_id += 1;
+                    match close_mid_window(run) {
+                        BoundaryOut::Continue(r) => run = *r,
+                        BoundaryOut::Exit(code) => return code,
+                    }
+                    continue;
+                }
+                TickDecision::AdmitWholeExceed { bytes_over } => {
+                    let cycle = run.cycle.as_mut().expect("window open in run loop");
+                    let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
+                    cycle.staging.admit_piece(piece);
+                    cycle.accum_exceeded = Some(AccumExceeded { bytes: bytes_over });
+                    cycle.accum_cut = true;
+                    run.summary.windows_cut_accum += 1;
+                    run.tick_id += 1;
+                    match close_mid_window(run) {
+                        BoundaryOut::Continue(r) => run = *r,
+                        BoundaryOut::Exit(code) => return code,
+                    }
+                    continue;
+                }
+            }
+        }
+        // Requested end reached → normal boundary close.
+        let close_at_end = match run.cycle.as_ref() {
+            Some(cycle) => monotonic_ns() >= cycle.requested_end_ns,
+            None => false,
+        };
+        if close_at_end {
+            match close_mid_window(run) {
+                BoundaryOut::Continue(r) => run = *r,
+                BoundaryOut::Exit(code) => return code,
+            }
+            continue;
+        }
+        // Cancel latched → the in-flight window finalizes NOW with
+        // `signal_cut` (stop after the current window, §7.1).
+        if run.cancel_latched {
+            return close_final_window(run);
+        }
+        // Quantum sleep that doubles as the synchronous signal poll.
+        let sigs = run.signals.wait(PUMP_QUANTUM);
+        consume_signals(&mut run, sigs);
+    }
+}
+
+/// Effective-ns → tick via the `Start.run_origin_ns` anchor (6A §7;
+/// both domains `CLOCK_MONOTONIC`). Saturates at 0 below the origin.
+fn tick_of(ns: u64, origin_ns: u64, tick_ns: u64) -> u64 {
+    if tick_ns == 0 || ns <= origin_ns {
+        return 0;
+    }
+    ns.saturating_sub(origin_ns) / tick_ns
+}
+
+/// Extract retirement-sealed documents from staged values
+/// (`ProcessObservation` records → `(segment, document)`), filtered
+/// to close-absent segments (retired ⟺ absent from close — a sealed
+/// doc for a close-present member is a drain-order artifact whose
+/// counts the still-open path already carries; its doc still rides
+/// `crypto_watch[]` verbatim).
+fn sealed_map(
+    staged: &[crate::service::staging::StagedRecord],
+    close_segments: &std::collections::BTreeSet<u64>,
+) -> HashMap<u64, crate::evidence::CaptureDocument> {
+    let mut out = HashMap::new();
+    for r in staged {
+        let Some(v) = r.value.as_ref() else {
+            continue;
+        };
+        if v.get("kind").and_then(|k| k.as_str()) != Some("process_observation") {
+            continue;
+        }
+        let (Some(seg), Some(doc_v)) =
+            (v.get("segment").and_then(|s| s.as_u64()), v.get("document"))
+        else {
+            continue;
+        };
+        if close_segments.contains(&seg) {
+            continue;
+        }
+        if let Ok(doc) = serde_json::from_value::<crate::evidence::CaptureDocument>(doc_v.clone()) {
+            out.insert(seg, doc);
+        }
+    }
+    out
+}
+
+/// Close mode: mid-run (commit + next window) vs run-final
+/// (seal + end) vs terminal (MAX seal + end, `exhausted`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseMode {
+    Mid,
+    Final,
+    Terminal,
+}
+
+/// Mid-run boundary close (§§2, 4.3, 5.1, 6, 11.1): close snapshot
+/// (the flip IS the cut) → produce → envelope → publish → sinks →
+/// step-5 commit+reserve → adoption → next 1a-verify/1b open.
+/// `N == u64::MAX` diverts to the terminal seal (no window after
+/// MAX is representable, §4.2).
+fn close_mid_window(run: Run) -> BoundaryOut {
+    let seq = run.cycle.as_ref().expect("window open at close").seq;
+    if seq == u64::MAX {
+        return close_terminal_window(run);
+    }
+    // Close snapshot: flip every member's bound-epoch to N+1 (the
+    // flip IS the cut — §11.1 close order: flip-all → record the
+    // effective edge → guarded read pass).
+    let close = run.engine.snapshot(Some(seq.saturating_add(1)));
+    close_common_body(run, close, false, CloseMode::Mid)
+}
+
+/// Run-final close (§7.1 — cancel latched): drain FIRST (the `End`
+/// plus retirement seals ride the final window's `crypto_watch[]`,
+/// and Control-7 exact-Σ needs sealed totals, not
+/// snapshot-then-retire micro-gaps), stage the drain bytes into
+/// the current piece (admitted whole — the final window consumes
+/// its tail undecided), then the common close with `signal_cut`.
+fn close_final_window(mut run: Run) -> ExitCode {
+    let seq = run.cycle.as_ref().expect("window open at final close").seq;
+    // Drain (the engine retires sessions without readmit; cancel
+    // stops admission, never the drain mechanics — mirrors 6A).
+    let drain = run.engine.close_drain(&run.cancel);
+    match drain {
+        Ok(out) => {
+            // Stage the drain bytes (spill-capable — a spill failure
+            // here abandons pre-close, like the run loop's).
+            let mut spill_failed = false;
+            let tick = run.tick_id;
+            if let Some(cycle) = run.cycle.as_mut() {
+                for line in out.bytes.split(|b| *b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if cycle
+                        .staging
+                        .admit_record(&mut cycle.piece, &run.out, &run.tag, line, tick)
+                        .is_err()
+                    {
+                        spill_failed = true;
+                        break;
+                    }
+                }
+                // Admit the tail piece whole (no tick-end decision —
+                // the final window consumes its tail undecided; the
+                // staging RAM ceiling still bounds via spill).
+                let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
+                cycle.staging.admit_piece(piece);
+            }
+            if spill_failed {
+                return abandon_window(run, AbandonReason::DiskFull, None);
+            }
+        }
+        Err(e) => {
+            // Drain failure (mirrors the 6A close-failure salvage):
+            // record the FIRST fatal and continue with the close
+            // snapshot (still-open members read exact-at-snapshot).
+            diag_line(
+                &run.diag,
+                &run.format,
+                "error",
+                &format!("close drain failed: {e}"),
+            );
+            if let Some(cycle) = run.cycle.as_mut() {
+                if cycle.fatal.is_none() {
+                    cycle.fatal = Some(crate::evidence::FatalKind::Runtime(
+                        "close drain failed".into(),
+                    ));
+                }
+            }
+        }
+    }
+    // MAX under cancel still seals terminally (no N+1 exists) with
+    // the cut flag set (cancel cut it).
+    if seq == u64::MAX {
+        let close = run.engine.snapshot_sealed(u64::MAX);
+        return close_common_body(run, close, true, CloseMode::Terminal).into_exit_code();
+    }
+    let close = run.engine.snapshot(Some(seq.saturating_add(1)));
+    close_common_body(run, close, true, CloseMode::Final).into_exit_code()
+}
+
+/// Terminal close (`N == u64::MAX`, §4.2): drain (the `End` rides
+/// the MAX window like any final close), then the sealed-without-
+/// flip snapshot (MAX+1 is unrepresentable) and the common close
+/// with the TERMINAL seal (`exhausted`, no next window ever).
+fn close_terminal_window(mut run: Run) -> BoundaryOut {
+    let drain = run.engine.close_drain(&run.cancel);
+    match drain {
+        Ok(out) => {
+            let mut spill_failed = false;
+            let tick = run.tick_id;
+            if let Some(cycle) = run.cycle.as_mut() {
+                for line in out.bytes.split(|b| *b == b'\n') {
+                    if line.is_empty() {
+                        continue;
+                    }
+                    if cycle
+                        .staging
+                        .admit_record(&mut cycle.piece, &run.out, &run.tag, line, tick)
+                        .is_err()
+                    {
+                        spill_failed = true;
+                        break;
+                    }
+                }
+                let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
+                cycle.staging.admit_piece(piece);
+            }
+            if spill_failed {
+                return BoundaryOut::Exit(abandon_window(run, AbandonReason::DiskFull, None));
+            }
+        }
+        Err(e) => {
+            diag_line(
+                &run.diag,
+                &run.format,
+                "error",
+                &format!("close drain failed: {e}"),
+            );
+            if let Some(cycle) = run.cycle.as_mut() {
+                if cycle.fatal.is_none() {
+                    cycle.fatal = Some(crate::evidence::FatalKind::Runtime(
+                        "close drain failed".into(),
+                    ));
+                }
+            }
+        }
+    }
+    let close = run.engine.snapshot_sealed(u64::MAX);
+    close_common_body(run, close, false, CloseMode::Terminal)
+}
+
+impl BoundaryOut {
+    fn into_exit_code(self) -> ExitCode {
+        match self {
+            BoundaryOut::Exit(code) => code,
+            // The final/terminal tail always ends the run (commit
+            // is unreachable — mode diverts to seal first).
+            BoundaryOut::Continue(_) => ExitCode::from(1),
+        }
+    }
+}
+
+/// Shared close body (all modes): floor + sealed map + produce →
+/// publish → judge → sinks → commit-or-seal.
+fn close_common_body(
+    mut run: Run,
+    close: Snapshot,
+    signal_cut: bool,
+    mode: CloseMode,
+) -> BoundaryOut {
+    close_gate(&mut run);
+    let effective_end_ns = close.at_ns;
+    // Run-member floor (the empty-window target fallback, §11.1).
+    for m in &close.members {
+        let id = (m.pid, m.starttime);
+        run.run_member_floor = Some(match run.run_member_floor {
+            Some(f) => f.min(id),
+            None => id,
+        });
+    }
+    let close_segments: std::collections::BTreeSet<u64> =
+        close.members.iter().map(|m| m.segment).collect();
+    let cycle = run.cycle.as_ref().expect("window open at close");
+    let sealed = sealed_map(&cycle.staging.staged, &close_segments);
+    let open_tick = tick_of(cycle.effective_start_ns, run.origin_ns, run.tick_ns);
+    let close_tick = tick_of(effective_end_ns, run.origin_ns, run.tick_ns);
+    let policy_rules = match run.policy.active_rules.as_ref() {
+        Some(ruleset) => crate::check::policy_rules(ruleset),
+        None => Vec::new(),
+    };
+    let ctx = WindowCtx {
+        seq: cycle.seq,
+        generation: run.generation,
+        run_id: run.run_id.clone(),
+        span: WindowSpan {
+            requested_start_ns: cycle.requested_start_ns,
+            requested_end_ns: cycle.requested_end_ns,
+            effective_start_ns: cycle.effective_start_ns,
+            effective_end_ns,
+            signal_cut,
+            accum_cut: cycle.accum_cut,
+        },
+        open_tick,
+        close_tick,
+        policy_rules,
+        active_policy: run.policy.active.clone(),
+        fatal: cycle.fatal.clone(),
+        run_member_floor: run.run_member_floor,
+        selection_pid: run.cfg.pids.first().copied().unwrap_or(0),
+    };
+    let produced = produce(&cycle.open, &close, &sealed, &ctx);
+    mid_window_publish(run, close, produced, effective_end_ns, signal_cut, mode)
+}
+
+/// Poll a destination's slot until the worker unregisters (a
+/// detached worker mutates at most once, then exits — §7.2), so a
+/// successor may register. Returns true when the slot is gone
+/// (consumed) or free. Bounded — reconciliation never waits past
+/// its sub-deadline.
+fn poll_unregister(dest: &Destination, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        match view_slot(dest) {
+            None => return true,
+            Some(view) if !view.live => return true,
+            Some(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Evidence destination key (per-destination registry, §7.2 — one
+/// live publisher per window file).
+fn evidence_dest(seq: u64) -> Destination {
+    Destination {
+        class: DestClass::EvidenceLink,
+        key: format!("window-{seq}"),
+    }
+}
+
+/// Publish one rendered window (TWO-phase assemble + link, §7.2):
+/// assemble (read-only, spill tmps intact — abandonment-safe),
+/// render + link on an evidence worker, then absorb the consumed
+/// spills. Returns the publish judgment for the caller.
+struct PublishJudgment {
+    step: PublishStep,
+    stage_errno: Option<(crate::service::publish::PublishStage, i32)>,
+    sha256: String,
+    bytes_len: u64,
+    /// `true` when the publish worker never ran to judgment
+    /// (Expired/Cancelled/SpawnFailed — the window cannot publish
+    /// this boundary; the late P1 may still land, §4.4).
+    worker_gone: bool,
+    /// `true` iff the worker was never spawned (F-015).
+    spawn_failed: bool,
+}
+
+fn mid_window_publish(
+    mut run: Run,
+    close: Snapshot,
+    produced: crate::service::snapshot::Produced,
+    effective_end_ns: u64,
+    signal_cut: bool,
+    mode: CloseMode,
+) -> BoundaryOut {
+    let seq = run.cycle.as_ref().expect("window open at publish").seq;
+    // Assemble (worker, read-only — spill tmps intact so a retry
+    // re-assembles completely; §7.2 lossless two-phase).
+    let (staged, spilled, carried_tick, carried_from, staging_peak, open_tick_id) = {
+        let cycle = run.cycle.as_ref().expect("window open at publish");
+        (
+            cycle
+                .staging
+                .staged
+                .iter()
+                .map(|r| (r.raw.clone(), r.tick))
+                .collect::<Vec<_>>(),
+            cycle
+                .staging
+                .spilled
+                .iter()
+                .map(|r| (r.tmp.clone(), r.bytes, r.tick))
+                .collect::<Vec<_>>(),
+            cycle.carried_in.map(|(_, tick)| tick),
+            cycle.carried_in.map(|(from, _)| from),
+            cycle.staging.meter.staging_peak(),
+            cycle.open_tick_id,
+        )
+    };
+    let budget = boundary_budget(run.cfg.timeout);
+    let dest = Destination {
+        class: DestClass::OwnTmp,
+        key: format!("assemble-{seq}"),
+    };
+    let asm: Control<std::io::Result<crate::service::staging::Assembled>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("assemble_window_{seq}"),
+        dest.clone(),
+        budget,
+        move |_gate| {
+            // Rebuild the record views worker-side (parsed values
+            // re-derived — the coordinator's DOMs stay home).
+            let staged: Vec<crate::service::staging::StagedRecord> = staged
+                .into_iter()
+                .map(|(raw, tick)| {
+                    let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
+                    crate::service::staging::StagedRecord { raw, value, tick }
+                })
+                .collect();
+            let spilled: Vec<crate::service::staging::SpilledRecord> = spilled
+                .into_iter()
+                .map(
+                    |(tmp, bytes, tick)| crate::service::staging::SpilledRecord {
+                        tmp,
+                        bytes,
+                        tick,
+                    },
+                )
+                .collect();
+            WorkerOut::value(assemble_crypto_watch(
+                &staged,
+                &spilled,
+                carried_tick,
+                carried_from,
+                false,
+            ))
+        },
+    );
+    let assembled = match asm {
+        Control::Done(Ok(a)) => a,
+        Control::Done(Err(e)) => {
+            diag_line(
+                &run.diag,
+                &run.format,
+                "error",
+                &format!("assemble failed: {e}"),
+            );
+            return BoundaryOut::Exit(abandon_window(
+                run,
+                AbandonReason::IoError,
+                Some(effective_end_ns),
+            ));
+        }
+        _ => {
+            // Assemble never ran to judgment (slow FS or signal):
+            // the window cannot publish this boundary — abandon
+            // (the run ends; the next start resumes at N+1, §4.4).
+            // Spawn failure names `worker_unavailable` (F-015).
+            let reason = match asm {
+                Control::SpawnFailed => AbandonReason::WorkerUnavailable,
+                _ => AbandonReason::IoError,
+            };
+            return BoundaryOut::Exit(abandon_window(run, reason, Some(effective_end_ns)));
+        }
+    };
+    if assembled.skipped_invalid > 0 {
+        diag_line(
+            &run.diag,
+            &run.format,
+            "warn",
+            &format!(
+                "window {seq}: {} non-JSON records skipped",
+                assembled.skipped_invalid
+            ),
+        );
+    }
+    // Render (coordinator CPU — the assembled bytes are held): the
+    // envelope value with a byte-verbatim `crypto_watch[]` splice
+    // (`RawValue` — stronger than round-trip: staged bytes are
+    // 6A-emitted verbatim).
+    let cycle = run.cycle.as_ref().expect("window open at publish");
+    let (first_tick, last_tick) = match (assembled.first_tick, assembled.last_tick) {
+        (Some(f), Some(l)) => (f, l),
+        // Empty array: the ticks that elapsed (honest — these ticks
+        // were admitted, zero records).
+        _ => (open_tick_id, run.tick_id),
+    };
+    let tick_span = TickSpan {
+        first_tick,
+        last_tick,
+        carried_records: assembled.carried_records,
+        carried_from_seq: assembled.carried_from_seq,
+    };
+    let spilled_note = Spilled {
+        records: assembled.spilled_records,
+        bytes: assembled.spilled_bytes,
+    };
+    let envelope = WindowEnvelope {
+        schema: crate::service::envelope::SCHEMA_WINDOW.to_string(),
+        seq,
+        generation: run.generation,
+        run_id: run.run_id.clone(),
+        window: WindowSpan {
+            requested_start_ns: cycle.requested_start_ns,
+            requested_end_ns: cycle.requested_end_ns,
+            effective_start_ns: cycle.effective_start_ns,
+            effective_end_ns,
+            signal_cut,
+            accum_cut: cycle.accum_cut,
+        },
+        accum_exceeded: cycle.accum_exceeded.clone(),
+        spilled: spilled_note.clone(),
+        staging_peak_bytes: staging_peak,
+        tick_span: tick_span.clone(),
+        policy: run.policy.active.clone(),
+        members: produced.members.clone(),
+        site_sources: produced.site_sources.clone(),
+        crypto_watch: Vec::new(),
+        document: produced.document.clone(),
+    };
+    let envelope_value = serde_json::to_value(&envelope).unwrap_or(serde_json::Value::Null);
+    let mut bytes = serde_json::to_vec(&envelope_value).unwrap_or_default();
+    // Byte-verbatim `crypto_watch[]` splice: serde renders the empty
+    // vec deterministically as `"crypto_watch":[]` — replace those
+    // exact bytes with the assembled array. The search pattern is
+    // provably structural (string values render with ESCAPED quotes,
+    // so no value can match the unescaped pattern).
+    const NEEDLE: &[u8] = b"\"crypto_watch\":[]";
+    let mut array = Vec::with_capacity(assembled.array_inner.len() + 2);
+    array.push(b'[');
+    array.extend_from_slice(&assembled.array_inner);
+    array.push(b']');
+    let mut spliced = false;
+    if let Some(pos) = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
+        bytes.splice(pos..pos + NEEDLE.len(), array.iter().copied());
+        spliced = true;
+    }
+    if !spliced {
+        // Unreachable (the envelope always carries the empty vec) —
+        // fail closed, never a corrupt file.
+        return BoundaryOut::Exit(abandon_window(
+            run,
+            AbandonReason::IoError,
+            Some(effective_end_ns),
+        ));
+    }
+    let sha256 = crate::kinds::prov_hash(&bytes);
+    let bytes_len = bytes.len() as u64;
+    // Publish (evidence worker — single attempt; a successor is
+    // refused while the worker is registered, §7.2 — so non-Done
+    // abandons the window and the late P1 adopts at recovery).
+    let attempt = AttemptKey {
+        seq,
+        pid: run.run_id.pid,
+        starttime: run.run_id.starttime,
+        boot_id: run.run_id.boot_id.clone(),
+    };
+    let pub_dest = evidence_dest(seq);
+    let published: Control<(
+        PublishStep,
+        Option<(crate::service::publish::PublishStage, i32)>,
+    )> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("publish_window_{seq}"),
+        pub_dest,
+        boundary_budget(run.cfg.timeout),
+        {
+            let (out, tag) = (run.out.clone(), run.tag.clone());
+            move |_gate| {
+                // EvidenceLink is P-class (no fenced re-check — the
+                // link is no-overwrite; EEXIST converges per the ONE
+                // rule inside the publish call).
+                let out = crate::service::publish::publish_window_detailed(
+                    &out, seq, &tag, &bytes, &attempt,
+                );
+                WorkerOut::value(out)
+            }
+        },
+    );
+    let judgment = match published {
+        Control::Done((step, stage_errno)) => PublishJudgment {
+            step,
+            stage_errno,
+            sha256,
+            bytes_len,
+            worker_gone: false,
+            spawn_failed: false,
+        },
+        Control::SpawnFailed => PublishJudgment {
+            step: PublishStep::NotPublished,
+            stage_errno: None,
+            sha256,
+            bytes_len,
+            worker_gone: true,
+            spawn_failed: true,
+        },
+        _ => PublishJudgment {
+            step: PublishStep::NotPublished,
+            stage_errno: None,
+            sha256,
+            bytes_len,
+            worker_gone: true,
+            spawn_failed: false,
+        },
+    };
+    mid_window_judge(run, close, produced, effective_end_ns, judgment, mode)
+}
+
+/// Judge the publish step (§4.2): durable/converged proceed to
+/// sinks; uncertain/not-published/worker-gone/integrity end the
+/// run through their frozen dispositions.
+fn mid_window_judge(
+    mut run: Run,
+    close: Snapshot,
+    produced: crate::service::snapshot::Produced,
+    effective_end_ns: u64,
+    judgment: PublishJudgment,
+    mode: CloseMode,
+) -> BoundaryOut {
+    use crate::service::publish::PublishStep;
+    let seq = run.cycle.as_ref().expect("window open at judge").seq;
+    if judgment.worker_gone {
+        let reason = if judgment.spawn_failed {
+            AbandonReason::WorkerUnavailable
+        } else {
+            AbandonReason::IoError
+        };
+        return BoundaryOut::Exit(abandon_window(run, reason, Some(effective_end_ns)));
+    }
+    match judgment.step {
+        PublishStep::Durable | PublishStep::Converged => {}
+        PublishStep::Uncertain => {
+            // Neither durable nor abandoned: the reservation stays
+            // open-attempted (recovery adopts-or-gaps via the §4.4
+            // matrix + the identity-bound summary flag) — the run
+            // ends as a run-level tool failure WITHOUT sealing (a
+            // seal would claim committed — false).
+            run.summary.durability_uncertain =
+                Some(crate::service::envelope::DurabilityUncertain { seq });
+            run.tool_failure = Some(RunToolFailure::DurabilityUncertain);
+            diag_line(
+                &run.diag,
+                &run.format,
+                "error",
+                &format!("window {seq}: publish uncertain"),
+            );
+            return BoundaryOut::Exit(close_run_end(run));
+        }
+        PublishStep::NotPublished => {
+            // ENOSPC at any stage ⟹ `disk_full`, any other IO error
+            // ⟹ `io_error` (T7.4's stage→reason map, reported).
+            let reason = match judgment.stage_errno {
+                Some((_, errno)) if errno == libc::ENOSPC => AbandonReason::DiskFull,
+                _ => AbandonReason::IoError,
+            };
+            if let Some((stage, errno)) = judgment.stage_errno {
+                diag_line(
+                    &run.diag,
+                    &run.format,
+                    "error",
+                    &format!("window {seq}: publish failed at {stage:?} (errno {errno})"),
+                );
+            }
+            return BoundaryOut::Exit(abandon_window(run, reason, Some(effective_end_ns)));
+        }
+        PublishStep::IntegrityRefusal => {
+            diag_line(
+                &run.diag,
+                &run.format,
+                "error",
+                &format!("window {seq}: duplicate-seq attempt"),
+            );
+            return BoundaryOut::Exit(integrity_exit(run, "duplicate-seq attempt"));
+        }
+    }
+    // Durable (or converged): absorb the consumed spills (OwnTmp —
+    // the bytes are coordinator-held, so a leak reconciles via
+    // retry + §4.4 cleanup, never a loss).
+    let spill_tmps: Vec<PathBuf> = run
+        .cycle
+        .as_ref()
+        .expect("window open at judge")
+        .staging
+        .spilled
+        .iter()
+        .map(|r| r.tmp.clone())
+        .collect();
+    if !spill_tmps.is_empty() {
+        let absorb: Control<usize> = run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            &format!("absorb_spills_{seq}"),
+            Destination {
+                class: DestClass::OwnTmp,
+                key: format!("absorb-{seq}"),
+            },
+            boundary_budget(run.cfg.timeout),
+            move |_gate| {
+                let mut unlinked = 0usize;
+                for tmp in &spill_tmps {
+                    if std::fs::remove_file(tmp).is_ok() {
+                        unlinked += 1;
+                    }
+                }
+                WorkerOut::value(unlinked)
+            },
+        );
+        // A non-Done absorb leaks (retried at the next boundary;
+        // §4.4 cleanup backstops at the next start). Partial
+        // absorbs re-list below — the op reports its count; the
+        // LEAKED remainder is unknown without a re-list, so re-list
+        // the spill tmps (read-only) and queue survivors.
+        let unlinked = matches!(absorb, Control::Done(_));
+        if !unlinked {
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                &format!("window {seq}: spill absorb deferred"),
+            );
+        }
+        queue_leaked_spills(&mut run, seq);
+    }
+    // Release the staging RAM (the envelope holds the bytes now).
+    if let Some(cycle) = run.cycle.as_mut() {
+        cycle.staging.release();
+    }
+    // The finalized window enters the §7.3 fold.
+    run.windows.push(WindowExit {
+        outcome: produced.outcome,
+        doc: produced.document.clone(),
+        delivery: crate::report::DeliveryResult {
+            primary: crate::report::ArtifactOutcome {
+                dest: window_name(seq),
+                ok: true,
+                bytes: judgment.bytes_len,
+                error: None,
+            },
+            cbom: None,
+            diagnostics: Vec::new(),
+        },
+    });
+    if run.first_seq.is_none() {
+        run.first_seq = Some(seq);
+    }
+    run.summary.last_seq = Some(seq);
+    let (run, sinks) = mid_window_sinks(run, judgment.sha256);
+    mid_window_commit(run, close, effective_end_ns, sinks, mode)
+}
+
+/// Re-list this run's spill tmps (worker — read-only) and queue
+/// survivors for the next boundary's absorb retry (leak, never
+/// loss — §4.4 cleanup backstops at the next start).
+fn queue_leaked_spills(run: &mut Run, seq: u64) {
+    let prefix = format!(".{}.tmp.spill.", run.tag);
+    let relist: Control<Vec<PathBuf>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("relist_spills_{seq}"),
+        Destination {
+            class: DestClass::OwnTmp,
+            key: format!("relist-{seq}"),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let out = run.out.clone();
+            move |_gate| {
+                let leaked: Vec<PathBuf> = std::fs::read_dir(&out)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with(&prefix))
+                    })
+                    .collect();
+                WorkerOut::value(leaked)
+            }
+        },
+    );
+    if let Control::Done(leaked) = relist {
+        run.pending_spill_unlinks.extend(leaked);
+    }
+}
+
+/// Awaiting rotation-tail reconcile (the rotated file + the
+/// pre-rename size + the declared span at rename).
+struct PendingRotation {
+    rotated: PathBuf,
+    dev: u64,
+    ino: u64,
+    first: u64,
+    last: u64,
+}
+
+/// Boundary sinks outcome: continue to commit, or stop with the
+/// quota latch written (the window is published — lossless DIR
+/// path — and the run ends as a run-level tool failure, §6.2).
+enum SinksOut {
+    Continue,
+    QuotaStop,
+}
+
+/// Boundary sinks (§4.3 step 4): pending-rotation reconcile →
+/// rotation decision → stream marker+ref enqueue → tap drive →
+/// retention + quota. No `--stream` ⟹ retention only.
+/// Rotation-tail reconcile (L6 over the ROTATED file): content-match
+/// the rotated tail against the in-flight records abandoned at
+/// rotation (§7.2 rotation mode — those records were folded
+/// `epipe`), strike what landed (`tap_recovered`), and file the
+/// `rotation_tail` note (matched seqs beyond the declared span
+/// extend it — normally zero, honestly computed, never assumed).
+fn reconcile_rotation(run: &mut Run) {
+    let pending = run.stream.as_mut().and_then(|s| s.pending_reconcile.take());
+    let Some(rot) = pending else {
+        return;
+    };
+    // Bounded tail read (worker): the last 8 MiB + the identity
+    // gate (reconcile only the file the rename produced — a
+    // replaced path reconciles nothing).
+    let tail: Control<(std::io::Result<Vec<Vec<u8>>>, bool)> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        "rotation_tail_read",
+        Destination {
+            class: DestClass::TapWrite,
+            key: format!("tail-{}-{}", rot.first, rot.last),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let (path, dev, ino) = (rot.rotated.clone(), rot.dev, rot.ino);
+            move |_gate| {
+                let lines = crate::service::stream::read_tail_lines(&path, 8 << 20);
+                let same = {
+                    use std::os::unix::fs::MetadataExt;
+                    std::fs::metadata(&path)
+                        .map(|m| (m.dev(), m.ino()) == (dev, ino))
+                        .unwrap_or(false)
+                };
+                WorkerOut::value((lines, same))
+            }
+        },
+    );
+    let Control::Done((Ok(lines), true)) = tail else {
+        // Tail unreadable or identity replaced: reconciling nothing
+        // is the honest outcome (a replaced file's bytes are not
+        // this run's evidence). Still file the note (zero extras —
+        // the reconcile RAN, it matched nothing).
+        run.summary
+            .rotation_tail
+            .push(crate::service::envelope::RotationTail {
+                file: rot.rotated.to_string_lossy().into_owned(),
+                extra_records: 0,
+                extra_bytes: 0,
+            });
+        truncate_rotation_tail(&mut run.summary);
+        return;
+    };
+    let matched_op_ids = {
+        let s = match run.stream.as_ref() {
+            Some(s) => s,
+            None => return,
+        };
+        crate::service::stream::reconcile_tail(&lines, &s.inflight)
+    };
+    let mut extra_records = 0u64;
+    let mut extra_bytes = 0u64;
+    {
+        let s = run.stream.as_mut().expect("stream state vanished");
+        for op_id in &matched_op_ids {
+            if let Some(rec) = s.inflight.iter().find(|r| r.op_id == *op_id) {
+                // Struck from the (epipe-folded) ledger + counted
+                // recovered (delivered-exactly-once: the fold
+                // claimed the drop, the tail proves the landing —
+                // NET corrects, gross stands).
+                let seq = rec.seq.unwrap_or(rot.last);
+                let (r, b) = s.queue.strike(
+                    seq,
+                    rec.full_bytes(),
+                    crate::service::envelope::DropReason::Epipe,
+                );
+                run.summary.tap_recovered.records += r;
+                run.summary.tap_recovered.bytes += b;
+                if seq < rot.first || seq > rot.last {
+                    extra_records += r;
+                    extra_bytes += b;
+                }
+            }
+        }
+        s.inflight.retain(|r| !matched_op_ids.contains(&r.op_id));
+    }
+    run.summary
+        .rotation_tail
+        .push(crate::service::envelope::RotationTail {
+            file: rot.rotated.to_string_lossy().into_owned(),
+            extra_records,
+            extra_bytes,
+        });
+    truncate_rotation_tail(&mut run.summary);
+}
+
+/// Cap `rotation_tail[]` at the most recent 4096 + overflow (§6.2).
+fn truncate_rotation_tail(accum: &mut SummaryAccum) {
+    while accum.rotation_tail.len() > 4096 {
+        accum.rotation_tail.remove(0);
+        accum.rotation_tail_overflow += 1;
+    }
+}
+
+/// Rotation decision (regular-file taps only, ≥1 record assigned):
+/// EITHER threshold fires at the boundary. The active size is a
+/// true file length (worker stat — pre-existing bytes count).
+fn rotation_fires(run: &mut Run) -> bool {
+    let Some(s) = run.stream.as_ref() else {
+        return false;
+    };
+    if s.active_records == 0 {
+        return false;
+    }
+    let is_fifo = matches!(s.tap, Tap::Open(ref t) if t.ident.is_fifo);
+    if is_fifo {
+        return false;
+    }
+    // Zero-record files never rotate (age clock restarts below).
+    let Some(first_wall) = s.first_record_wall else {
+        return false;
+    };
+    let size: Control<Option<u64>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        "tap_size_check",
+        Destination {
+            class: DestClass::TapWrite,
+            key: "tap-size".to_string(),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let path = s.tap_path.clone();
+            move |_gate| WorkerOut::value(std::fs::metadata(&path).map(|m| m.len()).ok())
+        },
+    );
+    let Control::Done(Some(len)) = size else {
+        return false;
+    };
+    let age = first_wall.elapsed().as_secs();
+    rotation_due(
+        len,
+        age,
+        run.cfg.rotate_bytes,
+        run.cfg.rotate_interval.as_secs(),
+    )
+}
+
+/// Rotation outcome: renamed, deferred (retry next boundary), or
+/// held-name fatal (exit 1, never a skip).
+enum RotationOut {
+    Rotated,
+    Deferred,
+    Held,
+}
+
+/// Rename the active tap aside (fenced Rotate worker — the rename
+/// is the ONE destination mutation). On success the tap returns to
+/// pending (fresh fd next drive — the old fd names the rotated
+/// file now) and the reconcile pends for the next boundary.
+fn rotate_active(run: &mut Run, seq: u64) -> RotationOut {
+    let (active, first, last) = match run.stream.as_ref() {
+        Some(s) => match (s.active_first, s.active_last) {
+            (Some(f), Some(l)) => (s.tap_path.clone(), f, l),
+            _ => return RotationOut::Deferred,
+        },
+        None => return RotationOut::Deferred,
+    };
+    let rotated = active.with_file_name(rotated_name(first, last));
+    let renamed: Control<Result<(), String>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("rotate_stream_{seq}"),
+        Destination {
+            class: DestClass::Rotate,
+            key: "tap-rotate".to_string(),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let (active, rotated) = (active.clone(), rotated.clone());
+            move |gate| {
+                // Fenced re-check before the ONE rename (F3: never
+                // initiate past abandonment).
+                if gate.abandoned() {
+                    return WorkerOut::value(Err("abandoned".to_string()));
+                }
+                WorkerOut::value(rotate_file(&active, &rotated))
+            }
+        },
+    );
+    match renamed {
+        Control::Done(Ok(())) => {}
+        Control::Done(Err(e)) if e.starts_with("rotated stream name held") => {
+            diag_line(&run.diag, &run.format, "error", &e);
+            return RotationOut::Held;
+        }
+        _ => {
+            // Rename abandoned/failed/transient: DEFER to the next
+            // boundary (the active file keeps receiving — the ONLY
+            // fatal rename is the held name).
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                "rotation deferred to next boundary",
+            );
+            return RotationOut::Deferred;
+        }
+    }
+    // Rename won: snapshot the rotated file's (len, dev, ino) for
+    // the tail window + identity gate (worker stat — the rename
+    // preserves identity, so this names the produced file).
+    let stat: Control<Option<(u64, u64, u64)>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        "rotated_size_check",
+        Destination {
+            class: DestClass::TapWrite,
+            key: "rotated-size".to_string(),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let rotated = rotated.clone();
+            move |_gate| {
+                use std::os::unix::fs::MetadataExt;
+                WorkerOut::value(
+                    std::fs::metadata(&rotated)
+                        .map(|m| (m.len(), m.dev(), m.ino()))
+                        .ok(),
+                )
+            }
+        },
+    );
+    let Control::Done(stat) = stat else {
+        // Identity unknown: reconcile from 0 with a wildcard gate
+        // (dev/ino 0 — the gate compares against the stat the
+        // reconcile worker takes; 0 never matches a real file, so
+        // the reconcile honestly matches nothing).
+        if let Some(s) = run.stream.as_mut() {
+            s.pending_reconcile = Some(PendingRotation {
+                rotated,
+                dev: 0,
+                ino: 0,
+                first,
+                last,
+            });
+            reset_active_file(s);
+        }
+        return RotationOut::Rotated;
+    };
+    if let Some(s) = run.stream.as_mut() {
+        let (_, dev, ino) = stat.unwrap_or((0, 0, 0));
+        s.pending_reconcile = Some(PendingRotation {
+            rotated,
+            dev,
+            ino,
+            first,
+            last,
+        });
+        reset_active_file(s);
+    }
+    RotationOut::Rotated
+}
+
+/// Reset the active-file assignment after a rotation (fresh fd next
+/// drive — the old fd names the rotated file).
+fn reset_active_file(s: &mut StreamState) {
+    s.tap = Tap::pending();
+    s.first_record_wall = None;
+    s.active_first = None;
+    s.active_last = None;
+    s.active_records = 0;
+}
+
+/// Enqueue this boundary's marker (covering all uncleared spans) +
+/// window-ref (§§5.2, 10 — marker first: evictions predate the ref,
+/// chronological). Both assign to the CURRENT active file. One
+/// marker per boundary max (none since → no marker).
+fn enqueue_boundary_records(run: &mut Run, seq: u64, sha256: &str) {
+    use crate::service::envelope::StreamRecord;
+    use crate::service::queue::QueuedRecord;
+    let Some(s) = run.stream.as_mut() else {
+        return;
+    };
+    if s.queue.has_pending_spans() {
+        let marker = StreamRecord::DropMarker {
+            schema: crate::service::envelope::SCHEMA_WINDOW.to_string(),
+            at_seq: seq,
+            generation: run.generation,
+            stream_gaps: s.queue.spans(),
+        };
+        // Cover BEFORE enqueue: the marker's own eviction (if any)
+        // folds UNMARKED (marked spans never merge) → the next
+        // boundary's marker re-covers it (delayed marker covers
+        // both spans, §5.2).
+        s.queue.mark_all();
+        if let Ok(line) = serde_json::to_vec(&marker) {
+            s.queue.enqueue(QueuedRecord { seq, bytes: line });
+            assign_active(s, seq);
+        }
+    }
+    let reference = StreamRecord::WindowRef {
+        schema: crate::service::envelope::SCHEMA_WINDOW.to_string(),
+        generation: run.generation,
+        seq,
+        sha256: sha256.to_string(),
+    };
+    if let Ok(line) = serde_json::to_vec(&reference) {
+        s.queue.enqueue(QueuedRecord { seq, bytes: line });
+        assign_active(s, seq);
+    }
+}
+
+/// Assign one record's seq to the active file's declared span (the
+/// rotation age clock starts on the file's first ASSIGNED record).
+fn assign_active(s: &mut StreamState, seq: u64) {
+    s.active_first = Some(s.active_first.map(|f| f.min(seq)).unwrap_or(seq));
+    s.active_last = Some(s.active_last.map(|l| l.max(seq)).unwrap_or(seq));
+    s.active_records += 1;
+    if s.first_record_wall.is_none() {
+        s.first_record_wall = Some(Instant::now());
+    }
+}
+
+/// Tap destination key (TapWrite — one live writer per tap).
+fn tap_dest(run: &Run) -> Destination {
+    Destination {
+        class: DestClass::TapWrite,
+        key: format!(
+            "tap-{}",
+            run.stream
+                .as_ref()
+                .map(|s| s.tap_path.display().to_string())
+                .unwrap_or_default()
+        ),
+    }
+}
+
+/// Drive the tap (§§5.2–5.3, 7.2): open while pending (every
+/// boundary), then pop+write while open and queued
+/// (MAX_OUTSTANDING_TAP = 1 — a registered prior refuses the
+/// successor; in-run abandonment folds `epipe`, shutdown folds
+/// `stream_abandoned`).
+fn drive_tap(run: &mut Run) {
+    // Shutdown cutoff is handled by the close path (this drive is
+    // the in-run form — `epipe` folds, no deadline).
+    drive_tap_inner(run, crate::service::envelope::DropReason::Epipe, None);
+}
+
+fn drive_tap_inner(
+    run: &mut Run,
+    abandon_cause: crate::service::envelope::DropReason,
+    cutoff: Option<Instant>,
+) {
+    use crate::service::stream::WriteOutcome;
+    if run.stream.is_none() {
+        return;
+    }
+    // Open while pending (every boundary; ENXIO-class failures stay
+    // pending — records accumulate + evict oldest as queue_full).
+    if !run.stream.as_ref().expect("stream state").tap.is_open() {
+        let dest = tap_dest(run);
+        // Successor refused while a prior tap worker is registered
+        // (fail-closed — retry next boundary, never concurrent).
+        if matches!(view_slot(&dest), Some(v) if v.live) {
+            return;
+        }
+        let opened: Control<std::io::Result<Tap>> = run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            "tap_open",
+            dest,
+            boundary_budget(run.cfg.timeout),
+            {
+                let path = run.stream.as_ref().expect("stream state").tap_path.clone();
+                move |_gate| WorkerOut::value(Tap::open(&path))
+            },
+        );
+        match opened {
+            Control::Done(Ok(tap)) => {
+                if let Some(s) = run.stream.as_mut() {
+                    s.tap = tap;
+                }
+            }
+            _ => return,
+        }
+    }
+    // Pop + write while open and queued (one op per record — the
+    // tap ping-pongs through the worker and back).
+    loop {
+        // Shutdown cutoff: double-signal or grace expiry stops the
+        // flush between records (leftovers fold `stream_abandoned`
+        // at the close path). Signals drain between records so a
+        // mid-flush double is observed promptly.
+        if cutoff.is_some() {
+            let sigs = run.signals.drain();
+            consume_signals(run, sigs);
+            if run.double_signal || cutoff.is_some_and(|d| Instant::now() >= d) {
+                return;
+            }
+        }
+        let dest = tap_dest(run);
+        if matches!(view_slot(&dest), Some(v) if v.live) {
+            return;
+        }
+        let popped = run.stream.as_mut().and_then(|s| s.queue.pop());
+        let Some(record) = popped else {
+            return;
+        };
+        // Records are identified from their rendered bytes (kind +
+        // seq/at_seq — exact, no parallel bookkeeping to desync).
+        let (kind, at_seq) = stream_record_identity(&record.bytes);
+        let is_marker = kind == "drop-marker";
+        let tap = match run
+            .stream
+            .as_mut()
+            .map(|s| std::mem::replace(&mut s.tap, Tap::pending()))
+        {
+            Some(Tap::Open(t)) => t,
+            _ => {
+                // Tap closed under us (rotation raced? — no: rotation
+                // runs before the drive at each boundary; this is
+                // Long-Term-Cutoff (shutdown) — requeue + stop.
+                if let Some(s) = run.stream.as_mut() {
+                    s.queue.enqueue(record);
+                }
+                return;
+            }
+        };
+        let op_id = run.stream.as_ref().expect("stream state").next_op_id;
+        let tap_is_fifo = tap.ident.is_fifo;
+        if let Some(s) = run.stream.as_mut() {
+            s.next_op_id += 1;
+            s.inflight.push(crate::service::stream::InflightRecord {
+                op_id,
+                content: record.bytes.clone(),
+                kind: kind.clone(),
+                seq: Some(at_seq),
+                span: None,
+                fifo: tap_is_fifo,
+            });
+        }
+        let seq_for_fold = at_seq;
+        let bytes_for_fold = record.bytes.len() as u64 + 1;
+        let written: Control<(crate::service::stream::OpenTap, WriteOutcome)> = run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            &format!("tap_write_{op_id}"),
+            dest.clone(),
+            boundary_budget(run.cfg.timeout),
+            move |_gate| {
+                // P-class: no fenced re-check (the write is never
+                // revoked — abandoned writes reconcile). EINTR
+                // without a byte retries INSIDE the worker (before
+                // ANY other state change, §5.3).
+                let mut tap = tap;
+                let outcome = loop {
+                    match tap.write_record(&record.bytes) {
+                        WriteOutcome::Failed { errno } if errno == libc::EINTR => continue,
+                        other => break other,
+                    }
+                };
+                let receipt_state = match outcome {
+                    WriteOutcome::Complete { bytes } => {
+                        crate::service::worker::TapReceiptState::Complete { bytes }
+                    }
+                    WriteOutcome::Partial { written, .. } => {
+                        crate::service::worker::TapReceiptState::Partial { bytes: written }
+                    }
+                    WriteOutcome::Failed { errno } => {
+                        crate::service::worker::TapReceiptState::Failed { errno }
+                    }
+                };
+                let receipt = crate::service::worker::TapReceipt {
+                    op_id,
+                    state: receipt_state,
+                    kind,
+                    seq: Some(at_seq),
+                    span: None,
+                    record_bytes: bytes_for_fold,
+                    dest_path: tap.ident.path.display().to_string(),
+                    dest_dev: tap.ident.dev,
+                    dest_ino: tap.ident.ino,
+                };
+                WorkerOut {
+                    value: (tap, outcome),
+                    receipt: Some(receipt),
+                }
+            },
+        );
+        match written {
+            Control::Done((tap, outcome)) => {
+                // The tap returns (its clean/written state updated
+                // by the write) — store it back, then judge.
+                let is_fifo = tap.ident.is_fifo;
+                if let Some(s) = run.stream.as_mut() {
+                    s.tap = Tap::Open(tap);
+                    s.inflight.retain(|r| r.op_id != op_id);
+                }
+                match outcome {
+                    WriteOutcome::Complete { .. } => {
+                        if is_marker {
+                            if let Some(s) = run.stream.as_mut() {
+                                s.queue.clear_marked();
+                            }
+                        }
+                    }
+                    WriteOutcome::Partial { .. } | WriteOutcome::Failed { .. } => {
+                        let errno = match outcome {
+                            WriteOutcome::Failed { errno } => errno,
+                            _ => -1,
+                        };
+                        if let Some(s) = run.stream.as_mut() {
+                            s.queue.fold(seq_for_fold, bytes_for_fold, abandon_cause);
+                        }
+                        diag_line(
+                            &run.diag,
+                            &run.format,
+                            "warn",
+                            &format!("tap write failed (errno {errno})"),
+                        );
+                        if errno == libc::EPIPE {
+                            // Disconnect: close the fd, return to
+                            // pending (boundary-retry), stop driving.
+                            if let Some(s) = run.stream.as_mut() {
+                                s.tap = Tap::pending();
+                            }
+                            return;
+                        }
+                        if is_fifo {
+                            // FIFO non-EPIPE errors fail closed to
+                            // pending (same disposition as ENXIO).
+                            if let Some(s) = run.stream.as_mut() {
+                                s.tap = Tap::pending();
+                            }
+                            return;
+                        }
+                        // Regular-file non-EPIPE (ENOSPC family):
+                        // the tap stays open for the next record.
+                    }
+                }
+            }
+            _ => {
+                // Worker gone (expired/cancelled/never-spawned): the
+                // tap fd went with it (P3 late bytes permitted) —
+                // fold the FULL record bytes (whole-record rule) and
+                // reconcile (receipt → strike; no-receipt regular →
+                // tail re-read; FIFO → uncertain). Stop driving:
+                // the successor is refused while registered.
+                if let Some(s) = run.stream.as_mut() {
+                    s.queue.fold(seq_for_fold, bytes_for_fold, abandon_cause);
+                    s.tap = Tap::pending();
+                }
+                reconcile_tap_write(run, op_id, abandon_cause);
+                return;
+            }
+        }
+    }
+}
+
+/// Identify a stream record from its rendered bytes (kind word +
+/// seq/at_seq — the tap driver parses, never parallel-tracks).
+fn stream_record_identity(bytes: &[u8]) -> (String, u64) {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let kind = value
+        .as_ref()
+        .and_then(|v| v.get("kind"))
+        .and_then(|k| k.as_str())
+        .unwrap_or("")
+        .to_string();
+    let seq = value
+        .as_ref()
+        .and_then(|v| v.get("seq").or_else(|| v.get("at_seq")))
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+    (kind, seq)
+}
+
+/// Reconcile one detached tap write (§7.2 outcome ladder):
+/// receipt Complete → strike + `tap_recovered`; Partial/Failed →
+/// stays folded; no receipt + regular file → bounded tail re-read
+/// (content-match → strike + recovered); no receipt + FIFO (or
+/// still registered at cutoff) → `tap_uncertain` entry.
+fn reconcile_tap_write(
+    run: &mut Run,
+    op_id: u64,
+    abandon_cause: crate::service::envelope::DropReason,
+) {
+    let dest = tap_dest(run);
+    let slot = view_slot(&dest);
+    // The in-flight dispatch record (frozen at dispatch — the ONLY
+    // source for what this op attempted).
+    let inflight = run
+        .stream
+        .as_ref()
+        .and_then(|s| s.inflight.iter().find(|r| r.op_id == op_id).cloned());
+    let Some(rec) = inflight else {
+        return;
+    };
+    let seq = rec.seq.unwrap_or(0);
+    match slot.and_then(|v| v.receipt) {
+        Some(receipt) if receipt.op_id == op_id => {
+            // The worker exited with its receipt: settle now.
+            let done = match receipt.state {
+                crate::service::worker::TapReceiptState::Complete { .. } => {
+                    let (r, b) = run.stream.as_mut().expect("stream state").queue.strike(
+                        seq,
+                        rec.full_bytes(),
+                        abandon_cause,
+                    );
+                    run.summary.tap_recovered.records += r;
+                    run.summary.tap_recovered.bytes += b;
+                    if rec.kind == "drop-marker" {
+                        if let Some(s) = run.stream.as_mut() {
+                            s.queue.clear_marked();
+                        }
+                    }
+                    true
+                }
+                _ => false,
+            };
+            if done {
+                if let Some(s) = run.stream.as_mut() {
+                    s.inflight.retain(|r| r.op_id != op_id);
+                }
+            }
+        }
+        _ => {
+            // No receipt: regular files tail-re-read (bounded
+            // content-match — the L6 resync rule covers
+            // resync-completed partials); FIFOs go uncertain (the
+            // bytes may yet land, unprovable — no tail exists).
+            if !rec.fifo {
+                tail_reconcile_regular(run, &rec, seq, abandon_cause);
+            } else {
+                push_tap_uncertain(run, &rec, seq);
+            }
+        }
+    }
+}
+
+/// Bounded tail re-read for a no-receipt regular-file write (L6
+/// content-match over the ACTIVE file — the detached worker's fd
+/// still names it; rotation renames first, so a rotated-away file
+/// reconciles under `reconcile_rotation` instead — the identity
+/// gate keeps the two disjoint).
+fn tail_reconcile_regular(
+    run: &mut Run,
+    rec: &crate::service::stream::InflightRecord,
+    seq: u64,
+    abandon_cause: crate::service::envelope::DropReason,
+) {
+    let tail: Control<std::io::Result<Vec<Vec<u8>>>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("tail_reconcile_{}", rec.op_id),
+        Destination {
+            class: DestClass::TapWrite,
+            key: format!("tail-active-{}", rec.op_id),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let path = run.stream.as_ref().expect("stream state").tap_path.clone();
+            move |_gate| WorkerOut::value(crate::service::stream::read_tail_lines(&path, 8 << 20))
+        },
+    );
+    let Control::Done(Ok(lines)) = tail else {
+        // Tail unreadable: the bytes are unprovable → uncertain
+        // (regular-file no-receipt with an unreadable tail is the
+        // honest uncertain — not a silent fold).
+        push_tap_uncertain(run, rec, seq);
+        return;
+    };
+    let matched = crate::service::stream::reconcile_tail(&lines, std::slice::from_ref(rec));
+    if matched.contains(&rec.op_id) {
+        let (r, b) = run.stream.as_mut().expect("stream state").queue.strike(
+            seq,
+            rec.full_bytes(),
+            abandon_cause,
+        );
+        run.summary.tap_recovered.records += r;
+        run.summary.tap_recovered.bytes += b;
+        if rec.kind == "drop-marker" {
+            if let Some(s) = run.stream.as_mut() {
+                s.queue.clear_marked();
+            }
+        }
+        if let Some(s) = run.stream.as_mut() {
+            s.inflight.retain(|r| r.op_id != rec.op_id);
+        }
+    } else {
+        // Content absent: NOT proven (the detached worker may land
+        // bytes after this read) — the record stays in-flight for
+        // the next boundary's recheck (bounded: the worker exits,
+        // then its receipt settles it).
+    }
+}
+
+/// File one `tap_uncertain` entry (4096 cap + overflow, §6.2 —
+/// the destination identity is the ACTIVE path's live truth...
+/// — no: the uncertain destination is the DISPATCH-time identity.
+/// The dispatch fd is gone with the worker; the receipt-less
+/// reconcile cannot name (dev, ino) honestly → dev/ino 0 with the
+/// path (unknown-identity marking, reported — never a fabricated
+/// identity).
+fn push_tap_uncertain(run: &mut Run, rec: &crate::service::stream::InflightRecord, seq: u64) {
+    use crate::service::envelope::{TapUncertain, UncertainDest, UncertainRecord};
+    let path = run
+        .stream
+        .as_ref()
+        .map(|s| s.tap_path.display().to_string())
+        .unwrap_or_default();
+    run.summary.tap_uncertain.push(TapUncertain {
+        op: format!("tap_write_{}", rec.op_id),
+        record: UncertainRecord {
+            kind: rec.kind.clone(),
+            seq: Some(seq),
+            span: None,
+            bytes: rec.full_bytes(),
+        },
+        dest: UncertainDest {
+            path,
+            dev: 0,
+            ino: 0,
+        },
+    });
+    while run.summary.tap_uncertain.len() > 4096 {
+        run.summary.tap_uncertain.remove(0);
+        run.summary.tap_uncertain_overflow.ops += 1;
+        run.summary.tap_uncertain_overflow.bytes += rec.full_bytes();
+    }
+    if let Some(s) = run.stream.as_mut() {
+        s.inflight.retain(|r| r.op_id != rec.op_id);
+    }
+}
+
+/// Step-5 commit + reserve (§4.3): commit this window AND reserve
+/// the next in ONE write (mid-run there is no instant where N is
+/// committed but N+1 is unreserved). Quota-stop diverts to the
+/// seal-and-end path instead.
+fn mid_window_commit(
+    mut run: Run,
+    close: Snapshot,
+    effective_end_ns: u64,
+    sinks: SinksOut,
+    mode: CloseMode,
+) -> BoundaryOut {
+    let seq = run.cycle.as_ref().expect("window open at commit").seq;
+    let next = seq.saturating_add(1);
+    let terminal = mode == CloseMode::Terminal;
+    if matches!(sinks, SinksOut::QuotaStop) {
+        // Quota-stop (or held rotation name): the published window
+        // stands; seal the reservation and end the run (the fold
+        // resolves exit 1 — finalized windows exist).
+        return BoundaryOut::Exit(seal_and_end(run, seq, terminal));
+    }
+    if mode != CloseMode::Mid {
+        // Run-final (cancel cut or terminal): no next window — seal
+        // the reservation and end the run.
+        return BoundaryOut::Exit(seal_and_end(run, seq, terminal));
+    }
+    // Reload consumption (§3 — the SIGHUP flag becomes a pending
+    // candidate or a recorded rejection at THIS boundary; adoption
+    // at the next open below).
+    consume_reload(&mut run);
+    // Step 5 proper: next_seq = N+1, reserved = {N+1 fresh},
+    // close_completed_ns = null (the sealed value carries to 1b).
+    let window_ns = run.cfg.window.as_nanos().min(u128::from(u64::MAX)) as u64;
+    let first_seq = run.first_seq.unwrap_or(seq);
+    let (next_start, next_end) = requested_span(run.origin_ns, first_seq, next, window_ns);
+    let bytes = serde_json::to_vec(&SequenceState {
+        schema: crate::service::state::SCHEMA_SEQ.to_string(),
+        generation: run.generation,
+        next_seq: next,
+        updated_wall_ns: wall_ns().unwrap_or(0),
+        close_completed_ns: None,
+        exhausted: false,
+        run_id: run.run_id.clone(),
+        reserved: Some(Reservation {
+            seq: next,
+            run_id: run.run_id.clone(),
+            generation: run.generation,
+            requested_start_ns: next_start,
+            requested_end_ns: next_end,
+            state: ReservationState::Open,
+            reason: None,
+            started: false,
+        }),
+    })
+    .unwrap_or_default();
+    let commit_budget = boundary_budget(run.cfg.timeout);
+    let (reflected, ts) = state_write_reconciled(
+        &mut run,
+        &format!("commit_window_{seq}"),
+        "sequence.json",
+        bytes,
+        commit_budget,
+    );
+    match reflected {
+        Ok(true) => {
+            run.summary.pending_close_completed = ts;
+            run.summary.last_commit_ts = ts.or(run.summary.last_commit_ts);
+        }
+        _ => {
+            // State-commit failure after publish (§4.3 step 5): a
+            // run-level tool failure (priority 4) — the published
+            // window stands (recovery adopts it); try the seal once
+            // (a commit-shaped write — success commits N durably),
+            // then end through the table.
+            run.tool_failure = Some(RunToolFailure::StateCommit);
+            diag_line(
+                &run.diag,
+                &run.format,
+                "error",
+                &format!("window {seq}: step-5 commit failed"),
+            );
+            return BoundaryOut::Exit(seal_and_end(run, seq, terminal));
+        }
+    }
+    open_next_window(run, next, next_start, next_end, close, effective_end_ns)
+}
+
+/// Reload consumption (§3 — at the boundary, never mid-window):
+/// the SIGHUP flag becomes a pending candidate (displacing any
+/// older pending, counted) or a recorded rejection (three ways:
+/// status file at open below, stderr line, summary count). At most
+/// one pending candidate ever exists.
+fn consume_reload(run: &mut Run) {
+    if !run.reload_pending {
+        return;
+    }
+    run.reload_pending = false;
+    let Some(path) = run.cfg.policy.clone() else {
+        // No policy file configured: the HUP names no candidate —
+        // ignore (a diagnostic, never a fabricated rejection).
+        diag_line(
+            &run.diag,
+            &run.format,
+            "info",
+            "SIGHUP with no --policy: ignored",
+        );
+        return;
+    };
+    let read: Control<Result<Vec<u8>, String>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        "reload_policy_read",
+        state_dest("policy-read"),
+        boundary_budget(run.cfg.timeout),
+        {
+            let path = path.clone();
+            move |_gate| WorkerOut::value(read_policy_snapshot(&path))
+        },
+    );
+    let bytes = match read {
+        Control::Done(Ok(b)) => b,
+        Control::Done(Err(reason)) => {
+            run.policy.rejected += 1;
+            run.policy.last_rejection = Some(PolicyRejection {
+                at_wall_ns: wall_ns().unwrap_or(0),
+                reason: crate::report::bound_line(&reason),
+                attempted_path: path.to_string_lossy().into_owned(),
+                attempted_sha256: None,
+            });
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                &format!("policy reload rejected: {reason}"),
+            );
+            return;
+        }
+        _ => {
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                "policy reload read abandoned",
+            );
+            return;
+        }
+    };
+    match crate::policy_config::admit_snapshot(&bytes) {
+        Ok(admission) => {
+            if run.policy.pending.is_some() {
+                run.policy.displaced += 1;
+            }
+            run.policy.pending = Some(PendingPolicy {
+                ident: PolicyIdentity {
+                    path: path.to_string_lossy().into_owned(),
+                    sha256: admission.sha256,
+                    version: admission.version,
+                    rule_count: admission.rule_count,
+                    adopted_seq: None,
+                },
+                rules: admission.ruleset,
+            });
+        }
+        Err(reason) => {
+            run.policy.rejected += 1;
+            run.policy.last_rejection = Some(PolicyRejection {
+                at_wall_ns: wall_ns().unwrap_or(0),
+                reason: crate::report::bound_line(&reason),
+                attempted_path: path.to_string_lossy().into_owned(),
+                attempted_sha256: Some(crate::kinds::prov_hash(&bytes)),
+            });
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                &format!("policy reload rejected: {reason}"),
+            );
+        }
+    }
+}
+
+/// Next-window open (§§2, 3, 4.3): 1a-VERIFY the step-5
+/// reservation (fatal integrity refusal on mismatch, exit 1) →
+/// adopt any pending policy → 1b flip + seal → chained `Cycle`
+/// (open IS the previous close; effective_start IS the previous
+/// effective end; the carried tick preloaded).
+fn open_next_window(
+    mut run: Run,
+    next: u64,
+    next_start: u64,
+    next_end: u64,
+    close: Snapshot,
+    effective_end_ns: u64,
+) -> BoundaryOut {
+    // 1a-VERIFY: re-read + check the reservation names N+1 fresh
+    // (step 5 wrote it; anything else is a fatal integrity
+    // refusal — exit 1, never a skip).
+    let reread: Control<Option<Vec<u8>>> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("verify_reserve_{next}"),
+        Destination {
+            class: DestClass::StateMut,
+            key: format!("reread-sequence-{next}"),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let out = run.out.clone();
+            move |_gate| WorkerOut::value(std::fs::read(out.join("sequence.json")).ok())
+        },
+    );
+    let verified = match reread {
+        Control::Done(Some(bytes)) => serde_json::from_slice::<SequenceState>(&bytes)
+            .ok()
+            .and_then(|s| s.reserved)
+            .is_some_and(|r| {
+                r.seq == next
+                    && r.run_id == run.run_id
+                    && r.generation == run.generation
+                    && r.state == ReservationState::Open
+                    && !r.started
+                    && r.requested_start_ns == next_start
+                    && r.requested_end_ns == next_end
+            }),
+        _ => false,
+    };
+    if !verified {
+        diag_line(
+            &run.diag,
+            &run.format,
+            "error",
+            "reservation mismatch at next-window verify",
+        );
+        return BoundaryOut::Exit(integrity_exit(run, "reservation mismatch"));
+    }
+    // Adoption (W2: the pending candidate becomes active AT the
+    // next window open — one atomic step with the open below).
+    if let Some(pending) = run.policy.pending.take() {
+        let mut ident = pending.ident;
+        ident.adopted_seq = Some(next);
+        run.policy.active = Some(ident);
+        run.policy.active_rules = Some(pending.rules);
+        run.policy.adopted += 1;
+    }
+    // Single policy-status write per boundary (covers admit + adopt
+    // + rejection atomically — observability, never run-fatal).
+    let status = PolicyStatus {
+        schema: SCHEMA_POLICY.to_string(),
+        active: run.policy.active.clone(),
+        pending_valid: run.policy.pending.as_ref().map(|p| p.ident.clone()),
+        pending_displaced: run.policy.displaced,
+        last_rejection: run.policy.last_rejection.clone(),
+    };
+    let status_bytes = serde_json::to_vec(&status).unwrap_or_default();
+    let status_budget = boundary_budget(run.cfg.timeout);
+    let (written, _) = state_write_reconciled(
+        &mut run,
+        "policy_status_write",
+        "policy-status.json",
+        status_bytes,
+        status_budget,
+    );
+    if !matches!(written, Ok(true)) {
+        diag_line(&run.diag, &run.format, "warn", "policy status write failed");
+    }
+    // 1b: flip `started` + seal the carried close instant (the
+    // pending value from step 5 — the pairing rule, §4.3).
+    let seal = run.summary.pending_close_completed.take();
+    let state_bytes = serde_json::to_vec(&SequenceState {
+        schema: crate::service::state::SCHEMA_SEQ.to_string(),
+        generation: run.generation,
+        next_seq: next,
+        updated_wall_ns: wall_ns().unwrap_or(0),
+        close_completed_ns: seal,
+        exhausted: false,
+        run_id: run.run_id.clone(),
+        reserved: Some(Reservation {
+            seq: next,
+            run_id: run.run_id.clone(),
+            generation: run.generation,
+            requested_start_ns: next_start,
+            requested_end_ns: next_end,
+            state: ReservationState::Open,
+            reason: None,
+            started: true,
+        }),
+    })
+    .unwrap_or_default();
+    // The 1b seal value escapes into the summary when the flip
+    // fails (the carried sealed value — the summary still pairs
+    // the last finalized window honestly, §4.3).
+    let open_budget = boundary_budget(run.cfg.timeout);
+    let (reflected, _) = state_write_reconciled(
+        &mut run,
+        &format!("open_window_{next}"),
+        "sequence.json",
+        state_bytes,
+        open_budget,
+    );
+    if !matches!(reflected, Ok(true)) {
+        run.summary.pending_close_completed = seal;
+        run.tool_failure = Some(RunToolFailure::StateCommit);
+        diag_line(
+            &run.diag,
+            &run.format,
+            "error",
+            &format!("window {next}: 1b open flip failed"),
+        );
+        // The previous window stands committed (step 5 won); the
+        // seal converts the un-openable N+1 reservation into the
+        // honest committed seal, then the run ends via the table.
+        let seq = next.saturating_sub(1);
+        return BoundaryOut::Exit(seal_and_end(run, seq, false));
+    }
+    // Chained cycle: open IS the previous close (same object),
+    // effective_start IS the previous effective end, the carried
+    // tick preloaded (admitted-first — every window consumes at
+    // least its carried tick).
+    let old = run.cycle.take().expect("window open at next-open");
+    let (staging, carried_in) = match old.carry_out {
+        Some(carry) => {
+            let tick = carry
+                .staged
+                .first()
+                .map(|r| r.tick)
+                .or_else(|| carry.spilled.first().map(|r| r.tick));
+            let from = carry.from_seq;
+            (Staging::with_carry(carry), tick.map(|t| (from, t)))
+        }
+        None => (Staging::new(), None),
+    };
+    run.cycle = Some(Cycle {
+        seq: next,
+        requested_start_ns: next_start,
+        requested_end_ns: next_end,
+        effective_start_ns: effective_end_ns,
+        open: close,
+        staging,
+        piece: TickPiece::open(run.tick_id),
+        carry_out: None,
+        carried_in,
+        open_tick_id: run.tick_id,
+        fatal: None,
+        accum_exceeded: None,
+        accum_cut: false,
+    });
+    BoundaryOut::Continue(Box::new(run))
+}
+
+/// Seal the run's final window and end (§4.3 seal path):
+/// `next_seq` = N+1, reserved = {N, committed}, `exhausted` for the
+/// terminal seal. `final_close_completed_ns` = the carried sealed
+/// value when one pends (the 1b-failure path — N's first durable
+/// commit was its step-5), else the seal's own commit instant.
+fn seal_and_end(mut run: Run, seq: u64, terminal: bool) -> ExitCode {
+    let (req_start, req_end) = match run.cycle.as_ref() {
+        Some(cycle) => (cycle.requested_start_ns, cycle.requested_end_ns),
+        None => (0, 0),
+    };
+    let bytes = serde_json::to_vec(&SequenceState {
+        schema: crate::service::state::SCHEMA_SEQ.to_string(),
+        generation: run.generation,
+        next_seq: seq.saturating_add(1),
+        updated_wall_ns: wall_ns().unwrap_or(0),
+        close_completed_ns: None,
+        exhausted: terminal,
+        run_id: run.run_id.clone(),
+        reserved: Some(Reservation {
+            seq,
+            run_id: run.run_id.clone(),
+            generation: run.generation,
+            requested_start_ns: req_start,
+            requested_end_ns: req_end,
+            state: ReservationState::Committed,
+            reason: None,
+            started: true,
+        }),
+    })
+    .unwrap_or_default();
+    let seal_budget = boundary_budget(run.cfg.timeout);
+    let (reflected, ts) = state_write_reconciled(
+        &mut run,
+        &format!("seal_window_{seq}"),
+        "sequence.json",
+        bytes,
+        seal_budget,
+    );
+    run.summary.final_close_completed_ns = run.summary.pending_close_completed.take().or(ts);
+    if !matches!(reflected, Ok(true)) {
+        // Seal failure: the published window stands (recovery
+        // adopts it); first failure wins (a set tool_failure is
+        // never overwritten — the seal is the terminal commit, so
+        // a bare seal failure is `StateCommit`).
+        if run.tool_failure.is_none() {
+            run.tool_failure = Some(RunToolFailure::StateCommit);
+        }
+        diag_line(
+            &run.diag,
+            &run.format,
+            "error",
+            &format!("window {seq}: seal write failed"),
+        );
+    }
+    run.cycle = None;
+    close_run_end(run)
+}
+
+/// Abandon the open window and end the run (§4.2 abandonment: the
+/// seq is permanently gapped, never reused; the next start resumes
+/// at N+1 via the §4.4 gap row). `close_at_ns` = the observation
+/// end for post-close abandonments (publish/assemble stage — the
+/// coverage is `[effective_start, close]`); pre-close abandonments
+/// (spill failure — the window never closed) cut at the mark
+/// instant.
+fn abandon_window(mut run: Run, reason: AbandonReason, close_at_ns: Option<u64>) -> ExitCode {
+    close_gate(&mut run);
+    let cycle = run.cycle.take().expect("window open at abandon");
+    let mark = serde_json::to_vec(&SequenceState {
+        schema: crate::service::state::SCHEMA_SEQ.to_string(),
+        generation: run.generation,
+        next_seq: cycle.seq.saturating_add(1),
+        updated_wall_ns: wall_ns().unwrap_or(0),
+        close_completed_ns: None,
+        exhausted: false,
+        run_id: run.run_id.clone(),
+        reserved: Some(Reservation {
+            seq: cycle.seq,
+            run_id: run.run_id.clone(),
+            generation: run.generation,
+            requested_start_ns: cycle.requested_start_ns,
+            requested_end_ns: cycle.requested_end_ns,
+            state: ReservationState::Abandoned,
+            reason: Some(reason),
+            started: true,
+        }),
+    })
+    .unwrap_or_default();
+    let abandon_budget = boundary_budget(run.cfg.timeout);
+    let (reflected, ts) = state_write_reconciled(
+        &mut run,
+        &format!("abandon_window_{}", cycle.seq),
+        "sequence.json",
+        mark,
+        abandon_budget,
+    );
+    if !matches!(reflected, Ok(true)) {
+        diag_line(
+            &run.diag,
+            &run.format,
+            "error",
+            "abandonment mark failed (best-effort)",
+        );
+    }
+    // The cut instant is the FIRST monotonic read after the
+    // abandonment is marked (the mark write's own timestamp, else a
+    // coordinator read — the state write already returned).
+    let cut_ns = close_at_ns.or(ts).unwrap_or_else(monotonic_ns);
+    run.summary
+        .push_abandoned(crate::service::envelope::AbandonedNote {
+            seq: cycle.seq,
+            run_id: run.run_id.clone(),
+            generation: run.generation,
+            requested_start_ns: cycle.requested_start_ns,
+            requested_end_ns: cycle.requested_end_ns,
+            reason,
+            cut_tail_ns: Some(crate::service::envelope::CutTail {
+                effective_end_ns: cut_ns,
+                requested_end_ns: cycle.requested_end_ns,
+            }),
+        });
+    diag_line(
+        &run.diag,
+        &run.format,
+        "warn",
+        &format!("window {} abandoned ({reason:?})", cycle.seq),
+    );
+    close_run_end(run)
+}
+
+/// Swap the diagnostics worker at shutdown: abandon the run's
+/// worker (its drop count enters the summary) and install a fresh
+/// one for the summary write's own accounting. The fresh worker
+/// carries only routine lines (`run_op` stays silent on `Done`;
+/// failures also print synchronously), so its own uncounted drops
+/// are zero in practice.
+fn swap_diag(run: &mut Run) -> u64 {
+    let old = std::mem::replace(&mut run.diag, Diagnostics::spawn());
+    old.abandon(Duration::from_millis(200))
+}
+
+/// Fatal integrity refusal (explicit exit 1, never a skip): the
+/// message prints synchronously (fatal-integrity visibility — the
+/// run is dying, the worker may be implicated) and the summary is
+/// best-effort. No drain, no flush — immediate.
+fn integrity_exit(mut run: Run, msg: &str) -> ExitCode {
+    close_gate(&mut run);
+    run.cycle = None;
+    let dropped = swap_diag(&mut run);
+    let mut summary = RunSummary::blank(run.run_id.clone(), run.generation, run.origin_ns);
+    fill_summary(&mut run, &mut summary, dropped);
+    summary.exit = 1;
+    let bytes = serde_json::to_vec(&summary).unwrap_or_default();
+    let wrote = state_write_reconciled(
+        &mut run,
+        "integrity_summary_write",
+        "run-summary.json",
+        bytes,
+        Duration::from_secs(2),
+    );
+    if !matches!(wrote.0, Ok(true)) {
+        crate::report::err_line("osslscope service: integrity summary write failed");
+    }
+    let _ = run.diag.abandon(Duration::from_millis(200));
+    crate::report::err_line(&format!("osslscope service: integrity refusal: {msg}"));
+    ExitCode::from(1)
+}
+
+/// Run end (§7): the stream flushes within `--grace` (single-signal
+/// and tool-failure ends — the double-signal path cuts with no
+/// flush), shutdown reconciliation settles every in-flight write,
+/// the summary writes, and the §7.3 fold decides the exit. The
+/// engine is never drained here (the final/terminal path drains
+/// before its close; every other end leaves published windows +
+/// the summary with no `End` — there is no open window for drain
+/// bytes to ride).
+fn close_run_end(mut run: Run) -> ExitCode {
+    close_gate(&mut run);
+    run.cycle = None;
+    let deadline = Instant::now() + run.cfg.grace;
+    // Shutdown flush (no flush on the double-signal cutoff — §7.1):
+    // drive the tap within grace (delivery errors fold `epipe` —
+    // the cause names the mechanism, not the phase), then fold
+    // never-attempted leftovers as `stream_abandoned`.
+    if !run.double_signal && run.stream.is_some() {
+        drive_tap_inner(
+            &mut run,
+            crate::service::envelope::DropReason::Epipe,
+            Some(deadline),
+        );
+    }
+    if let Some(s) = run.stream.as_mut() {
+        while let Some(record) = s.queue.pop() {
+            let bytes = record.bytes.len() as u64 + 1;
+            s.queue.fold(
+                record.seq,
+                bytes,
+                crate::service::envelope::DropReason::StreamAbandoned,
+            );
+        }
+    }
+    // Shutdown reconciliation: every in-flight write settles —
+    // receipt/tail when the worker exited, `tap_uncertain` when it
+    // is still registered at the cutoff (unprovable, never silent).
+    let op_ids: Vec<u64> = run
+        .stream
+        .as_ref()
+        .map(|s| s.inflight.iter().map(|r| r.op_id).collect())
+        .unwrap_or_default();
+    for op_id in op_ids {
+        let live = matches!(view_slot(&tap_dest(&run)), Some(v) if v.live);
+        if live {
+            let rec = run
+                .stream
+                .as_ref()
+                .and_then(|s| s.inflight.iter().find(|r| r.op_id == op_id).cloned());
+            if let Some(rec) = rec {
+                let seq = rec.seq.unwrap_or(0);
+                push_tap_uncertain(&mut run, &rec, seq);
+            }
+        } else {
+            reconcile_tap_write(&mut run, op_id, crate::service::envelope::DropReason::Epipe);
+        }
+    }
+    // Last rotation-tail reconcile (the final boundary's rename).
+    reconcile_rotation(&mut run);
+    // Diagnostics swap (the run worker's drop count enters the
+    // summary; the fresh worker serves the summary write).
+    let dropped = swap_diag(&mut run);
+    let mut summary = RunSummary::blank(run.run_id.clone(), run.generation, run.origin_ns);
+    fill_summary(&mut run, &mut summary, dropped);
+    // The §7.3 fold (interrupted = cancel OR double-signal stop).
+    let interrupted = run.cancel_latched || run.double_signal;
+    let code = crate::service::exit::fold(&run.windows, run.tool_failure, interrupted);
+    summary.exit = code;
+    let bytes = serde_json::to_vec(&summary).unwrap_or_default();
+    let wrote = state_write_reconciled(
+        &mut run,
+        "run_summary_write",
+        "run-summary.json",
+        bytes,
+        deadline.saturating_duration_since(Instant::now()),
+    );
+    if !matches!(wrote.0, Ok(true)) {
+        // Post-abandon last resort (the summary is evidence, not
+        // gating — the exit proceeds regardless).
+        crate::report::err_line("osslscope service: run summary write failed");
+    }
+    let _ = run.diag.abandon(Duration::from_millis(200));
+    ExitCode::from(code)
+}
+
+/// Fill a run summary from the accumulators (§7.3 — every field
+/// the fold's callers and the §9 oracles read).
+fn fill_summary(run: &mut Run, summary: &mut RunSummary, diagnostics_dropped: u64) {
+    use crate::service::envelope::{ByReason, ReasonTotals};
+    summary.first_seq = run.first_seq;
+    summary.last_seq = run.summary.last_seq;
+    summary.abandoned = std::mem::take(&mut run.summary.abandoned);
+    summary.abandoned_overflow = run.summary.abandoned_overflow;
+    summary.commit_recovered = run.summary.commit_recovered.clone();
+    summary.orphan_cut_tail = run.summary.orphan_cut_tail.clone();
+    summary.durability_uncertain = run.summary.durability_uncertain.clone();
+    // `final_close_completed_ns`: the seal path's value first,
+    // else the last commit instant ("the first read after the last
+    // commit fsync", §4.3).
+    summary.final_close_completed_ns = run
+        .summary
+        .final_close_completed_ns
+        .or(run.summary.last_commit_ts);
+    summary.close_unmeasured = std::mem::take(&mut run.summary.close_unmeasured);
+    summary.reloads_adopted = run.policy.adopted;
+    summary.reloads_rejected = run.policy.rejected;
+    summary.windows_cut_accum = run.summary.windows_cut_accum;
+    summary.quota_exceeded = run.summary.quota_exceeded.clone();
+    if let Some(s) = run.stream.as_ref() {
+        let (records, bytes) = s.queue.gross();
+        let (qf_r, qf_b) = s
+            .queue
+            .gross_by_reason(crate::service::envelope::DropReason::QueueFull);
+        let (ep_r, ep_b) = s
+            .queue
+            .gross_by_reason(crate::service::envelope::DropReason::Epipe);
+        let (sa_r, sa_b) = s
+            .queue
+            .gross_by_reason(crate::service::envelope::DropReason::StreamAbandoned);
+        summary.stream_drops = crate::service::envelope::StreamDrops {
+            records,
+            bytes,
+            by_reason: ByReason {
+                queue_full: ReasonTotals {
+                    records: qf_r,
+                    bytes: qf_b,
+                },
+                epipe: ReasonTotals {
+                    records: ep_r,
+                    bytes: ep_b,
+                },
+                stream_abandoned: ReasonTotals {
+                    records: sa_r,
+                    bytes: sa_b,
+                },
+            },
+        };
+        summary.stream_pending = s.queue.spans();
+    }
+    summary.tap_recovered = run.summary.tap_recovered.clone();
+    summary.tap_uncertain = std::mem::take(&mut run.summary.tap_uncertain);
+    summary.tap_uncertain_overflow = run.summary.tap_uncertain_overflow.clone();
+    summary.rotation_tail = std::mem::take(&mut run.summary.rotation_tail);
+    summary.rotation_tail_overflow = run.summary.rotation_tail_overflow;
+    summary.close_accounting = std::mem::take(&mut run.summary.close_accounting);
+    summary.close_accounting_overflow = run.summary.close_accounting_overflow;
+    summary.diagnostics_dropped = diagnostics_dropped;
+}
+
+/// Pre-first-window failure exit (1a/1b reserve/open failed): a
+/// minimal summary (the attempt's accumulators + `close_accounting`
+/// showing the failed op) writes best-effort, the cause prints
+/// synchronously (pre-run — no worker could drain), and the run
+/// exits 4 (zero finalized).
+#[allow(clippy::too_many_arguments)]
+fn write_abandoned_summary_and_exit(
+    cfg: ServiceConfig,
+    run_id: RunId,
+    tag: String,
+    diag: Diagnostics,
+    mut accum: SummaryAccum,
+    generation: u64,
+    origin_ns: u64,
+    msg: &str,
+    code: u8,
+) -> ExitCode {
+    let mut summary = RunSummary::blank(run_id, generation, origin_ns);
+    summary.abandoned = std::mem::take(&mut accum.abandoned);
+    summary.abandoned_overflow = accum.abandoned_overflow;
+    summary.commit_recovered = accum.commit_recovered.clone();
+    summary.orphan_cut_tail = accum.orphan_cut_tail.clone();
+    summary.close_unmeasured = std::mem::take(&mut accum.close_unmeasured);
+    summary.close_accounting = std::mem::take(&mut accum.close_accounting);
+    summary.close_accounting_overflow = accum.close_accounting_overflow;
+    summary.exit = code;
+    let bytes = serde_json::to_vec(&summary).unwrap_or_default();
+    let cancel = AtomicBool::new(false);
+    let format = cfg.format;
+    let out = cfg.out.clone();
+    let wrote: Control<(std::io::Result<()>, Option<u64>)> = run_op(
+        &diag,
+        &format,
+        &mut accum,
+        &cancel,
+        "abandoned_summary_write",
+        state_dest("run-summary.json"),
+        Duration::from_secs(5),
+        move |gate| {
+            if gate.abandoned() {
+                return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
+            }
+            WorkerOut::value(write_state_ts(&out, "run-summary.json", &tag, &bytes))
+        },
+    );
+    let _ = diag.abandon(Duration::from_millis(200));
+    if !matches!(wrote, Control::Done((Ok(()), _))) {
+        crate::report::err_line("osslscope service: summary write failed");
+    }
+    crate::report::err_line(&format!("osslscope service: {msg}"));
+    ExitCode::from(code)
+}
+
+/// Double-signal exit (§7.1): immediate stop — the in-flight
+/// window is abandoned best-effort (single attempt, no reconcile —
+/// immediacy beats certainty; recovery re-derives from the open
+/// reservation when the mark lands nowhere), the stream is cut
+/// (no flush — cutoff, leftovers fold `stream_abandoned`), and the
+/// run exits via the table.
+fn double_signal_exit(mut run: Run) -> ExitCode {
+    close_gate(&mut run);
+    diag_line(
+        &run.diag,
+        &run.format,
+        "warn",
+        "second signal: immediate stop",
+    );
+    if let Some(cycle) = run.cycle.take() {
+        let mark = serde_json::to_vec(&SequenceState {
+            schema: crate::service::state::SCHEMA_SEQ.to_string(),
+            generation: run.generation,
+            next_seq: cycle.seq.saturating_add(1),
+            updated_wall_ns: wall_ns().unwrap_or(0),
+            close_completed_ns: None,
+            exhausted: false,
+            run_id: run.run_id.clone(),
+            reserved: Some(Reservation {
+                seq: cycle.seq,
+                run_id: run.run_id.clone(),
+                generation: run.generation,
+                requested_start_ns: cycle.requested_start_ns,
+                requested_end_ns: cycle.requested_end_ns,
+                state: ReservationState::Abandoned,
+                reason: Some(AbandonReason::DoubleSignal),
+                started: true,
+            }),
+        })
+        .unwrap_or_default();
+        // Best-effort single attempt (no poll, no re-apply — the
+        // double-signal path never waits).
+        let marked: Control<(std::io::Result<()>, Option<u64>)> = run_op(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &run.cancel,
+            "double_signal_mark",
+            state_dest("sequence.json"),
+            Duration::from_millis(500),
+            {
+                let (out, tag) = (run.out.clone(), run.tag.clone());
+                move |gate| {
+                    if gate.abandoned() {
+                        return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
+                    }
+                    WorkerOut::value(write_state_ts(&out, "sequence.json", &tag, &mark))
+                }
+            },
+        );
+        let cut_ns = match marked {
+            Control::Done((_, ts)) => ts.unwrap_or_else(monotonic_ns),
+            _ => monotonic_ns(),
+        };
+        run.summary
+            .push_abandoned(crate::service::envelope::AbandonedNote {
+                seq: cycle.seq,
+                run_id: run.run_id.clone(),
+                generation: run.generation,
+                requested_start_ns: cycle.requested_start_ns,
+                requested_end_ns: cycle.requested_end_ns,
+                reason: AbandonReason::DoubleSignal,
+                cut_tail_ns: Some(crate::service::envelope::CutTail {
+                    effective_end_ns: cut_ns,
+                    requested_end_ns: cycle.requested_end_ns,
+                }),
+            });
+    }
+    close_run_end(run)
+}
+
+fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
+    let seq = run.cycle.as_ref().expect("window open at sinks").seq;
+    // Pending rotation-tail reconcile (last boundary's rename —
+    // the L6 tail content-match over the ROTATED file).
+    reconcile_rotation(&mut run);
+    // Rotation decision (regular-file taps only, records assigned).
+    if rotation_fires(&mut run) {
+        match rotate_active(&mut run, seq) {
+            RotationOut::Rotated | RotationOut::Deferred => {}
+            RotationOut::Held => {
+                // Held rotated name: fatal (never a skip) — the
+                // published window stands; the run ends and the
+                // fold resolves exit 1 (finalized windows exist).
+                run.tool_failure = Some(RunToolFailure::RotatedNameHeld);
+                return (run, SinksOut::QuotaStop);
+            }
+        }
+    }
+    // Stream marker + ref enqueue (assign to the CURRENT active
+    // file — post-rotation, so queued records land in the new
+    // file, §6.1).
+    enqueue_boundary_records(&mut run, seq, &sha256);
+    // Tap drive (open attempts + writes, MAX_OUTSTANDING_TAP = 1).
+    drive_tap(&mut run);
+    // Retention + quota (§6.2 — enforced at this boundary).
+    let retention: Control<crate::service::retain::RetentionOut> = run_op(
+        &run.diag,
+        &run.format,
+        &mut run.summary,
+        &run.cancel,
+        &format!("retain_boundary_{seq}"),
+        Destination {
+            class: DestClass::Delete,
+            key: format!("retain-{seq}"),
+        },
+        boundary_budget(run.cfg.timeout),
+        {
+            let (out, rw, rb) = (
+                run.out.clone(),
+                run.cfg.retain_windows,
+                run.cfg.retain_bytes,
+            );
+            move |gate| {
+                // Fenced pre-check (F2: never initiate deletes past
+                // abandonment — a retry at the next boundary covers
+                // the skipped pass).
+                if gate.abandoned() {
+                    return WorkerOut::value(crate::service::retain::RetentionOut {
+                        deleted_files: 0,
+                        deleted_bytes: 0,
+                        delete_errors: vec!["abandoned".to_string()],
+                        quota_exceeded: None,
+                        window_count: 0,
+                        managed_bytes: 0,
+                    });
+                }
+                WorkerOut::value(enforce_retention(&out, rw, rb))
+            }
+        },
+    );
+    match retention {
+        Control::Done(out) => {
+            for err in &out.delete_errors {
+                diag_line(&run.diag, &run.format, "warn", &format!("retention: {err}"));
+            }
+            if let Some(qe) = out.quota_exceeded {
+                use crate::service::envelope::QuotaCause;
+                match qe.cause {
+                    QuotaCause::ProtectedEvidence => {
+                        run.summary.quota_exceeded = Some(qe);
+                        diag_line(
+                            &run.diag,
+                            &run.format,
+                            "warn",
+                            "quota exceeded (protected evidence)",
+                        );
+                    }
+                    QuotaCause::DeletionFailure => {
+                        // Quota-stop: the in-flight window is
+                        // PUBLISHED (lossless — never discarded);
+                        // write the latch, then end the run as a
+                        // run-level tool failure.
+                        run.summary.quota_exceeded = Some(qe);
+                        let (generation, qbytes, qcap) = (
+                            run.generation,
+                            run.summary
+                                .quota_exceeded
+                                .as_ref()
+                                .map(|q| q.bytes)
+                                .unwrap_or(0),
+                            run.summary
+                                .quota_exceeded
+                                .as_ref()
+                                .map(|q| q.cap)
+                                .unwrap_or(0),
+                        );
+                        let latched: Control<std::io::Result<()>> = run_op(
+                            &run.diag,
+                            &run.format,
+                            &mut run.summary,
+                            &run.cancel,
+                            &format!("quota_latch_{seq}"),
+                            state_dest("quota-stop.json"),
+                            boundary_budget(run.cfg.timeout),
+                            {
+                                let (out, tag) = (run.out.clone(), run.tag.clone());
+                                let (generation, bytes, cap) = (generation, qbytes, qcap);
+                                move |gate| {
+                                    if gate.abandoned() {
+                                        return WorkerOut::value(Err(std::io::Error::other(
+                                            "abandoned",
+                                        )));
+                                    }
+                                    WorkerOut::value(write_latch(
+                                        &out, &tag, generation, seq, bytes, cap,
+                                    ))
+                                }
+                            },
+                        );
+                        match latched {
+                            Control::Done(Ok(())) => {}
+                            Control::Done(Err(e)) => {
+                                diag_line(
+                                    &run.diag,
+                                    &run.format,
+                                    "error",
+                                    &format!("quota latch write failed: {e}"),
+                                );
+                            }
+                            _ => {
+                                diag_line(
+                                    &run.diag,
+                                    &run.format,
+                                    "warn",
+                                    "quota latch write abandoned",
+                                );
+                            }
+                        }
+                        run.tool_failure = Some(RunToolFailure::QuotaDeletionFailure);
+                        return (run, SinksOut::QuotaStop);
+                    }
+                }
+            }
+        }
+        _ => {
+            // Retention abandoned/expired: retried at the next
+            // boundary (§6.2) — never fatal in-run.
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                "retention deferred to next boundary",
+            );
+        }
+    }
+    (run, SinksOut::Continue)
+}

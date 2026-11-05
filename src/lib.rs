@@ -39,6 +39,7 @@ pub mod report;
 // and production backend (see scan's module documentation).
 pub mod scan;
 pub mod schema;
+pub mod service;
 pub mod target;
 
 pub mod focused_count;
