@@ -429,9 +429,11 @@ pub struct ObserverConfig {
 /// Run the observer loop (diverges; the harness kills the observer
 /// at teardown — killing the tracer auto-detaches + resumes all
 /// tracees, so the workload always survives observer death).
-/// Exits nonzero (fail-loud) when an initial pid cannot be seized
-/// or a clone child cannot be optioned — the harness voids on
-/// observer death (an unproven observer proves nothing).
+/// Exits nonzero (fail-loud) when an explicit pid cannot be seized,
+/// an enumerated member fails for a non-ESRCH errno, or a clone
+/// child cannot be optioned — the harness voids on observer death
+/// (an unproven observer proves nothing). ESRCH on enumerated
+/// members is a transient death race (noted, tolerated).
 pub fn run_observer(cfg: &ObserverConfig) -> ! {
     let log = std::fs::OpenOptions::new()
         .create(true)
@@ -447,6 +449,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
         pending_initial: HashSet::new(),
         last_sender: HashMap::new(),
     };
+    let explicit: HashSet<i32> = cfg.pids.iter().copied().collect();
     let mut initial = cfg.pids.clone();
     if let Some(cg) = cfg.cgroup_procs.as_ref() {
         initial.extend(read_cgroup_procs(cg));
@@ -454,9 +457,20 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
     initial.sort();
     initial.dedup();
     for pid in initial {
-        if obs.seize(pid).is_err() {
-            eprintln!("witness: cannot seize {pid}");
-            std::process::exit(2);
+        if let Err(e) = obs.seize(pid) {
+            // ESRCH on an enumerated member = a transient that died
+            // between enumeration and seize (short-lived workload
+            // children churn constantly) — noted, tolerated. ESRCH
+            // on an EXPLICIT pid, or any other errno (EPERM =
+            // lost containment), fails loud.
+            let transient_gone =
+                e.kind() == std::io::ErrorKind::NotFound && !explicit.contains(&pid);
+            if transient_gone {
+                eprintln!("witness: enumerated {pid} already gone (ESRCH)");
+            } else {
+                eprintln!("witness: cannot seize {pid}: {e}");
+                std::process::exit(2);
+            }
         }
     }
     if let Some((pid, signo)) = cfg.signal_test {
@@ -479,9 +493,19 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
             if last_enum.elapsed() >= std::time::Duration::from_secs(60) {
                 last_enum = std::time::Instant::now();
                 for pid in read_cgroup_procs(cg) {
-                    if !obs.traced.contains(&pid) && obs.seize(pid).is_err() {
-                        eprintln!("witness: newcomer {pid} escaped (seize failed)");
-                        std::process::exit(3);
+                    if obs.traced.contains(&pid) {
+                        continue;
+                    }
+                    if let Err(e) = obs.seize(pid) {
+                        // Same transient rule as startup: ESRCH on an
+                        // enumerated newcomer is a death race, noted;
+                        // anything else is a containment failure.
+                        if e.kind() == std::io::ErrorKind::NotFound {
+                            eprintln!("witness: newcomer {pid} already gone (ESRCH)");
+                        } else {
+                            eprintln!("witness: newcomer {pid} escaped (seize failed: {e})");
+                            std::process::exit(3);
+                        }
                     }
                 }
             }
