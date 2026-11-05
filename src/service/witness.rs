@@ -463,8 +463,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
             // children churn constantly) — noted, tolerated. ESRCH
             // on an EXPLICIT pid, or any other errno (EPERM =
             // lost containment), fails loud.
-            let transient_gone =
-                e.kind() == std::io::ErrorKind::NotFound && !explicit.contains(&pid);
+            let transient_gone = Observer::tolerate_seize_error(&e, explicit.contains(&pid));
             if transient_gone {
                 eprintln!("witness: enumerated {pid} already gone (ESRCH)");
             } else {
@@ -500,7 +499,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
                         // Same transient rule as startup: ESRCH on an
                         // enumerated newcomer is a death race, noted;
                         // anything else is a containment failure.
-                        if e.kind() == std::io::ErrorKind::NotFound {
+                        if Observer::tolerate_seize_error(&e, false) {
                             eprintln!("witness: newcomer {pid} already gone (ESRCH)");
                         } else {
                             eprintln!("witness: newcomer {pid} escaped (seize failed: {e})");
@@ -552,6 +551,14 @@ struct Observer {
 }
 
 impl Observer {
+    /// Seize-failure triage: ESRCH (raw errno 3 — NOT `NotFound`,
+    /// which is ENOENT) on an enumerated member is a transient death
+    /// race and tolerated; ESRCH on an explicit pid, or any other
+    /// errno, fails loud.
+    fn tolerate_seize_error(e: &std::io::Error, explicit: bool) -> bool {
+        !explicit && e.raw_os_error() == Some(libc::ESRCH)
+    }
+
     fn seize(&mut self, pid: i32) -> std::io::Result<()> {
         // SAFETY: seize + setoptions on a target pid.
         let rc = unsafe { libc::ptrace(libc::PTRACE_SEIZE, pid, 0, 0) };
@@ -742,6 +749,20 @@ mod tests {
     }
 
     #[test]
+    /// ESRCH triage pin (regression: ESRCH is raw errno 3, NOT
+    /// `ErrorKind::NotFound`, which is ENOENT — the first cut
+    /// compared kinds and failed loud on every transient).
+    #[test]
+    fn seize_triage_esrch_enumerated_only() {
+        let esrch = std::io::Error::from_raw_os_error(libc::ESRCH);
+        assert!(Observer::tolerate_seize_error(&esrch, false));
+        assert!(!Observer::tolerate_seize_error(&esrch, true));
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(!Observer::tolerate_seize_error(&eperm, false));
+        let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
+        assert!(!Observer::tolerate_seize_error(&enoent, false));
+    }
+
     fn strict_untouched_passes() {
         let workload: HashSet<i32> = [11, 12].into_iter().collect();
         let canary: HashSet<i32> = [21].into_iter().collect();
