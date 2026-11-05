@@ -458,21 +458,19 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
     initial.sort();
     initial.dedup();
     for pid in initial {
-        if let Err(e) = obs.seize(pid) {
-            // ESRCH on an enumerated member = a transient that died
-            // between enumeration and seize (short-lived workload
-            // children churn constantly) — noted, tolerated. ESRCH
-            // on an EXPLICIT pid, or any other errno (EPERM =
-            // lost containment), fails loud.
-            let transient_gone = Observer::tolerate_seize_error(&e, pid, explicit.contains(&pid));
-            if transient_gone {
-                if e.raw_os_error() == Some(libc::ESRCH) {
-                    eprintln!("witness: enumerated {pid} already gone (ESRCH)");
-                } else {
-                    eprintln!("witness: enumerated {pid} dead-or-zombie, tolerated ({e})");
-                }
-            } else {
-                eprintln!("witness: cannot seize {pid}: {e}");
+        match obs.seize_or_adopt(pid, explicit.contains(&pid)) {
+            SeizeOutcome::Seized => {}
+            SeizeOutcome::AdoptedOurs => {
+                eprintln!("witness: enumerated {pid} already ours (adoption)");
+            }
+            SeizeOutcome::GoneEsrch => {
+                eprintln!("witness: enumerated {pid} already gone (ESRCH)");
+            }
+            SeizeOutcome::GoneZombie => {
+                eprintln!("witness: enumerated {pid} dead-or-zombie, tolerated");
+            }
+            SeizeOutcome::Fatal => {
+                eprintln!("witness: cannot seize {pid}: lost containment");
                 std::process::exit(2);
             }
         }
@@ -500,20 +498,19 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
                     if obs.traced.contains(&pid) {
                         continue;
                     }
-                    if let Err(e) = obs.seize(pid) {
-                        // Same transient rule as startup: ESRCH on an
-                        // enumerated newcomer is a death race, noted;
-                        // anything else is a containment failure.
-                        if Observer::tolerate_seize_error(&e, pid, false) {
-                            if e.raw_os_error() == Some(libc::ESRCH) {
-                                eprintln!("witness: newcomer {pid} already gone (ESRCH)");
-                            } else {
-                                eprintln!(
-                                    "witness: newcomer {pid} dead-or-zombie, tolerated ({e})"
-                                );
-                            }
-                        } else {
-                            eprintln!("witness: newcomer {pid} escaped (seize failed: {e})");
+                    match obs.seize_or_adopt(pid, false) {
+                        SeizeOutcome::Seized => {}
+                        SeizeOutcome::AdoptedOurs => {
+                            eprintln!("witness: newcomer {pid} already ours (adoption)");
+                        }
+                        SeizeOutcome::GoneEsrch => {
+                            eprintln!("witness: newcomer {pid} already gone (ESRCH)");
+                        }
+                        SeizeOutcome::GoneZombie => {
+                            eprintln!("witness: newcomer {pid} dead-or-zombie, tolerated");
+                        }
+                        SeizeOutcome::Fatal => {
+                            eprintln!("witness: newcomer {pid} escaped (lost containment)");
                             std::process::exit(3);
                         }
                     }
@@ -549,6 +546,22 @@ fn read_cgroup_procs(path: &Path) -> Vec<i32> {
         .collect()
 }
 
+/// Outcome of a seize-or-adopt attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum SeizeOutcome {
+    /// Attached now.
+    Seized,
+    /// Already our tracee (unhandled birth); adopted.
+    AdoptedOurs,
+    /// Died mid-race (ESRCH); tolerated iff enumerated.
+    GoneEsrch,
+    /// Dead-or-zombie; tolerated iff enumerated.
+    GoneZombie,
+    /// Explicit-pid failure, another tracer, or persistent
+    /// unseizability: fail loud.
+    Fatal,
+}
+
 struct Observer {
     log: std::fs::File,
     traced: HashSet<i32>,
@@ -572,24 +585,6 @@ struct Observer {
 }
 
 impl Observer {
-    /// Seize-failure triage: ESRCH (raw errno 3 — NOT `NotFound`,
-    /// which is ENOENT) on an enumerated member is a transient death
-    /// race and tolerated, as is any failure against a target that
-    /// is already dead-or-zombie (cgroup.procs lists unreaped
-    /// zombies, which refuse seizure with EPERM — a zombie can
-    /// receive no signals, so no delivery evidence is at stake).
-    /// ESRCH on an explicit pid, or failure against a LIVE target,
-    /// fails loud.
-    fn tolerate_seize_error(e: &std::io::Error, pid: i32, explicit: bool) -> bool {
-        if explicit {
-            return false;
-        }
-        if e.raw_os_error() == Some(libc::ESRCH) {
-            return true;
-        }
-        Self::target_dead_or_zombie(pid)
-    }
-
     /// True when `pid` is gone or a zombie (no signals receivable).
     fn target_dead_or_zombie(pid: i32) -> bool {
         let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
@@ -598,6 +593,110 @@ impl Observer {
         stat.rsplit_once(')')
             .and_then(|(_, rest)| rest.split_whitespace().next())
             .is_none_or(|state| state == "Z")
+    }
+
+    /// The pid tracing `pid` per kernel truth (`TracerPid`), or
+    /// `None` when unreadable (died mid-race).
+    fn tracer_pid_of(pid: i32) -> Option<i32> {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("TracerPid:") {
+                return rest.trim().parse::<i32>().ok();
+            }
+        }
+        None
+    }
+
+    /// Drain all queued tracee stops (birth events adopt their
+    /// children here — a drain may explain a pid).
+    fn drain_waits(&mut self) {
+        loop {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            if got < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return; // ECHILD: nothing to drain.
+            }
+            if got == 0 {
+                return;
+            }
+            self.handle_wait(got, status);
+        }
+    }
+
+    /// Seize with kernel-truth disambiguation (dry-run root cause
+    /// #3: a re-enum pass races the unhandled event queue — a birth
+    /// whose event-stop hasn't been handled yet is already
+    /// auto-attached (ours!) but untracked, so a naive re-seize
+    /// dies EPERM on our own tracee every re-enum). EPERM (or any
+    /// non-ESRCH failure) against an enumerated pid therefore
+    /// consults `TracerPid` instead of guessing: ours → adopt (the
+    /// queued event completes bookkeeping); another tracer →
+    /// fail loud (containment failure); untraced → transient
+    /// kernel state (mid-exec) → bounded retry. ESRCH on an
+    /// enumerated pid is a death race (tolerated); anything on an
+    /// EXPLICIT pid fails loud (preserved strictness).
+    fn seize_or_adopt(&mut self, pid: i32, explicit: bool) -> SeizeOutcome {
+        match self.seize(pid) {
+            Ok(()) => return SeizeOutcome::Seized,
+            Err(e) => {
+                // ESRCH is raw errno 3 — NOT `NotFound` (ENOENT).
+                if e.raw_os_error() == Some(libc::ESRCH) {
+                    if explicit {
+                        return SeizeOutcome::Fatal;
+                    }
+                    return SeizeOutcome::GoneEsrch;
+                }
+                if explicit {
+                    return SeizeOutcome::Fatal;
+                }
+                if Self::target_dead_or_zombie(pid) {
+                    return SeizeOutcome::GoneZombie;
+                }
+            }
+        }
+        // Slow path: live, untraced-or-ours, unseizable — resolve
+        // by kernel truth with bounded retries (mid-exec and
+        // unhandled-birth races resolve in ms).
+        for _ in 0..10 {
+            self.drain_waits();
+            if self.traced.contains(&pid) {
+                return SeizeOutcome::AdoptedOurs;
+            }
+            if Self::target_dead_or_zombie(pid) {
+                return SeizeOutcome::GoneZombie;
+            }
+            match Self::tracer_pid_of(pid) {
+                None => return SeizeOutcome::GoneEsrch,
+                Some(t) if t as u32 == std::process::id() => {
+                    self.traced.insert(pid);
+                    self.pending_initial.insert(pid);
+                    if self.set_options(pid).is_err() {
+                        self.pending_options.insert(pid);
+                    }
+                    return SeizeOutcome::AdoptedOurs;
+                }
+                Some(0) => {
+                    if self.seize(pid).is_ok() {
+                        return SeizeOutcome::Seized;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Some(_) => return SeizeOutcome::Fatal,
+            }
+        }
+        self.drain_waits();
+        if self.traced.contains(&pid) {
+            return SeizeOutcome::AdoptedOurs;
+        }
+        if Self::target_dead_or_zombie(pid) {
+            return SeizeOutcome::GoneZombie;
+        }
+        SeizeOutcome::Fatal
     }
 
     fn seize(&mut self, pid: i32) -> std::io::Result<()> {
@@ -842,23 +941,169 @@ mod tests {
         }
     }
 
+    /// True when this environment permits parent→child ptrace (a
+    /// probe fork+seize+detach). Sandboxes with ptrace-blocking
+    /// seccomp fail the probe, and the live tests return early
+    /// instead of failing on environmental denial.
+    fn ptrace_available() -> bool {
+        // SAFETY: fork; the child only sleeps and exits.
+        let probe = unsafe { libc::fork() };
+        if probe < 0 {
+            return false;
+        }
+        if probe == 0 {
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: seize/detach/kill on our own child (detach of a
+        // non-tracee fails harmlessly when the seize was denied).
+        let ok = unsafe { libc::ptrace(libc::PTRACE_SEIZE, probe, 0, 0) == 0 };
+        unsafe {
+            libc::ptrace(libc::PTRACE_DETACH, probe, 0, 0);
+            libc::kill(probe, libc::SIGKILL);
+        }
+        drain_reap();
+        ok
+    }
+
+    /// Fork a sleeper child (returns its pid). The child touches no
+    /// Rust state.
+    fn spawn_sleeper() -> i32 {
+        // SAFETY: fork; the child only sleeps and exits.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+        pid
+    }
+
+    /// seize_or_adopt outcome pins (dry-run root cause #3): the
+    /// second seize of our own tracee adopts via TracerPid (not
+    /// fail-loud); the dead are Gone (fast, no retry); explicit
+    /// failures stay Fatal; self-seize (EPERM + TracerPid 0, never
+    /// resolving) retries ~1 s then fails loud; a victim held by
+    /// ANOTHER tracer fails loud fast (the containment property).
     #[test]
-    /// ESRCH triage pin (regression: ESRCH is raw errno 3, NOT
-    /// `ErrorKind::NotFound`, which is ENOENT — the first cut
-    /// compared kinds and failed loud on every transient).
-    #[test]
-    fn seize_triage_esrch_enumerated_only() {
-        let esrch = std::io::Error::from_raw_os_error(libc::ESRCH);
-        assert!(Observer::tolerate_seize_error(&esrch, 1, false));
-        assert!(!Observer::tolerate_seize_error(&esrch, 1, true));
-        // EPERM against a LIVE target fails loud (init is alive).
-        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
-        assert!(!Observer::tolerate_seize_error(&eperm, 1, false));
-        // EPERM against a DEAD target is tolerated (no such pid).
-        assert!(Observer::tolerate_seize_error(&eperm, i32::MAX, false));
-        // ENOENT against a live target fails loud (wrong errno).
-        let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
-        assert!(!Observer::tolerate_seize_error(&enoent, 1, false));
+    fn seize_or_adopt_disambiguates_by_tracer_pid() {
+        if !ptrace_available() {
+            eprintln!("seize_or_adopt test: ptrace denied, skipping live pin");
+            return;
+        }
+        let log = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .unwrap();
+        let mut obs = Observer {
+            log,
+            traced: HashSet::new(),
+            pending_initial: HashSet::new(),
+            pending_options: HashSet::new(),
+            last_sender: HashMap::new(),
+        };
+        // Live own child → Seized, then AdoptedOurs on re-seize
+        // (EPERM + TracerPid == us — the re-enum race shape).
+        let child = spawn_sleeper();
+        assert_eq!(obs.seize_or_adopt(child, false), SeizeOutcome::Seized);
+        assert_eq!(obs.seize_or_adopt(child, false), SeizeOutcome::AdoptedOurs);
+        // Dead pid → GoneEsrch, fast (ESRCH fast path, no retry).
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            obs.seize_or_adopt(i32::MAX - 7, false),
+            SeizeOutcome::GoneEsrch
+        );
+        assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+        // Dead pid, explicit → Fatal (preserved strictness).
+        assert_eq!(obs.seize_or_adopt(i32::MAX - 7, true), SeizeOutcome::Fatal);
+        // Self → Fatal. When untraced ourselves this exercises the
+        // retry loop (~1 s: EPERM + TracerPid 0 persists); when the
+        // test itself runs traced (debugger/strace) it resolves
+        // fast as other-tracer — the outcome is Fatal either way.
+        let me_traced = Observer::tracer_pid_of(std::process::id() as i32) != Some(0);
+        let t0 = std::time::Instant::now();
+        assert_eq!(
+            obs.seize_or_adopt(std::process::id() as i32, false),
+            SeizeOutcome::Fatal
+        );
+        let dt = t0.elapsed();
+        if !me_traced {
+            assert!(
+                dt >= std::time::Duration::from_millis(900),
+                "no retry: {dt:?}"
+            );
+        }
+        assert!(
+            dt < std::time::Duration::from_secs(30),
+            "retry ran away: {dt:?}"
+        );
+        // Victim held by ANOTHER tracer → Fatal, fast. The holder
+        // announces the victim pid only AFTER seizing it, so the
+        // read returning proves the hold is established.
+        let mut fds = [0 as libc::c_int; 2];
+        // SAFETY: pipe into a valid array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let holder = unsafe { libc::fork() };
+        assert!(holder >= 0, "fork failed");
+        if holder == 0 {
+            unsafe {
+                libc::close(fds[0]);
+                let victim = libc::fork();
+                if victim == 0 {
+                    libc::sleep(30);
+                    libc::_exit(0);
+                }
+                libc::ptrace(libc::PTRACE_SEIZE, victim, 0, 0);
+                let pid_bytes = victim.to_ne_bytes();
+                libc::write(
+                    fds[1],
+                    pid_bytes.as_ptr() as *const libc::c_void,
+                    pid_bytes.len(),
+                );
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+        // SAFETY: close our write end (EOF-on-death, no hangs).
+        unsafe {
+            libc::close(fds[1]);
+        }
+        let mut victim: i32 = 0;
+        let mut got = 0usize;
+        while got < 4 {
+            // SAFETY: read into a valid buffer.
+            let n = unsafe {
+                libc::read(
+                    fds[0],
+                    (std::ptr::addr_of_mut!(victim) as *mut u8).add(got) as *mut libc::c_void,
+                    4 - got,
+                )
+            };
+            assert!(n > 0, "holder died before announcing victim");
+            got += n as usize;
+        }
+        // SAFETY: done with the read end.
+        unsafe {
+            libc::close(fds[0]);
+        }
+        let t0 = std::time::Instant::now();
+        assert_eq!(obs.seize_or_adopt(victim, false), SeizeOutcome::Fatal);
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "other-tracer case retried?!"
+        );
+        // Cleanup either way.
+        unsafe {
+            libc::ptrace(libc::PTRACE_DETACH, child, 0, 0);
+            libc::kill(child, libc::SIGKILL);
+            libc::kill(holder, libc::SIGKILL);
+            libc::kill(victim, libc::SIGKILL);
+        }
+        drain_reap();
     }
 
     /// Live-seize pin (dry-run regression): SEIZE must attach AND
