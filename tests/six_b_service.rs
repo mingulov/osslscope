@@ -356,3 +356,118 @@ fn sixb_mixed_double_signal_abandons_immediately() {
         "abandoned note: {summary}"
     );
 }
+
+/// Latch hold (§6.2 MUST): a restart into a latched out-DIR exits 4
+/// with a byte-identical DIR (the refused start restores even the
+/// lock bytes).
+///
+/// Honest hostile environment, no forged state: run 1 fills the DIR
+/// (retain 1); the oldest window file becomes an undeletable
+/// directory (external fs condition — unlink fails); run 2 hits
+/// deletion-failure → quota-stop latch → exit 1; the DIR goes
+/// read-only (deletion provably impossible); legs A and B refuse
+/// with 4 and leave every byte identical.
+#[test]
+fn sixb_latch_hold_exits_4_byte_identical() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = fresh_dir("latch-hold");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    let flags = |cmd: &mut Command| {
+        cmd.arg("--out")
+            .arg(&dir)
+            .arg("--pid")
+            .arg(&pid)
+            .arg("--window")
+            .arg("1")
+            .arg("--interval")
+            .arg("0.2")
+            .arg("--retain-windows")
+            .arg("1");
+    };
+    // Run 1: fill + graceful cut.
+    let mut run1 = bin();
+    flags(&mut run1);
+    let mut run1 = run1.spawn().expect("spawn run 1");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    unsafe { libc::kill(run1.id() as i32, libc::SIGTERM) };
+    let st1 = run1.wait().expect("wait run 1");
+    assert_eq!(st1.code(), Some(3), "run 1 cuts gracefully");
+    // Surgery: the oldest window file becomes a non-empty directory.
+    let mut wins: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("window-"))
+        .collect();
+    wins.sort();
+    assert!(!wins.is_empty(), "run 1 published windows");
+    let victim = dir.join(&wins[0]);
+    std::fs::remove_file(&victim).unwrap();
+    std::fs::create_dir(&victim).unwrap();
+    std::fs::write(victim.join("junk"), b"undeletable-by-unlink").unwrap();
+    // Run 2: eviction fails → deletion-failure latch → exit 1 (self).
+    let mut run2 = bin();
+    flags(&mut run2);
+    let mut run2 = run2.spawn().expect("spawn run 2");
+    let st2 = wait_bounded(&mut run2, 30).expect("run 2 exits itself");
+    assert_eq!(st2.code(), Some(1), "run 2 quota-stops with 1");
+    assert!(dir.join("quota-stop.json").is_file(), "latch written");
+    // Read-only: deletion provably impossible from here on.
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o555);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let snap0 = dir_snapshot(&dir);
+    // Legs A and B: refuse 4, byte-identical (including service.lock).
+    for leg in ["A", "B"] {
+        let mut cmd = bin();
+        flags(&mut cmd);
+        let mut proc = cmd.spawn().expect("spawn latch leg");
+        let st = wait_bounded(&mut proc, 30).expect("latch leg exits");
+        assert_eq!(st.code(), Some(4), "leg {leg} refuses with 4");
+        assert_eq!(dir_snapshot(&dir), snap0, "leg {leg} byte-identical");
+    }
+    let mut perms = std::fs::metadata(&dir).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&dir, perms).unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Bounded wait for a self-exiting child (poll — fail-loud timeout).
+fn wait_bounded(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    loop {
+        if let Some(st) = child.try_wait().expect("try_wait") {
+            return Some(st);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Full-DIR content snapshot (every regular file incl. service.lock).
+fn dir_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&d).unwrap().flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let p = e.path();
+            if e.file_type().unwrap().is_dir() {
+                stack.push(p);
+            } else {
+                let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
+                out.push((rel, std::fs::read(&p).unwrap()));
+            }
+        }
+    }
+    out.sort();
+    out
+}

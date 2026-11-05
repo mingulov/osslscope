@@ -285,14 +285,20 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
 #[derive(Debug)]
 pub struct DirLock {
     _file: File,
+    path: std::path::PathBuf,
+    /// Pre-take bytes (the refused start restores these, §6.2
+    /// byte-identical latch hold).
+    prior: Option<Vec<u8>>,
 }
 
 impl DirLock {
     /// Take the lock, writing `{ schema, run_id, started_wall_ns }`
     /// first. A held lock refuses with `AlreadyExists` (caller exits
-    /// 2 "out-DIR locked").
+    /// 2 "out-DIR locked"). The pre-take bytes are retained for
+    /// [`DirLock::restore`].
     pub fn take(dir: &Path, run_id: &RunId, started_wall_ns: u64) -> std::io::Result<Self> {
         let path = dir.join("service.lock");
+        let prior = std::fs::read(&path).ok();
         let file = OpenOptions::new()
             .write(true)
             .create(true)
@@ -316,7 +322,35 @@ impl DirLock {
         file.set_len(0)?;
         file.write_all_at(&bytes, 0)?;
         file.sync_all()?;
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            path,
+            prior,
+        })
+    }
+
+    /// Refused start (§6.2 latch hold): restore the pre-take lock
+    /// bytes (or remove the file when none existed) and release, so
+    /// the refused start leaves no trace. Best-effort, never fails
+    /// the exit path.
+    pub fn restore(self) {
+        let Self {
+            _file: file,
+            path,
+            prior,
+        } = self;
+        use std::os::unix::fs::FileExt as _;
+        match prior {
+            Some(bytes) => {
+                let _ = file.set_len(0);
+                let _ = file.write_all_at(&bytes, 0);
+                let _ = file.sync_all();
+            }
+            None => {
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
 }
 

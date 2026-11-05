@@ -660,7 +660,8 @@ fn run_service(cfg: ServiceConfig) -> ExitCode {
 
 /// Pre-run exit-4 (synchronous stderr — the run never opened, so no
 /// worker could drain; the diagnostics worker is abandoned).
-fn prestart_exit4(diag: Diagnostics, msg: &str) -> ExitCode {
+fn prestart_exit4(diag: Diagnostics, lock: DirLock, msg: &str) -> ExitCode {
+    lock.restore();
     let _ = diag.abandon(Duration::from_millis(200));
     crate::report::err_line(&format!("osslscope service: {msg}"));
     ExitCode::from(4)
@@ -701,7 +702,7 @@ fn startup_recovery(
         },
     );
     let Control::Done(latch_bytes) = latch else {
-        return prestart_exit4(diag, "startup timed out");
+        return prestart_exit4(diag, lock, "startup timed out");
     };
     if latch_bytes.is_some() {
         let probe: Control<(bool, bool)> = run_op(
@@ -719,10 +720,10 @@ fn startup_recovery(
             },
         );
         let Control::Done((over, deletable)) = probe else {
-            return prestart_exit4(diag, "startup timed out");
+            return prestart_exit4(diag, lock, "startup timed out");
         };
         if over && !deletable {
-            return prestart_exit4(diag, "quota stop latched");
+            return prestart_exit4(diag, lock, "quota stop latched");
         }
         // Quota clears (or deletion can proceed at the first
         // boundary — the latch's un-deletable premise is moot):
@@ -751,7 +752,7 @@ fn startup_recovery(
             Control::Done(Err(e)) => {
                 diag_line(&diag, &format, "warn", &format!("latch clear failed: {e}"));
             }
-            _ => return prestart_exit4(diag, "startup timed out"),
+            _ => return prestart_exit4(diag, lock, "startup timed out"),
         }
     }
     // Stale tmp cleanup (§4.2 — under the §4.1 lock, no live run
@@ -773,7 +774,7 @@ fn startup_recovery(
         },
     );
     let Control::Done(Ok(_)) = cleaned else {
-        return prestart_exit4(diag, "startup timed out");
+        return prestart_exit4(diag, lock, "startup timed out");
     };
     // State reads (one worker op, three reads; parsing is
     // in-memory and non-blocking).
@@ -797,12 +798,12 @@ fn startup_recovery(
         },
     );
     let Control::Done((seq_bytes, highest, summary_bytes)) = reads else {
-        return prestart_exit4(diag, "startup timed out");
+        return prestart_exit4(diag, lock, "startup timed out");
     };
     let (state, state_missing) = match seq_bytes {
         Some(b) => match serde_json::from_slice::<SequenceState>(&b) {
             Ok(s) => (Some(s), false),
-            Err(_) => return prestart_exit4(diag, "sequence state missing"),
+            Err(_) => return prestart_exit4(diag, lock, "sequence state missing"),
         },
         None => (None, highest.is_some()),
     };
@@ -826,7 +827,7 @@ fn startup_recovery(
             },
         );
         let Control::Done((over, deletable)) = probe else {
-            return prestart_exit4(diag, "startup timed out");
+            return prestart_exit4(diag, lock, "startup timed out");
         };
         if over && !deletable {
             let expected_gen = state.as_ref().map(|s| s.generation).unwrap_or(0);
@@ -840,7 +841,7 @@ fn startup_recovery(
                 None => true,
             };
             if blocks {
-                return prestart_exit4(diag, "quota stop defense (unlatched)");
+                return prestart_exit4(diag, lock, "quota stop defense (unlatched)");
             }
         }
     }
@@ -854,7 +855,7 @@ fn startup_recovery(
     );
     match recovery.refuse {
         Some(Refusal::SequenceStateMissing) => {
-            return prestart_exit4(diag, "sequence state missing");
+            return prestart_exit4(diag, lock, "sequence state missing");
         }
         Some(Refusal::Integrity(reason)) => {
             let _ = diag.abandon(Duration::from_millis(200));
@@ -1108,7 +1109,7 @@ fn open_engine(
                     &format!("osslscope: policy reload rejected: {reason}"),
                 );
             }
-            _ => return prestart_exit4(diag, "startup timed out"),
+            _ => return prestart_exit4(diag, lock, "startup timed out"),
         }
         // Initial `policy-status.json` (mutable-state discipline).
         let status = PolicyStatus {
@@ -1152,7 +1153,7 @@ fn open_engine(
                     &format!("policy status write failed: {e}"),
                 );
             }
-            _ => return prestart_exit4(diag, "startup timed out"),
+            _ => return prestart_exit4(diag, lock, "startup timed out"),
         }
     }
     // Engine pool + companions (mirrors the 6A `run` setup: resolve
@@ -1176,7 +1177,7 @@ fn open_engine(
     let mut leases = Vec::new();
     match pool.reserve(object_bytes) {
         Some(lease) => leases.push(lease),
-        None => return prestart_exit4(diag, "engine pool exhausted"),
+        None => return prestart_exit4(diag, lock, "engine pool exhausted"),
     }
     let engine_config = crate::crypto_watch::CryptoWatchConfig {
         selection: crate::inventory::scope::Selection {
@@ -1218,7 +1219,7 @@ fn open_engine(
             {
                 diag.emit(line);
             }
-            return prestart_exit4(diag, "scope unavailable");
+            return prestart_exit4(diag, lock, "scope unavailable");
         }
     };
     let origin_ns = engine.run_origin_ns();
@@ -1343,7 +1344,7 @@ fn open_first_window(
                 cfg, run_id, tag, diag, accum, generation, origin_ns, &msg, 4,
             );
         }
-        _ => return prestart_exit4(diag, "startup timed out"),
+        _ => return prestart_exit4(diag, lock, "startup timed out"),
     }
     // Step 1b (first window): flip `started` (no previous close to
     // seal — the field stays as recovery left it).
@@ -1393,7 +1394,7 @@ fn open_first_window(
                 cfg, run_id, tag, diag, accum, generation, origin_ns, &msg, 4,
             );
         }
-        _ => return prestart_exit4(diag, "startup timed out"),
+        _ => return prestart_exit4(diag, lock, "startup timed out"),
     }
     // Setup bytes open the first window's tick 0 (§11: `Start`
     // opens the run's first window). Spill-capable from the first
@@ -1408,7 +1409,7 @@ fn open_first_window(
             .admit_record(&mut piece, &out, &tag, line, 0)
             .is_err()
         {
-            return prestart_exit4(diag, "staging setup records failed");
+            return prestart_exit4(diag, lock, "staging setup records failed");
         }
     }
     // Tick 0 admits unconditionally (a Carry with empty staging

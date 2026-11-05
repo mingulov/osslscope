@@ -238,6 +238,23 @@ pub fn clear_latch(dir: &Path) -> std::io::Result<()> {
 /// pre-start evaluation cannot run `enforce_retention` (which
 /// deletes). Deletability follows the same oldest-first rule
 /// (latest window protected, tie rotated-first).
+/// Unlink possibility probe (no deletion attempted): the DIR must
+/// be writable + searchable or no candidate is deletable — a
+/// candidate you cannot unlink is not a deletable candidate (a
+/// read-only out-DIR refuses with 4 instead of starting into a
+/// futile run). TOCTOU-safe: a permissions change between this
+/// probe and the delete only reroutes to the mid-run quota-stop,
+/// the honest fallback.
+pub fn dir_deletion_possible(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = dir.as_os_str().as_bytes();
+    let Ok(c) = std::ffi::CString::new(bytes) else {
+        return false;
+    };
+    // SAFETY: `access` only reads metadata.
+    unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
 pub fn quota_state(dir: &Path, retain_windows: u64, retain_bytes: u64) -> (bool, bool) {
     let scan = scan_managed(dir);
     let over = scan.windows.len() as u64 > retain_windows || scan.managed_bytes > retain_bytes;
@@ -245,7 +262,8 @@ pub fn quota_state(dir: &Path, retain_windows: u64, retain_bytes: u64) -> (bool,
         return (false, false);
     }
     let latest = scan.windows.last().map(|w| w.0);
-    (true, oldest_deletable(&scan, latest).is_some())
+    let candidate = oldest_deletable(&scan, latest).is_some();
+    (true, candidate && dir_deletion_possible(dir))
 }
 
 pub fn quota_blocked(dir: &Path, retain_windows: u64, retain_bytes: u64) -> bool {
@@ -255,7 +273,7 @@ pub fn quota_blocked(dir: &Path, retain_windows: u64, retain_bytes: u64) -> bool
     }
     let scan = scan_managed(dir);
     let latest = scan.windows.last().map(|w| w.0);
-    oldest_deletable(&scan, latest).is_none()
+    oldest_deletable(&scan, latest).is_none() || !dir_deletion_possible(dir)
 }
 
 /// L4-extended unlatched-stop defense (§6.2): no latch file + quota
@@ -454,5 +472,28 @@ mod tests {
         assert!(unlatched_defense_blocks(Some(&alien), &expected, 0, true));
         // No quota pressure: never blocks.
         assert!(!unlatched_defense_blocks(None, &expected, 0, false));
+    }
+
+    /// Permission-aware deletability: an over-quota DIR whose
+    /// candidate cannot be unlinked (read-only DIR) reports
+    /// NOT-deletable, so the latch gate refuses with 4 instead of
+    /// starting into a futile run.
+    #[test]
+    fn quota_state_readonly_dir_is_not_deletable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let d = dir("ro-deletable");
+        std::fs::write(d.join(window_name(0)), b"w0").unwrap();
+        std::fs::write(d.join(window_name(1)), b"w1").unwrap();
+        assert_eq!(quota_state(&d, 1, u64::MAX), (true, true));
+        let mut perms = std::fs::metadata(&d).unwrap().permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&d, perms).unwrap();
+        assert_eq!(quota_state(&d, 1, u64::MAX), (true, false));
+        assert!(!dir_deletion_possible(&d));
+        let mut perms = std::fs::metadata(&d).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&d, perms).unwrap();
+        assert_eq!(quota_state(&d, 1, u64::MAX), (true, true));
+        let _ = std::fs::remove_dir_all(&d);
     }
 }
