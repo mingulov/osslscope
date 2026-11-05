@@ -3931,140 +3931,263 @@ fn help_requested(args: &[String]) -> bool {
     false
 }
 
-fn observe(
-    config: &CryptoWatchConfig,
+/// 6B steppable 6A engine (D-record §11.1): the `observe()` loop
+/// restructured into open/pump/close withOUT behavior change.
+/// `observe()` below drives these same methods (the 6A gates prove
+/// preservation); the 6B service coordinator drives one engine per
+/// run (W4 — windows never restart it) and calls `snapshot`
+/// (below) at window boundaries.
+pub(crate) struct ServiceEngine {
+    config: CryptoWatchConfig,
     objects: FocusedObjects,
-    pool: &MemoryPool,
-    output: &mut impl Write,
+    pool: MemoryPool,
+    scanner: ScopedScanner,
+    port: LiveLifecycle,
+    run: RunState,
+    sequence: u64,
     json: bool,
-    cancel: &AtomicBool,
-    producer: Option<&crate::lifecycle_producer::ProducerHandle>,
-) -> io::Result<u8> {
-    let mut out = Output {
-        writer: output,
-        sequence: 0,
-        json,
-        pending_gaps: Vec::new(),
-        resolve_paths: config.resolve_paths,
-        terminal: config.terminal,
-    };
-    let mut scanner = match ScopedScanner::new_budgeted(
-        config.selection.clone(),
-        inventory::Limits::default(),
-        Some(pool.clone()),
-    ) {
-        Ok(s) => s,
-        Err(reason) => {
-            out.emit(Record::Gap {
-                gap: &inventory::Gap {
-                    pid: None,
-                    device: None,
-                    inode: None,
-                    reason,
-                    errno: None,
-                    actor_euid: None,
-                },
-            })?;
-            out.emit(Record::End {
-                reason: "scope_unavailable",
-                segments: 0,
-                peak_accounted_bytes: pool.peak(),
-                coverage: "unknown",
-                peak_deferred_depth: 0,
-                deferred_drops: 0,
-                deferred_removed: DeferredRemoved::default(),
-                session_loss: SessionLoss {
-                    ring: [0; 8],
-                    connector_drops: 0,
-                    connector_enobufs: 0,
-                    scan_loss: 0,
-                    signal_dropped: 0,
-                    signal_prefix_unwitnessed: 0,
-                    drain_pending: 0,
-                    polling_fallback: false,
-                    unattributed_events: 0,
-                    admitted_exit_artifacts: 0,
-                    lost_intervals: Vec::new(),
-                    coalesced: 0,
-                },
-            })?;
-            crate::report::err_line(&format!(
-                "osslscope crypto watch: scope unavailable ({}; see records above)",
-                reason.word()
-            ));
-            return Ok(4);
-        }
-    };
-    let tracing = !objects.observation.is_empty() && !objects.count.is_empty();
-    if !tracing {
-        out.emit(Record::TracingGap {
-            reason: "companions_unavailable",
-        })?;
-    }
-    let (tracing, reservation) = if tracing {
-        match FocusedSession::reservation_bytes(&objects) {
-            Ok(bytes) => (true, bytes),
-            Err(_) => {
-                out.emit(Record::TracingGap {
-                    reason: "session_capacity_unavailable",
+    pending_gaps: Vec<(GapReason, Option<u64>, Option<u32>)>,
+    resolve_paths: bool,
+    terminal: bool,
+    tracing: bool,
+    reservation: usize,
+    trust_reviewed: bool,
+    run_origin_ns: u64,
+    tick_ns: u64,
+    deadline: Instant,
+    next_scan: Instant,
+    admitted: Vec<u32>,
+}
+
+/// `ServiceEngine::open` outcome: the setup record bytes always
+/// flow (scope gaps / `TracingGap` / `Start`); `engine` is `None`
+/// with `early_code` set when setup ends the run before the loop
+/// (scope unavailable).
+pub(crate) struct OpenOut {
+    pub engine: Option<ServiceEngine>,
+    pub setup_bytes: Vec<u8>,
+    pub early_code: u8,
+}
+
+/// One pump iteration: the emitted record bytes + whether a sample
+/// fired (the coordinator's admission-tick edge).
+pub(crate) struct IterationOut {
+    pub bytes: Vec<u8>,
+    pub sample_fired: bool,
+}
+
+/// Close drain: the emitted record bytes + the 6A exit code.
+pub(crate) struct CloseOut {
+    pub bytes: Vec<u8>,
+    pub code: u8,
+}
+
+impl ServiceEngine {
+    /// Engine setup (moved verbatim from `observe()`): scanner,
+    /// tracing reservation, `Start`, the lifecycle port, and the
+    /// initial run state. Admission contexts are rebuilt per pump
+    /// from the owned parts below.
+    pub(crate) fn open(
+        config: &CryptoWatchConfig,
+        objects: FocusedObjects,
+        pool: &MemoryPool,
+        json: bool,
+        producer: Option<&crate::lifecycle_producer::ProducerHandle>,
+    ) -> io::Result<OpenOut> {
+        let mut setup_bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut setup_bytes,
+            sequence: 0,
+            json,
+            pending_gaps: Vec::new(),
+            resolve_paths: config.resolve_paths,
+            terminal: config.terminal,
+        };
+        let mut scanner = match ScopedScanner::new_budgeted(
+            config.selection.clone(),
+            inventory::Limits::default(),
+            Some(pool.clone()),
+        ) {
+            Ok(s) => s,
+            Err(reason) => {
+                out.emit(Record::Gap {
+                    gap: &inventory::Gap {
+                        pid: None,
+                        device: None,
+                        inode: None,
+                        reason,
+                        errno: None,
+                        actor_euid: None,
+                    },
                 })?;
-                (false, 0)
+                out.emit(Record::End {
+                    reason: "scope_unavailable",
+                    segments: 0,
+                    peak_accounted_bytes: pool.peak(),
+                    coverage: "unknown",
+                    peak_deferred_depth: 0,
+                    deferred_drops: 0,
+                    deferred_removed: DeferredRemoved::default(),
+                    session_loss: SessionLoss {
+                        ring: [0; 8],
+                        connector_drops: 0,
+                        connector_enobufs: 0,
+                        scan_loss: 0,
+                        signal_dropped: 0,
+                        signal_prefix_unwitnessed: 0,
+                        drain_pending: 0,
+                        polling_fallback: false,
+                        unattributed_events: 0,
+                        admitted_exit_artifacts: 0,
+                        lost_intervals: Vec::new(),
+                        coalesced: 0,
+                    },
+                })?;
+                crate::report::err_line(&format!(
+                    "osslscope crypto watch: scope unavailable ({}; see records above)",
+                    reason.word()
+                ));
+                drop(out);
+                return Ok(OpenOut {
+                    engine: None,
+                    setup_bytes,
+                    early_code: 4,
+                });
             }
+        };
+        let tracing = !objects.observation.is_empty() && !objects.count.is_empty();
+        if !tracing {
+            out.emit(Record::TracingGap {
+                reason: "companions_unavailable",
+            })?;
         }
-    } else {
-        (false, 0)
-    };
-    // 6A tick clock (§7 `Start` rule): the producer-clock anchor is
-    // read immediately before emitting `Start` (tick 0 opens with
-    // the first sample that follows).
-    let run_origin_ns = LiveClock.monotonic_ns();
-    let tick_ns = config.interval.as_nanos().min(u64::MAX as u128) as u64;
-    out.emit(Record::Start {
-        max_active: config.max_active,
-        max_state_bytes: config.max_state_bytes,
-        poll_interval: config.interval,
-        duration: config.duration,
-        membership: "sampled; unsampled intervals and unseen members remain unknown",
-        run_origin_ns,
-    })?;
-    // 6A event feed (§1.8): one port for the run, subscribed on the
-    // observer itself (always live — a dead selection must not force
-    // polling fallback) with the watched roots replaced every tick.
-    // Subscribe failure anywhere here degrades to polling (PARTIAL),
-    // never to silence.
-    let barrier = crate::count_owner::CountForkBarrier::new();
-    let mut port = match barrier.prefix_permit(Instant::now() + Duration::from_secs(5)) {
-        Ok(permit) => match producer {
-            // Installed producer: a real connector subscription
-            // (trusted birth/exec/exit timestamps, Drops oracle).
-            Some(producer) => {
-                LiveLifecycle::select_with_producer(std::process::id(), true, &permit, producer)
+        let (tracing, reservation) = if tracing {
+            match FocusedSession::reservation_bytes(&objects) {
+                Ok(bytes) => (true, bytes),
+                Err(_) => {
+                    out.emit(Record::TracingGap {
+                        reason: "session_capacity_unavailable",
+                    })?;
+                    (false, 0)
+                }
             }
-            None => LiveLifecycle::select(std::process::id(), true, &permit),
-        },
-        Err(_) => LiveLifecycle::Polling(crate::capture::PollingLifecycle::new(std::process::id())),
-    };
-    let trust_reviewed =
-        port.timing_trust() == crate::capture::LifecycleTimingTrust::ReviewedMonotonic;
-    let user_pids: BTreeSet<u32> = config.selection.pids.iter().copied().collect();
-    let mut run = RunState::new(user_pids, run_origin_ns, tick_ns);
-    sync_selection(&mut scanner, &run);
-    sync_roots(&mut port, &run);
-    let ctx = AdmitCtx {
-        pool,
-        objects: &objects,
-        reservation,
-        deadline: Instant::now() + config.duration,
-        cancel,
-        tracing,
-        trust_reviewed,
-        selection: &config.selection,
-        max_active: config.max_active,
-    };
-    let deadline = ctx.deadline;
-    let mut next_scan = Instant::now();
-    let mut admitted: Vec<u32> = Vec::new();
-    while Instant::now() < deadline && !cancel.load(Ordering::Relaxed) {
+        } else {
+            (false, 0)
+        };
+        // 6A tick clock (§7 `Start` rule): the producer-clock anchor is
+        // read immediately before emitting `Start` (tick 0 opens with
+        // the first sample that follows).
+        let run_origin_ns = LiveClock.monotonic_ns();
+        let tick_ns = config.interval.as_nanos().min(u64::MAX as u128) as u64;
+        out.emit(Record::Start {
+            max_active: config.max_active,
+            max_state_bytes: config.max_state_bytes,
+            poll_interval: config.interval,
+            duration: config.duration,
+            membership: "sampled; unsampled intervals and unseen members remain unknown",
+            run_origin_ns,
+        })?;
+        // Setup emission ends here: release the setup-bytes borrow and
+        // keep the sequence state for the engine.
+        let Output {
+            sequence,
+            pending_gaps,
+            ..
+        } = out;
+        // 6A event feed (§1.8): one port for the run, subscribed on the
+        // observer itself (always live — a dead selection must not force
+        // polling fallback) with the watched roots replaced every tick.
+        // Subscribe failure anywhere here degrades to polling (PARTIAL),
+        // never to silence.
+        let barrier = crate::count_owner::CountForkBarrier::new();
+        let mut port = match barrier.prefix_permit(Instant::now() + Duration::from_secs(5)) {
+            Ok(permit) => match producer {
+                // Installed producer: a real connector subscription
+                // (trusted birth/exec/exit timestamps, Drops oracle).
+                Some(producer) => {
+                    LiveLifecycle::select_with_producer(std::process::id(), true, &permit, producer)
+                }
+                None => LiveLifecycle::select(std::process::id(), true, &permit),
+            },
+            Err(_) => {
+                LiveLifecycle::Polling(crate::capture::PollingLifecycle::new(std::process::id()))
+            }
+        };
+        let trust_reviewed =
+            port.timing_trust() == crate::capture::LifecycleTimingTrust::ReviewedMonotonic;
+        let user_pids: BTreeSet<u32> = config.selection.pids.iter().copied().collect();
+        let run = RunState::new(user_pids, run_origin_ns, tick_ns);
+        sync_selection(&mut scanner, &run);
+        sync_roots(&mut port, &run);
+        // Pack the engine (admission contexts rebuild per pump from
+        // these owned parts; `cancel` arrives per call).
+        let engine = ServiceEngine {
+            config: config.clone(),
+            objects,
+            pool: pool.clone(),
+            scanner,
+            port,
+            run,
+            sequence,
+            json,
+            pending_gaps,
+            resolve_paths: config.resolve_paths,
+            terminal: config.terminal,
+            tracing,
+            reservation,
+            trust_reviewed,
+            run_origin_ns,
+            tick_ns,
+            deadline: Instant::now() + config.duration,
+            next_scan: Instant::now(),
+            admitted: Vec::new(),
+        };
+        Ok(OpenOut {
+            engine: Some(engine),
+            setup_bytes,
+            early_code: 0,
+        })
+    }
+
+    /// One loop iteration (moved verbatim from `observe()`): event
+    /// drain, triple probes, the sample arm (when due), deferral
+    /// flush, baselines, polls. Deadline/cancel/sleep stay with the
+    /// caller (the coordinator's cadence). `sample_fired` marks the
+    /// coordinator's admission-tick edge.
+    pub(crate) fn pump_iteration(&mut self, cancel: &AtomicBool) -> io::Result<IterationOut> {
+        let mut buf = Vec::new();
+        let mut out = Output {
+            writer: &mut buf,
+            sequence: self.sequence,
+            json: self.json,
+            pending_gaps: std::mem::take(&mut self.pending_gaps),
+            resolve_paths: self.resolve_paths,
+            terminal: self.terminal,
+        };
+        let ctx = AdmitCtx {
+            pool: &self.pool,
+            objects: &self.objects,
+            reservation: self.reservation,
+            deadline: self.deadline,
+            cancel,
+            tracing: self.tracing,
+            trust_reviewed: self.trust_reviewed,
+            selection: &self.config.selection,
+            max_active: self.config.max_active,
+        };
+        // Local views over owned engine state (field-disjoint from
+        // the `ctx` borrows above; scalars copied out/in).
+        let run = &mut self.run;
+        let port = &mut self.port;
+        let scanner = &mut self.scanner;
+        let admitted = &mut self.admitted;
+        let mut next_scan = self.next_scan;
+        let deadline = self.deadline;
+        let trust_reviewed = self.trust_reviewed;
+        let run_origin_ns = self.run_origin_ns;
+        let tick_ns = self.tick_ns;
+        let interval = self.config.interval;
+        let mut sample_fired = false;
         let now = Instant::now();
         // R7-3: reset the per-tick global cleanup allowance FIRST
         // (before any admission/poll arms links): live links
@@ -4082,7 +4205,7 @@ fn observe(
         // events bind (fences/flags/candidates/gaps/quarantine).
         // Revalidation runs between event application (here) and
         // count projection (the polls below).
-        drain_port(&mut port, &mut run, &mut out, trust_reviewed)?;
+        drain_port(port, run, &mut out, trust_reviewed)?;
         // (2) 6A per-iteration triple probes (live, unflagged
         // members only): BPF rows are pid-number-keyed, so reuse
         // fences within one cadence bound instead of aliasing up to
@@ -4112,11 +4235,11 @@ fn observe(
         // Drop each snapshot before acquiring the next; only the scanner cache
         // and active sessions retain metadata between samples.
         let sampled = if now >= next_scan {
+            sample_fired = true;
             let sample_open_ns = LiveClock.monotonic_ns();
-            let snapshot = scanner.observation_snapshot_for(
-                config.interval.min(deadline.saturating_duration_since(now)),
-            );
-            next_scan = Instant::now() + config.interval;
+            let snapshot = scanner
+                .observation_snapshot_for(interval.min(deadline.saturating_duration_since(now)));
+            next_scan = Instant::now() + interval;
             // 6A elapsed-derived tick (§7 Start rule) + skipped spans
             // (nominal ticks with no sample render unknown, §4.1).
             let tick = tick_of(sample_open_ns, run_origin_ns, tick_ns);
@@ -4140,7 +4263,7 @@ fn observe(
             out.flush_gaps()?;
             // 6A per-member pass: flags seal first (re-probed),
             // then sample-driven stay/resume/retire/suspend.
-            run.sample_members(&mut out, &snapshot.snapshot, &ctx, &mut admitted)?;
+            run.sample_members(&mut out, &snapshot.snapshot, &ctx, admitted)?;
             for p in &snapshot.snapshot.processes {
                 out.emit(Record::Discovery {
                     process: p,
@@ -4154,7 +4277,7 @@ fn observe(
                 run.sweep_deferred(&mut out, &snapshot.snapshot)?;
                 run.sweep_pending_epoch();
                 run.resolve_follow_pending(&mut out, &snapshot.snapshot)?;
-                run.scan_admit(&mut out, &snapshot.snapshot, &ctx, &mut admitted)?;
+                run.scan_admit(&mut out, &snapshot.snapshot, &ctx, admitted)?;
             }
             // R6-3: drain live-path deferred closes when capacity
             // frees (covers all-suspended ticks with no session
@@ -4199,8 +4322,8 @@ fn observe(
                 port.add_known(pid);
             }
             // Following + roots for the next sample.
-            sync_selection(&mut scanner, &run);
-            sync_roots(&mut port, &run);
+            sync_selection(scanner, run);
+            sync_roots(port, run);
             run.prev_tick = Some(tick);
             Some(snapshot)
         } else {
@@ -4276,203 +4399,457 @@ fn observe(
             }
         }
         drop(sampled);
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        self.next_scan = next_scan;
+        self.sequence = out.sequence;
+        self.pending_gaps = out.pending_gaps;
+        Ok(IterationOut {
+            bytes: buf,
+            sample_fired,
+        })
+    }
+
+    /// 6A close drain (moved verbatim from `observe()`): the final
+    /// poll (lanes fold, events bind), retirement seals without
+    /// readmit, deferred close-out, and the terminal `End`. The
+    /// caller's `cancel` decides the reason word (`cancelled` vs
+    /// `duration`); service stops always cancel first (the engine
+    /// run IS cancelled — the window-level reason rides the
+    /// envelope/summary, never the 6A vocabulary).
+    pub(crate) fn close_drain(&mut self, cancel: &AtomicBool) -> io::Result<CloseOut> {
+        let mut buf = Vec::new();
+        let mut out = Output {
+            writer: &mut buf,
+            sequence: self.sequence,
+            json: self.json,
+            pending_gaps: std::mem::take(&mut self.pending_gaps),
+            resolve_paths: self.resolve_paths,
+            terminal: self.terminal,
+        };
+        let run = &mut self.run;
+        let port = &mut self.port;
+        let run_origin_ns = self.run_origin_ns;
+        let trust_reviewed = self.trust_reviewed;
+        let reason = if cancel.load(Ordering::Relaxed) {
+            "cancelled"
+        } else {
+            "duration"
+        };
+        // 6A close drain: a final poll — its lanes fold and its events
+        // bind (births may gap; exits may confirm; execs seal without
+        // readmit). No suffix witness exists on the §7 boundary, so the
+        // close witness is not recorded.
+        {
+            let edge = crate::capture::LifecycleEdge {
+                start_ns: run_origin_ns,
+                end_ns: LiveClock.monotonic_ns(),
+            };
+            let close = port.close_drain(edge, None);
+            if let Some(delta) = close.delta {
+                run.scan_loss = run.scan_loss.saturating_add(delta.loss);
+                run.signal_dropped = run.signal_dropped.saturating_add(delta.dropped);
+                run.signal_prefix_unwitnessed = run
+                    .signal_prefix_unwitnessed
+                    .saturating_add(delta.prefix_unwitnessed);
+                run.drain_pending = run.drain_pending.saturating_add(delta.pending);
+                run.connector_drops = run.connector_drops.saturating_add(delta.connector_drops);
+                run.connector_enobufs = run
+                    .connector_enobufs
+                    .saturating_add(delta.connector_enobufs);
+                if port.fallback_partial() {
+                    run.polling = true;
+                }
+                let mut events = delta.events;
+                events.sort_by_key(|e| (e.timestamp_ns.unwrap_or(u64::MAX), e.cpu, e.seq));
+                for event in events {
+                    bind_event(run, &mut out, &event, trust_reviewed)?;
+                }
+            }
+            // 6A close-drain evaluation (§4.1): newly folded closing loss
+            // needs the same covering intervals as per-tick loss — the
+            // session carrier plus every still-open ledger — before the
+            // seals below close those ledgers. N5: detection runs at
+            // the elapsed-derived close tick, not the last sample's.
+            let tick_pending = run.drain_pending.saturating_sub(run.pending_mark);
+            run.pending_mark = run.drain_pending;
+            run.refresh_close_tick(LiveClock.monotonic_ns());
+            run.update_loss_baselines(tick_pending);
+            run.update_lane_baselines();
+        }
+        // Stop every member before potentially slow final projection/output. This
+        // also propagates cancellation arriving between poll passes into documents.
+        for a in &mut run.active {
+            a.session.stop_admission(cancel);
+        }
+        // Flagged seals first (proven deaths/reuses/execs keep their
+        // exact reasons at close).
+        run.seal_exit_flags(&mut out)?;
+        let flagged: Vec<u32> = run.exec_flags.keys().copied().collect();
+        for pid in flagged {
+            let Some((fence_tick, _ts, count)) = run.exec_flags.get(&pid).copied() else {
+                continue;
+            };
+            let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) else {
+                run.exec_flags.remove(&pid);
+                continue;
+            };
+            let epoch = run.active[pos].image_epoch;
+            let identity = run.active[pos].identity.clone();
+            let tick = run.current_tick;
+            run.active[pos].ledger.windows.append(
+                fence_tick,
+                tick.saturating_add(1),
+                LossCause::ExecSpanningAggregate,
+            );
+            let active = run.active.remove(pos);
+            run.drop_flags_for(pid);
+            let outcome = out.finish_exec_seal(active)?;
+            run.seal_fold(outcome.loss_totals);
+            // Middle images seal in drain order (no readmit at close —
+            // the run ends inside the transition window).
+            for middle in 1..count.max(1) {
+                let middle_epoch = epoch.saturating_add(middle);
+                out.emit_middle_seal(&identity, middle_epoch, &outcome.ledger)?;
+            }
+        }
+        let flagged: Vec<u32> = run.retire_flags.keys().copied().collect();
+        for pid in flagged {
+            let Some((flag_reason, fenced)) = run.retire_flags.get(&pid).copied() else {
+                continue;
+            };
+            run.retire_flags.remove(&pid);
+            if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
+                run.seal_active(&mut out, pos, flag_reason, fenced)?;
+            }
+        }
+        let flagged: Vec<u32> = run.unsteady.iter().copied().collect();
+        for pid in flagged {
+            run.unsteady.remove(&pid);
+            if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
+                run.seal_active(&mut out, pos, "visibility_lost", true)?;
+            }
+        }
+        // Seal-all: the run ended (death unproven either way — stopping
+        // observation, never inventing exits).
+        while let Some(active) = run.active.pop() {
+            let pid = active.identity.pid;
+            let outcome = out.finish(active, reason, false)?;
+            run.seal_fold(outcome.loss_totals);
+            run.drop_flags_for(pid);
+        }
+        // Deferred close: every entry still deferred emits
+        // `deferred_removed` (cancel/timeout path vs natural expiry).
+        // R6-2a: run-end DISCARDS continuations (the run ends — no
+        // readmission follows, so nothing resumes them).
+        let close_reason = if cancel.load(Ordering::Relaxed) {
+            "cancelled"
+        } else {
+            "end_of_observation"
+        };
+        let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
+        for key in keys {
+            if let Some(entry) = run.deferred.remove(&key) {
+                run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
+                run.removed.closed = run.removed.closed.saturating_add(1);
+            }
+        }
+        // Follow-pending at close: dead births gap (counted per root);
+        // live-but-never-classified births gap as unknown (no root bill).
+        let pids: Vec<u32> = run.follow_pending.keys().copied().collect();
+        for pid in pids {
+            let Some((_recorded, parent, _)) = run.follow_pending.remove(&pid) else {
+                continue;
+            };
+            let gap = inventory::Gap {
+                pid: Some(pid),
+                device: None,
+                inode: None,
+                reason: GapReason::MembershipUnknown,
+                errno: None,
+                actor_euid: None,
+            };
+            if matches!(probe_liveness(pid), Liveness::Dead) {
+                if let Some(root) = parent {
+                    run.count_ignored(root);
+                }
+            }
+            out.emit(Record::Gap { gap: &gap })?;
+        }
+        run.pending_epoch.clear();
+        // R3-4b: the run ends — no readmission follows, so demoted
+        // contexts and tombstones retire with the primary stash (their
+        // ledgers already rode the seals; nothing is reborn).
+        run.evicted_epoch.clear();
+        run.epoch_tombstones.clear();
+        // R6-3: run-end flush of live-path deferred closes (terminal —
+        // no more polling, so bounded synchronous close is allowed).
+        crate::provider_observation::session::flush_deferred_offpath_sync();
+        // 6A seal-fold evaluation (§4.1): final ring reads folded during
+        // sealing join the cumulative ring here, so the evaluators run
+        // once more — seal-folded loss reaches the session carrier
+        // (sealed ledgers ride the carrier; they are never revised).
+        // N5: same elapsed-derived close tick as the close drain.
+        run.refresh_close_tick(LiveClock.monotonic_ns());
+        run.update_loss_baselines(0);
+        run.update_lane_baselines();
+        out.flush_gaps()?;
+        run.emit_pending_drops_all(&mut out)?;
+        out.emit_ignored_line(&run.ignored)?;
+        run.ignored.clear();
+        let session_loss = SessionLoss {
+            ring: run.live_ring(),
+            connector_drops: run.connector_drops,
+            connector_enobufs: run.connector_enobufs,
+            scan_loss: run.scan_loss,
+            signal_dropped: run.signal_dropped,
+            signal_prefix_unwitnessed: run.signal_prefix_unwitnessed,
+            drain_pending: run.drain_pending,
+            polling_fallback: run.polling,
+            unattributed_events: run.unattributed,
+            admitted_exit_artifacts: run.admitted_exit_artifacts,
+            lost_intervals: run.carrier.wire(),
+            coalesced: run.carrier.coalesced,
+        };
+        out.emit(Record::End {
+            reason,
+            segments: run.segments,
+            peak_accounted_bytes: self.pool.peak(),
+            coverage: "partial",
+            peak_deferred_depth: run.peak_depth,
+            deferred_drops: run.drops,
+            deferred_removed: std::mem::take(&mut run.removed),
+            session_loss,
+        })?;
+        crate::report::err_line(&crypto_end_reason(run.segments, reason));
+        let code = if run.segments == 0 { 4 } else { 3 };
+        self.sequence = out.sequence;
+        self.pending_gaps = out.pending_gaps;
+        Ok(CloseOut { bytes: buf, code })
+    }
+}
+
+impl ServiceEngine {
+    /// The 6A tick-clock anchor (`Start.run_origin_ns`) for the
+    /// coordinator's effective-ns → tick mapping (§11.1).
+    pub(crate) fn run_origin_ns(&self) -> u64 {
+        self.run_origin_ns
+    }
+
+    /// The 6A tick length in ns (the engine interval).
+    pub(crate) fn tick_ns(&self) -> u64 {
+        self.tick_ns
+    }
+
+    /// The §11.1 non-destructive snapshot query (additive API): deep
+    /// copies of cumulative per-site counts, count-generation
+    /// markers, incarnation ledgers, session tallies, and sealed
+    /// in-window hit bounds — reads WITHOUT consuming anything
+    /// (no re-poll, no re-read; deltas derive from the stored
+    /// open/close pair only).
+    ///
+    /// `flip_to`: flip every member's bound-epoch to the NEXT
+    /// window's seq before reading (close seal — the sealed pairs
+    /// read are generation `flip_to − 1`), or `None` for the
+    /// run-open acquisition read (no flip; sealed bounds unset —
+    /// opens carry counts + ledgers only).
+    ///
+    /// Map-read failures degrade, never trap: the member's missing
+    /// reads count as absent (the L3 clamp absorbs the difference
+    /// and the residual formula still holds exactly) and the
+    /// snapshot marks unstable (PARTIAL via the existing
+    /// `forces_partial` mechanism).
+    pub(crate) fn snapshot(&self, flip_to: Option<u64>) -> crate::service::snapshot::Snapshot {
+        self.snapshot_impl(flip_to, flip_to.map(|g| g.saturating_sub(1)))
+    }
+
+    /// Terminal-window close (`N == u64::MAX`, §4.2): read the sealed
+    /// generation WITHOUT flipping — MAX+1 is unrepresentable, so no
+    /// flip target exists. Unreachable in practice; frozen for
+    /// MAXGATE fidelity.
+    pub(crate) fn snapshot_sealed(&self, sealed_gen: u64) -> crate::service::snapshot::Snapshot {
+        self.snapshot_impl(None, Some(sealed_gen))
+    }
+
+    fn snapshot_impl(
+        &self,
+        flip_to: Option<u64>,
+        sealed_gen: Option<u64>,
+    ) -> crate::service::snapshot::Snapshot {
+        use crate::service::snapshot::{
+            LossView, LostView, MemberView, RunTallies, SiteBinding, SiteCounts, Snapshot,
+        };
+        let mut flip_failed = false;
+        if let Some(g) = flip_to {
+            debug_assert!(g >= 1, "first close flips 0 → 1");
+            for a in &self.run.active {
+                if let Some(counter) = a.session.counter() {
+                    // A failed flip leaves this member's epoch
+                    // behind: its sealed reads then tag-mismatch to
+                    // EMPTY (L1 lazy reinit) — bounds unknown,
+                    // counts exact. Tag mismatch reads
+                    // stable-empty, so the failure marks unstable
+                    // explicitly here (PARTIAL via `forces_partial`).
+                    if counter.flip_bound_epoch(g).is_err() {
+                        flip_failed = true;
+                    }
+                }
+            }
+        }
+        // Close: the first monotonic read after the last flip.
+        // Open: the acquisition read instant.
+        let at_ns = crate::service::state::monotonic_ns();
+        let mut stable = !flip_failed;
+        let mut members = Vec::new();
+        for a in &self.run.active {
+            let mut sites = Vec::new();
+            let mut bindings = Vec::new();
+            let mut gen_marker = 1u32;
+            let mut gaps = Vec::new();
+            let mut gauges = (0u64, 0u64);
+            if let Some(counter) = a.session.counter() {
+                let (marker, rows, fold_gaps) = counter.snapshot_fold();
+                gen_marker = marker;
+                gaps = fold_gaps;
+                let mut attached = 0u64;
+                let mut fenced = 0u64;
+                for (cookie, row, active) in &rows {
+                    if *active {
+                        attached += 1;
+                    } else {
+                        fenced += 1;
+                    }
+                    bindings.push(SiteBinding {
+                        cookie: *cookie,
+                        site: row.site.clone(),
+                        candidates: row.candidates.clone(),
+                        coverage: row.candidates_coverage,
+                        installed_at: row.installed_at,
+                    });
+                }
+                gauges = (attached.saturating_add(fenced), attached);
+                match counter.counts_keys() {
+                    Ok(keys) => {
+                        for key in keys {
+                            let (cookie, generation) = osslscope_ebpf_common::split_key(key);
+                            let calls = counter.read_key_counts(key).unwrap_or_else(|_| {
+                                stable = false;
+                                0
+                            });
+                            let sealed_bounds = match sealed_gen {
+                                Some(g) => match counter.read_sealed_bounds(key, g) {
+                                    Ok((bounds, ok)) => {
+                                        stable = stable && ok;
+                                        bounds
+                                    }
+                                    Err(_) => {
+                                        stable = false;
+                                        None
+                                    }
+                                },
+                                None => None,
+                            };
+                            // ENGINE-plane keys share the COUNTS map:
+                            // site rows only (engine deltas are empty
+                            // in T7.4 — the certified finish path
+                            // emits no engine observations, and no
+                            // certified cookie→site join exists for
+                            // the snapshot path).
+                            if crate::focused_count::is_engine_cookie(cookie) {
+                                continue;
+                            }
+                            sites.push(SiteCounts {
+                                cookie,
+                                generation,
+                                calls,
+                                sealed_bounds,
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        stable = false;
+                    }
+                }
+            }
+            let ledger = LossSummary::from_ledger(&a.ledger);
+            members.push(MemberView {
+                pid: a.identity.pid,
+                starttime: a.identity.starttime,
+                segment: a.segment,
+                image_epoch: a.image_epoch,
+                sites,
+                gen_marker,
+                bindings,
+                loss: LossView {
+                    loss: ledger.loss,
+                    deferred_ticks: ledger.deferred.ticks,
+                    deferred_first: ledger.deferred.first_tick,
+                    deferred_last: ledger.deferred.last_tick,
+                    lost: ledger
+                        .lost_windows
+                        .iter()
+                        .map(|w| LostView {
+                            start_tick: w.start_tick,
+                            end_tick: w.end_tick,
+                            cause: w.cause,
+                        })
+                        .collect(),
+                    coalesced: ledger.coalesced,
+                },
+                ring: a.session.session_loss_totals(),
+                gaps,
+                engine: Vec::new(),
+                gauges,
+                target: crate::evidence::TargetRecord::new(
+                    a.identity.pid,
+                    "unknown".to_string(),
+                    String::new(),
+                    String::new(),
+                ),
+            });
+        }
+        Snapshot {
+            at_ns,
+            stable,
+            members,
+            run: RunTallies {
+                scan_loss: self.run.scan_loss,
+                signal_dropped: self.run.signal_dropped,
+                prefix_unwitnessed: self.run.signal_prefix_unwitnessed,
+                drain_pending: self.run.drain_pending,
+            },
+            polling: self.run.polling,
+        }
+    }
+}
+
+/// One-shot 6A observation: the original `observe()` loop, now a
+/// thin driver over the steppable engine (identical record bytes,
+/// cadence, and exit codes — the 6A gates prove it).
+fn observe(
+    config: &CryptoWatchConfig,
+    objects: FocusedObjects,
+    pool: &MemoryPool,
+    output: &mut impl Write,
+    json: bool,
+    cancel: &AtomicBool,
+    producer: Option<&crate::lifecycle_producer::ProducerHandle>,
+) -> io::Result<u8> {
+    let opened = ServiceEngine::open(config, objects, pool, json, producer)?;
+    output.write_all(&opened.setup_bytes)?;
+    let mut engine = match opened.engine {
+        Some(engine) => engine,
+        None => return Ok(opened.early_code),
+    };
+    while Instant::now() < engine.deadline && !cancel.load(Ordering::Relaxed) {
+        let it = engine.pump_iteration(cancel)?;
+        output.write_all(&it.bytes)?;
+        let remaining = engine.deadline.saturating_duration_since(Instant::now());
         if !cancel.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(25).min(remaining));
         }
     }
-    let reason = if cancel.load(Ordering::Relaxed) {
-        "cancelled"
-    } else {
-        "duration"
-    };
-    // 6A close drain: a final poll — its lanes fold and its events
-    // bind (births may gap; exits may confirm; execs seal without
-    // readmit). No suffix witness exists on the §7 boundary, so the
-    // close witness is not recorded.
-    {
-        let edge = crate::capture::LifecycleEdge {
-            start_ns: run_origin_ns,
-            end_ns: LiveClock.monotonic_ns(),
-        };
-        let close = port.close_drain(edge, None);
-        if let Some(delta) = close.delta {
-            run.scan_loss = run.scan_loss.saturating_add(delta.loss);
-            run.signal_dropped = run.signal_dropped.saturating_add(delta.dropped);
-            run.signal_prefix_unwitnessed = run
-                .signal_prefix_unwitnessed
-                .saturating_add(delta.prefix_unwitnessed);
-            run.drain_pending = run.drain_pending.saturating_add(delta.pending);
-            run.connector_drops = run.connector_drops.saturating_add(delta.connector_drops);
-            run.connector_enobufs = run
-                .connector_enobufs
-                .saturating_add(delta.connector_enobufs);
-            if port.fallback_partial() {
-                run.polling = true;
-            }
-            let mut events = delta.events;
-            events.sort_by_key(|e| (e.timestamp_ns.unwrap_or(u64::MAX), e.cpu, e.seq));
-            for event in events {
-                bind_event(&mut run, &mut out, &event, trust_reviewed)?;
-            }
-        }
-        // 6A close-drain evaluation (§4.1): newly folded closing loss
-        // needs the same covering intervals as per-tick loss — the
-        // session carrier plus every still-open ledger — before the
-        // seals below close those ledgers. N5: detection runs at
-        // the elapsed-derived close tick, not the last sample's.
-        let tick_pending = run.drain_pending.saturating_sub(run.pending_mark);
-        run.pending_mark = run.drain_pending;
-        run.refresh_close_tick(LiveClock.monotonic_ns());
-        run.update_loss_baselines(tick_pending);
-        run.update_lane_baselines();
-    }
-    // Stop every member before potentially slow final projection/output. This
-    // also propagates cancellation arriving between poll passes into documents.
-    for a in &mut run.active {
-        a.session.stop_admission(cancel);
-    }
-    // Flagged seals first (proven deaths/reuses/execs keep their
-    // exact reasons at close).
-    run.seal_exit_flags(&mut out)?;
-    let flagged: Vec<u32> = run.exec_flags.keys().copied().collect();
-    for pid in flagged {
-        let Some((fence_tick, _ts, count)) = run.exec_flags.get(&pid).copied() else {
-            continue;
-        };
-        let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) else {
-            run.exec_flags.remove(&pid);
-            continue;
-        };
-        let epoch = run.active[pos].image_epoch;
-        let identity = run.active[pos].identity.clone();
-        let tick = run.current_tick;
-        run.active[pos].ledger.windows.append(
-            fence_tick,
-            tick.saturating_add(1),
-            LossCause::ExecSpanningAggregate,
-        );
-        let active = run.active.remove(pos);
-        run.drop_flags_for(pid);
-        let outcome = out.finish_exec_seal(active)?;
-        run.seal_fold(outcome.loss_totals);
-        // Middle images seal in drain order (no readmit at close —
-        // the run ends inside the transition window).
-        for middle in 1..count.max(1) {
-            let middle_epoch = epoch.saturating_add(middle);
-            out.emit_middle_seal(&identity, middle_epoch, &outcome.ledger)?;
-        }
-    }
-    let flagged: Vec<u32> = run.retire_flags.keys().copied().collect();
-    for pid in flagged {
-        let Some((flag_reason, fenced)) = run.retire_flags.get(&pid).copied() else {
-            continue;
-        };
-        run.retire_flags.remove(&pid);
-        if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
-            run.seal_active(&mut out, pos, flag_reason, fenced)?;
-        }
-    }
-    let flagged: Vec<u32> = run.unsteady.iter().copied().collect();
-    for pid in flagged {
-        run.unsteady.remove(&pid);
-        if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
-            run.seal_active(&mut out, pos, "visibility_lost", true)?;
-        }
-    }
-    // Seal-all: the run ended (death unproven either way — stopping
-    // observation, never inventing exits).
-    while let Some(active) = run.active.pop() {
-        let pid = active.identity.pid;
-        let outcome = out.finish(active, reason, false)?;
-        run.seal_fold(outcome.loss_totals);
-        run.drop_flags_for(pid);
-    }
-    // Deferred close: every entry still deferred emits
-    // `deferred_removed` (cancel/timeout path vs natural expiry).
-    // R6-2a: run-end DISCARDS continuations (the run ends — no
-    // readmission follows, so nothing resumes them).
-    let close_reason = if cancel.load(Ordering::Relaxed) {
-        "cancelled"
-    } else {
-        "end_of_observation"
-    };
-    let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
-    for key in keys {
-        if let Some(entry) = run.deferred.remove(&key) {
-            run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
-            run.removed.closed = run.removed.closed.saturating_add(1);
-        }
-    }
-    // Follow-pending at close: dead births gap (counted per root);
-    // live-but-never-classified births gap as unknown (no root bill).
-    let pids: Vec<u32> = run.follow_pending.keys().copied().collect();
-    for pid in pids {
-        let Some((_recorded, parent, _)) = run.follow_pending.remove(&pid) else {
-            continue;
-        };
-        let gap = inventory::Gap {
-            pid: Some(pid),
-            device: None,
-            inode: None,
-            reason: GapReason::MembershipUnknown,
-            errno: None,
-            actor_euid: None,
-        };
-        if matches!(probe_liveness(pid), Liveness::Dead) {
-            if let Some(root) = parent {
-                run.count_ignored(root);
-            }
-        }
-        out.emit(Record::Gap { gap: &gap })?;
-    }
-    run.pending_epoch.clear();
-    // R3-4b: the run ends — no readmission follows, so demoted
-    // contexts and tombstones retire with the primary stash (their
-    // ledgers already rode the seals; nothing is reborn).
-    run.evicted_epoch.clear();
-    run.epoch_tombstones.clear();
-    // R6-3: run-end flush of live-path deferred closes (terminal —
-    // no more polling, so bounded synchronous close is allowed).
-    crate::provider_observation::session::flush_deferred_offpath_sync();
-    // 6A seal-fold evaluation (§4.1): final ring reads folded during
-    // sealing join the cumulative ring here, so the evaluators run
-    // once more — seal-folded loss reaches the session carrier
-    // (sealed ledgers ride the carrier; they are never revised).
-    // N5: same elapsed-derived close tick as the close drain.
-    run.refresh_close_tick(LiveClock.monotonic_ns());
-    run.update_loss_baselines(0);
-    run.update_lane_baselines();
-    out.flush_gaps()?;
-    run.emit_pending_drops_all(&mut out)?;
-    out.emit_ignored_line(&run.ignored)?;
-    run.ignored.clear();
-    let session_loss = SessionLoss {
-        ring: run.live_ring(),
-        connector_drops: run.connector_drops,
-        connector_enobufs: run.connector_enobufs,
-        scan_loss: run.scan_loss,
-        signal_dropped: run.signal_dropped,
-        signal_prefix_unwitnessed: run.signal_prefix_unwitnessed,
-        drain_pending: run.drain_pending,
-        polling_fallback: run.polling,
-        unattributed_events: run.unattributed,
-        admitted_exit_artifacts: run.admitted_exit_artifacts,
-        lost_intervals: run.carrier.wire(),
-        coalesced: run.carrier.coalesced,
-    };
-    out.emit(Record::End {
-        reason,
-        segments: run.segments,
-        peak_accounted_bytes: pool.peak(),
-        coverage: "partial",
-        peak_deferred_depth: run.peak_depth,
-        deferred_drops: run.drops,
-        deferred_removed: std::mem::take(&mut run.removed),
-        session_loss,
-    })?;
-    crate::report::err_line(&crypto_end_reason(run.segments, reason));
-    Ok(if run.segments == 0 { 4 } else { 3 })
+    let closed = engine.close_drain(cancel)?;
+    output.write_all(&closed.bytes)?;
+    Ok(closed.code)
 }
 /// Complete grammar admission precedes selectors, companion reads and signals.
 pub fn run(args: &[String]) -> ExitCode {
@@ -4931,18 +5308,32 @@ mod tests {
         assert_eq!(doc["refusal_diagnostics"].as_array().unwrap().len(), 1);
     }
     #[test]
-    fn two_normal_reservations_include_coordinator_scanner_and_stock_parser() {
+    fn two_normal_reservations_fit_parser_coexists_with_one() {
+        // 6B capacity note (D-record §11.1, mandated): the
+        // sealed-bound maps (BOUNDS/EPOCH/EPOCH_CUR, 2048-entry
+        // bound per the loader capacity comment) grow each session
+        // reservation (~2.5 MiB at 16 CPUs), so the stock parser
+        // scratch no longer fits alongside TWO max sessions. This
+        // test proves the new working set: two sessions +
+        // coordinator + scanner fit (third session refused), and the
+        // stock parser still coexists with ONE session.
         let pool = MemoryPool::new(GLOBAL_BYTES);
         let _coordinator = pool.reserve(COORDINATOR_BYTES + 32_768).unwrap();
         let _scanner = pool.reserve(4096 * 160 + 100 * 4096).unwrap();
         let cost = FocusedSession::reservation_bytes(&objects()).unwrap() + 29_480;
         let _a = pool.reserve(cost).unwrap();
         let _b = pool.reserve(cost).unwrap();
-        let _parser = pool
-            .reserve(inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
-            .unwrap();
         assert!(pool.peak() <= GLOBAL_BYTES);
         assert!(pool.reserve(cost).is_none());
+        // Parser coexistence with one session (fresh pool).
+        let pool2 = MemoryPool::new(GLOBAL_BYTES);
+        let _coordinator2 = pool2.reserve(COORDINATOR_BYTES + 32_768).unwrap();
+        let _scanner2 = pool2.reserve(4096 * 160 + 100 * 4096).unwrap();
+        let _a2 = pool2.reserve(cost).unwrap();
+        let _parser = pool2
+            .reserve(inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
+            .unwrap();
+        assert!(pool2.peak() <= GLOBAL_BYTES);
     }
     #[test]
     fn reincarnation_and_visibility_are_not_inferred_exits() {

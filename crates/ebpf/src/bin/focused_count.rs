@@ -58,8 +58,8 @@ use aya_ebpf::{
     EbpfContext as _,
 };
 use osslscope_bpf_contract::{
-    focused_namespace_admits, lat_bucket, make_key, CountNamespace, CountValue, WINDOW_CELLS,
-    WINDOW_DEADLINE, WINDOW_START,
+    focused_namespace_admits, lat_bucket, make_key, BoundSlot, CountNamespace, CountValue,
+    WINDOW_CELLS, WINDOW_DEADLINE, WINDOW_START,
 };
 
 /// `BPF_NOEXIST` for `insert` (kernel UAPI; aya-ebpf exposes no const).
@@ -112,6 +112,30 @@ static ADMITTED: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
 /// sampling semantics. This diagnostic is not performance qualification.
 #[map]
 static LATC: PerCpuArray<u64> = PerCpuArray::with_max_entries(16, 0);
+
+/// 6B sealed-bound slots: one per CPU per counted key (the
+/// `COUNTS` key space, capacity-bounded below), two bound pairs
+/// under one sequence word + the L1 generation tag. Every counted
+/// hit also tags its bounds here; the host flips the epoch at
+/// each window seal and consumes the sealed pair. Counts NEVER
+/// depend on this map (a full `BOUNDS` loses bounds, never
+/// counts).
+#[map]
+static BOUNDS: PerCpuHashMap<u64, BoundSlot> = PerCpuHashMap::with_max_entries(1024, 0);
+
+/// 6B per-key per-CPU bound epoch (host-owned: BPF READS ONLY —
+/// the host is the sole writer, so epoch flips never race BPF
+/// count updates). Absent ⟺ `EPOCH_CUR` (below).
+#[map]
+static EPOCH: PerCpuHashMap<u64, u64> = PerCpuHashMap::with_max_entries(1024, 0);
+
+/// 6B global epoch (host-owned, BPF-read-only): the currently
+/// accumulating window generation. The host bumps this FIRST at
+/// each seal, then sets every known key's per-CPU epoch; BPF tags
+/// `EPOCH.get(key).unwrap_or(EPOCH_CUR)` so fresh keys always tag
+/// the current generation.
+#[map]
+static EPOCH_CUR: Array<u64> = Array::with_max_entries(1, 0);
 
 #[uprobe]
 pub fn count_entry(ctx: ProbeContext) -> u32 {
@@ -168,6 +192,9 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     let key = make_key(cookie as u32, gen);
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
         bump(slot, now);
+        // 6B: tag the sealed-bound pair (bounds only — counts are
+        // already kept above and never depend on this call).
+        tag_bounds(&key, now);
         // At most one eligible partition in this same generation. A failed
         // attribution leaves the stored physical hit unresolved.
         let params = typed_producer::OpParams {
@@ -201,6 +228,8 @@ pub fn count_entry(ctx: ProbeContext) -> u32 {
     let _ = COUNTS.insert(&key, &zero, BPF_NOEXIST);
     if let Some(slot) = COUNTS.get_ptr_mut(&key) {
         bump(slot, now);
+        // 6B slow path tags too (same single-tag rule as fast).
+        tag_bounds(&key, now);
         // Same-generation partition assignment on the slow path too: the
         // physical store succeeded, so this hit is eligible exactly once.
         let params = typed_producer::OpParams {
@@ -234,6 +263,56 @@ fn bump(slot: *mut CountValue, now: u64) {
     }
     v.count = v.count.saturating_add(1);
     v.last_ns = now;
+}
+
+/// 6B bound tagging (one call per counted hit, both paths): tag
+/// this hit's bounds into the pair selected by the slot's epoch.
+/// Seqlock: odd before, even after. L1: bank writes apply only
+/// when the updater epoch matches the tag (a mismatched tag
+/// reinitializes — empties both pairs, adopts the generation —
+/// before the write, so stale bounds never pollute a new window).
+/// A missing `BOUNDS` slot (map full) drops the BOUNDS ONLY —
+/// counts are already kept and `DROPFAIL` stays count-scoped.
+#[inline(always)]
+fn tag_bounds(key: &u64, now: u64) {
+    // `EPOCH.get` reads THIS CPU's epoch (per-CPU semantics —
+    // exactly the updater epoch for this slot); absent ⟺ the
+    // global default. Sound: the returned reference borrows
+    // map memory for the statement only, copied out immediately.
+    let gen = match unsafe { EPOCH.get(key) } {
+        Some(e) => *e,
+        None => EPOCH_CUR.get(0).copied().unwrap_or(0),
+    };
+    let slot = match BOUNDS.get_ptr_mut(key) {
+        Some(s) => s,
+        None => {
+            let zero = BoundSlot {
+                seq: 0,
+                tag: 0,
+                pairs: [[0; 2]; 2],
+            };
+            let _ = BOUNDS.insert(key, &zero, BPF_NOEXIST);
+            match BOUNDS.get_ptr_mut(key) {
+                Some(s) => s,
+                None => return,
+            }
+        }
+    };
+    let v = unsafe { &mut *slot };
+    // Plain in-order stores (BPF executes in order; the existing
+    // `bump` relies on the same — no fence instruction exists for
+    // this target).
+    v.seq = v.seq.wrapping_add(1);
+    if v.tag != gen {
+        v.pairs = [[0; 2]; 2];
+        v.tag = gen;
+    }
+    let pair = &mut v.pairs[(gen & 1) as usize];
+    if pair[0] == 0 {
+        pair[0] = now;
+    }
+    pair[1] = now;
+    v.seq = v.seq.wrapping_add(1);
 }
 
 fn dropfail() {

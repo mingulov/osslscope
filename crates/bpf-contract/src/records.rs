@@ -8,6 +8,30 @@ pub struct CountValue {
     pub last_ns: u64,
 }
 
+/// 6B sealed-bound slot (one per CPU per `COUNTS` key, `BOUNDS`
+/// map): two bound pairs (first/last hit ns) under one sequence
+/// word, plus the L1 last-written window-seq generation tag. BPF
+/// tags hits into `pairs[g & 1]` where `g` is the current epoch
+/// (`EPOCH` map, `EPOCH_CUR` default); the host flips `g` at each
+/// window seal. 48 bytes, align 8. A pair `[0, 0]` is empty (the
+/// `CountValue` first-touch convention).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct BoundSlot {
+    /// Seqlock: odd during a BPF update, even when quiescent.
+    pub seq: u64,
+    /// L1 tag: the window-seq generation that last wrote this
+    /// slot. `tag != current` reads as EMPTY (lazy reinit); BPF
+    /// reinitializes (empties both pairs, adopts the tag) before
+    /// writing under a new generation.
+    pub tag: u64,
+    /// Bound pairs by epoch bit.
+    pub pairs: [[u64; 2]; 2],
+}
+
+const _: () = assert!(core::mem::size_of::<BoundSlot>() == 48);
+const _: () = assert!(core::mem::align_of::<BoundSlot>() == 8);
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct PendQuery {

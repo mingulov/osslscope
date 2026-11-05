@@ -10643,6 +10643,28 @@ impl<'a> BorrowedMap<'a> {
         // SAFETY: non-per-CPU key/value lengths match this exact FD.
         unsafe { ossl_bpf_sys::map_update_elem(self.fd.as_raw_fd(), key, value, 0) }
     }
+    /// 6B bound-epoch flip: whole-value update of a per-CPU map
+    /// (one host write per key touching each CPU's slot once).
+    /// Restricted by construction to host-owned maps (the flip
+    /// writes `EPOCH` only, which BPF never writes — no RMW race
+    /// with BPF count updates is constructable). `BPF_ANY`
+    /// creates-or-updates (absent ⟺ insert with the new epoch).
+    pub(crate) fn update_percpu(&self, key: &[u8], value: &[u8]) -> std::io::Result<()> {
+        self.check()?;
+        if key.len() != self.info.key_size as usize || !matches!(self.info.map_type, 5 | 6) {
+            return Err(std::io::Error::other("map update shape mismatch"));
+        }
+        let cpus = aya::util::nr_cpus().map_err(|(_, error)| error)?;
+        let expected = (self.info.value_size as usize)
+            .next_multiple_of(8)
+            .checked_mul(cpus)
+            .ok_or_else(|| std::io::Error::other("per-CPU value size overflow"))?;
+        if value.len() != expected {
+            return Err(std::io::Error::other("map value size mismatch"));
+        }
+        // SAFETY: per-CPU key/value lengths match this exact FD.
+        unsafe { ossl_bpf_sys::map_update_elem(self.fd.as_raw_fd(), key, value, 0) }
+    }
     pub(crate) fn keys(&self, capacity: u32) -> std::io::Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         let mut previous: Option<Vec<u8>> = None;
@@ -11443,7 +11465,7 @@ pub const BORROWED_COUNT_MAPS: [&str; 20] = [
 ];
 
 /// The legacy seven-map Count owner/validators remain independent.
-pub const FOCUSED_COUNT_MAPS: [MapSpec; 30] = [
+pub const FOCUSED_COUNT_MAPS: [MapSpec; 33] = [
     crate::writer_gate::SPEC,
     COUNT_MAPS[0],
     COUNT_MAPS[1],
@@ -11452,6 +11474,46 @@ pub const FOCUSED_COUNT_MAPS: [MapSpec; 30] = [
     COUNT_MAPS[4],
     COUNT_MAPS[5],
     COUNT_MAPS[6],
+    // 6B sealed-bound maps (D-record §11.1 + L1): per-CPU bound
+    // pairs under a seqlock, the host-owned per-key epoch, and the
+    // global epoch default.
+    MapSpec {
+        name: "BOUNDS",
+        map_type: 5,
+        key_size: 8,
+        value_size: 48,
+        // 1024: the pool charges worst-case-full maps per
+        // session, and the pinned 256 MiB two-session arithmetic
+        // (`session_reservation_precedes_open...`) budgets these
+        // three maps at ≤1,394,063 B/session on a 16-CPU box
+        // (904×BOUNDS + 264×EPOCH ≤ 1,197,315 after the fixed
+        // 65,536 B/map terms — 1024/1024 clears it by 1,283 B).
+        // 8192 would refuse the second concurrent session the 6A
+        // gates require (control-1 parent + survivor). 1024
+        // covers qual-scale key counts (bounds annotate counted
+        // hits only; overflow drops bounds with counts exact —
+        // the D-record L2 degraded mode).
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "EPOCH",
+        map_type: 5,
+        key_size: 8,
+        value_size: 8,
+        // Same 1024 key space as BOUNDS (one epoch per bound
+        // key); absent ⟺ EPOCH_CUR by BPF construction.
+        max_entries: 1024,
+        flags: 0,
+    },
+    MapSpec {
+        name: "EPOCH_CUR",
+        map_type: 2,
+        key_size: 4,
+        value_size: 8,
+        max_entries: 1,
+        flags: 0,
+    },
     MapSpec {
         name: "NS_CONFIG",
         map_type: 2,

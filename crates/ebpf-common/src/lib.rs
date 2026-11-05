@@ -110,6 +110,58 @@ impl CountValue {
     }
 }
 
+/// 6B sealed-bound slot (host mirror of
+/// `osslscope_bpf_contract::BoundSlot`, same 48-byte ABI): two
+/// bound pairs under one sequence word + the L1 generation tag.
+/// A pair `[0, 0]` is empty.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoundSlot {
+    pub seq: u64,
+    pub tag: u64,
+    pub pairs: [[u64; 2]; 2],
+}
+
+const _: () = assert!(size_of::<BoundSlot>() == 48);
+const _: () = assert!(align_of::<BoundSlot>() == 8);
+
+/// Typed map reads over the snapshot path. Sound: `repr(C)`,
+/// all-`u64`, zero padding (size 48 = 6×8, asserted above), `Copy`.
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BoundSlot {}
+
+/// Sealed-pair consumption (L1): the epoch-`gen` pair reads EMPTY
+/// unless the slot's tag matches `gen` exactly (lazy reinit — a
+/// stale tag's pairs are never consumed).
+#[cfg(feature = "user")]
+impl BoundSlot {
+    /// The sealed pair for window generation `generation`, or
+    /// `None` when empty/tag-mismatched.
+    pub fn sealed(&self, generation: u64) -> Option<(u64, u64)> {
+        if self.tag != generation {
+            return None;
+        }
+        let pair = self.pairs[(generation & 1) as usize];
+        if pair[0] == 0 {
+            return None;
+        }
+        Some((pair[0], pair[1]))
+    }
+
+    /// Union one CPU's sealed pair into an accumulator.
+    pub fn union_into(acc: &mut Option<(u64, u64)>, slot: &BoundSlot, generation: u64) {
+        if let Some((first, last)) = slot.sealed(generation) {
+            match acc {
+                None => *acc = Some((first, last)),
+                Some((a, b)) => {
+                    *a = (*a).min(first);
+                    *b = (*b).max(last);
+                }
+            }
+        }
+    }
+}
+
 // Count wire ABI v2 (T07 kernel admission window): `WINDOW` is a
 // 2-cell `Array<u64>` holding the monotonic admission interval
 // `[start_ns, deadline_ns)` in `bpf_ktime_get_ns` time. A hit counts

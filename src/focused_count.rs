@@ -10,7 +10,7 @@ use crate::{
         static_tables::{DynamicAlgorithmId, StaticTableProvenance, TableStorage},
     },
 };
-use osslscope_ebpf_common::{CountValue, split_key};
+use osslscope_ebpf_common::{BoundSlot, CountValue, split_key};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -1381,6 +1381,181 @@ impl FocusedCounter {
         }
         sample
     }
+    /// 6B window-seal bound-epoch flip (D-record §11.1): flip this
+    /// counter's bound epoch to `generation` (the closing window's
+    /// seq). Protocol: bump `EPOCH_CUR` FIRST (fresh keys tag the
+    /// current generation), then set every known `COUNTS` key's
+    /// per-CPU epoch explicitly (absent ⟺ insert with the new
+    /// generation; present-with-old ⟺ set; present-with-new ⟺
+    /// leave). The host is the sole writer of `EPOCH`/`EPOCH_CUR`
+    /// (BPF reads only) → no RMW race with BPF count updates is
+    /// constructable. Called under the engine's mutation lock at
+    /// the seal instant.
+    pub(crate) fn flip_bound_epoch(&self, generation: u64) -> Result<(), CountFailure> {
+        if !self.gate.admitting() {
+            return Err(CountFailure::Close);
+        }
+        checked_map(&self.loaded, "EPOCH_CUR")?
+            .update(&0u32.to_ne_bytes(), &generation.to_ne_bytes())
+            .map_err(|_| CountFailure::Map)?;
+        let counts = checked_map(&self.loaded, "COUNTS")?;
+        let keys = counts
+            .keys(self.limits.max_keys as u32)
+            .map_err(|_| CountFailure::Read)?;
+        let epoch = checked_map(&self.loaded, "EPOCH")?;
+        let mut buf = vec![0u8; self.cpus * 8];
+        let fresh: Vec<u8> = (0..self.cpus)
+            .flat_map(|_| generation.to_ne_bytes())
+            .collect();
+        for key in keys {
+            match epoch.lookup(&key, &mut buf) {
+                Ok(()) => {
+                    let current: Vec<u64> = buf
+                        .chunks_exact(8)
+                        .map(|c| u64::from_ne_bytes(c.try_into().unwrap()))
+                        .collect();
+                    if current.iter().all(|v| *v == generation) {
+                        continue;
+                    }
+                    epoch
+                        .update_percpu(&key, &fresh)
+                        .map_err(|_| CountFailure::Map)?;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
+                    epoch
+                        .update_percpu(&key, &fresh)
+                        .map_err(|_| CountFailure::Map)?;
+                }
+                Err(_) => return Err(CountFailure::Map),
+            }
+        }
+        Ok(())
+    }
+
+    /// 6B seqlock-guarded sealed-pair union for one `COUNTS` key at
+    /// `generation` (L1 tag-checked: tag-mismatched slots read
+    /// EMPTY). Returns the cross-CPU union + stability: `stable` is
+    /// false when any CPU exhausted the 64-retry bound or was
+    /// unreadable mid-pass (the best-prefix union is still
+    /// returned). An ABSENT key reads `(None, true)` (no bounds
+    /// exist — the L2 unknown path marks it; stability concerns
+    /// read coherence, not availability).
+    pub(crate) fn read_sealed_bounds(
+        &self,
+        key: u64,
+        generation: u64,
+    ) -> Result<(Option<(u64, u64)>, bool), CountFailure> {
+        let bounds = checked_map(&self.loaded, "BOUNDS")?;
+        let key_bytes = key.to_ne_bytes();
+        let mut a = vec![0u8; self.cpus * 48];
+        match bounds.lookup(&key_bytes, &mut a) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok((None, true)),
+            Err(_) => return Err(CountFailure::Read),
+        }
+        let mut b = vec![0u8; self.cpus * 48];
+        let mut union: Option<(u64, u64)> = None;
+        let mut resolved = vec![false; self.cpus];
+        let mut last_even: Vec<Option<BoundSlot>> = vec![None; self.cpus];
+        // Seed pass already in `a`; pair it with a second read.
+        for _ in 0..64 {
+            if resolved.iter().all(|r| *r) {
+                break;
+            }
+            if bounds.lookup(&key_bytes, &mut b).is_err() {
+                // Unreadable mid-pass: stop resolving, keep
+                // best-prefix below (UNSTABLE, never fatal).
+                break;
+            }
+            for cpu in 0..self.cpus {
+                if resolved[cpu] {
+                    continue;
+                }
+                let sa = parse_bound_slot(&a[cpu * 48..(cpu + 1) * 48]);
+                let sb = parse_bound_slot(&b[cpu * 48..(cpu + 1) * 48]);
+                if sa.seq % 2 == 0 {
+                    last_even[cpu] = Some(sa);
+                }
+                if sa.seq == sb.seq && sa.seq % 2 == 0 {
+                    resolved[cpu] = true;
+                    BoundSlot::union_into(&mut union, &sa, generation);
+                }
+            }
+            std::mem::swap(&mut a, &mut b);
+        }
+        let stable = resolved.iter().all(|r| *r);
+        if !stable {
+            // Best-prefix: last even-seq reads for unresolved CPUs;
+            // CPUs with NO even read contribute ABSENT.
+            for cpu in 0..self.cpus {
+                if !resolved[cpu] {
+                    if let Some(slot) = last_even[cpu] {
+                        BoundSlot::union_into(&mut union, &slot, generation);
+                    }
+                }
+            }
+        }
+        Ok((union, stable))
+    }
+
+    /// 6B cumulative per-CPU counts for one `COUNTS` key (plain
+    /// single lookup — counts ride the existing concurrent-prefix
+    /// path; stability is a property of the guarded `BOUNDS` pass
+    /// only). Absent ⟺ zero.
+    pub(crate) fn read_key_counts(&self, key: u64) -> Result<u64, CountFailure> {
+        let map = checked_map(&self.loaded, "COUNTS")?;
+        let mut bytes = vec![0u8; self.cpus * 24];
+        match map.lookup(&key.to_ne_bytes(), &mut bytes) {
+            Ok(()) => {}
+            Err(e) if e.raw_os_error() == Some(libc::ENOENT) => return Ok(0),
+            Err(_) => return Err(CountFailure::Read),
+        }
+        let mut total = 0u64;
+        for chunk in bytes.chunks_exact(24) {
+            total = total.saturating_add(u64::from_ne_bytes(chunk[..8].try_into().unwrap()));
+        }
+        Ok(total)
+    }
+
+    /// 6B snapshot access: the current count-generation marker,
+    /// live-admission bindings (cookie → row + active flag), and
+    /// cumulative gap tallies (the same `gap()` mapping as
+    /// `sample()` — pure projection, nothing consumed).
+    pub(crate) fn snapshot_fold(
+        &self,
+    ) -> (
+        u32,
+        Vec<(u32, crate::evidence::SiteExecution, bool)>,
+        Vec<crate::evidence::GapCounter>,
+    ) {
+        let rows = self
+            .fold
+            .rows
+            .iter()
+            .map(|(cookie, r)| (*cookie, r.row.clone(), r.active))
+            .collect();
+        // Cumulative gap tallies via the pure `sample()` projection
+        // (the same `gap()` mapping the finish path uses).
+        let gaps = self.fold.sample().gaps;
+        (self.fold.generation, rows, gaps)
+    }
+
+    /// 6B: enumerate known `COUNTS` keys (bounded by
+    /// `limits.max_keys`, like `read_snapshot`).
+    pub(crate) fn counts_keys(&self) -> Result<Vec<u64>, CountFailure> {
+        let map = checked_map(&self.loaded, "COUNTS")?;
+        let keys = map
+            .keys(self.limits.max_keys as u32)
+            .map_err(|_| CountFailure::Read)?;
+        keys.into_iter()
+            .map(|k| {
+                k.try_into()
+                    .map(u64::from_ne_bytes)
+                    .map_err(|_| CountFailure::Read)
+            })
+            .collect()
+    }
+
     fn read_snapshot(&mut self, deadline: Instant, strict: bool) -> Result<(), CountFailure> {
         let check = || {
             if Instant::now() >= deadline {
@@ -1502,6 +1677,17 @@ impl Drop for FocusedCounter {
         self.close_links();
     }
 }
+/// 6B: parse one 48-byte per-CPU bound slot (native endian,
+/// the `read_snapshot` convention).
+fn parse_bound_slot(v: &[u8]) -> BoundSlot {
+    let w = |o: usize| u64::from_ne_bytes(v[o..o + 8].try_into().unwrap());
+    BoundSlot {
+        seq: w(0),
+        tag: w(8),
+        pairs: [[w(16), w(24)], [w(32), w(40)]],
+    }
+}
+
 fn checked_map<'a>(
     loaded: &'a loader::Loaded,
     name: &str,
@@ -3530,5 +3716,73 @@ mod budget_tests {
             FocusedCounter::open(&[0u8; 64], 1234, namespace, roomy),
             Err(CountFailure::Object)
         ));
+    }
+
+    /// L1 bank-reuse proof: a slot whose tag is not the consuming
+    /// generation reads EMPTY (lazy reinit) — stale pairs never
+    /// pollute a new window — while the matching tag reads its
+    /// epoch-bit pair.
+    #[test]
+    fn l1_tag_mismatch_reads_empty() {
+        let slot = BoundSlot {
+            seq: 42,
+            tag: 5,
+            pairs: [[100, 200], [300, 400]],
+        };
+        // Same parity (7 & 1 == 5 & 1) but different generation:
+        // still EMPTY (full-generation match, never parity-only —
+        // window N+2 must not inherit window N's stale pair).
+        assert_eq!(slot.sealed(7), None);
+        assert_eq!(slot.sealed(6), None);
+        // Matching tag reads the epoch-bit pair.
+        assert_eq!(slot.sealed(5), Some((300, 400)));
+        let slot4 = BoundSlot {
+            seq: 42,
+            tag: 4,
+            pairs: [[100, 200], [300, 400]],
+        };
+        assert_eq!(slot4.sealed(4), Some((100, 200)));
+    }
+
+    /// L1 union proof: the cross-CPU union folds ONLY
+    /// tag-matching banks; mismatched banks contribute nothing
+    /// (never a zero, never a stale endpoint).
+    #[test]
+    fn l1_union_skips_mismatched_banks() {
+        let good = BoundSlot {
+            seq: 2,
+            tag: 9,
+            pairs: [[10, 20], [30, 40]],
+        };
+        let stale = BoundSlot {
+            seq: 2,
+            tag: 8,
+            pairs: [[1, 2], [3, 4]],
+        };
+        let mut acc = None;
+        BoundSlot::union_into(&mut acc, &stale, 9);
+        assert_eq!(acc, None);
+        BoundSlot::union_into(&mut acc, &good, 9);
+        assert_eq!(acc, Some((30, 40)));
+        // A second matching bank extends the union honestly.
+        let good2 = BoundSlot {
+            seq: 2,
+            tag: 9,
+            pairs: [[10, 20], [25, 45]],
+        };
+        BoundSlot::union_into(&mut acc, &good2, 9);
+        assert_eq!(acc, Some((25, 45)));
+    }
+
+    /// L1 empty-pair proof: a matching tag with an empty pair reads
+    /// EMPTY (absent bounds ⟹ the L2 unknown path, never zeros).
+    #[test]
+    fn l1_empty_pair_reads_empty() {
+        let slot = BoundSlot {
+            seq: 2,
+            tag: 3,
+            pairs: [[0, 0], [0, 0]],
+        };
+        assert_eq!(slot.sealed(3), None);
     }
 }

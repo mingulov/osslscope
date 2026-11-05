@@ -8,9 +8,9 @@ mod scalars;
 pub use classify::{classify_alg_with, classify_trip_with, AlgVerdict, TripTaxonomy, TripVerdict};
 
 pub use records::{
-    AlgClassValue, AlgEvent, CountValue, CtrlValue, GuardEvent, InitRetEvent, PendQuery, RowEvent,
-    ScanAlgEvent, ScanCallEvent, ScanRec, ScanRetEvent, ScanRowEvent, TCacheValue, TripClassValue,
-    TripEvent,
+    AlgClassValue, AlgEvent, BoundSlot, CountValue, CtrlValue, GuardEvent, InitRetEvent, PendQuery,
+    RowEvent, ScanAlgEvent, ScanCallEvent, ScanRec, ScanRetEvent, ScanRowEvent, TCacheValue,
+    TripClassValue, TripEvent,
 };
 pub use scalars::{
     lat_bucket, loss_for_skip_cause, make_bucket, make_call_flags, make_key, make_rcount, make_seq,

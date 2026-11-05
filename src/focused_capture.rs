@@ -1961,6 +1961,12 @@ impl FocusedSession {
     /// 6A cumulative per-index LOSS deltas (session scope,
     /// unlocalized — the coordinator folds these into
     /// `SessionLoss.ring`).
+    /// 6B snapshot access: the live counter (map reads + fold
+    /// views) without consuming anything.
+    pub(crate) fn counter(&self) -> Option<&crate::focused_count::FocusedCounter> {
+        self.counter.as_ref()
+    }
+
     pub(crate) fn session_loss_totals(&self) -> [u64; 8] {
         self.session
             .as_ref()

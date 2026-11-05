@@ -272,11 +272,11 @@ fn actual_focused_object_shape_privacy_and_namespace_guard() {
     let budget = osslscope::provider_observation::ObservationBudget::default();
     let prepared = osslscope::loader::prepare_focused_count(&bytes, &budget).unwrap();
     // The count object carries the 20 borrowed producer maps plus its own
-    // 10 (gate + 7 count + 2 ns), exactly what FOCUSED_COUNT_MAPS
-    // specifies. This 30-map pin repairs a stale test expectation that
-    // asserted 10: the pre-stage object already defined all 30 maps, so
-    // no object growth is claimed here.
-    assert_eq!(prepared.maps.len(), 30);
+    // 13 (gate + 7 count + 2 ns + 3 6B sealed-bound maps: BOUNDS,
+    // EPOCH, EPOCH_CUR per the frozen 6B D-record §11.1), exactly
+    // what FOCUSED_COUNT_MAPS specifies. This 33-map pin updates the
+    // 30-map pin for the D-record-mandated sealed-bound mechanism.
+    assert_eq!(prepared.maps.len(), 33);
     assert_eq!(prepared.progs.len(), 1);
     let helpers: Vec<u32> = prepared.progs[0]
         .insns
