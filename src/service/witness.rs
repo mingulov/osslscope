@@ -447,6 +447,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
         log,
         traced: HashSet::new(),
         pending_initial: HashSet::new(),
+        pending_options: HashSet::new(),
         last_sender: HashMap::new(),
     };
     let explicit: HashSet<i32> = cfg.pids.iter().copied().collect();
@@ -555,6 +556,16 @@ struct Observer {
     /// artifact, never logged — a REAL SIGSTOP to these pids
     /// queues behind it and is handled next).
     pending_initial: HashSet<i32>,
+    /// Clone children whose options are deferred to their first
+    /// stop: a vfork child mid-flight (spawn uses vfork+exec)
+    /// refuses SETOPTIONS with ESRCH until it execs, so the
+    /// fork-event arm options immediately when it can (normal
+    /// fork/clone children are stopped at birth) and defers on
+    /// ANY failure; the SIGSTOP arm then options fail-loud (a
+    /// child in a stop is alive and optionable). The deferral
+    /// window admits no escape in this workload: only curl
+    /// children (which never fork) traverse it.
+    pending_options: HashSet<i32>,
     /// Last observed delivery sender per (tid, signo) (death
     /// attribution for fatal stops).
     last_sender: HashMap<(i32, i32), Option<i32>>,
@@ -680,13 +691,32 @@ impl Observer {
     }
 
     fn handle_wait(&mut self, pid: i32, status: i32) {
+        if !self.traced.contains(&pid) {
+            // Unknown pid from waitpid(-1): only our children and
+            // auto-attached births surface here, so this is an
+            // unprocessed birth whose fork-event still queues
+            // (waitpid returns newest first — the child's
+            // artifact SIGSTOP routinely precedes the parent's
+            // event). Adopt it and handle normally: a first stop
+            // is always the artifact stop (kernel: the auto-stop
+            // precedes any signal delivery), never a delivery.
+            self.traced.insert(pid);
+            self.pending_initial.insert(pid);
+            if self.set_options(pid).is_err() {
+                self.pending_options.insert(pid);
+            }
+        }
         if libc::WIFEXITED(status) {
             self.traced.remove(&pid);
+            self.pending_initial.remove(&pid);
+            self.pending_options.remove(&pid);
             self.append(WitnessKind::Exit, 0, None, pid);
             return;
         }
         if libc::WIFSIGNALED(status) {
             self.traced.remove(&pid);
+            self.pending_initial.remove(&pid);
+            self.pending_options.remove(&pid);
             let signo = libc::WTERMSIG(status);
             let sender = self.last_sender.get(&(pid, signo)).copied().flatten();
             self.append(WitnessKind::Death, signo, sender, pid);
@@ -698,17 +728,33 @@ impl Observer {
         let stopsig = libc::WSTOPSIG(status);
         let event = (status >> 16) & 0xffff;
         if event != 0 {
+            if event == libc::PTRACE_EVENT_VFORK_DONE as i32 {
+                // Vfork completion: the birth was already handled
+                // at the VFORK event; nothing to option.
+                self.cont(pid, 0);
+                return;
+            }
             // Clone/fork/vfork event on the parent: the child is
-            // auto-attached — option it (fail-loud: no task
-            // escapes), then resume the parent.
+            // auto-attached — option it now when possible, else
+            // defer to its first stop (a vfork child mid-flight
+            // refuses ptrace until it execs; the SIGSTOP arm
+            // options fail-loud, so no task escapes silently).
+            // (Re)tried unconditionally: the child may have been
+            // adopted early (first stop beat this event), in which
+            // case this is a free second chance.
             let child = self.event_msg(pid) as i32;
-            if child != 0 {
-                if self.set_options(child).is_err() {
-                    eprintln!("witness: clone child {child} escaped (options failed)");
-                    std::process::exit(3);
+            if child != 0 && !Self::target_dead_or_zombie(child) {
+                if self.traced.insert(child) {
+                    // Fresh birth: expect the artifact stop.
+                    // (Adopted-early children keep their possibly
+                    // already-consumed artifact state.)
+                    self.pending_initial.insert(child);
                 }
-                self.traced.insert(child);
-                self.pending_initial.insert(child);
+                if self.set_options(child).is_ok() {
+                    self.pending_options.remove(&child);
+                } else {
+                    self.pending_options.insert(child);
+                }
             }
             self.cont(pid, 0);
             return;
@@ -720,7 +766,15 @@ impl Observer {
             }
             libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
                 if stopsig == libc::SIGSTOP && self.pending_initial.remove(&pid) {
-                    // Auto-attach artifact: resume silently.
+                    // Auto-attach artifact: arm deferred options
+                    // (fail-loud — a child in a stop is alive and
+                    // optionable), then resume silently.
+                    if self.pending_options.remove(&pid)
+                        && let Err(e) = self.set_options(pid)
+                    {
+                        eprintln!("witness: clone child {pid} escaped (options failed: {e})");
+                        std::process::exit(3);
+                    }
                     self.cont(pid, 0);
                     return;
                 }
@@ -811,13 +865,20 @@ mod tests {
     /// arm fork-following atomically. The first cut called
     /// SETOPTIONS after SEIZE on a still-running target, which
     /// fails ESRCH — startup then "tolerated" a live attach and
-    /// re-enumeration died EPERM. Parent→child ptrace needs no
-    /// privilege (Yama parent exemption); when the sandbox denies
-    /// ptrace outright (seccomp), this pins nothing and returns.
+    /// re-enumeration died EPERM. The child also vfork+execs once
+    /// (the dry curl shape); mid-flight vfork children refuse
+    /// ptrace, which the fork-event arm answers by deferring (not
+    /// dying) — the deferral branch itself is pinned by the qual,
+    /// which traverses it ~172k times (any fail-loud there VOIDs
+    /// the run); forcing the 1–5 ms window deterministically
+    /// in-unit would need pipe-synced handling and is not worth
+    /// its flake risk. Parent→child ptrace needs no privilege
+    /// (Yama parent exemption); when the sandbox denies ptrace
+    /// outright (seccomp), this pins nothing and returns.
     #[test]
     fn seize_live_child_attaches_with_fork_events() {
         // SAFETY: fork; the child touches no Rust state — sleeps,
-        // forks once, sleeps, exits.
+        // forks once, vforks once, sleeps, exits.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
@@ -826,18 +887,35 @@ mod tests {
                 if libc::fork() == 0 {
                     libc::_exit(0);
                 }
+                libc::sleep(2);
+                // SAFETY: vfork+exec of /bin/sleep — the dry curl
+                // shape. The parent's vfork returns at exec, so
+                // the tracer's event handling lands while the
+                // exec'd child RUNS (vfork-exec children take no
+                // auto-stop) and unoptionable — the fork-event arm
+                // must defer, not die. (A bare vfork+_exit would
+                // be zombie by handling time and prove nothing.)
+                if libc::vfork() == 0 {
+                    libc::execl(
+                        c"/bin/sleep".as_ptr(),
+                        c"sleep".as_ptr(),
+                        c"2".as_ptr(),
+                        std::ptr::null::<libc::c_char>(),
+                    );
+                    libc::_exit(127);
+                }
                 libc::sleep(30);
                 libc::_exit(0);
             }
         }
-        let log = std::fs::OpenOptions::new()
-            .write(true)
-            .open("/dev/null")
-            .unwrap();
+        let log_path =
+            std::env::temp_dir().join(format!("witness-seize-{}.log", std::process::id()));
+        let log = std::fs::File::create(&log_path).unwrap();
         let mut obs = Observer {
             log,
             traced: HashSet::new(),
             pending_initial: HashSet::new(),
+            pending_options: HashSet::new(),
             last_sender: HashMap::new(),
         };
         match obs.seize(child) {
@@ -855,14 +933,23 @@ mod tests {
             Err(e) => panic!("seize of live child must succeed: {e}"),
         }
         assert!(obs.traced.contains(&child));
+        // Kernel rule both witness bugs violated: SETOPTIONS on a
+        // RUNNING (never-stopped) tracee fails — options need a
+        // stop, which SEIZE deliberately never sends.
+        assert!(obs.set_options(child).is_err());
         // A second seize proves kernel-level attach (already traced).
         let err = obs.seize(child).expect_err("re-seize must fail EPERM");
         assert_eq!(err.raw_os_error(), Some(libc::EPERM));
         // Drain stops until the child's FORK event lands (options
-        // live from the attach instant — no escape window).
+        // live from the attach instant — no escape window) AND the
+        // later vfork birth/death is processed (survival past it
+        // pins the deferral — the old code exit(3)d here).
         let mut saw_fork = false;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        while !saw_fork && std::time::Instant::now() < deadline {
+        let start = std::time::Instant::now();
+        let deadline = start + std::time::Duration::from_secs(15);
+        while (!saw_fork || start.elapsed() < std::time::Duration::from_secs(8))
+            && std::time::Instant::now() < deadline
+        {
             let mut status = 0;
             // SAFETY: waitpid with a valid status pointer.
             let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
@@ -885,6 +972,28 @@ mod tests {
         }
         drain_reap();
         assert!(saw_fork, "no FORK event within 15 s — options not armed");
+        // End-to-end following: at least one grandchild lifecycle
+        // (birth → tracked → exit observed) must be in the log, and
+        // no birth bookkeeping may leak (both grandchildren reaped
+        // through the Death/Exit arms during the drain).
+        assert!(
+            obs.pending_initial.is_empty() && obs.pending_options.is_empty(),
+            "birth bookkeeping leaked: {:?} {:?}",
+            obs.pending_initial,
+            obs.pending_options
+        );
+        assert_eq!(obs.traced.len(), 1);
+        assert!(obs.traced.contains(&child));
+        drop(obs);
+        let bytes = std::fs::read(&log_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&log_path);
+        let text = String::from_utf8_lossy(&bytes);
+        let child_mark = format!("\"target_pid\":{child}");
+        let followed = text.lines().any(|l| {
+            (l.contains("\"kind\":\"exit\"") || l.contains("\"kind\":\"death\""))
+                && !l.contains(&child_mark)
+        });
+        assert!(followed, "no grandchild exit in log:\n{text}");
     }
 
     /// Reap until no children/tracees remain (or 10 s pass).
