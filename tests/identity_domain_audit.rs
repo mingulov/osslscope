@@ -1541,6 +1541,63 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".and_then(|pins| pins.get(&(key.device, key.inode, key.offset)).copied())",
             1,
         ),
+        // 6B service stream tap: the OPEN tap file's native
+        // (dev, ino) is retained at open; rotation/reconcile paths
+        // re-stat the PATH and compare native-to-native (same-file
+        // proof, §6.1). No encoded evidence device joins this
+        // comparison anywhere; both sides are observer-side fstat.
+        (
+            "src/service/coordinator.rs",
+            "raw",
+            ".map(|m| (m.dev(), m.ino()) == (dev, ino))",
+            1,
+        ),
+        // 6B rotation stat snapshot: native (len, dev, ino) of the
+        // active/rotated tap file for size + identity decisions.
+        // Observer-side fstat only.
+        (
+            "src/service/coordinator.rs",
+            "raw",
+            ".map(|m| (m.len(), m.dev(), m.ino()))",
+            1,
+        ),
+        // 6B rotation record: repeats the retained native tap
+        // identity into the rotation row. No re-read, no join.
+        (
+            "src/service/coordinator.rs",
+            "raw",
+            "dest_dev: tap.ident.dev,",
+            1,
+        ),
+        // 6B rotation unpack: repeats the retained native
+        // (path, dev, ino) triple. No re-read, no join.
+        (
+            "src/service/coordinator.rs",
+            "raw",
+            "let (path, dev, ino) = (rot.rotated.clone(), rot.dev, rot.ino);",
+            1,
+        ),
+        // 6B tap re-stat: fresh native fstat of a tap path for
+        // the same-file proof. Observer-side fstat only.
+        (
+            "src/service/coordinator.rs",
+            "raw",
+            "std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))",
+            1,
+        ),
+        // 6B snapshot rows: evidence-encoded site devices
+        // (admission-encoded once) propagated into merged rows —
+        // the attribution.rs precedent. No native/stat join.
+        ("src/service/snapshot.rs", "stat", "device: site.device,", 1),
+        (
+            "src/service/snapshot.rs",
+            "stat",
+            "push(row.site.object.clone(), row.site.device, row.site.inode);",
+            1,
+        ),
+        // 6B dev_ino helper: native fstat of an open tap FD into
+        // a (dev, ino) tuple. Observer-side fstat only.
+        ("src/service/stream.rs", "raw", "Ok((m.dev(), m.ino()))", 1),
         // Native test harness (cfg(test) module): the observer
         // namespace's native st_dev/inode written as map bytes.
         (
