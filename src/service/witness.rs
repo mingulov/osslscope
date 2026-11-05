@@ -463,7 +463,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
             // children churn constantly) — noted, tolerated. ESRCH
             // on an EXPLICIT pid, or any other errno (EPERM =
             // lost containment), fails loud.
-            let transient_gone = Observer::tolerate_seize_error(&e, explicit.contains(&pid));
+            let transient_gone = Observer::tolerate_seize_error(&e, pid, explicit.contains(&pid));
             if transient_gone {
                 eprintln!("witness: enumerated {pid} already gone (ESRCH)");
             } else {
@@ -499,7 +499,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
                         // Same transient rule as startup: ESRCH on an
                         // enumerated newcomer is a death race, noted;
                         // anything else is a containment failure.
-                        if Observer::tolerate_seize_error(&e, false) {
+                        if Observer::tolerate_seize_error(&e, pid, false) {
                             eprintln!("witness: newcomer {pid} already gone (ESRCH)");
                         } else {
                             eprintln!("witness: newcomer {pid} escaped (seize failed: {e})");
@@ -553,10 +553,30 @@ struct Observer {
 impl Observer {
     /// Seize-failure triage: ESRCH (raw errno 3 — NOT `NotFound`,
     /// which is ENOENT) on an enumerated member is a transient death
-    /// race and tolerated; ESRCH on an explicit pid, or any other
-    /// errno, fails loud.
-    fn tolerate_seize_error(e: &std::io::Error, explicit: bool) -> bool {
-        !explicit && e.raw_os_error() == Some(libc::ESRCH)
+    /// race and tolerated, as is any failure against a target that
+    /// is already dead-or-zombie (cgroup.procs lists unreaped
+    /// zombies, which refuse seizure with EPERM — a zombie can
+    /// receive no signals, so no delivery evidence is at stake).
+    /// ESRCH on an explicit pid, or failure against a LIVE target,
+    /// fails loud.
+    fn tolerate_seize_error(e: &std::io::Error, pid: i32, explicit: bool) -> bool {
+        if explicit {
+            return false;
+        }
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            return true;
+        }
+        Self::target_dead_or_zombie(pid)
+    }
+
+    /// True when `pid` is gone or a zombie (no signals receivable).
+    fn target_dead_or_zombie(pid: i32) -> bool {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return true;
+        };
+        stat.rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().next())
+            .is_none_or(|state| state == "Z")
     }
 
     fn seize(&mut self, pid: i32) -> std::io::Result<()> {
@@ -755,12 +775,16 @@ mod tests {
     #[test]
     fn seize_triage_esrch_enumerated_only() {
         let esrch = std::io::Error::from_raw_os_error(libc::ESRCH);
-        assert!(Observer::tolerate_seize_error(&esrch, false));
-        assert!(!Observer::tolerate_seize_error(&esrch, true));
+        assert!(Observer::tolerate_seize_error(&esrch, 1, false));
+        assert!(!Observer::tolerate_seize_error(&esrch, 1, true));
+        // EPERM against a LIVE target fails loud (init is alive).
         let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
-        assert!(!Observer::tolerate_seize_error(&eperm, false));
+        assert!(!Observer::tolerate_seize_error(&eperm, 1, false));
+        // EPERM against a DEAD target is tolerated (no such pid).
+        assert!(Observer::tolerate_seize_error(&eperm, i32::MAX, false));
+        // ENOENT against a live target fails loud (wrong errno).
         let enoent = std::io::Error::from_raw_os_error(libc::ENOENT);
-        assert!(!Observer::tolerate_seize_error(&enoent, false));
+        assert!(!Observer::tolerate_seize_error(&enoent, 1, false));
     }
 
     fn strict_untouched_passes() {
