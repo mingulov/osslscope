@@ -463,6 +463,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             duration: args.cfg.duration,
             timeout: args.cfg.harvest_timeout,
             grace: args.cfg.grace,
+            parsed_cache: None,
         };
         return Ok(Prepared {
             args,

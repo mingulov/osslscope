@@ -7,6 +7,7 @@ use super::{
     ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, ProcessRecord, Scope,
     ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, backing, elf, resolve,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CString, OsStr};
 use std::fs::{self, File, Metadata, OpenOptions};
@@ -15,6 +16,7 @@ use std::os::fd::{AsRawFd as _, FromRawFd as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Instant;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -229,6 +231,11 @@ type CacheKey = (Fingerprint, Option<u64>);
 pub(super) struct ScanState {
     pub(super) memory: Option<crate::observation_memory::MemoryPool>,
     pub(super) records_memory: Vec<crate::observation_memory::MemoryLease>,
+    /// Run-shared parsed-object cache (F8d restoration): the scan
+    /// prefills export-bearing parses while the pool is idle so
+    /// later sessions under contention hit instead of re-parsing.
+    /// Pure optimization; `None` keeps legacy uncached behavior.
+    pub(super) parsed_cache: Option<Rc<RefCell<crate::provider_observation::objects::ParseCache>>>,
     cache: BTreeMap<CacheKey, Cached>,
     cursor: Option<u32>,
 }
@@ -257,6 +264,12 @@ struct Work<'a> {
     /// retained locator bytes charge here, never the shared
     /// record pools, so the flag cannot change machine records).
     resolve_bytes: usize,
+    /// Run-shared parsed-object cache handle (F8d restoration),
+    /// threaded per snapshot from the persistent scan state.
+    parsed_cache: Option<Rc<RefCell<crate::provider_observation::objects::ParseCache>>>,
+    /// Prefill parses attempted this snapshot (miss-budget: at most
+    /// four files per tick; fresh `Work` per snapshot resets it).
+    prefill_used: usize,
 }
 
 /// Inventory half of ER-5E-I2: backing IO and buffers charge the same read
@@ -431,6 +444,35 @@ impl Work<'_> {
             bytes.extend_from_slice(&chunk[..read]);
         }
     }
+    /// Scan-time prefill (F8d restoration): parse one
+    /// export-bearing file into the run-shared cache while the
+    /// pool is idle (the scan runs before sessions open, so this
+    /// first-sight parse fits where a contended re-parse would
+    /// not). At most four files per snapshot (miss-budget); the
+    /// descriptor reads from offset zero without moving the
+    /// cursor, so this reuses the just-inspected bytes
+    /// (page-cache hot). Best-effort: every failure keeps
+    /// legacy uncached session parses (sessions fall back when
+    /// the cache misses).
+    fn prefill_parsed_cache(
+        &mut self,
+        file: &mut File,
+        _metadata: &Metadata,
+        expected: &ModuleInfo,
+    ) {
+        const MAX_PREFILL_PER_SNAPSHOT: usize = 4;
+        if self.prefill_used >= MAX_PREFILL_PER_SNAPSHOT {
+            return;
+        }
+        let (Some(pool), Some(cache)) = (self.memory.clone(), self.parsed_cache.clone()) else {
+            return;
+        };
+        self.prefill_used += 1;
+        let mut scratch = crate::provider_observation::schema::ObservationBudget::default();
+        scratch.memory = Some(pool);
+        scratch.parsed_cache = Some(cache);
+        let _ = crate::provider_observation::objects::parse_object(file, Some(expected), &scratch);
+    }
     fn inspect(
         &mut self,
         mut file: File,
@@ -481,6 +523,15 @@ impl Work<'_> {
         self.deadline()?;
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
+        }
+        // F8d restoration: prefill the run-shared parsed-object
+        // cache from this first-sight parse while the pool is
+        // idle; sessions under contention then hit the cache
+        // instead of re-parsing the same bytes.
+        if let Ok(info) = &result {
+            if !info.exports.is_empty() {
+                self.prefill_parsed_cache(&mut file, metadata, info);
+            }
         }
         // Current-snapshot attempts are capped by max_objects. Prefer dropping
         // an unseen retained entry before admitting a newly observed object.
@@ -993,6 +1044,8 @@ pub(super) fn snapshot_reused(
         sidecar: resolve::ResolveSidecar::default(),
         resolve_staged: Vec::new(),
         resolve_bytes: 0,
+        parsed_cache: state.parsed_cache.clone(),
+        prefill_used: 0,
     };
     // Keep at most two bounded prefixes while enumerating: the next PIDs
     // above the previous cursor, then wrap. Enumerating itself is deadline
@@ -1194,6 +1247,8 @@ mod tests {
             sidecar: resolve::ResolveSidecar::default(),
             resolve_staged: Vec::new(),
             resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
         };
         let mut state = ScanState::default();
         assert!(sample_order(&options.pids, &mut work, &mut state).is_empty());
@@ -1208,6 +1263,62 @@ mod tests {
                 work.gaps
             );
         }
+    }
+
+    // Scan-time prefill (F8d restoration): the first export-bearing
+    // parse fills the run-shared cache so later sessions under pool
+    // contention hit instead of re-parsing the same bytes.
+    #[test]
+    fn scan_prefills_parsed_cache_for_export_bearing_modules() {
+        let path = [
+            "/usr/lib64/libcrypto.so.3",
+            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+            "/lib64/libcrypto.so.3",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+        let Some(path) = path else {
+            eprintln!("SKIP: no system libcrypto for the prefill test");
+            return;
+        };
+        let mut file = std::fs::File::open(path).unwrap();
+        let metadata = file.metadata().unwrap();
+        let info = elf::inspect_file(&mut file, metadata.len()).unwrap();
+        assert!(
+            !info.exports.is_empty(),
+            "system libcrypto must export OpenSSL APIs"
+        );
+        let pool = crate::observation_memory::MemoryPool::new(256 << 20);
+        let cache = Rc::new(RefCell::new(
+            crate::provider_observation::objects::ParseCache::new(),
+        ));
+        let options = SnapshotOptions {
+            pids: vec![],
+            resolve_paths: false,
+            limits: super::super::Limits::default(),
+        };
+        let mut work = Work {
+            records_memory: Vec::new(),
+            memory: Some(pool),
+            options: &options,
+            include_other: false,
+            started: Instant::now(),
+            totals: WorkTotals::default(),
+            gaps: BTreeSet::new(),
+            cache: BTreeMap::new(),
+            backing_limit: None,
+            sidecar: resolve::ResolveSidecar::default(),
+            resolve_staged: Vec::new(),
+            resolve_bytes: 0,
+            parsed_cache: Some(cache.clone()),
+            prefill_used: 0,
+        };
+        work.prefill_parsed_cache(&mut file, &metadata, &info);
+        assert_eq!(
+            cache.borrow().len(),
+            1,
+            "prefill must cache the export-bearing parse"
+        );
     }
 
     // Catches accepting truncated/overflowing/non-file mappings as identities.
@@ -1248,6 +1359,8 @@ mod tests {
             sidecar: resolve::ResolveSidecar::default(),
             resolve_staged: Vec::new(),
             resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
         };
         for _ in 0..3 {
             assert_eq!(
@@ -1290,6 +1403,8 @@ mod tests {
             sidecar: resolve::ResolveSidecar::default(),
             resolve_staged: Vec::new(),
             resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
         };
         assert_eq!(
             work.inspect(File::open(&path).unwrap(), &metadata, None),
@@ -1313,6 +1428,8 @@ mod tests {
             sidecar: resolve::ResolveSidecar::default(),
             resolve_staged: Vec::new(),
             resolve_bytes: 0,
+            parsed_cache: None,
+            prefill_used: 0,
         };
         assert_eq!(
             fresh.inspect(File::open(&path).unwrap(), &metadata, None),

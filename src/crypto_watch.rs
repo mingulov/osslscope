@@ -1458,6 +1458,10 @@ fn sync_selection(scanner: &mut ScopedScanner, run: &RunState) {
             .filter(|pid| !run.user_pids.contains(pid))
             .collect(),
     );
+    // F8d restoration: re-share the run's parsed-object cache
+    // every tick (cheap handle clone; also re-wires after a
+    // failed-tick scan-state reset).
+    scanner.set_parsed_cache(run.parsed_cache.clone());
 }
 /// 6A port roots: the watched TGIDs (the port additionally
 /// fail-closes on every admitted pid it has ever seen).
@@ -2006,6 +2010,9 @@ struct StashedCtx {
 /// baselines, per-tick flags and end tallies.
 struct RunState {
     active: Vec<Active>,
+    /// Run-shared ELF parse cache (F8d RESTORATION): handed to
+    /// every admitted session so same-file parses happen once.
+    parsed_cache: std::rc::Rc<std::cell::RefCell<crate::provider_observation::objects::ParseCache>>,
     deferred: BTreeMap<DeferredKey, DeferredEntry>,
     /// Followed-but-unclassified pids (event births + stranger
     /// execs): pid → (recorded triple, parent tgid if any, first tick).
@@ -2105,6 +2112,9 @@ impl RunState {
     fn new(user_pids: BTreeSet<u32>, origin_ns: u64, tick_ns: u64) -> Self {
         Self {
             active: Vec::new(),
+            parsed_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::provider_observation::objects::ParseCache::new(),
+            )),
             deferred: BTreeMap::new(),
             follow_pending: BTreeMap::new(),
             pending_epoch: BTreeMap::new(),
@@ -2930,6 +2940,11 @@ impl RunState {
             .min(Duration::from_secs(crate::args::MAX_DURATION_SECS as u64));
         let config = FocusedConfig {
             duration,
+            // F8d RESTORATION: the run's shared parse cache — the
+            // second session clones same-file parses instead of
+            // re-reserving the 22 MiB transient that no longer
+            // fits beside two held session leases.
+            parsed_cache: Some(self.parsed_cache.clone()),
             ..Default::default()
         };
         match FocusedSession::open_scanned_reserved(
@@ -5346,24 +5361,33 @@ mod tests {
     }
     #[test]
     fn parser_refused_honestly_with_two_sessions_live_recovers_after() {
-        // F8d ADJUDICATION (R1 finding 8): the pre-6A envelope
-        // (stock parser + TWO max sessions on one 256 MiB pool) no
-        // longer fits — the 6A sealed-bound maps cost ~1.39 MiB
-        // per session and the pool size is D-bound frozen. The
-        // contended state IS reachable (a periodic rescan parsing
-        // a new large module while two sessions hold leases), so
-        // this pins the HONEST behavior instead of the fit:
-        // refusal (never silent corruption), partial availability
-        // (small modules still parse), and recovery (the parse
-        // fits again once a session ends). Refusal surfaces as a
-        // `ReadLimit` scan gap (loss vocabulary, never silent)
-        // and the member stays deferred-queued with its span
-        // preserved for retry (`deferred_spans_merge_by_union`).
-        // Restoration (re-fitting) needs BPF map right-sizing
-        // with workload key-count evidence — round-2 work. The
-        // stock size IS libcrypto.so.3 (6,386,528 B on the qual
-        // host): with two max sessions ~21.8 MiB is free, so
-        // modules ≤ ~4.7 MiB parse and larger ones refuse.
+        // F8d (R1 finding 8) — pool-arithmetic pin (STILL TRUE):
+        // the pre-6A envelope (stock parser + TWO max sessions on
+        // one 256 MiB pool) no longer fits — the 6A sealed-bound
+        // maps cost ~1.39 MiB per session and the pool size is
+        // D-bound frozen. This pins the HONEST behavior of the
+        // SYNTHETIC contended state: refusal (never silent
+        // corruption), partial availability (small modules still
+        // parse), and recovery (the parse fits again once a
+        // session ends). The stock size IS libcrypto.so.3
+        // (6,386,528 B on the qual host): with two max sessions
+        // ~21.8 MiB is free, so modules ≤ ~4.7 MiB parse and
+        // larger ones refuse.
+        //
+        // F8d RESTORATION (same round): live evidence (vacuous
+        // 2-pid observation — E2E out20 + the §1.4 unit smoke)
+        // proved the contended state is NOT an acceptable
+        // production steady state — the second session parses
+        // the SAME bytes. Production now serves same-file
+        // parses from a run-shared cache
+        // (`provider_observation::objects::ParseCache`, wired via
+        // `RunState.parsed_cache`), so two sessions over one
+        // module never re-reserve the 22 MiB transient. This
+        // test's synthetic exhaustion still refuses (the pool
+        // arithmetic is unchanged); only DISTINCT large files
+        // parsed beside two held leases can refuse now
+        // (vanishingly rare — separate libcrypto builds in one
+        // run). BPF map right-sizing stays round-2 work.
         let pool = MemoryPool::new(GLOBAL_BYTES);
         let _coordinator = pool.reserve(COORDINATOR_BYTES + 32_768).unwrap();
         let _scanner = pool.reserve(4096 * 160 + 100 * 4096).unwrap();

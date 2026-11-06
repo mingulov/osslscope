@@ -169,6 +169,16 @@ impl ScopedScanner {
     pub(crate) fn set_memory_pool(&mut self, memory: crate::observation_memory::MemoryPool) {
         self.scan_state.memory = Some(memory);
     }
+    /// F8d restoration: share the run's parsed-object cache
+    /// with the scan so first-sight export-bearing parses
+    /// prefill it while the pool is idle (mirror of
+    /// `set_memory_pool`).
+    pub(crate) fn set_parsed_cache(
+        &mut self,
+        cache: std::rc::Rc<std::cell::RefCell<crate::provider_observation::objects::ParseCache>>,
+    ) {
+        self.scan_state.parsed_cache = Some(cache);
+    }
     /// 6A membership following: replace the FOLLOWED pid set (live
     /// members ∪ deferred ∪ followed-but-unclassified,
     /// coordinator-owned, sorted). The original discovery scope
@@ -376,8 +386,10 @@ impl ScopedScanner {
         // A wholly unavailable sampling pass observed no reusable objects.
         // Keep pinned selectors, but release obsolete sampled descriptors.
         let memory = self.scan_state.memory.take();
+        let parsed_cache = self.scan_state.parsed_cache.take();
         self.scan_state = procfs::ScanState::default();
         self.scan_state.memory = memory;
+        self.scan_state.parsed_cache = parsed_cache;
         let mut result = procfs::snapshot_selected(
             &SnapshotOptions {
                 pids: vec![],

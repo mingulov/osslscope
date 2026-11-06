@@ -119,7 +119,7 @@ impl BudgetAdapter<'_> {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Stamp {
     native: u64,
     inode: u64,
@@ -146,19 +146,66 @@ impl Stamp {
         }
     }
 }
+/// Distinct file versions retained by one run-shared parse cache
+/// (system libcrypto + libssl + a margin for container/namespace
+/// layers; past the cap parses run uncached — see [`parse_object`]).
+pub(crate) const MAX_CACHED_PARSES: usize = 16;
+/// Run-shared ELF parse cache (F8d RESTORATION): two max
+/// sessions plus a stock-module parse no longer fits the
+/// D-frozen pool — but sessions of one run parse the SAME bytes.
+/// The first parse fills; later sessions clone the offsets
+/// without a second 22 MiB transient. Keyed by [`Stamp`]
+/// (dev, inode, size, mode, links, mtime, ctime): a changed file
+/// never matches a stale entry (inert garbage bounded by the
+/// cap), and every use still runs the caller's `unchanged()`
+/// revalidation. The cache is a pure optimization: any lookup
+/// or fill failure falls back to the uncached parse (today's
+/// behavior), never to an error. One instance per engine run,
+/// shared across that run's sessions via the admission config.
+pub(crate) struct ParseCache {
+    map: std::collections::HashMap<Stamp, Rc<ElfObject>>,
+}
+impl std::fmt::Debug for ParseCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ParseCache")
+            .field("len", &self.map.len())
+            .finish()
+    }
+}
+impl ParseCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.map.len()
+    }
+    fn lookup(&self, key: &Stamp) -> Option<ElfObject> {
+        self.map.get(key).map(|cached| cached.as_ref().clone())
+    }
+    fn fill(&mut self, key: Stamp, object: &ElfObject) {
+        if self.map.len() < MAX_CACHED_PARSES {
+            self.map.insert(key, Rc::new(object.clone()));
+        }
+    }
+}
 struct Mapping {
     start: u64,
     end: u64,
     offset: u64,
     inode: u64,
 }
+#[derive(Clone)]
 struct Segment {
     writable: bool,
     offset: u64,
     address: u64,
     size: u64,
 }
-struct ElfObject {
+#[derive(Clone)]
+pub(crate) struct ElfObject {
     hash: ObjectHash,
     segments: Vec<Segment>,
     exports: Vec<(ObservationApi, u64)>,
@@ -173,7 +220,7 @@ struct ElfObject {
 // Internal retry classification: shared capacity is not part of a retained
 // file fingerprint. Public diagnostics keep their existing finite gap labels.
 #[derive(Debug)]
-enum ParseError {
+pub(crate) enum ParseError {
     Gap(ObservationGap),
     SharedCapacity(ObservationGap),
 }
@@ -1974,7 +2021,7 @@ pub fn inspect_expected_exports(
         .map(|(api, _)| api)
         .collect())
 }
-fn parse_object(
+pub(crate) fn parse_object(
     file: &mut File,
     expected: Option<&ModuleInfo>,
     budget: &ObservationBudget,
@@ -1990,6 +2037,20 @@ fn parse_object(
         e.device != before.dev() || e.inode != before.ino() || e.size_bytes != before.len()
     }) {
         return Err(ObservationGap::ObjectChanged.into());
+    }
+    // Run-shared cache (F8d RESTORATION): a hit clones the offsets
+    // without the 22 MiB transient below, so the second session's
+    // same-file parse fits a contended pool. The state charge
+    // above (deadline + clone accounting) is kept on hits; no IO
+    // is performed, so no read charge accrues. Any lookup failure
+    // falls through to the uncached parse (never an error).
+    if let Some(cache) = budget.parsed_cache.as_ref() {
+        let key = Stamp::of(&before);
+        let hit = cache.try_borrow().ok().and_then(|map| map.lookup(&key));
+        if let Some(object) = hit {
+            reservation.retain();
+            return Ok(object);
+        }
     }
     // Reserve both non-overlapping phase needs before committing any IO work.
     // Export headroom can refuse even when inventory scratch fits; acquiring it
@@ -2043,6 +2104,14 @@ fn parse_object(
     if Stamp::of(&before) != Stamp::of(&file.metadata().map_err(|_| ObservationGap::ObjectChanged)?)
     {
         return Err(ObservationGap::ObjectChanged.into());
+    }
+    // Fill the run-shared cache (best-effort, cap-gated inside;
+    // never fails the parse). Keyed by the pre-parse stamp — the
+    // check above proves the bytes parsed are these bytes.
+    if let Some(cache) = budget.parsed_cache.as_ref() {
+        if let Ok(mut map) = cache.try_borrow_mut() {
+            map.fill(Stamp::of(&before), &result);
+        }
     }
     reservation.retain();
     Ok(result)
@@ -3030,6 +3099,94 @@ mod tests {
         );
         sleep.kill().unwrap();
         sleep.wait().unwrap();
+    }
+    #[test]
+    fn parse_cache_serves_second_parse_under_contention() {
+        // F8d RESTORATION (R1 finding 8): two max sessions plus a
+        // stock-module parse no longer fits the D-frozen pool (the
+        // weakened BASE test proves the arithmetic) — but the
+        // second session parses the SAME bytes. A run-shared parse
+        // cache serves it without a second 22 MiB transient: the
+        // first parse fills, and a contended pool then refuses
+        // only DISTINCT files.
+        let dir = std::env::temp_dir();
+        let tag = std::process::id();
+        let a = dir.join(format!("osslscope-parse-cache-a-{tag}"));
+        let b = dir.join(format!("osslscope-parse-cache-b-{tag}"));
+        std::fs::copy("/bin/true", &a).unwrap();
+        std::fs::copy("/bin/true", &b).unwrap();
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(ParseCache::new()));
+        let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+        // First parse fills the cache (room available).
+        {
+            let mut budget = ObservationBudget::default();
+            budget.memory = Some(pool.clone());
+            budget.parsed_cache = Some(cache.clone());
+            let mut file = File::open(&a).unwrap();
+            parse_object(&mut file, None, &budget).expect("first parse fills");
+        }
+        // Contend the pool: only the cached path can still serve.
+        let _busy = pool.reserve((64 << 20) - 1).unwrap();
+        {
+            let mut budget = ObservationBudget::default();
+            budget.memory = Some(pool.clone());
+            budget.parsed_cache = Some(cache.clone());
+            let mut file = File::open(&a).unwrap();
+            parse_object(&mut file, None, &budget).expect("cached parse serves under contention");
+            let mut other = File::open(&b).unwrap();
+            assert!(
+                matches!(
+                    parse_object(&mut other, None, &budget),
+                    Err(ParseError::SharedCapacity(_))
+                ),
+                "distinct file still refuses honestly under contention"
+            );
+        }
+        std::fs::remove_file(a).unwrap();
+        std::fs::remove_file(b).unwrap();
+    }
+    #[test]
+    fn parse_cache_cap_bypasses_honestly_without_poisoning() {
+        // The cache is bounded (never an unbounded stash of stale
+        // file versions): past the cap, parses run uncached —
+        // succeeding with room, refusing honestly under
+        // contention — while cached entries keep serving.
+        let dir = std::env::temp_dir();
+        let tag = std::process::id();
+        let mut paths = Vec::new();
+        for i in 0..(MAX_CACHED_PARSES + 1) {
+            let path = dir.join(format!("osslscope-parse-cache-cap-{tag}-{i}"));
+            std::fs::copy("/bin/true", &path).unwrap();
+            paths.push(path);
+        }
+        let cache = std::rc::Rc::new(std::cell::RefCell::new(ParseCache::new()));
+        let pool = crate::observation_memory::MemoryPool::new(64 << 20);
+        for path in &paths {
+            let mut budget = ObservationBudget::default();
+            budget.memory = Some(pool.clone());
+            budget.parsed_cache = Some(cache.clone());
+            let mut file = File::open(path).unwrap();
+            parse_object(&mut file, None, &budget).expect("fills with room");
+        }
+        assert_eq!(cache.borrow().len(), MAX_CACHED_PARSES);
+        // Contend the pool: a cached entry serves, the over-cap
+        // entry refuses honestly (never cached, never poisoned).
+        let _busy = pool.reserve((64 << 20) - 1).unwrap();
+        {
+            let mut budget = ObservationBudget::default();
+            budget.memory = Some(pool.clone());
+            budget.parsed_cache = Some(cache.clone());
+            let mut file = File::open(&paths[0]).unwrap();
+            parse_object(&mut file, None, &budget).expect("cached entry serves");
+            let mut other = File::open(paths.last().unwrap()).unwrap();
+            assert!(matches!(
+                parse_object(&mut other, None, &budget),
+                Err(ParseError::SharedCapacity(_))
+            ));
+        }
+        for path in paths {
+            std::fs::remove_file(path).unwrap();
+        }
     }
 }
 

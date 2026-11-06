@@ -34,11 +34,15 @@ use std::{
 const POLL: Duration = Duration::from_millis(100);
 const DRAIN: Duration = Duration::from_millis(25);
 const RESCAN: Duration = Duration::from_secs(1);
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct FocusedConfig {
     pub duration: Duration,
     pub timeout: Duration,
     pub grace: Duration,
+    /// Run-shared ELF parse cache handle (F8d RESTORATION; `None`
+    /// parses uncached). Clone shares the run's cache.
+    pub(crate) parsed_cache:
+        Option<std::rc::Rc<std::cell::RefCell<crate::provider_observation::objects::ParseCache>>>,
 }
 impl Default for FocusedConfig {
     fn default() -> Self {
@@ -46,6 +50,7 @@ impl Default for FocusedConfig {
             duration: Duration::from_secs(30),
             timeout: Duration::from_secs(60),
             grace: Duration::from_secs(5),
+            parsed_cache: None,
         }
     }
 }
@@ -921,6 +926,7 @@ impl FocusedSession {
             ..Default::default()
         });
         budget.memory = Some(pool.clone());
+        budget.parsed_cache = config.parsed_cache.clone();
         budget.set_deadline(setup_deadline);
         if <[u8; 32]>::from(Sha256::digest(&objects.count)) != objects.count_sha256 {
             bail!("focused count object identity mismatch");
@@ -1029,6 +1035,11 @@ impl FocusedSession {
         )
         .map_err(|_| TargetUnavailable)?;
         scanner.set_memory_pool(pool);
+        // F8d restoration: the per-target rescan prefills the
+        // same run-shared cache the session below parses from.
+        if let Some(cache) = &budget.parsed_cache {
+            scanner.set_parsed_cache(cache.clone());
+        }
         let mut gaps = BTreeSet::new();
         let gate = if objects.observation.is_empty() && objects.count.is_empty() {
             None
@@ -2390,6 +2401,7 @@ pub fn run(
     config.validate()?;
     let signals = Signals::install().context("focused signal setup failed")?;
     let cancel = signals.cancel();
+    let grace = config.grace;
     let mut session = FocusedSession::open(config, target, objects, setup_deadline, cancel, None)?;
     loop {
         let now = Instant::now();
@@ -2402,7 +2414,7 @@ pub fn run(
                 .saturating_duration_since(Instant::now()),
         );
     }
-    session.finish(Instant::now() + config.grace)
+    session.finish(Instant::now() + grace)
 }
 
 #[cfg(test)]
@@ -3383,14 +3395,21 @@ mod session_tests {
         assert!(session.gaps.contains(&ObservationGap::ProcessChanged));
     }
     #[test]
-    fn session_reservation_precedes_open_and_shares_parser_headroom() {
+    fn session_reservation_precedes_open_and_contended_parse_needs_cache() {
         // Session-like companions for the reservation: a session's
         // counter borrows maps, so the estimate skips the shared set.
         // (The `open_reserved` below still runs standalone companions.)
+        // F8d RESTORATION: the estimate MUST use production object
+        // sizes (1 KiB fakes understated two sessions by 776 KiB and
+        // asserted a fit production never had — the vacuous 2-pid
+        // observation). Lengths only (content-independent); update
+        // when the built BPF objects change size.
+        const PRODUCTION_OBSERVATION_LEN: usize = 218_504;
+        const PRODUCTION_COUNT_LEN: usize = 171_912;
         let estimate = FocusedObjects {
-            observation: Arc::from([0u8; 1024]),
-            count: Arc::from([0u8; 1024]),
-            count_sha256: Sha256::digest([0u8; 1024]).into(),
+            observation: Arc::from(vec![0u8; PRODUCTION_OBSERVATION_LEN]),
+            count: Arc::from(vec![0u8; PRODUCTION_COUNT_LEN]),
+            count_sha256: Sha256::digest(vec![0u8; PRODUCTION_COUNT_LEN]).into(),
         };
         let objects = objects();
         let bytes = FocusedSession::reservation_bytes(&estimate).unwrap();
@@ -3398,14 +3417,22 @@ mod session_tests {
         let pool = crate::observation_memory::MemoryPool::new(256 << 20);
         let one = pool.reserve(bytes).unwrap();
         let two = pool.reserve(bytes).unwrap();
-        let stock = pool
-            .reserve(crate::inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
-            .unwrap();
+        // After two sessions retain their reservations, a FRESH
+        // libcrypto parse no longer fits: this is the live
+        // contention that starved the second session's parse.
+        // The scan prefills the run-shared cache while the pool
+        // is idle, so live sessions hit the cache (no scratch)
+        // instead of re-parsing; assert the contention honestly
+        // here (the old `.unwrap()` asserted a fit production
+        // never had).
+        assert!(
+            pool.reserve(crate::inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
+                .is_none()
+        );
         assert!(
             pool.reserve(crate::inventory::elf::parser_scratch_bytes(128 << 20).unwrap())
                 .is_none()
         );
-        drop(stock);
         drop(two);
         drop(one);
         let expected = record();

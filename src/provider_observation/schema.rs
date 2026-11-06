@@ -168,6 +168,11 @@ pub struct ObservationBudget {
     work: Rc<RefCell<Work>>,
     deadline: Rc<Cell<Option<std::time::Instant>>>,
     pub(crate) memory: Option<crate::observation_memory::MemoryPool>,
+    /// Run-shared ELF parse cache (F8d RESTORATION): sessions of
+    /// one run clone same-file parses instead of re-reserving the
+    /// 22 MiB transient. `None` parses uncached (today's
+    /// behavior); clones share the handle like the work ledger.
+    pub(crate) parsed_cache: Option<std::rc::Rc<std::cell::RefCell<super::objects::ParseCache>>>,
     /// Shaped backing-refusal strings recorded during acquisition (R06
     /// vocabulary, caller-rendered). Shared across budget clones like
     /// the work ledger; the session drains it once per reconcile so a
@@ -188,6 +193,7 @@ impl ObservationBudget {
             work: Rc::default(),
             deadline: Rc::default(),
             memory: None,
+            parsed_cache: None,
             refusals: Rc::default(),
         }
     }
