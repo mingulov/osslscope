@@ -259,10 +259,13 @@ impl StreamQueue {
     /// covered or not). Each span with uncovered growth appends
     /// its delta (an unchanged span needs no entry — any newer
     /// delivery re-proves its old deltas, §5.2). Overflow thins
-    /// the SECOND-newest delta (the oldest — likeliest to deliver
-    /// — and the newest — the pending frontier — stay exact; a
-    /// thinned delta's later delivery under-subtracts, which
-    /// over-retains explicitly in the span — never quiet loss).
+    /// the SECOND-newest delta into the pending frontier (R2 Gate
+    /// 4b): the oldest — likeliest to deliver — stays exact, and
+    /// the merged frontier stays exact for its own + newer
+    /// deliveries (cumulative markers prove older growth, so
+    /// forward-merging preserves Σdeltas and cumulative clears
+    /// stay exact); only the thinned marker's own future delivery
+    /// over-retains (explicit, never quiet loss).
     /// Zero-record uncovered spans sweep here (struck-empty —
     /// their bytes already recovered).
     pub fn mark_all(&mut self, marker: u64) {
@@ -280,7 +283,20 @@ impl StreamQueue {
             }
             if span.covering.len() >= COVERAGE_CAP {
                 let thin = span.covering.len() - 2;
-                span.covering.remove(thin);
+                let removed = span.covering.remove(thin);
+                // Forward-merge (R2 Gate 4b): the frontier (newest
+                // before push) proves the thinned growth (cumulative),
+                // so its claim absorbs it exactly. Newest clears stay
+                // exact; only the thinned marker's own delivery
+                // over-retains (safe direction).
+                if let Some(frontier) = span.covering.last_mut() {
+                    frontier.records = frontier.records.saturating_add(removed.records);
+                    frontier.bytes = frontier.bytes.saturating_add(removed.bytes);
+                    frontier.folds = frontier
+                        .folds
+                        .saturating_add(removed.folds)
+                        .min(frontier.records.saturating_sub(1));
+                }
             }
             span.covering.push(SpanCoverage {
                 marker,
@@ -330,7 +346,13 @@ impl StreamQueue {
 
     /// Strike a landed record OUT of the folded spans (gross totals
     /// stay; §7.2 gross/net split). Strikes newest-first within the
-    /// named cause; returns the struck (records, bytes).
+    /// named cause; returns the struck (records, bytes). R2 Gate 4a:
+    /// the strike also shrinks the covering delta that proves the
+    /// struck seq (oldest delta with `marker ≥ seq` — the first
+    /// marker emitted after the fold), preserving
+    /// `growth = records − Σdeltas` so old-marker acks never erase
+    /// newer-only drops. Uncovered strikes (no eligible delta)
+    /// shrink the span alone (exact: no claim to adjust).
     pub fn strike(&mut self, seq: u64, bytes: u64, reason: DropReason) -> (u64, u64) {
         // Find the newest span of this cause covering seq.
         let mut struck_records = 0u64;
@@ -350,6 +372,18 @@ impl StreamQueue {
             span.records -= 1;
             span.bytes = span.bytes.saturating_sub(bytes);
             span.folds = span.folds.saturating_sub(1);
+            // Shrink the proving delta (R2 Gate 4a): the struck
+            // record leaves its coverage claim with it, so the old
+            // claim never erases newer growth at delivery.
+            if let Some(c) = span
+                .covering
+                .iter_mut()
+                .find(|c| c.marker >= seq && c.records > 0)
+            {
+                c.records -= 1;
+                c.bytes = c.bytes.saturating_sub(bytes);
+                c.folds = c.folds.saturating_sub(1).min(c.records.saturating_sub(1));
+            }
             struck_records = 1;
             struck_bytes = bytes;
             break;
@@ -545,5 +579,49 @@ mod tests {
         let spans = q.spans();
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].records, 2);
+    }
+
+    /// R2 Gate 4a (F6): recovery must update coverage deltas, not
+    /// just span totals — an old-marker ack after `strike` + new
+    /// `fold` must not erase the new drop. Adopted from the R2
+    /// linked queue probe.
+    #[test]
+    fn recovered_old_drop_must_not_erase_new_drop() {
+        use crate::service::envelope::DropReason::QueueFull;
+        let mut q = StreamQueue::new(65536, 64);
+        q.fold(1, 10, QueueFull);
+        q.mark_all(1);
+        assert_eq!(q.strike(1, 10, QueueFull), (1, 10));
+        q.fold(2, 20, QueueFull);
+        assert!(
+            q.has_pending_spans(),
+            "new uncovered drop must stay pending"
+        );
+        q.clear_marker(1);
+        assert_eq!(
+            q.spans().iter().map(|s| s.records).sum::<u64>(),
+            1,
+            "new drop must remain"
+        );
+    }
+
+    /// R2 Gate 4b (F6): cumulative markers must clear everything
+    /// they prove, even after coverage thinning — 70 `fold→mark`
+    /// + `clear(70)` must leave nothing. Adopted from the R2 linked
+    /// queue probe.
+    #[test]
+    fn newest_cumulative_marker_must_clear_all_after_thinning() {
+        use crate::service::envelope::DropReason::QueueFull;
+        let mut q = StreamQueue::new(65536, 64);
+        for seq in 1..=70 {
+            q.fold(seq, 41, QueueFull);
+            q.mark_all(seq);
+        }
+        q.clear_marker(70);
+        assert!(
+            q.spans().is_empty(),
+            "all 70 drops were proven by marker 70, got {:?}",
+            q.spans()
+        );
     }
 }
