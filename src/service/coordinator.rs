@@ -2106,12 +2106,25 @@ fn close_common_body(
     }
     let close_segments: std::collections::BTreeSet<u64> =
         close.members.iter().map(|m| m.segment).collect();
+    // Sealed map (R2 Gate 3): spilled seals read on workers under
+    // the ONE close deadline with WaitPoll signal consumption —
+    // never coordinator-direct. Staged values never touch the FS.
+    let sealed = {
+        let cycle = run.cycle.as_ref().expect("window open at close");
+        let deadline = run.close_deadline;
+        let fallback = boundary_budget(run.cfg.timeout);
+        let poll = run_wait_poll!(run);
+        sealed_map(
+            &cycle.staging.staged,
+            &cycle.staging.spilled,
+            &close_segments,
+            deadline,
+            fallback,
+            &run.cancel,
+            Some(&poll),
+        )
+    };
     let cycle = run.cycle.as_ref().expect("window open at close");
-    let sealed = sealed_map(
-        &cycle.staging.staged,
-        &cycle.staging.spilled,
-        &close_segments,
-    );
     let open_tick = tick_of(cycle.effective_start_ns, run.origin_ns, run.tick_ns);
     let close_tick = tick_of(effective_end_ns, run.origin_ns, run.tick_ns);
     let policy_rules = match run.policy.active_rules.as_ref() {

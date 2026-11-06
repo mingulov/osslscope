@@ -905,16 +905,37 @@ fn seal_of(v: &serde_json::Value) -> Option<(u64, SealedRetirement)> {
     ))
 }
 
+/// Parse one spilled seal's bytes (`None` ⟺ malformed —
+/// the record still rides `crypto_watch[]` verbatim; only seal
+/// consumption skips). Every spilled-seal parse flows through here
+/// (twin-audited: the worker readers below never parse inline).
+pub(crate) fn parse_seal_bytes(bytes: &[u8]) -> Option<(u64, SealedRetirement)> {
+    let v: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    seal_of(&v)
+}
+
 /// Extract retirement seals from staged AND spilled values
 /// (`ProcessObservation` records → `(segment, seal)`), filtered to
 /// close-absent segments (retired ⟺ absent from close — a sealed
 /// doc for a close-present member is a drain-order artifact whose
 /// counts the still-open path already carries; its doc still rides
 /// `crypto_watch[]` verbatim).
+///
+/// R2 Gate 3: spilled seals read on OwnTmp workers under the SINGLE
+/// close deadline (`deadline` — remainder recomputed before EVERY
+/// read, same discipline as Gate 2's spill writes; `fallback` is
+/// the per-read budget when no deadline is set, e.g. mid-closes and
+/// unit tests) with WaitPoll signal consumption. Expired/cancelled/
+/// unreadable seals skip — the close meets its deadline despite
+/// stalls. Staged values never touch the filesystem.
 pub(crate) fn sealed_map(
     staged: &[crate::service::staging::StagedRecord],
     spilled: &[crate::service::staging::SpilledRecord],
     close_segments: &BTreeSet<u64>,
+    deadline: Option<std::time::Instant>,
+    fallback: std::time::Duration,
+    cancel: &std::sync::atomic::AtomicBool,
+    poll: Option<&crate::service::worker::WaitPoll>,
 ) -> HashMap<u64, SealedRetirement> {
     let mut out = HashMap::new();
     for r in staged {
@@ -940,18 +961,43 @@ pub(crate) fn sealed_map(
         if close_segments.contains(&seg_hint) {
             continue;
         }
-        let Ok(bytes) = std::fs::read(&r.tmp) else {
-            continue;
+        // Remainder of the ONE deadline before EVERY read (Gate 2
+        // discipline); a stalled FIFO expires instead of blocking.
+        let budget = deadline
+            .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+            .unwrap_or(fallback);
+        let bytes = {
+            use crate::service::worker::{
+                Control, DestClass, Destination, WorkerOut, run_under_control,
+            };
+            let dest = Destination {
+                class: DestClass::OwnTmp,
+                key: format!(
+                    "seal-{}-{}",
+                    seg_hint,
+                    crate::service::state::next_op_nonce()
+                ),
+            };
+            let tmp = r.tmp.clone();
+            let ctrl: Control<std::io::Result<Vec<u8>>> = run_under_control(
+                dest,
+                budget,
+                cancel,
+                move |_gate| WorkerOut::value(std::fs::read(&tmp)),
+                poll,
+            );
+            match ctrl {
+                Control::Done(Ok(b)) => b,
+                _ => continue,
+            }
         };
-        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
-        drop(bytes);
-        let Ok(v) = parsed else {
-            continue;
-        };
-        if let Some((seg, seal)) = seal_of(&v) {
+        if let Some((seg, seal)) = parse_seal_bytes(&bytes) {
             if !close_segments.contains(&seg) {
                 out.entry(seg).or_insert(seal);
             }
+        }
+        if poll.is_some_and(|p| p.doubled()) {
+            break;
         }
     }
     out
@@ -1349,7 +1395,16 @@ mod tests {
             content_sha,
         }];
         let close_segments = BTreeSet::new();
-        let m = sealed_map(&[], &spilled, &close_segments);
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let m = sealed_map(
+            &[],
+            &spilled,
+            &close_segments,
+            None,
+            std::time::Duration::from_secs(5),
+            &cancel,
+            None,
+        );
         assert_eq!(m.len(), 1, "spilled seal consumed");
         let s = &m[&7];
         assert_eq!((s.pid, s.starttime, s.image_epoch), (9, 100, 3));
@@ -1673,5 +1728,79 @@ mod tests {
             .find(|g| g.name == "snapshot_unstable")
             .unwrap();
         assert!(counter.forces_partial());
+    }
+
+    /// R2 Gate 3 (F3): stalled spilled-seal reads must not block
+    /// the coordinator — `sealed_map` meets its deadline despite a
+    /// FIFO stall. Adopted from the R2 seal-read probe (stalled-read
+    /// injection): a FIFO spill must not stall past the deadline.
+    #[test]
+    fn sealed_map_stalled_spill_meets_deadline() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "t74-gate3-seal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("stalled-spill");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let r = crate::service::staging::SpilledRecord {
+            tmp: fifo.clone(),
+            bytes: 1,
+            tick: 0,
+            valid: true,
+            seal_segment: Some(1),
+            content_sha: [0; 32],
+        };
+        let t0 = std::time::Instant::now();
+        let h = std::thread::spawn(move || {
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            sealed_map(
+                &[],
+                &[r],
+                &BTreeSet::new(),
+                Some(deadline),
+                std::time::Duration::from_secs(5),
+                &cancel,
+                None,
+            )
+        });
+        // The fixed map returns within its deadline (hundreds of ms
+        // at most); the pre-fix map blocks until the FIFO writer
+        // arrives. Poll up to 2 s, then unblock + fail loud.
+        let mut finished = false;
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if h.is_finished() {
+                finished = true;
+                break;
+            }
+        }
+        if !finished {
+            // Unblock the stalled reader so the thread can join
+            // (RED path — the assert below fails).
+            let mut f = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            f.write_all(b"{}\n").unwrap();
+            drop(f);
+        }
+        let _ = h.join();
+        let dt = t0.elapsed();
+        eprintln!("sealed_map stalled-spill: finished={finished} dt={dt:?}");
+        assert!(
+            finished,
+            "sealed_map must meet its deadline despite a stalled spill (blocked {dt:?})"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
