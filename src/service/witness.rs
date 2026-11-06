@@ -8,10 +8,19 @@
 //! every signal-delivery stop plus `PTRACE_GETSIGINFO`
 //! (`si_pid` — the kernel-reported sender, never inferred). The
 //! observer self-reports its OWN sends (generation attempts,
-//! independent of delivery — a blocked/ignored/dead-target send has
-//! no delivery stop but the attempt is real). No BPF, no loader
-//! changes, no workload modification (no handlers/wrappers installed
-//! in workload processes; dispositions snapshotted before/after).
+//! independent of delivery — a blocked-forever or dead-target send
+//! has no delivery stop but the attempt is real; ignored signals DO
+//! stop under ptrace, pinned below). F8c: self-report
+//! alone is INSUFFICIENT evidence (R1) — a second, independent
+//! channel, the attempt tracer, supervises each suspect process
+//! under a seccomp `RET_TRACE` filter on the kill family, so the
+//! KERNEL stops the suspect at every signal-generation syscall and
+//! reports (sender, target, signo, result) to the tracer. The
+//! oracle corroborates self-reports against the attempt log and
+//! FAILs on kernel-proven suspect sends even when the witness log
+//! is empty. No BPF, no loader changes, no workload modification
+//! (no handlers/wrappers installed in workload processes;
+//! dispositions snapshotted before/after).
 //!
 //! Log: `signal-witness.jsonl`, one entry per observed delivery
 //! (`{ at_ns, signo, sender_pid, target_pid }`, D-record shape) plus
@@ -54,6 +63,37 @@ pub struct WitnessEntry {
     #[serde(default)]
     pub uncertain: bool,
     pub kind: WitnessKind,
+}
+
+/// One `attempt-witness.jsonl` entry (F8c): a kernel-traced
+/// signal-generation syscall by a suspect process. Written by the
+/// attempt tracer — a process that is neither the suspect nor the
+/// delivery observer — at the kernel's `PTRACE_EVENT_SECCOMP` stop,
+/// with the result captured at the syscall-exit stop. The suspect
+/// runs no userspace code between the syscall and the stop, so it
+/// can neither suppress nor forge the entry (it can only avoid
+/// sending).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AttemptRecord {
+    /// Tracer `CLOCK_MONOTONIC` at the seccomp-entry stop.
+    pub at_ns: u64,
+    /// Sending thread (waitpid-reported tid of the suspect task).
+    pub sender_pid: i32,
+    /// `/proc/<tid>/comm` at the stop (`?` when unreadable).
+    pub sender_comm: String,
+    /// Decoded syscall name (`kill`, `tkill`, `tgkill`,
+    /// `rt_sigqueueinfo`, `rt_tgsigqueueinfo`, `pidfd_send_signal`).
+    pub syscall: String,
+    /// Raw `__NR` (the filter already gates to x86-64).
+    pub syscall_nr: i64,
+    /// Decoded target: pid/tid, or `None` for pidfd sends the
+    /// tracer could not resolve and out-of-range garbage.
+    pub target_pid: Option<i32>,
+    /// Requested signo (0 = existence probe — generates nothing).
+    pub signo: i32,
+    /// Raw syscall return (negative errno), or `None` when the
+    /// sender died mid-syscall before the exit stop.
+    pub result: Option<i64>,
 }
 
 /// One harness-logged send (the harness logs every signal IT sends:
@@ -144,6 +184,9 @@ pub struct OracleInput<'a> {
     pub workload: &'a HashSet<i32>,
     /// Canary pids (positive + null controls).
     pub canary: &'a HashSet<i32>,
+    /// Kernel-traced generation attempts (F8c independent
+    /// channel; empty when the run did not attempt-trace).
+    pub attempts: &'a [AttemptRecord],
     /// Quiet-canary window `[start_ns, end_ns]` (null control: MUST
     /// log nothing for the canary).
     pub quiet_window: (u64, u64),
@@ -175,6 +218,13 @@ pub struct ExternalEvent {
 /// as observed; uncertainty flags the possibly-masked sender — the
 /// oracle NEVER attributes a coalesced repeat to the most recent
 /// generate.
+///
+/// F8c: traced attempts join the send count (proven sends —
+/// successful or unknown result only; a negative result proves the
+/// kernel queued nothing, so failed sends are not pending), and
+/// kernel-traced suspect sends FAIL even with an empty witness log
+/// (rule 1b), while self-reported attempts require traced
+/// corroboration (rule 2b — uncorroborated self-report VOIDs).
 pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
     // Annotate uncertainty first (oracle-owned; the log stays raw).
     let mut entries = input.witness.to_vec();
@@ -220,6 +270,22 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
                                 a.kind == WitnessKind::Attempt
                                     && a.target_pid == e.target_pid
                                     && a.signo == e.signo
+                                    && a.at_ns > floor
+                                    && a.at_ns <= e.at_ns
+                            })
+                            .count()
+                        + input
+                            .attempts
+                            .iter()
+                            .filter(|a| {
+                                // F8c: proven traced sends join the
+                                // count (failed sends queued nothing
+                                // and are not pending; signo 0
+                                // generates nothing).
+                                a.target_pid == Some(e.target_pid)
+                                    && a.signo == e.signo
+                                    && a.signo != 0
+                                    && a.result.is_none_or(|r| r >= 0)
                                     && a.at_ns > floor
                                     && a.at_ns <= e.at_ns
                             })
@@ -271,10 +337,102 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
         }
     }
 
-    // 2. The observer/service is a suspect, never background: ANY
-    // entry with sender == observer/service pid is FAIL (L5 positive
-    // controls prove this fires).
+    // 1b. F8c independent attempt evidence: kernel-traced suspect
+    // sends FAIL even with an EMPTY witness log (a blocked-forever
+    // or dead-target send has no delivery stop — this rule is the
+    // L5 no-stop detector). The result is diagnostic, never
+    // exculpatory: a
+    // correct observer/service never calls kill on workload pids
+    // (even ESRCH attempts FAIL). Signo 0 generates nothing
+    // (existence probes — the observer heartbeat) and is ignored.
+    for a in input.attempts.iter().filter(|a| a.signo != 0) {
+        let suspect =
+            a.sender_pid == input.observer_pid || input.service_pids.contains(&a.sender_pid);
+        if suspect {
+            match a.target_pid {
+                Some(t) if input.workload.contains(&t) => {
+                    return (
+                        SignalVerdict::Fail(format!(
+                            "traced observer/service-originated signal attempt: {a:?}"
+                        )),
+                        entries,
+                    );
+                }
+                None => {
+                    return (
+                        SignalVerdict::Fail(format!(
+                            "traced observer/service-originated signal attempt with \
+                             indeterminate target (cannot prove the workload missed): {a:?}"
+                        )),
+                        entries,
+                    );
+                }
+                Some(t) if t <= 0 => {
+                    return (
+                        SignalVerdict::Fail(format!(
+                            "traced observer/service-originated broadcast signal attempt \
+                             (cannot prove the workload missed): {a:?}"
+                        )),
+                        entries,
+                    );
+                }
+                Some(t) if input.canary.contains(&t) => {
+                    // The canary catches everything: a missing
+                    // delivery means the delivery observer is
+                    // unproven — VOID, never a pass. (A matching
+                    // delivery FAILs below at rule 2a.)
+                    let seen = entries.iter().any(|e| {
+                        e.kind == WitnessKind::Delivery
+                            && e.target_pid == t
+                            && e.signo == a.signo
+                            && e.at_ns >= a.at_ns
+                    });
+                    if !seen {
+                        return (
+                            SignalVerdict::Void(format!(
+                                "suspect→canary attempt without observed delivery \
+                                 (observer unproven): {a:?}"
+                            )),
+                            entries,
+                        );
+                    }
+                }
+                _ => {} // Suspect send elsewhere (self-probes, own tree) — ignored.
+            }
+        } else if a.sender_pid == input.harness_pid {
+            // Traced harness sends must match the harness-sent log
+            // (the attempt-channel mirror of rule 3).
+            let matched = match a.target_pid {
+                Some(t) => input
+                    .harness_sends
+                    .iter()
+                    .any(|s| s.target_pid == t && s.signo == a.signo && s.at_ns <= a.at_ns),
+                None => false,
+            };
+            if !matched {
+                return (
+                    SignalVerdict::Fail(format!(
+                        "traced harness send without a send record: {a:?}"
+                    )),
+                    entries,
+                );
+            }
+        }
+        // Stranger/workload-internal attempts without deliveries are
+        // kernel-dropped (ignored) sends — unobservable, ignored.
+    }
+
+    // 2a. The observer/service is a suspect, never background: ANY
+    // delivery/death/exit entry with sender == observer/service pid
+    // is FAIL (delivery-channel evidence — independent of
+    // self-report; L5 positive controls prove this fires).
     for e in &entries {
+        if !matches!(
+            e.kind,
+            WitnessKind::Delivery | WitnessKind::Death | WitnessKind::Exit
+        ) {
+            continue;
+        }
         if e.sender_pid == Some(input.observer_pid)
             || e.sender_pid
                 .is_some_and(|p| input.service_pids.contains(&p))
@@ -284,6 +442,45 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
                 entries,
             );
         }
+    }
+
+    // 2b. F8c: self-reported attempts need INDEPENDENT corroboration
+    // (R1: self-report alone is insufficient — a matching traced
+    // attempt within ±60 s proves the claim). Corroborated ⟹ FAIL
+    // (proven misbehavior wins); otherwise VOID (an unproven
+    // observer proves nothing — rerun under the attempt tracer).
+    let self_reports: Vec<&WitnessEntry> = entries
+        .iter()
+        .filter(|e| {
+            e.kind == WitnessKind::Attempt
+                && (e.sender_pid == Some(input.observer_pid)
+                    || e.sender_pid
+                        .is_some_and(|p| input.service_pids.contains(&p)))
+        })
+        .collect();
+    if let Some(proven) = self_reports.iter().find(|e| {
+        input.attempts.iter().any(|a| {
+            Some(a.sender_pid) == e.sender_pid
+                && a.target_pid == Some(e.target_pid)
+                && a.signo == e.signo
+                && a.at_ns.abs_diff(e.at_ns) <= 60_000_000_000
+        })
+    }) {
+        return (
+            SignalVerdict::Fail(format!(
+                "corroborated observer/service-originated signal attempt: {proven:?}"
+            )),
+            entries,
+        );
+    }
+    if let Some(unproven) = self_reports.first() {
+        return (
+            SignalVerdict::Void(format!(
+                "uncorroborated self-reported observer/service attempt \
+                 (no attempt-trace evidence — rerun under the tracer): {unproven:?}"
+            )),
+            entries,
+        );
     }
 
     // 3. Harness-sender entries MUST match the harness-sent log.
@@ -483,7 +680,7 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
         let rc = unsafe { libc::kill(pid, signo) };
         if rc == 0 {
             // Self-reported generation attempt (independent of
-            // delivery — a blocked/ignored send has no stop).
+            // delivery — a blocked-forever send has no stop).
             obs.append(
                 WitnessKind::Attempt,
                 signo,
@@ -492,8 +689,16 @@ pub fn run_observer(cfg: &ObserverConfig) -> ! {
             );
         }
     }
+    // F8c: startup heartbeat (the attempt-tracer positive
+    // control starts here — every 60 s below keeps it live).
+    Observer::heartbeat();
     let mut last_enum = std::time::Instant::now();
+    let mut last_beat = std::time::Instant::now();
     loop {
+        if last_beat.elapsed() >= std::time::Duration::from_secs(60) {
+            last_beat = std::time::Instant::now();
+            Observer::heartbeat();
+        }
         if let Some(cg) = cfg.cgroup_procs.as_ref() {
             if last_enum.elapsed() >= std::time::Duration::from_secs(60) {
                 last_enum = std::time::Instant::now();
@@ -775,6 +980,17 @@ impl Observer {
         if rc != 0 { 0 } else { msg as u64 }
     }
 
+    /// Zero-effect liveness probe (F8c): `kill(self, 0)` checks
+    /// existence and generates nothing. The observer emits one at
+    /// startup and every 60 s; under the attempt tracer each probe
+    /// lands in the attempt log as a signo-0 record — the
+    /// attempt-tracer positive control (a broken tracer logs no
+    /// heartbeat). Returns the raw `kill` return (0 = alive).
+    pub fn heartbeat() -> i32 {
+        // SAFETY: kill(self, 0) is an existence check with no effect.
+        unsafe { libc::kill(libc::getpid(), 0) }
+    }
+
     fn append(&mut self, kind: WitnessKind, signo: i32, sender_pid: Option<i32>, target_pid: i32) {
         use std::io::Write as _;
         let entry = WitnessEntry {
@@ -899,6 +1115,592 @@ impl Observer {
     }
 }
 
+// ---------------------------------------------------------------------------
+// F8c attempt tracer: independent kernel-mediated generation-attempt evidence.
+//
+// The delivery observer above sees signal DELIVERIES (ptrace stops at
+// the target). L5 additionally requires generation ATTEMPTS
+// independent of delivery: a blocked-forever or dead-target send
+// has no delivery stop (ignored signals DO stop under ptrace —
+// default and explicit alike, pinned by
+// `delivery_observer_sees_default_ignored_signal`), and the T7.4
+// self-report (the suspect logging its own sends) is insufficient
+// evidence (R1 F8c). The attempt tracer supervises
+// each SUSPECT process (the delivery observer; the service in a
+// later round) under a seccomp `RET_TRACE` filter covering the six
+// kill-family syscalls: the KERNEL stops the suspect at every
+// signal-generation syscall and reports (nr, args) to the tracer,
+// which decodes (sender, target, signo) and captures the result at
+// the syscall-exit stop. One `attempt-witness.jsonl` entry per
+// traced syscall. The suspect runs no userspace code between the
+// syscall and the stop — it can avoid sending, never suppress or
+// forge the record.
+//
+// Launcher semantics (like strace): spawn the suspect, supervise its
+// whole tree (clone/fork/vfork inherit both the filter and the
+// tracing) to completion, return 0. Nonzero is fail-loud (a hole in
+// supervision voids the run's attempt evidence, never a silent gap).
+// The suspect's own exit status is NOT propagated — the oracle
+// judges the log, not the code.
+
+/// `ptrace_syscall_info` (linux/ptrace.h): `op u8, reserved u8,
+/// flags u16, arch u32, ip u64, sp u64`, then the variant payload
+/// (entry/seccomp: nr + args[6]; exit: rval + is_error).
+#[repr(C)]
+pub struct SyscallInfo {
+    pub op: u8,
+    pub reserved: u8,
+    pub flags: u16,
+    pub arch: u32,
+    pub ip: u64,
+    pub sp: u64,
+    pub data: [u64; 8],
+}
+
+const SYSCALL_INFO_ENTRY: u8 = 1;
+const SYSCALL_INFO_EXIT: u8 = 2;
+const SYSCALL_INFO_SECCOMP: u8 = 3;
+
+/// A decoded signal-generation syscall: name, target
+/// (pid for kill/tkill/rt_sigqueueinfo, tid for tgkill family,
+/// `None` for pidfd sends — resolved separately), and signo.
+pub struct DecodedSignalSyscall {
+    pub name: &'static str,
+    pub target: Option<i32>,
+    pub signo: i32,
+}
+
+/// Decode a kill-family syscall (pure — unit-tested). `None` for
+/// anything else. Pids outside i32 range decode to indeterminate
+/// (the kernel rejects them; the oracle fails suspect sends with
+/// indeterminate targets — it cannot prove the workload missed).
+pub fn decode_signal_syscall(nr: i64, args: &[u64; 6]) -> Option<DecodedSignalSyscall> {
+    fn pid(v: u64) -> Option<i32> {
+        let raw = v as i64;
+        if raw < i32::MIN as i64 || raw > i32::MAX as i64 {
+            None
+        } else {
+            Some(raw as i32)
+        }
+    }
+    let (name, target, signo) = if nr == libc::SYS_kill {
+        ("kill", pid(args[0]), args[1] as i32)
+    } else if nr == libc::SYS_tkill {
+        ("tkill", pid(args[0]), args[1] as i32)
+    } else if nr == libc::SYS_tgkill {
+        ("tgkill", pid(args[1]), args[2] as i32)
+    } else if nr == libc::SYS_rt_sigqueueinfo {
+        ("rt_sigqueueinfo", pid(args[0]), args[1] as i32)
+    } else if nr == libc::SYS_rt_tgsigqueueinfo {
+        ("rt_tgsigqueueinfo", pid(args[1]), args[2] as i32)
+    } else if nr == libc::SYS_pidfd_send_signal {
+        ("pidfd_send_signal", None, args[1] as i32)
+    } else {
+        return None;
+    };
+    Some(DecodedSignalSyscall {
+        name,
+        target,
+        signo,
+    })
+}
+
+/// Classic-BPF opcodes from linux/filter.h (the `BPF_STMT` macros
+/// are C-only, so the program is hand-encoded; the filter test pins
+/// the literal values, not these constants).
+const BPF_LD_W_ABS: u16 = 0x20;
+const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_RET_K: u16 = 0x06;
+/// `AUDIT_ARCH_X86_64` (linux/audit.h: `EM_X86_64 | __AUDIT_ARCH_64BIT`).
+const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+
+/// The suspect's seccomp program: arch-gated, `RET_TRACE` on
+/// exactly the six kill-family nrs, `RET_ALLOW` everywhere else
+/// (near-zero overhead — the filter is a handful of insns per
+/// syscall and stops only signal-generation syscalls).
+pub fn attempt_filter() -> Vec<libc::sock_filter> {
+    fn stmt(code: u16, k: u32) -> libc::sock_filter {
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
+    }
+    fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
+        libc::sock_filter { code, jt, jf, k }
+    }
+    let nrs = [
+        libc::SYS_kill as u32,
+        libc::SYS_tkill as u32,
+        libc::SYS_tgkill as u32,
+        libc::SYS_rt_sigqueueinfo as u32,
+        libc::SYS_rt_tgsigqueueinfo as u32,
+        libc::SYS_pidfd_send_signal as u32,
+    ];
+    // [LD arch][JEQ arch → LD nr][RET ALLOW][LD nr]
+    // [JEQ nr → TRACE × 6][RET TRACE][RET ALLOW]
+    let mut prog = vec![
+        stmt(BPF_LD_W_ABS, 4), // struct seccomp_data.arch
+        jump(BPF_JMP_JEQ_K, AUDIT_ARCH_X86_64, 1, 0),
+        stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW),
+        stmt(BPF_LD_W_ABS, 0), // struct seccomp_data.nr
+    ];
+    let trace_at = 4 + nrs.len();
+    for (i, nr) in nrs.iter().enumerate() {
+        let jt = (trace_at - (4 + i) - 1) as u8;
+        // The LAST compare must skip the TRACE ret on mismatch
+        // (jf=1 → ALLOW tail); jf=0 would fall through INTO the
+        // TRACE ret and trace every syscall on the box.
+        let jf = if i + 1 == nrs.len() { 1 } else { 0 };
+        prog.push(jump(BPF_JMP_JEQ_K, *nr, jt, jf));
+    }
+    prog.push(stmt(BPF_RET_K, libc::SECCOMP_RET_TRACE));
+    prog.push(stmt(BPF_RET_K, libc::SECCOMP_RET_ALLOW));
+    prog
+}
+
+fn get_syscall_info(tid: i32) -> std::io::Result<SyscallInfo> {
+    let mut info: SyscallInfo = unsafe { std::mem::zeroed() };
+    // SAFETY: GET_SYSCALL_INFO into a valid buffer (returns bytes written).
+    let rc = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GET_SYSCALL_INFO,
+            tid,
+            std::mem::size_of::<SyscallInfo>() as *mut libc::c_void,
+            &mut info as *mut SyscallInfo as *mut libc::c_void,
+        )
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(info)
+    }
+}
+
+/// Resolve a pidfd held by `tid` to its target pid via
+/// `/proc/<tid>/fdinfo/<fd>` (`Pid:` line). `None` when unreadable
+/// (the oracle treats indeterminate suspect targets as FAIL — it
+/// cannot prove the workload missed).
+pub fn resolve_pidfd(tid: i32, fd: i32) -> Option<i32> {
+    let text = std::fs::read_to_string(format!("/proc/{tid}/fdinfo/{fd}")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Pid:") {
+            return rest.trim().parse::<i32>().ok();
+        }
+    }
+    None
+}
+
+fn read_comm(tid: i32) -> String {
+    std::fs::read_to_string(format!("/proc/{tid}/comm"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".to_string())
+}
+
+/// Attempt-tracer configuration (launcher; see `run_attempt_tracer`).
+pub struct AttemptTracerConfig {
+    /// `attempt-witness.jsonl` append path.
+    pub log_path: std::path::PathBuf,
+    /// Optional path the tracer writes the suspect root pid to
+    /// (the harness kills the suspect first at teardown, then reaps
+    /// the tracer — suspect-first leaves no untraced gap).
+    pub suspect_pid_file: Option<std::path::PathBuf>,
+    /// Suspect command (`execvp` — `PATH` lookup).
+    pub argv: Vec<String>,
+}
+
+/// An in-flight traced syscall (entry stop seen, exit stop pending).
+struct PendingAttempt {
+    at_ns: u64,
+    comm: String,
+    name: &'static str,
+    nr: i64,
+    target: Option<i32>,
+    signo: i32,
+}
+
+struct AttemptTracer {
+    log: std::fs::File,
+    traced: HashSet<i32>,
+    pending: HashMap<i32, PendingAttempt>,
+}
+
+impl AttemptTracer {
+    fn set_options(&self, pid: i32) -> std::io::Result<()> {
+        // SAFETY: option flags are plain bits.
+        let opts = (libc::PTRACE_O_TRACESECCOMP
+            | libc::PTRACE_O_TRACESYSGOOD
+            | libc::PTRACE_O_TRACECLONE
+            | libc::PTRACE_O_TRACEFORK
+            | libc::PTRACE_O_TRACEVFORK) as libc::c_ulong;
+        // SAFETY: setoptions on a stopped tracee.
+        let rc =
+            unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS, pid, 0, opts as *mut libc::c_void) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn cont(&self, pid: i32, signo: i32) {
+        // SAFETY: cont with an optional re-injected signal.
+        unsafe {
+            libc::ptrace(libc::PTRACE_CONT, pid, 0, signo as *mut libc::c_void);
+        }
+    }
+
+    fn syscall(&self, pid: i32) {
+        // SAFETY: run to the next syscall-entry/exit stop.
+        unsafe {
+            libc::ptrace(libc::PTRACE_SYSCALL, pid, 0, 0);
+        }
+    }
+
+    fn event_msg(&self, pid: i32) -> u64 {
+        // SAFETY: geteventmsg into a valid word.
+        let mut msg: libc::c_ulong = 0;
+        let rc = unsafe {
+            libc::ptrace(
+                libc::PTRACE_GETEVENTMSG,
+                pid,
+                0,
+                &mut msg as *mut libc::c_ulong as *mut libc::c_void,
+            )
+        };
+        if rc != 0 { 0 } else { msg as u64 }
+    }
+
+    fn emit(&mut self, tid: i32, p: PendingAttempt, result: Option<i64>) {
+        use std::io::Write as _;
+        let rec = AttemptRecord {
+            at_ns: p.at_ns,
+            sender_pid: tid,
+            sender_comm: p.comm,
+            syscall: p.name.to_string(),
+            syscall_nr: p.nr,
+            target_pid: p.target,
+            signo: p.signo,
+            result,
+        };
+        if let Ok(mut bytes) = serde_json::to_vec(&rec) {
+            bytes.push(b'\n');
+            let _ = self.log.write_all(&bytes);
+            let _ = self.log.sync_all();
+        }
+    }
+
+    /// Handle one wait status. Returns 0 to continue, nonzero to
+    /// abort the run with that exit code (fail-loud supervision
+    /// holes — a missed attempt voids the evidence, never a gap).
+    fn handle_wait(&mut self, pid: i32, status: i32) -> i32 {
+        if !self.traced.contains(&pid) {
+            // Not ours (a co-located observer's tracee in unit
+            // tests — in qual the tracer supervises exactly its
+            // suspect tree, so this never fires there).
+            if libc::WIFSTOPPED(status) {
+                self.cont(pid, 0);
+            }
+            return 0;
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            // A tid that died mid-syscall: the send may or may not
+            // have queued — emit with an unknown result (the oracle
+            // counts unknown results as pending — conservative).
+            if let Some(p) = self.pending.remove(&pid) {
+                self.emit(pid, p, None);
+            }
+            self.traced.remove(&pid);
+            return 0;
+        }
+        if !libc::WIFSTOPPED(status) {
+            return 0;
+        }
+        let stopsig = libc::WSTOPSIG(status);
+        let event = (status >> 16) & 0xffff;
+        if event == libc::PTRACE_EVENT_SECCOMP {
+            match get_syscall_info(pid) {
+                Ok(info) if info.op == SYSCALL_INFO_SECCOMP => {
+                    let nr = info.data[0] as i64;
+                    let mut args = [0u64; 6];
+                    args.copy_from_slice(&info.data[1..7]);
+                    match decode_signal_syscall(nr, &args) {
+                        Some(d) => {
+                            let target = match d.target {
+                                Some(t) => Some(t),
+                                None if nr == libc::SYS_pidfd_send_signal => {
+                                    resolve_pidfd(pid, args[0] as i32)
+                                }
+                                None => None,
+                            };
+                            self.pending.insert(
+                                pid,
+                                PendingAttempt {
+                                    at_ns: crate::service::state::monotonic_ns(),
+                                    comm: read_comm(pid),
+                                    name: d.name,
+                                    nr,
+                                    target,
+                                    signo: d.signo,
+                                },
+                            );
+                            // Run to the syscall-exit stop for the result.
+                            self.syscall(pid);
+                        }
+                        None => {
+                            // Impossible by construction (the filter
+                            // traces exactly the decoder's nr set) —
+                            // a disagreement is a broken filter, so
+                            // fail loud rather than skip silently.
+                            eprintln!(
+                                "attempt-tracer: filter/decoder disagree on nr {nr} from {pid}"
+                            );
+                            return 3;
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("attempt-tracer: cannot read seccomp stop of {pid} (missed attempt)");
+                    return 3;
+                }
+            }
+            return 0;
+        }
+        if event != 0 {
+            if event == libc::PTRACE_EVENT_VFORK_DONE {
+                self.cont(pid, 0);
+                return 0;
+            }
+            // Clone/fork/vfork birth: the child inherits the filter
+            // AND auto-attach — option it (fail-loud: an unoptioned
+            // suspect task is a supervision hole).
+            let child = self.event_msg(pid) as i32;
+            if child != 0 && !Observer::target_dead_or_zombie(child) {
+                self.traced.insert(child);
+                if self.set_options(child).is_err() {
+                    eprintln!("attempt-tracer: suspect task {child} escaped (lost containment)");
+                    return 3;
+                }
+            }
+            self.cont(pid, 0);
+            return 0;
+        }
+        if stopsig == libc::SIGTRAP | 0x80 {
+            match self.pending.remove(&pid) {
+                Some(p) => match get_syscall_info(pid) {
+                    Ok(info) if info.op == SYSCALL_INFO_EXIT => {
+                        self.emit(pid, p, Some(info.data[0] as i64));
+                        self.cont(pid, 0);
+                    }
+                    Ok(info) if info.op == SYSCALL_INFO_ENTRY => {
+                        // Re-entered (a signal raced the exit path):
+                        // keep waiting for the exit.
+                        self.pending.insert(pid, p);
+                        self.syscall(pid);
+                    }
+                    _ => {
+                        eprintln!("attempt-tracer: cannot read exit stop of {pid} (missed result)");
+                        return 3;
+                    }
+                },
+                None => self.cont(pid, 0), // Stray syscall stop — resume.
+            }
+            return 0;
+        }
+        match stopsig {
+            // Exec trap / stray trap: not a delivery — never inject.
+            libc::SIGTRAP => self.cont(pid, 0),
+            libc::SIGSTOP | libc::SIGTSTP | libc::SIGTTIN | libc::SIGTTOU => {
+                // Preserve stop semantics (never inject stops).
+                self.cont(pid, 0);
+            }
+            other => {
+                // Re-inject: the suspect observes signals exactly
+                // as untraced (handlers run, dispositions unchanged).
+                self.cont(pid, other);
+            }
+        }
+        0
+    }
+
+    /// Blocking reap of one pid (teardown paths only).
+    fn reap_quiet(&self, pid: i32) {
+        loop {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(pid, &mut status, libc::__WALL) };
+            if got < 0 {
+                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return;
+            }
+            if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+                return;
+            }
+            // A stop on the way out (e.g. the initial SIGSTOP when
+            // options failed): detach, resuming it toward the exit.
+            // SAFETY: detach a stopped tracee.
+            unsafe {
+                libc::ptrace(libc::PTRACE_DETACH, pid, 0, 0);
+            }
+        }
+    }
+}
+
+/// Supervise a suspect command under the kill-family seccomp filter
+/// to completion (launcher semantics — returns, unlike the
+/// diverging delivery observer).
+///
+/// Returns 0 when the whole suspect tree was supervised to
+/// completion (the log is complete — possibly empty); 2 on
+/// usage/spawn/setup failure; 3 on a supervision hole (a suspect
+/// task escaped optioning, or a stop became unreadable — the
+/// attempt evidence is void, never silently gapped).
+///
+/// Fork-safety: the child only `TRACEME`s, stops for options,
+/// installs the pre-built filter, and execs — no allocation before
+/// exec (the test suite runs `RUST_TEST_THREADS=1`).
+pub fn run_attempt_tracer(cfg: &AttemptTracerConfig) -> i32 {
+    if cfg.argv.is_empty() {
+        eprintln!("attempt-tracer: no suspect command");
+        return 2;
+    }
+    let log = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&cfg.log_path)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("attempt-tracer: cannot open log: {e}");
+            return 2;
+        }
+    };
+    // Pre-fork: argv CStrings + the filter program (the child must
+    // not allocate before exec).
+    let mut cstrs = Vec::with_capacity(cfg.argv.len());
+    for a in &cfg.argv {
+        match std::ffi::CString::new(a.as_str()) {
+            Ok(c) => cstrs.push(c),
+            Err(_) => {
+                eprintln!("attempt-tracer: NUL byte in suspect argv");
+                return 2;
+            }
+        }
+    }
+    let mut ptrs: Vec<*const libc::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+    ptrs.push(std::ptr::null());
+    let mut filter = attempt_filter();
+    let prog = libc::sock_fprog {
+        len: filter.len() as libc::c_ushort,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: fork; the child only traces itself, stops, installs
+    // the filter, and execs (see above).
+    let child = unsafe { libc::fork() };
+    if child < 0 {
+        eprintln!("attempt-tracer: fork failed");
+        return 2;
+    }
+    if child == 0 {
+        unsafe {
+            if libc::ptrace(libc::PTRACE_TRACEME, 0, 0, 0) != 0 {
+                libc::_exit(9);
+            }
+            libc::raise(libc::SIGSTOP);
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1 as libc::c_ulong, 0, 0, 0) != 0 {
+                libc::_exit(9);
+            }
+            if libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER as libc::c_ulong,
+                &prog as *const libc::sock_fprog,
+                0,
+                0,
+            ) != 0
+            {
+                libc::_exit(9);
+            }
+            libc::execvp(ptrs[0], ptrs.as_ptr());
+            libc::_exit(127);
+        }
+    }
+    // The initial stop (the child's SIGSTOP): option the suspect
+    // before it runs a single filtered syscall.
+    let status = loop {
+        let mut status = 0;
+        // SAFETY: waitpid with a valid status pointer.
+        let got = unsafe { libc::waitpid(child, &mut status, libc::__WALL) };
+        if got < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            eprintln!("attempt-tracer: waitpid for suspect stop failed");
+            return 2;
+        }
+        break status;
+    };
+    let mut tracer = AttemptTracer {
+        log,
+        traced: HashSet::from([child]),
+        pending: HashMap::new(),
+    };
+    if !libc::WIFSTOPPED(status) || libc::WSTOPSIG(status) != libc::SIGSTOP {
+        eprintln!("attempt-tracer: suspect {child} refused supervision (TRACEME/filter denied?)");
+        if libc::WIFSTOPPED(status) {
+            tracer.cont(child, 0);
+        }
+        tracer.reap_quiet(child);
+        return 2;
+    }
+    if tracer.set_options(child).is_err() {
+        eprintln!("attempt-tracer: cannot option suspect {child}");
+        // SAFETY: kill our own suspect.
+        unsafe {
+            libc::kill(child, libc::SIGKILL);
+        }
+        tracer.reap_quiet(child);
+        return 2;
+    }
+    if let Some(p) = cfg.suspect_pid_file.as_ref() {
+        if std::fs::write(p, format!("{child}\n")).is_err() {
+            eprintln!("attempt-tracer: cannot write suspect pid file");
+            // SAFETY: kill our own suspect.
+            unsafe {
+                libc::kill(child, libc::SIGKILL);
+            }
+            tracer.reap_quiet(child);
+            return 2;
+        }
+    }
+    tracer.cont(child, 0);
+    loop {
+        if tracer.traced.is_empty() {
+            break;
+        }
+        let mut status = 0;
+        // SAFETY: waitpid with a valid status pointer.
+        let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL) };
+        if got < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD with live tracees = lost supervision — fail loud.
+            eprintln!(
+                "attempt-tracer: waitpid failed with {} suspect tasks live",
+                tracer.traced.len()
+            );
+            return 3;
+        }
+        let rc = tracer.handle_wait(got, status);
+        if rc != 0 {
+            return rc;
+        }
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,6 +1735,7 @@ mod tests {
     ) -> OracleInput<'a> {
         OracleInput {
             witness,
+            attempts: &[],
             harness_sends: sends,
             harness_pid: 100,
             observer_pid: 200,
@@ -941,6 +1744,33 @@ mod tests {
             canary,
             quiet_window: (1_000_000, 2_000_000),
             external_events: &[],
+        }
+    }
+
+    fn attempt(sender: i32, target: Option<i32>, signo: i32, at: u64) -> AttemptRecord {
+        AttemptRecord {
+            at_ns: at,
+            sender_pid: sender,
+            sender_comm: "sh".to_string(),
+            syscall: "kill".to_string(),
+            syscall_nr: 62,
+            target_pid: target,
+            signo,
+            result: Some(0),
+        }
+    }
+
+    fn base_a<'a>(
+        witness: &'a [WitnessEntry],
+        sends: &'a [HarnessSend],
+        workload: &'a HashSet<i32>,
+        canary: &'a HashSet<i32>,
+        service: &'a HashSet<i32>,
+        attempts: &'a [AttemptRecord],
+    ) -> OracleInput<'a> {
+        OracleInput {
+            attempts,
+            ..base(witness, sends, workload, canary, service)
         }
     }
 
@@ -1294,15 +2124,16 @@ mod tests {
         assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
     }
 
-    /// L5 positive control, attempt edition: the observer's own
-    /// self-reported send fails even without a delivery.
+    /// F8c: a SELF-REPORTED observer send with no independent
+    /// attempt-trace corroboration VOIDs (an unproven observer
+    /// proves nothing — self-report alone is insufficient).
     #[test]
-    fn observer_attempt_fails_without_delivery() {
+    fn uncorroborated_self_report_voids() {
         let workload: HashSet<i32> = [11].into_iter().collect();
         let canary: HashSet<i32> = [21].into_iter().collect();
         let witness = vec![entry(WitnessKind::Attempt, 10, Some(200), 11, 500)];
         let (verdict, _) = adjudicate(&base(&witness, &[], &workload, &canary, &service()));
-        assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
+        assert!(matches!(verdict, SignalVerdict::Void(_)), "{verdict:?}");
     }
 
     #[test]
@@ -1403,5 +2234,601 @@ mod tests {
         input2.external_events = &far;
         let (verdict2, _) = adjudicate(&input2);
         assert!(matches!(verdict2, SignalVerdict::Fail(_)), "{verdict2:?}");
+    }
+
+    /// F8c L5 core: a kernel-traced suspect→workload send FAILs
+    /// even with an EMPTY witness log (a blocked-forever or
+    /// dead-target send has no delivery stop — the attempt channel
+    /// is the only evidence).
+    #[test]
+    fn traced_suspect_attempt_fails_without_delivery() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let attempts = vec![attempt(200, Some(11), libc::SIGURG, 500)];
+        let (verdict, _) = adjudicate(&base_a(&[], &[], &workload, &canary, &service(), &attempts));
+        assert!(
+            matches!(verdict, SignalVerdict::Fail(ref d) if d.contains("traced")),
+            "{verdict:?}"
+        );
+    }
+
+    /// F8c: a suspect attempt on a dead workload pid (ESRCH) still
+    /// FAILs — a correct observer/service never calls kill on
+    /// workload pids; the result is diagnostic, not exculpatory.
+    #[test]
+    fn traced_suspect_esrch_attempt_still_fails() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let attempts = vec![AttemptRecord {
+            result: Some(-(libc::ESRCH as i64)),
+            ..attempt(200, Some(11), 10, 500)
+        }];
+        let (verdict, _) = adjudicate(&base_a(&[], &[], &workload, &canary, &service(), &attempts));
+        assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
+    }
+
+    /// F8c: a self-report WITH a matching traced attempt FAILs
+    /// (the independent channel corroborates the claim).
+    #[test]
+    fn corroborated_self_report_fails() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let witness = vec![entry(WitnessKind::Attempt, 10, Some(200), 11, 500)];
+        let attempts = vec![attempt(200, Some(11), 10, 490)];
+        let (verdict, _) = adjudicate(&base_a(
+            &witness,
+            &[],
+            &workload,
+            &canary,
+            &service(),
+            &attempts,
+        ));
+        assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
+    }
+
+    /// F8c: signo 0 generates nothing (existence probe — the
+    /// observer heartbeat) and never breaks Untouched.
+    #[test]
+    fn traced_signo_zero_ignored() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let attempts = vec![attempt(200, Some(11), 0, 500)];
+        let (verdict, _) = adjudicate(&base_a(&[], &[], &workload, &canary, &service(), &attempts));
+        assert!(matches!(verdict, SignalVerdict::Pass), "{verdict:?}");
+    }
+
+    /// F8c: a suspect→canary attempt with no observed delivery VOIDs
+    /// (the canary catches everything — a missing delivery means the
+    /// delivery observer is unproven, never a pass).
+    #[test]
+    fn suspect_canary_attempt_without_delivery_voids() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let attempts = vec![attempt(200, Some(21), 10, 500)];
+        let (verdict, _) = adjudicate(&base_a(&[], &[], &workload, &canary, &service(), &attempts));
+        assert!(matches!(verdict, SignalVerdict::Void(_)), "{verdict:?}");
+    }
+
+    /// F8c: a stranger's never-delivered send (traced attempt, no
+    /// delivery — blocked-forever or dead-target) is unobservable
+    /// by the workload and does not break Untouched.
+    #[test]
+    fn stranger_ignored_attempt_ignored() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let attempts = vec![attempt(999, Some(11), 10, 500)];
+        let (verdict, _) = adjudicate(&base_a(&[], &[], &workload, &canary, &service(), &attempts));
+        assert!(matches!(verdict, SignalVerdict::Pass), "{verdict:?}");
+    }
+
+    /// F8c: proven traced sends join the L5 coalescing count — one
+    /// harness send + one traced stranger send while pending ⟹ the
+    /// delivery is uncertain (never most-recent attributed).
+    #[test]
+    fn traced_attempt_counts_for_coalescing() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let witness = vec![entry(WitnessKind::Delivery, 10, Some(100), 11, 900)];
+        let sends = vec![HarnessSend {
+            at_ns: 400,
+            signo: 10,
+            target_pid: 11,
+            sender_pid: 100,
+        }];
+        let attempts = vec![attempt(999, Some(11), 10, 500)];
+        let (verdict, annotated) = adjudicate(&base_a(
+            &witness,
+            &sends,
+            &workload,
+            &canary,
+            &service(),
+            &attempts,
+        ));
+        assert!(
+            annotated[0].uncertain,
+            "traced + harness sends must be uncertain"
+        );
+        assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
+    }
+
+    /// F8c: a FAILED send (negative result — the kernel queued
+    /// nothing) is not a pending send and does not coalesce.
+    #[test]
+    fn failed_send_does_not_coalesce() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let witness = vec![entry(WitnessKind::Delivery, 10, Some(100), 11, 900)];
+        let sends = vec![HarnessSend {
+            at_ns: 400,
+            signo: 10,
+            target_pid: 11,
+            sender_pid: 100,
+        }];
+        let attempts = vec![AttemptRecord {
+            result: Some(-(libc::ESRCH as i64)),
+            ..attempt(999, Some(11), 10, 500)
+        }];
+        let (_, annotated) = adjudicate(&base_a(
+            &witness,
+            &sends,
+            &workload,
+            &canary,
+            &service(),
+            &attempts,
+        ));
+        assert!(!annotated[0].uncertain, "a failed send is not pending");
+    }
+
+    /// F8c: a traced HARNESS send must match the harness-sent log
+    /// (mirrors the rule-3 delivery check on the attempt channel).
+    #[test]
+    fn traced_harness_attempt_must_match_log() {
+        let workload: HashSet<i32> = [11].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        // Negative: traced but undeclared ⟹ FAIL naming the log gap.
+        let attempts = vec![attempt(100, Some(11), 10, 500)];
+        let (verdict, _) = adjudicate(&base_a(&[], &[], &workload, &canary, &service(), &attempts));
+        assert!(
+            matches!(verdict, SignalVerdict::Fail(ref d) if d.contains("without a send record")),
+            "{verdict:?}"
+        );
+        // Positive: declared ⟹ the ordinary touched-FAIL (the
+        // harness sent the workload — the attempt channel agrees).
+        let sends = vec![HarnessSend {
+            at_ns: 400,
+            signo: 10,
+            target_pid: 11,
+            sender_pid: 100,
+        }];
+        let (verdict2, _) = adjudicate(&base_a(
+            &[],
+            &sends,
+            &workload,
+            &canary,
+            &service(),
+            &attempts,
+        ));
+        assert!(
+            matches!(verdict2, SignalVerdict::Fail(ref d) if d.contains("touched")),
+            "{verdict2:?}"
+        );
+    }
+
+    /// F8c decoder pins: every kill-family nr decodes to
+    /// (name, target, signo); pidfd targets resolve separately
+    /// (None here); anything else is not a signal send.
+    #[test]
+    fn decode_kill_family() {
+        let args = |a0: u64, a1: u64, a2: u64| [a0, a1, a2, 0, 0, 0];
+        let d = decode_signal_syscall(libc::SYS_kill as i64, &args(11, 10, 0)).unwrap();
+        assert_eq!((d.name, d.target, d.signo), ("kill", Some(11), 10));
+        let d = decode_signal_syscall(libc::SYS_tkill as i64, &args(12, 9, 0)).unwrap();
+        assert_eq!((d.name, d.target, d.signo), ("tkill", Some(12), 9));
+        let d = decode_signal_syscall(libc::SYS_tgkill as i64, &args(13, 14, 15)).unwrap();
+        assert_eq!((d.name, d.target, d.signo), ("tgkill", Some(14), 15));
+        let d = decode_signal_syscall(libc::SYS_rt_sigqueueinfo as i64, &args(11, 10, 0)).unwrap();
+        assert_eq!(
+            (d.name, d.target, d.signo),
+            ("rt_sigqueueinfo", Some(11), 10)
+        );
+        let d =
+            decode_signal_syscall(libc::SYS_rt_tgsigqueueinfo as i64, &args(13, 14, 10)).unwrap();
+        assert_eq!(
+            (d.name, d.target, d.signo),
+            ("rt_tgsigqueueinfo", Some(14), 10)
+        );
+        let d = decode_signal_syscall(libc::SYS_pidfd_send_signal as i64, &args(7, 10, 0)).unwrap();
+        assert_eq!((d.name, d.target, d.signo), ("pidfd_send_signal", None, 10));
+        // Literal-ABI leg (not via libc's own numbers): 62 is kill.
+        let d = decode_signal_syscall(62, &args(11, 10, 0)).unwrap();
+        assert_eq!((d.name, d.target, d.signo), ("kill", Some(11), 10));
+        assert!(decode_signal_syscall(libc::SYS_getpid as i64, &args(0, 0, 0)).is_none());
+        assert!(decode_signal_syscall(9999, &args(0, 0, 0)).is_none());
+    }
+
+    /// F8c filter pins (literal kernel ABI from linux/filter.h +
+    /// linux/seccomp.h — NOT the implementation's own constants):
+    /// arch-gated, TRACE on exactly the six kill-family nrs,
+    /// ALLOW everywhere else.
+    #[test]
+    fn filter_traces_kill_family_allows_rest() {
+        let prog = attempt_filter();
+        // LD W ABS arch.
+        assert_eq!(prog[0].code, 0x20);
+        assert_eq!(prog[0].k, 4);
+        // JEQ AUDIT_ARCH_X86_64.
+        assert_eq!(prog[1].code, 0x15);
+        assert_eq!(prog[1].k, 0xC000_003E);
+        // One TRACE ret, six nr comparisons, default ALLOW tail.
+        let traces = prog
+            .iter()
+            .filter(|i| i.code == 0x06 && i.k == 0x7FF0_0000)
+            .count();
+        assert_eq!(traces, 1);
+        let compares = prog
+            .iter()
+            .filter(|i| i.code == 0x15 && i.k != 0xC000_003E)
+            .count();
+        assert_eq!(compares, 6);
+        // The six compared nrs are exactly the x86-64 kill family
+        // (literal kernel ABI: kill 62, rt_sigqueueinfo 129, tkill
+        // 200, tgkill 234, rt_tgsigqueueinfo 297, pidfd_send_signal
+        // 424).
+        let mut nrs: Vec<u32> = prog
+            .iter()
+            .filter(|i| i.code == 0x15 && i.k != 0xC000_003E)
+            .map(|i| i.k)
+            .collect();
+        nrs.sort_unstable();
+        assert_eq!(nrs, vec![62, 129, 200, 234, 297, 424]);
+        // The LAST compare skips the TRACE ret on mismatch (a
+        // fall-through jf=0 would trace every syscall on the box —
+        // that exact bug is what this pin guards).
+        assert_eq!(prog[4 + 6 - 1].jf, 1);
+        for i in 0..5 {
+            assert_eq!(prog[4 + i].jf, 0);
+        }
+        let last = prog.last().unwrap();
+        assert_eq!((last.code, last.k), (0x06, 0x7FFF_0000));
+    }
+
+    /// F8c: `SyscallInfo` matches the kernel's
+    /// `ptrace_syscall_info` (`op u8, reserved u8, flags u16, arch
+    /// u32, ip u64, sp u64`, variant payload at 24, 88 bytes).
+    #[test]
+    fn syscall_info_layout() {
+        use std::mem::offset_of;
+        assert_eq!(offset_of!(SyscallInfo, op), 0);
+        assert_eq!(offset_of!(SyscallInfo, arch), 4);
+        assert_eq!(offset_of!(SyscallInfo, ip), 8);
+        assert_eq!(offset_of!(SyscallInfo, sp), 16);
+        assert_eq!(offset_of!(SyscallInfo, data), 24);
+        assert_eq!(std::mem::size_of::<SyscallInfo>(), 88);
+    }
+
+    /// F8c: pidfd→pid resolution round-trips on our own pidfd.
+    #[test]
+    fn resolve_pidfd_roundtrip() {
+        // SAFETY: pidfd_open/close on our own pid.
+        let me = unsafe { libc::getpid() };
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, me, 0) };
+        assert!(fd >= 0, "pidfd_open failed");
+        assert_eq!(resolve_pidfd(me, fd as i32), Some(me));
+        assert_eq!(resolve_pidfd(me, 999_999), None);
+        unsafe {
+            libc::close(fd as i32);
+        }
+    }
+
+    /// F8c: the observer heartbeat is a zero-effect self-probe
+    /// (kill(self, 0) — traced, oracle-ignored, proves the attempt
+    /// channel is live).
+    #[test]
+    fn observer_heartbeat_is_noop_probe() {
+        assert_eq!(Observer::heartbeat(), 0);
+    }
+
+    /// F8c L5 live leg, blocked edition: a SIGURG that is BLOCKED
+    /// in the target never dequeues, so the attached delivery
+    /// observer provably sees nothing (the drain runs with NO
+    /// tracer active — no waitpid sharing can eat a stop, so an
+    /// empty log is an airtight no-stop proof), while the attempt
+    /// tracer kernel-catches the same send and the oracle FAILs on
+    /// the pair. Blocked windows model real daemons (workers block
+    /// signals around critical sections).
+    #[test]
+    fn l5_attempt_tracer_catches_blocked_send() {
+        if !ptrace_available() {
+            eprintln!("l5: ptrace denied, skipping live leg");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("osslscope-l5-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let attempt_log = dir.join("attempt-witness.jsonl");
+        let witness_log = dir.join("signal-witness.jsonl");
+        // Target: SIGURG blocked forever (a python fixture — the
+        // block models a daemon's masked window, not a handler).
+        let mut target = std::process::Command::new("python3")
+            .arg("-c")
+            .arg("import signal,time;signal.pthread_sigmask(signal.SIG_BLOCK,{signal.SIGURG});time.sleep(30)")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn python3 fixture");
+        let fixture = target.id() as i32;
+        // Wait (<= 5 s) for the mask: SigBlk bit (SIGURG - 1) set.
+        // No blind sleep — the test proceeds only when the kernel
+        // confirms the block.
+        let mask_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let status =
+                std::fs::read_to_string(format!("/proc/{fixture}/status")).unwrap_or_default();
+            let blocked = status
+                .lines()
+                .find(|l| l.starts_with("SigBlk:"))
+                .is_some_and(|l| {
+                    u64::from_str_radix(l["SigBlk:".len()..].trim(), 16)
+                        .is_ok_and(|m| m & (1 << (libc::SIGURG - 1)) != 0)
+                });
+            if blocked {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < mask_deadline,
+                "fixture never blocked SIGURG"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        // Delivery observer over the fixture (parent→child).
+        let wlog = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&witness_log)
+            .unwrap();
+        let mut obs = Observer {
+            log: wlog,
+            traced: HashSet::new(),
+            pending_initial: HashSet::new(),
+            pending_options: HashSet::new(),
+            last_sender: HashMap::new(),
+        };
+        assert!(matches!(
+            obs.seize_or_adopt(fixture, true),
+            SeizeOutcome::Seized
+        ));
+        // A plain (untraced) send + drain FIRST: with no tracer
+        // running, the observer is the only stop consumer — an
+        // empty log proves the blocked send never stopped.
+        // SAFETY: kill our own fixture.
+        assert_eq!(unsafe { libc::kill(fixture, libc::SIGURG) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            if got == fixture {
+                obs.handle_wait(got, status);
+            } else if got <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        let wtext = std::fs::read_to_string(&witness_log).unwrap();
+        assert!(
+            wtext.trim().is_empty(),
+            "blocked send must not stop: {wtext}"
+        );
+        // The SAME send under the attempt tracer: kernel-caught.
+        let cfg = AttemptTracerConfig {
+            log_path: attempt_log.clone(),
+            suspect_pid_file: None,
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("kill -s URG {fixture}"),
+            ],
+        };
+        assert_eq!(run_attempt_tracer(&cfg), 0);
+        // The fixture cannot have stopped (still blocked), so the
+        // tracer can have eaten nothing — re-drain to be sure.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while std::time::Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            if got == fixture {
+                obs.handle_wait(got, status);
+            } else if got <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        drop(obs);
+        let text = std::fs::read_to_string(&attempt_log).unwrap();
+        let attempts: Vec<AttemptRecord> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(attempts.len(), 1, "attempt log:\n{text}");
+        assert_eq!(attempts[0].syscall, "kill");
+        assert_eq!(attempts[0].target_pid, Some(fixture));
+        assert_eq!(attempts[0].signo, libc::SIGURG);
+        assert_eq!(attempts[0].result, Some(0));
+        assert!(!attempts[0].sender_comm.is_empty());
+        // Delivery channel: proven empty (both drains).
+        let wtext = std::fs::read_to_string(&witness_log).unwrap();
+        assert!(wtext.trim().is_empty(), "witness log:\n{wtext}");
+        // Oracle: traced attempt + proven-empty witness ⟹ FAIL.
+        let workload: HashSet<i32> = [fixture].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let svc = service();
+        let mut input = base_a(&[], &[], &workload, &canary, &svc, &attempts);
+        input.observer_pid = attempts[0].sender_pid;
+        let (verdict, _) = adjudicate(&input);
+        assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
+        // SIGKILL is unblockable; reap everything.
+        target.kill().unwrap();
+        target.wait().unwrap();
+        drain_reap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F8c L5 live leg, dead-target edition: a send to a dead
+    /// workload pid cannot stop anything (no task exists — silence
+    /// BY CONSTRUCTION, no observer needed), the attempt tracer
+    /// kernel-catches it with an ESRCH result, and the oracle FAILs.
+    /// (Pid-reuse safety: Linux allocates pids sequentially, so the
+    /// sender forked after the reap cannot take the dead pid short
+    /// of a full pid-space wraparound — and the target!=sender
+    /// assert would catch that visibly.)
+    #[test]
+    fn l5_attempt_tracer_catches_dead_target_send() {
+        if !ptrace_available() {
+            eprintln!("l5: ptrace denied, skipping live leg");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("osslscope-l5d-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let attempt_log = dir.join("attempt-witness.jsonl");
+        // A reaped workload pid (spawn + wait — fully dead).
+        let mut dead = std::process::Command::new("true")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn true");
+        let gone = dead.id() as i32;
+        dead.wait().unwrap();
+        let cfg = AttemptTracerConfig {
+            log_path: attempt_log.clone(),
+            suspect_pid_file: None,
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("kill -s URG {gone} 2>/dev/null"),
+            ],
+        };
+        assert_eq!(run_attempt_tracer(&cfg), 0);
+        let text = std::fs::read_to_string(&attempt_log).unwrap();
+        let attempts: Vec<AttemptRecord> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(attempts.len(), 1, "attempt log:\n{text}");
+        assert_eq!(attempts[0].syscall, "kill");
+        assert_eq!(attempts[0].target_pid, Some(gone));
+        assert_eq!(attempts[0].signo, libc::SIGURG);
+        assert_eq!(attempts[0].result, Some(-(libc::ESRCH as i64)));
+        assert_ne!(attempts[0].sender_pid, gone, "pid reuse collision");
+        // Oracle: traced dead-target attempt, empty witness ⟹ FAIL.
+        let workload: HashSet<i32> = [gone].into_iter().collect();
+        let canary: HashSet<i32> = [21].into_iter().collect();
+        let svc = service();
+        let mut input = base_a(&[], &[], &workload, &canary, &svc, &attempts);
+        input.observer_pid = attempts[0].sender_pid;
+        let (verdict, _) = adjudicate(&input);
+        assert!(matches!(verdict, SignalVerdict::Fail(_)), "{verdict:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Kernel-truth pin (guards the L5 design against a plausible
+    /// wrong model): a DEFAULT-ignored signal DOES stop a seized
+    /// tracee — the delivery observer logs it with the kernel
+    /// sender. (Explicitly-ignored signals stop too — verified with
+    /// a C probe during F8c, since the ptrace hook runs before the
+    /// ignore check.) Only blocked-forever and dead-target sends
+    /// are stop-free — those are the cases the attempt channel
+    /// exists for.
+    #[test]
+    fn delivery_observer_sees_default_ignored_signal() {
+        if !ptrace_available() {
+            eprintln!("delivery pin: ptrace denied, skipping live leg");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("osslscope-l5e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let witness_log = dir.join("signal-witness.jsonl");
+        let sleeper = spawn_sleeper();
+        let wlog = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&witness_log)
+            .unwrap();
+        let mut obs = Observer {
+            log: wlog,
+            traced: HashSet::new(),
+            pending_initial: HashSet::new(),
+            pending_options: HashSet::new(),
+            last_sender: HashMap::new(),
+        };
+        assert!(matches!(
+            obs.seize_or_adopt(sleeper, true),
+            SeizeOutcome::Seized
+        ));
+        // SAFETY: kill our own sleeper (SIGURG default-ignored).
+        assert_eq!(unsafe { libc::kill(sleeper, libc::SIGURG) }, 0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let mut status = 0;
+            // SAFETY: waitpid with a valid status pointer.
+            let got = unsafe { libc::waitpid(-1, &mut status, libc::__WALL | libc::WNOHANG) };
+            if got == sleeper {
+                obs.handle_wait(got, status);
+            } else if got <= 0 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+        drop(obs);
+        let text = std::fs::read_to_string(&witness_log).unwrap();
+        let entries: Vec<WitnessEntry> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(entries.len(), 1, "witness log:\n{text}");
+        assert_eq!(entries[0].kind, WitnessKind::Delivery);
+        assert_eq!(entries[0].target_pid, sleeper);
+        assert_eq!(entries[0].signo, libc::SIGURG);
+        // SAFETY: getpid for the expected si_pid.
+        assert_eq!(entries[0].sender_pid, Some(unsafe { libc::getpid() }));
+        // SAFETY: kill our own sleeper; reap everything.
+        unsafe {
+            libc::kill(sleeper, libc::SIGKILL);
+        }
+        drain_reap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// F8c launcher semantics: a clean suspect exits the tracer 0
+    /// with an empty log, and the suspect-pid file names the
+    /// (reaped) suspect pid honestly.
+    #[test]
+    fn attempt_tracer_clean_suspect_empty_log() {
+        if !ptrace_available() {
+            eprintln!("attempt-tracer: ptrace denied, skipping live leg");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("osslscope-l5b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("attempt.jsonl");
+        let pidfile = dir.join("suspect.pid");
+        let cfg = AttemptTracerConfig {
+            log_path: log.clone(),
+            suspect_pid_file: Some(pidfile.clone()),
+            argv: vec!["true".to_string()],
+        };
+        assert_eq!(run_attempt_tracer(&cfg), 0);
+        assert!(std::fs::read_to_string(&log).unwrap().is_empty());
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(pid > 0);
+        // SAFETY: existence probe on the reaped suspect.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

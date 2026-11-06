@@ -143,6 +143,7 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "alias-audit" => crate::aliases::run(&argv[1..]),
         "service" => crate::service::run(&argv[1..]),
         "service-witness" => crate::service::witness_cli::run(&argv[1..]),
+        "service-attempt-trace" => crate::service::witness_cli::run_trace(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
         "check" => crate::check::run(&argv[1..]),
         "help" | "--help" | "-h" => {

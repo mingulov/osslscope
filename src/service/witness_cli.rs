@@ -21,11 +21,13 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::service::witness::{
-    ExternalEvent, HarnessSend, ObserverConfig, OracleInput, SignalVerdict, WitnessEntry,
-    adjudicate, run_observer,
+    AttemptRecord, AttemptTracerConfig, ExternalEvent, HarnessSend, ObserverConfig, OracleInput,
+    SignalVerdict, WitnessEntry, adjudicate, run_attempt_tracer, run_observer,
 };
 
-const HELP: &str = "usage: osslscope service-witness --log PATH (--cgroup DIR | --pid N [--pid N...]) [--signal-test PID,SIGNO]\n       osslscope service-witness --adjudicate --log PATH --timeline PATH\n\nharness-side signal observer (6B §9/L5). Observe mode seizes the workload\ncgroup/pids via PTRACE_SEIZE and appends signal-witness.jsonl entries;\nadjudicate mode judges the log against the harness timeline.\n\ntimeline JSON: { harness_pid, observer_pid, service_pids[], workload[],\n  canary[], quiet_window:[start_ns,end_ns], sends[], external_events[] }\nverdict JSON: { verdict: pass|fail|void, detail, annotated }\nadjudicate exits: 0 pass, 1 fail, 4 void (rerun), 2 usage/unreadable input.";
+const HELP: &str = "usage: osslscope service-witness --log PATH (--cgroup DIR | --pid N [--pid N...]) [--signal-test PID,SIGNO]\n       osslscope service-witness --adjudicate --log PATH --timeline PATH\n\nharness-side signal observer (6B §9/L5). Observe mode seizes the workload\ncgroup/pids via PTRACE_SEIZE and appends signal-witness.jsonl entries;\nadjudicate mode judges the log against the harness timeline.\n\ntimeline JSON: { harness_pid, observer_pid, service_pids[], workload[],\n  canary[], quiet_window:[start_ns,end_ns], sends[], external_events[] }\nverdict JSON: { verdict: pass|fail|void, detail, annotated }\nadjudicate exits: 0 pass, 1 fail, 4 void (rerun), 2 usage/unreadable input.\nadjudicate also takes [--attempt-log PATH] (F8c independent attempt\nevidence; absent = no attempt evidence — uncorroborated self-reports\nthen VOID).";
+
+const TRACE_HELP: &str = "usage: osslscope service-attempt-trace --log PATH [--suspect-pid-file PATH] -- CMD [ARGS...]\n\nharness-side signal-attempt tracer (6B L5/F8c). Supervises a suspect\ncommand under a seccomp RET_TRACE filter on the kill family and\nappends attempt-witness.jsonl entries, one per traced send.\nExits 0 (supervised to completion), 2 (usage/spawn failure),\n3 (supervision hole — attempt evidence void).";
 
 fn refuse(msg: &str) -> ExitCode {
     crate::report::err_line(&format!("osslscope service-witness: {msg}"));
@@ -118,6 +120,59 @@ fn parse_observe(argv: &[String]) -> Result<ObserveArgs, String> {
     })
 }
 
+/// Parsed `service-attempt-trace` arguments (pure — unit-tested).
+#[derive(Debug, PartialEq, Eq)]
+struct AttemptTraceArgs {
+    log: PathBuf,
+    suspect_pid_file: Option<PathBuf>,
+    argv: Vec<String>,
+}
+
+fn parse_attempt_trace(argv: &[String]) -> Result<AttemptTraceArgs, String> {
+    let mut log: Option<PathBuf> = None;
+    let mut suspect_pid_file: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--log" => {
+                i += 1;
+                let v = argv.get(i).ok_or("--log needs a path")?;
+                if log.is_some() {
+                    return Err("service-attempt-trace takes at most one --log".to_string());
+                }
+                log = Some(PathBuf::from(v));
+            }
+            "--suspect-pid-file" => {
+                i += 1;
+                let v = argv.get(i).ok_or("--suspect-pid-file needs a path")?;
+                if suspect_pid_file.is_some() {
+                    return Err(
+                        "service-attempt-trace takes at most one --suspect-pid-file".to_string()
+                    );
+                }
+                suspect_pid_file = Some(PathBuf::from(v));
+            }
+            "--" => {
+                let rest = argv[i + 1..].to_vec();
+                if rest.is_empty() {
+                    return Err(
+                        "service-attempt-trace needs a suspect command after --".to_string()
+                    );
+                }
+                let log = log.ok_or("--log is required")?;
+                return Ok(AttemptTraceArgs {
+                    log,
+                    suspect_pid_file,
+                    argv: rest,
+                });
+            }
+            other => return Err(format!("service-attempt-trace: unknown flag {other:?}")),
+        }
+        i += 1;
+    }
+    Err("service-attempt-trace needs -- CMD...".to_string())
+}
+
 /// Harness-timeline JSON (harness-written; see `HELP`).
 #[derive(Debug, serde::Deserialize)]
 struct Timeline {
@@ -148,8 +203,32 @@ fn read_witness_log(path: &std::path::Path) -> Result<Vec<WitnessEntry>, String>
     Ok(out)
 }
 
-fn adjudicate_files(log: &std::path::Path, timeline: &std::path::Path) -> Result<ExitCode, String> {
+fn read_attempt_log(path: &std::path::Path) -> Result<Vec<AttemptRecord>, String> {
+    let text =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read attempt log: {e}"))?;
+    let mut out = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        out.push(
+            serde_json::from_str::<AttemptRecord>(line)
+                .map_err(|e| format!("attempt log line {}: {e}", n + 1))?,
+        );
+    }
+    Ok(out)
+}
+
+fn adjudicate_files_with_attempts(
+    log: &std::path::Path,
+    timeline: &std::path::Path,
+    attempt_log: Option<&std::path::Path>,
+) -> Result<ExitCode, String> {
     let witness = read_witness_log(log)?;
+    let attempts = match attempt_log {
+        Some(p) => read_attempt_log(p)?,
+        None => Vec::new(),
+    };
     let raw =
         std::fs::read_to_string(timeline).map_err(|e| format!("cannot read timeline: {e}"))?;
     let tl: Timeline =
@@ -159,6 +238,7 @@ fn adjudicate_files(log: &std::path::Path, timeline: &std::path::Path) -> Result
     let service: HashSet<i32> = tl.service_pids.into_iter().collect();
     let input = OracleInput {
         witness: &witness,
+        attempts: &attempts,
         harness_sends: &tl.sends,
         harness_pid: tl.harness_pid,
         observer_pid: tl.observer_pid,
@@ -191,6 +271,7 @@ pub fn run(argv: &[String]) -> ExitCode {
     if argv.first().is_some_and(|a| a == "--adjudicate") {
         let mut log: Option<PathBuf> = None;
         let mut timeline: Option<PathBuf> = None;
+        let mut attempt_log: Option<PathBuf> = None;
         let mut i = 1;
         while i < argv.len() {
             match argv[i].as_str() {
@@ -208,6 +289,13 @@ pub fn run(argv: &[String]) -> ExitCode {
                     };
                     timeline = Some(PathBuf::from(v));
                 }
+                "--attempt-log" => {
+                    i += 1;
+                    let Some(v) = argv.get(i) else {
+                        return refuse("--attempt-log needs a path");
+                    };
+                    attempt_log = Some(PathBuf::from(v));
+                }
                 other => return refuse(&format!("service-witness: unknown flag {other:?}")),
             }
             i += 1;
@@ -215,7 +303,8 @@ pub fn run(argv: &[String]) -> ExitCode {
         let (Some(log), Some(timeline)) = (log, timeline) else {
             return refuse("--adjudicate needs --log PATH --timeline PATH");
         };
-        return adjudicate_files(&log, &timeline).unwrap_or_else(|e| refuse(&e));
+        return adjudicate_files_with_attempts(&log, &timeline, attempt_log.as_deref())
+            .unwrap_or_else(|e| refuse(&e));
     }
     match parse_observe(argv) {
         Ok(args) => run_observer(&ObserverConfig {
@@ -225,6 +314,31 @@ pub fn run(argv: &[String]) -> ExitCode {
             signal_test: args.signal_test,
         }),
         Err(e) => refuse(&e),
+    }
+}
+
+/// `service-attempt-trace --log PATH [--suspect-pid-file PATH] --
+/// CMD...`: supervise a suspect under the kill-family seccomp
+/// filter to completion. Exits 0 (log complete), 2 (usage/spawn
+/// failure), or 3 (supervision hole — attempt evidence void).
+pub fn run_trace(argv: &[String]) -> ExitCode {
+    if argv.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{TRACE_HELP}");
+        return ExitCode::from(0);
+    }
+    match parse_attempt_trace(argv) {
+        Ok(args) => {
+            let rc = run_attempt_tracer(&AttemptTracerConfig {
+                log_path: args.log,
+                suspect_pid_file: args.suspect_pid_file,
+                argv: args.argv,
+            });
+            ExitCode::from(rc as u8)
+        }
+        Err(e) => {
+            crate::report::err_line(&format!("osslscope service-attempt-trace: {e}"));
+            ExitCode::from(2)
+        }
     }
 }
 
@@ -292,7 +406,7 @@ mod tests {
             "{\"at_ns\":500,\"signo\":10,\"sender_pid\":100,\"target_pid\":21,\"uncertain\":false,\"kind\":\"delivery\"}\n",
         );
         let tl = write_temp(&dir, "t.json", &timeline_json().to_string());
-        let code = adjudicate_files(&log, &tl).expect("adjudicate");
+        let code = adjudicate_files_with_attempts(&log, &tl, None).expect("adjudicate");
         assert_eq!(code, ExitCode::from(0));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -313,7 +427,7 @@ mod tests {
         let mut tl = timeline_json();
         tl["service_pids"] = serde_json::json!([300, 301]);
         let tlp = write_temp(&dir, "t.json", &tl.to_string());
-        let code = adjudicate_files(&log, &tlp).expect("adjudicate");
+        let code = adjudicate_files_with_attempts(&log, &tlp, None).expect("adjudicate");
         assert_eq!(code, ExitCode::from(1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -321,10 +435,59 @@ mod tests {
     #[test]
     fn adjudicate_rejects_unreadable_input() {
         let missing = PathBuf::from("/nonexistent-witness-cli/missing.jsonl");
-        assert!(adjudicate_files(&missing, &missing).is_err());
+        assert!(adjudicate_files_with_attempts(&missing, &missing, None).is_err());
         assert_eq!(
             run(&argv(&["--adjudicate", "--log", "a"])),
             ExitCode::from(2)
         );
+    }
+
+    #[test]
+    fn attempt_trace_parses_cmd() {
+        let args = parse_attempt_trace(&argv(&[
+            "--log",
+            "a.jsonl",
+            "--suspect-pid-file",
+            "s.pid",
+            "--",
+            "sh",
+            "-c",
+            "true",
+        ]))
+        .expect("parse");
+        assert_eq!(args.log, PathBuf::from("a.jsonl"));
+        assert_eq!(args.suspect_pid_file, Some(PathBuf::from("s.pid")));
+        assert_eq!(args.argv, vec!["sh", "-c", "true"]);
+    }
+
+    #[test]
+    fn attempt_trace_requires_log_separator_and_cmd() {
+        assert!(parse_attempt_trace(&argv(&["--", "true"])).is_err());
+        assert!(parse_attempt_trace(&argv(&["--log", "a.jsonl", "true"])).is_err());
+        assert!(parse_attempt_trace(&argv(&["--log", "a.jsonl", "--"])).is_err());
+        assert!(parse_attempt_trace(&argv(&["--log", "a.jsonl", "--nope", "1"])).is_err());
+    }
+
+    #[test]
+    fn adjudicate_with_attempt_log_leg() {
+        // Canary positive control proved (delivery present) while the
+        // attempt channel caught a suspect→workload send ⟹ FAIL.
+        let dir = std::env::temp_dir().join(format!("witness-cli-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = write_temp(
+            &dir,
+            "w.jsonl",
+            "{\"at_ns\":500,\"signo\":10,\"sender_pid\":100,\"target_pid\":21,\"uncertain\":false,\"kind\":\"delivery\"}\n",
+        );
+        let attempt_log = write_temp(
+            &dir,
+            "a.jsonl",
+            "{\"at_ns\":600,\"sender_pid\":200,\"sender_comm\":\"osslscope\",\"syscall\":\"kill\",\"syscall_nr\":62,\"target_pid\":11,\"signo\":23,\"result\":0}\n",
+        );
+        let tl = write_temp(&dir, "t.json", &timeline_json().to_string());
+        let code =
+            adjudicate_files_with_attempts(&log, &tl, Some(&attempt_log)).expect("adjudicate");
+        assert_eq!(code, ExitCode::from(1));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
