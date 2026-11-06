@@ -44,6 +44,15 @@ EOF
 chmod +x "$T/stubbin/setcap"
 export SETCAP_LOG="$T/setcap.log"
 
+# --- stub systemctl: logs argv, exit code controlled by STUB_SYSTEMCTL_EXIT ---
+cat >"$T/stubbin/systemctl" <<'EOF'
+#!/bin/sh
+echo "$*" >>"$SYSTEMCTL_LOG"
+exit "${STUB_SYSTEMCTL_EXIT:-0}"
+EOF
+chmod +x "$T/stubbin/systemctl"
+export SYSTEMCTL_LOG="$T/systemctl.log"
+
 # Extract one %section body from the spec into a runnable sh file.
 extract_spec_section() {
     # $1 = section name (post|preun|posttrans), $2 = output file
@@ -198,6 +207,62 @@ if run_with_stub sh "$PRERM" deconfigure 2>"$T/err"; then
         || bad "deb prerm deconfigure clears caps"
 else
     bad "deb prerm deconfigure exits 0 (got nonzero)"
+fi
+
+# ============ deb unit lifecycle (F8b) ============
+: >"$SYSTEMCTL_LOG"
+if run_with_stub sh "$POSTINST" configure 2>"$T/err"; then
+    if grep -q '^daemon-reload$' "$SYSTEMCTL_LOG" 2>/dev/null; then
+        ok "deb postinst configure daemon-reloads (new unit is startable)"
+    else
+        bad "deb postinst configure daemon-reloads (saw: $(cat "$SYSTEMCTL_LOG" 2>/dev/null))"
+    fi
+    if grep -q 'enable' "$SYSTEMCTL_LOG" 2>/dev/null; then
+        bad "deb postinst installs but never enables (saw enable call)"
+    else
+        ok "deb postinst installs but never enables"
+    fi
+else
+    bad "deb postinst configure exits 0 (got nonzero)"
+fi
+
+: >"$SYSTEMCTL_LOG"
+if STUB_SYSTEMCTL_EXIT=1 run_with_stub sh "$POSTINST" configure 2>"$T/err"; then
+    if grep -q '^daemon-reload$' "$SYSTEMCTL_LOG" 2>/dev/null; then
+        ok "deb postinst with failing systemctl still reload-attempts, exit 0"
+    else
+        bad "deb postinst with failing systemctl still reload-attempts, exit 0"
+    fi
+else
+    bad "deb postinst with failing systemctl still exits 0 (got nonzero)"
+fi
+
+: >"$SYSTEMCTL_LOG"
+: >"$SETCAP_LOG"
+if run_with_stub sh "$PRERM" remove 2>"$T/err"; then
+    grep -q '^stop osslscope-service$' "$SYSTEMCTL_LOG" 2>/dev/null \
+        && ok "deb prerm remove stops the unit best-effort" \
+        || bad "deb prerm remove stops the unit best-effort (saw: $(cat "$SYSTEMCTL_LOG" 2>/dev/null))"
+else
+    bad "deb prerm remove exits 0 (got nonzero)"
+fi
+
+: >"$SYSTEMCTL_LOG"
+if STUB_SYSTEMCTL_EXIT=1 run_with_stub sh "$PRERM" remove 2>"$T/err"; then
+    ok "deb prerm remove with failing systemctl still exits 0"
+else
+    bad "deb prerm remove with failing systemctl still exits 0 (got nonzero)"
+fi
+
+: >"$SYSTEMCTL_LOG"
+if run_with_stub sh "$PRERM" upgrade 2>"$T/err"; then
+    if [ ! -s "$SYSTEMCTL_LOG" ]; then
+        ok "deb prerm upgrade leaves the running unit alone (no systemctl call)"
+    else
+        bad "deb prerm upgrade leaves the running unit alone (saw: $(cat "$SYSTEMCTL_LOG"))"
+    fi
+else
+    bad "deb prerm upgrade exits 0 (got nonzero)"
 fi
 
 # ============ rpm matrix (bodies extracted from spec) ============

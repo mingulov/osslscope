@@ -1,0 +1,22 @@
+# D-record §1.4 frozen — changes need a §1.4 amendment (+ minor bump).
+[Unit]
+Description=osslscope continuous OpenSSL observer service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/osslscope service --config /etc/osslscope/service.toml
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=4
+StateDirectory=osslscope
+# +CAP_SYS_PTRACE: §1.4 grants it iff foreign-uid targets are
+# selected. The unit runs as root, so any non-root target is
+# foreign — the shipped unit carries it. Drop it only when every
+# target runs as root.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
+
+[Install]
+WantedBy=multi-user.target

@@ -254,6 +254,28 @@ def archive_tree(root, output, epoch, base=''):
                 archive.addfile(info, stream if info.isfile() else None)
 
 
+def stage_deb_service_files(stage):
+    """Stage the §1.4 installed-service payload into a deb tree.
+
+    The unit + default config ship as payload; the config is a
+    conffile so admin (and qual) target selections survive
+    upgrades. Inputs are the exact `packaging/deb/*` sources the
+    freeze tests pin — never generated here.
+    """
+    unit = stage/'lib/systemd/system/osslscope-service.service'
+    unit.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ROOT/'packaging/deb/osslscope-service.service', unit)
+    unit.chmod(0o644)
+    config = stage/'etc/osslscope/service.toml'
+    config.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(ROOT/'packaging/deb/service.toml', config)
+    config.chmod(0o644)
+    control = stage/'DEBIAN'
+    control.mkdir(mode=0o755, exist_ok=True)
+    (control/'conffiles').write_text('/etc/osslscope/service.toml\n')
+    (control/'conffiles').chmod(0o644)
+
+
 def package_deb(stage, output, version, revision, epoch):
     control = stage/'DEBIAN'
     control.mkdir(mode=0o755)
@@ -265,6 +287,7 @@ def package_deb(stage, output, version, revision, epoch):
     for name in ('postinst', 'prerm'):
         shutil.copyfile(ROOT/'packaging/deb/DEBIAN'/name, control/name)
         (control/name).chmod(0o755)
+    stage_deb_service_files(stage)
     env = dict(os.environ, SOURCE_DATE_EPOCH=str(epoch))
     run(['dpkg-deb', '--build', '--root-owner-group', str(stage), str(output)], env=env)
 

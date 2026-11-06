@@ -1,0 +1,39 @@
+# Default osslscope service configuration (D-record §§1.3–1.4).
+#
+# The package installs this file but never enables the unit: pick a
+# target selection below, then `systemctl enable --now
+# osslscope-service`. Without a selection the service refuses loudly
+# (exit 2 `service requires at least one of --pid/--cgroup`) — it
+# never runs an observe-nothing service.
+#
+# Scalar keys use the CLI flag spellings kebab-cased; times are
+# float seconds (same ranges as CLI §1.2). Explicit CLI flags
+# override these values; `pid`/`module` concatenate across CLI and
+# file. Unknown keys refuse (exit 2).
+version = 1
+window = 30
+interval = 1
+timeout = 60
+grace = 5
+format = "json"
+queue-bytes = 1048576
+queue-events = 1024
+rotate-bytes = 67108864
+rotate-interval = 3600
+retain-windows = 2880
+retain-bytes = 1073741824
+# §1.4: the StateDirectory out-DIR. The unit runs root with a
+# CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE bounding set (no DAC override),
+# so the out-DIR must stay root-writable — keep this default unless
+# the replacement is writable by the service.
+out = "/var/lib/osslscope/windows"
+# Target selection (exactly one shape — pick ONE):
+# Observe explicit PIDs (repeatable across restarts only while the
+# PIDs live; prefer `cgroup` for durable selections):
+# pid = [1234, 5678]
+# Observe every process in one cgroup (durable across exec/fork):
+# cgroup = "/sys/fs/cgroup/my-workload"
+# Optional policy + stream tap (paths must be readable/writable by
+# the service as above):
+# policy = "/etc/osslscope/policy.toml"
+# stream = "/var/lib/osslscope/stream.jsonl"

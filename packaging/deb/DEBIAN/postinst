@@ -14,6 +14,12 @@ case "$1" in
     else
       echo "osslscope: setcap not found (install libcap2-bin); fallback (labeled sudo): run 'sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope' then 'osslscope doctor'." >&2
     fi
+    # §1.4: the new unit must be startable right after install —
+    # reload best-effort (never fail install). Install only: never
+    # enable here (the admin enables after configuring targets).
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
     ;;
 esac
 exit 0

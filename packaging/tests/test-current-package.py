@@ -4,6 +4,7 @@
 import hashlib
 import contextlib
 import io
+import shutil
 import sys
 from unittest.mock import patch
 import importlib.util
@@ -234,6 +235,77 @@ class CurrentPackage(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.builder.stage_artifacts(self.root/'stage', '/usr', self.manifest, artifacts)
         self.assertFalse((self.root/'stage/share/osslscope/install-manifest.json').exists())
+
+    def test_deb_service_files_stage_frozen_unit_config_and_conffiles(self):
+        # F8b: the deb carries the frozen §1.4 unit, the default
+        # service config (a conffile: admin edits survive upgrades),
+        # and the conffiles control entry.
+        deb_stage = self.root/'deb'
+        (deb_stage/'usr').mkdir(parents=True)
+        (deb_stage/'DEBIAN').mkdir()
+        self.builder.stage_deb_service_files(deb_stage)
+        unit = deb_stage/'lib/systemd/system/osslscope-service.service'
+        self.assertTrue(unit.is_file())
+        self.assertEqual(unit.read_bytes(), FROZEN_UNIT)
+        self.assertEqual(unit.stat().st_mode & 0o777, 0o644)
+        config = deb_stage/'etc/osslscope/service.toml'
+        text = config.read_text()
+        self.assertIn('version = 1', text.splitlines())
+        self.assertIn('out = "/var/lib/osslscope/windows"', text.splitlines())
+        self.assertEqual(config.stat().st_mode & 0o777, 0o644)
+        conffiles = deb_stage/'DEBIAN/conffiles'
+        self.assertEqual(conffiles.read_text(), '/etc/osslscope/service.toml\n')
+        self.assertEqual(conffiles.stat().st_mode & 0o777, 0o644)
+
+    def test_deb_build_contains_service_payload(self):
+        # Full dpkg-deb assembly with synthetic ELFs: the unit and
+        # config are installed payload, the conffile is declared.
+        artifacts = self.builder.select_artifacts(self.manifest, 'a'*40, 'b'*40)
+        stage = self.root/'prefix'
+        self.builder.stage_artifacts(stage, '/usr', self.manifest, artifacts)
+        deb_stage = self.root/'deb'
+        (deb_stage/'usr').mkdir(parents=True)
+        shutil.copytree(stage, deb_stage/'usr', dirs_exist_ok=True)
+        out = self.root/'osslscope_0.5.0-1_amd64.deb'
+        self.builder.package_deb(deb_stage, out, '0.5.0', '1', 1)
+        listing = subprocess.run(['dpkg-deb', '-c', str(out)], capture_output=True, text=True)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertIn('./lib/systemd/system/osslscope-service.service', listing.stdout)
+        self.assertIn('./etc/osslscope/service.toml', listing.stdout)
+        ctrl = self.root/'ctrl'
+        ctrl.mkdir()
+        extract = subprocess.run(['dpkg-deb', '-e', str(out), str(ctrl)], capture_output=True, text=True)
+        self.assertEqual(extract.returncode, 0, extract.stderr)
+        self.assertEqual((ctrl/'conffiles').read_text(), '/etc/osslscope/service.toml\n')
+
+
+#: Frozen D-record §1.4 unit bytes (mirrors the Rust freeze test in
+#: tests/service_packaging.rs — both must change only via a §1.4
+#: amendment). Module-level so the constant is importable.
+FROZEN_UNIT = (
+    "# D-record §1.4 frozen — changes need a §1.4 amendment (+ minor bump).\n"
+    "[Unit]\n"
+    "Description=osslscope continuous OpenSSL observer service\n"
+    "StartLimitIntervalSec=300\n"
+    "StartLimitBurst=5\n"
+    "\n"
+    "[Service]\n"
+    "Type=simple\n"
+    "ExecStart=/usr/bin/osslscope service --config /etc/osslscope/service.toml\n"
+    "ExecReload=/bin/kill -HUP $MAINPID\n"
+    "Restart=on-failure\n"
+    "RestartSec=5\n"
+    "RestartPreventExitStatus=4\n"
+    "StateDirectory=osslscope\n"
+    "# +CAP_SYS_PTRACE: §1.4 grants it iff foreign-uid targets are\n"
+    "# selected. The unit runs as root, so any non-root target is\n"
+    "# foreign — the shipped unit carries it. Drop it only when every\n"
+    "# target runs as root.\n"
+    "CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE\n"
+    "\n"
+    "[Install]\n"
+    "WantedBy=multi-user.target\n"
+).encode()
 
 
 if __name__ == '__main__':

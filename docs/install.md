@@ -112,6 +112,42 @@ reviewed runtime source components; see [packaging](../packaging/README.md) for
 format selection, prefix binding, prerequisites and installed acceptance gates.
 Construction/extraction does not establish platform support or release readiness.
 
+## Installed service (DEB)
+
+The DEB ships the D-record §1.4 installed-service layout:
+
+- `/lib/systemd/system/osslscope-service.service` — the frozen unit
+  (runs `/usr/bin/osslscope service --config
+  /etc/osslscope/service.toml` as root with a
+  `CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE` bounding set; windows land in
+  the `StateDirectory` out-DIR below).
+- `/etc/osslscope/service.toml` — the default service config (a
+  conffile: edits survive upgrades). It pins the code-default
+  timings and `out = "/var/lib/osslscope/windows"` but selects NO
+  targets: without a `pid`/`cgroup` selection the service refuses
+  loudly instead of observing nothing.
+- `/var/lib/osslscope/windows` — created at first start
+  (`StateDirectory` + service-side creation); window files,
+  `sequence.json`, `run-summary.json`, and the stream tap (when
+  configured) live here.
+
+The package installs but never enables the unit. To run it, select
+targets in `/etc/osslscope/service.toml`, then:
+
+```sh
+sudo systemctl enable --now osslscope-service
+systemctl is-active osslscope-service
+sudo journalctl -u osslscope-service -n 20
+```
+
+Policy reloads go through `systemctl reload` (SIGHUP at the next
+window boundary). `Restart=on-failure` restarts abnormal deaths
+after 5 s; exit 4 (scope unavailable — nothing finalized, operator
+needed) holds the unit stopped, as does the start-rate backstop
+(5 starts per 300 s). Removing the package stops the unit and keeps
+both the conffile and the out-DIR; upgrades preserve a modified
+config and leave a running unit alone until it is restarted.
+
 ## Historical and deferred distribution
 
 `--libcrypto PATH` explicitly selects the historical v0.2 exact-profile Count

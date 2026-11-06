@@ -5,6 +5,12 @@
 set -e
 case "$1" in
   remove|deconfigure)
+    # §1.4: stop the unit before its binary goes away (best-effort;
+    # an already-stopped unit is a silent no-op). Upgrades leave
+    # the running unit alone (no branch here matches `upgrade`).
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl stop osslscope-service >/dev/null 2>&1 || true
+    fi
     if command -v setcap >/dev/null 2>&1; then
       setcap -r /usr/bin/osslscope 2>/dev/null || true
     fi
