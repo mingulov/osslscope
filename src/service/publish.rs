@@ -76,8 +76,8 @@ pub fn publish_window(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // THE ONE duplicate rule, streamed (R2 Gate 1): chunked
-            // byte-compare + bounded attempt-identity prefix scan —
+            // THE ONE duplicate rule, streamed (R3 Gate 1): chunked
+            // byte-compare + bounded attempt-identity streaming scan —
             // the existing window never loads whole.
             let step = match file_equals_bytes(&final_path, bytes) {
                 Ok(true) if attempt.matches_file(&final_path) => PublishStep::Converged,
@@ -209,8 +209,8 @@ pub fn publish_window_streaming(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // THE ONE duplicate rule, streamed (R2 Gate 1): chunked
-            // byte-compare + bounded attempt-identity prefix scan —
+            // THE ONE duplicate rule, streamed (R3 Gate 1): chunked
+            // byte-compare + bounded attempt-identity streaming scan —
             // neither the compare nor the identity holds the window.
             let step = match files_equal_chunked(&tmp, &final_path) {
                 Ok(true) if attempt.matches_file(&final_path) => PublishStep::Converged,
@@ -327,7 +327,7 @@ pub fn publish_window_detailed(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Streamed duplicate rule (R2 Gate 1 — same as above).
+            // Streamed duplicate rule (R3 Gate 1 — same as above).
             let step = match file_equals_bytes(&final_path, bytes) {
                 Ok(true) if attempt.matches_file(&final_path) => PublishStep::Converged,
                 Ok(_) => PublishStep::IntegrityRefusal,
@@ -367,49 +367,116 @@ pub struct AttemptKey {
     pub boot_id: String,
 }
 
-/// Bounded attempt-identity scan ceiling (one streaming
-/// buffer — `seq` + `run_id` open every envelope, so the
-/// prefix always holds them; anything beyond fails closed to
-/// refusal, never a whole-window read).
-pub const ATTEMPT_SCAN_MAX_BYTES: u64 = PUBLISH_BUF_BYTES as u64;
+/// Bounded attempt-identity scan chunk (one streaming buffer —
+/// the scan streams the file in chunks, so identity is reached
+/// past arbitrarily large preceding values with O(chunk) memory,
+/// never a whole-window read).
+pub const ATTEMPT_SCAN_CHUNK_BYTES: usize = PUBLISH_BUF_BYTES;
 
-/// Extract `(seq, pid, starttime, boot_id)` from a JSON prefix
-/// without parsing the whole document (minimal top-level parser:
-/// `seq` at depth 1, `run_id.{pid,starttime,boot_id}` at depth 2;
-/// any truncation, syntax error, or non-integer shape is `None` —
-/// refusal, never a skip). Early-exits once all four fields land,
-/// so large `members`/`crypto_watch`/`document` tails never load.
-fn extract_attempt_prefix(buf: &[u8]) -> Option<(u64, u64, u64, String)> {
-    fn ws(b: &[u8], p: &mut usize) {
-        while *p < b.len() && matches!(b[*p], b' ' | b'\n' | b'\r' | b'\t') {
-            *p += 1;
+/// One 8 KiB string-accumulation ceiling (identity strings and
+/// keys — anything beyond fails closed to refusal).
+const ATTEMPT_STR_MAX: usize = 8192;
+
+/// Chunked streaming byte reader (one bounded buffer + one byte
+/// of pushback — the scanned file never loads whole; any IO
+/// error reads as EOF, which fails closed downstream).
+struct ScanReader<R> {
+    inner: R,
+    buf: Vec<u8>,
+    pos: usize,
+    len: usize,
+    eof: bool,
+    pushback: Option<u8>,
+}
+
+impl<R: std::io::Read> ScanReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buf: vec![0u8; ATTEMPT_SCAN_CHUNK_BYTES],
+            pos: 0,
+            len: 0,
+            eof: false,
+            pushback: None,
         }
     }
-    fn parse_string(b: &[u8], p: &mut usize) -> Option<String> {
-        if *p >= b.len() || b[*p] != b'"' {
-            return None;
+
+    fn next_byte(&mut self) -> Option<u8> {
+        if let Some(b) = self.pushback.take() {
+            return Some(b);
         }
-        *p += 1;
-        let mut out = String::new();
-        while *p < b.len() {
-            let c = b[*p];
-            if c == b'"' {
-                *p += 1;
-                return Some(out);
-            }
-            if c != b'\\' {
-                if c < 0x20 {
-                    return None;
-                }
-                out.push(c as char);
-                *p += 1;
-                continue;
-            }
-            *p += 1;
-            if *p >= b.len() {
+        if self.pos >= self.len {
+            if self.eof {
                 return None;
             }
-            match b[*p] {
+            match self.inner.read(&mut self.buf) {
+                Ok(0) => {
+                    self.eof = true;
+                    return None;
+                }
+                Ok(n) => {
+                    self.pos = 0;
+                    self.len = n;
+                }
+                Err(_) => {
+                    self.eof = true;
+                    return None;
+                }
+            }
+        }
+        let b = self.buf[self.pos];
+        self.pos += 1;
+        Some(b)
+    }
+
+    fn unread(&mut self, b: u8) {
+        debug_assert!(self.pushback.is_none());
+        self.pushback = Some(b);
+    }
+}
+
+/// Skip JSON whitespace (EOF simply ends the skip — the caller
+/// treats a missing expected byte as refusal).
+fn scan_ws<R: std::io::Read>(rd: &mut ScanReader<R>) {
+    loop {
+        match rd.next_byte() {
+            Some(b' ' | b'\n' | b'\r' | b'\t') => {}
+            Some(b) => {
+                rd.unread(b);
+                return;
+            }
+            None => return,
+        }
+    }
+}
+
+/// Expect one exact byte after optional whitespace.
+fn scan_expect<R: std::io::Read>(rd: &mut ScanReader<R>, want: u8) -> Option<()> {
+    scan_ws(rd);
+    if rd.next_byte() == Some(want) {
+        Some(())
+    } else {
+        None
+    }
+}
+
+/// Parse one JSON string (the opening quote already consumed):
+/// escapes incl. `\u`, control chars rejected, accumulation
+/// capped (anything beyond fails closed to refusal).
+fn scan_string<R: std::io::Read>(rd: &mut ScanReader<R>) -> Option<String> {
+    let mut out = String::new();
+    loop {
+        let c = rd.next_byte()?;
+        if c == b'"' {
+            return Some(out);
+        }
+        if c != b'\\' {
+            if c < 0x20 {
+                return None;
+            }
+            out.push(c as char);
+        } else {
+            match rd.next_byte()? {
                 b'"' => out.push('"'),
                 b'\\' => out.push('\\'),
                 b'/' => out.push('/'),
@@ -419,130 +486,147 @@ fn extract_attempt_prefix(buf: &[u8]) -> Option<(u64, u64, u64, String)> {
                 b'r' => out.push('\r'),
                 b't' => out.push('\t'),
                 b'u' => {
-                    if *p + 4 >= b.len() {
-                        return None;
+                    let mut hex = [0u8; 4];
+                    for slot in hex.iter_mut() {
+                        *slot = rd.next_byte()?;
                     }
-                    let hex = std::str::from_utf8(&b[*p + 1..*p + 5]).ok()?;
+                    let hex = std::str::from_utf8(&hex).ok()?;
                     let cp = u32::from_str_radix(hex, 16).ok()?;
-                    *p += 4;
                     out.push(char::from_u32(cp)?);
                 }
                 _ => return None,
             }
-            *p += 1;
-            if out.len() > 8192 {
-                return None;
-            }
         }
-        None
-    }
-    fn parse_u64(b: &[u8], p: &mut usize) -> Option<u64> {
-        ws(b, p);
-        let s = *p;
-        while *p < b.len() && b[*p].is_ascii_digit() {
-            *p += 1;
-        }
-        if s == *p || *p - s > 20 {
+        if out.len() > ATTEMPT_STR_MAX {
             return None;
         }
-        // A JSON float/exponent/negative is not an integer identity.
-        if *p < b.len() && matches!(b[*p], b'.' | b'e' | b'E' | b'-' | b'+') {
-            return None;
-        }
-        std::str::from_utf8(&b[s..*p]).ok()?.parse::<u64>().ok()
     }
-    /// Skip one JSON value starting at `*p` (caller already skipped
-    /// whitespace). Bounded by `buf.len()`; returns `None` on
-    /// truncation or syntax error.
-    fn skip_value(b: &[u8], p: &mut usize) -> Option<()> {
-        ws(b, p);
-        if *p >= b.len() {
-            return None;
-        }
-        match b[*p] {
-            b'"' => {
-                parse_string(b, p)?;
-                Some(())
-            }
-            b'{' | b'[' => {
-                let mut depth = 0usize;
-                let mut in_str = false;
-                let mut esc = false;
-                while *p < b.len() {
-                    let c = b[*p];
-                    if in_str {
-                        if esc {
-                            esc = false;
-                        } else if c == b'\\' {
-                            esc = true;
-                        } else if c == b'"' {
-                            in_str = false;
-                        }
-                        *p += 1;
-                        continue;
-                    }
-                    match c {
-                        b'"' => in_str = true,
-                        b'{' | b'[' => depth += 1,
-                        b'}' | b']' => {
-                            depth = depth.checked_sub(1)?;
-                            if depth == 0 {
-                                *p += 1;
-                                return Some(());
-                            }
-                        }
-                        _ => {}
-                    }
-                    *p += 1;
+}
+
+/// Parse one JSON integer identity (1–20 digits; a JSON
+/// float/exponent/negative is not an integer identity).
+fn scan_u64<R: std::io::Read>(rd: &mut ScanReader<R>) -> Option<u64> {
+    scan_ws(rd);
+    let mut digits = [0u8; 20];
+    let mut n = 0usize;
+    loop {
+        match rd.next_byte() {
+            Some(b) if b.is_ascii_digit() => {
+                if n >= digits.len() {
+                    return None;
                 }
-                None
+                digits[n] = b;
+                n += 1;
             }
-            b't' => {
-                if b.len() - *p >= 4 && &b[*p..*p + 4] == b"true" {
-                    *p += 4;
-                    Some(())
-                } else {
-                    None
-                }
+            Some(b) => {
+                rd.unread(b);
+                break;
             }
-            b'f' => {
-                if b.len() - *p >= 5 && &b[*p..*p + 5] == b"false" {
-                    *p += 5;
-                    Some(())
-                } else {
-                    None
-                }
-            }
-            b'n' => {
-                if b.len() - *p >= 4 && &b[*p..*p + 4] == b"null" {
-                    *p += 4;
-                    Some(())
-                } else {
-                    None
-                }
-            }
-            b'-' | b'0'..=b'9' => {
-                if b[*p] == b'-' {
-                    *p += 1;
-                }
-                let mut any = false;
-                while *p < b.len()
-                    && matches!(b[*p], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
-                {
-                    *p += 1;
-                    any = true;
-                }
-                if any { Some(()) } else { None }
-            }
-            _ => None,
+            None => break,
         }
     }
-    let mut p = 0usize;
-    ws(buf, &mut p);
-    if p >= buf.len() || buf[p] != b'{' {
+    if n == 0 {
         return None;
     }
-    p += 1;
+    // A JSON float/exponent/negative is not an integer identity.
+    match rd.next_byte() {
+        Some(b'.' | b'e' | b'E' | b'-' | b'+') => return None,
+        Some(b) => rd.unread(b),
+        None => {}
+    }
+    std::str::from_utf8(&digits[..n]).ok()?.parse::<u64>().ok()
+}
+
+/// Skip one JSON string body (the opening quote already
+/// consumed): escapes tracked, nothing accumulated.
+fn skip_string_body<R: std::io::Read>(rd: &mut ScanReader<R>) -> Option<()> {
+    let mut esc = false;
+    loop {
+        let c = rd.next_byte()?;
+        if esc {
+            esc = false;
+        } else if c == b'\\' {
+            esc = true;
+        } else if c == b'"' {
+            return Some(());
+        }
+    }
+}
+
+/// Skip one JSON value (caller need not skip whitespace first).
+/// Containers stream in chunks with O(1) extra state (depth +
+/// string/escape flags — arbitrarily large values pass with
+/// bounded memory); truncation or a malformed shape is `None`.
+fn skip_scan_value<R: std::io::Read>(rd: &mut ScanReader<R>) -> Option<()> {
+    scan_ws(rd);
+    match rd.next_byte()? {
+        b'"' => skip_string_body(rd),
+        b'{' | b'[' => {
+            let mut depth = 1usize;
+            let mut in_str = false;
+            let mut esc = false;
+            loop {
+                let c = rd.next_byte()?;
+                if in_str {
+                    if esc {
+                        esc = false;
+                    } else if c == b'\\' {
+                        esc = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                    continue;
+                }
+                match c {
+                    b'"' => in_str = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return Some(());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // Scalar (number/literal): consume to the delimiter (the
+        // caller consumes the delimiter itself).
+        b if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.') => {
+            loop {
+                match rd.next_byte() {
+                    Some(c) if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'+' | b'.') => {}
+                    Some(c) => {
+                        rd.unread(c);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            scan_ws(rd);
+            if let Some(c @ (b',' | b'}')) = rd.next_byte() {
+                rd.unread(c);
+                Some(())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Extract `(seq, pid, starttime, boot_id)` from a JSON document
+/// WITHOUT parsing it whole (R3 Gate 1: minimal top-level
+/// streaming parser — `seq` at depth 1,
+/// `run_id.{pid,starttime,boot_id}` at depth 2; large preceding
+/// values stream past in chunks with O(chunk) memory — identity
+/// is reached wherever it sits; any truncation, IO error, syntax
+/// error, or non-integer shape is `None` — refusal, never a
+/// skip). Early-exits once all four fields land. First occurrence
+/// wins (production renders each key once).
+fn extract_attempt_streaming<R: std::io::Read>(r: R) -> Option<(u64, u64, u64, String)> {
+    let mut rd = ScanReader::new(r);
+    scan_expect(&mut rd, b'{')?;
     let (mut seq, mut pid, mut start, mut boot): (
         Option<u64>,
         Option<u64>,
@@ -550,86 +634,59 @@ fn extract_attempt_prefix(buf: &[u8]) -> Option<(u64, u64, u64, String)> {
         Option<String>,
     ) = (None, None, None, None);
     loop {
-        ws(buf, &mut p);
-        if p >= buf.len() {
-            return None;
+        scan_ws(&mut rd);
+        match rd.next_byte()? {
+            b'}' => break,
+            b'"' => {}
+            _ => return None,
         }
-        if buf[p] == b'}' {
-            break;
-        }
-        let key = parse_string(buf, &mut p)?;
-        ws(buf, &mut p);
-        if p >= buf.len() || buf[p] != b':' {
-            return None;
-        }
-        p += 1;
-        if key == "seq" {
-            seq = Some(parse_u64(buf, &mut p)?);
+        let key = scan_string(&mut rd)?;
+        scan_expect(&mut rd, b':')?;
+        if key == "seq" && seq.is_none() {
+            seq = Some(scan_u64(&mut rd)?);
         } else if key == "run_id" {
-            ws(buf, &mut p);
-            if p >= buf.len() || buf[p] != b'{' {
-                return None;
-            }
-            p += 1;
+            scan_expect(&mut rd, b'{')?;
             loop {
-                ws(buf, &mut p);
-                if p >= buf.len() {
-                    return None;
+                scan_ws(&mut rd);
+                match rd.next_byte()? {
+                    b'}' => break,
+                    b'"' => {}
+                    _ => return None,
                 }
-                if buf[p] == b'}' {
-                    p += 1;
-                    break;
-                }
-                let rk = parse_string(buf, &mut p)?;
-                ws(buf, &mut p);
-                if p >= buf.len() || buf[p] != b':' {
-                    return None;
-                }
-                p += 1;
-                if rk == "pid" {
-                    pid = Some(parse_u64(buf, &mut p)?);
-                } else if rk == "starttime" {
-                    start = Some(parse_u64(buf, &mut p)?);
-                } else if rk == "boot_id" {
-                    ws(buf, &mut p);
-                    boot = Some(parse_string(buf, &mut p)?);
+                let rk = scan_string(&mut rd)?;
+                scan_expect(&mut rd, b':')?;
+                if rk == "pid" && pid.is_none() {
+                    pid = Some(scan_u64(&mut rd)?);
+                } else if rk == "starttime" && start.is_none() {
+                    start = Some(scan_u64(&mut rd)?);
+                } else if rk == "boot_id" && boot.is_none() {
+                    scan_ws(&mut rd);
+                    if rd.next_byte() != Some(b'"') {
+                        return None;
+                    }
+                    boot = Some(scan_string(&mut rd)?);
                 } else {
-                    skip_value(buf, &mut p)?;
+                    skip_scan_value(&mut rd)?;
                 }
-                ws(buf, &mut p);
-                if p >= buf.len() {
-                    return None;
-                }
-                if buf[p] == b',' {
-                    p += 1;
-                } else if buf[p] == b'}' {
-                    p += 1;
-                    break;
-                } else {
-                    return None;
-                }
-                if seq.is_some() && pid.is_some() && start.is_some() && boot.is_some() {
-                    let (s, q, t, o) = (seq.unwrap(), pid.unwrap(), start.unwrap(), boot.unwrap());
-                    return Some((s, q, t, o));
+                scan_ws(&mut rd);
+                match rd.next_byte()? {
+                    b',' => {}
+                    b'}' => break,
+                    _ => return None,
                 }
             }
         } else {
-            skip_value(buf, &mut p)?;
+            skip_scan_value(&mut rd)?;
         }
         if seq.is_some() && pid.is_some() && start.is_some() && boot.is_some() {
             let (s, q, t, o) = (seq.unwrap(), pid.unwrap(), start.unwrap(), boot.unwrap());
             return Some((s, q, t, o));
         }
-        ws(buf, &mut p);
-        if p >= buf.len() {
-            return None;
-        }
-        if buf[p] == b',' {
-            p += 1;
-        } else if buf[p] == b'}' {
-            break;
-        } else {
-            return None;
+        scan_ws(&mut rd);
+        match rd.next_byte()? {
+            b',' => {}
+            b'}' => break,
+            _ => return None,
         }
     }
     match (seq, pid, start, boot) {
@@ -691,22 +748,18 @@ impl AttemptKey {
         }
     }
 
-    /// Bounded attempt-identity check (R2 Gate 1): streams at most
-    /// one buffer of the existing file's prefix and extracts
-    /// `(seq, run_id)` without loading the window. Any IO error,
-    /// truncation, or parse failure is NOT a match — refusal.
+    /// Bounded attempt-identity check (R3 Gate 1): streams the
+    /// existing file in chunks and extracts `(seq, run_id)`
+    /// wherever it sits — past arbitrarily large preceding values
+    /// — with O(chunk) memory, never loading the window. Any IO
+    /// error, truncation, or parse failure is NOT a match —
+    /// refusal.
     pub fn matches_file(&self, path: &Path) -> bool {
-        use std::io::Read as _;
         let f = match std::fs::File::open(path) {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let mut prefix = Vec::new();
-        let mut take = f.take(ATTEMPT_SCAN_MAX_BYTES);
-        if take.read_to_end(&mut prefix).is_err() {
-            return false;
-        }
-        match extract_attempt_prefix(&prefix) {
+        match extract_attempt_streaming(f) {
             Some((s, p, t, b)) => {
                 s == self.seq
                     && p == u64::from(self.pid)
@@ -849,6 +902,43 @@ mod tests {
         let (step3, _, _) =
             publish_window_streaming(&d, 3, "t", &head, &tail, &array_tmp2, &key(3));
         assert_eq!(step3, PublishStep::IntegrityRefusal);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// R3 Gate 1 (F1): production renders envelopes via
+    /// `serde_json::to_value` → BTreeMap (alphabetical keys), so
+    /// `crypto_watch` precedes `run_id`/`seq` — identity sits past
+    /// large preceding values. A byte-identical same-attempt retry
+    /// of production-ordered bytes must converge, not refuse.
+    /// Adopted from the R3 linked probe
+    /// (`producer_order_duplicate`).
+    #[test]
+    fn duplicate_converges_with_production_key_order() {
+        let d = dir("prodorder");
+        let key = key(3);
+        // Same serde_json::to_value -> to_vec ordering as the
+        // coordinator envelope render (keys sort alphabetically).
+        let envelope = serde_json::json!({
+            "seq": 3,
+            "run_id": {"pid": 7, "starttime": 8, "boot_id": "boot"},
+            "crypto_watch": [{"pad": "x".repeat(131072)}],
+        });
+        let value = serde_json::to_value(&envelope).unwrap();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        assert!(bytes.len() > ATTEMPT_SCAN_CHUNK_BYTES);
+        assert!(key.matches_bytes(&bytes));
+        assert_eq!(
+            publish_window_durable(&d, 3, "t", &bytes, &key),
+            PublishStep::Durable
+        );
+        assert!(
+            key.matches_file(&d.join("window-0000000003.json")),
+            "bounded scan must reach identity past large preceding values"
+        );
+        assert_eq!(
+            publish_window_durable(&d, 3, "t", &bytes, &key),
+            PublishStep::Converged
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
