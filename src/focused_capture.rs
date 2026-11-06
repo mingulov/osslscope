@@ -41,7 +41,7 @@ pub struct FocusedConfig {
     pub grace: Duration,
     /// Run-shared ELF parse cache handle (F8d RESTORATION; `None`
     /// parses uncached). Clone shares the run's cache.
-    pub(crate) parsed_cache:
+    pub parsed_cache:
         Option<std::rc::Rc<std::cell::RefCell<crate::provider_observation::objects::ParseCache>>>,
 }
 impl Default for FocusedConfig {

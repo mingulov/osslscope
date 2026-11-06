@@ -162,7 +162,11 @@ pub(crate) const MAX_CACHED_PARSES: usize = 16;
 /// or fill failure falls back to the uncached parse (today's
 /// behavior), never to an error. One instance per engine run,
 /// shared across that run's sessions via the admission config.
-pub(crate) struct ParseCache {
+/// Run-shared ELF parse cache (F8d restoration). Public only so
+/// `FocusedConfig` (a public config) can carry the handle across
+/// crates (integration tests); all methods stay crate-internal —
+/// external holders can clone the handle but never fill/lookup.
+pub struct ParseCache {
     map: std::collections::HashMap<Stamp, Rc<ElfObject>>,
 }
 impl std::fmt::Debug for ParseCache {

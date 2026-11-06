@@ -320,19 +320,19 @@ fn config_defaults_and_positive_bounded_validation() {
     for config in [
         FocusedConfig {
             duration: Duration::ZERO,
-            ..config
+            ..config.clone()
         },
         FocusedConfig {
             timeout: Duration::ZERO,
-            ..config
+            ..config.clone()
         },
         FocusedConfig {
             grace: Duration::ZERO,
-            ..config
+            ..config.clone()
         },
         FocusedConfig {
             timeout: Duration::from_secs(121),
-            ..config
+            ..config.clone()
         },
     ] {
         assert!(config.validate().is_err());
