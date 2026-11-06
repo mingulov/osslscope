@@ -299,10 +299,24 @@ fn tag_bounds(key: &u64, now: u64) {
         }
     };
     let v = unsafe { &mut *slot };
-    // Plain in-order stores (BPF executes in order; the existing
-    // `bump` relies on the same — no fence instruction exists for
-    // this target).
-    v.seq = v.seq.wrapping_add(1);
+    // Seqlock writer, ordering-preserving (R1 finding 1): the odd
+    // seq store MUST reach map memory before the payload, and the
+    // even store after. Plain stores let LLVM merge the pair into
+    // ONE `+= 2` AFTER the payload (observed emitted) — execution
+    // order is irrelevant once the compiler deletes the odd store.
+    // Volatile seq accesses (each a visible side effect the backend
+    // cannot merge or delete) plus `black_box` barriers (empty
+    // side-effect asm — an IR scheduling barrier with zero
+    // codegen; `compiler_fence` is unselectable on this backend
+    // and real atomic CAS loops are the heavier fallback) pin the
+    // shape: odd store, payload, even store. The emitted-check
+    // test pins both inlined copies.
+    let seq = &mut v.seq as *mut u64;
+    unsafe {
+        let s0 = core::ptr::read_volatile(seq);
+        core::ptr::write_volatile(seq, s0.wrapping_add(1));
+        core::hint::black_box(s0);
+    }
     if v.tag != gen {
         v.pairs = [[0; 2]; 2];
         v.tag = gen;
@@ -312,7 +326,11 @@ fn tag_bounds(key: &u64, now: u64) {
         pair[0] = now;
     }
     pair[1] = now;
-    v.seq = v.seq.wrapping_add(1);
+    unsafe {
+        let s1 = core::ptr::read_volatile(seq);
+        core::ptr::write_volatile(seq, s1.wrapping_add(1));
+        core::hint::black_box(s1);
+    }
 }
 
 fn dropfail() {

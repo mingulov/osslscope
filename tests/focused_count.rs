@@ -432,3 +432,119 @@ fn saturated_physical_count_retains_lower_bound_with_explicit_loss() {
         1
     );
 }
+
+/// Emitted seqlock shape (R1 finding 1): the `tag_bounds` updater
+/// must emit TWO distinct seq stores (odd, then even) with payload
+/// writes between — LLVM once merged them into a single `+= 2`
+/// store AFTER the payload (insns 204-205, 347-348), making the
+/// host even/equal check vacuous. Both inlined copies (fast +
+/// slow path) must show the split shape:
+/// (a) no `ALU64 ADD K=2` anywhere in `count_entry` (the merge
+/// signature — exactly 2 pre-fix, both merges);
+/// (b) ≥2 disjoint `LDX[+0] → STX[+0] → STX[+off] → STX[+0]`
+/// windows on one base register, each flanking store fed by its
+/// own `ADD64 K=1` (no clobber between).
+#[test]
+#[ignore = "requires an explicitly supplied freshly built focused BPF object"]
+fn actual_focused_object_seqlock_emits_two_seq_stores() {
+    let path = std::env::var("OSSLSCOPE_FOCUSED_COUNT_OBJECT")
+        .expect("set OSSLSCOPE_FOCUSED_COUNT_OBJECT to the freshly built object");
+    let bytes = std::fs::read(path).expect("read focused BPF object");
+    let budget = osslscope::provider_observation::ObservationBudget::default();
+    let prepared = osslscope::loader::prepare_focused_count(&bytes, &budget).unwrap();
+    assert_eq!(prepared.progs.len(), 1);
+    let insns = &prepared.progs[0].insns;
+    assert_eq!(insns.len() % 8, 0, "whole instructions");
+    let n = insns.len() / 8;
+    let op = |i: usize| insns[i * 8];
+    let dst = |i: usize| insns[i * 8 + 1] & 0x0f;
+    let src = |i: usize| insns[i * 8 + 1] >> 4;
+    let off = |i: usize| i16::from_le_bytes([insns[i * 8 + 2], insns[i * 8 + 3]]);
+    let imm = |i: usize| {
+        i32::from_le_bytes([
+            insns[i * 8 + 4],
+            insns[i * 8 + 5],
+            insns[i * 8 + 6],
+            insns[i * 8 + 7],
+        ])
+    };
+    // (a) The merge signature: any ADD64 K=2 is the folded pair.
+    let mut add2 = 0;
+    for i in 0..n {
+        if op(i) == 0x07 && imm(i) == 2 {
+            add2 += 1;
+        }
+    }
+    assert_eq!(add2, 0, "merged seq += 2 stores (R1 finding 1)");
+    // An STX's value reg fed by ADD64 K=1 within 12 insns, with no
+    // clobber between (a call clobbers r0-r5; LD_IMM64 tails are
+    // not writes; jumps never write their dst).
+    let fed_by_add1 = |store: usize, rv: u8| -> bool {
+        let lo = store.saturating_sub(12);
+        let mut j = store;
+        while j > lo {
+            j -= 1;
+            if op(j) == 0x00 {
+                continue; // LD_IMM64 tail — not a write.
+            }
+            if op(j) == 0x85 {
+                if rv <= 5 {
+                    return false; // Call clobbered r0-r5.
+                }
+                continue;
+            }
+            match op(j) & 0x07 {
+                0x00 | 0x01 | 0x04 | 0x07 if dst(j) == rv => {
+                    return op(j) == 0x07 && imm(j) == 1;
+                }
+                _ => {}
+            }
+        }
+        false
+    };
+    // (b) Seq windows: LDX[rb+0] … STX[rb+0] … STX[rb+off≠0] …
+    // STX[rb+0] on one base within 96 insns, both flankers ADD-1
+    // fed. Greedy disjoint scan (extras are harmless — the bound
+    // is a minimum, one window per inlined copy).
+    let mut windows = 0;
+    let mut i = 0;
+    while i < n {
+        let mut end = None;
+        if op(i) == 0x79 && off(i) == 0 {
+            let rb = src(i);
+            let lim = (i + 96).min(n);
+            let mut first: Option<usize> = None;
+            let mut payload = false;
+            let mut j = i + 1;
+            while j < lim {
+                if op(j) == 0x7b && dst(j) == rb {
+                    if off(j) == 0 {
+                        if first.is_none() {
+                            first = Some(j);
+                        } else if payload {
+                            end = Some(j);
+                            break;
+                        }
+                    } else if first.is_some() {
+                        payload = true;
+                    }
+                }
+                j += 1;
+            }
+            if let (Some(f), Some(e)) = (first, end) {
+                let v0 = src(f);
+                let v1 = src(e);
+                if fed_by_add1(f, v0) && fed_by_add1(e, v1) {
+                    windows += 1;
+                    i = e + 1;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    assert!(
+        windows >= 2,
+        "two split seq-guard windows (fast + slow path), found {windows}"
+    );
+}

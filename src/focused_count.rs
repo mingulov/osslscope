@@ -2116,6 +2116,258 @@ mod startup_controls {
     }
     #[test]
     #[ignore = "requires privileged BPF and fresh focused count object"]
+    fn native_sealed_bounds_stay_coherent_under_concurrent_hits() {
+        // R1 finding 1, live leg: the fixed seqlock writer (odd
+        // store → payload → even store) must keep the host
+        // even/equal reader coherent while hits land. Pipelined
+        // "B" bursts race seqlock reads against in-kernel tagging;
+        // every read must be well-formed, and the quiesced cut
+        // must resolve stable with the exact hammered count.
+        // (A torn BETWEEN-stores race window is nanoseconds — this
+        // leg qualifies live coherency; the emitted-shape test is
+        // the RED→GREEN discriminator for the merge.)
+        use crate::capture::ClockPort;
+        use std::{
+            fs,
+            io::{BufRead, BufReader, Write},
+            os::{
+                fd::{AsRawFd, FromRawFd},
+                unix::fs::MetadataExt as _,
+            },
+            process::Command,
+        };
+        let dir =
+            std::env::temp_dir().join(format!("osslscope-seqlock-live-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let app = dir.join("engine_probe_calls");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/engine_probe_calls.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let input = dir.join("commands");
+        assert!(
+            Command::new("mkfifo")
+                .arg(&input)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let mut commands = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&input)
+            .unwrap();
+        let mut pipe = [-1; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let read = unsafe { fs::File::from_raw_fd(pipe[0]) };
+        let write = unsafe { fs::File::from_raw_fd(pipe[1]) };
+        let argv = vec![app.to_str().unwrap().into(), input.to_str().unwrap().into()];
+        struct Child(crate::target::OwnedTarget);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                if self.0.state() != crate::target::CustodyState::Reaped {
+                    unsafe {
+                        libc::kill(self.0.pid() as i32, libc::SIGKILL);
+                    }
+                    let _ = self.0.finish_observation();
+                }
+            }
+        }
+        let mut child = Child(
+            crate::target::OwnedTarget::spawn_stopped(
+                &argv,
+                crate::target::WorkloadDest::Fd(write.as_raw_fd()),
+            )
+            .unwrap(),
+        );
+        let cancel = AtomicBool::new(false);
+        let bytes = fs::read(std::env::var_os("OSSLSCOPE_FOCUSED_COUNT_OBJECT").unwrap()).unwrap();
+        let start = crate::capture::LiveClock.checked_monotonic_ns().unwrap();
+        let mut counter = FocusedCounter::open(
+            &bytes,
+            child.0.pid(),
+            crate::focused_capture::observer_namespace().unwrap(),
+            CountLimits {
+                window: CountAdmissionWindow {
+                    start_ns: start,
+                    deadline_ns: start + 60_000_000_000,
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        child.0.release_retaining_exit().unwrap();
+        drop(write);
+        let mut output = BufReader::new(read);
+        let mut line = String::new();
+        output.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let maps = crate::discovery::maps::read_maps(child.0.pid()).unwrap();
+        let lc_path = crate::discovery::legacy::find_libcrypto(&maps).expect("libcrypto mapped");
+        let lc = crate::plan::read_file_bound(&lc_path).unwrap();
+        let mut mod_bufs: Vec<(String, Vec<u8>)> = Vec::new();
+        for path in crate::discovery::legacy::target_modules(&maps, &lc_path) {
+            if let Ok(fb) = crate::plan::read_file_bound(&path) {
+                mod_bufs.push((path, fb.bytes.to_vec()));
+            }
+        }
+        let modules: Vec<crate::discovery::legacy::Module<'_>> = mod_bufs
+            .iter()
+            .map(|(p, b)| crate::discovery::legacy::Module { path: p, bytes: b })
+            .collect();
+        let set = crate::discovery::legacy::probes_for(
+            &lc_path,
+            &lc.bytes,
+            &modules,
+            (crate::plan::render_device(lc.dev), lc.ino),
+        )
+        .unwrap();
+        let app_str = app.to_str().unwrap().to_string();
+        let wanted: Vec<&crate::discovery::legacy::Probe> = set
+            .probes
+            .iter()
+            .filter(|p| p.module == app_str && p.family.is_none())
+            .collect();
+        let meta = fs::metadata(&app).unwrap();
+        let app_bytes = &mod_bufs
+            .iter()
+            .find(|(p, _)| p == &app_str)
+            .expect("fixture bytes scanned")
+            .1;
+        let digest: [u8; 32] = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(app_bytes).into()
+        };
+        let plans: Vec<EngineProbePlan> = wanted
+            .iter()
+            .map(|p| EngineProbePlan {
+                path: p.module.clone(),
+                offset: p.offset,
+                device: meta.dev(),
+                inode: meta.ino(),
+                sha256: digest,
+            })
+            .collect();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![child.0.pid()],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1);
+        let cookies = counter
+            .attach_engine_probes(
+                &plans,
+                child.0.pid(),
+                records[0].starttime,
+                Instant::now() + Duration::from_secs(10),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(cookies.len(), plans.len());
+        let by_id = cookies[wanted
+            .iter()
+            .position(|p| p.symbol == "ENGINE_by_id")
+            .unwrap()];
+        assert!(is_engine_cookie(by_id));
+        // Warm: one burst so the BOUNDS slot exists, then resolve
+        // its key + tag (fresh maps: EPOCH 0 tags pairs[0]).
+        writeln!(commands, "B").unwrap();
+        commands.flush().unwrap();
+        let mut response = String::new();
+        loop {
+            let mut ack = String::new();
+            assert!(output.read_line(&mut ack).unwrap() > 0);
+            response.push_str(&ack);
+            if ack.starts_with("ack ") {
+                assert!(response.contains("did=5"), "{response}");
+                break;
+            }
+        }
+        let key = counter
+            .counts_keys()
+            .unwrap()
+            .into_iter()
+            .find(|k| osslscope_ebpf_common::split_key(*k).0 == by_id)
+            .expect("by_id counts key");
+        let tag = {
+            let bounds = checked_map(&counter.loaded, "BOUNDS").unwrap();
+            let mut slot = vec![0u8; counter.cpus * 48];
+            bounds.lookup(&key.to_ne_bytes(), &mut slot).unwrap();
+            // Every CPU that tagged carries tag 0 (fresh EPOCH);
+            // CPUs that never tagged read all-zero (tag 0 too).
+            for chunk in slot.chunks_exact(48) {
+                assert_eq!(parse_bound_slot(chunk).tag, 0, "fresh-epoch tag");
+            }
+            0u64
+        };
+        // Hammer: 60 pipelined bursts (300 hits) streaming while the
+        // test reads sealed bounds between writes — reads race
+        // in-kernel tagging. Every read must be well-formed.
+        const BURSTS: usize = 60;
+        const HITS_PER_BURST: u64 = 5;
+        let mut raced = 0u64;
+        for _ in 0..BURSTS {
+            writeln!(commands, "B").unwrap();
+            for _ in 0..5 {
+                let (union, _stable) = counter.read_sealed_bounds(key, tag).unwrap();
+                raced += 1;
+                if let Some((first, last)) = union {
+                    assert!(first > 0, "sealed first is a real stamp");
+                    assert!(first <= last, "sealed pair never torn ({first} > {last})");
+                }
+            }
+        }
+        commands.flush().unwrap();
+        assert_eq!(raced, (BURSTS * 5) as u64);
+        // Drain all 60 acks (every hit landed before its ack).
+        let mut acks = 0;
+        while acks < BURSTS {
+            let mut ack = String::new();
+            assert!(output.read_line(&mut ack).unwrap() > 0);
+            if ack.starts_with("ack B 1 ") {
+                acks += 1;
+            }
+        }
+        // Quiesced cut: stable + exact count + spanning union.
+        let calls = counter.read_key_counts(key).unwrap();
+        assert_eq!(calls, 5 + BURSTS as u64 * HITS_PER_BURST, "every hit kept");
+        let (union, stable) = counter.read_sealed_bounds(key, tag).unwrap();
+        assert!(stable, "quiesced seqlock resolves");
+        let (first, last) = union.expect("hammered slot seals a pair");
+        assert!(first > 0 && first <= last, "well-formed sealed pair");
+        assert!(
+            last > first,
+            "union spans the hammer ({first}..{last} over {} hits)",
+            calls
+        );
+        writeln!(commands, "E").unwrap();
+        commands.flush().unwrap();
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(code) = child.0.peek_exit().unwrap() {
+                assert_eq!(code, 0);
+                break;
+            }
+            assert!(Instant::now() < until, "fixture must exit");
+            std::thread::yield_now();
+        }
+        child.0.finish_observation().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh focused count object"]
     fn native_engine_alias_plans_count_stub_once() {
         use crate::capture::ClockPort;
         use std::{
