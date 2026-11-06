@@ -490,4 +490,54 @@ mod tests {
         assert_eq!(code, ExitCode::from(1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// R2 Gate 5 (F8c): every traced suspect task stays suspect —
+    /// leader-200 AND worker-201 sends FAIL. Adopted from the R2
+    /// attempt inputs (`/tmp/t74-r2-attempt-1a1yejpl/`): the worker
+    /// record carries traced-tree ownership (`sender_tgid` +
+    /// `suspect_root`), which the pre-fix oracle ignores (TID-only
+    /// check ⟹ PASS, RED) and the fixed oracle honors (FAIL, GREEN).
+    #[test]
+    fn adjudicate_traced_worker_task_stays_suspect() {
+        let dir = std::env::temp_dir().join(format!(
+            "witness-cli-gate5-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // R2 timeline shape: harness 100, observer 200, workload 300.
+        let tl_body = serde_json::json!({
+            "harness_pid": 100, "observer_pid": 200, "service_pids": [],
+            "workload": [300], "canary": [],
+            "quiet_window": [0u64, 10000u64],
+            "sends": [], "external_events": [],
+        })
+        .to_string();
+        let tl = write_temp(&dir, "timeline", &tl_body);
+        let log = write_temp(&dir, "witness", "");
+        // Leader-200 (root PID, no ownership fields — old-format
+        // positive control, FAILs before and after).
+        let a200 = write_temp(
+            &dir,
+            "attempts200",
+            "{\"at_ns\":100,\"sender_pid\":200,\"sender_comm\":\"observer\",\"syscall\":\"kill\",\"syscall_nr\":62,\"target_pid\":300,\"signo\":23,\"result\":-3}\n",
+        );
+        let code200 =
+            adjudicate_files_with_attempts(&log, &tl, Some(&a200)).expect("adjudicate 200");
+        assert_eq!(code200, ExitCode::from(1), "leader-200 send must FAIL");
+        // Worker-201 (TID, with traced-tree ownership — FAILs only
+        // after the fix; pre-fix oracle sees TID 201 ≠ root 200 ⟹ PASS).
+        let a201 = write_temp(
+            &dir,
+            "attempts201",
+            "{\"at_ns\":100,\"sender_pid\":201,\"sender_tgid\":200,\"suspect_root\":200,\"sender_comm\":\"observer-worker\",\"syscall\":\"kill\",\"syscall_nr\":62,\"target_pid\":300,\"signo\":23,\"result\":-3}\n",
+        );
+        let code201 =
+            adjudicate_files_with_attempts(&log, &tl, Some(&a201)).expect("adjudicate 201");
+        assert_eq!(code201, ExitCode::from(1), "worker-201 send must FAIL");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -79,6 +79,16 @@ pub struct AttemptRecord {
     pub at_ns: u64,
     /// Sending thread (waitpid-reported tid of the suspect task).
     pub sender_pid: i32,
+    /// Sending process (tgid at the stop — distinguishes TID from
+    /// process identity, R2 Gate 5; `None` in pre-fix logs).
+    #[serde(default)]
+    pub sender_tgid: Option<i32>,
+    /// Traced-tree ownership (the suspect root pid supervised by the
+    /// tracer that logged this — every task in that tree carries its
+    /// root, R2 Gate 5; `None` in pre-fix logs, which the oracle
+    /// judges by pid/tgid alone).
+    #[serde(default)]
+    pub suspect_root: Option<i32>,
     /// `/proc/<tid>/comm` at the stop (`?` when unreadable).
     pub sender_comm: String,
     /// Decoded syscall name (`kill`, `tkill`, `tgkill`,
@@ -346,8 +356,17 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
     // (even ESRCH attempts FAIL). Signo 0 generates nothing
     // (existence probes — the observer heartbeat) and is ignored.
     for a in input.attempts.iter().filter(|a| a.signo != 0) {
-        let suspect =
-            a.sender_pid == input.observer_pid || input.service_pids.contains(&a.sender_pid);
+        // R2 Gate 5: every traced suspect task stays suspect —
+        // TID (`sender_pid`), process (`sender_tgid`), or tree
+        // ownership (`suspect_root`) matching a suspect root proves
+        // suspect origin (pre-fix logs carry tid only; the tid check
+        // preserves their leader/stranger behavior exactly).
+        let suspect = a.sender_pid == input.observer_pid
+            || input.service_pids.contains(&a.sender_pid)
+            || a.sender_tgid
+                .is_some_and(|t| t == input.observer_pid || input.service_pids.contains(&t))
+            || a.suspect_root
+                .is_some_and(|r| r == input.observer_pid || input.service_pids.contains(&r));
         if suspect {
             match a.target_pid {
                 Some(t) if input.workload.contains(&t) => {
@@ -399,7 +418,10 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
                 }
                 _ => {} // Suspect send elsewhere (self-probes, own tree) — ignored.
             }
-        } else if a.sender_pid == input.harness_pid {
+        } else if a.sender_pid == input.harness_pid
+            || a.sender_tgid.is_some_and(|t| t == input.harness_pid)
+            || a.suspect_root.is_some_and(|r| r == input.harness_pid)
+        {
             // Traced harness sends must match the harness-sent log
             // (the attempt-channel mirror of rule 3).
             let matched = match a.target_pid {
@@ -460,7 +482,12 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
         .collect();
     if let Some(proven) = self_reports.iter().find(|e| {
         input.attempts.iter().any(|a| {
-            Some(a.sender_pid) == e.sender_pid
+            // R2 Gate 5: a worker-task traced send corroborates its
+            // process/root self-report (tid, tgid, or tree ownership
+            // matching the self-reported sender).
+            (Some(a.sender_pid) == e.sender_pid
+                || a.sender_tgid.is_some_and(|t| Some(t) == e.sender_pid)
+                || a.suspect_root.is_some_and(|r| Some(r) == e.sender_pid))
                 && a.target_pid == Some(e.target_pid)
                 && a.signo == e.signo
                 && a.at_ns.abs_diff(e.at_ns) <= 60_000_000_000
@@ -1298,6 +1325,20 @@ fn read_comm(tid: i32) -> String {
         .unwrap_or_else(|_| "?".to_string())
 }
 
+/// Read a task's thread-group id (`Tgid:` from
+/// `/proc/<tid>/status` — the process identity for R2 Gate 5).
+/// `None` when unreadable (the task died mid-stop — the record
+/// still carries tid + ownership; the oracle judges by those).
+fn read_tgid(tid: i32) -> Option<i32> {
+    let text = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("Tgid:") {
+            return rest.trim().parse::<i32>().ok();
+        }
+    }
+    None
+}
+
 /// Attempt-tracer configuration (launcher; see `run_attempt_tracer`).
 pub struct AttemptTracerConfig {
     /// `attempt-witness.jsonl` append path.
@@ -1314,6 +1355,7 @@ pub struct AttemptTracerConfig {
 struct PendingAttempt {
     at_ns: u64,
     comm: String,
+    tgid: Option<i32>,
     name: &'static str,
     nr: i64,
     target: Option<i32>,
@@ -1324,6 +1366,9 @@ struct AttemptTracer {
     log: std::fs::File,
     traced: HashSet<i32>,
     pending: HashMap<i32, PendingAttempt>,
+    /// Suspect root pid (the initial supervised child — every
+    /// record from this tree carries it as ownership, R2 Gate 5).
+    root: i32,
 }
 
 impl AttemptTracer {
@@ -1376,6 +1421,8 @@ impl AttemptTracer {
         let rec = AttemptRecord {
             at_ns: p.at_ns,
             sender_pid: tid,
+            sender_tgid: p.tgid,
+            suspect_root: Some(self.root),
             sender_comm: p.comm,
             syscall: p.name.to_string(),
             syscall_nr: p.nr,
@@ -1438,6 +1485,7 @@ impl AttemptTracer {
                                 PendingAttempt {
                                     at_ns: crate::service::state::monotonic_ns(),
                                     comm: read_comm(pid),
+                                    tgid: read_tgid(pid),
                                     name: d.name,
                                     nr,
                                     target,
@@ -1645,6 +1693,7 @@ pub fn run_attempt_tracer(cfg: &AttemptTracerConfig) -> i32 {
         log,
         traced: HashSet::from([child]),
         pending: HashMap::new(),
+        root: child,
     };
     if !libc::WIFSTOPPED(status) || libc::WSTOPSIG(status) != libc::SIGSTOP {
         eprintln!("attempt-tracer: suspect {child} refused supervision (TRACEME/filter denied?)");
@@ -1751,6 +1800,8 @@ mod tests {
         AttemptRecord {
             at_ns: at,
             sender_pid: sender,
+            sender_tgid: None,
+            suspect_root: None,
             sender_comm: "sh".to_string(),
             syscall: "kill".to_string(),
             syscall_nr: 62,
