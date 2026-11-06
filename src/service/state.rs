@@ -46,7 +46,7 @@ impl RunId {
         let after = stat.rsplit_once(')').map(|(_, t)| t).unwrap_or("");
         let starttime = after
             .split_whitespace()
-            .nth(20)
+            .nth(19) // field 22 overall (post-comm token k = field k+3)
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
@@ -466,6 +466,68 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Field-position regression (R1 C2): `RunId::current` must
+    /// read field 22 (starttime), not field 23 (vsize). Pinned
+    /// against the established `pin` parser on self, plus an
+    /// anonymous-mapping probe proving vsize-independence (a 16 MiB
+    /// anon mmap moves vsize; starttime must not budge).
+    #[test]
+    fn run_id_starttime_is_field_22_not_vsize() {
+        fn post_comm(pid: u32) -> Vec<String> {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            stat.rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        }
+        let me = std::process::id();
+        let expect = crate::pin::starttime_of(me).unwrap();
+        assert!(expect > 0, "self has a starttime");
+        let got = RunId::current().unwrap();
+        assert_eq!(got.pid, me);
+        assert_eq!(
+            got.starttime, expect,
+            "RunId::current must equal the established field-22 parser"
+        );
+        // Anonymous-mapping probe: reserve 16 MiB (vsize moves by
+        // ≥16 MiB; rss untouched — never touched).
+        let vsize_before: u64 = post_comm(me)[20].parse().unwrap();
+        let len = 16 << 20;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(ptr, libc::MAP_FAILED, "anon probe mmap");
+        let vsize_after: u64 = post_comm(me)[20].parse().unwrap();
+        assert!(
+            vsize_after >= vsize_before + len as u64,
+            "probe validity: vsize must move ≥16 MiB ({vsize_before} → {vsize_after})"
+        );
+        assert_eq!(
+            RunId::current().unwrap().starttime,
+            expect,
+            "starttime must not follow vsize"
+        );
+        assert_eq!(
+            crate::service::witness::snapshot_proc(me as i32)
+                .unwrap()
+                .starttime,
+            expect,
+            "witness snapshot_proc must equal the established field-22 parser"
+        );
+        unsafe {
+            libc::munmap(ptr, len);
+        }
     }
 
     #[test]

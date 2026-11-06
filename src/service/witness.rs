@@ -85,9 +85,12 @@ pub struct ProcSnap {
 pub fn snapshot_proc(pid: i32) -> Option<ProcSnap> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after = stat.rsplit_once(')')?.1;
-    let mut it = after.split_whitespace();
-    let state = it.next()?.chars().next()?;
-    let starttime = it.nth(19)?.parse::<u64>().ok()?;
+    // Post-comm tokens index from field 3 (state): field 22
+    // (starttime) is token 19. Parse positionally (a consumed
+    // `state` + `nth(19)` re-derives the field-23 vsize trap).
+    let toks: Vec<&str> = after.split_whitespace().collect();
+    let state = toks.first()?.chars().next()?;
+    let starttime = toks.get(19)?.parse::<u64>().ok()?;
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let mut sigpnd = 0u64;
     let mut sigblk = 0u64;
