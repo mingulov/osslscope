@@ -16,8 +16,11 @@ A cache miss falls back to the uncached parse, which can then fail
 with a StateLimit/ReadLimit gap when the pool is contended. The
 miss path is honest loss accounting, not equivalent availability:
 
-- up to 16 distinct stable files: hits fit; same-file two
-  sessions qualify;
+- up to 16 distinct stable files: hits fit (demonstrated
+  reservation/cache property only: a same-file second session
+  reuses cached offsets without the transient, inside the pinned
+  reservation; runtime multi-worker observation is not yet
+  qualified and is not claimed here);
 - cache full: further distinct files always miss;
 - churning Stamps (upgrades, container layer turnover): new
   Stamps miss until filled if room remains, otherwise always;

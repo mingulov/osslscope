@@ -362,7 +362,7 @@ def main():
             receipt = stage_artifacts(stage, args.prefix, manifest, artifacts)
             docs = stage/'share/doc/osslscope'
             docs.mkdir(parents=True)
-            for name in ('docs/install.md', 'docs/licensing.md', 'NOTICE.md', 'LICENSE', 'LICENSES/GPL-2.0-only.txt'):
+            for name in ('docs/install.md', 'docs/licensing.md', 'NOTICE.md', 'LICENSE', 'LICENSES/GPL-2.0-only.txt', 'packaging/deb/README.Debian'):
                 shutil.copyfile(ROOT/name, docs/Path(name).name)
             (docs/'dependency-notices.json').write_bytes(canonical(notices))
             shutil.copytree(payload/'runtime-notices', docs/'runtime-notices')
