@@ -39,6 +39,24 @@ impl QueuedRecord {
     }
 }
 
+/// Identify a stream record from its rendered bytes (kind word +
+/// seq/at_seq — parsed, never parallel-tracked).
+pub(crate) fn stream_record_identity(bytes: &[u8]) -> (String, u64) {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok();
+    let kind = value
+        .as_ref()
+        .and_then(|v| v.get("kind"))
+        .and_then(|k| k.as_str())
+        .unwrap_or("")
+        .to_string();
+    let seq = value
+        .as_ref()
+        .and_then(|v| v.get("seq").or_else(|| v.get("at_seq")))
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+    (kind, seq)
+}
+
 /// Marker-specific coverage delta (R1 C1): the span growth one
 /// emitted marker covers BEYOND all older markers (cumulative
 /// markers, disjoint deltas — ascending by marker). Delivery of
@@ -59,12 +77,12 @@ pub struct SpanCoverage {
     /// sequence). Contiguous across the span's deltas.
     pub start: u64,
     pub end: u64,
+    /// Dead ⟺ the marker will never deliver (retired — evicted,
+    /// failed, uncertain). Merges into its successor (whose marker
+    /// truly covers the merged interval); flags when newest until
+    /// the next append. Live deltas are never merged (R3 F4).
+    pub dead: bool,
 }
-
-/// Coverage deltas retained per span (mirrors `LEDGER_CAP` — the
-/// ledger's memory is bounded by spans × this, regardless of how
-/// many markers go undelivered).
-pub const COVERAGE_CAP: usize = 64;
 
 /// Folded drop span (the §5.2 ledger entry shape + merge state).
 #[derive(Debug, Clone)]
@@ -206,10 +224,12 @@ impl StreamQueue {
     /// Enqueue one rendered record. Evicts oldest-first while either
     /// cap would break; a record larger than `--queue-bytes` alone is
     /// accounted as dropped without enqueueing (never an evict loop).
+    /// Evicted markers retire (R3 Gate 4 F4 — they never deliver).
     pub fn enqueue(&mut self, record: QueuedRecord) {
         let size = record.full_bytes();
         if size > self.queue_bytes {
             self.fold(record.seq, size, DropReason::QueueFull);
+            self.retire_evicted_marker(&record.bytes);
             return;
         }
         while !self.queued.is_empty()
@@ -221,12 +241,23 @@ impl StreamQueue {
                 let seq = old.seq;
                 let bytes = old.full_bytes();
                 self.fold(seq, bytes, DropReason::QueueFull);
+                self.retire_evicted_marker(&old.bytes);
             }
         }
         // After evicting everything the record still fits (size ≤
         // cap proven above; events ≥ 1 by the [64,4096] range).
         self.queued_bytes += size;
         self.queued.push_back(record);
+    }
+
+    /// Retire an evicted (or never-enqueued) marker's delta (R3
+    /// Gate 4 F4): the marker never delivers, so its claim merges
+    /// away. Identity from the rendered bytes. Non-markers no-op.
+    fn retire_evicted_marker(&mut self, bytes: &[u8]) {
+        let (kind, at_seq) = stream_record_identity(bytes);
+        if kind == "drop-marker" {
+            self.retire_marker(at_seq);
+        }
     }
 
     /// Pop the oldest queued record for the tap writer.
@@ -280,14 +311,15 @@ impl StreamQueue {
     /// build — the emitted marker carries `spans()` verbatim,
     /// covered or not). Each span with uncovered growth appends
     /// its delta (an unchanged span needs no entry — any newer
-    /// delivery re-proves its old deltas, §5.2). Overflow thins
-    /// the SECOND-newest delta into the pending frontier (R2 Gate
-    /// 4b): the oldest — likeliest to deliver — stays exact, and
-    /// the merged frontier stays exact for its own + newer
-    /// deliveries (cumulative markers prove older growth, so
-    /// forward-merging preserves Σdeltas and cumulative clears
-    /// stay exact); only the thinned marker's own future delivery
-    /// over-retains (explicit, never quiet loss).
+    /// delivery re-proves its old deltas, §5.2). R3 Gate 4 F4:
+    /// every undelivered marker keeps its EXACT delta (delivery in
+    /// any order stays exact — no live claim is ever merged); only
+    /// DEAD markers (retired — provably never delivering) merge
+    /// into their successor, whose marker truly covers the merged
+    /// interval (cumulative emission). Bound: live deltas ⟺ live
+    /// markers ≤ queued + in-flight records (queue caps); dead
+    /// entries ≤ 1 per span (the flagged newest, merged at the
+    /// next append).
     /// Zero-record uncovered spans sweep here (struck-empty —
     /// their bytes already recovered).
     pub fn mark_all(&mut self, marker: u64) {
@@ -303,22 +335,16 @@ impl StreamQueue {
                 db = db.saturating_sub(c.bytes);
                 df = df.saturating_sub(c.folds);
             }
-            if span.covering.len() >= COVERAGE_CAP {
-                let thin = span.covering.len() - 2;
-                let removed = span.covering.remove(thin);
-                // Forward-merge (R2 Gate 4b): the frontier (newest
-                // before push) proves the thinned growth (cumulative),
-                // so its claim absorbs it exactly. Newest clears stay
-                // exact; only the thinned marker's own delivery
-                // over-retains (safe direction).
-                if let Some(frontier) = span.covering.last_mut() {
-                    frontier.records = frontier.records.saturating_add(removed.records);
-                    frontier.bytes = frontier.bytes.saturating_add(removed.bytes);
-                    frontier.folds = frontier
-                        .folds
-                        .saturating_add(removed.folds)
-                        .min(frontier.records.saturating_sub(1));
-                    frontier.start = removed.start;
+            // Merge dead deltas into their successor (a dead marker
+            // never delivers, so its claim rides the next-newer
+            // delta exactly; the flagged newest merges once this
+            // append gives it a successor).
+            let mut i = 0usize;
+            while i + 1 < span.covering.len() {
+                if span.covering[i].dead {
+                    Self::merge_into_successor(&mut span.covering, i);
+                } else {
+                    i += 1;
                 }
             }
             let start = span.covering.last().map(|c| c.end).unwrap_or(0);
@@ -329,7 +355,43 @@ impl StreamQueue {
                 folds: df,
                 start,
                 end: span.fold_serial,
+                dead: false,
             });
+        }
+    }
+
+    /// Merge delta `i` into its successor (the successor exists;
+    /// live-or-dead the claims union exactly — the successor's
+    /// marker truly covers the merged interval).
+    fn merge_into_successor(covering: &mut Vec<SpanCoverage>, i: usize) {
+        let dead = covering.remove(i);
+        let succ = &mut covering[i];
+        succ.records = succ.records.saturating_add(dead.records);
+        succ.bytes = succ.bytes.saturating_add(dead.bytes);
+        succ.folds = succ
+            .folds
+            .saturating_add(dead.folds)
+            .min(succ.records.saturating_sub(1));
+        succ.start = dead.start;
+    }
+
+    /// Retire marker `marker`'s coverage delta (R3 Gate 4 F4): the
+    /// marker will never deliver (evicted from the queue, failed
+    /// dispatch, uncertain — the coordinator reports every death),
+    /// so its claim merges into its successor, or flags when
+    /// newest (merged at the next append). Markers without deltas
+    /// (never covered, already cleared, unknown) no-op, as do
+    /// repeat retirements.
+    pub fn retire_marker(&mut self, marker: u64) {
+        for span in self.spans.iter_mut() {
+            let Some(i) = span.covering.iter().position(|c| c.marker == marker) else {
+                continue;
+            };
+            if i + 1 < span.covering.len() {
+                Self::merge_into_successor(&mut span.covering, i);
+            } else {
+                span.covering[i].dead = true;
+            }
         }
     }
 
@@ -536,11 +598,16 @@ mod tests {
         assert!(q.has_pending_spans(), "post-snapshot growth stays pending");
     }
 
-    /// R1 C1(a): repeated `fold → mark_all` without delivery must
-    /// stay bounded (no panic, no quiet loss — every folded record
-    /// stays covered by an explicit span).
+    /// R1 C1(a) under the R3 F4 contract: repeated direct
+    /// `fold → mark_all` without delivery keeps every marker's
+    /// EXACT claim (no thinning of live markers — any-order
+    /// delivery stays exact; a 64-cap cannot hold 65+ live claims
+    /// exactly). Direct marks are all-live (no deaths reported),
+    /// so `covering` grows with the marks BY DESIGN; the
+    /// production bound (queue + retire) is pinned
+    /// production-shaped below.
     #[test]
-    fn repeated_undelivered_markers_stay_bounded_and_exact() {
+    fn repeated_undelivered_markers_stay_exact() {
         let mut q = StreamQueue::new(100, 64);
         for seq in 1..=70u64 {
             q.fold(seq, 41, DropReason::QueueFull);
@@ -561,15 +628,80 @@ mod tests {
                 "fold invariant holds: {s:?}"
             );
         }
-        // Structural memory bound (70 undelivered markers thinning
-        // into the cap — the ledger cannot grow with marker count).
-        for s in q.spans.iter() {
-            assert!(
-                s.covering.len() <= COVERAGE_CAP,
-                "coverage deltas bounded: {} (cap {COVERAGE_CAP})",
-                s.covering.len()
-            );
+        // Every marker's own delivery is exact (in-order here;
+        // out-of-order is pinned above).
+        for m in 1..=70u64 {
+            q.clear_marker(m);
+            let left: u64 = q.spans().iter().map(|s| s.records).sum();
+            assert_eq!(left, 70 - m, "pending exact after clear({m})");
         }
+        assert!(q.spans().is_empty());
+    }
+
+    /// R3 Gate 4 F4 (production bound): markers flowing through a
+    /// small queue — evicted markers retire, delivered markers
+    /// clear — keep per-span coverage ≤ queued + 1 (the flagged
+    /// dead newest) at every step, with exact gross accounting
+    /// throughout (enqueued − popped − queued ⟺ evicted).
+    #[test]
+    fn production_shaped_markers_stay_bounded_and_exact() {
+        let mut q = StreamQueue::new(65536, 8);
+        let (mut enqueued, mut popped, mut marks) = (0u64, 0u64, 0u64);
+        for n in 1..=50u64 {
+            // Two records per round (the 8-event queue churns —
+            // oldest evict as QueueFull folds with growth).
+            q.enqueue(rec(n * 2, 40));
+            q.enqueue(rec(n * 2 + 1, 40));
+            enqueued += 2;
+            if q.has_pending_spans() {
+                q.mark_all(n);
+                marks += 1;
+                let line = format!("{{\"kind\":\"drop-marker\",\"at_seq\":{n}}}").into_bytes();
+                q.enqueue(QueuedRecord {
+                    seq: n,
+                    bytes: line,
+                });
+                enqueued += 1;
+            }
+            // Dispatch promptly: pop one, deliver markers in order.
+            if let Some(popped_rec) = q.pop() {
+                popped += 1;
+                let (kind, at) = stream_record_identity(&popped_rec.bytes);
+                if kind == "drop-marker" {
+                    q.clear_marker(at);
+                }
+            }
+            // Bound at every step: live deltas ≤ queued + 1.
+            for s in q.spans.iter() {
+                assert!(
+                    s.covering.len() as u64 <= q.queued_records() + 1,
+                    "coverage bounded by live markers (round {n}: {} deltas, {} queued)",
+                    s.covering.len(),
+                    q.queued_records()
+                );
+            }
+        }
+        assert!(marks >= 1, "marks must flow (got {marks})");
+        // Exact eviction accounting (no quiet loss/gain — every
+        // record enqueued is popped, queued, or folded).
+        let evicted = enqueued - popped - q.queued_records();
+        assert_eq!(q.gross().0, evicted);
+        assert!(q.gross().1 >= evicted, "every fold carries bytes");
+        // Drain: pop everything, clear every marker, then one final
+        // mark covers any flagged-dead tail and clears it.
+        while let Some(popped_rec) = q.pop() {
+            let (kind, at) = stream_record_identity(&popped_rec.bytes);
+            if kind == "drop-marker" {
+                q.clear_marker(at);
+            }
+        }
+        q.mark_all(51);
+        q.clear_marker(51);
+        assert!(
+            q.spans().is_empty(),
+            "all proven drops clear, got {:?}",
+            q.spans()
+        );
     }
 
     /// R1 C1(b): delivering an OLD marker must not erase drops
@@ -713,6 +845,49 @@ mod tests {
         assert_eq!((spans[0].records, spans[0].bytes), (1, 20));
         q.clear_marker(2);
         assert!(q.spans().is_empty());
+    }
+
+    /// R3 Gate 4 (F4): delivering a thinned marker itself must
+    /// stay exact — 65 folds + `clear(63)` leaves the 2 records
+    /// past 63's coverage, not 3. Adopted from the R3 linked probe
+    /// (`thinned_marker_delivered`).
+    #[test]
+    fn delivering_thinned_marker_itself_stays_exact() {
+        use crate::service::envelope::DropReason::Epipe;
+        let mut q = StreamQueue::new(65536, 4096);
+        for n in 1..=65 {
+            q.fold(n, 10, Epipe);
+            q.mark_all(n);
+        }
+        q.clear_marker(63);
+        let n: u64 = q.spans().iter().map(|s| s.records).sum();
+        assert_eq!(n, 2, "65 folds, marker 63 delivered: pending must be 2");
+    }
+
+    /// R3 Gate 4 (F4): out-of-order delivery across thinned
+    /// markers stays exact at every step.
+    #[test]
+    fn out_of_order_marker_delivery_stays_exact() {
+        use crate::service::envelope::DropReason::Epipe;
+        let mut q = StreamQueue::new(65536, 4096);
+        for n in 1..=65 {
+            q.fold(n, 10, Epipe);
+            q.mark_all(n);
+        }
+        let pending = |q: &StreamQueue| {
+            q.spans()
+                .iter()
+                .map(|s| (s.records, s.bytes))
+                .fold((0u64, 0u64), |(nr, nb), (r, b)| (nr + r, nb + b))
+        };
+        q.clear_marker(60);
+        assert_eq!(pending(&q), (5, 50));
+        q.clear_marker(63);
+        assert_eq!(pending(&q), (2, 20));
+        q.clear_marker(65);
+        assert_eq!(pending(&q), (0, 0));
+        q.clear_marker(1);
+        assert_eq!(pending(&q), (0, 0));
     }
 
     /// R2 Gate 4b (F6): cumulative markers must clear everything

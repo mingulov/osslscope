@@ -23,7 +23,7 @@ use crate::service::envelope::{
 };
 use crate::service::exit::{RunFold, RunToolFailure};
 use crate::service::publish::{AttemptKey, PublishStep, StreamedPublish};
-use crate::service::queue::StreamQueue;
+use crate::service::queue::{StreamQueue, stream_record_identity};
 use crate::service::recovery::{Recovery, Refusal, recover};
 use crate::service::retain::{
     enforce_retention, rotate_file, rotation_due, unlatched_defense_blocks, write_latch,
@@ -2748,6 +2748,13 @@ fn reconcile_rotation(run: &mut Run) {
                     crate::service::envelope::DropReason::Epipe,
                     rec.fold_token,
                 );
+                // Rotation content-match proves the landing (same
+                // proof as the active tail) — a landed marker is
+                // delivered (R3 Gate 4 F4 — mirrors the regular
+                // tail path).
+                if rec.kind == "drop-marker" {
+                    s.queue.clear_marker(seq);
+                }
                 run.summary.tap_recovered.records += r;
                 run.summary.tap_recovered.bytes += b;
                 if seq < rot.first || seq > rot.last {
@@ -3231,6 +3238,13 @@ fn drive_tap_inner(
                         };
                         if let Some(s) = run.stream.as_mut() {
                             s.queue.fold(seq_for_fold, bytes_for_fold, abandon_cause);
+                            // A failed/partial marker never proves
+                            // delivery (R3 Gate 4 F4 — the record
+                            // leaves in-flight; no reconcile will
+                            // ever prove it, so it retires).
+                            if is_marker {
+                                s.queue.retire_marker(at_seq);
+                            }
                         }
                         diag_line(
                             &run.diag,
@@ -3280,29 +3294,24 @@ fn drive_tap_inner(
     }
 }
 
-/// Identify a stream record from its rendered bytes (kind word +
-/// seq/at_seq — the tap driver parses, never parallel-tracks).
-fn stream_record_identity(bytes: &[u8]) -> (String, u64) {
-    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok();
-    let kind = value
-        .as_ref()
-        .and_then(|v| v.get("kind"))
-        .and_then(|k| k.as_str())
-        .unwrap_or("")
-        .to_string();
-    let seq = value
-        .as_ref()
-        .and_then(|v| v.get("seq").or_else(|| v.get("at_seq")))
-        .and_then(|s| s.as_u64())
-        .unwrap_or(0);
-    (kind, seq)
+/// Retire a dead marker's coverage delta (R3 Gate 4 F4): the
+/// marker will never deliver (failed dispatch / failed receipt /
+/// uncertain / never-landing), so its claim merges away.
+/// Evictions retire queue-internally; every other death reports
+/// here. Non-markers no-op.
+fn retire_if_marker(queue: &mut StreamQueue, kind: &str, seq: u64) {
+    if kind == "drop-marker" {
+        queue.retire_marker(seq);
+    }
 }
 
 /// Reconcile one detached tap write (§7.2 outcome ladder):
 /// receipt Complete → strike + `tap_recovered`; Partial/Failed →
-/// stays folded; no receipt + regular file → bounded tail re-read
-/// (content-match → strike + recovered); no receipt + FIFO (or
-/// still registered at cutoff) → `tap_uncertain` entry.
+/// stays folded (a Failed marker retires — its bytes never land);
+/// no receipt + regular file → bounded tail re-read
+/// (content-match → strike + recovered; absent + worker gone →
+/// settle — never landing); no receipt + FIFO (or still
+/// registered at cutoff) → `tap_uncertain` entry.
 fn reconcile_tap_write(
     run: &mut Run,
     op_id: u64,
@@ -3320,6 +3329,9 @@ fn reconcile_tap_write(
         return;
     };
     let seq = rec.seq.unwrap_or(0);
+    // Worker still live ⟺ the slot view says so (None ⟺ the worker
+    // exited — consumed — or never spawned: nothing left to land).
+    let worker_live = slot.as_ref().is_some_and(|v| v.live);
     match slot.and_then(|v| v.receipt) {
         Some(receipt) if receipt.op_id == op_id => {
             // The worker exited with its receipt: settle now.
@@ -3340,6 +3352,16 @@ fn reconcile_tap_write(
                     }
                     true
                 }
+                crate::service::worker::TapReceiptState::Failed { .. } => {
+                    // Failed: the bytes never land (the worker is
+                    // gone) — a Failed marker retires (it never
+                    // delivers). The record stays in-flight until
+                    // the next recheck drops it as never-landing.
+                    if let Some(s) = run.stream.as_mut() {
+                        retire_if_marker(&mut s.queue, &rec.kind, seq);
+                    }
+                    false
+                }
                 _ => false,
             };
             if done {
@@ -3354,7 +3376,7 @@ fn reconcile_tap_write(
             // resync-completed partials); FIFOs go uncertain (the
             // bytes may yet land, unprovable — no tail exists).
             if !rec.fifo {
-                tail_reconcile_regular(run, &rec, seq, abandon_cause);
+                tail_reconcile_regular(run, &rec, seq, abandon_cause, worker_live);
             } else {
                 push_tap_uncertain(run, &rec, seq);
             }
@@ -3367,11 +3389,17 @@ fn reconcile_tap_write(
 /// still names it; rotation renames first, so a rotated-away file
 /// reconciles under `reconcile_rotation` instead — the identity
 /// gate keeps the two disjoint).
+/// `worker_live` settles the tail-absent branch (R3 Gate 4 F4):
+/// a live worker may yet land (stays in-flight for the next
+/// boundary's recheck); a gone worker never lands (settle — the
+/// fold stands, the entry drops). Callers run rotation first, so
+/// this never drops a rotated match.
 fn tail_reconcile_regular(
     run: &mut Run,
     rec: &crate::service::stream::InflightRecord,
     seq: u64,
     abandon_cause: crate::service::envelope::DropReason,
+    worker_live: bool,
 ) {
     let tail_budget = close_budget(run);
     let tail_poll = run_wait_poll!(run);
@@ -3417,11 +3445,22 @@ fn tail_reconcile_regular(
         if let Some(s) = run.stream.as_mut() {
             s.inflight.retain(|r| r.op_id != rec.op_id);
         }
+    } else if worker_live {
+        // Content absent with the worker still live: NOT proven
+        // (the detached worker may land bytes after this read) —
+        // the record stays in-flight for the next boundary's
+        // recheck.
     } else {
-        // Content absent: NOT proven (the detached worker may land
-        // bytes after this read) — the record stays in-flight for
-        // the next boundary's recheck (bounded: the worker exits,
-        // then its receipt settles it).
+        // Content absent with the worker gone: never landing (no
+        // worker to land it, no bytes to match — rotation already
+        // ran, so no rotated match is pending either) — settle:
+        // the fold stands (honestly pending) and the in-flight
+        // entry drops (no future change possible). A marker that
+        // never lands never delivers — retire it.
+        if let Some(s) = run.stream.as_mut() {
+            retire_if_marker(&mut s.queue, &rec.kind, seq);
+            s.inflight.retain(|r| r.op_id != rec.op_id);
+        }
     }
 }
 
@@ -3459,6 +3498,9 @@ fn push_tap_uncertain(run: &mut Run, rec: &crate::service::stream::InflightRecor
         run.summary.tap_uncertain_overflow.bytes += rec.full_bytes();
     }
     if let Some(s) = run.stream.as_mut() {
+        // Uncertain records never prove — an uncertain marker
+        // never delivers (R3 Gate 4 F4).
+        retire_if_marker(&mut s.queue, &rec.kind, seq);
         s.inflight.retain(|r| r.op_id != rec.op_id);
     }
 }
@@ -4061,8 +4103,16 @@ fn close_run_end(mut run: Run) -> ExitCode {
                 bytes,
                 crate::service::envelope::DropReason::StreamAbandoned,
             );
+            // Leftover markers never deliver (R3 Gate 4 F4).
+            let (kind, at_seq) = stream_record_identity(&record.bytes);
+            retire_if_marker(&mut s.queue, &kind, at_seq);
         }
     }
+    // Last rotation-tail reconcile FIRST (the final boundary's
+    // rename — content-matches settle before the per-op pass, so
+    // the exited-never-landing rule below never drops a rotated
+    // match).
+    reconcile_rotation(&mut run);
     // Shutdown reconciliation: every in-flight write settles —
     // receipt/tail when the worker exited, `tap_uncertain` when it
     // is still registered at the cutoff (unprovable, never silent).
@@ -4086,8 +4136,6 @@ fn close_run_end(mut run: Run) -> ExitCode {
             reconcile_tap_write(&mut run, op_id, crate::service::envelope::DropReason::Epipe);
         }
     }
-    // Last rotation-tail reconcile (the final boundary's rename).
-    reconcile_rotation(&mut run);
     // Diagnostics swap (the run worker's drop count enters the
     // summary; the fresh worker serves the summary write).
     let dropped = swap_diag(&mut run);
@@ -4338,8 +4386,27 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
     // Tap drive (open attempts + writes, MAX_OUTSTANDING_TAP = 1).
     // A post-open reserved identity ends the run as a tool failure
     // (the published window stands; the fold resolves exit 1).
+    // Stale ops (below the pre-drive op id) recheck after the
+    // drive (R3 Gate 4 F4 — the "next boundary's recheck" the
+    // reconcile promises; rotation already ran above, so rotated
+    // landings matched first).
+    let recheck_below = run.stream.as_ref().map(|s| s.next_op_id).unwrap_or(0);
     if drive_tap(&mut run) {
         return (run, SinksOut::QuotaStop);
+    }
+    let stale: Vec<u64> = run
+        .stream
+        .as_ref()
+        .map(|s| {
+            s.inflight
+                .iter()
+                .filter(|r| r.op_id < recheck_below)
+                .map(|r| r.op_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for op_id in stale {
+        reconcile_tap_write(&mut run, op_id, crate::service::envelope::DropReason::Epipe);
     }
     // Retention + quota (§6.2 — enforced at this boundary).
     let retain_budget = close_budget(&run);
