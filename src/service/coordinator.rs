@@ -33,10 +33,10 @@ use crate::service::snapshot::{Snapshot, WindowCtx, produce};
 use crate::service::staging::{Carry, Staging, TickDecision, TickPiece, assemble_crypto_watch};
 use crate::service::state::{
     AbandonReason, DirLock, PolicyIdentity, PolicyRejection, PolicyStatus, Reservation,
-    ReservationState, RunId, SCHEMA_POLICY, SequenceState, clean_tmps, monotonic_ns, rotated_name,
-    scan_highest_seq, sync_dir, wall_ns, window_name, write_state,
+    ReservationState, RunId, SCHEMA_POLICY, SequenceState, clean_tmps, is_reserved_sink_name,
+    monotonic_ns, rotated_name, scan_highest_seq, sync_dir, wall_ns, window_name, write_state,
 };
-use crate::service::stream::{Tap, resolve_stream};
+use crate::service::stream::{Tap, TapOpenError, resolve_stream};
 use crate::service::worker::{
     Control, DestClass, Destination, Diagnostics, Gate, WorkerOut, outcome_of, push_accounting,
     run_under_control, view_slot,
@@ -100,19 +100,6 @@ fn diag_line(diag: &Diagnostics, format: &Format, level: &str, msg: &str) {
     diag.emit(line.as_bytes());
 }
 
-/// Reserved out-DIR filenames (§4.1 sink-alias admission).
-fn is_reserved_sink_name(name: &str) -> bool {
-    matches!(
-        name,
-        "sequence.json"
-            | "policy-status.json"
-            | "run-summary.json"
-            | "quota-stop.json"
-            | "service.lock"
-    ) || crate::service::state::parse_window_seq(name).is_some()
-        || crate::service::state::is_rotated_name(name)
-}
-
 /// (device, inode) identity of a path (follows the §4.1 alias rule
 /// — hard links share identity).
 fn dev_ino_of(path: &Path) -> Option<(u64, u64)> {
@@ -139,12 +126,19 @@ fn admit_sink(out: &Path, stream: Option<&Path>) -> Result<Option<PathBuf>, Stri
         if ft.is_symlink() {
             return Err("--stream must not be a symlink".to_string());
         }
-        // Alias check: the resolved existing file must not share
-        // identity with any out-DIR evidence/state/latch/lock entry.
+        // Alias check (§4.1): the resolved existing file must not
+        // share identity with a RESERVED out-DIR entry
+        // (window/state/latch/lock — hard links included). A
+        // resident non-reserved tap (the canonical
+        // `out-DIR/stream.jsonl`) is the tap's own file and admits.
         if let Some(id) = dev_ino_of(&resolved) {
             let entries = std::fs::read_dir(out).map_err(|e| format!("--out unreadable: {e}"))?;
             for entry in entries.flatten() {
-                if dev_ino_of(&entry.path()) == Some(id) {
+                let reserved = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_reserved_sink_name);
+                if reserved && dev_ino_of(&entry.path()) == Some(id) {
                     return Err("--stream aliases out-DIR evidence or state".to_string());
                 }
             }
@@ -2771,20 +2765,23 @@ fn tap_dest(run: &Run) -> Destination {
 /// (MAX_OUTSTANDING_TAP = 1 — a registered prior refuses the
 /// successor; in-run abandonment folds `epipe`, shutdown folds
 /// `stream_abandoned`).
-fn drive_tap(run: &mut Run) {
+/// Drive the tap; returns true iff the tap failed CLOSED on a
+/// post-open reserved identity (the run must end as a tool
+/// failure — `run.tool_failure` is already set).
+fn drive_tap(run: &mut Run) -> bool {
     // Shutdown cutoff is handled by the close path (this drive is
     // the in-run form — `epipe` folds, no deadline).
-    drive_tap_inner(run, crate::service::envelope::DropReason::Epipe, None);
+    drive_tap_inner(run, crate::service::envelope::DropReason::Epipe, None)
 }
 
 fn drive_tap_inner(
     run: &mut Run,
     abandon_cause: crate::service::envelope::DropReason,
     cutoff: Option<Instant>,
-) {
+) -> bool {
     use crate::service::stream::WriteOutcome;
     if run.stream.is_none() {
-        return;
+        return false;
     }
     // Open while pending (every boundary; ENXIO-class failures stay
     // pending — records accumulate + evict oldest as queue_full).
@@ -2793,9 +2790,9 @@ fn drive_tap_inner(
         // Successor refused while a prior tap worker is registered
         // (fail-closed — retry next boundary, never concurrent).
         if matches!(view_slot(&dest), Some(v) if v.live) {
-            return;
+            return false;
         }
-        let opened: Control<std::io::Result<Tap>> = run_op(
+        let opened: Control<Result<Tap, TapOpenError>> = run_op(
             &run.diag,
             &run.format,
             &mut run.summary,
@@ -2805,7 +2802,8 @@ fn drive_tap_inner(
             boundary_budget(run.cfg.timeout),
             {
                 let path = run.stream.as_ref().expect("stream state").tap_path.clone();
-                move |_gate| WorkerOut::value(Tap::open(&path))
+                let out = run.out.clone();
+                move |_gate| WorkerOut::value(Tap::open_checked(&path, &out))
             },
         );
         match opened {
@@ -2814,7 +2812,20 @@ fn drive_tap_inner(
                     s.tap = tap;
                 }
             }
-            _ => return,
+            Control::Done(Err(TapOpenError::Identity)) => {
+                // Post-open reserved match (§4.1): the fd closed
+                // pre-write; the run fails as a run-level tool
+                // failure (the §7.3 fold resolves 1/4).
+                run.tool_failure = Some(RunToolFailure::SinkIdentity);
+                diag_line(
+                    &run.diag,
+                    &run.format,
+                    "error",
+                    "stream tap aliases out-DIR evidence or state (post-open identity)",
+                );
+                return true;
+            }
+            _ => return false,
         }
     }
     // Pop + write while open and queued (one op per record — the
@@ -2828,16 +2839,16 @@ fn drive_tap_inner(
             let sigs = run.signals.drain();
             consume_signals(run, sigs);
             if run.double_signal || cutoff.is_some_and(|d| Instant::now() >= d) {
-                return;
+                return false;
             }
         }
         let dest = tap_dest(run);
         if matches!(view_slot(&dest), Some(v) if v.live) {
-            return;
+            return false;
         }
         let popped = run.stream.as_mut().and_then(|s| s.queue.pop());
         let Some(record) = popped else {
-            return;
+            return false;
         };
         // Records are identified from their rendered bytes (kind +
         // seq/at_seq — exact, no parallel bookkeeping to desync).
@@ -2856,7 +2867,7 @@ fn drive_tap_inner(
                 if let Some(s) = run.stream.as_mut() {
                     s.queue.enqueue(record);
                 }
-                return;
+                return false;
             }
         };
         let op_id = run.stream.as_ref().expect("stream state").next_op_id;
@@ -2959,7 +2970,7 @@ fn drive_tap_inner(
                             if let Some(s) = run.stream.as_mut() {
                                 s.tap = Tap::pending();
                             }
-                            return;
+                            return false;
                         }
                         if is_fifo {
                             // FIFO non-EPIPE errors fail closed to
@@ -2967,7 +2978,7 @@ fn drive_tap_inner(
                             if let Some(s) = run.stream.as_mut() {
                                 s.tap = Tap::pending();
                             }
-                            return;
+                            return false;
                         }
                         // Regular-file non-EPIPE (ENOSPC family):
                         // the tap stays open for the next record.
@@ -2986,7 +2997,7 @@ fn drive_tap_inner(
                     s.tap = Tap::pending();
                 }
                 reconcile_tap_write(run, op_id, abandon_cause);
-                return;
+                return false;
             }
         }
     }
@@ -3185,9 +3196,10 @@ fn mid_window_commit(
     let next = seq.saturating_add(1);
     let terminal = mode == CloseMode::Terminal;
     if matches!(sinks, SinksOut::QuotaStop) {
-        // Quota-stop (or held rotation name): the published window
-        // stands; seal the reservation and end the run (the fold
-        // resolves exit 1 — finalized windows exist).
+        // Quota-stop (held rotation name / sink-identity tool
+        // failure alike): the published window stands; seal the
+        // reservation and end the run (the fold resolves exit 1 —
+        // finalized windows exist).
         return BoundaryOut::Exit(seal_and_end(run, seq, terminal));
     }
     if mode != CloseMode::Mid {
@@ -3707,7 +3719,9 @@ fn close_run_end(mut run: Run) -> ExitCode {
     // the cause names the mechanism, not the phase), then fold
     // never-attempted leftovers as `stream_abandoned`.
     if !run.double_signal && run.stream.is_some() {
-        drive_tap_inner(
+        // Identity failure (if any) already set `tool_failure`;
+        // leftovers fold below and the fold resolves the exit.
+        let _ = drive_tap_inner(
             &mut run,
             crate::service::envelope::DropReason::Epipe,
             Some(deadline),
@@ -3990,7 +4004,11 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
     // file, §6.1).
     enqueue_boundary_records(&mut run, seq, &sha256);
     // Tap drive (open attempts + writes, MAX_OUTSTANDING_TAP = 1).
-    drive_tap(&mut run);
+    // A post-open reserved identity ends the run as a tool failure
+    // (the published window stands; the fold resolves exit 1).
+    if drive_tap(&mut run) {
+        return (run, SinksOut::QuotaStop);
+    }
     // Retention + quota (§6.2 — enforced at this boundary).
     let retention: Control<crate::service::retain::RetentionOut> = run_op(
         &run.diag,

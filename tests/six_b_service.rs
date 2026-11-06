@@ -437,6 +437,172 @@ fn sixb_latch_hold_exits_4_byte_identical() {
     let _ = child.wait();
 }
 
+/// Resident-stream restart admits (R1 finding 5a): `--stream` given
+/// as the out-DIR resolves to the resident `stream.jsonl`, which is
+/// the tap's own file — never evidence. A restart with the tap
+/// resident must NOT refuse exit 2 (the alias check covers RESERVED
+/// artifacts only).
+#[test]
+fn sixb_resident_stream_restart_admits() {
+    let dir = fresh_dir("resident-restart");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    let flags = |cmd: &mut Command| {
+        cmd.arg("--out")
+            .arg(&dir)
+            .arg("--pid")
+            .arg(&pid)
+            .arg("--window")
+            .arg("1")
+            .arg("--interval")
+            .arg("0.2")
+            .arg("--stream")
+            .arg(&dir);
+    };
+    // Run 1: publish + cut; the resident tap now exists.
+    let mut run1 = bin();
+    flags(&mut run1);
+    let mut run1 = run1.spawn().expect("spawn run 1");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    unsafe { libc::kill(run1.id() as i32, libc::SIGTERM) };
+    let st1 = run1.wait().expect("wait run 1");
+    assert_eq!(st1.code(), Some(3), "run 1 cuts gracefully");
+    assert!(
+        dir.join("stream.jsonl").is_file(),
+        "resident tap exists after run 1"
+    );
+    // Run 2 (restart): the resident tap must admit.
+    let mut run2 = bin();
+    flags(&mut run2);
+    let mut run2 = run2.spawn().expect("spawn run 2");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    unsafe { libc::kill(run2.id() as i32, libc::SIGTERM) };
+    let st2 = run2.wait().expect("wait run 2");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(st2.code(), Some(3), "resident restart admits (cuts 3)");
+}
+
+/// Reserved-alias taps refuse pre-open (R1 finding 5 guard): a
+/// non-reserved FILENAME hard-linked to a RESERVED identity
+/// (sequence.json) still refuses exit 2 — the identity half of the
+/// §4.1 rule survives the F5a restriction to reserved artifacts.
+#[test]
+fn sixb_reserved_alias_tap_refused_preopen() {
+    let dir = fresh_dir("reserved-alias");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    // Seed run: create sequence.json (state).
+    let mut seed = bin();
+    seed.arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--interval")
+        .arg("0.2");
+    let mut seed = seed.spawn().expect("spawn seed");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    unsafe { libc::kill(seed.id() as i32, libc::SIGTERM) };
+    let st = seed.wait().expect("wait seed");
+    assert_eq!(st.code(), Some(3), "seed cuts gracefully");
+    assert!(dir.join("sequence.json").is_file(), "seed wrote state");
+    // Non-reserved name, reserved identity.
+    let evil = dir.join("evil-tap.jsonl");
+    std::fs::hard_link(dir.join("sequence.json"), &evil).unwrap();
+    let probe = bin()
+        .arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--stream")
+        .arg(&evil)
+        .status()
+        .expect("spawn probe");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(probe.code(), Some(2), "reserved-alias tap refuses exit 2");
+}
+
+/// Post-open hard-link swap fails the run as a tool failure (R1
+/// finding 5b): the tap admits clean, then the PATH is swapped to a
+/// hard link of a RESERVED window file before the first tap open.
+/// The post-open fstat check must catch it: fd closed before any
+/// write (the window stays byte-identical — an unchecked open would
+/// splice stream bytes into published evidence), run-level tool
+/// failure (exit 1 — windows finalized).
+#[test]
+fn sixb_postopen_reserved_swap_fails_tool_failure() {
+    let dir = fresh_dir("postopen-swap");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    // Seed run: publish window 0 (the reserved swap target).
+    let mut seed = bin();
+    seed.arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--interval")
+        .arg("0.2");
+    let mut seed = seed.spawn().expect("spawn seed");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    unsafe { libc::kill(seed.id() as i32, libc::SIGTERM) };
+    let st = seed.wait().expect("wait seed");
+    assert_eq!(st.code(), Some(3), "seed cuts gracefully");
+    let win0 = dir.join("window-0000000000.json");
+    assert!(win0.is_file(), "seed published window 0");
+    let win0_bytes = std::fs::read(&win0).unwrap();
+    // Run 2: tap ABSENT at admission (clean admit), swapped to
+    // the reserved window before the first tap open (the final
+    // close drives the tap). Pre-creating it would trip the F5a
+    // self-refusal instead of the post-open path.
+    let tap = dir.join("stream.jsonl");
+    let mut svc = bin();
+    svc.arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("30")
+        .arg("--interval")
+        .arg("0.2")
+        .arg("--stream")
+        .arg(&tap);
+    let mut svc = svc.spawn().expect("spawn service");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(dir.join("sequence.json").is_file(), "admission wrote state");
+    std::fs::hard_link(&win0, &tap).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
+    let st = svc.wait().expect("wait service");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        st.code(),
+        Some(1),
+        "post-open reserved swap fails as tool failure (exit 1), got {st:?}"
+    );
+    assert_eq!(
+        std::fs::read(&win0).unwrap(),
+        win0_bytes,
+        "window 0 byte-identical (fd closed pre-write)"
+    );
+}
+
 /// Bounded wait for a self-exiting child (poll — fail-loud timeout).
 fn wait_bounded(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);

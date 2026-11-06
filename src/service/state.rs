@@ -210,6 +210,21 @@ pub fn is_rotated_name(name: &str) -> bool {
         && b.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Reserved out-DIR filenames (§4.1 sink-alias admission — the ONE
+/// predicate shared by the pre-start alias check and the post-open
+/// fstat re-verification).
+pub fn is_reserved_sink_name(name: &str) -> bool {
+    matches!(
+        name,
+        "sequence.json"
+            | "policy-status.json"
+            | "run-summary.json"
+            | "quota-stop.json"
+            | "service.lock"
+    ) || parse_window_seq(name).is_some()
+        || is_rotated_name(name)
+}
+
 /// CLOCK_MONOTONIC nanoseconds (close instants, tick edges).
 pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {

@@ -93,6 +93,22 @@ impl InflightRecord {
     }
 }
 
+/// Tap-open failure: ordinary IO vs reserved-identity refusal
+/// (§4.1 — the fd closed before any write).
+#[derive(Debug)]
+pub enum TapOpenError {
+    Io(std::io::Error),
+    /// Post-open fstat matched a reserved out-DIR identity
+    /// (hard-link alias — the run fails as a tool failure).
+    Identity,
+}
+
+impl From<std::io::Error> for TapOpenError {
+    fn from(e: std::io::Error) -> Self {
+        TapOpenError::Io(e)
+    }
+}
+
 impl Tap {
     pub fn pending() -> Self {
         Tap::Pending
@@ -101,8 +117,26 @@ impl Tap {
     /// Open the resolved tap (§5.3 type rule on the RESOLVED file).
     /// FIFO with no reader fails ENXIO → caller keeps `pending`.
     /// Regular files open append (+create); the tail byte decides
-    /// clean vs needs-resync.
+    /// clean vs needs-resync. `O_NOFOLLOW` throughout (a swapped-in
+    /// symlink fails ELOOP even if it won the pre-check race).
     pub fn open(path: &Path) -> std::io::Result<Self> {
+        Self::open_inner(path, None).map_err(|e| match e {
+            TapOpenError::Io(io) => io,
+            // Unreachable: no identity set disciplined this open.
+            TapOpenError::Identity => std::io::Error::other("tap aliases reserved identity"),
+        })
+    }
+
+    /// Open + post-open §4.1 re-verification (after EVERY
+    /// open/rotation): the fd's fstat type must be regular/FIFO and
+    /// its identity must not match a RESERVED out-DIR entry. A match
+    /// closes the fd and reports `Identity` (the caller fails the
+    /// run — never writes, never retries into evidence).
+    pub fn open_checked(path: &Path, out_dir: &Path) -> Result<Self, TapOpenError> {
+        Self::open_inner(path, Some(out_dir))
+    }
+
+    fn open_inner(path: &Path, out_dir: Option<&Path>) -> Result<Self, TapOpenError> {
         let meta = std::fs::symlink_metadata(path).ok();
         let is_fifo = meta
             .as_ref()
@@ -111,23 +145,24 @@ impl Tap {
         if let Some(m) = meta {
             let ft = m.file_type();
             if ft.is_dir() || ft.is_socket() || ft.is_block_device() || ft.is_char_device() {
-                return Err(std::io::Error::new(
+                return Err(TapOpenError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "stream tap must be a regular file or FIFO",
-                ));
+                )));
             }
             if ft.is_symlink() {
-                return Err(std::io::Error::new(
+                return Err(TapOpenError::Io(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "stream tap must not be a symlink",
-                ));
+                )));
             }
         }
         if is_fifo {
             let file = OpenOptions::new()
                 .write(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+                .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOFOLLOW)
                 .open(path)?;
+            verify_fd(&file, out_dir)?;
             let (dev, ino) = dev_ino(&file)?;
             // FIFO open success means a reader holds it; a fresh
             // open after ANY interruption still resyncs (the writer
@@ -150,8 +185,9 @@ impl Tap {
             .read(true)
             .create(true)
             .append(true)
-            .custom_flags(libc::O_CLOEXEC)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
             .open(path)?;
+        verify_fd(&file, out_dir)?;
         let (dev, ino) = dev_ino(&file)?;
         // Tail-byte check: empty or ends-with-`\n` ⟹ clean.
         let clean = tail_is_clean(&mut file)?;
@@ -177,6 +213,47 @@ fn dev_ino(file: &File) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
     let m = file.metadata()?;
     Ok((m.dev(), m.ino()))
+}
+
+/// Post-open fstat verification (§4.1): the fd must be a regular
+/// file or FIFO (a TOCTOU-swapped device/socket fails here even
+/// past the pre-check), and — when `out_dir` disciplines the open —
+/// its identity must not match a RESERVED out-DIR entry (hard-link
+/// protection). The fd closes on every error path (owned `File`
+/// drop — the caller never writes through a refused fd).
+fn verify_fd(file: &File, out_dir: Option<&Path>) -> Result<(), TapOpenError> {
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _};
+    let meta = file.metadata()?;
+    let ft = meta.file_type();
+    if !(ft.is_file() || ft.is_fifo()) {
+        return Err(TapOpenError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "stream tap must be a regular file or FIFO",
+        )));
+    }
+    let Some(out) = out_dir else {
+        return Ok(());
+    };
+    let id = (meta.dev(), meta.ino());
+    // An unreadable out-DIR fails IO (pending-retry), never
+    // Identity: only a PROVEN reserved match is fatal.
+    let entries = std::fs::read_dir(out).map_err(TapOpenError::Io)?;
+    for entry in entries.flatten() {
+        let reserved = entry
+            .file_name()
+            .to_str()
+            .is_some_and(crate::service::state::is_reserved_sink_name);
+        if !reserved {
+            continue;
+        }
+        let same = std::fs::metadata(entry.path())
+            .map(|m| (m.dev(), m.ino()) == id)
+            .unwrap_or(false);
+        if same {
+            return Err(TapOpenError::Identity);
+        }
+    }
+    Ok(())
 }
 
 fn tail_is_clean(file: &mut File) -> std::io::Result<bool> {
@@ -361,6 +438,36 @@ mod tests {
         let (records, skipped) = parse_tail_records(&lines);
         assert_eq!(records.len(), 1);
         assert_eq!(skipped, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn checked_open_refuses_reserved_hardlink_admits_clean() {
+        let d = dir("checked");
+        std::fs::write(d.join("sequence.json"), b"{}").unwrap();
+        // Hard link with a non-reserved NAME to a RESERVED identity.
+        let evil = d.join("tap.jsonl");
+        std::fs::hard_link(d.join("sequence.json"), &evil).unwrap();
+        assert!(
+            matches!(Tap::open_checked(&evil, &d), Err(TapOpenError::Identity)),
+            "reserved-identity hard link refuses post-open"
+        );
+        // The refused open wrote nothing (fd closed pre-write).
+        assert_eq!(std::fs::read(d.join("sequence.json")).unwrap(), b"{}");
+        std::fs::remove_file(&evil).unwrap();
+        // A clean resident tap admits.
+        std::fs::write(&evil, b"").unwrap();
+        assert!(Tap::open_checked(&evil, &d).is_ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn checked_open_refuses_symlink() {
+        let d = dir("symlink");
+        std::fs::write(d.join("real.jsonl"), b"").unwrap();
+        std::os::unix::fs::symlink(d.join("real.jsonl"), d.join("link.jsonl")).unwrap();
+        assert!(Tap::open_checked(&d.join("link.jsonl"), &d).is_err());
+        assert!(Tap::open(&d.join("link.jsonl")).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 
