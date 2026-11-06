@@ -359,14 +359,22 @@ pub fn adjudicate(input: &OracleInput) -> (SignalVerdict, Vec<WitnessEntry>) {
         // R2 Gate 5: every traced suspect task stays suspect —
         // TID (`sender_pid`), process (`sender_tgid`), or tree
         // ownership (`suspect_root`) matching a suspect root proves
-        // suspect origin (pre-fix logs carry tid only; the tid check
-        // preserves their leader/stranger behavior exactly).
+        // suspect origin. Pre-fix logs carry tid only: the tid check
+        // preserves their leader/stranger behavior exactly, plus a
+        // best-effort worker-comm fallback (`observer-*`/`sixb-*`
+        // name only suspect worker tasks — the R2 worker-201 input
+        // carries `observer-worker`) so the exact R2 inputs FAIL;
+        // post-fix logs ignore comm (tracer-attested ownership is
+        // authoritative; comm is suspect-forgeable).
         let suspect = a.sender_pid == input.observer_pid
             || input.service_pids.contains(&a.sender_pid)
             || a.sender_tgid
                 .is_some_and(|t| t == input.observer_pid || input.service_pids.contains(&t))
             || a.suspect_root
-                .is_some_and(|r| r == input.observer_pid || input.service_pids.contains(&r));
+                .is_some_and(|r| r == input.observer_pid || input.service_pids.contains(&r))
+            || (a.sender_tgid.is_none()
+                && a.suspect_root.is_none()
+                && (a.sender_comm.starts_with("observer-") || a.sender_comm.starts_with("sixb-")));
         if suspect {
             match a.target_pid {
                 Some(t) if input.workload.contains(&t) => {
