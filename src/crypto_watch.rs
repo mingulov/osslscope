@@ -2917,8 +2917,19 @@ impl RunState {
         ctx: &AdmitCtx<'_>,
         admitted: &mut Vec<u32>,
     ) -> io::Result<bool> {
+        // F8a: the engine deadline is a decade out (the service
+        // runs until canceled) but session durations validate at ≤
+        // `MAX_DURATION_SECS` — the uncapped engine life failed
+        // EVERY service admission (the vacuous 24h). Cap the session
+        // at the validation bound (a session observes within the
+        // bound; renewal past it is future work — session windows
+        // already span any dry qual).
+        let duration = ctx
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(crate::args::MAX_DURATION_SECS as u64));
         let config = FocusedConfig {
-            duration: ctx.deadline.saturating_duration_since(Instant::now()),
+            duration,
             ..Default::default()
         };
         match FocusedSession::open_scanned_reserved(
@@ -6274,6 +6285,93 @@ mod tests {
         let lease = run.reserve_session(&pool, 60, 0).expect("fits after drain");
         assert!(pool.reserve(40).is_some(), "drained guard frees room");
         drop(lease);
+    }
+
+    #[test]
+    fn f8a_service_deadline_admits_with_capped_session() {
+        // F8a REGRESSION (R1 finding 8 — the vacuous 24h): the
+        // service engine lives a decade (ENGINE_DURATION) and
+        // try_admit fed the FULL remaining engine life as the
+        // session duration — but FocusedConfig::validate caps
+        // duration at 3600 s, so EVERY admission failed
+        // (acquisition_unavailable × 85k; zero members/sites/calls
+        // in all 2880 windows). The session duration must be
+        // capped at the validation bound. Self-targeted, no BPF
+        // (empty companions degrade — the failure under test is
+        // the pre-BPF validation, which is what rejected every
+        // qual admission before any BPF syscall ran).
+        use sha2::{Digest, Sha256};
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let pid = std::process::id();
+        let snapshot = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![pid],
+            resolve_paths: false,
+            limits: inventory::Limits::default(),
+        });
+        let record = snapshot
+            .processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("own record")
+            .clone();
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count: Arc::from([]),
+            count_sha256: Sha256::digest([]).into(),
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation: 0,
+            // The service engine deadline (a decade out).
+            deadline: Instant::now() + Duration::from_secs(10 * 365 * 24 * 3600),
+            cancel: &cancel,
+            tracing: true,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let need = FocusedSession::reservation_bytes(&objects).expect("session cost");
+        let lease = pool.reserve(need).expect("session lease");
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let mut admitted = Vec::new();
+        let admitted_now = run
+            .try_admit(
+                &mut sink,
+                AdmitSpec {
+                    identity: Incarnation {
+                        pid,
+                        starttime: record.starttime,
+                        namespaces: record.namespaces.clone(),
+                    },
+                    record: &record,
+                    epoch: 0,
+                    detail: None,
+                    ledger: MemberLedger::empty(),
+                    cgroup: None,
+                    admit_floor_ns: 0,
+                },
+                lease,
+                &ctx,
+                &mut admitted,
+            )
+            .unwrap();
+        assert!(
+            admitted_now,
+            "a decade-out engine deadline must still admit (capped session)"
+        );
+        assert_eq!(admitted, vec![pid]);
     }
     #[test]
     fn exit_against_live_admitted_member_counts_artifact() {
