@@ -76,15 +76,12 @@ pub fn publish_window(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // THE ONE duplicate rule: byte-compare + same attempt.
-            let step = match std::fs::read(&final_path) {
-                Ok(existing) => {
-                    if existing == bytes && attempt.matches_bytes(&existing) {
-                        PublishStep::Converged
-                    } else {
-                        PublishStep::IntegrityRefusal
-                    }
-                }
+            // THE ONE duplicate rule, streamed (R2 Gate 1): chunked
+            // byte-compare + bounded attempt-identity prefix scan —
+            // the existing window never loads whole.
+            let step = match file_equals_bytes(&final_path, bytes) {
+                Ok(true) if attempt.matches_file(&final_path) => PublishStep::Converged,
+                Ok(_) => PublishStep::IntegrityRefusal,
                 Err(_) => PublishStep::IntegrityRefusal,
             };
             let _ = std::fs::remove_file(&tmp);
@@ -212,17 +209,12 @@ pub fn publish_window_streaming(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // THE ONE duplicate rule, streamed: chunked
-            // byte-compare (never holding both files) + same
-            // attempt. The attempt parse still reads the existing
-            // file whole (rare EEXIST-only path — the steady path
-            // never holds window bytes; twin-audited, R1 finding 2b).
+            // THE ONE duplicate rule, streamed (R2 Gate 1): chunked
+            // byte-compare + bounded attempt-identity prefix scan —
+            // neither the compare nor the identity holds the window.
             let step = match files_equal_chunked(&tmp, &final_path) {
-                Ok(true) => match std::fs::read(&final_path) {
-                    Ok(existing) if attempt.matches_bytes(&existing) => PublishStep::Converged,
-                    _ => PublishStep::IntegrityRefusal,
-                },
-                Ok(false) => PublishStep::IntegrityRefusal,
+                Ok(true) if attempt.matches_file(&final_path) => PublishStep::Converged,
+                Ok(_) => PublishStep::IntegrityRefusal,
                 Err(read_err) => {
                     let _ = std::fs::remove_file(&tmp);
                     return (
@@ -335,14 +327,10 @@ pub fn publish_window_detailed(
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let step = match std::fs::read(&final_path) {
-                Ok(existing) => {
-                    if existing == bytes && attempt.matches_bytes(&existing) {
-                        PublishStep::Converged
-                    } else {
-                        PublishStep::IntegrityRefusal
-                    }
-                }
+            // Streamed duplicate rule (R2 Gate 1 — same as above).
+            let step = match file_equals_bytes(&final_path, bytes) {
+                Ok(true) if attempt.matches_file(&final_path) => PublishStep::Converged,
+                Ok(_) => PublishStep::IntegrityRefusal,
                 Err(read_err) => {
                     let _ = std::fs::remove_file(&tmp);
                     return (
@@ -379,6 +367,299 @@ pub struct AttemptKey {
     pub boot_id: String,
 }
 
+/// Bounded attempt-identity scan ceiling (one streaming
+/// buffer — `seq` + `run_id` open every envelope, so the
+/// prefix always holds them; anything beyond fails closed to
+/// refusal, never a whole-window read).
+pub const ATTEMPT_SCAN_MAX_BYTES: u64 = PUBLISH_BUF_BYTES as u64;
+
+/// Extract `(seq, pid, starttime, boot_id)` from a JSON prefix
+/// without parsing the whole document (minimal top-level parser:
+/// `seq` at depth 1, `run_id.{pid,starttime,boot_id}` at depth 2;
+/// any truncation, syntax error, or non-integer shape is `None` —
+/// refusal, never a skip). Early-exits once all four fields land,
+/// so large `members`/`crypto_watch`/`document` tails never load.
+fn extract_attempt_prefix(buf: &[u8]) -> Option<(u64, u64, u64, String)> {
+    fn ws(b: &[u8], p: &mut usize) {
+        while *p < b.len() && matches!(b[*p], b' ' | b'\n' | b'\r' | b'\t') {
+            *p += 1;
+        }
+    }
+    fn parse_string(b: &[u8], p: &mut usize) -> Option<String> {
+        if *p >= b.len() || b[*p] != b'"' {
+            return None;
+        }
+        *p += 1;
+        let mut out = String::new();
+        while *p < b.len() {
+            let c = b[*p];
+            if c == b'"' {
+                *p += 1;
+                return Some(out);
+            }
+            if c != b'\\' {
+                if c < 0x20 {
+                    return None;
+                }
+                out.push(c as char);
+                *p += 1;
+                continue;
+            }
+            *p += 1;
+            if *p >= b.len() {
+                return None;
+            }
+            match b[*p] {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'b' => out.push('\u{0008}'),
+                b'f' => out.push('\u{000C}'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' => {
+                    if *p + 4 >= b.len() {
+                        return None;
+                    }
+                    let hex = std::str::from_utf8(&b[*p + 1..*p + 5]).ok()?;
+                    let cp = u32::from_str_radix(hex, 16).ok()?;
+                    *p += 4;
+                    out.push(char::from_u32(cp)?);
+                }
+                _ => return None,
+            }
+            *p += 1;
+            if out.len() > 8192 {
+                return None;
+            }
+        }
+        None
+    }
+    fn parse_u64(b: &[u8], p: &mut usize) -> Option<u64> {
+        ws(b, p);
+        let s = *p;
+        while *p < b.len() && b[*p].is_ascii_digit() {
+            *p += 1;
+        }
+        if s == *p || *p - s > 20 {
+            return None;
+        }
+        // A JSON float/exponent/negative is not an integer identity.
+        if *p < b.len() && matches!(b[*p], b'.' | b'e' | b'E' | b'-' | b'+') {
+            return None;
+        }
+        std::str::from_utf8(&b[s..*p]).ok()?.parse::<u64>().ok()
+    }
+    /// Skip one JSON value starting at `*p` (caller already skipped
+    /// whitespace). Bounded by `buf.len()`; returns `None` on
+    /// truncation or syntax error.
+    fn skip_value(b: &[u8], p: &mut usize) -> Option<()> {
+        ws(b, p);
+        if *p >= b.len() {
+            return None;
+        }
+        match b[*p] {
+            b'"' => {
+                parse_string(b, p)?;
+                Some(())
+            }
+            b'{' | b'[' => {
+                let mut depth = 0usize;
+                let mut in_str = false;
+                let mut esc = false;
+                while *p < b.len() {
+                    let c = b[*p];
+                    if in_str {
+                        if esc {
+                            esc = false;
+                        } else if c == b'\\' {
+                            esc = true;
+                        } else if c == b'"' {
+                            in_str = false;
+                        }
+                        *p += 1;
+                        continue;
+                    }
+                    match c {
+                        b'"' => in_str = true,
+                        b'{' | b'[' => depth += 1,
+                        b'}' | b']' => {
+                            depth = depth.checked_sub(1)?;
+                            if depth == 0 {
+                                *p += 1;
+                                return Some(());
+                            }
+                        }
+                        _ => {}
+                    }
+                    *p += 1;
+                }
+                None
+            }
+            b't' => {
+                if b.len() - *p >= 4 && &b[*p..*p + 4] == b"true" {
+                    *p += 4;
+                    Some(())
+                } else {
+                    None
+                }
+            }
+            b'f' => {
+                if b.len() - *p >= 5 && &b[*p..*p + 5] == b"false" {
+                    *p += 5;
+                    Some(())
+                } else {
+                    None
+                }
+            }
+            b'n' => {
+                if b.len() - *p >= 4 && &b[*p..*p + 4] == b"null" {
+                    *p += 4;
+                    Some(())
+                } else {
+                    None
+                }
+            }
+            b'-' | b'0'..=b'9' => {
+                if b[*p] == b'-' {
+                    *p += 1;
+                }
+                let mut any = false;
+                while *p < b.len()
+                    && matches!(b[*p], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
+                    *p += 1;
+                    any = true;
+                }
+                if any { Some(()) } else { None }
+            }
+            _ => None,
+        }
+    }
+    let mut p = 0usize;
+    ws(buf, &mut p);
+    if p >= buf.len() || buf[p] != b'{' {
+        return None;
+    }
+    p += 1;
+    let (mut seq, mut pid, mut start, mut boot): (
+        Option<u64>,
+        Option<u64>,
+        Option<u64>,
+        Option<String>,
+    ) = (None, None, None, None);
+    loop {
+        ws(buf, &mut p);
+        if p >= buf.len() {
+            return None;
+        }
+        if buf[p] == b'}' {
+            break;
+        }
+        let key = parse_string(buf, &mut p)?;
+        ws(buf, &mut p);
+        if p >= buf.len() || buf[p] != b':' {
+            return None;
+        }
+        p += 1;
+        if key == "seq" {
+            seq = Some(parse_u64(buf, &mut p)?);
+        } else if key == "run_id" {
+            ws(buf, &mut p);
+            if p >= buf.len() || buf[p] != b'{' {
+                return None;
+            }
+            p += 1;
+            loop {
+                ws(buf, &mut p);
+                if p >= buf.len() {
+                    return None;
+                }
+                if buf[p] == b'}' {
+                    p += 1;
+                    break;
+                }
+                let rk = parse_string(buf, &mut p)?;
+                ws(buf, &mut p);
+                if p >= buf.len() || buf[p] != b':' {
+                    return None;
+                }
+                p += 1;
+                if rk == "pid" {
+                    pid = Some(parse_u64(buf, &mut p)?);
+                } else if rk == "starttime" {
+                    start = Some(parse_u64(buf, &mut p)?);
+                } else if rk == "boot_id" {
+                    ws(buf, &mut p);
+                    boot = Some(parse_string(buf, &mut p)?);
+                } else {
+                    skip_value(buf, &mut p)?;
+                }
+                ws(buf, &mut p);
+                if p >= buf.len() {
+                    return None;
+                }
+                if buf[p] == b',' {
+                    p += 1;
+                } else if buf[p] == b'}' {
+                    p += 1;
+                    break;
+                } else {
+                    return None;
+                }
+                if seq.is_some() && pid.is_some() && start.is_some() && boot.is_some() {
+                    let (s, q, t, o) = (seq.unwrap(), pid.unwrap(), start.unwrap(), boot.unwrap());
+                    return Some((s, q, t, o));
+                }
+            }
+        } else {
+            skip_value(buf, &mut p)?;
+        }
+        if seq.is_some() && pid.is_some() && start.is_some() && boot.is_some() {
+            let (s, q, t, o) = (seq.unwrap(), pid.unwrap(), start.unwrap(), boot.unwrap());
+            return Some((s, q, t, o));
+        }
+        ws(buf, &mut p);
+        if p >= buf.len() {
+            return None;
+        }
+        if buf[p] == b',' {
+            p += 1;
+        } else if buf[p] == b'}' {
+            break;
+        } else {
+            return None;
+        }
+    }
+    match (seq, pid, start, boot) {
+        (Some(s), Some(q), Some(t), Some(o)) => Some((s, q, t, o)),
+        _ => None,
+    }
+}
+
+/// Chunked file-vs-bytes equality (one bounded buffer — the
+/// existing file never loads whole).
+fn file_equals_bytes(path: &Path, expected: &[u8]) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(path)?;
+    if f.metadata()?.len() != expected.len() as u64 {
+        return Ok(false);
+    }
+    let mut buf = vec![0u8; PUBLISH_BUF_BYTES];
+    let mut off = 0usize;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            return Ok(off == expected.len());
+        }
+        if off + n > expected.len() || buf[..n] != expected[off..off + n] {
+            return Ok(false);
+        }
+        off += n;
+    }
+}
+
 impl AttemptKey {
     /// Parse the existing envelope's `(seq, run_id)` from its bytes
     /// (tolerant: any parse failure is NOT a match — refusal, never
@@ -407,6 +688,32 @@ impl AttemptKey {
                     && b == self.boot_id
             }
             _ => false,
+        }
+    }
+
+    /// Bounded attempt-identity check (R2 Gate 1): streams at most
+    /// one buffer of the existing file's prefix and extracts
+    /// `(seq, run_id)` without loading the window. Any IO error,
+    /// truncation, or parse failure is NOT a match — refusal.
+    pub fn matches_file(&self, path: &Path) -> bool {
+        use std::io::Read as _;
+        let f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(_) => return false,
+        };
+        let mut prefix = Vec::new();
+        let mut take = f.take(ATTEMPT_SCAN_MAX_BYTES);
+        if take.read_to_end(&mut prefix).is_err() {
+            return false;
+        }
+        match extract_attempt_prefix(&prefix) {
+            Some((s, p, t, b)) => {
+                s == self.seq
+                    && p == u64::from(self.pid)
+                    && t == self.starttime
+                    && b == self.boot_id
+            }
+            None => false,
         }
     }
 }
