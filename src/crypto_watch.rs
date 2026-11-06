@@ -5345,6 +5345,53 @@ mod tests {
         assert_eq!(doc["refusal_diagnostics"].as_array().unwrap().len(), 1);
     }
     #[test]
+    fn parser_refused_honestly_with_two_sessions_live_recovers_after() {
+        // F8d ADJUDICATION (R1 finding 8): the pre-6A envelope
+        // (stock parser + TWO max sessions on one 256 MiB pool) no
+        // longer fits — the 6A sealed-bound maps cost ~1.39 MiB
+        // per session and the pool size is D-bound frozen. The
+        // contended state IS reachable (a periodic rescan parsing
+        // a new large module while two sessions hold leases), so
+        // this pins the HONEST behavior instead of the fit:
+        // refusal (never silent corruption), partial availability
+        // (small modules still parse), and recovery (the parse
+        // fits again once a session ends). Refusal surfaces as a
+        // `ReadLimit` scan gap (loss vocabulary, never silent)
+        // and the member stays deferred-queued with its span
+        // preserved for retry (`deferred_spans_merge_by_union`).
+        // Restoration (re-fitting) needs BPF map right-sizing
+        // with workload key-count evidence — round-2 work. The
+        // stock size IS libcrypto.so.3 (6,386,528 B on the qual
+        // host): with two max sessions ~21.8 MiB is free, so
+        // modules ≤ ~4.7 MiB parse and larger ones refuse.
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let _coordinator = pool.reserve(COORDINATOR_BYTES + 32_768).unwrap();
+        let _scanner = pool.reserve(4096 * 160 + 100 * 4096).unwrap();
+        let cost = FocusedSession::reservation_bytes(&objects()).unwrap() + 29_480;
+        let _a = pool.reserve(cost).unwrap();
+        let _b = pool.reserve(cost).unwrap();
+        // Contended: the stock parse refuses (loud `None` — the
+        // scan records a `ReadLimit` gap, never a silent skip).
+        assert!(
+            pool.reserve(inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
+                .is_none(),
+            "stock libcrypto parse refuses under two max sessions"
+        );
+        // Partial availability: small modules still parse (a
+        // 1 MiB module needs ~17.9 MiB < ~21.8 MiB free).
+        {
+            let _small = pool
+                .reserve(inventory::elf::parser_scratch_bytes(1 << 20).unwrap())
+                .expect("small-module parse fits under two sessions");
+        }
+        // Recovery: the stock parse fits again once a session ends.
+        drop(_b);
+        let _parser = pool
+            .reserve(inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
+            .expect("stock parse recovers after a session ends");
+        assert!(pool.peak() <= GLOBAL_BYTES);
+    }
+    #[test]
     fn two_normal_reservations_fit_parser_coexists_with_one() {
         // 6B capacity note (D-record §11.1, mandated): the
         // sealed-bound maps (BOUNDS/EPOCH/EPOCH_CUR, 2048-entry
