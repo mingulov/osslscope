@@ -40,8 +40,8 @@ use crate::service::state::{
 };
 use crate::service::stream::{Tap, TapOpenError, resolve_stream};
 use crate::service::worker::{
-    Control, DestClass, Destination, Diagnostics, Gate, WorkerOut, outcome_of, push_accounting,
-    run_under_control, view_slot,
+    Control, DestClass, Destination, Diagnostics, Gate, WaitPoll, WorkerOut, outcome_of,
+    push_accounting, run_under_control, view_slot,
 };
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
@@ -175,10 +175,20 @@ struct Run {
     /// engine's clone of the same pool).
     _leases: Vec<crate::observation_memory::MemoryLease>,
     /// Signal state: first cancel latched, double-signal latched.
-    cancel_latched: bool,
-    double_signal: bool,
+    /// Atomic: worker-wait polls consume signalfd concurrently with
+    /// the coordinator path (R1 finding 3 — shared refs only).
+    cancel_latched: AtomicBool,
+    double_signal: AtomicBool,
     /// SIGHUP reload pending (consumed at the next boundary, §3).
-    reload_pending: bool,
+    /// Atomic: set by wait polls (R1 finding 3).
+    reload_pending: AtomicBool,
+    /// The ONE shutdown deadline (R1 finding 3): minted at
+    /// run-final close entry (before the drain), or when a mid-run
+    /// close diverts to a run-ending tail — every later close stage
+    /// draws its budget from the REMAINDER, so `--grace` bounds the
+    /// complete close. `None` in-run and mid-close (per-stage
+    /// boundary budgets there, as before).
+    close_deadline: Option<Instant>,
     /// Policy state (§3).
     policy: PolicyState,
     /// Stream state (§5.2/§5.3/§6.1 — `None` without `--stream`).
@@ -346,9 +356,28 @@ impl SummaryAccum {
     }
 }
 
+/// Hoist one wait poll for a `&mut Run` scope: the standard
+/// run-cancel form (`wait_poll_for` with the run's own refs).
+/// Kept as a macro: a `fn` taking `&Run` would borrow the whole
+/// run and conflict with the caller's `&mut` field borrows.
+macro_rules! run_wait_poll {
+    ($run:expr) => {
+        wait_poll_for(
+            &$run.signals,
+            &$run.cancel,
+            &$run.cancel_latched,
+            &$run.double_signal,
+            &$run.reload_pending,
+        )
+    };
+}
+
 /// One §7.2 worker op: run under `budget` + `cancel`, record the
 /// coordinator-observed outcome in `close_accounting`, and emit
-/// one bounded diagnostic on anything but `Done`.
+/// one bounded diagnostic on anything but `Done`. `wait_poll`
+/// (when present) consumes signalfd during the wait (R1 finding
+/// 3); pre-`Run` startup ops pass `None` (signals pend for the
+/// loop-top drain, as before).
 #[allow(clippy::too_many_arguments)]
 fn run_op<T, F>(
     diag: &Diagnostics,
@@ -358,13 +387,14 @@ fn run_op<T, F>(
     op_name: &str,
     dest: Destination,
     budget: Duration,
+    wait_poll: Option<&WaitPoll>,
     op: F,
 ) -> Control<T>
 where
     T: Send + 'static,
     F: FnOnce(Gate) -> WorkerOut<T> + Send + 'static,
 {
-    let control = run_under_control(dest, budget, cancel, op);
+    let control = run_under_control(dest, budget, cancel, op, wait_poll);
     let outcome = outcome_of(&control);
     if outcome != OpOutcome::Done {
         diag_line(
@@ -381,6 +411,54 @@ where
         outcome,
     );
     control
+}
+
+/// Worker-backed spill sink for staging (R1 finding 3): each spill
+/// file write + fsync runs on an OwnTmp control worker under
+/// `budget` + `cancel` — never coordinator-direct. Registry keys
+/// derive from the spill tmp name (run tag + tick + index — unique
+/// per record, so a lingering detached slot never collides).
+/// `poll` consumes signalfd during the wait.
+fn spill_sink_for<'a>(
+    diag: &'a Diagnostics,
+    format: &'a Format,
+    accum: &'a mut SummaryAccum,
+    cancel: &'a AtomicBool,
+    poll: Option<&'a WaitPoll<'a>>,
+    budget: Duration,
+) -> impl FnMut(&Path, &[u8]) -> std::io::Result<()> + 'a {
+    move |tmp: &Path, line: &[u8]| {
+        let key = tmp
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("spill")
+            .to_string();
+        let wrote: Control<std::io::Result<()>> = run_op(
+            diag,
+            format,
+            accum,
+            cancel,
+            "spill_write",
+            Destination {
+                class: DestClass::OwnTmp,
+                key: format!("spill-{key}"),
+            },
+            budget,
+            poll,
+            {
+                let (tmp, line) = (tmp.to_path_buf(), line.to_vec());
+                move |_gate| {
+                    WorkerOut::value(crate::service::staging::spill_write_direct(&tmp, &line))
+                }
+            },
+        );
+        match wrote {
+            Control::Done(result) => result,
+            Control::Cancelled => Err(std::io::Error::other("spill cancelled")),
+            Control::Expired => Err(std::io::Error::other("spill expired")),
+            Control::SpawnFailed => Err(std::io::Error::other("spill worker unavailable")),
+        }
+    }
 }
 
 /// State-file destination key (per-destination registry, §7.2).
@@ -436,10 +514,15 @@ fn state_write_reconciled(
 ) -> (Result<bool, std::io::Error>, Option<u64>) {
     let dest = state_dest(file);
     // Attempt 1 (fenced worker with the pre-mutation re-check).
+    // Every wait re-caps by the shutdown remainder (R1 finding 3 —
+    // attempt 1 may consume the whole budget, leaving the
+    // reconcile waits to fail fast instead of stacking more).
     let first = {
         let (out, tag) = (run.out.clone(), run.tag.clone());
         let file = file.to_string();
         let bytes = bytes.clone();
+        let attempt_budget = cap_by_deadline(run, budget);
+        let poll = run_wait_poll!(run);
         run_op(
             &run.diag,
             &run.format,
@@ -447,7 +530,8 @@ fn state_write_reconciled(
             &run.cancel,
             op_name,
             dest.clone(),
-            budget,
+            attempt_budget,
+            Some(&poll),
             move |gate| {
                 if gate.abandoned() {
                     return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
@@ -471,8 +555,12 @@ fn state_write_reconciled(
     // re-read is itself a worker op — §7.2 lists reads; a distinct
     // slot so a still-registered writer never refuses it). A
     // reflected transition converges (the detached worker's
-    // post-check completion won the race, §7.2).
-    if !poll_unregister(&dest, Duration::from_secs(1)) {
+    // post-check completion won the race, §7.2). The poll is capped
+    // by the shutdown remainder and breaks on the double (R1
+    // finding 3 — reconciliation adds no fresh wait past grace).
+    let poll_cap = cap_by_deadline(run, Duration::from_secs(1));
+    let unreg_poll = run_wait_poll!(run);
+    if !poll_unregister(&dest, poll_cap, Some(&unreg_poll)) {
         diag_line(
             &run.diag,
             &run.format,
@@ -482,6 +570,8 @@ fn state_write_reconciled(
     }
     let reread = {
         let (out, file) = (run.out.clone(), file.to_string());
+        let reread_budget = cap_by_deadline(run, budget);
+        let poll = run_wait_poll!(run);
         run_op(
             &run.diag,
             &run.format,
@@ -492,7 +582,8 @@ fn state_write_reconciled(
                 class: DestClass::StateMut,
                 key: format!("reread-{file}"),
             },
-            budget,
+            reread_budget,
+            Some(&poll),
             move |_gate| WorkerOut::value(std::fs::read(out.join(&file)).ok()),
         )
     };
@@ -507,6 +598,8 @@ fn state_write_reconciled(
     let second = {
         let (out, tag) = (run.out.clone(), run.tag.clone());
         let file = file.to_string();
+        let retry_budget = cap_by_deadline(run, budget);
+        let poll = run_wait_poll!(run);
         run_op(
             &run.diag,
             &run.format,
@@ -514,7 +607,8 @@ fn state_write_reconciled(
             &run.cancel,
             op_name,
             dest.clone(),
-            budget,
+            retry_budget,
+            Some(&poll),
             move |gate| {
                 if gate.abandoned() {
                     return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
@@ -596,6 +690,7 @@ fn run_service(cfg: ServiceConfig) -> ExitCode {
             "reset_sequence_write",
             state_dest("sequence.json"),
             startup_budget(),
+            None,
             move |gate| {
                 let old_gen = std::fs::read(dir.join("sequence.json"))
                     .ok()
@@ -694,6 +789,7 @@ fn startup_recovery(
         "startup_latch_probe",
         state_dest("quota-stop.json"),
         startup_budget(),
+        None,
         {
             let out = out.clone();
             move |_gate| WorkerOut::value(std::fs::read(out.join("quota-stop.json")).ok())
@@ -711,6 +807,7 @@ fn startup_recovery(
             "startup_quota_probe",
             state_dest("quota-probe"),
             startup_budget(),
+            None,
             {
                 let out = out.clone();
                 let (rw, rb) = (cfg.retain_windows, cfg.retain_bytes);
@@ -734,6 +831,7 @@ fn startup_recovery(
             "startup_latch_clear",
             state_dest("quota-stop.json"),
             startup_budget(),
+            None,
             {
                 let out = out.clone();
                 move |gate| {
@@ -766,6 +864,7 @@ fn startup_recovery(
             key: "startup-tmps".to_string(),
         },
         startup_budget(),
+        None,
         {
             let out = out.clone();
             move |_gate| WorkerOut::value(clean_tmps(&out))
@@ -785,6 +884,7 @@ fn startup_recovery(
         "startup_state_reads",
         state_dest("startup-reads"),
         startup_budget(),
+        None,
         {
             let out = out.clone();
             move |_gate| {
@@ -818,6 +918,7 @@ fn startup_recovery(
             "startup_quota_probe",
             state_dest("quota-probe"),
             startup_budget(),
+            None,
             {
                 let out = out.clone();
                 let (rw, rb) = (cfg.retain_windows, cfg.retain_bytes);
@@ -935,6 +1036,7 @@ fn terminal_refusal(
         "terminal_summary_write",
         state_dest("run-summary.json"),
         Duration::from_secs(10),
+        None,
         {
             move |gate| {
                 if gate.abandoned() {
@@ -1061,6 +1163,7 @@ fn open_engine(
             "startup_policy_read",
             state_dest("policy-read"),
             startup_budget(),
+            None,
             move |_gate| WorkerOut::value(read_policy_snapshot(&path_for_worker)),
         );
         match read {
@@ -1126,6 +1229,7 @@ fn open_engine(
             "startup_policy_status_write",
             state_dest("policy-status.json"),
             startup_budget(),
+            None,
             {
                 let (out, tag) = (out.clone(), tag.clone());
                 move |gate| {
@@ -1319,6 +1423,7 @@ fn open_first_window(
         "reserve_first_window",
         state_dest("sequence.json"),
         startup_budget(),
+        None,
         {
             let (out, tag) = (out.clone(), tag.clone());
             move |gate| {
@@ -1369,6 +1474,7 @@ fn open_first_window(
         "open_first_window",
         state_dest("sequence.json"),
         startup_budget(),
+        None,
         {
             let (out, tag) = (out.clone(), tag.clone());
             move |gate| {
@@ -1396,20 +1502,26 @@ fn open_first_window(
     }
     // Setup bytes open the first window's tick 0 (§11: `Start`
     // opens the run's first window). Spill-capable from the first
-    // byte (the same admission path as every tick).
+    // byte (the same admission path as every tick) — spills run on
+    // workers (no signal poll pre-`Run`; signals pend for the
+    // loop-top drain, as before — R1 finding 3).
     let mut staging = Staging::new();
     let mut piece = TickPiece::open(0);
+    let mut setup_sink =
+        spill_sink_for(&diag, &format, &mut accum, &cancel, None, startup_budget());
     for line in setup_bytes.split(|b| *b == b'\n') {
         if line.is_empty() {
             continue;
         }
         if staging
-            .admit_record(&mut piece, &out, &tag, line, 0)
+            .admit_record(&mut piece, &out, &tag, line, 0, &mut setup_sink)
             .is_err()
         {
+            drop(setup_sink);
             return prestart_exit4(diag, lock, "staging setup records failed");
         }
     }
+    drop(setup_sink);
     // Tick 0 admits unconditionally (a Carry with empty staging
     // would fabricate an empty window — the first tick is always
     // consumed; §5.1 admitted-first accounting).
@@ -1454,9 +1566,10 @@ fn open_first_window(
         cancel,
         engine,
         _leases: leases,
-        cancel_latched: false,
-        double_signal: false,
-        reload_pending: false,
+        cancel_latched: AtomicBool::new(false),
+        double_signal: AtomicBool::new(false),
+        reload_pending: AtomicBool::new(false),
+        close_deadline: None,
         policy,
         stream,
         cycle: Some(cycle),
@@ -1482,27 +1595,80 @@ fn consume_signals(run: &mut Run, sigs: Vec<Signal>) {
     for sig in sigs {
         match sig {
             Signal::Term => {
-                if run.cancel_latched {
-                    run.double_signal = true;
+                if run.cancel_latched.load(Ordering::SeqCst) {
+                    run.double_signal.store(true, Ordering::SeqCst);
                 }
-                run.cancel_latched = true;
+                run.cancel_latched.store(true, Ordering::SeqCst);
                 run.cancel.store(true, Ordering::Release);
             }
             Signal::Hup => {
-                run.reload_pending = true;
+                run.reload_pending.store(true, Ordering::SeqCst);
             }
         }
     }
 }
 
+/// True once the second stop is observed (wait polls + loop drains
+/// both latch — the divert checks read this, never `cancel`, which
+/// `close_gate` resets at close entry).
+fn double_observed(run: &Run) -> bool {
+    run.double_signal.load(Ordering::SeqCst)
+}
+
+/// Mint the ONE shutdown deadline (R1 finding 3) when no close has
+/// one yet: now + `--grace`.
+fn mint_close_deadline(run: &mut Run) {
+    if run.close_deadline.is_none() {
+        run.close_deadline = Some(Instant::now() + run.cfg.grace);
+    }
+}
+
+/// Close-stage worker budget (R1 finding 3): the shutdown
+/// deadline's REMAINDER once minted (every close stage shares the
+/// one `--grace`), else the in-run boundary budget. Saturates at
+/// zero past the deadline (the wait fails fast — Expired — instead
+/// of stacking another full budget).
+fn close_budget(run: &Run) -> Duration {
+    match run.close_deadline {
+        Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+        None => boundary_budget(run.cfg.timeout),
+    }
+}
+
+/// Cap an explicit multi-wait budget by the shutdown remainder
+/// (R1 finding 3): `state_write_reconciled` passes attempt/reread/
+/// retry/poll waits through here so reconciliation never outlives
+/// the one deadline.
+fn cap_by_deadline(run: &Run, budget: Duration) -> Duration {
+    match run.close_deadline {
+        Some(deadline) => budget.min(deadline.saturating_duration_since(Instant::now())),
+        None => budget,
+    }
+}
+
+/// This wait's signal poll (R1 finding 3): drain signalfd every
+/// quantum into the run latches + `cancel`. Dissected refs (never
+/// `&Run` — the caller also borrows `&mut summary`).
+fn wait_poll_for<'a>(
+    signals: &'a SignalFd,
+    cancel: &'a AtomicBool,
+    latched: &'a AtomicBool,
+    double: &'a AtomicBool,
+    reload: &'a AtomicBool,
+) -> WaitPoll<'a> {
+    WaitPoll::new(signals, cancel, latched, double, reload)
+}
+
 /// Enter the close (§7.1): the latched run cancel stops the
 /// ENGINE (admission + drain promptness), never the close
-/// mechanics — close worker ops run under grace/timeout
-/// sub-deadline budgets on a fresh gate, or a signal-cut close
-/// would cancel its own publish + summary. `cancel_latched` keeps
-/// the interruption fact for the §7.3 fold. No-op in-run (the
-/// latch is only set on the signal/pump-failure paths, which
-/// always close next).
+/// mechanics — close worker ops run under the one shutdown
+/// deadline on a fresh gate, or a signal-cut close would cancel
+/// its own publish + summary. `cancel_latched` keeps the
+/// interruption fact for the §7.3 fold. A second signal observed
+/// DURING the close re-stores cancel via the wait polls (R1
+/// finding 3) — the divert checks read `double_signal`, which no
+/// gate ever resets. No-op in-run (the latch is only set on the
+/// signal/pump-failure paths, which always close next).
 fn close_gate(run: &mut Run) {
     run.cancel.store(false, Ordering::Release);
 }
@@ -1531,7 +1697,7 @@ fn run_loop(mut run: Run) -> ExitCode {
     loop {
         let sigs = run.signals.drain();
         consume_signals(&mut run, sigs);
-        if run.double_signal {
+        if double_observed(&run) {
             return double_signal_exit(run);
         }
         // One engine pump (coordinator-direct per the §7.2
@@ -1557,7 +1723,7 @@ fn run_loop(mut run: Run) -> ExitCode {
                         ));
                     }
                 }
-                run.cancel_latched = true;
+                run.cancel_latched.store(true, Ordering::SeqCst);
                 run.cancel.store(true, Ordering::Release);
                 return close_final_window(run);
             }
@@ -1569,6 +1735,27 @@ fn run_loop(mut run: Run) -> ExitCode {
         // next pull).
         let tick = run.tick_id;
         let mut spill_failed = false;
+        // In-run spills run on workers but survive the first stop
+        // (fresh cancel — a first-Term iteration still signal-cuts
+        // instead of abandoning; only the double cancels, via the
+        // poll, and then the abandon funnel diverts — R1 finding 3).
+        let spill_cancel = AtomicBool::new(false);
+        let spill_poll = wait_poll_for(
+            &run.signals,
+            &spill_cancel,
+            &run.cancel_latched,
+            &run.double_signal,
+            &run.reload_pending,
+        );
+        let spill_budget = close_budget(&run);
+        let mut spill_sink = spill_sink_for(
+            &run.diag,
+            &run.format,
+            &mut run.summary,
+            &spill_cancel,
+            Some(&spill_poll),
+            spill_budget,
+        );
         if let Some(cycle) = run.cycle.as_mut() {
             for line in it.bytes.split(|b| *b == b'\n') {
                 if line.is_empty() {
@@ -1576,7 +1763,14 @@ fn run_loop(mut run: Run) -> ExitCode {
                 }
                 if cycle
                     .staging
-                    .admit_record(&mut cycle.piece, &run.out, &run.tag, line, tick)
+                    .admit_record(
+                        &mut cycle.piece,
+                        &run.out,
+                        &run.tag,
+                        line,
+                        tick,
+                        &mut spill_sink,
+                    )
                     .is_err()
                 {
                     spill_failed = true;
@@ -1584,6 +1778,10 @@ fn run_loop(mut run: Run) -> ExitCode {
                 }
             }
         }
+        // End the sink's borrows (its `impl FnMut` type would
+        // otherwise hold them to scope end, blocking the moves
+        // below).
+        drop(spill_sink);
         if spill_failed {
             // Spill-write failure (disk-full family — the record can
             // neither stage nor spill): Control-2 pre-publish
@@ -1659,7 +1857,7 @@ fn run_loop(mut run: Run) -> ExitCode {
         }
         // Cancel latched → the in-flight window finalizes NOW with
         // `signal_cut` (stop after the current window, §7.1).
-        if run.cancel_latched {
+        if run.cancel_latched.load(Ordering::SeqCst) {
             return close_final_window(run);
         }
         // Quantum sleep that doubles as the synchronous signal poll.
@@ -1710,6 +1908,10 @@ fn close_mid_window(run: Run) -> BoundaryOut {
 /// the current piece (admitted whole — the final window consumes
 /// its tail undecided), then the common close with `signal_cut`.
 fn close_final_window(mut run: Run) -> ExitCode {
+    // Mint the ONE shutdown deadline BEFORE the drain (R1 finding
+    // 3): drain, assembly, publication, sinks, seal, and summary
+    // all draw from this single `--grace`.
+    run.close_deadline = Some(Instant::now() + run.cfg.grace);
     let seq = run.cycle.as_ref().expect("window open at final close").seq;
     // Drain (the engine retires sessions without readmit; cancel
     // stops admission, never the drain mechanics — mirrors 6A).
@@ -1717,9 +1919,21 @@ fn close_final_window(mut run: Run) -> ExitCode {
     match drain {
         Ok(out) => {
             // Stage the drain bytes (spill-capable — a spill failure
-            // here abandons pre-close, like the run loop's).
+            // here abandons pre-close, like the run loop's; spills
+            // run on workers under the shutdown remainder — R1
+            // finding 3).
             let mut spill_failed = false;
             let tick = run.tick_id;
+            let spill_budget = close_budget(&run);
+            let spill_poll = run_wait_poll!(run);
+            let mut spill_sink = spill_sink_for(
+                &run.diag,
+                &run.format,
+                &mut run.summary,
+                &run.cancel,
+                Some(&spill_poll),
+                spill_budget,
+            );
             if let Some(cycle) = run.cycle.as_mut() {
                 for line in out.bytes.split(|b| *b == b'\n') {
                     if line.is_empty() {
@@ -1727,7 +1941,14 @@ fn close_final_window(mut run: Run) -> ExitCode {
                     }
                     if cycle
                         .staging
-                        .admit_record(&mut cycle.piece, &run.out, &run.tag, line, tick)
+                        .admit_record(
+                            &mut cycle.piece,
+                            &run.out,
+                            &run.tag,
+                            line,
+                            tick,
+                            &mut spill_sink,
+                        )
                         .is_err()
                     {
                         spill_failed = true;
@@ -1740,6 +1961,7 @@ fn close_final_window(mut run: Run) -> ExitCode {
                 let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
                 cycle.staging.admit_piece(piece);
             }
+            drop(spill_sink);
             if spill_failed {
                 return abandon_window(run, AbandonReason::DiskFull, None);
             }
@@ -1778,11 +2000,26 @@ fn close_final_window(mut run: Run) -> ExitCode {
 /// flip snapshot (MAX+1 is unrepresentable) and the common close
 /// with the TERMINAL seal (`exhausted`, no next window ever).
 fn close_terminal_window(mut run: Run) -> BoundaryOut {
+    // The ONE shutdown deadline (R1 finding 3 — before the drain,
+    // like the final close).
+    run.close_deadline = Some(Instant::now() + run.cfg.grace);
     let drain = run.engine.close_drain(&run.cancel);
     match drain {
         Ok(out) => {
+            // Close-drain staging (worker-backed spills under the
+            // shutdown remainder — R1 finding 3, like the final).
             let mut spill_failed = false;
             let tick = run.tick_id;
+            let spill_budget = close_budget(&run);
+            let spill_poll = run_wait_poll!(run);
+            let mut spill_sink = spill_sink_for(
+                &run.diag,
+                &run.format,
+                &mut run.summary,
+                &run.cancel,
+                Some(&spill_poll),
+                spill_budget,
+            );
             if let Some(cycle) = run.cycle.as_mut() {
                 for line in out.bytes.split(|b| *b == b'\n') {
                     if line.is_empty() {
@@ -1790,7 +2027,14 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
                     }
                     if cycle
                         .staging
-                        .admit_record(&mut cycle.piece, &run.out, &run.tag, line, tick)
+                        .admit_record(
+                            &mut cycle.piece,
+                            &run.out,
+                            &run.tag,
+                            line,
+                            tick,
+                            &mut spill_sink,
+                        )
                         .is_err()
                     {
                         spill_failed = true;
@@ -1800,6 +2044,7 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
                 let piece = std::mem::replace(&mut cycle.piece, TickPiece::open(tick + 1));
                 cycle.staging.admit_piece(piece);
             }
+            drop(spill_sink);
             if spill_failed {
                 return BoundaryOut::Exit(abandon_window(run, AbandonReason::DiskFull, None));
             }
@@ -1895,14 +2140,22 @@ fn close_common_body(
 /// detached worker mutates at most once, then exits — §7.2), so a
 /// successor may register. Returns true when the slot is gone
 /// (consumed) or free. Bounded — reconciliation never waits past
-/// its sub-deadline.
-fn poll_unregister(dest: &Destination, budget: Duration) -> bool {
+/// its sub-deadline — and double-aware (R1 finding 3): the poll
+/// consumes signals and breaks early on the second stop (false —
+/// the caller judges, and the funnel diverts to the double exit).
+fn poll_unregister(dest: &Destination, budget: Duration, wait_poll: Option<&WaitPoll>) -> bool {
     let deadline = Instant::now() + budget;
     loop {
         match view_slot(dest) {
             None => return true,
             Some(view) if !view.live => return true,
             Some(_) => {}
+        }
+        if let Some(poll) = wait_poll {
+            poll.poll();
+            if poll.doubled() {
+                return false;
+            }
         }
         if Instant::now() >= deadline {
             return false;
@@ -1969,11 +2222,15 @@ fn mid_window_publish(
         run.tag,
         crate::service::state::next_op_nonce()
     ));
-    let budget = boundary_budget(run.cfg.timeout);
+    // The shutdown remainder once a close minted the deadline
+    // (run-final — R1 finding 3), else the in-run boundary budget
+    // (mid-close, unchanged).
+    let budget = close_budget(&run);
     let dest = Destination {
         class: DestClass::OwnTmp,
         key: format!("assemble-{seq}"),
     };
+    let asm_poll = run_wait_poll!(run);
     let asm: Control<std::io::Result<AssembledCounts>> = run_op(
         &run.diag,
         &run.format,
@@ -1982,6 +2239,7 @@ fn mid_window_publish(
         &format!("assemble_window_{seq}"),
         dest.clone(),
         budget,
+        Some(&asm_poll),
         {
             let array_tmp = array_tmp.clone();
             move |_gate| {
@@ -2126,6 +2384,8 @@ fn mid_window_publish(
         boot_id: run.run_id.boot_id.clone(),
     };
     let pub_dest = evidence_dest(seq);
+    let pub_budget = close_budget(&run);
+    let pub_poll = run_wait_poll!(run);
     let published: Control<StreamedPublish> = run_op(
         &run.diag,
         &run.format,
@@ -2133,7 +2393,8 @@ fn mid_window_publish(
         &run.cancel,
         &format!("publish_window_{seq}"),
         pub_dest,
-        boundary_budget(run.cfg.timeout),
+        pub_budget,
+        Some(&pub_poll),
         {
             let (out, tag) = (run.out.clone(), run.tag.clone());
             move |_gate| {
@@ -2189,6 +2450,11 @@ fn mid_window_judge(
     mode: CloseMode,
 ) -> BoundaryOut {
     use crate::service::publish::PublishStep;
+    // A double observed during assemble/publish expedites (R1
+    // finding 3): immediate stop, never the abandonment mapping.
+    if double_observed(&run) {
+        return BoundaryOut::Exit(double_signal_exit(run));
+    }
     let seq = run.cycle.as_ref().expect("window open at judge").seq;
     if judgment.worker_gone {
         let reason = if judgment.spawn_failed {
@@ -2257,6 +2523,8 @@ fn mid_window_judge(
         .map(|r| r.tmp.clone())
         .collect();
     if !spill_tmps.is_empty() {
+        let absorb_budget = close_budget(&run);
+        let absorb_poll = run_wait_poll!(run);
         let absorb: Control<usize> = run_op(
             &run.diag,
             &run.format,
@@ -2267,7 +2535,8 @@ fn mid_window_judge(
                 class: DestClass::OwnTmp,
                 key: format!("absorb-{seq}"),
             },
-            boundary_budget(run.cfg.timeout),
+            absorb_budget,
+            Some(&absorb_poll),
             move |_gate| {
                 let mut unlinked = 0usize;
                 for tmp in &spill_tmps {
@@ -2321,6 +2590,8 @@ fn mid_window_judge(
 /// loss — §4.4 cleanup backstops at the next start).
 fn queue_leaked_spills(run: &mut Run, seq: u64) {
     let prefix = format!(".{}.tmp.spill.", run.tag);
+    let relist_budget = close_budget(run);
+    let relist_poll = run_wait_poll!(run);
     let relist: Control<Vec<PathBuf>> = run_op(
         &run.diag,
         &run.format,
@@ -2331,7 +2602,8 @@ fn queue_leaked_spills(run: &mut Run, seq: u64) {
             class: DestClass::OwnTmp,
             key: format!("relist-{seq}"),
         },
-        boundary_budget(run.cfg.timeout),
+        relist_budget,
+        Some(&relist_poll),
         {
             let out = run.out.clone();
             move |_gate| {
@@ -2390,6 +2662,8 @@ fn reconcile_rotation(run: &mut Run) {
     // Bounded tail read (worker): the last 8 MiB + the identity
     // gate (reconcile only the file the rename produced — a
     // replaced path reconciles nothing).
+    let tail_budget = close_budget(run);
+    let tail_poll = run_wait_poll!(run);
     let tail: Control<(std::io::Result<Vec<Vec<u8>>>, bool)> = run_op(
         &run.diag,
         &run.format,
@@ -2400,7 +2674,8 @@ fn reconcile_rotation(run: &mut Run) {
             class: DestClass::TapWrite,
             key: format!("tail-{}-{}", rot.first, rot.last),
         },
-        boundary_budget(run.cfg.timeout),
+        tail_budget,
+        Some(&tail_poll),
         {
             let (path, dev, ino) = (rot.rotated.clone(), rot.dev, rot.ino);
             move |_gate| {
@@ -2499,6 +2774,8 @@ fn rotation_fires(run: &mut Run) -> bool {
     let Some(first_wall) = s.first_record_wall else {
         return false;
     };
+    let size_budget = close_budget(run);
+    let size_poll = run_wait_poll!(run);
     let size: Control<Option<u64>> = run_op(
         &run.diag,
         &run.format,
@@ -2509,7 +2786,8 @@ fn rotation_fires(run: &mut Run) -> bool {
             class: DestClass::TapWrite,
             key: "tap-size".to_string(),
         },
-        boundary_budget(run.cfg.timeout),
+        size_budget,
+        Some(&size_poll),
         {
             let path = s.tap_path.clone();
             move |_gate| WorkerOut::value(std::fs::metadata(&path).map(|m| m.len()).ok())
@@ -2548,6 +2826,8 @@ fn rotate_active(run: &mut Run, seq: u64) -> RotationOut {
         None => return RotationOut::Deferred,
     };
     let rotated = active.with_file_name(rotated_name(first, last));
+    let rename_budget = close_budget(run);
+    let rename_poll = run_wait_poll!(run);
     let renamed: Control<Result<(), String>> = run_op(
         &run.diag,
         &run.format,
@@ -2558,7 +2838,8 @@ fn rotate_active(run: &mut Run, seq: u64) -> RotationOut {
             class: DestClass::Rotate,
             key: "tap-rotate".to_string(),
         },
-        boundary_budget(run.cfg.timeout),
+        rename_budget,
+        Some(&rename_poll),
         {
             let (active, rotated) = (active.clone(), rotated.clone());
             move |gate| {
@@ -2593,6 +2874,8 @@ fn rotate_active(run: &mut Run, seq: u64) -> RotationOut {
     // Rename won: snapshot the rotated file's (len, dev, ino) for
     // the tail window + identity gate (worker stat — the rename
     // preserves identity, so this names the produced file).
+    let stat_budget = close_budget(run);
+    let stat_poll = run_wait_poll!(run);
     let stat: Control<Option<(u64, u64, u64)>> = run_op(
         &run.diag,
         &run.format,
@@ -2603,7 +2886,8 @@ fn rotate_active(run: &mut Run, seq: u64) -> RotationOut {
             class: DestClass::TapWrite,
             key: "rotated-size".to_string(),
         },
-        boundary_budget(run.cfg.timeout),
+        stat_budget,
+        Some(&stat_poll),
         {
             let rotated = rotated.clone();
             move |_gate| {
@@ -2755,6 +3039,8 @@ fn drive_tap_inner(
         if matches!(view_slot(&dest), Some(v) if v.live) {
             return false;
         }
+        let open_budget = close_budget(run);
+        let open_poll = run_wait_poll!(run);
         let opened: Control<Result<Tap, TapOpenError>> = run_op(
             &run.diag,
             &run.format,
@@ -2762,7 +3048,8 @@ fn drive_tap_inner(
             &run.cancel,
             "tap_open",
             dest,
-            boundary_budget(run.cfg.timeout),
+            open_budget,
+            Some(&open_poll),
             {
                 let path = run.stream.as_ref().expect("stream state").tap_path.clone();
                 let out = run.out.clone();
@@ -2801,7 +3088,7 @@ fn drive_tap_inner(
         if cutoff.is_some() {
             let sigs = run.signals.drain();
             consume_signals(run, sigs);
-            if run.double_signal || cutoff.is_some_and(|d| Instant::now() >= d) {
+            if double_observed(run) || cutoff.is_some_and(|d| Instant::now() >= d) {
                 return false;
             }
         }
@@ -2848,6 +3135,8 @@ fn drive_tap_inner(
         }
         let seq_for_fold = at_seq;
         let bytes_for_fold = record.bytes.len() as u64 + 1;
+        let write_budget = close_budget(run);
+        let write_poll = run_wait_poll!(run);
         let written: Control<(crate::service::stream::OpenTap, WriteOutcome)> = run_op(
             &run.diag,
             &run.format,
@@ -2855,7 +3144,8 @@ fn drive_tap_inner(
             &run.cancel,
             &format!("tap_write_{op_id}"),
             dest.clone(),
-            boundary_budget(run.cfg.timeout),
+            write_budget,
+            Some(&write_poll),
             move |_gate| {
                 // P-class: no fenced re-check (the write is never
                 // revoked — abandoned writes reconcile). EINTR
@@ -3058,6 +3348,8 @@ fn tail_reconcile_regular(
     seq: u64,
     abandon_cause: crate::service::envelope::DropReason,
 ) {
+    let tail_budget = close_budget(run);
+    let tail_poll = run_wait_poll!(run);
     let tail: Control<std::io::Result<Vec<Vec<u8>>>> = run_op(
         &run.diag,
         &run.format,
@@ -3068,7 +3360,8 @@ fn tail_reconcile_regular(
             class: DestClass::TapWrite,
             key: format!("tail-active-{}", rec.op_id),
         },
-        boundary_budget(run.cfg.timeout),
+        tail_budget,
+        Some(&tail_poll),
         {
             let path = run.stream.as_ref().expect("stream state").tap_path.clone();
             move |_gate| WorkerOut::value(crate::service::stream::read_tail_lines(&path, 8 << 20))
@@ -3155,6 +3448,11 @@ fn mid_window_commit(
     sinks: SinksOut,
     mode: CloseMode,
 ) -> BoundaryOut {
+    // A double observed during the sinks expedites (R1 finding 3):
+    // immediate stop, never commit-then-exit.
+    if double_observed(&run) {
+        return BoundaryOut::Exit(double_signal_exit(run));
+    }
     let seq = run.cycle.as_ref().expect("window open at commit").seq;
     let next = seq.saturating_add(1);
     let terminal = mode == CloseMode::Terminal;
@@ -3199,7 +3497,7 @@ fn mid_window_commit(
         }),
     })
     .unwrap_or_default();
-    let commit_budget = boundary_budget(run.cfg.timeout);
+    let commit_budget = close_budget(&run);
     let (reflected, ts) = state_write_reconciled(
         &mut run,
         &format!("commit_window_{seq}"),
@@ -3237,10 +3535,10 @@ fn mid_window_commit(
 /// status file at open below, stderr line, summary count). At most
 /// one pending candidate ever exists.
 fn consume_reload(run: &mut Run) {
-    if !run.reload_pending {
+    if !run.reload_pending.load(Ordering::SeqCst) {
         return;
     }
-    run.reload_pending = false;
+    run.reload_pending.store(false, Ordering::SeqCst);
     let Some(path) = run.cfg.policy.clone() else {
         // No policy file configured: the HUP names no candidate —
         // ignore (a diagnostic, never a fabricated rejection).
@@ -3252,6 +3550,8 @@ fn consume_reload(run: &mut Run) {
         );
         return;
     };
+    let reload_budget = close_budget(run);
+    let reload_poll = run_wait_poll!(run);
     let read: Control<Result<Vec<u8>, String>> = run_op(
         &run.diag,
         &run.format,
@@ -3259,7 +3559,8 @@ fn consume_reload(run: &mut Run) {
         &run.cancel,
         "reload_policy_read",
         state_dest("policy-read"),
-        boundary_budget(run.cfg.timeout),
+        reload_budget,
+        Some(&reload_poll),
         {
             let path = path.clone();
             move |_gate| WorkerOut::value(read_policy_snapshot(&path))
@@ -3340,9 +3641,17 @@ fn open_next_window(
     close: Snapshot,
     effective_end_ns: u64,
 ) -> BoundaryOut {
+    // A double observed during the commit expedites (R1 finding 3):
+    // immediate stop, never verify-then-exit (a Cancelled verify
+    // would otherwise misread as an integrity refusal).
+    if double_observed(&run) {
+        return BoundaryOut::Exit(double_signal_exit(run));
+    }
     // 1a-VERIFY: re-read + check the reservation names N+1 fresh
     // (step 5 wrote it; anything else is a fatal integrity
     // refusal — exit 1, never a skip).
+    let verify_budget = close_budget(&run);
+    let verify_poll = run_wait_poll!(run);
     let reread: Control<Option<Vec<u8>>> = run_op(
         &run.diag,
         &run.format,
@@ -3353,7 +3662,8 @@ fn open_next_window(
             class: DestClass::StateMut,
             key: format!("reread-sequence-{next}"),
         },
-        boundary_budget(run.cfg.timeout),
+        verify_budget,
+        Some(&verify_poll),
         {
             let out = run.out.clone();
             move |_gate| WorkerOut::value(std::fs::read(out.join("sequence.json")).ok())
@@ -3402,7 +3712,7 @@ fn open_next_window(
         last_rejection: run.policy.last_rejection.clone(),
     };
     let status_bytes = serde_json::to_vec(&status).unwrap_or_default();
-    let status_budget = boundary_budget(run.cfg.timeout);
+    let status_budget = close_budget(&run);
     let (written, _) = state_write_reconciled(
         &mut run,
         "policy_status_write",
@@ -3439,7 +3749,7 @@ fn open_next_window(
     // The 1b seal value escapes into the summary when the flip
     // fails (the carried sealed value — the summary still pairs
     // the last finalized window honestly, §4.3).
-    let open_budget = boundary_budget(run.cfg.timeout);
+    let open_budget = close_budget(&run);
     let (reflected, _) = state_write_reconciled(
         &mut run,
         &format!("open_window_{next}"),
@@ -3503,6 +3813,13 @@ fn open_next_window(
 /// value when one pends (the 1b-failure path — N's first durable
 /// commit was its step-5), else the seal's own commit instant.
 fn seal_and_end(mut run: Run, seq: u64, terminal: bool) -> ExitCode {
+    // A double observed upstream expedites (R1 finding 3).
+    if double_observed(&run) {
+        return double_signal_exit(run);
+    }
+    // Run-ending tail: mint the shutdown deadline when no close
+    // has one yet (mid-close diversion — R1 finding 3).
+    mint_close_deadline(&mut run);
     let (req_start, req_end) = match run.cycle.as_ref() {
         Some(cycle) => (cycle.requested_start_ns, cycle.requested_end_ns),
         None => (0, 0),
@@ -3527,7 +3844,7 @@ fn seal_and_end(mut run: Run, seq: u64, terminal: bool) -> ExitCode {
         }),
     })
     .unwrap_or_default();
-    let seal_budget = boundary_budget(run.cfg.timeout);
+    let seal_budget = close_budget(&run);
     let (reflected, ts) = state_write_reconciled(
         &mut run,
         &format!("seal_window_{seq}"),
@@ -3563,6 +3880,14 @@ fn seal_and_end(mut run: Run, seq: u64, terminal: bool) -> ExitCode {
 /// (spill failure — the window never closed) cut at the mark
 /// instant.
 fn abandon_window(mut run: Run, reason: AbandonReason, close_at_ns: Option<u64>) -> ExitCode {
+    // A double observed upstream expedites with the DoubleSignal
+    // disposition (R1 finding 3) — never the caller's mapping.
+    if double_observed(&run) {
+        return double_signal_exit(run);
+    }
+    // Run-ending tail: mint the shutdown deadline when no close
+    // has one yet (R1 finding 3).
+    mint_close_deadline(&mut run);
     close_gate(&mut run);
     let cycle = run.cycle.take().expect("window open at abandon");
     let mark = serde_json::to_vec(&SequenceState {
@@ -3585,7 +3910,7 @@ fn abandon_window(mut run: Run, reason: AbandonReason, close_at_ns: Option<u64>)
         }),
     })
     .unwrap_or_default();
-    let abandon_budget = boundary_budget(run.cfg.timeout);
+    let abandon_budget = close_budget(&run);
     let (reflected, ts) = state_write_reconciled(
         &mut run,
         &format!("abandon_window_{}", cycle.seq),
@@ -3635,7 +3960,10 @@ fn abandon_window(mut run: Run, reason: AbandonReason, close_at_ns: Option<u64>)
 /// are zero in practice.
 fn swap_diag(run: &mut Run) -> u64 {
     let old = std::mem::replace(&mut run.diag, Diagnostics::spawn());
-    old.abandon(Duration::from_millis(200))
+    // Capped by the shutdown remainder (R1 finding 3 — the swap is
+    // a close stage too; the worker only drains stderr, so the cap
+    // binds only pathologically).
+    old.abandon(cap_by_deadline(run, Duration::from_millis(200)))
 }
 
 /// Fatal integrity refusal (explicit exit 1, never a skip): the
@@ -3650,17 +3978,21 @@ fn integrity_exit(mut run: Run, msg: &str) -> ExitCode {
     fill_summary(&mut run, &mut summary, dropped);
     summary.exit = 1;
     let bytes = serde_json::to_vec(&summary).unwrap_or_default();
+    // Capped by the shutdown remainder when a close minted one (R1
+    // finding 3 — the integrity exit is still a close stage).
+    let integ_budget = cap_by_deadline(&run, Duration::from_secs(2));
     let wrote = state_write_reconciled(
         &mut run,
         "integrity_summary_write",
         "run-summary.json",
         bytes,
-        Duration::from_secs(2),
+        integ_budget,
     );
     if !matches!(wrote.0, Ok(true)) {
         crate::report::err_line("osslscope service: integrity summary write failed");
     }
-    let _ = run.diag.abandon(Duration::from_millis(200));
+    let tail_cap = cap_by_deadline(&run, Duration::from_millis(200));
+    let _ = run.diag.abandon(tail_cap);
     crate::report::err_line(&format!("osslscope service: integrity refusal: {msg}"));
     ExitCode::from(1)
 }
@@ -3676,12 +4008,17 @@ fn integrity_exit(mut run: Run, msg: &str) -> ExitCode {
 fn close_run_end(mut run: Run) -> ExitCode {
     close_gate(&mut run);
     run.cycle = None;
-    let deadline = Instant::now() + run.cfg.grace;
+    // The ONE shutdown deadline (R1 finding 3): minted at close
+    // entry upstream — minted here only when no close ran (the
+    // double-signal and uncertain paths). The flush cutoff and the
+    // summary write share its remainder.
+    mint_close_deadline(&mut run);
+    let deadline = run.close_deadline.expect("minted above");
     // Shutdown flush (no flush on the double-signal cutoff — §7.1):
     // drive the tap within grace (delivery errors fold `epipe` —
     // the cause names the mechanism, not the phase), then fold
     // never-attempted leftovers as `stream_abandoned`.
-    if !run.double_signal && run.stream.is_some() {
+    if !double_observed(&run) && run.stream.is_some() {
         // Identity failure (if any) already set `tool_failure`;
         // leftovers fold below and the fold resolves the exit.
         let _ = drive_tap_inner(
@@ -3731,7 +4068,7 @@ fn close_run_end(mut run: Run) -> ExitCode {
     let mut summary = RunSummary::blank(run.run_id.clone(), run.generation, run.origin_ns);
     fill_summary(&mut run, &mut summary, dropped);
     // The §7.3 fold (interrupted = cancel OR double-signal stop).
-    let interrupted = run.cancel_latched || run.double_signal;
+    let interrupted = run.cancel_latched.load(Ordering::SeqCst) || double_observed(&run);
     let code = run.fold.fold(run.tool_failure, interrupted);
     summary.exit = code;
     let bytes = serde_json::to_vec(&summary).unwrap_or_default();
@@ -3747,7 +4084,8 @@ fn close_run_end(mut run: Run) -> ExitCode {
         // gating — the exit proceeds regardless).
         crate::report::err_line("osslscope service: run summary write failed");
     }
-    let _ = run.diag.abandon(Duration::from_millis(200));
+    let tail_cap = cap_by_deadline(&run, Duration::from_millis(200));
+    let _ = run.diag.abandon(tail_cap);
     ExitCode::from(code)
 }
 
@@ -3853,6 +4191,7 @@ fn write_abandoned_summary_and_exit(
         "abandoned_summary_write",
         state_dest("run-summary.json"),
         Duration::from_secs(5),
+        None,
         move |gate| {
             if gate.abandoned() {
                 return WorkerOut::value((Err(std::io::Error::other("abandoned")), None));
@@ -3904,7 +4243,10 @@ fn double_signal_exit(mut run: Run) -> ExitCode {
         })
         .unwrap_or_default();
         // Best-effort single attempt (no poll, no re-apply — the
-        // double-signal path never waits).
+        // double-signal path never waits): 500 ms, capped by the
+        // shutdown remainder when a close minted one (R1 finding 3).
+        let mark_budget = cap_by_deadline(&run, Duration::from_millis(500));
+        let mark_poll = run_wait_poll!(run);
         let marked: Control<(std::io::Result<()>, Option<u64>)> = run_op(
             &run.diag,
             &run.format,
@@ -3912,7 +4254,8 @@ fn double_signal_exit(mut run: Run) -> ExitCode {
             &run.cancel,
             "double_signal_mark",
             state_dest("sequence.json"),
-            Duration::from_millis(500),
+            mark_budget,
+            Some(&mark_poll),
             {
                 let (out, tag) = (run.out.clone(), run.tag.clone());
                 move |gate| {
@@ -3973,6 +4316,8 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
         return (run, SinksOut::QuotaStop);
     }
     // Retention + quota (§6.2 — enforced at this boundary).
+    let retain_budget = close_budget(&run);
+    let retain_poll = run_wait_poll!(run);
     let retention: Control<crate::service::retain::RetentionOut> = run_op(
         &run.diag,
         &run.format,
@@ -3983,7 +4328,8 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
             class: DestClass::Delete,
             key: format!("retain-{seq}"),
         },
-        boundary_budget(run.cfg.timeout),
+        retain_budget,
+        Some(&retain_poll),
         {
             let (out, rw, rb) = (
                 run.out.clone(),
@@ -4044,6 +4390,8 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
                                 .map(|q| q.cap)
                                 .unwrap_or(0),
                         );
+                        let latch_budget = close_budget(&run);
+                        let latch_poll = run_wait_poll!(run);
                         let latched: Control<std::io::Result<()>> = run_op(
                             &run.diag,
                             &run.format,
@@ -4051,7 +4399,8 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
                             &run.cancel,
                             &format!("quota_latch_{seq}"),
                             state_dest("quota-stop.json"),
-                            boundary_budget(run.cfg.timeout),
+                            latch_budget,
+                            Some(&latch_poll),
                             {
                                 let (out, tag) = (run.out.clone(), run.tag.clone());
                                 let (generation, bytes, cap) = (generation, qbytes, qcap);

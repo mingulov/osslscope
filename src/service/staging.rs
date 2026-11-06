@@ -144,7 +144,11 @@ impl Staging {
     /// into the tick piece: stage in arrival order while the
     /// tick's staged bytes stay within caps, else spill. Returns
     /// the placement. Staging charges RAM at materialization;
-    /// spilling streams through the bounded buffer.
+    /// spilling streams through the bounded buffer. `spill_write`
+    /// performs the spill file write + fsync (the coordinator
+    /// supplies a worker-backed sink — spill I/O never runs
+    /// coordinator-direct, R1 finding 3; tests pass
+    /// `spill_write_direct`).
     pub fn admit_record(
         &mut self,
         piece: &mut TickPiece,
@@ -152,12 +156,13 @@ impl Staging {
         run_tag: &str,
         line: &[u8],
         tick_seq: u64,
+        spill_write: &mut dyn FnMut(&Path, &[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<Placement> {
         let line_cost = line.len() as u64 + RECORD_OVERHEAD;
         let tick_staged_after = piece.staged_bytes + line_cost;
         // Spill stickiness: the first spill latches the tick.
         if piece.spilling {
-            return self.spill_record(piece, dir, run_tag, line, tick_seq);
+            return self.spill_record(piece, dir, run_tag, line, tick_seq, spill_write);
         }
         let over_tick_cap = tick_staged_after > MAX_TICK_BYTES;
         let over_record_cap = line.len() as u64 > MAX_RECORD_BYTES;
@@ -187,7 +192,7 @@ impl Staging {
             }
         }
         // Spill: render ONCE, streaming, through the bounded buffer.
-        self.spill_record(piece, dir, run_tag, line, tick_seq)
+        self.spill_record(piece, dir, run_tag, line, tick_seq, spill_write)
     }
 
     /// The spill path (shared by the first spill + sticky spills).
@@ -198,23 +203,13 @@ impl Staging {
         run_tag: &str,
         line: &[u8],
         tick_seq: u64,
+        spill_write: &mut dyn FnMut(&Path, &[u8]) -> std::io::Result<()>,
     ) -> std::io::Result<Placement> {
         piece.spilling = true;
         let idx = piece.spilled.len() as u64;
         let tmp_name = format!(".{run_tag}.tmp.spill.{tick_seq}.{idx}");
         let tmp = dir.join(&tmp_name);
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            for chunk in line.chunks(SPILL_BUF_BYTES) {
-                f.write_all(chunk)?;
-            }
-            f.write_all(b"\n")?;
-            f.sync_all()?;
-        }
+        spill_write(&tmp, line)?;
         let bytes = line.len() as u64 + 1;
         self.spill_files.insert(tmp.clone(), bytes);
         piece.total_bytes += bytes;
@@ -244,6 +239,24 @@ impl Staging {
 pub enum Placement {
     Staged,
     Spilled,
+}
+
+/// The spill file write proper (create-new + chunked streaming
+/// write + fsync): runs on a worker in production (the
+/// coordinator's sink calls this inside the op) and direct in
+/// unit tests.
+pub fn spill_write_direct(tmp: &Path, line: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(tmp)?;
+    for chunk in line.chunks(SPILL_BUF_BYTES) {
+        f.write_all(chunk)?;
+    }
+    f.write_all(b"\n")?;
+    f.sync_all()?;
+    Ok(())
 }
 
 /// True iff the line's bracket-nesting depth exceeds 127 (the
@@ -726,11 +739,13 @@ mod tests {
         let a = br#"{"kind":"start","sequence":0}"#;
         let b = br#"{"kind":"gap","sequence":1}"#;
         assert_eq!(
-            s.admit_record(&mut piece, &dir, "t", a, 0).unwrap(),
+            s.admit_record(&mut piece, &dir, "t", a, 0, &mut spill_write_direct)
+                .unwrap(),
             Placement::Staged
         );
         assert_eq!(
-            s.admit_record(&mut piece, &dir, "t", b, 0).unwrap(),
+            s.admit_record(&mut piece, &dir, "t", b, 0, &mut spill_write_direct)
+                .unwrap(),
             Placement::Staged
         );
         assert!(matches!(s.decide_tick(&piece, 0), TickDecision::Admit));
@@ -755,14 +770,17 @@ mod tests {
         // One record just over the 8 MiB staged-record cap.
         let mut big = vec![b'x'; MAX_RECORD_BYTES as usize + 1];
         big[0] = b'"';
-        s.admit_record(&mut piece, &dir, "t", small, 3).unwrap();
+        s.admit_record(&mut piece, &dir, "t", small, 3, &mut spill_write_direct)
+            .unwrap();
         assert_eq!(
-            s.admit_record(&mut piece, &dir, "t", &big, 3).unwrap(),
+            s.admit_record(&mut piece, &dir, "t", &big, 3, &mut spill_write_direct)
+                .unwrap(),
             Placement::Spilled
         );
         // A later record of the same tick spills too (spill sticks).
         assert_eq!(
-            s.admit_record(&mut piece, &dir, "t", small, 3).unwrap(),
+            s.admit_record(&mut piece, &dir, "t", small, 3, &mut spill_write_direct)
+                .unwrap(),
             Placement::Spilled
         );
         s.admit_piece(piece);
@@ -872,7 +890,8 @@ mod tests {
         big[0] = b'"';
         *big.last_mut().unwrap() = b'"';
         assert_eq!(
-            s.admit_record(&mut piece, &dir, "t", &big, 3).unwrap(),
+            s.admit_record(&mut piece, &dir, "t", &big, 3, &mut spill_write_direct)
+                .unwrap(),
             Placement::Spilled
         );
         assert!(piece.spilled[0].valid);
@@ -900,7 +919,8 @@ mod tests {
         seal.resize(MAX_RECORD_BYTES as usize + 1, b' ');
         // Trailing spaces keep it valid JSON (object + whitespace).
         assert_eq!(
-            s.admit_record(&mut piece, &dir, "t", &seal, 1).unwrap(),
+            s.admit_record(&mut piece, &dir, "t", &seal, 1, &mut spill_write_direct)
+                .unwrap(),
             Placement::Spilled
         );
         assert!(piece.spilled[0].valid);

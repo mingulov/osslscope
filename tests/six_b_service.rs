@@ -603,6 +603,279 @@ fn sixb_postopen_reserved_swap_fails_tool_failure() {
     );
 }
 
+/// Ptrace fsync delayer (R1 finding 3 — hostile stalled-I/O
+/// through the real coordinator): seizes `pid` (own child — no
+/// caps), follows clones, and holds every fsync/fdatasync ENTER
+/// for `delay` before resuming it. Never injects signals (resume
+/// signo is always 0 on stops; only a real delivered-signal stop
+/// is re-injected, and the service blocks its signals so those
+/// never occur). Returns the tracee's `(exit_code, term_signal)`.
+///
+/// Stall discipline (stash-and-defer): a stalled thread's stop is
+/// CONSUMED but its resume is deferred to `now + delay` while the
+/// tracer keeps serving other threads' stops — detached
+/// background workers' stalls must never serialize onto the
+/// coordinator's own stops (that would inflate every wait
+/// iteration and fake a deadline overrun). The wait stays
+/// BLOCKING (a `WNOHANG`+sleep poll adds millisecond latency per
+/// stop whenever the queue momentarily drains — measured 500x
+/// collapse on syscall-dense phases); the due-resume runs before
+/// every wait, and the tracee's own wait/pump quanta (5–25 ms of
+/// stops) bound any overstay. A stalled tid can only outlive its
+/// resume while the whole process is otherwise idle — in which
+/// case nothing waits on it (the coordinator never fsyncs, so it
+/// is never the stalled one).
+/// Reaping discipline: this thread OWNS all `waitpid(-1)` reaping
+/// for the tracee (cloned worker threads included) — the caller
+/// must NOT `wait`/`try_wait` the child (that races the tracer).
+/// Termination is by the LEADER's exit status (traced non-leader
+/// threads vanish after their EXIT event-stop without a waitable
+/// status, so thread-set emptiness is never the rule).
+#[allow(non_upper_case_globals)]
+fn delay_tracee_syncs(pid: u32, delay: std::time::Duration) -> (Option<i32>, Option<i32>) {
+    use std::collections::{HashMap, HashSet};
+    const SYS_FSYNC: u64 = 74;
+    const SYS_FDATASYNC: u64 = 75;
+    const WAIT_FLAGS: libc::c_int = libc::__WALL | libc::WUNTRACED;
+    let leader = pid as libc::pid_t;
+    unsafe {
+        let opts = (libc::PTRACE_O_TRACESYSGOOD
+            | libc::PTRACE_O_TRACECLONE
+            | libc::PTRACE_O_TRACEEXIT) as u64;
+        if libc::ptrace(
+            libc::PTRACE_SEIZE,
+            leader,
+            std::ptr::null_mut::<libc::c_void>(),
+            opts as *mut libc::c_void,
+        ) != 0
+        {
+            return (None, None); // Already gone — nothing to stall.
+        }
+        // Stop it once so syscall-tracing can start (no signal).
+        libc::ptrace(
+            libc::PTRACE_INTERRUPT,
+            leader,
+            std::ptr::null_mut::<libc::c_void>(),
+            std::ptr::null_mut::<libc::c_void>(),
+        );
+    }
+    let cont = |tid: libc::pid_t, sig: i32| unsafe {
+        libc::ptrace(
+            libc::PTRACE_SYSCALL,
+            tid,
+            std::ptr::null_mut::<libc::c_void>(),
+            sig as *mut libc::c_void,
+        );
+    };
+    let mut tids: HashSet<libc::pid_t> = HashSet::new();
+    let mut entering: HashMap<libc::pid_t, bool> = HashMap::new();
+    // Stalled fsync ENTERs: tid → resume instant (the stop is
+    // consumed; the resume is deferred — other tids' stops keep
+    // flowing meanwhile).
+    let mut stashed: HashMap<libc::pid_t, std::time::Instant> = HashMap::new();
+    tids.insert(leader);
+    loop {
+        // Resume due stashed tids first (their syscalls execute;
+        // their exit-stops arrive later like any other stop).
+        let now = std::time::Instant::now();
+        let due: Vec<libc::pid_t> = stashed
+            .iter()
+            .filter(|(_, at)| now >= **at)
+            .map(|(tid, _)| *tid)
+            .collect();
+        for tid in due {
+            stashed.remove(&tid);
+            cont(tid, 0);
+        }
+        let mut status = 0;
+        let got = unsafe { libc::waitpid(-1, &mut status, WAIT_FLAGS) };
+        if got < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            // ECHILD backstop (unreachable — the leader's exit below
+            // always terminates first): status unknown, fail loud.
+            return (None, None);
+        }
+        if libc::WIFEXITED(status) || libc::WIFSIGNALED(status) {
+            tids.remove(&got);
+            entering.remove(&got);
+            if got == leader {
+                let code = if libc::WIFEXITED(status) {
+                    Some(libc::WEXITSTATUS(status))
+                } else {
+                    None
+                };
+                let sig = if libc::WIFSIGNALED(status) {
+                    Some(libc::WTERMSIG(status))
+                } else {
+                    None
+                };
+                // Drain stragglers once (non-blocking), then done.
+                let mut extra = 0;
+                let mut st = 0;
+                while unsafe { libc::waitpid(-1, &mut st, WAIT_FLAGS | libc::WNOHANG) } > 0 {
+                    extra += 1;
+                    if extra > 64 {
+                        break;
+                    }
+                }
+                return (code, sig);
+            }
+            continue;
+        }
+        if !libc::WIFSTOPPED(status) {
+            continue;
+        }
+        tids.insert(got);
+        let event = (status >> 16) as i32;
+        if event == libc::PTRACE_EVENT_CLONE {
+            let mut new_tid: libc::c_ulong = 0;
+            unsafe {
+                libc::ptrace(
+                    libc::PTRACE_GETEVENTMSG,
+                    got,
+                    std::ptr::null_mut::<libc::c_void>(),
+                    &mut new_tid as *mut _ as *mut libc::c_void,
+                );
+            }
+            tids.insert(new_tid as libc::pid_t);
+            cont(got, 0);
+            continue;
+        }
+        if event == libc::PTRACE_EVENT_EXIT {
+            // A dying thread vanishes after this stop with NO
+            // waitable status — drop it now (never the rule).
+            tids.remove(&got);
+            entering.remove(&got);
+            cont(got, 0);
+            continue;
+        }
+        let sig = libc::WSTOPSIG(status);
+        if sig == (libc::SIGTRAP | 0x80) {
+            let is_enter = entering.get(&got).copied().unwrap_or(true);
+            if is_enter {
+                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                let ok = unsafe {
+                    libc::ptrace(
+                        libc::PTRACE_GETREGS,
+                        got,
+                        std::ptr::null_mut::<libc::c_void>(),
+                        &mut regs as *mut _ as *mut libc::c_void,
+                    )
+                };
+                if ok == 0 && (regs.orig_rax == SYS_FSYNC || regs.orig_rax == SYS_FDATASYNC) {
+                    // Stash (defer the resume — never sleep inline).
+                    entering.insert(got, false);
+                    stashed.insert(got, std::time::Instant::now() + delay);
+                    continue;
+                }
+            }
+            entering.insert(got, !is_enter);
+            cont(got, 0);
+        } else {
+            // Group/event stop (SIGTRAP — resume clean, never
+            // re-inject: an injected SIGTRAP would kill) or a real
+            // delivered-signal stop (re-inject — swallow nothing;
+            // the service blocks TERM/INT/HUP so those never stop
+            // here).
+            entering.insert(got, true);
+            let reinject = if sig == libc::SIGTRAP { 0 } else { sig };
+            cont(got, reinject);
+        }
+    }
+}
+
+/// Single-deadline shutdown + double-signal expedition (R1 finding
+/// 3): with every fsync stalled 1.5 s, the close from the first
+/// TERM must still meet ONE `--grace` (3 s here — stale per-stage
+/// budgets would stack ~10 s), and a second TERM mid-close must
+/// expedite via Cancelled waits (not blind expiry). Zero finalized
+/// + double-signal exits 4 (§7.3 priority 3 beats 6).
+#[test]
+fn sixb_shutdown_meets_single_deadline_and_double_expedites() {
+    let dir = fresh_dir("shutdown-deadline");
+    let mut child = Command::new("/bin/sleep")
+        .arg("300")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    let mut svc = bin();
+    svc.arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("30")
+        .arg("--interval")
+        .arg("0.2")
+        .arg("--grace")
+        .arg("3")
+        .arg("--timeout")
+        .arg("30");
+    let mut svc = svc.spawn().expect("spawn service");
+    // Settle WITHOUT stalls (fast startup): window 0 reserved.
+    let seq_path = dir.join("sequence.json");
+    let mut settled = false;
+    for _ in 0..300 {
+        if let Ok(body) = std::fs::read_to_string(&seq_path) {
+            if body.contains("\"started\":true") {
+                settled = true;
+                break;
+            }
+        }
+        if let Ok(Some(st)) = svc.try_wait() {
+            panic!("service exited during settle: {st:?}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(settled, "window 0 reserved (settle)");
+    // Stall every fsync from here (the close path only). From this
+    // point the tracer OWNS reaping — never wait the child here.
+    let svc_id = svc.id();
+    let tracer = std::thread::spawn(move || {
+        delay_tracee_syncs(svc_id, std::time::Duration::from_millis(1500))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let t0 = std::time::Instant::now();
+    unsafe { libc::kill(svc_id as i32, libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    unsafe { libc::kill(svc_id as i32, libc::SIGTERM) };
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    unsafe { libc::kill(svc_id as i32, libc::SIGTERM) };
+    // The clock stops when the tracer reaps the leader (fail-loud
+    // 60 s on the tracer, never on the child handle).
+    let mut done = false;
+    for _ in 0..600 {
+        if tracer.is_finished() {
+            done = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(done, "close finishes (60 s fail-loud)");
+    let dt = t0.elapsed();
+    let (code, sig) = tracer.join().expect("tracer thread");
+    drop(svc);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(sig, None, "service not killed by a signal");
+    assert_eq!(code, Some(4), "double-signal zero-finalized exits 4");
+    assert!(
+        dt <= std::time::Duration::from_secs(6),
+        "one grace (3 s) bounds the stalled close — took {dt:?}"
+    );
+    // Expedition proof: a cancelled op (signal-consumed wait —
+    // `OpOutcome` serializes snake_case), not blind expiry alone.
+    let summary =
+        std::fs::read_to_string(dir.join("run-summary.json")).expect("run summary written");
+    assert!(
+        summary.contains("\"cancelled\""),
+        "a close wait cancelled on the second signal"
+    );
+}
+
 /// Bounded wait for a self-exiting child (poll — fail-loud timeout).
 fn wait_bounded(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);

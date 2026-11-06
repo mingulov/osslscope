@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::service::envelope::OpOutcome;
+use crate::service::signals::{Signal, SignalFd};
 
 /// Destination classes (§7.2). P-effects (`EvidenceLink`, `OwnTmp`,
 /// `TapWrite`) are the abandonment allowlist; the fenced classes
@@ -114,6 +115,71 @@ fn registry() -> &'static Mutex<HashMap<Destination, Slot>> {
 
 static NEXT_WORKER: AtomicU64 = AtomicU64::new(1);
 
+/// Signal consumption DURING a worker wait (R1 finding 3): the
+/// waiter drains signalfd every poll quantum so a second signal
+/// updates the latches + cancel promptly instead of sitting
+/// unread until the coordinator returns to signal consumption.
+/// All shared refs (disjoint `Run` fields at the call sites).
+pub struct WaitPoll<'a> {
+    /// The signalfd to drain (non-blocking, consuming).
+    pub signals: &'a SignalFd,
+    /// This wait's cancel (the run cancel — or a fresh flag where
+    /// the op must survive the first stop, e.g. in-run spills).
+    pub cancel: &'a AtomicBool,
+    /// First-stop latch (set on the first observed `Term`).
+    pub latched: &'a AtomicBool,
+    /// Second-observed-`Term` latch (C4 semantics — the immediate
+    /// stop trigger).
+    pub double: &'a AtomicBool,
+    /// SIGHUP flag (consumed at the next boundary).
+    pub reload: &'a AtomicBool,
+}
+
+impl<'a> WaitPoll<'a> {
+    pub fn new(
+        signals: &'a SignalFd,
+        cancel: &'a AtomicBool,
+        latched: &'a AtomicBool,
+        double: &'a AtomicBool,
+        reload: &'a AtomicBool,
+    ) -> Self {
+        Self {
+            signals,
+            cancel,
+            latched,
+            double,
+            reload,
+        }
+    }
+
+    /// Drain + apply one batch. A first observed `Term` latches
+    /// ONLY (the op runs on — the loop cuts after the boundary);
+    /// the second observed `Term` latches double AND stores cancel
+    /// (this wait — and every later close wait — Cancels promptly,
+    /// expediting the close instead of expiring blind).
+    pub fn poll(&self) {
+        for sig in self.signals.drain() {
+            match sig {
+                Signal::Term => {
+                    if self.latched.swap(true, Ordering::SeqCst) {
+                        self.double.store(true, Ordering::SeqCst);
+                        self.cancel.store(true, Ordering::SeqCst);
+                    }
+                }
+                Signal::Hup => {
+                    self.reload.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
+
+    /// True once the second stop is observed (prompt-exit checks
+    /// outside worker waits).
+    pub fn doubled(&self) -> bool {
+        self.double.load(Ordering::SeqCst)
+    }
+}
+
 /// Run one blocking op on a control worker under `budget` +
 /// `cancel`. At most one live worker per destination (a successor
 /// while the prior is registered is refused fail-closed → `Expired`,
@@ -122,11 +188,15 @@ static NEXT_WORKER: AtomicU64 = AtomicU64::new(1);
 /// The waiter's abandonment path stores the flag + bumps the epoch
 /// and takes NO lock; the detached worker unregisters at exit via
 /// worker-side `on_exit`.
+///
+/// `wait_poll` (when present) drains signalfd every poll quantum
+/// (R1 finding 3) so waits observe the second signal.
 pub fn run_under_control<T, F>(
     dest: Destination,
     budget: Duration,
     cancel: &AtomicBool,
     op: F,
+    wait_poll: Option<&WaitPoll>,
 ) -> Control<T>
 where
     T: Send + 'static,
@@ -224,6 +294,11 @@ where
                 }
                 _ => {}
             }
+        }
+        // Consume signals BEFORE the cancel check (a second stop
+        // observed here Cancels this wait within one quantum).
+        if let Some(poll) = wait_poll {
+            poll.poll();
         }
         if cancel.load(Ordering::Relaxed) {
             // Abandonment path: NO lock, NO blocking syscall.
@@ -439,10 +514,13 @@ mod tests {
     #[test]
     fn done_op_returns_value() {
         let cancel = AtomicBool::new(false);
-        let c: Control<u64> =
-            run_under_control(dest("done"), Duration::from_secs(5), &cancel, |_| {
-                WorkerOut::value(41)
-            });
+        let c: Control<u64> = run_under_control(
+            dest("done"),
+            Duration::from_secs(5),
+            &cancel,
+            |_| WorkerOut::value(41),
+            None,
+        );
         assert!(matches!(c, Control::Done(41)));
         assert_eq!(outcome_of(&c), OpOutcome::Done);
     }
@@ -466,15 +544,19 @@ mod tests {
                 }
                 WorkerOut::value(1)
             },
+            None,
         );
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert!(matches!(c, Control::Expired));
         assert!(started.load(Ordering::Acquire));
         // Successor refused while the abandoned worker is registered.
-        let c2: Control<u64> =
-            run_under_control(dest("expiry"), Duration::from_millis(50), &cancel, |_| {
-                WorkerOut::value(2)
-            });
+        let c2: Control<u64> = run_under_control(
+            dest("expiry"),
+            Duration::from_millis(50),
+            &cancel,
+            |_| WorkerOut::value(2),
+            None,
+        );
         assert!(matches!(c2, Control::Expired));
         // Reconcile consumes the finished slot; then reuse works.
         let mut tries = 0;
@@ -489,10 +571,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert!(!view.live);
-        let c3: Control<u64> =
-            run_under_control(dest("expiry"), Duration::from_secs(5), &cancel, |_| {
-                WorkerOut::value(3)
-            });
+        let c3: Control<u64> = run_under_control(
+            dest("expiry"),
+            Duration::from_secs(5),
+            &cancel,
+            |_| WorkerOut::value(3),
+            None,
+        );
         assert!(matches!(c3, Control::Done(3)));
     }
 
@@ -500,10 +585,13 @@ mod tests {
     fn cancel_abandons() {
         let cancel = AtomicBool::new(false);
         cancel.store(true, Ordering::Release);
-        let c: Control<u64> =
-            run_under_control(dest("cancel"), Duration::from_secs(5), &cancel, |_| {
-                WorkerOut::value(1)
-            });
+        let c: Control<u64> = run_under_control(
+            dest("cancel"),
+            Duration::from_secs(5),
+            &cancel,
+            |_| WorkerOut::value(1),
+            None,
+        );
         assert!(matches!(c, Control::Cancelled));
         assert_eq!(outcome_of(&c), OpOutcome::Cancelled);
     }
@@ -511,8 +599,11 @@ mod tests {
     #[test]
     fn fenced_gate_sees_abandonment_and_epoch() {
         let cancel = AtomicBool::new(false);
-        let c: Control<u64> =
-            run_under_control(dest("fence"), Duration::from_millis(30), &cancel, |gate| {
+        let c: Control<u64> = run_under_control(
+            dest("fence"),
+            Duration::from_millis(30),
+            &cancel,
+            |gate| {
                 // Fenced worker re-checks before its ONE mutation.
                 let mut rechecks = 0;
                 while !gate.abandoned() && rechecks < 1000 {
@@ -521,7 +612,9 @@ mod tests {
                 }
                 assert!(gate.abandoned(), "abandonment must be visible");
                 WorkerOut::value(rechecks)
-            });
+            },
+            None,
+        );
         assert!(matches!(c, Control::Expired));
     }
 
@@ -544,13 +637,16 @@ mod tests {
             dest_ino: 2,
         };
         let receipt_w = receipt.clone();
-        let c: Control<u64> =
-            run_under_control(d.clone(), Duration::from_secs(5), &cancel, move |_| {
-                WorkerOut {
-                    value: 1,
-                    receipt: Some(receipt_w),
-                }
-            });
+        let c: Control<u64> = run_under_control(
+            d.clone(),
+            Duration::from_secs(5),
+            &cancel,
+            move |_| WorkerOut {
+                value: 1,
+                receipt: Some(receipt_w),
+            },
+            None,
+        );
         assert!(matches!(c, Control::Done(1)));
         // Waiter-Done consumes the slot (no reconcile needed).
         assert!(view_slot(&d).is_none());
