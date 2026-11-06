@@ -85,6 +85,10 @@ pub struct InflightRecord {
     /// fd went with the worker — FIFOs reconcile uncertain,
     /// regular files tail-re-read).
     pub fifo: bool,
+    /// Fold cohort token (R3 Gate 4 F3): set when an abandoned
+    /// dispatch folds — the `fold` return for this record, passed
+    /// back to `strike` at reconcile. 0 ⟺ never folded (unset).
+    pub fold_token: u64,
 }
 
 impl InflightRecord {
@@ -505,6 +509,7 @@ mod tests {
             seq: Some(9),
             span: None,
             fifo: false,
+            fold_token: 0,
         }];
         assert_eq!(reconcile_tail(&lines, &inflight), vec![7]);
         let _ = std::fs::remove_dir_all(&d);

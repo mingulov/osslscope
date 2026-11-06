@@ -2746,6 +2746,7 @@ fn reconcile_rotation(run: &mut Run) {
                     seq,
                     rec.full_bytes(),
                     crate::service::envelope::DropReason::Epipe,
+                    rec.fold_token,
                 );
                 run.summary.tap_recovered.records += r;
                 run.summary.tap_recovered.bytes += b;
@@ -3150,6 +3151,7 @@ fn drive_tap_inner(
                 seq: Some(at_seq),
                 span: None,
                 fifo: tap_is_fifo,
+                fold_token: 0,
             });
         }
         let seq_for_fold = at_seq;
@@ -3265,7 +3267,10 @@ fn drive_tap_inner(
                 // tail re-read; FIFO → uncertain). Stop driving:
                 // the successor is refused while registered.
                 if let Some(s) = run.stream.as_mut() {
-                    s.queue.fold(seq_for_fold, bytes_for_fold, abandon_cause);
+                    let token = s.queue.fold(seq_for_fold, bytes_for_fold, abandon_cause);
+                    if let Some(inflight) = s.inflight.iter_mut().find(|r| r.op_id == op_id) {
+                        inflight.fold_token = token;
+                    }
                     s.tap = Tap::pending();
                 }
                 reconcile_tap_write(run, op_id, abandon_cause);
@@ -3324,6 +3329,7 @@ fn reconcile_tap_write(
                         seq,
                         rec.full_bytes(),
                         abandon_cause,
+                        rec.fold_token,
                     );
                     run.summary.tap_recovered.records += r;
                     run.summary.tap_recovered.bytes += b;
@@ -3399,6 +3405,7 @@ fn tail_reconcile_regular(
             seq,
             rec.full_bytes(),
             abandon_cause,
+            rec.fold_token,
         );
         run.summary.tap_recovered.records += r;
         run.summary.tap_recovered.bytes += b;

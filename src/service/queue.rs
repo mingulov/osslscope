@@ -53,6 +53,12 @@ pub struct SpanCoverage {
     pub records: u64,
     pub bytes: u64,
     pub folds: u64,
+    /// Fold-serial interval `(start, end]` this delta covers (R3
+    /// Gate 4 F3: per-span fold chronology — strikes match their
+    /// fold token against these intervals, never window
+    /// sequence). Contiguous across the span's deltas.
+    pub start: u64,
+    pub end: u64,
 }
 
 /// Coverage deltas retained per span (mirrors `LEDGER_CAP` — the
@@ -74,6 +80,13 @@ pub struct LedgerSpan {
     /// merge here (bounded: one span per cause); the deltas — not
     /// a merge ban — distinguish covered drops from new growth.
     pub covering: Vec<SpanCoverage>,
+    /// Per-span fold serial (R3 Gate 4 F3: every fold takes the
+    /// next serial as its cohort token; 0 ⟺ no fold yet).
+    pub fold_serial: u64,
+    /// Max fold-serial boundary delivered so far (a strike at or
+    /// below this already left the span at delivery — no-op,
+    /// never a double-subtract).
+    pub delivered_through: u64,
 }
 
 impl LedgerSpan {
@@ -86,6 +99,8 @@ impl LedgerSpan {
             folds: 0,
             reason,
             covering: Vec::new(),
+            fold_serial: 1,
+            delivered_through: 0,
         }
     }
 
@@ -165,7 +180,11 @@ impl StreamQueue {
     /// 64-cap never binds; gross totals charge first, so even a
     /// hypothetical overflow stays explicit in the totals, never
     /// quiet. Each span keeps `0 ≤ folds ≤ records − 1` exactly.
-    pub fn fold(&mut self, seq: u64, bytes: u64, reason: DropReason) {
+    /// Returns the fold's cohort token (the span's fold serial —
+    /// R3 Gate 4 F3: recovery matches this token against delta
+    /// intervals, never window sequence; the caller threads it to
+    /// `strike` via the in-flight record).
+    pub fn fold(&mut self, seq: u64, bytes: u64, reason: DropReason) -> u64 {
         self.gross_records += 1;
         self.gross_bytes += bytes;
         let slot = &mut self.gross_by_reason[Self::reason_idx(reason)];
@@ -173,12 +192,15 @@ impl StreamQueue {
         slot.1 += bytes;
         if let Some(span) = self.spans.iter_mut().find(|s| s.reason == reason) {
             span.merge(seq, bytes);
-            return;
+            span.fold_serial += 1;
+            return span.fold_serial;
         }
         debug_assert!(self.spans.len() < LEDGER_CAP);
         if self.spans.len() < LEDGER_CAP {
             self.spans.push(LedgerSpan::fresh(seq, bytes, reason));
+            return 1;
         }
+        0
     }
 
     /// Enqueue one rendered record. Evicts oldest-first while either
@@ -296,13 +318,17 @@ impl StreamQueue {
                         .folds
                         .saturating_add(removed.folds)
                         .min(frontier.records.saturating_sub(1));
+                    frontier.start = removed.start;
                 }
             }
+            let start = span.covering.last().map(|c| c.end).unwrap_or(0);
             span.covering.push(SpanCoverage {
                 marker,
                 records: dr,
                 bytes: db,
                 folds: df,
+                start,
+                end: span.fold_serial,
             });
         }
     }
@@ -323,16 +349,19 @@ impl StreamQueue {
     pub fn clear_marker(&mut self, marker: u64) {
         for span in self.spans.iter_mut() {
             let (mut dr, mut db, mut df) = (0u64, 0u64, 0u64);
+            let mut delivered = span.delivered_through;
             span.covering.retain(|c| {
                 if c.marker <= marker {
                     dr = dr.saturating_add(c.records);
                     db = db.saturating_add(c.bytes);
                     df = df.saturating_add(c.folds);
+                    delivered = delivered.max(c.end);
                     false
                 } else {
                     true
                 }
             });
+            span.delivered_through = delivered;
             span.records = span.records.saturating_sub(dr);
             span.bytes = span.bytes.saturating_sub(db);
             span.folds = span
@@ -346,14 +375,26 @@ impl StreamQueue {
 
     /// Strike a landed record OUT of the folded spans (gross totals
     /// stay; §7.2 gross/net split). Strikes newest-first within the
-    /// named cause; returns the struck (records, bytes). R2 Gate 4a:
-    /// the strike also shrinks the covering delta that proves the
-    /// struck seq (oldest delta with `marker ≥ seq` — the first
-    /// marker emitted after the fold), preserving
+    /// named cause; returns the struck (records, bytes). R3 Gate 4
+    /// F3: the strike binds to the fold cohort via `fold_token`
+    /// (the token `fold` returned — fold chronology, never window
+    /// sequence: an old queued record can fold after a newer
+    /// marker). The delta whose interval contains the token
+    /// shrinks with the span, preserving
     /// `growth = records − Σdeltas` so old-marker acks never erase
-    /// newer-only drops. Uncovered strikes (no eligible delta)
-    /// shrink the span alone (exact: no claim to adjust).
-    pub fn strike(&mut self, seq: u64, bytes: u64, reason: DropReason) -> (u64, u64) {
+    /// newer-only drops. Uncovered strikes (no containing delta)
+    /// shrink the span alone (exact: no claim to adjust). A strike
+    /// at or below the delivered boundary no-ops (its growth
+    /// already left the span at delivery — never a
+    /// double-subtract). Token 0 (unset — defensive, unreachable
+    /// in production) shrinks the span alone, saturating.
+    pub fn strike(
+        &mut self,
+        seq: u64,
+        bytes: u64,
+        reason: DropReason,
+        fold_token: u64,
+    ) -> (u64, u64) {
         // Find the newest span of this cause covering seq.
         let mut struck_records = 0u64;
         let mut struck_bytes = 0u64;
@@ -364,25 +405,34 @@ impl StreamQueue {
             if seq < span.first_seq || seq > span.last_seq {
                 continue;
             }
+            // Already delivered ⟹ the growth left the span at
+            // delivery: no-op (re-shrinking would double-subtract
+            // into newer growth).
+            if fold_token != 0 && fold_token <= span.delivered_through {
+                break;
+            }
             // Strike one record's bytes from this span. The struck
             // record takes its merge with it (`folds − 1`), which
             // preserves `0 ≤ folds ≤ records − 1` exactly (Control 1
             // checks the invariant on every span, marker-carried or
-            // pending).
-            span.records -= 1;
+            // pending). Saturating: a strike never drives a span
+            // negative (single strikes are exact; doubles clamp).
+            span.records = span.records.saturating_sub(1);
             span.bytes = span.bytes.saturating_sub(bytes);
             span.folds = span.folds.saturating_sub(1);
-            // Shrink the proving delta (R2 Gate 4a): the struck
-            // record leaves its coverage claim with it, so the old
-            // claim never erases newer growth at delivery.
-            if let Some(c) = span
-                .covering
-                .iter_mut()
-                .find(|c| c.marker >= seq && c.records > 0)
-            {
-                c.records -= 1;
-                c.bytes = c.bytes.saturating_sub(bytes);
-                c.folds = c.folds.saturating_sub(1).min(c.records.saturating_sub(1));
+            // Shrink the proving delta (the struck record leaves its
+            // coverage claim with it, so the old claim never erases
+            // newer growth at delivery).
+            if fold_token != 0 {
+                if let Some(c) = span
+                    .covering
+                    .iter_mut()
+                    .find(|c| c.start < fold_token && fold_token <= c.end && c.records > 0)
+                {
+                    c.records = c.records.saturating_sub(1);
+                    c.bytes = c.bytes.saturating_sub(bytes);
+                    c.folds = c.folds.saturating_sub(1).min(c.records.saturating_sub(1));
+                }
             }
             struck_records = 1;
             struck_bytes = bytes;
@@ -461,8 +511,9 @@ mod tests {
         }
         // Gross: 2 folded (seqs 1..=2).
         assert_eq!(q.gross(), (2, 82));
-        // One landed late: strike it (NET), gross stays.
-        let (r, b) = q.strike(2, 41, DropReason::QueueFull);
+        // One landed late: strike it (NET), gross stays. (The
+        // struck seq 2 is the second QueueFull fold — token 2.)
+        let (r, b) = q.strike(2, 41, DropReason::QueueFull, 2);
         assert_eq!((r, b), (1, 41));
         assert_eq!(q.gross(), (2, 82));
         let spans = q.spans();
@@ -589,9 +640,9 @@ mod tests {
     fn recovered_old_drop_must_not_erase_new_drop() {
         use crate::service::envelope::DropReason::QueueFull;
         let mut q = StreamQueue::new(65536, 64);
-        q.fold(1, 10, QueueFull);
+        let t1 = q.fold(1, 10, QueueFull);
         q.mark_all(1);
-        assert_eq!(q.strike(1, 10, QueueFull), (1, 10));
+        assert_eq!(q.strike(1, 10, QueueFull, t1), (1, 10));
         q.fold(2, 20, QueueFull);
         assert!(
             q.has_pending_spans(),
@@ -603,6 +654,65 @@ mod tests {
             1,
             "new drop must remain"
         );
+    }
+
+    /// R3 Gate 4 (F3): recovery must bind to the actual folded
+    /// cohort, not window sequence — an old queued record can fold
+    /// AFTER a newer marker, so `marker ≥ seq` misidentifies its
+    /// cohort. Unequal byte lengths (equal fixtures mask byte
+    /// misaccounting). Adopted from the R3 linked probe
+    /// (`late_strike_underclaims_new_bytes`).
+    #[test]
+    fn strike_binds_fold_cohort_not_window_sequence() {
+        use crate::service::envelope::DropReason::Epipe;
+        let mut q = StreamQueue::new(65536, 4096);
+        q.fold(1, 10, Epipe);
+        q.mark_all(10);
+        let t2 = q.fold(2, 20, Epipe);
+        q.mark_all(11);
+        q.fold(3, 30, Epipe);
+        q.strike(2, 20, Epipe, t2);
+        q.clear_marker(11);
+        let n: u64 = q.spans().iter().map(|s| s.records).sum();
+        let b: u64 = q.spans().iter().map(|s| s.bytes).sum();
+        assert_eq!((n, b), (1, 30), "uncovered record 3 is 30 bytes");
+    }
+
+    /// R3 Gate 4 (F3): a late old-sequence record recovered before
+    /// its prior marker delivers must not stay pending. Adopted
+    /// from the R3 linked probe (`late_old_record_strike`).
+    #[test]
+    fn strike_of_old_record_clears_with_prior_marker() {
+        use crate::service::envelope::DropReason::Epipe;
+        let mut q = StreamQueue::new(65536, 4096);
+        q.fold(1, 10, Epipe);
+        q.mark_all(10);
+        let t2 = q.fold(2, 20, Epipe);
+        assert_eq!(q.strike(2, 20, Epipe, t2), (1, 20));
+        q.clear_marker(10);
+        let n: u64 = q.spans().iter().map(|s| s.records).sum();
+        let b: u64 = q.spans().iter().map(|s| s.bytes).sum();
+        assert_eq!((n, b), (0, 0), "acked drop must not stay pending");
+    }
+
+    /// Recovery of an already-delivered fold must no-op (its
+    /// growth was delivered-proven and left the span at delivery;
+    /// re-shrinking would double-subtract into newer growth).
+    #[test]
+    fn strike_after_delivery_is_noop() {
+        use crate::service::envelope::DropReason::Epipe;
+        let mut q = StreamQueue::new(65536, 4096);
+        let t1 = q.fold(1, 10, Epipe);
+        q.mark_all(1);
+        q.fold(2, 20, Epipe);
+        q.mark_all(2);
+        q.clear_marker(1);
+        assert_eq!(q.strike(1, 10, Epipe, t1), (0, 0));
+        let spans = q.spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!((spans[0].records, spans[0].bytes), (1, 20));
+        q.clear_marker(2);
+        assert!(q.spans().is_empty());
     }
 
     /// R2 Gate 4b (F6): cumulative markers must clear everything
