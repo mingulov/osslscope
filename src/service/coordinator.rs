@@ -427,12 +427,18 @@ fn spill_sink_for<'a>(
     poll: Option<&'a WaitPoll<'a>>,
     budget: Duration,
 ) -> impl FnMut(&Path, &[u8]) -> std::io::Result<()> + 'a {
+    // R2 Gate 2 (F3): the sink mints ONE absolute deadline at
+    // creation (`now + budget` — the close/startup remainder then,
+    // so exactly the shared deadline) and every operation draws
+    // the REMAINDER, never a fresh full budget.
+    let deadline = Instant::now() + budget;
     move |tmp: &Path, line: &[u8]| {
         let key = tmp
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("spill")
             .to_string();
+        let op_budget = deadline.saturating_duration_since(Instant::now());
         let wrote: Control<std::io::Result<()>> = run_op(
             diag,
             format,
@@ -443,7 +449,7 @@ fn spill_sink_for<'a>(
                 class: DestClass::OwnTmp,
                 key: format!("spill-{key}"),
             },
-            budget,
+            op_budget,
             poll,
             {
                 let (tmp, line) = (tmp.to_path_buf(), line.to_vec());
@@ -4453,4 +4459,52 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
         }
     }
     (run, SinksOut::Continue)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// R2 Gate 2 (F3): spill waits share ONE absolute deadline —
+    /// ops past the deadline expire instead of renewing the budget.
+    /// Adopted from the R2 spill-deadline probe (inverted +
+    /// deterministic): after sleeping past the 12 ms sink budget,
+    /// further ops must expire. The pre-fix sink renews the full
+    /// budget per op, so the post-sleep op completes (RED); the
+    /// fixed sink draws the remainder, so it expires (GREEN).
+    #[test]
+    fn spill_sink_shares_one_absolute_deadline() {
+        let dir = std::env::temp_dir().join(format!(
+            "t74-gate2-spill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let diag = Diagnostics::spawn();
+        let format = Format::Json;
+        let mut accum = SummaryAccum::new();
+        let cancel = AtomicBool::new(false);
+        let budget = Duration::from_millis(12);
+        let mut sink = spill_sink_for(&diag, &format, &mut accum, &cancel, None, budget);
+        // Sleep past the sink's absolute deadline (12 ms + margin).
+        std::thread::sleep(Duration::from_millis(30));
+        let mut expired = 0u32;
+        for n in 0..5 {
+            match sink(&dir.join(format!("spill-{n}")), b"{}") {
+                Ok(()) => {}
+                Err(_) => expired += 1,
+            }
+        }
+        drop(sink);
+        diag.abandon(Duration::from_millis(50));
+        eprintln!("spill-deadline post-sleep: expired={expired}/5");
+        assert_eq!(
+            expired, 5,
+            "all ops past the sink deadline must expire (none may renew)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
