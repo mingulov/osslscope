@@ -1,0 +1,32 @@
+osslscope-service capacity notes (Debian)
+------------------------------------------
+
+The continuous observer shares one 256 MiB watch pool across its
+sessions and ELF parses. A maximal session reserves 122,990,172 B
+(pinned by the tight reservation test with production object
+sizes); two maximal sessions leave about 21 MiB, while a fresh
+uncached parse needs a 22 MiB transient. Two maximal sessions plus
+a fresh parse therefore do not fit; the run-shared ParseCache
+(Stamp-keyed on dev, inode, size, mode, links, mtime and ctime; at
+most 16 distinct files, first-fill wins) lets later sessions reuse
+already-parsed offsets without the transient when the working set
+is stable and within cap.
+
+A cache miss falls back to the uncached parse, which can then fail
+with a StateLimit/ReadLimit gap when the pool is contended. The
+miss path is honest loss accounting, not equivalent availability:
+
+- up to 16 distinct stable files: hits fit; same-file two
+  sessions qualify;
+- cache full: further distinct files always miss;
+- churning Stamps (upgrades, container layer turnover): new
+  Stamps miss until filled if room remains, otherwise always;
+- 17 or more distinct libcrypto builds: over cap; misses may gap.
+
+Gaps are reported in the evidence; refused scopes are not
+qualified. The cache alone does not restore a two-session
+guarantee for churning or over-cap working sets. Narrow the
+observed scope or stabilize the image set and re-qualify.
+
+See docs/install.md ("Watch capacity and ParseCache") and
+docs/overhead-matrix.md for the full arithmetic.

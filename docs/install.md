@@ -148,6 +148,39 @@ needed) holds the unit stopped, as does the start-rate backstop
 both the conffile and the out-DIR; upgrades preserve a modified
 config and leave a running unit alone until it is restarted.
 
+## Watch capacity and ParseCache
+
+The watch pool is 256 MiB. A maximal session reserves
+122,990,172 B (pinned by the tight reservation test with
+production object sizes); two maximal sessions leave ~21 MiB,
+while a fresh uncached ELF parse needs a 22 MiB transient
+(inventory + export scratch) — so two maximal sessions plus a
+fresh parse do not fit. The run-shared `ParseCache`
+(Stamp-keyed: dev, inode, size, mode, links, mtime, ctime; cap
+16 entries, first-fill wins, pure optimization) lets later
+sessions clone already-parsed offsets without the transient, so
+same-file second sessions fit. A miss falls back to the uncached
+parse, which may then fail with a `StateLimit`/`ReadLimit` gap
+when the pool is contended — miss-fallback is not equivalent
+availability.
+
+- Cap (≤16 distinct files, stable): hits fit; same-file two
+  sessions qualify.
+- Full (16 cached): further distinct files always miss
+  (uncached; may gap under contention).
+- Churn (Stamps changing across snapshots, e.g. upgrades or
+  container layer turnover): new Stamps miss until filled (if
+  room) or always (if full).
+- Distinct-object (17+ distinct libcrypto builds, e.g. many
+  containers/namespaces): exceeds the cap; misses may gap.
+
+Gaps are reported (never silent success, never quiet loss); the
+refused scope is not qualified. The cache does not by itself
+restore a two-session guarantee for churning or over-cap working
+sets — narrow the scope or stabilize the image set and re-qualify.
+See `packaging/deb/README.Debian` and the
+[overhead matrix](overhead-matrix.md) for the full arithmetic.
+
 ## Historical and deferred distribution
 
 `--libcrypto PATH` explicitly selects the historical v0.2 exact-profile Count
