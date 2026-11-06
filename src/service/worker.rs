@@ -2,9 +2,10 @@
 //! §7.2 bounded cancellation on EVERY blocking path: the
 //! `Control<T>`/`run_under_control` pattern (abandonment flag stored
 //! by the waiter; a started worker keeps running detached and owns
-//! its captures; the waiter's abandonment path takes no lock and
-//! performs no blocking syscall), per-destination epochs + fencing,
-//! the tap receipt protocol, and the diagnostics worker.
+//! its captures; the waiter's abandonment path takes only the
+//! registry short critical section — never a worker-dependent wait
+//! — and performs no blocking syscall), per-destination epochs +
+//! fencing, the tap receipt protocol, and the diagnostics worker.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -186,8 +187,9 @@ impl<'a> WaitPoll<'a> {
 /// retried at the next boundary — never concurrent).
 ///
 /// The waiter's abandonment path stores the flag + bumps the epoch
-/// and takes NO lock; the detached worker unregisters at exit via
-/// worker-side `on_exit`.
+/// and takes only the registry short critical section (all holders
+/// are microsecond HashMap ops — never worker progress); the
+/// detached worker reconciles at exit via worker-side `on_exit`.
 ///
 /// `wait_poll` (when present) drains signalfd every poll quantum
 /// (R1 finding 3) so waits observe the second signal.
@@ -237,6 +239,7 @@ where
         fenced: dest.class.fenced(),
     };
     let dest_key = dest.clone();
+    let exit_flag = flag.clone();
     let spawn = std::thread::Builder::new()
         .name(format!("sixb-{}", short_dest(&dest_key)))
         .spawn(move || {
@@ -251,14 +254,36 @@ where
             // Worker-side `on_exit`: store receipt + result,
             // unregister — but ONLY when the slot is still this
             // worker's (a successor may have registered since).
+            // R3 Gate 3 F2: when the waiter abandoned (flag set —
+            // checked under this lock, so the waiter's
+            // abandon-or-consume and this exit serialize), the
+            // result is dropped unread (no consumer can read a
+            // result post-abandonment — `view_slot` exposes
+            // receipts only) and the slot unregisters unless a
+            // receipt needs reconciling (nonce destinations have no
+            // successor to reconcile — retention would accumulate
+            // unboundedly across closes).
             let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
             if let Some(slot) = reg.get_mut(&dest_key) {
                 if slot.worker == worker {
-                    slot.live = false;
-                    if let Some(v) = value {
-                        slot.result = Some(Box::new(v));
+                    if exit_flag.load(Ordering::Acquire) {
+                        drop(value);
+                        match receipt {
+                            Some(r) => {
+                                slot.live = false;
+                                slot.receipt = Some(r);
+                            }
+                            None => {
+                                reg.remove(&dest_key);
+                            }
+                        }
+                    } else {
+                        slot.live = false;
+                        if let Some(v) = value {
+                            slot.result = Some(Box::new(v));
+                        }
+                        slot.receipt = receipt;
                     }
-                    slot.receipt = receipt;
                 }
             }
         });
@@ -301,17 +326,45 @@ where
             poll.poll();
         }
         if cancel.load(Ordering::Relaxed) {
-            // Abandonment path: NO lock, NO blocking syscall.
+            // Abandonment path: flag + epoch, then the registry
+            // short critical section (never worker-dependent), NO
+            // blocking syscall.
             flag.store(true, Ordering::Release);
             epoch.fetch_add(1, Ordering::AcqRel);
+            consume_if_finished(&dest, worker);
             return Control::Cancelled;
         }
         if Instant::now() >= deadline {
             flag.store(true, Ordering::Release);
             epoch.fetch_add(1, Ordering::AcqRel);
+            consume_if_finished(&dest, worker);
             return Control::Expired;
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Abandonment-path consume (R3 Gate 3 F2): a worker that finished
+/// between the waiter's last completion check and the abandonment
+/// stores its result just as the waiter leaves — consume the
+/// finished slot here (the disposition stays Expired/Cancelled —
+/// the deadline/cancel fired first) so no race retains a result.
+/// Receiptless slots unregister; receipt-bearing slots drop their
+/// (unreadable) result but stay for the reconciler. Short critical
+/// section only (no worker progress needed).
+fn consume_if_finished(dest: &Destination, worker: u64) {
+    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    let finished = matches!(
+        reg.get(dest),
+        Some(slot) if slot.worker == worker && !slot.live
+    );
+    if !finished {
+        return;
+    }
+    if reg.get(dest).is_some_and(|slot| slot.receipt.is_none()) {
+        reg.remove(dest);
+    } else if let Some(slot) = reg.get_mut(dest) {
+        slot.result = None;
     }
 }
 
@@ -526,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn expiry_abandons_without_join_or_lock() {
+    fn expiry_abandons_without_join() {
         let cancel = AtomicBool::new(false);
         let started = Arc::new(AtomicBool::new(false));
         let started_w = started.clone();
@@ -558,19 +611,20 @@ mod tests {
             None,
         );
         assert!(matches!(c2, Control::Expired));
-        // Reconcile consumes the finished slot; then reuse works.
+        // Reconcile: the abandoned receiptless slot is gone
+        // (worker-side self-reclaim — R3 Gate 3 F2: nothing to
+        // consume) or finished; then reuse works.
         let mut tries = 0;
-        let view = loop {
-            if let Some(v) = view_slot(&dest("expiry")) {
-                if !v.live {
-                    break v;
-                }
+        loop {
+            match view_slot(&dest("expiry")) {
+                None => break,
+                Some(v) if !v.live => break,
+                Some(_) => {}
             }
             tries += 1;
             assert!(tries < 500, "worker must exit + unregister");
             std::thread::sleep(Duration::from_millis(5));
-        };
-        assert!(!view.live);
+        }
         let c3: Control<u64> = run_under_control(
             dest("expiry"),
             Duration::from_secs(5),

@@ -2109,7 +2109,7 @@ fn close_common_body(
     // Sealed map (R2 Gate 3): spilled seals read on workers under
     // the ONE close deadline with WaitPoll signal consumption —
     // never coordinator-direct. Staged values never touch the FS.
-    let sealed = {
+    let (sealed, seal_outcomes) = {
         let cycle = run.cycle.as_ref().expect("window open at close");
         let deadline = run.close_deadline;
         let fallback = boundary_budget(run.cfg.timeout);
@@ -2124,6 +2124,29 @@ fn close_common_body(
             Some(&poll),
         )
     };
+    // Record every spilled seal-read outcome (R3 Gate 4 F2 — the
+    // frozen rule: every Expired/Cancelled/Lost/Failed op lands in
+    // `close_accounting` + one bounded stderr line, `failed` with
+    // its errno). A seal that cannot be consumed gaps
+    // `snapshot.member_unsealed` in `produce` (fail-closed — the
+    // retirement record still rides `crypto_watch[]` verbatim; the
+    // seal only sharpens the exact-Σ).
+    for o in &seal_outcomes {
+        let op = format!("seal_read_{}", o.seg_hint);
+        if o.outcome != OpOutcome::Done {
+            let mut msg = format!("op {op} ended {:?}", o.outcome);
+            if let Some(errno) = o.errno {
+                msg.push_str(&format!(" (errno {errno})"));
+            }
+            diag_line(&run.diag, &run.format, "warn", &msg);
+        }
+        push_accounting(
+            &mut run.summary.close_accounting,
+            &mut run.summary.close_accounting_overflow,
+            op,
+            o.outcome,
+        );
+    }
     let cycle = run.cycle.as_ref().expect("window open at close");
     let open_tick = tick_of(cycle.effective_start_ns, run.origin_ns, run.tick_ns);
     let close_tick = tick_of(effective_end_ns, run.origin_ns, run.tick_ns);

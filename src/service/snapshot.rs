@@ -32,8 +32,8 @@ use crate::evidence::{
 };
 use crate::policy::{PolicyOutcome, PolicyRule};
 use crate::service::envelope::{
-    ContributorEntry, MemberEntry, SiteRef, SiteSourceEntry, UNKNOWN_FIRST_NS, UNKNOWN_LAST_NS,
-    WindowSpan,
+    ContributorEntry, MemberEntry, OpOutcome, SiteRef, SiteSourceEntry, UNKNOWN_FIRST_NS,
+    UNKNOWN_LAST_NS, WindowSpan,
 };
 use crate::service::state::{PolicyIdentity, RunId};
 
@@ -914,6 +914,18 @@ pub(crate) fn parse_seal_bytes(bytes: &[u8]) -> Option<(u64, SealedRetirement)> 
     seal_of(&v)
 }
 
+/// One spilled seal-read outcome (R3 Gate 4 F2: every read is an
+/// accounted worker op — the coordinator records these through
+/// the shared `outcome_of` + `close_accounting` path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SealReadOutcome {
+    pub seg_hint: u64,
+    pub outcome: OpOutcome,
+    /// errno when the op executed and errored (`Failed` — rides
+    /// the stderr line per the frozen rule).
+    pub errno: Option<i32>,
+}
+
 /// Extract retirement seals from staged AND spilled values
 /// (`ProcessObservation` records → `(segment, seal)`), filtered to
 /// close-absent segments (retired ⟺ absent from close — a sealed
@@ -928,6 +940,12 @@ pub(crate) fn parse_seal_bytes(bytes: &[u8]) -> Option<(u64, SealedRetirement)> 
 /// unit tests) with WaitPoll signal consumption. Expired/cancelled/
 /// unreadable seals skip — the close meets its deadline despite
 /// stalls. Staged values never touch the filesystem.
+///
+/// R3 Gate 4 F2: abandoned reads reconcile worker-side (late
+/// results never accumulate) and EVERY read reports its outcome
+/// (the coordinator records them — a seal that cannot be consumed
+/// gaps `snapshot.member_unsealed` in `produce`, fail-closed: the
+/// retirement record still rides `crypto_watch[]` verbatim).
 pub(crate) fn sealed_map(
     staged: &[crate::service::staging::StagedRecord],
     spilled: &[crate::service::staging::SpilledRecord],
@@ -936,8 +954,9 @@ pub(crate) fn sealed_map(
     fallback: std::time::Duration,
     cancel: &std::sync::atomic::AtomicBool,
     poll: Option<&crate::service::worker::WaitPoll>,
-) -> HashMap<u64, SealedRetirement> {
+) -> (HashMap<u64, SealedRetirement>, Vec<SealReadOutcome>) {
     let mut out = HashMap::new();
+    let mut outcomes = Vec::new();
     for r in staged {
         let Some(v) = r.value.as_ref() else {
             continue;
@@ -966,7 +985,7 @@ pub(crate) fn sealed_map(
         let budget = deadline
             .map(|d| d.saturating_duration_since(std::time::Instant::now()))
             .unwrap_or(fallback);
-        let bytes = {
+        let ctrl = {
             use crate::service::worker::{
                 Control, DestClass, Destination, WorkerOut, run_under_control,
             };
@@ -987,9 +1006,37 @@ pub(crate) fn sealed_map(
                 poll,
             );
             match ctrl {
-                Control::Done(Ok(b)) => b,
-                _ => continue,
+                Control::Done(Ok(b)) => {
+                    outcomes.push(SealReadOutcome {
+                        seg_hint,
+                        outcome: OpOutcome::Done,
+                        errno: None,
+                    });
+                    Some(b)
+                }
+                Control::Done(Err(e)) => {
+                    outcomes.push(SealReadOutcome {
+                        seg_hint,
+                        outcome: OpOutcome::Failed,
+                        errno: Some(e.raw_os_error().unwrap_or(-1)),
+                    });
+                    None
+                }
+                other => {
+                    outcomes.push(SealReadOutcome {
+                        seg_hint,
+                        outcome: crate::service::worker::outcome_of(&other),
+                        errno: None,
+                    });
+                    None
+                }
             }
+        };
+        let Some(bytes) = ctrl else {
+            if poll.is_some_and(|p| p.doubled()) {
+                break;
+            }
+            continue;
         };
         if let Some((seg, seal)) = parse_seal_bytes(&bytes) {
             if !close_segments.contains(&seg) {
@@ -1000,7 +1047,7 @@ pub(crate) fn sealed_map(
             break;
         }
     }
-    out
+    (out, outcomes)
 }
 
 fn open_keyed(open: &MemberView) -> HashMap<(SiteKey, u32), u64> {
@@ -1396,7 +1443,7 @@ mod tests {
         }];
         let close_segments = BTreeSet::new();
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        let m = sealed_map(
+        let (m, outcomes) = sealed_map(
             &[],
             &spilled,
             &close_segments,
@@ -1406,6 +1453,15 @@ mod tests {
             None,
         );
         assert_eq!(m.len(), 1, "spilled seal consumed");
+        assert_eq!(
+            outcomes,
+            vec![SealReadOutcome {
+                seg_hint: 7,
+                outcome: OpOutcome::Done,
+                errno: None,
+            }],
+            "every read reports its outcome (R3 F2)"
+        );
         let s = &m[&7];
         assert_eq!((s.pid, s.starttime, s.image_epoch), (9, 100, 3));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1730,6 +1786,138 @@ mod tests {
         assert!(counter.forces_partial());
     }
 
+    /// R3 Gate 3 (F2): an abandoned seal read's late result must
+    /// not accumulate — after the worker completes late, no
+    /// finished-unconsumed slot stays registered (worker-side
+    /// self-cleanup; nothing ever reconciles the nonce
+    /// destination explicitly). Adopted from the R3 seal probe
+    /// (3 expired reads each retaining ~2 MiB).
+    #[test]
+    fn sealed_map_abandoned_read_leaves_no_retained_slot() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!(
+            "t74-gate3-sealret-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("stalled-spill");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let r = crate::service::staging::SpilledRecord {
+            tmp: fifo.clone(),
+            bytes: 1048576,
+            tick: 0,
+            valid: true,
+            seal_segment: Some(7),
+            content_sha: [0; 32],
+        };
+        // The nonce destination this read mints (same shape as
+        // production: `seal-{seg}-{nonce}`).
+        let n0 = crate::service::state::next_op_nonce();
+        let dest = crate::service::worker::Destination {
+            class: crate::service::worker::DestClass::OwnTmp,
+            key: format!("seal-7-{}", n0 + 1),
+        };
+        let t0 = std::time::Instant::now();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+        let (m, outcomes) = sealed_map(
+            &[],
+            &[r],
+            &BTreeSet::new(),
+            Some(deadline),
+            std::time::Duration::from_secs(5),
+            &cancel,
+            None,
+        );
+        assert!(m.is_empty(), "expired read seals nothing");
+        assert_eq!(
+            outcomes,
+            vec![SealReadOutcome {
+                seg_hint: 7,
+                outcome: OpOutcome::Expired,
+                errno: None,
+            }],
+            "every read reports its outcome (R3 F2)"
+        );
+        eprintln!("abandoned seal read returned in {:?}", t0.elapsed());
+        // The writer arrives late with 1 MiB — the detached worker
+        // completes (nothing reconciles it explicitly).
+        {
+            let mut w = std::fs::OpenOptions::new().write(true).open(&fifo).unwrap();
+            w.write_all(&vec![b'x'; 1048576]).unwrap();
+        }
+        // Settle: live polls don't consume; a finished view proves
+        // retention (RED), None proves self-cleanup (GREEN).
+        let mut retained = false;
+        for _ in 0..600 {
+            match crate::service::worker::view_slot(&dest) {
+                None => break,
+                Some(v) if v.live => std::thread::sleep(std::time::Duration::from_millis(5)),
+                Some(_) => {
+                    retained = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            !retained,
+            "abandoned seal read must not leave a retained slot"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3 Gate 4 (F2): a seal read that executes and errors
+    /// reports `Failed` with its errno (frozen rule: `failed` =
+    /// the op executed and returned an error).
+    #[test]
+    fn sealed_map_errored_read_reports_failed_with_errno() {
+        let r = crate::service::staging::SpilledRecord {
+            tmp: std::env::temp_dir().join(format!(
+                "t74-seal-missing-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
+            bytes: 1,
+            tick: 0,
+            valid: true,
+            seal_segment: Some(9),
+            content_sha: [0; 32],
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (m, outcomes) = sealed_map(
+            &[],
+            &[r],
+            &BTreeSet::new(),
+            None,
+            std::time::Duration::from_secs(5),
+            &cancel,
+            None,
+        );
+        assert!(m.is_empty(), "errored read seals nothing");
+        assert_eq!(
+            outcomes,
+            vec![SealReadOutcome {
+                seg_hint: 9,
+                outcome: OpOutcome::Failed,
+                errno: Some(libc::ENOENT),
+            }],
+            "executed-and-errored reads report Failed with errno"
+        );
+    }
+
     /// R2 Gate 3 (F3): stalled spilled-seal reads must not block
     /// the coordinator — `sealed_map` meets its deadline despite a
     /// FIFO stall. Adopted from the R2 seal-read probe (stalled-read
@@ -1794,12 +1982,22 @@ mod tests {
             f.write_all(b"{}\n").unwrap();
             drop(f);
         }
-        let _ = h.join();
+        let (m, outcomes) = h.join().expect("seal thread joins");
         let dt = t0.elapsed();
         eprintln!("sealed_map stalled-spill: finished={finished} dt={dt:?}");
         assert!(
             finished,
             "sealed_map must meet its deadline despite a stalled spill (blocked {dt:?})"
+        );
+        assert!(m.is_empty(), "expired read seals nothing");
+        assert_eq!(
+            outcomes,
+            vec![SealReadOutcome {
+                seg_hint: 1,
+                outcome: OpOutcome::Expired,
+                errno: None,
+            }],
+            "every read reports its outcome (R3 F2)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
