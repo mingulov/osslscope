@@ -2714,10 +2714,12 @@ fn enqueue_boundary_records(run: &mut Run, seq: u64, sha256: &str) {
             stream_gaps: s.queue.spans(),
         };
         // Cover BEFORE enqueue: the marker's own eviction (if any)
-        // folds UNMARKED (marked spans never merge) → the next
-        // boundary's marker re-covers it (delayed marker covers
-        // both spans, §5.2).
-        s.queue.mark_all();
+        // folds into the same span as uncovered growth → the next
+        // boundary's marker re-covers it (marker-specific deltas;
+        // the delayed marker covers old + new, §5.2). Marker
+        // identity = the window seq (unique per run: seqs
+        // increase, ≤1 marker/boundary).
+        s.queue.mark_all(seq);
         if let Ok(line) = serde_json::to_vec(&marker) {
             s.queue.enqueue(QueuedRecord { seq, bytes: line });
             assign_active(s, seq);
@@ -2946,7 +2948,7 @@ fn drive_tap_inner(
                     WriteOutcome::Complete { .. } => {
                         if is_marker {
                             if let Some(s) = run.stream.as_mut() {
-                                s.queue.clear_marked();
+                                s.queue.clear_marker(at_seq);
                             }
                         }
                     }
@@ -3057,7 +3059,7 @@ fn reconcile_tap_write(
                     run.summary.tap_recovered.bytes += b;
                     if rec.kind == "drop-marker" {
                         if let Some(s) = run.stream.as_mut() {
-                            s.queue.clear_marked();
+                            s.queue.clear_marker(seq);
                         }
                     }
                     true
@@ -3129,7 +3131,7 @@ fn tail_reconcile_regular(
         run.summary.tap_recovered.bytes += b;
         if rec.kind == "drop-marker" {
             if let Some(s) = run.stream.as_mut() {
-                s.queue.clear_marked();
+                s.queue.clear_marker(seq);
             }
         }
         if let Some(s) = run.stream.as_mut() {

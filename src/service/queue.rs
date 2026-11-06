@@ -8,7 +8,9 @@
 //! 64-entry drop ledger (same-cause merge, visible fold count). The
 //! ledger is a fixed in-memory structure, NOT queued records: at each
 //! window boundary it emits one `drop-marker` covering evictions
-//! since the previous marker. Spans clear ONLY on newline-delivery.
+//! since the previous marker. Spans clear ONLY on newline-delivery
+//! of their OWN marker (marker-specific coverage snapshots —
+//! R1 C1); same-cause folds always merge (one span per cause).
 
 use std::collections::VecDeque;
 
@@ -37,6 +39,27 @@ impl QueuedRecord {
     }
 }
 
+/// Marker-specific coverage delta (R1 C1): the span growth one
+/// emitted marker covers BEYOND all older markers (cumulative
+/// markers, disjoint deltas — ascending by marker). Delivery of
+/// marker M proves M's whole cumulative content, so it subtracts
+/// every delta ≤ M (an evicted marker's delta clears under any
+/// newer delivery — no unmark path, §5.2). A delivery NEVER
+/// touches deltas > M (R1 C1(b): an old delivery never erases
+/// newer-only drops).
+#[derive(Debug, Clone)]
+pub struct SpanCoverage {
+    pub marker: u64,
+    pub records: u64,
+    pub bytes: u64,
+    pub folds: u64,
+}
+
+/// Coverage deltas retained per span (mirrors `LEDGER_CAP` — the
+/// ledger's memory is bounded by spans × this, regardless of how
+/// many markers go undelivered).
+pub const COVERAGE_CAP: usize = 64;
+
 /// Folded drop span (the §5.2 ledger entry shape + merge state).
 #[derive(Debug, Clone)]
 pub struct LedgerSpan {
@@ -46,14 +69,11 @@ pub struct LedgerSpan {
     pub bytes: u64,
     pub folds: u64,
     pub reason: DropReason,
-    /// Covered by an emitted marker (marker-carried, awaiting
-    /// newline-delivery to clear). New folds NEVER merge into
-    /// marked spans (their content is already marker-rendered —
-    /// merging would hide uncovered bytes under old coverage);
-    /// each marker build re-covers every records>0 span (marked or
-    /// not — the delayed marker covers both spans, §5.2), so an
-    /// evicted marker needs no unmark path.
-    pub marked: bool,
+    /// Marker coverage deltas, ascending (empty ⟺ never covered —
+    /// every record is uncovered growth). Same-cause folds ALWAYS
+    /// merge here (bounded: one span per cause); the deltas — not
+    /// a merge ban — distinguish covered drops from new growth.
+    pub covering: Vec<SpanCoverage>,
 }
 
 impl LedgerSpan {
@@ -65,7 +85,7 @@ impl LedgerSpan {
             bytes,
             folds: 0,
             reason,
-            marked: false,
+            covering: Vec::new(),
         }
     }
 
@@ -139,23 +159,19 @@ impl StreamQueue {
     /// Fold one dropped record into the ledger + gross totals.
     /// Same-cause merging is MANDATORY (Control 1: unmerged
     /// same-cause spans are FAIL) — every cause merges into its
-    /// UNMARKED span. Marked (marker-covered) spans never absorb
-    /// new folds (their content is already rendered into an
-    /// emitted marker); a same-cause fold past a marked span opens
-    /// a second unmarked span (same reason, disjoint coverage —
-    /// each span keeps `0 ≤ folds ≤ records − 1` exactly, and the
-    /// 64-cap still never binds: ≤2 spans per cause).
+    /// ONE span, covered or not (coverage deltas, not a merge
+    /// ban, distinguish covered drops from new growth — R1 C1).
+    /// Bounded: one span per cause (3 reasons), so the
+    /// 64-cap never binds; gross totals charge first, so even a
+    /// hypothetical overflow stays explicit in the totals, never
+    /// quiet. Each span keeps `0 ≤ folds ≤ records − 1` exactly.
     pub fn fold(&mut self, seq: u64, bytes: u64, reason: DropReason) {
         self.gross_records += 1;
         self.gross_bytes += bytes;
         let slot = &mut self.gross_by_reason[Self::reason_idx(reason)];
         slot.0 += 1;
         slot.1 += bytes;
-        if let Some(span) = self
-            .spans
-            .iter_mut()
-            .find(|s| s.reason == reason && !s.marked)
-        {
+        if let Some(span) = self.spans.iter_mut().find(|s| s.reason == reason) {
             span.merge(seq, bytes);
             return;
         }
@@ -199,8 +215,8 @@ impl StreamQueue {
     }
 
     /// Uncleared spans (NET of recovery) for marker emission /
-    /// `stream_pending[]` — every records>0 span, marked or not
-    /// (marked-but-undelivered spans are uncleared).
+    /// `stream_pending[]` — every records>0 span, covered or not
+    /// (covered-but-undelivered spans are uncleared).
     pub fn spans(&self) -> Vec<DropLedgerEntry> {
         self.spans
             .iter()
@@ -209,40 +225,107 @@ impl StreamQueue {
             .collect()
     }
 
-    /// Spans needing marker coverage (unmarked, records>0).
+    /// Spans needing marker coverage (uncovered growth, records>0).
     pub fn uncovered(&self) -> Vec<DropLedgerEntry> {
         self.spans
             .iter()
-            .filter(|s| !s.marked && s.records > 0)
+            .filter(|s| s.records > 0 && Self::has_growth(s))
             .map(LedgerSpan::entry)
             .collect()
+    }
+
+    /// Records already covered by emitted markers (Σ deltas —
+    /// strikes shrink the span, never the deltas, so growth is
+    /// exactly post-coverage folds).
+    fn covered_records(span: &LedgerSpan) -> u64 {
+        span.covering.iter().map(|c| c.records).sum()
+    }
+
+    /// Uncovered growth ⟺ folded past the covered prefix.
+    fn has_growth(span: &LedgerSpan) -> bool {
+        span.records > Self::covered_records(span)
     }
 
     /// A new marker is needed iff uncovered folds exist (a marker
     /// was emitted with no new folds since → no marker, §5.2).
     pub fn has_pending_spans(&self) -> bool {
-        self.spans.iter().any(|s| !s.marked && s.records > 0)
+        self.spans
+            .iter()
+            .any(|s| s.records > 0 && Self::has_growth(s))
     }
 
-    /// Cover every records>0 span (call at marker build — the
-    /// emitted marker carries `spans()` verbatim, marked or not).
-    /// Zero-record spans sweep here (struck-empty, unmarked — their
-    /// bytes already recovered; marked zero spans clear at
-    /// delivery).
-    pub fn mark_all(&mut self) {
-        self.spans.retain(|s| s.records > 0 || s.marked);
+    /// Cover every records>0 span with `marker` (call at marker
+    /// build — the emitted marker carries `spans()` verbatim,
+    /// covered or not). Each span with uncovered growth appends
+    /// its delta (an unchanged span needs no entry — any newer
+    /// delivery re-proves its old deltas, §5.2). Overflow thins
+    /// the SECOND-newest delta (the oldest — likeliest to deliver
+    /// — and the newest — the pending frontier — stay exact; a
+    /// thinned delta's later delivery under-subtracts, which
+    /// over-retains explicitly in the span — never quiet loss).
+    /// Zero-record uncovered spans sweep here (struck-empty —
+    /// their bytes already recovered).
+    pub fn mark_all(&mut self, marker: u64) {
+        self.spans
+            .retain(|s| s.records > 0 || !s.covering.is_empty());
         for span in self.spans.iter_mut() {
-            if span.records > 0 {
-                span.marked = true;
+            if span.records == 0 || !Self::has_growth(span) {
+                continue;
             }
+            let (mut dr, mut db, mut df) = (span.records, span.bytes, span.folds);
+            for c in span.covering.iter() {
+                dr = dr.saturating_sub(c.records);
+                db = db.saturating_sub(c.bytes);
+                df = df.saturating_sub(c.folds);
+            }
+            if span.covering.len() >= COVERAGE_CAP {
+                let thin = span.covering.len() - 2;
+                span.covering.remove(thin);
+            }
+            span.covering.push(SpanCoverage {
+                marker,
+                records: dr,
+                bytes: db,
+                folds: df,
+            });
         }
     }
 
-    /// Clear marker-covered spans on newline-delivery of their
-    /// marker (struck bytes already recovered — delivery clears
-    /// coverage, never double-corrects).
-    pub fn clear_marked(&mut self) {
-        self.spans.retain(|s| !s.marked);
+    /// Clear on newline-delivery of marker `marker`: the delivery
+    /// proves the marker's whole cumulative content, so each span
+    /// subtracts every delta ≤ `marker` (saturating — struck bytes
+    /// already recovered; delivery clears coverage, never
+    /// double-corrects — the arithmetic mirrors the Control-1
+    /// equation gross − recovered − delivered-claimed exactly, in
+    /// every delivery order). Deltas > `marker` are untouched (R1
+    /// C1(b): an old delivery never erases newer-only drops).
+    /// Fully-cleared spans drop; partials stay pending (their
+    /// post-delivery growth needs the next marker). The span's seq
+    /// range is preserved across partial clears (records/bytes /
+    /// folds stay exact; the range still names the span's
+    /// eviction range).
+    pub fn clear_marker(&mut self, marker: u64) {
+        for span in self.spans.iter_mut() {
+            let (mut dr, mut db, mut df) = (0u64, 0u64, 0u64);
+            span.covering.retain(|c| {
+                if c.marker <= marker {
+                    dr = dr.saturating_add(c.records);
+                    db = db.saturating_add(c.bytes);
+                    df = df.saturating_add(c.folds);
+                    false
+                } else {
+                    true
+                }
+            });
+            span.records = span.records.saturating_sub(dr);
+            span.bytes = span.bytes.saturating_sub(db);
+            span.folds = span
+                .folds
+                .saturating_sub(df)
+                .min(span.records.saturating_sub(1));
+        }
+        self.spans
+            .retain(|s| s.records > 0 || !s.covering.is_empty());
     }
 
     /// Strike a landed record OUT of the folded spans (gross totals
@@ -271,8 +354,8 @@ impl StreamQueue {
             struck_bytes = bytes;
             break;
         }
-        // Emptied spans sweep at the next `mark_all` (marked
-        // empties clear at delivery; unmarked empties carry
+        // Emptied spans sweep at the next `mark_all` (covered
+        // empties clear at delivery; uncovered empties carry
         // nothing) — strikes never remove (positions stay stable
         // under delivery clears).
         (struck_records, struck_bytes)
@@ -352,17 +435,102 @@ mod tests {
         assert_eq!(spans.len(), 1);
         assert_eq!(spans[0].records, 1);
         assert!(spans[0].folds <= spans[0].records.saturating_sub(1));
-        // Marker emission covers; delivery clears exactly the
-        // covered spans (new folds past coverage open a sibling).
+        // Marker emission covers; delivery of that marker
+        // subtracts exactly its snapshot (new folds past coverage
+        // merge into the same span as uncovered growth — R1 C1).
         assert!(q.has_pending_spans());
-        q.mark_all();
+        q.mark_all(7);
         assert!(!q.has_pending_spans());
         q.fold(9, 41, DropReason::QueueFull);
         assert!(q.has_pending_spans());
-        assert_eq!(q.spans().len(), 2);
-        q.clear_marked();
+        assert_eq!(q.spans().len(), 1);
+        assert_eq!(q.spans()[0].records, 2);
+        q.clear_marker(7);
         assert_eq!(q.spans().len(), 1);
         assert_eq!(q.spans()[0].records, 1);
+        assert!(q.has_pending_spans(), "post-snapshot growth stays pending");
+    }
+
+    /// R1 C1(a): repeated `fold → mark_all` without delivery must
+    /// stay bounded (no panic, no quiet loss — every folded record
+    /// stays covered by an explicit span).
+    #[test]
+    fn repeated_undelivered_markers_stay_bounded_and_exact() {
+        let mut q = StreamQueue::new(100, 64);
+        for seq in 1..=70u64 {
+            q.fold(seq, 41, DropReason::QueueFull);
+            q.mark_all(seq);
+        }
+        assert_eq!(q.gross(), (70, 70 * 41));
+        let spans = q.spans();
+        assert!(
+            spans.len() <= LEDGER_CAP,
+            "bounded: {} spans (cap {LEDGER_CAP})",
+            spans.len()
+        );
+        let covered: u64 = spans.iter().map(|s| s.records).sum();
+        assert_eq!(covered, 70, "no quiet loss: all 70 folds covered");
+        for s in &spans {
+            assert!(
+                s.folds <= s.records.saturating_sub(1),
+                "fold invariant holds: {s:?}"
+            );
+        }
+        // Structural memory bound (70 undelivered markers thinning
+        // into the cap — the ledger cannot grow with marker count).
+        for s in q.spans.iter() {
+            assert!(
+                s.covering.len() <= COVERAGE_CAP,
+                "coverage deltas bounded: {} (cap {COVERAGE_CAP})",
+                s.covering.len()
+            );
+        }
+    }
+
+    /// R1 C1(b): delivering an OLD marker must not erase drops
+    /// covered only by a NEWER undelivered marker.
+    #[test]
+    fn old_marker_delivery_keeps_newer_coverage() {
+        let mut q = StreamQueue::new(100, 64);
+        for seq in 1..=5u64 {
+            q.fold(seq, 41, DropReason::QueueFull);
+        }
+        q.mark_all(1); // marker 1 covers the first 5
+        for seq in 6..=8u64 {
+            q.fold(seq, 41, DropReason::QueueFull);
+        }
+        q.mark_all(2); // marker 2 covers all 8
+        q.clear_marker(1); // marker 1 delivers (old)
+        let spans = q.spans();
+        let covered: u64 = spans.iter().map(|s| s.records).sum();
+        assert_eq!(
+            covered, 3,
+            "newer-only coverage survives old-marker delivery"
+        );
+        q.clear_marker(2); // marker 2 delivers (new)
+        assert!(q.spans().is_empty(), "all proven drops clear");
+        assert_eq!(q.gross(), (8, 8 * 41), "gross untouched by clears");
+    }
+
+    /// Reversed delivery order (new marker first) clears the full
+    /// cumulative proof at once; the older delivery after is a
+    /// no-op (its content was already proven).
+    #[test]
+    fn reversed_delivery_clears_cumulative_once() {
+        let mut q = StreamQueue::new(100, 64);
+        for seq in 1..=5u64 {
+            q.fold(seq, 41, DropReason::QueueFull);
+        }
+        q.mark_all(1);
+        for seq in 6..=8u64 {
+            q.fold(seq, 41, DropReason::QueueFull);
+        }
+        q.mark_all(2);
+        q.clear_marker(2); // new first: proves all 8
+        assert!(q.spans().is_empty());
+        q.clear_marker(1); // old after: no-op
+        assert!(q.spans().is_empty());
+        assert_eq!(q.gross(), (8, 8 * 41));
     }
 
     #[test]
