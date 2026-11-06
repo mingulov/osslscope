@@ -108,6 +108,163 @@ pub fn publish_window_durable(
     publish_window(dir, seq, tag, bytes, attempt, &sync_dir)
 }
 
+/// 64 KiB streaming buffer (matches the spill buffer — one bound
+/// for every publication stream).
+pub const PUBLISH_BUF_BYTES: usize = 64 * 1024;
+
+/// Streamed publish judgment (step + failing stage/errno when
+/// any + the incremental window SHA-256).
+pub type StreamedPublish = (PublishStep, Option<(PublishStage, i32)>, String);
+
+/// Publish a streamed window (R1 finding 2b): `head + "[" +
+/// array-tmp bytes + "]" + tail` streams into the window tmp
+/// through the bounded buffer with an incremental SHA-256, then
+/// follows the §4.2 link protocol EXACTLY (same steps, stages, and
+/// ONE duplicate rule — the EEXIST byte-compare streams chunked,
+/// never holding both files). `array_tmp` is read-only here (the
+/// caller owns its lifecycle).
+pub fn publish_window_streaming(
+    dir: &Path,
+    seq: u64,
+    tag: &str,
+    head: &[u8],
+    tail: &[u8],
+    array_tmp: &Path,
+    attempt: &AttemptKey,
+) -> StreamedPublish {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Write as _};
+    let fail = |stage: PublishStage, e: std::io::Error| (stage, e.raw_os_error().unwrap_or(-1));
+    let fail_tmp = |tmp: &Path, stage: PublishStage, e: std::io::Error| {
+        let _ = std::fs::remove_file(tmp);
+        (
+            PublishStep::NotPublished,
+            Some(fail(stage, e)),
+            String::new(),
+        )
+    };
+    let final_name = window_name(seq);
+    let tmp_name = format!(".{final_name}.tmp.{tag}.{}", next_op_nonce());
+    let tmp = dir.join(&tmp_name);
+    let mut f = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&tmp)
+    {
+        Ok(f) => f,
+        Err(e) => return fail_tmp(&tmp, PublishStage::TmpWrite, e),
+    };
+    let mut h = sha2::Sha256::new();
+    // Head + `[` (RAM-held — the envelope without the array).
+    if let Err(e) = (|| -> std::io::Result<()> {
+        f.write_all(head)?;
+        h.update(head);
+        f.write_all(b"[")?;
+        h.update(b"[");
+        Ok(())
+    })() {
+        return fail_tmp(&tmp, PublishStage::TmpWrite, e);
+    }
+    // Array body: the array tmp streams in bounded chunks.
+    let mut array = match std::fs::File::open(array_tmp) {
+        Ok(f) => f,
+        Err(e) => return fail_tmp(&tmp, PublishStage::TmpWrite, e),
+    };
+    let mut buf = vec![0u8; PUBLISH_BUF_BYTES];
+    loop {
+        let n = match array.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return fail_tmp(&tmp, PublishStage::TmpWrite, e),
+        };
+        if let Err(e) = f.write_all(&buf[..n]) {
+            return fail_tmp(&tmp, PublishStage::TmpWrite, e);
+        }
+        h.update(&buf[..n]);
+    }
+    // `]` + tail.
+    if let Err(e) = (|| -> std::io::Result<()> {
+        f.write_all(b"]")?;
+        h.update(b"]");
+        f.write_all(tail)?;
+        h.update(tail);
+        Ok(())
+    })() {
+        return fail_tmp(&tmp, PublishStage::TmpWrite, e);
+    }
+    if let Err(e) = f.sync_all() {
+        return fail_tmp(&tmp, PublishStage::FileFsync, e);
+    }
+    drop(f);
+    let sha256: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let final_path = dir.join(&final_name);
+    match std::fs::hard_link(&tmp, &final_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&tmp);
+            match sync_dir(dir) {
+                Ok(()) => (PublishStep::Durable, None, sha256),
+                Err(e) => (
+                    PublishStep::Uncertain,
+                    Some(fail(PublishStage::DirFsync, e)),
+                    sha256,
+                ),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // THE ONE duplicate rule, streamed: chunked
+            // byte-compare (never holding both files) + same
+            // attempt. The attempt parse still reads the existing
+            // file whole (rare EEXIST-only path — the steady path
+            // never holds window bytes; twin-audited, R1 finding 2b).
+            let step = match files_equal_chunked(&tmp, &final_path) {
+                Ok(true) => match std::fs::read(&final_path) {
+                    Ok(existing) if attempt.matches_bytes(&existing) => PublishStep::Converged,
+                    _ => PublishStep::IntegrityRefusal,
+                },
+                Ok(false) => PublishStep::IntegrityRefusal,
+                Err(read_err) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    return (
+                        PublishStep::IntegrityRefusal,
+                        Some(fail(PublishStage::ReadExisting, read_err)),
+                        sha256,
+                    );
+                }
+            };
+            let _ = std::fs::remove_file(&tmp);
+            (step, None, sha256)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            (
+                PublishStep::NotPublished,
+                Some(fail(PublishStage::Link, e)),
+                sha256,
+            )
+        }
+    }
+}
+
+/// Chunked file equality (bounded buffer — neither file is held).
+fn files_equal_chunked(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let (mut fa, mut fb) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; PUBLISH_BUF_BYTES], vec![0u8; PUBLISH_BUF_BYTES]);
+    loop {
+        let (na, nb) = (fa.read(&mut ba)?, fb.read(&mut bb)?);
+        if na != nb || ba[..na] != bb[..nb] {
+            return Ok(false);
+        }
+        if na == 0 {
+            return Ok(true);
+        }
+    }
+}
+
 /// Publish stage for Control-2 abandonment reasons + the stderr
 /// cause line (the step is judged by `PublishStep`; the stage names
 /// WHERE it failed — T7.4's naming, the outcomes are frozen).
@@ -347,6 +504,44 @@ mod tests {
         );
         // Visible but unproven: the file exists.
         assert!(d.join("window-0000000003.json").is_file());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Streaming publish is byte-identical to the detailed
+    /// publish (same bytes + sha) + follows the ONE duplicate
+    /// rule (converge/refuse) — R1 finding 2b.
+    #[test]
+    fn streaming_matches_detailed_byte_identical() {
+        let d = dir("streaming");
+        // (head ends before `[`: the helper wraps the array body.)
+        let head = br#"{"schema":"service-window-v1","seq":3,"run_id":{"pid":7,"starttime":8,"boot_id":"boot"},"crypto_watch":"#.to_vec();
+        let tail = br#","document":{}}"#.to_vec();
+        let array = br#"{"k":1},{"k":2}"#;
+        let array_tmp = d.join("array.tmp");
+        std::fs::write(&array_tmp, array).unwrap();
+        let (step, stage, sha) =
+            publish_window_streaming(&d, 3, "t", &head, &tail, &array_tmp, &key(3));
+        assert_eq!(step, PublishStep::Durable);
+        assert_eq!(stage, None);
+        let mut expect = head.clone();
+        expect.push(b'[');
+        expect.extend_from_slice(array);
+        expect.push(b']');
+        expect.extend_from_slice(&tail);
+        let got = std::fs::read(d.join("window-0000000003.json")).unwrap();
+        assert_eq!(got, expect);
+        assert_eq!(sha, crate::kinds::prov_hash(&expect));
+        // Same-attempt retry converges (streamed compare).
+        let (step2, _, sha2) =
+            publish_window_streaming(&d, 3, "t", &head, &tail, &array_tmp, &key(3));
+        assert_eq!(step2, PublishStep::Converged);
+        assert_eq!(sha2, sha);
+        // Differing bytes refuse.
+        let array_tmp2 = d.join("array2.tmp");
+        std::fs::write(&array_tmp2, br#"{"k":9}"#).unwrap();
+        let (step3, _, _) =
+            publish_window_streaming(&d, 3, "t", &head, &tail, &array_tmp2, &key(3));
+        assert_eq!(step3, PublishStep::IntegrityRefusal);
         let _ = std::fs::remove_dir_all(&d);
     }
 

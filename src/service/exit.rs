@@ -5,9 +5,8 @@
 //! (no owned children, §1.1). The process exit folds run-level
 //! conditions in the frozen priority order below (first match wins).
 
-use crate::evidence::{CaptureDocument, Completeness};
+use crate::evidence::Completeness;
 use crate::policy::PolicyOutcome;
-use crate::report::DeliveryResult;
 
 /// Run-level tool failures (frozen, priority-4 1-group). Each is
 /// also named at its site; presence here only feeds the table.
@@ -33,63 +32,70 @@ pub enum RunToolFailure {
     DurabilityUncertain,
 }
 
-/// One finalized window's contribution to the exit fold.
-#[derive(Debug, Clone)]
-pub struct WindowExit {
-    /// The window's policy outcome (evaluated, or the `report`-path
-    /// map when observe-only).
-    pub outcome: PolicyOutcome,
-    /// The window document (status + usable-evidence distinction).
-    pub doc: CaptureDocument,
-    /// The DIR write result for this window.
-    pub delivery: DeliveryResult,
+/// O(1) run-exit accumulator (R1 finding 2a): the §7.3 fold
+/// inputs per window are outcome/status/delivery BITS only — never
+/// the document. One struct per RUN (fixed 16 bytes); per-window
+/// document clones are unrepresentable here by construction.
+#[derive(Debug, Clone, Default)]
+pub struct RunFold {
+    windows: u64,
+    violation: bool,
+    fatal_salvaged: bool,
+    no_verdict: bool,
+    inconclusive: bool,
+    incomplete: bool,
+    delivery_failed: bool,
 }
 
-/// Fold finalized windows + run conditions into the process exit.
-///
-/// Priority (frozen): 10 violation → 1 salvaged Fatal → 4
-/// zero/NoVerdict → 1 delivery/tool → 11 Inconclusive → 3
-/// partial/interrupted → 0 clean.
-pub fn fold(windows: &[WindowExit], tool_failure: Option<RunToolFailure>, interrupted: bool) -> u8 {
-    if windows
-        .iter()
-        .any(|w| w.outcome == PolicyOutcome::Violation)
-    {
-        return 10;
+impl RunFold {
+    pub fn new() -> Self {
+        Self::default()
     }
-    if windows
-        .iter()
-        .any(|w| matches!(&w.doc.status, Completeness::Fatal { .. }) && w.doc.has_usable_evidence())
-    {
-        return 1;
-    }
-    if windows.is_empty()
-        || windows
-            .iter()
-            .any(|w| w.outcome == PolicyOutcome::NoVerdict)
-    {
-        return 4;
-    }
-    if tool_failure.is_some() || windows.iter().any(|w| w.delivery.failed()) {
-        return 1;
-    }
-    if windows
-        .iter()
-        .any(|w| w.outcome == PolicyOutcome::Inconclusive)
-    {
-        return 11;
-    }
-    if interrupted
-        || windows
-            .iter()
-            .any(|w| !matches!(&w.doc.status, Completeness::Complete))
-    {
-        return 3;
-    }
-    0
-}
 
-/// Per-window exit via `report::exit_for` (`child_exit = None`).
-pub fn window_exit(w: &WindowExit) -> u8 {
-    crate::report::exit_for(w.outcome, None, &w.doc, &w.delivery)
+    /// Fold one finalized window's §7.3 inputs (call per window —
+    /// O(1) time and heap). `usable` is the window document's
+    /// `has_usable_evidence()` (computed by the caller from its
+    /// already-held document — never cloned in).
+    pub fn add(
+        &mut self,
+        outcome: PolicyOutcome,
+        status: &Completeness,
+        usable: bool,
+        delivery_failed: bool,
+    ) {
+        self.windows += 1;
+        self.violation |= outcome == PolicyOutcome::Violation;
+        self.fatal_salvaged |= matches!(status, Completeness::Fatal { .. }) && usable;
+        self.no_verdict |= outcome == PolicyOutcome::NoVerdict;
+        self.inconclusive |= outcome == PolicyOutcome::Inconclusive;
+        self.incomplete |= !matches!(status, Completeness::Complete);
+        self.delivery_failed |= delivery_failed;
+    }
+
+    /// Fold finalized windows + run conditions into the process exit.
+    ///
+    /// Priority (frozen): 10 violation → 1 salvaged Fatal → 4
+    /// zero/NoVerdict → 1 delivery/tool → 11 Inconclusive → 3
+    /// partial/interrupted → 0 clean.
+    pub fn fold(&self, tool_failure: Option<RunToolFailure>, interrupted: bool) -> u8 {
+        if self.violation {
+            return 10;
+        }
+        if self.fatal_salvaged {
+            return 1;
+        }
+        if self.windows == 0 || self.no_verdict {
+            return 4;
+        }
+        if tool_failure.is_some() || self.delivery_failed {
+            return 1;
+        }
+        if self.inconclusive {
+            return 11;
+        }
+        if interrupted || self.incomplete {
+            return 3;
+        }
+        0
+    }
 }

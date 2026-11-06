@@ -151,6 +151,18 @@ pub struct WindowEnvelope {
     pub document: CaptureDocument,
 }
 
+/// Split a rendered envelope (with EMPTY `crypto_watch`) at the
+/// array site for streaming publication (R1 finding 2b): returns
+/// `(head, tail)` such that `head + "[" + inner + "]" + tail` is
+/// byte-identical to the old NEEDLE splice. `None` ⟺ the needle is
+/// absent (fail closed — same as the old `!spliced` arm).
+pub fn split_envelope_at_array(rendered: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    const NEEDLE: &[u8] = b"\"crypto_watch\":[]";
+    let pos = rendered.windows(NEEDLE.len()).position(|w| w == NEEDLE)?;
+    let arr = pos + NEEDLE.len() - 2;
+    Some((rendered[..arr].to_vec(), rendered[arr + 2..].to_vec()))
+}
+
 /// Drop-ledger reasons (§5.2 legend).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -446,6 +458,50 @@ mod tests {
         assert_eq!(v["contributors"][0]["bounds_known"], false);
         // The sentinel pair is inverted by construction.
         const _: () = assert!(UNKNOWN_FIRST_NS > UNKNOWN_LAST_NS);
+    }
+
+    /// Streaming split/join is byte-identical to the old NEEDLE
+    /// splice (R1 finding 2b — "NEEDLE capacity respected"): the
+    /// envelope renders `"crypto_watch":[]` exactly once (string
+    /// values render with ESCAPED quotes, so no value can match
+    /// the unescaped pattern — the battery below embeds hostile
+    /// near-misses), and `head + "[" + inner + "]" + tail` equals
+    /// the spliced bytes for every inner (empty, one, many).
+    #[test]
+    fn streaming_split_matches_splice_byte_identical() {
+        fn splice(rendered: &[u8], inner: &[u8]) -> Vec<u8> {
+            const NEEDLE: &[u8] = b"\"crypto_watch\":[]";
+            let mut bytes = rendered.to_vec();
+            let pos = bytes
+                .windows(NEEDLE.len())
+                .position(|w| w == NEEDLE)
+                .expect("needle present");
+            let arr = pos + NEEDLE.len() - 2;
+            let mut array = Vec::with_capacity(inner.len() + 2);
+            array.push(b'[');
+            array.extend_from_slice(inner);
+            array.push(b']');
+            bytes.splice(arr..arr + 2, array.iter().copied());
+            bytes
+        }
+        let rendered = br#"{"schema":"service-window-v1","seq":3,"note":"say \"crypto_watch\":[] loudly","nested":{"crypto_watch":[1]},"crypto_watch":[],"document":{"a":[1,2]}}"#.to_vec();
+        for inner in [
+            Vec::new(),
+            br#"{"k":1}"#.to_vec(),
+            br#"{"k":1},{"k":[2,{"crypto_watch":[]}]}"#.to_vec(),
+        ] {
+            let (head, tail) = split_envelope_at_array(&rendered).expect("needle splits");
+            let mut joined = Vec::with_capacity(head.len() + tail.len() + inner.len() + 2);
+            joined.extend_from_slice(&head);
+            joined.push(b'[');
+            joined.extend_from_slice(&inner);
+            joined.push(b']');
+            joined.extend_from_slice(&tail);
+            assert_eq!(joined, splice(&rendered, &inner), "inner {inner:?}");
+        }
+        // No needle (corrupt render): fail closed, never a guess.
+        assert!(split_envelope_at_array(b"{}").is_none());
+        assert!(split_envelope_at_array(b"{\"crypto_watch\":[1]}").is_none());
     }
 
     #[test]

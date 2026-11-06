@@ -928,11 +928,18 @@ pub(crate) fn sealed_map(
         }
     }
     // Spilled seals (MEM pressure pushed the retirement record to
-    // disk — R1 finding 4): one tmp at a time (one in-transit
-    // record; the bytes drop before the next read — never the
-    // whole window). Staged wins ties (a record lives in exactly
-    // one place; first-wins either way).
+    // disk — R1 finding 4): the spill-time seal flag gates (only
+    // flagged tmps read, one at a time — one in-transit record;
+    // the bytes drop before the next read — never the whole
+    // window). Staged wins ties (a record lives in exactly one
+    // place; first-wins either way).
     for r in spilled {
+        let Some(seg_hint) = r.seal_segment else {
+            continue;
+        };
+        if close_segments.contains(&seg_hint) {
+            continue;
+        }
         let Ok(bytes) = std::fs::read(&r.tmp) else {
             continue;
         };
@@ -1325,11 +1332,21 @@ mod tests {
             "image_epoch": 3u64,
         });
         let tmp = dir.join("spill.seal.json");
-        std::fs::write(&tmp, serde_json::to_vec(&rec).unwrap()).unwrap();
+        let line = serde_json::to_vec(&rec).unwrap();
+        let mut body = line.clone();
+        body.push(b'\n');
+        std::fs::write(&tmp, &body).unwrap();
+        let content_sha = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&line).into()
+        };
         let spilled = vec![crate::service::staging::SpilledRecord {
             tmp: tmp.clone(),
-            bytes: 1,
+            bytes: body.len() as u64,
             tick: 0,
+            valid: true,
+            seal_segment: Some(7),
+            content_sha,
         }];
         let close_segments = BTreeSet::new();
         let m = sealed_map(&[], &spilled, &close_segments);

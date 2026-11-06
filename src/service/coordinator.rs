@@ -19,10 +19,10 @@ use crate::crypto_watch::ServiceEngine;
 use crate::service::cli::{Format, ServiceConfig};
 use crate::service::envelope::{
     AccumExceeded, CloseOp, OpOutcome, RunSummary, Spilled, TapRecovered, TickSpan, WindowEnvelope,
-    WindowSpan,
+    WindowSpan, split_envelope_at_array,
 };
-use crate::service::exit::{RunToolFailure, WindowExit};
-use crate::service::publish::{AttemptKey, PublishStep};
+use crate::service::exit::{RunFold, RunToolFailure};
+use crate::service::publish::{AttemptKey, PublishStep, StreamedPublish};
 use crate::service::queue::StreamQueue;
 use crate::service::recovery::{Recovery, Refusal, recover};
 use crate::service::retain::{
@@ -30,17 +30,20 @@ use crate::service::retain::{
 };
 use crate::service::signals::{Signal, SignalFd};
 use crate::service::snapshot::{Snapshot, WindowCtx, produce, sealed_map};
-use crate::service::staging::{Carry, Staging, TickDecision, TickPiece, assemble_crypto_watch};
+use crate::service::staging::{
+    AssembledCounts, Carry, Staging, TickDecision, TickPiece, assemble_inner_into,
+};
 use crate::service::state::{
     AbandonReason, DirLock, PolicyIdentity, PolicyRejection, PolicyStatus, Reservation,
     ReservationState, RunId, SCHEMA_POLICY, SequenceState, clean_tmps, is_reserved_sink_name,
-    monotonic_ns, rotated_name, scan_highest_seq, sync_dir, wall_ns, window_name, write_state,
+    monotonic_ns, rotated_name, scan_highest_seq, sync_dir, wall_ns, write_state,
 };
 use crate::service::stream::{Tap, TapOpenError, resolve_stream};
 use crate::service::worker::{
     Control, DestClass, Destination, Diagnostics, Gate, WorkerOut, outcome_of, push_accounting,
     run_under_control, view_slot,
 };
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,7 +189,9 @@ struct Run {
     /// Summary accumulators (§7.3).
     summary: SummaryAccum,
     /// Finalized windows' fold inputs (§7.3).
-    windows: Vec<WindowExit>,
+    /// §7.3 exit inputs (O(1) accumulator — per-window bits, never
+    /// documents; R1 finding 2a).
+    fold: RunFold,
     /// First finalized seq (summary `first_seq`).
     first_seq: Option<u64>,
     /// Run-level tool failure (the §7.3 priority-4 1-group).
@@ -1456,7 +1461,7 @@ fn open_first_window(
         stream,
         cycle: Some(cycle),
         summary: accum,
-        windows: Vec::new(),
+        fold: RunFold::new(),
         first_seq: None,
         tool_failure: None,
         origin_ns,
@@ -1923,7 +1928,6 @@ struct PublishJudgment {
     step: PublishStep,
     stage_errno: Option<(crate::service::publish::PublishStage, i32)>,
     sha256: String,
-    bytes_len: u64,
     /// `true` when the publish worker never ran to judgment
     /// (Expired/Cancelled/SpawnFailed — the window cannot publish
     /// this boundary; the late P1 may still land, §4.4).
@@ -1941,35 +1945,36 @@ fn mid_window_publish(
     mode: CloseMode,
 ) -> BoundaryOut {
     let seq = run.cycle.as_ref().expect("window open at publish").seq;
-    // Assemble (worker, read-only — spill tmps intact so a retry
-    // re-assembles completely; §7.2 lossless two-phase).
+    // Assemble (worker, OwnTmp — streams the array-inner into an
+    // array tmp through bounded buffers, R1 finding 2b). Staged
+    // MOVES worker-side (no clone — abandonment-safe: any non-Done
+    // assemble abandons the run, so moved bytes are never needed
+    // after; a detached worker owns its inputs outright). Spill
+    // metas clone (paths + flags only — bytes stay on disk), and
+    // spill tmps stay intact for the post-publish absorb (§7.2
+    // lossless two-phase).
     let (staged, spilled, carried_tick, carried_from, staging_peak, open_tick_id) = {
-        let cycle = run.cycle.as_ref().expect("window open at publish");
+        let cycle = run.cycle.as_mut().expect("window open at publish");
         (
-            cycle
-                .staging
-                .staged
-                .iter()
-                .map(|r| (r.raw.clone(), r.tick))
-                .collect::<Vec<_>>(),
-            cycle
-                .staging
-                .spilled
-                .iter()
-                .map(|r| (r.tmp.clone(), r.bytes, r.tick))
-                .collect::<Vec<_>>(),
+            std::mem::take(&mut cycle.staging.staged),
+            cycle.staging.spilled.clone(),
             cycle.carried_in.map(|(_, tick)| tick),
             cycle.carried_in.map(|(from, _)| from),
             cycle.staging.meter.staging_peak(),
             cycle.open_tick_id,
         )
     };
+    let array_tmp = run.out.join(format!(
+        ".window-{seq:010}.tmp.{}.{}.array",
+        run.tag,
+        crate::service::state::next_op_nonce()
+    ));
     let budget = boundary_budget(run.cfg.timeout);
     let dest = Destination {
         class: DestClass::OwnTmp,
         key: format!("assemble-{seq}"),
     };
-    let asm: Control<std::io::Result<crate::service::staging::Assembled>> = run_op(
+    let asm: Control<std::io::Result<AssembledCounts>> = run_op(
         &run.diag,
         &run.format,
         &mut run.summary,
@@ -1977,33 +1982,34 @@ fn mid_window_publish(
         &format!("assemble_window_{seq}"),
         dest.clone(),
         budget,
-        move |_gate| {
-            // Rebuild the record views worker-side (parsed values
-            // re-derived — the coordinator's DOMs stay home).
-            let staged: Vec<crate::service::staging::StagedRecord> = staged
-                .into_iter()
-                .map(|(raw, tick)| {
-                    let value = serde_json::from_slice::<serde_json::Value>(&raw).ok();
-                    crate::service::staging::StagedRecord { raw, value, tick }
-                })
-                .collect();
-            let spilled: Vec<crate::service::staging::SpilledRecord> = spilled
-                .into_iter()
-                .map(
-                    |(tmp, bytes, tick)| crate::service::staging::SpilledRecord {
-                        tmp,
-                        bytes,
-                        tick,
-                    },
-                )
-                .collect();
-            WorkerOut::value(assemble_crypto_watch(
-                &staged,
-                &spilled,
-                carried_tick,
-                carried_from,
-                false,
-            ))
+        {
+            let array_tmp = array_tmp.clone();
+            move |_gate| {
+                // The worker owns the array tmp lifecycle (unlinked
+                // on every error path — a detached worker's tmp, if
+                // any, is §4.4-cleaned next start).
+                let result = (|| -> std::io::Result<AssembledCounts> {
+                    let mut f = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                        .open(&array_tmp)?;
+                    let counts = assemble_inner_into(
+                        &staged,
+                        &spilled,
+                        carried_tick,
+                        carried_from,
+                        false,
+                        &mut f,
+                    )?;
+                    drop(f);
+                    Ok(counts)
+                })();
+                if result.is_err() {
+                    let _ = std::fs::remove_file(&array_tmp);
+                }
+                WorkerOut::value(result)
+            }
         },
     );
     let assembled = match asm {
@@ -2026,6 +2032,9 @@ fn mid_window_publish(
             // the window cannot publish this boundary — abandon
             // (the run ends; the next start resumes at N+1, §4.4).
             // Spawn failure names `worker_unavailable` (F-015).
+            // (The moved staged vec is owned by the detached
+            // worker, if any — abandonment-safe by construction;
+            // its array tmp, if any, is §4.4-cleaned.)
             let reason = match asm {
                 Control::SpawnFailed => AbandonReason::WorkerUnavailable,
                 _ => AbandonReason::IoError,
@@ -2044,10 +2053,13 @@ fn mid_window_publish(
             ),
         );
     }
-    // Render (coordinator CPU — the assembled bytes are held): the
-    // envelope value with a byte-verbatim `crypto_watch[]` splice
-    // (`RawValue` — stronger than round-trip: staged bytes are
-    // 6A-emitted verbatim).
+    // Render (coordinator CPU — the envelope WITHOUT the array
+    // is held; the array streams from the array tmp at publish):
+    // split at the byte-verbatim `crypto_watch[]` site (serde
+    // renders the empty vec deterministically as
+    // `"crypto_watch":[]` — the search pattern is provably
+    // structural: string values render with ESCAPED quotes, so no
+    // value can match the unescaped pattern).
     let cycle = run.cycle.as_ref().expect("window open at publish");
     let (first_tick, last_tick) = match (assembled.first_tick, assembled.last_tick) {
         (Some(f), Some(l)) => (f, l),
@@ -2089,38 +2101,24 @@ fn mid_window_publish(
         document: produced.document.clone(),
     };
     let envelope_value = serde_json::to_value(&envelope).unwrap_or(serde_json::Value::Null);
-    let mut bytes = serde_json::to_vec(&envelope_value).unwrap_or_default();
-    // Byte-verbatim `crypto_watch[]` splice: serde renders the empty
-    // vec deterministically as `"crypto_watch":[]` — replace the
-    // trailing `[]` (KEY PRESERVED) with the assembled array. The
-    // search pattern is provably structural (string values render
-    // with ESCAPED quotes, so no value can match the unescaped
-    // pattern).
-    const NEEDLE: &[u8] = b"\"crypto_watch\":[]";
-    let mut array = Vec::with_capacity(assembled.array_inner.len() + 2);
-    array.push(b'[');
-    array.extend_from_slice(&assembled.array_inner);
-    array.push(b']');
-    let mut spliced = false;
-    if let Some(pos) = bytes.windows(NEEDLE.len()).position(|w| w == NEEDLE) {
-        let arr = pos + NEEDLE.len() - 2;
-        bytes.splice(arr..arr + 2, array.iter().copied());
-        spliced = true;
-    }
-    if !spliced {
+    let rendered = serde_json::to_vec(&envelope_value).unwrap_or_default();
+    let Some((head, tail)) = split_envelope_at_array(&rendered) else {
         // Unreachable (the envelope always carries the empty vec) —
-        // fail closed, never a corrupt file.
+        // fail closed, never a corrupt file. (The orphaned array
+        // tmp, if any, is §4.4-cleaned next start.)
         return BoundaryOut::Exit(abandon_window(
             run,
             AbandonReason::IoError,
             Some(effective_end_ns),
         ));
-    }
-    let sha256 = crate::kinds::prov_hash(&bytes);
-    let bytes_len = bytes.len() as u64;
+    };
     // Publish (evidence worker — single attempt; a successor is
     // refused while the worker is registered, §7.2 — so non-Done
-    // abandons the window and the late P1 adopts at recovery).
+    // abandons the window and the late P1 adopts at recovery). The
+    // worker streams head + array + tail into the window tmp
+    // (bounded buffers, incremental hash — R1 finding 2b) and owns
+    // the array tmp lifecycle (consumed on every settled path; a
+    // detached worker's tmp, if any, is §4.4-cleaned).
     let attempt = AttemptKey {
         seq,
         pid: run.run_id.pid,
@@ -2128,10 +2126,7 @@ fn mid_window_publish(
         boot_id: run.run_id.boot_id.clone(),
     };
     let pub_dest = evidence_dest(seq);
-    let published: Control<(
-        PublishStep,
-        Option<(crate::service::publish::PublishStage, i32)>,
-    )> = run_op(
+    let published: Control<StreamedPublish> = run_op(
         &run.diag,
         &run.format,
         &mut run.summary,
@@ -2145,35 +2140,36 @@ fn mid_window_publish(
                 // EvidenceLink is P-class (no fenced re-check — the
                 // link is no-overwrite; EEXIST converges per the ONE
                 // rule inside the publish call).
-                let out = crate::service::publish::publish_window_detailed(
-                    &out, seq, &tag, &bytes, &attempt,
+                let out = crate::service::publish::publish_window_streaming(
+                    &out, seq, &tag, &head, &tail, &array_tmp, &attempt,
                 );
+                let _ = std::fs::remove_file(&array_tmp);
                 WorkerOut::value(out)
             }
         },
     );
     let judgment = match published {
-        Control::Done((step, stage_errno)) => PublishJudgment {
+        Control::Done((step, stage_errno, sha256)) => PublishJudgment {
             step,
             stage_errno,
             sha256,
-            bytes_len,
             worker_gone: false,
             spawn_failed: false,
         },
+        // The worker never reported a hash (no bytes were linked by
+        // THIS attempt — sha is judgment-only on the durable arms,
+        // so empty here is unreachable downstream).
         Control::SpawnFailed => PublishJudgment {
             step: PublishStep::NotPublished,
             stage_errno: None,
-            sha256,
-            bytes_len,
+            sha256: String::new(),
             worker_gone: true,
             spawn_failed: true,
         },
         _ => PublishJudgment {
             step: PublishStep::NotPublished,
             stage_errno: None,
-            sha256,
-            bytes_len,
+            sha256: String::new(),
             worker_gone: true,
             spawn_failed: false,
         },
@@ -2302,21 +2298,16 @@ fn mid_window_judge(
     if let Some(cycle) = run.cycle.as_mut() {
         cycle.staging.release();
     }
-    // The finalized window enters the §7.3 fold.
-    run.windows.push(WindowExit {
-        outcome: produced.outcome,
-        doc: produced.document.clone(),
-        delivery: crate::report::DeliveryResult {
-            primary: crate::report::ArtifactOutcome {
-                dest: window_name(seq),
-                ok: true,
-                bytes: judgment.bytes_len,
-                error: None,
-            },
-            cbom: None,
-            diagnostics: Vec::new(),
-        },
-    });
+    // The finalized window enters the §7.3 fold (O(1) bits —
+    // the document is never cloned in, R1 finding 2a). Delivery
+    // here always succeeded (this arm runs only on
+    // Durable/Converged).
+    run.fold.add(
+        produced.outcome,
+        &produced.document.status,
+        produced.document.has_usable_evidence(),
+        false,
+    );
     if run.first_seq.is_none() {
         run.first_seq = Some(seq);
     }
@@ -3741,7 +3732,7 @@ fn close_run_end(mut run: Run) -> ExitCode {
     fill_summary(&mut run, &mut summary, dropped);
     // The §7.3 fold (interrupted = cancel OR double-signal stop).
     let interrupted = run.cancel_latched || run.double_signal;
-    let code = crate::service::exit::fold(&run.windows, run.tool_failure, interrupted);
+    let code = run.fold.fold(run.tool_failure, interrupted);
     summary.exit = code;
     let bytes = serde_json::to_vec(&summary).unwrap_or_default();
     let wrote = state_write_reconciled(

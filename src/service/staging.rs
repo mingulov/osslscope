@@ -39,10 +39,24 @@ pub struct StagedRecord {
 
 /// One spilled record: rendered ONCE, streaming, into its tmp.
 /// Only the identity + byte count ride RAM.
+#[derive(Debug, Clone)]
 pub struct SpilledRecord {
     pub tmp: PathBuf,
     pub bytes: u64,
     pub tick: u64,
+    /// Spill-time JSON validity (classified at admission from the
+    /// in-RAM line — assembly streams valid tmps WITHOUT re-parsing,
+    /// R1 finding 2b).
+    pub valid: bool,
+    /// `Some(segment)` iff the spilled line is a
+    /// `process_observation` seal (spill-time classification — the
+    /// sealed map reads only flagged tmps, one at a time).
+    pub seal_segment: Option<u64>,
+    /// SHA-256 over the spilled line (WITHOUT the trailing newline —
+    /// the assembly verifier re-hashes the streamed bytes; a
+    /// mismatch is post-admission tamper, skipped + counted exactly
+    /// like an unparseable spill, never spliced).
+    pub content_sha: [u8; 32],
 }
 
 /// A tick's staged piece: the records of the tick currently being
@@ -204,10 +218,22 @@ impl Staging {
         let bytes = line.len() as u64 + 1;
         self.spill_files.insert(tmp.clone(), bytes);
         piece.total_bytes += bytes;
+        // Spill-time classification (O(1) heap — no DOM) + content
+        // hash (the assembly verifier re-hashes the streamed bytes).
+        let (valid, seal_segment) = spill_classify(line);
+        let content_sha = {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(line);
+            h.finalize().into()
+        };
         piece.spilled.push(SpilledRecord {
             tmp,
             bytes,
             tick: tick_seq,
+            valid,
+            seal_segment,
+            content_sha,
         });
         Ok(Placement::Spilled)
     }
@@ -218,6 +244,114 @@ impl Staging {
 pub enum Placement {
     Staged,
     Spilled,
+}
+
+/// True iff the line's bracket-nesting depth exceeds 127 (the
+/// `serde_json::Value` recursion-failure boundary, calibrated:
+/// total depth 127 parses, 128 fails — `IgnoredAny`'s iterative
+/// ignore path enforces NO limit, so the classifier re-checks it
+/// here). String-aware (brackets inside strings + escapes don't
+/// count); O(n) time, O(1) space. Only meaningful for
+/// syntactically-valid JSON (invalid lines fail elsewhere).
+fn json_depth_exceeds_127(line: &[u8]) -> bool {
+    let mut depth = 0u32;
+    let mut in_string = false;
+    let mut escape = false;
+    for b in line.iter() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if *b == b'\\' {
+                escape = true;
+            } else if *b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' | b'[' => {
+                depth += 1;
+                if depth > 127 {
+                    return true;
+                }
+            }
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Spill-time classification (R1 finding 2b): full-JSON validity +
+/// seal detection in O(1) heap (no DOM — a hostile 100 MiB spilled
+/// line must not transiently triple in RAM at admission). Returns
+/// `(valid_json, seal_segment)`. The validity verdict is EXACTLY
+/// `from_slice::<Value>`'s (same parser + grammar via `IgnoredAny`,
+/// same 127-deep recursion boundary via the pre-scan);
+/// seal detection compares the (un)escaped kind + u64 segment.
+fn spill_classify(line: &[u8]) -> (bool, Option<u64>) {
+    use serde::de::{Deserializer, Error, Visitor};
+    if json_depth_exceeds_127(line) {
+        return (false, None);
+    }
+    if serde_json::from_slice::<serde::de::IgnoredAny>(line).is_err() {
+        return (false, None);
+    }
+    #[derive(Default)]
+    struct IsObservation(bool);
+    struct KindVisitor;
+    impl Visitor<'_> for KindVisitor {
+        type Value = IsObservation;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a kind string")
+        }
+        fn visit_str<E: Error>(self, v: &str) -> Result<IsObservation, E> {
+            Ok(IsObservation(v == "process_observation"))
+        }
+        fn visit_string<E: Error>(self, v: String) -> Result<IsObservation, E> {
+            Ok(IsObservation(v == "process_observation"))
+        }
+        fn visit_bytes<E: Error>(self, v: &[u8]) -> Result<IsObservation, E> {
+            Ok(IsObservation(v == b"process_observation"))
+        }
+    }
+    impl<'de> serde::Deserialize<'de> for IsObservation {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(KindVisitor)
+        }
+    }
+    #[derive(Default)]
+    struct MaybeU64(Option<u64>);
+    struct U64Visitor;
+    impl Visitor<'_> for U64Visitor {
+        type Value = MaybeU64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "a u64 segment")
+        }
+        fn visit_u64<E: Error>(self, v: u64) -> Result<MaybeU64, E> {
+            Ok(MaybeU64(Some(v)))
+        }
+        fn visit_i64<E: Error>(self, v: i64) -> Result<MaybeU64, E> {
+            Ok(MaybeU64(u64::try_from(v).ok()))
+        }
+    }
+    impl<'de> serde::Deserialize<'de> for MaybeU64 {
+        fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+            d.deserialize_any(U64Visitor)
+        }
+    }
+    #[derive(serde::Deserialize, Default)]
+    struct SealHead {
+        #[serde(default)]
+        kind: IsObservation,
+        #[serde(default)]
+        segment: MaybeU64,
+    }
+    match serde_json::from_slice::<SealHead>(line) {
+        Ok(h) if h.kind.0 => (true, h.segment.0),
+        _ => (true, None),
+    }
 }
 
 /// A carried tick: the over-budget tick's staged records + spills
@@ -329,14 +463,38 @@ impl Staging {
 /// completely), then unlink the consumed list with `unlink = true`
 /// (or a dedicated op) once the bytes are coordinator-held — a
 /// leak reconciles via retry + §4.4 cleanup, never a loss.
-pub fn assemble_crypto_watch(
+/// Streaming assembly counts (no bytes — the bytes went to the
+/// caller's writer).
+pub struct AssembledCounts {
+    pub spilled_records: u64,
+    pub spilled_bytes: u64,
+    pub carried_records: u32,
+    pub carried_from_seq: Option<u64>,
+    pub first_tick: Option<u64>,
+    pub last_tick: Option<u64>,
+    pub skipped_invalid: u64,
+    /// Array-inner bytes written (excludes the wrapping brackets).
+    pub inner_len: u64,
+}
+
+/// Assemble the `crypto_watch[]` array INNER bytes (`e1,e2,...`)
+/// into `out` through BOUNDED buffers (R1 finding 2b): staged raws
+/// write through (already in RAM — no second hold); each spill tmp
+/// streams in 64 KiB chunks (hash-verified against its spill-time
+/// content hash BEFORE splicing — two passes, same observable
+/// behavior as the old hold-and-parse: invalid/tampered spills
+/// skip + count, valid spills splice verbatim). No record is ever
+/// truncated or refused (D-record §5.1); on `Err` the caller MUST
+/// discard `out` (partial bytes may have been written — the window
+/// tmp is unlinked, never linked).
+pub fn assemble_inner_into<W: std::io::Write>(
     staged: &[StagedRecord],
     spilled: &[SpilledRecord],
     carried_tick: Option<u64>,
     carried_from_seq: Option<u64>,
     unlink: bool,
-) -> std::io::Result<Assembled> {
-    use std::io::Read;
+    out: &mut W,
+) -> std::io::Result<AssembledCounts> {
     // Admission order = tick order, staged-vs-spilled interleaved
     // by arrival. Staged and spilled vecs each preserve arrival
     // order; merge by (tick, arrival index). Arrival index is
@@ -344,6 +502,7 @@ pub fn assemble_crypto_watch(
     // tick T precede spilled records of tick T (spill starts at the
     // first over-cap record and every LATER record of that tick
     // spills — so within a tick, all staged precede all spilled).
+    // (References only — the index holds no record bytes.)
     let mut by_tick: HashMap<u64, (Vec<&[u8]>, Vec<&SpilledRecord>)> = HashMap::new();
     for r in staged {
         // Non-JSON staged lines never splice (counted below).
@@ -358,10 +517,10 @@ pub fn assemble_crypto_watch(
     let mut skipped_spilled_invalid = 0u64;
     let mut ticks: Vec<u64> = by_tick.keys().copied().collect();
     ticks.sort_unstable();
-    let mut out = Vec::new();
     let mut spilled_records = 0u64;
     let mut spilled_bytes = 0u64;
     let mut carried_records = 0u32;
+    let mut inner_len = 0u64;
     let mut first = true;
     // Ticks that contributed ≥1 valid record (the `tick_span` —
     // spans exactly the written array's admission ticks).
@@ -371,45 +530,29 @@ pub fn assemble_crypto_watch(
         let mut tick_valid = 0u32;
         for raw in staged_here {
             if !first {
-                out.push(b',');
+                out.write_all(b",")?;
+                inner_len += 1;
             }
             first = false;
-            out.extend_from_slice(raw);
+            out.write_all(raw)?;
+            inner_len += raw.len() as u64;
             tick_valid += 1;
         }
         for s in spilled_here {
-            // Stream the spill tmp through the bounded buffer (its
-            // trailing newline is stripped — elements join by `,`).
-            // Unparseable spill content is consumed (tmp unlinked)
-            // but never spliced.
-            let mut f = std::fs::File::open(&s.tmp)?;
-            let mut buf = vec![0u8; SPILL_BUF_BYTES];
-            let mut content: Vec<u8> = Vec::new();
-            loop {
-                let n = f.read(&mut buf)?;
-                if n == 0 {
-                    break;
-                }
-                content.extend_from_slice(&buf[..n]);
-            }
-            if content.last() == Some(&b'\n') {
-                content.pop();
-            }
-            let valid = serde_json::from_slice::<serde_json::Value>(&content).is_ok();
-            if unlink {
-                std::fs::remove_file(&s.tmp)?;
-            }
             spilled_records += 1;
             spilled_bytes += s.bytes;
-            if !valid {
+            // Verify BEFORE the separator (the comma precedes the
+            // element — a skipped spill emits nothing at all).
+            if !verify_spill(s, unlink)? {
                 skipped_spilled_invalid += 1;
                 continue;
             }
             if !first {
-                out.push(b',');
+                out.write_all(b",")?;
+                inner_len += 1;
             }
             first = false;
-            out.extend_from_slice(&content);
+            inner_len += copy_spill(s, unlink, out)?;
             tick_valid += 1;
         }
         if tick_valid > 0 {
@@ -419,8 +562,7 @@ pub fn assemble_crypto_watch(
             carried_records += tick_valid;
         }
     }
-    Ok(Assembled {
-        array_inner: out,
+    Ok(AssembledCounts {
         spilled_records,
         spilled_bytes,
         carried_records,
@@ -428,6 +570,126 @@ pub fn assemble_crypto_watch(
         first_tick: spanned.first().copied(),
         last_tick: spanned.last().copied(),
         skipped_invalid: skipped_invalid + skipped_spilled_invalid,
+        inner_len,
+    })
+}
+
+/// Pass 1 — verify one spill tmp without splicing: the
+/// spill-time validity flag gates (invalid ⟹ consumed + skipped,
+/// exactly like the old unparseable path); then the tmp streams
+/// through the bounded buffer re-hashing its line bytes (trailing
+/// newline excluded, same rule as the old strip-one-`\n`). A hash
+/// mismatch is post-admission tamper — consumed + skipped + counted
+/// (never spliced). Returns true iff the spill may splice.
+fn verify_spill(s: &SpilledRecord, unlink: bool) -> std::io::Result<bool> {
+    use sha2::Digest as _;
+    if !s.valid {
+        if unlink {
+            std::fs::remove_file(&s.tmp)?;
+        }
+        return Ok(false);
+    }
+    let mut f = std::fs::File::open(&s.tmp)?;
+    let len = f.metadata()?.len();
+    if len == 0 {
+        // Truncated-to-empty post-admission: same as unparseable.
+        if unlink {
+            std::fs::remove_file(&s.tmp)?;
+        }
+        return Ok(false);
+    }
+    let mut h = sha2::Sha256::new();
+    let mut buf = vec![0u8; SPILL_BUF_BYTES];
+    let mut remaining = len - 1;
+    use std::io::Read as _;
+    while remaining > 0 {
+        let want = remaining.min(SPILL_BUF_BYTES as u64) as usize;
+        f.read_exact(&mut buf[..want])?;
+        h.update(&buf[..want]);
+        remaining -= want as u64;
+    }
+    let mut last = [0u8; 1];
+    f.read_exact(&mut last)?;
+    if last[0] != b'\n' {
+        h.update(last);
+    }
+    if h.finalize().as_slice() != s.content_sha {
+        // Post-admission tamper: consumed, never spliced.
+        if unlink {
+            std::fs::remove_file(&s.tmp)?;
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Pass 2 — copy one VERIFIED spill tmp's line bytes (trailing
+/// newline stripped) into `out` through the bounded buffer.
+/// Returns the line length written. Unlinks on success when asked
+/// (read errors keep the tmp — same as the old read-all path).
+fn copy_spill(
+    s: &SpilledRecord,
+    unlink: bool,
+    out: &mut dyn std::io::Write,
+) -> std::io::Result<u64> {
+    use std::io::Read as _;
+    let mut f = std::fs::File::open(&s.tmp)?;
+    let len = f.metadata()?.len();
+    // Verified non-empty in pass 1 (a concurrent truncation errors
+    // out loudly below — never silent).
+    let mut buf = vec![0u8; SPILL_BUF_BYTES];
+    let mut remaining = len.saturating_sub(1);
+    let mut written = 0u64;
+    while remaining > 0 {
+        let want = remaining.min(SPILL_BUF_BYTES as u64) as usize;
+        f.read_exact(&mut buf[..want])?;
+        out.write_all(&buf[..want])?;
+        written += want as u64;
+        remaining -= want as u64;
+    }
+    if len > 0 {
+        let mut last = [0u8; 1];
+        f.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            out.write_all(&last)?;
+            written += 1;
+        }
+    }
+    drop(f);
+    if unlink {
+        std::fs::remove_file(&s.tmp)?;
+    }
+    Ok(written)
+}
+
+/// Materializing assembly over the streaming core (small-data /
+/// test use only — production streams into the window tmp via
+/// [`assemble_inner_into`]).
+pub fn assemble_crypto_watch(
+    staged: &[StagedRecord],
+    spilled: &[SpilledRecord],
+    carried_tick: Option<u64>,
+    carried_from_seq: Option<u64>,
+    unlink: bool,
+) -> std::io::Result<Assembled> {
+    let mut inner = Vec::new();
+    let c = assemble_inner_into(
+        staged,
+        spilled,
+        carried_tick,
+        carried_from_seq,
+        unlink,
+        &mut inner,
+    )?;
+    Ok(Assembled {
+        array_inner: inner,
+        spilled_records: c.spilled_records,
+        spilled_bytes: c.spilled_bytes,
+        carried_records: c.carried_records,
+        carried_from_seq: c.carried_from_seq,
+        first_tick: c.first_tick,
+        last_tick: c.last_tick,
+        skipped_invalid: c.skipped_invalid,
     })
 }
 
@@ -519,6 +781,130 @@ mod tests {
         );
         // Spill tmps are consumed at publish (unlinked).
         assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn spill_classify_matches_value_verdict() {
+        // (line, expect_valid, expect_seal)
+        let nest = |arrays: usize| {
+            format!("{{\"a\":{}}}", "[".repeat(arrays) + &"]".repeat(arrays)).into_bytes()
+        };
+        // Calibrated boundary: total depth 127 parses, 128 fails
+        // (guards serde_json upgrades — the verdict must track
+        // `Value` exactly at every depth).
+        let mut cases: Vec<(Vec<u8>, bool, Option<u64>)> = (120usize..=135)
+            .map(|arrays| {
+                let line = nest(arrays);
+                let valid = serde_json::from_slice::<serde_json::Value>(&line).is_ok();
+                (line, valid, None)
+            })
+            .collect();
+        // Brackets inside strings (and escapes) never count toward
+        // depth: 200 brackets in a string + shallow structure parses.
+        cases.push((
+            format!("{{\"a\":\"{}\"}}", "[".repeat(200)).into_bytes(),
+            true,
+            None,
+        ));
+        cases.push((
+            format!("{{\"a\":\"\\\"\u{005b}{}\"}}", "]".repeat(200)).into_bytes(),
+            true,
+            None,
+        ));
+        let deep = nest(200);
+        cases.extend([
+            (br#"{"kind":"gap","sequence":1}"#.to_vec(), true, None),
+            (
+                br#"{"kind":"process_observation","segment":7}"#.to_vec(),
+                true,
+                Some(7),
+            ),
+            // Escaped kind still seals (same as the close-path `as_str`).
+            (
+                br#"{"kind":"process_observatio\u006e","segment":9}"#.to_vec(),
+                true,
+                Some(9),
+            ),
+            // Non-u64 / missing segments: valid, not a seal.
+            (
+                br#"{"kind":"process_observation","segment":"x"}"#.to_vec(),
+                true,
+                None,
+            ),
+            (
+                br#"{"kind":"process_observation","segment":-1}"#.to_vec(),
+                true,
+                None,
+            ),
+            (br#"{"kind":"process_observation"}"#.to_vec(), true, None),
+            (br#"{"kind":5,"segment":7}"#.to_vec(), true, None),
+            // Any valid JSON stages (objects or not).
+            (b"5".to_vec(), true, None),
+            (b"[1,2]".to_vec(), true, None),
+            (b"\"s\"".to_vec(), true, None),
+            // Invalid JSON (verdict identical to `Value`'s).
+            (b"".to_vec(), false, None),
+            (b"{".to_vec(), false, None),
+            (b"{\"a\":}".to_vec(), false, None),
+            (b"{\"a\":1} trailing".to_vec(), false, None),
+            (deep, false, None),
+        ]);
+        for (line, expect_valid, expect_seal) in &cases {
+            let dom_valid = serde_json::from_slice::<serde_json::Value>(line).is_ok();
+            assert_eq!(dom_valid, *expect_valid, "fixture: {line:?}");
+            assert_eq!(
+                spill_classify(line),
+                (*expect_valid, *expect_seal),
+                "classify: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tampered_spill_skips_never_splices() {
+        let dir = scratch("tamper");
+        let mut s = Staging::new();
+        let mut piece = TickPiece::open(3);
+        // Force a spill with a small MEM trip: over-record-cap line
+        // that IS valid JSON (a big quoted string).
+        let mut big = vec![b'y'; MAX_RECORD_BYTES as usize + 1];
+        big[0] = b'"';
+        *big.last_mut().unwrap() = b'"';
+        assert_eq!(
+            s.admit_record(&mut piece, &dir, "t", &big, 3).unwrap(),
+            Placement::Spilled
+        );
+        assert!(piece.spilled[0].valid);
+        s.admit_piece(piece);
+        // Tamper post-admission (flip one content byte).
+        let tmp = s.spilled[0].tmp.clone();
+        let mut body = std::fs::read(&tmp).unwrap();
+        let mid = body.len() / 2;
+        body[mid] = body[mid].wrapping_add(1);
+        std::fs::write(&tmp, &body).unwrap();
+        let asm = assemble_crypto_watch(&s.staged, &s.spilled, None, None, true).unwrap();
+        assert_eq!(asm.skipped_invalid, 1, "tamper skips + counts");
+        assert_eq!(asm.spilled_records, 1, "admission truth kept");
+        assert!(asm.array_inner.is_empty(), "tamper never splices");
+        assert!(!tmp.exists(), "tampered tmp consumed");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seal_flag_flows_from_admission() {
+        let dir = scratch("sealflag");
+        let mut s = Staging::new();
+        let mut piece = TickPiece::open(1);
+        let mut seal = br#"{"kind":"process_observation","segment":7}"#.to_vec();
+        seal.resize(MAX_RECORD_BYTES as usize + 1, b' ');
+        // Trailing spaces keep it valid JSON (object + whitespace).
+        assert_eq!(
+            s.admit_record(&mut piece, &dir, "t", &seal, 1).unwrap(),
+            Placement::Spilled
+        );
+        assert!(piece.spilled[0].valid);
+        assert_eq!(piece.spilled[0].seal_segment, Some(7));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
