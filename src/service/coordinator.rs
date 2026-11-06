@@ -413,6 +413,73 @@ where
     control
 }
 
+/// Spill-sink control failure (R3 adjudication d): the spill op
+/// never ran to judgment (expiry/cancel/worker-unavailable) —
+/// distinct from errno failures (ENOSPC/EIO) so callers
+/// disambiguate expiry from disk-full by TYPE (downcast), never
+/// by message string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpillControlFail {
+    Cancelled,
+    Expired,
+    SpawnFailed,
+}
+
+impl std::fmt::Display for SpillControlFail {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpillControlFail::Cancelled => write!(f, "spill cancelled"),
+            SpillControlFail::Expired => write!(f, "spill expired"),
+            SpillControlFail::SpawnFailed => write!(f, "spill worker unavailable"),
+        }
+    }
+}
+
+impl std::error::Error for SpillControlFail {}
+
+/// Map a spill-sink failure to its abandonment reason (R3
+/// adjudication d): control failures are NOT disk-full (spawn
+/// failure → `worker_unavailable`, other control failures →
+/// `io_error` — mirroring the assemble map); errno failures map
+/// ENOSPC → `disk_full`, anything else → `io_error` (mirroring
+/// the publish stage map). Exit-neutral (§7.3 folds from windows,
+/// never from the reason).
+fn spill_abandon_reason(e: &std::io::Error) -> AbandonReason {
+    if let Some(fail) = e
+        .get_ref()
+        .and_then(|r| r.downcast_ref::<SpillControlFail>())
+    {
+        return match fail {
+            SpillControlFail::SpawnFailed => AbandonReason::WorkerUnavailable,
+            SpillControlFail::Cancelled | SpillControlFail::Expired => AbandonReason::IoError,
+        };
+    }
+    match e.raw_os_error() {
+        Some(errno) if errno == libc::ENOSPC => AbandonReason::DiskFull,
+        _ => AbandonReason::IoError,
+    }
+}
+
+/// Abandon after a spill-sink failure (R3 adjudication d):
+/// control failures need no extra stderr (the op outcome in
+/// `close_accounting` + `run_op`'s line already say which);
+/// errno failures print (the op returned `Done(Err)` — silent
+/// otherwise).
+fn abandon_on_spill_failure(run: Run, e: std::io::Error) -> ExitCode {
+    if e.get_ref()
+        .and_then(|r| r.downcast_ref::<SpillControlFail>())
+        .is_none()
+    {
+        diag_line(
+            &run.diag,
+            &run.format,
+            "error",
+            &format!("spill failed: {e}"),
+        );
+    }
+    abandon_window(run, spill_abandon_reason(&e), None)
+}
+
 /// Worker-backed spill sink for staging (R1 finding 3): each spill
 /// file write + fsync runs on an OwnTmp control worker under
 /// `budget` + `cancel` — never coordinator-direct. Registry keys
@@ -460,9 +527,9 @@ fn spill_sink_for<'a>(
         );
         match wrote {
             Control::Done(result) => result,
-            Control::Cancelled => Err(std::io::Error::other("spill cancelled")),
-            Control::Expired => Err(std::io::Error::other("spill expired")),
-            Control::SpawnFailed => Err(std::io::Error::other("spill worker unavailable")),
+            Control::Cancelled => Err(std::io::Error::other(SpillControlFail::Cancelled)),
+            Control::Expired => Err(std::io::Error::other(SpillControlFail::Expired)),
+            Control::SpawnFailed => Err(std::io::Error::other(SpillControlFail::SpawnFailed)),
         }
     }
 }
@@ -1740,7 +1807,7 @@ fn run_loop(mut run: Run) -> ExitCode {
         // rendered + staging/spill-decided + dropped before the
         // next pull).
         let tick = run.tick_id;
-        let mut spill_failed = false;
+        let mut spill_fail: Option<std::io::Error> = None;
         // In-run spills run on workers but survive the first stop
         // (fresh cancel — a first-Term iteration still signal-cuts
         // instead of abandoning; only the double cancels, via the
@@ -1767,19 +1834,15 @@ fn run_loop(mut run: Run) -> ExitCode {
                 if line.is_empty() {
                     continue;
                 }
-                if cycle
-                    .staging
-                    .admit_record(
-                        &mut cycle.piece,
-                        &run.out,
-                        &run.tag,
-                        line,
-                        tick,
-                        &mut spill_sink,
-                    )
-                    .is_err()
-                {
-                    spill_failed = true;
+                if let Err(e) = cycle.staging.admit_record(
+                    &mut cycle.piece,
+                    &run.out,
+                    &run.tag,
+                    line,
+                    tick,
+                    &mut spill_sink,
+                ) {
+                    spill_fail = Some(e);
                     break;
                 }
             }
@@ -1788,12 +1851,13 @@ fn run_loop(mut run: Run) -> ExitCode {
         // otherwise hold them to scope end, blocking the moves
         // below).
         drop(spill_sink);
-        if spill_failed {
-            // Spill-write failure (disk-full family — the record can
-            // neither stage nor spill): Control-2 pre-publish
-            // disposition — abandon with reason + persisted bounds,
-            // resume N+1 at the next start.
-            return abandon_window(run, AbandonReason::DiskFull, None);
+        if let Some(e) = spill_fail {
+            // Spill-write failure (the record can neither stage nor
+            // spill): Control-2 pre-publish disposition — abandon
+            // with the disambiguated reason (R3 adjudication d —
+            // expiry is not disk-full) + persisted bounds, resume
+            // N+1 at the next start.
+            return abandon_on_spill_failure(run, e);
         }
         // Sample edge = tick end: run the §5.1 budget decision.
         if it.sample_fired {
@@ -1928,7 +1992,7 @@ fn close_final_window(mut run: Run) -> ExitCode {
             // here abandons pre-close, like the run loop's; spills
             // run on workers under the shutdown remainder — R1
             // finding 3).
-            let mut spill_failed = false;
+            let mut spill_fail: Option<std::io::Error> = None;
             let tick = run.tick_id;
             let spill_budget = close_budget(&run);
             let spill_poll = run_wait_poll!(run);
@@ -1945,19 +2009,15 @@ fn close_final_window(mut run: Run) -> ExitCode {
                     if line.is_empty() {
                         continue;
                     }
-                    if cycle
-                        .staging
-                        .admit_record(
-                            &mut cycle.piece,
-                            &run.out,
-                            &run.tag,
-                            line,
-                            tick,
-                            &mut spill_sink,
-                        )
-                        .is_err()
-                    {
-                        spill_failed = true;
+                    if let Err(e) = cycle.staging.admit_record(
+                        &mut cycle.piece,
+                        &run.out,
+                        &run.tag,
+                        line,
+                        tick,
+                        &mut spill_sink,
+                    ) {
+                        spill_fail = Some(e);
                         break;
                     }
                 }
@@ -1968,8 +2028,11 @@ fn close_final_window(mut run: Run) -> ExitCode {
                 cycle.staging.admit_piece(piece);
             }
             drop(spill_sink);
-            if spill_failed {
-                return abandon_window(run, AbandonReason::DiskFull, None);
+            if let Some(e) = spill_fail {
+                // Spill-write failure: abandon pre-close with the
+                // disambiguated reason (R3 adjudication d — expiry
+                // is not disk-full), like the run loop's.
+                return abandon_on_spill_failure(run, e);
             }
         }
         Err(e) => {
@@ -2014,7 +2077,7 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
         Ok(out) => {
             // Close-drain staging (worker-backed spills under the
             // shutdown remainder — R1 finding 3, like the final).
-            let mut spill_failed = false;
+            let mut spill_fail: Option<std::io::Error> = None;
             let tick = run.tick_id;
             let spill_budget = close_budget(&run);
             let spill_poll = run_wait_poll!(run);
@@ -2031,19 +2094,15 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
                     if line.is_empty() {
                         continue;
                     }
-                    if cycle
-                        .staging
-                        .admit_record(
-                            &mut cycle.piece,
-                            &run.out,
-                            &run.tag,
-                            line,
-                            tick,
-                            &mut spill_sink,
-                        )
-                        .is_err()
-                    {
-                        spill_failed = true;
+                    if let Err(e) = cycle.staging.admit_record(
+                        &mut cycle.piece,
+                        &run.out,
+                        &run.tag,
+                        line,
+                        tick,
+                        &mut spill_sink,
+                    ) {
+                        spill_fail = Some(e);
                         break;
                     }
                 }
@@ -2051,8 +2110,12 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
                 cycle.staging.admit_piece(piece);
             }
             drop(spill_sink);
-            if spill_failed {
-                return BoundaryOut::Exit(abandon_window(run, AbandonReason::DiskFull, None));
+            if let Some(e) = spill_fail {
+                // Spill-write failure (the record can neither stage
+                // nor spill): Control-2 pre-publish disposition —
+                // abandon with the disambiguated reason (R3
+                // adjudication d — expiry is not disk-full).
+                return BoundaryOut::Exit(abandon_on_spill_failure(run, e));
             }
         }
         Err(e) => {
@@ -4615,6 +4678,79 @@ mod tests {
             expired, 5,
             "all ops past the sink deadline must expire (none may renew)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// R3 adjudication (d): spill control failures (expiry / cancel
+    /// / worker-unavailable) are NOT disk-full — only ENOSPC is
+    /// (other errno failures are `io_error`, mirroring the publish
+    /// stage map; spawn failure is `worker_unavailable`, mirroring
+    /// the assemble map).
+    #[test]
+    fn spill_failures_disambiguate_control_from_disk_full() {
+        use std::io::Error;
+        assert_eq!(
+            spill_abandon_reason(&Error::other(SpillControlFail::Expired)),
+            AbandonReason::IoError
+        );
+        assert_eq!(
+            spill_abandon_reason(&Error::other(SpillControlFail::Cancelled)),
+            AbandonReason::IoError
+        );
+        assert_eq!(
+            spill_abandon_reason(&Error::other(SpillControlFail::SpawnFailed)),
+            AbandonReason::WorkerUnavailable
+        );
+        assert_eq!(
+            spill_abandon_reason(&Error::from_raw_os_error(libc::ENOSPC)),
+            AbandonReason::DiskFull
+        );
+        assert_eq!(
+            spill_abandon_reason(&Error::from_raw_os_error(libc::EIO)),
+            AbandonReason::IoError
+        );
+        assert_eq!(
+            spill_abandon_reason(&Error::other("mystery")),
+            AbandonReason::IoError
+        );
+    }
+
+    /// R3 adjudication (d): the spill sink reports control
+    /// failures typed (downcastable — not stringly), so callers
+    /// disambiguate expiry from disk-full.
+    #[test]
+    fn spill_sink_reports_control_failures_typed() {
+        let dir = std::env::temp_dir().join(format!(
+            "t74-spilltyped-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let diag = Diagnostics::spawn();
+        let format = Format::Json;
+        let mut accum = SummaryAccum::new();
+        let cancel = AtomicBool::new(false);
+        let mut sink = spill_sink_for(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            None,
+            Duration::from_millis(12),
+        );
+        std::thread::sleep(Duration::from_millis(30));
+        let err = sink(&dir.join("spill-typed"), b"{}").expect_err("past-deadline op must fail");
+        drop(sink);
+        diag.abandon(Duration::from_millis(50));
+        let fail = err
+            .get_ref()
+            .and_then(|r| r.downcast_ref::<SpillControlFail>())
+            .expect("control failure must be typed");
+        assert_eq!(*fail, SpillControlFail::Expired);
+        assert_eq!(spill_abandon_reason(&err), AbandonReason::IoError);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
