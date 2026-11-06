@@ -4748,11 +4748,33 @@ impl ServiceEngine {
                                 None => None,
                             };
                             // ENGINE-plane keys share the COUNTS map:
-                            // site rows only (engine deltas are empty
-                            // in T7.4 — the certified finish path
-                            // emits no engine observations, and no
-                            // certified cookie→site join exists for
-                            // the snapshot path).
+                            // site rows only. Still-open ENGINE rows
+                            // are honestly EMPTY (R1 finding 4
+                            // adjudication, evidence both ways):
+                            // the cookie→meaning join lives in the
+                            // session collector and certifies ONLY
+                            // at the closed cut (`collector.build`
+                            // at `FocusedSession::finish`, with
+                            // finish-constructed objects +
+                            // closed-tail custody proof —
+                            // `capture.rs` collector, "would
+                            // misattribute replacement bytes to
+                            // stale meanings"; emission proven
+                            // live by
+                            // `native_session_routes_engine_calls_to_observations`).
+                            // No certified mid-run ENGINE read API
+                            // exists (a 6A engine addition — the
+                            // engine is frozen), so the snapshot
+                            // path projects no ENGINE rows rather
+                            // than joining uncertified meanings.
+                            // No ENGINE evidence is lost: retired
+                            // members' sealed `engine_observations`
+                            // ride `crypto_watch[]` verbatim AND
+                            // merge into the window document
+                            // (`snapshot::produce` sealed ENGINE
+                            // merge); still-open counts accumulate
+                            // in the fold + collector and certify
+                            // at seal.
                             if crate::focused_count::is_engine_cookie(cookie) {
                                 continue;
                             }
@@ -4796,6 +4818,10 @@ impl ServiceEngine {
                 },
                 ring: a.session.session_loss_totals(),
                 gaps,
+                // Honestly empty: still-open ENGINE rows have no
+                // certified mid-run projection (adjudication at the
+                // engine-cookie skip above; sealed rows merge in
+                // `snapshot::produce`).
                 engine: Vec::new(),
                 gauges,
                 target: crate::evidence::TargetRecord::new(

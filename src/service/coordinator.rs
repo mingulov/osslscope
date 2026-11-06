@@ -29,7 +29,7 @@ use crate::service::retain::{
     enforce_retention, rotate_file, rotation_due, unlatched_defense_blocks, write_latch,
 };
 use crate::service::signals::{Signal, SignalFd};
-use crate::service::snapshot::{Snapshot, WindowCtx, produce};
+use crate::service::snapshot::{Snapshot, WindowCtx, produce, sealed_map};
 use crate::service::staging::{Carry, Staging, TickDecision, TickPiece, assemble_crypto_watch};
 use crate::service::state::{
     AbandonReason, DirLock, PolicyIdentity, PolicyRejection, PolicyStatus, Reservation,
@@ -41,7 +41,6 @@ use crate::service::worker::{
     Control, DestClass, Destination, Diagnostics, Gate, WorkerOut, outcome_of, push_accounting,
     run_under_control, view_slot,
 };
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1673,39 +1672,6 @@ fn tick_of(ns: u64, origin_ns: u64, tick_ns: u64) -> u64 {
     ns.saturating_sub(origin_ns) / tick_ns
 }
 
-/// Extract retirement-sealed documents from staged values
-/// (`ProcessObservation` records → `(segment, document)`), filtered
-/// to close-absent segments (retired ⟺ absent from close — a sealed
-/// doc for a close-present member is a drain-order artifact whose
-/// counts the still-open path already carries; its doc still rides
-/// `crypto_watch[]` verbatim).
-fn sealed_map(
-    staged: &[crate::service::staging::StagedRecord],
-    close_segments: &std::collections::BTreeSet<u64>,
-) -> HashMap<u64, crate::evidence::CaptureDocument> {
-    let mut out = HashMap::new();
-    for r in staged {
-        let Some(v) = r.value.as_ref() else {
-            continue;
-        };
-        if v.get("kind").and_then(|k| k.as_str()) != Some("process_observation") {
-            continue;
-        }
-        let (Some(seg), Some(doc_v)) =
-            (v.get("segment").and_then(|s| s.as_u64()), v.get("document"))
-        else {
-            continue;
-        };
-        if close_segments.contains(&seg) {
-            continue;
-        }
-        if let Ok(doc) = serde_json::from_value::<crate::evidence::CaptureDocument>(doc_v.clone()) {
-            out.insert(seg, doc);
-        }
-    }
-    out
-}
-
 /// Close mode: mid-run (commit + next window) vs run-final
 /// (seal + end) vs terminal (MAX seal + end, `exhausted`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1885,7 +1851,11 @@ fn close_common_body(
     let close_segments: std::collections::BTreeSet<u64> =
         close.members.iter().map(|m| m.segment).collect();
     let cycle = run.cycle.as_ref().expect("window open at close");
-    let sealed = sealed_map(&cycle.staging.staged, &close_segments);
+    let sealed = sealed_map(
+        &cycle.staging.staged,
+        &cycle.staging.spilled,
+        &close_segments,
+    );
     let open_tick = tick_of(cycle.effective_start_ns, run.origin_ns, run.tick_ns);
     let close_tick = tick_of(effective_end_ns, run.origin_ns, run.tick_ns);
     let policy_rules = match run.policy.active_rules.as_ref() {

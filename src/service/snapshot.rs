@@ -22,7 +22,7 @@
 //! snapshot version source — same as the finish path); empty-window
 //! targets fall back along listed → run-observed → selection pid.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, CounterKind,
@@ -190,12 +190,13 @@ struct Contributor {
 }
 
 /// Produce one window from the stored open/close pair (§11.1).
-/// `sealed` maps retired segments to their verbatim sealed
-/// documents (parsed from the admitted `ProcessObservation`s).
+/// `sealed` maps retired segments to their consumed seals
+/// (verbatim sealed document + seal-record identity, parsed from
+/// the admitted `ProcessObservation`s — staged or spilled).
 pub fn produce(
     open: &Snapshot,
     close: &Snapshot,
-    sealed: &HashMap<u64, CaptureDocument>,
+    sealed: &HashMap<u64, SealedRetirement>,
     ctx: &WindowCtx,
 ) -> Produced {
     let unstable = !open.stable || !close.stable;
@@ -270,21 +271,27 @@ pub fn produce(
     // Retired members: sealed − open per (SiteKey, generation);
     // bounds L2-unknown (no sealed in-window bounds exist for dead
     // members — the sealed rows ride verbatim in `crypto_watch[]`).
-    for (seg, doc) in sealed {
-        let id = match open_members
+    // Absent-open (admitted after open, retired before close — R1
+    // finding 4): identity from the seal record, open ⟺ 0 (the
+    // module's Absent ⟺ zero rule), clamp 0 (nothing to clamp
+    // against), candidates honestly Unknown (no live-admission
+    // binding was ever snapshotted).
+    for (seg, seal) in sealed {
+        let doc = &seal.doc;
+        let found = open_members
             .iter()
             .find(|(_, m)| m.segment == *seg)
-            .map(|(id, _)| *id)
-        {
-            Some(id) => id,
-            None => continue,
-        };
-        let om = &open_members[&id];
-        let open_by_key = open_keyed(om);
-        let mut fact = member_facts
-            .remove(&id)
-            .unwrap_or_else(|| MemberFact::sealed(om));
+            .map(|(id, _)| *id);
+        let id = found.unwrap_or((seal.pid, seal.starttime, *seg));
+        let om = found.map(|id| &open_members[&id]);
+        let open_by_key: HashMap<(SiteKey, u32), u64> =
+            om.map(|o| open_keyed(o)).unwrap_or_default();
+        let mut fact = member_facts.remove(&id).unwrap_or_else(|| match om {
+            Some(o) => MemberFact::sealed(o),
+            None => MemberFact::sealed_absent(seal.image_epoch, doc.target.clone()),
+        });
         fact.retired = true;
+        let epoch = om.map(|o| o.image_epoch).unwrap_or(seal.image_epoch);
         for (key, sealed_calls, sealed_side_current) in sealed_rows(doc) {
             let open_calls = open_by_key.get(&key).copied().unwrap_or(0);
             let delta = sealed_calls.saturating_sub(open_calls);
@@ -292,9 +299,11 @@ pub fn produce(
             if delta == 0 {
                 continue;
             }
-            let binding = om.bindings.iter().find(|b| {
-                let k = (b.site.clone(), key.1);
-                k == key
+            let binding = om.and_then(|o| {
+                o.bindings.iter().find(|b| {
+                    let k = (b.site.clone(), key.1);
+                    k == key
+                })
             });
             let (candidates, installed_at, coverage) = match binding {
                 Some(b) => (b.candidates.clone(), b.installed_at, b.coverage),
@@ -305,14 +314,42 @@ pub fn produce(
             // window retires exactly one member (set below).
             fact.sealed_disposition = doc.disposition;
             rows.entry(key).or_default().push(Contributor {
-                segment: om.segment,
-                image_epoch: om.image_epoch,
+                segment: *seg,
+                image_epoch: epoch,
                 calls: delta,
                 bounds: None,
                 candidates,
                 coverage,
                 installed_at,
                 current_side: sealed_side_current,
+            });
+        }
+        // Certified sealed ENGINE merge (R1 finding 4): the seal's
+        // `engine_observations` (finish-built, `InWindow`) close at
+        // the sealed totals minus the open rows (absent-open ⟺
+        // full sealed calls). Zero deltas drop (same rule as the
+        // live `engine_deltas`); windows merge weakest below.
+        let open_engines: &[EngineRow] = om.map(|o| o.engine.as_slice()).unwrap_or(&[]);
+        for obs in doc.engine_observations.iter() {
+            let oc = open_engines
+                .iter()
+                .find(|r| {
+                    r.key == obs.key
+                        && r.generation == obs.generation
+                        && r.entrypoint == obs.entrypoint
+                })
+                .map(|r| r.calls)
+                .unwrap_or(0);
+            let calls = obs.calls.saturating_sub(oc);
+            if calls == 0 {
+                continue;
+            }
+            fact.engine_delta.push(EngineDelta {
+                key: obs.key.clone(),
+                generation: obs.generation,
+                entrypoint: obs.entrypoint,
+                calls,
+                window: obs.window,
             });
         }
         // Retired loss: sealed totals ARE the close (the seal's
@@ -638,7 +675,8 @@ pub fn produce(
 
     // Engine observations merged by (key, generation, entrypoint):
     // calls Σ, window weakest (Untimed > PreWindow > InWindow —
-    // live rows are InWindow-only, so weakest is structural).
+    // live rows are InWindow-only; sealed rows ride their sealed
+    // window, certified `InWindow` by the finish builder).
     let mut engine_merge: BTreeMap<(SiteKey, u64, u16), (u64, EngineWindow)> = BTreeMap::new();
     for fact in member_facts.values() {
         for e in &fact.engine_delta {
@@ -646,7 +684,7 @@ pub fn produce(
                 .entry((e.key.clone(), e.generation, e.entrypoint))
                 .or_insert((0, EngineWindow::InWindow));
             slot.0 = slot.0.saturating_add(e.calls);
-            slot.1 = weakest_window(slot.1, EngineWindow::InWindow);
+            slot.1 = weakest_window(slot.1, e.window);
         }
     }
     let engine_observations: Vec<EngineObservation> = engine_merge
@@ -668,8 +706,8 @@ pub fn produce(
     let mut api_rows: Vec<(u64, crate::api_activity::ApiActivityRow)> = Vec::new();
     for (id, fact) in &member_facts {
         if fact.retired {
-            if let Some(doc) = sealed.get(&id.2) {
-                for row in &doc.api_activity {
+            if let Some(seal) = sealed.get(&id.2) {
+                for row in &seal.doc.api_activity {
                     api_rows.push((id.2, row.clone()));
                 }
             }
@@ -775,6 +813,7 @@ struct EngineDelta {
     generation: u64,
     entrypoint: u16,
     calls: u64,
+    window: EngineWindow,
 }
 
 impl MemberFact {
@@ -796,6 +835,24 @@ impl MemberFact {
     fn sealed(m: &MemberView) -> Self {
         Self::new(m, true)
     }
+
+    /// Absent-open seal (R1 finding 4): identity from the seal
+    /// record (image epoch + sealed target); gauges unknown
+    /// (no close point was ever snapshotted).
+    fn sealed_absent(image_epoch: u64, target: TargetRecord) -> Self {
+        Self {
+            image_epoch,
+            target,
+            gauges: (0, 0),
+            calls: 0,
+            clamp: 0,
+            retired: true,
+            loss: crate::service::envelope::MemberWindowLoss::default(),
+            gap_delta: Vec::new(),
+            engine_delta: Vec::new(),
+            sealed_disposition: None,
+        }
+    }
 }
 
 fn index_members(members: &[MemberView]) -> BTreeMap<(u32, u64, u64), &MemberView> {
@@ -812,9 +869,87 @@ fn index_sites(sites: &[SiteCounts]) -> HashMap<(u32, u32), u64> {
         .collect()
 }
 
-/// Open cumulative keyed by merged row (SiteKey, generation) via
-/// the open bindings (for sealed-diffing retired members). Cookies
-/// mapping to one key sum (saturating).
+/// A consumed retirement seal: the verbatim sealed document plus
+/// the seal record's identity (incarnation + image epoch — the
+/// absent-open member's ONLY identity source, R1 finding 4).
+#[derive(Debug, Clone)]
+pub struct SealedRetirement {
+    pub doc: CaptureDocument,
+    pub pid: u32,
+    pub starttime: u64,
+    pub image_epoch: u64,
+}
+
+/// Extract one seal from a `process_observation` envelope value
+/// (`None` ⟺ not a seal / malformed — the record still rides
+/// `crypto_watch[]` verbatim; only seal consumption skips).
+fn seal_of(v: &serde_json::Value) -> Option<(u64, SealedRetirement)> {
+    if v.get("kind").and_then(|k| k.as_str()) != Some("process_observation") {
+        return None;
+    }
+    let seg = v.get("segment")?.as_u64()?;
+    let doc_v = v.get("document")?;
+    let doc: CaptureDocument = serde_json::from_value(doc_v.clone()).ok()?;
+    let incarnation = v.get("incarnation")?;
+    let pid: u32 = incarnation.get("pid")?.as_u64()?.try_into().ok()?;
+    let starttime = incarnation.get("starttime")?.as_u64()?;
+    let image_epoch = v.get("image_epoch")?.as_u64()?;
+    Some((
+        seg,
+        SealedRetirement {
+            doc,
+            pid,
+            starttime,
+            image_epoch,
+        },
+    ))
+}
+
+/// Extract retirement seals from staged AND spilled values
+/// (`ProcessObservation` records → `(segment, seal)`), filtered to
+/// close-absent segments (retired ⟺ absent from close — a sealed
+/// doc for a close-present member is a drain-order artifact whose
+/// counts the still-open path already carries; its doc still rides
+/// `crypto_watch[]` verbatim).
+pub(crate) fn sealed_map(
+    staged: &[crate::service::staging::StagedRecord],
+    spilled: &[crate::service::staging::SpilledRecord],
+    close_segments: &BTreeSet<u64>,
+) -> HashMap<u64, SealedRetirement> {
+    let mut out = HashMap::new();
+    for r in staged {
+        let Some(v) = r.value.as_ref() else {
+            continue;
+        };
+        if let Some((seg, seal)) = seal_of(v) {
+            if !close_segments.contains(&seg) {
+                out.insert(seg, seal);
+            }
+        }
+    }
+    // Spilled seals (MEM pressure pushed the retirement record to
+    // disk — R1 finding 4): one tmp at a time (one in-transit
+    // record; the bytes drop before the next read — never the
+    // whole window). Staged wins ties (a record lives in exactly
+    // one place; first-wins either way).
+    for r in spilled {
+        let Ok(bytes) = std::fs::read(&r.tmp) else {
+            continue;
+        };
+        let parsed = serde_json::from_slice::<serde_json::Value>(&bytes);
+        drop(bytes);
+        let Ok(v) = parsed else {
+            continue;
+        };
+        if let Some((seg, seal)) = seal_of(&v) {
+            if !close_segments.contains(&seg) {
+                out.entry(seg).or_insert(seal);
+            }
+        }
+    }
+    out
+}
+
 fn open_keyed(open: &MemberView) -> HashMap<(SiteKey, u32), u64> {
     let mut map: HashMap<(SiteKey, u32), u64> = HashMap::new();
     for s in &open.sites {
@@ -894,6 +1029,7 @@ fn engine_deltas(open: Option<&Vec<EngineRow>>, close: &[EngineRow]) -> Vec<Engi
                     .copied()
                     .unwrap_or(0),
             ),
+            window: EngineWindow::InWindow,
         })
         .filter(|d| d.calls > 0)
         .collect()
@@ -1032,6 +1168,15 @@ mod tests {
         }
     }
 
+    fn seal(doc: CaptureDocument, pid: u32, starttime: u64, image_epoch: u64) -> SealedRetirement {
+        SealedRetirement {
+            doc,
+            pid,
+            starttime,
+            image_epoch,
+        }
+    }
+
     fn ctx() -> WindowCtx {
         WindowCtx {
             seq: 0,
@@ -1060,6 +1205,13 @@ mod tests {
     }
 
     fn sealed_doc(rows: Vec<(SiteKey, u32, u64)>) -> CaptureDocument {
+        sealed_doc_eng(rows, Vec::new())
+    }
+
+    fn sealed_doc_eng(
+        rows: Vec<(SiteKey, u32, u64)>,
+        engines: Vec<EngineObservation>,
+    ) -> CaptureDocument {
         let sites: Vec<SiteExecution> = rows
             .into_iter()
             .map(|(site, generation, calls)| SiteExecution {
@@ -1094,9 +1246,97 @@ mod tests {
             disposition: None,
             policy: None,
             legacy_partition: LegacyCallPartition::default(),
-            engine_observations: Vec::new(),
+            engine_observations: engines,
             traversal: None,
         })
+    }
+
+    /// R1 finding 4 (absent-open retirement): a member admitted
+    /// after the open snapshot and retired before close has NO
+    /// open anchor — its sealed counts must still project (open ⟺
+    /// 0, clamp 0 shown), listed retired in `members[]`.
+    #[test]
+    fn absent_open_retirement_projects_at_zero() {
+        let open = snap(Vec::new());
+        let close = snap(Vec::new());
+        let mut sealed = HashMap::new();
+        sealed.insert(7, seal(sealed_doc(vec![(site("lib"), 1, 25)]), 9, 100, 3));
+        let p = produce(&open, &close, &sealed, &ctx());
+        assert_eq!(p.members.len(), 1, "absent-open retiree is listed");
+        let m = &p.members[0];
+        assert_eq!((m.pid, m.starttime, m.segment), (9, 100, 7));
+        assert_eq!(m.image_epoch, 3, "epoch from the seal record");
+        assert!(m.retired);
+        assert_eq!(m.clamp, 0, "no open anchor — nothing to clamp");
+        assert_eq!(p.document.sites.len(), 1);
+        assert_eq!(p.document.sites[0].calls, 25, "sealed − 0");
+    }
+
+    /// R1 finding 4 (sealed ENGINE merge): a retired member's
+    /// certified sealed `engine_observations` merge into the
+    /// window document (the finish path emits them —
+    /// `focused_capture.rs` finish; the snapshot path previously
+    /// dropped them).
+    #[test]
+    fn retired_sealed_engine_rows_merge() {
+        let open = snap(vec![member(9, 1, Vec::new(), Vec::new())]);
+        let close = snap(Vec::new());
+        let mut sealed = HashMap::new();
+        sealed.insert(
+            1,
+            seal(
+                sealed_doc_eng(
+                    vec![(site("lib"), 1, 25)],
+                    vec![EngineObservation {
+                        key: site("lib"),
+                        generation: 2,
+                        entrypoint: 3,
+                        calls: 11,
+                        window: EngineWindow::InWindow,
+                    }],
+                ),
+                9,
+                100,
+                0,
+            ),
+        );
+        let p = produce(&open, &close, &sealed, &ctx());
+        assert_eq!(p.document.engine_observations.len(), 1);
+        let e = &p.document.engine_observations[0];
+        assert_eq!(e.calls, 11);
+        assert_eq!(e.generation, 2);
+        assert_eq!(e.entrypoint, 3);
+    }
+
+    /// R1 finding 4 (spilled seals): a retirement record that
+    /// spilled to disk (MEM pressure) must still feed the sealed
+    /// map — `sealed_map` reads spill tmps one at a time (one
+    /// in-transit record, never the whole window).
+    #[test]
+    fn spilled_retirement_seals_consume() {
+        let dir = std::env::temp_dir().join(format!("ossl-seal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = sealed_doc(vec![(site("lib"), 1, 25)]);
+        let rec = serde_json::json!({
+            "kind": "process_observation",
+            "incarnation": {"pid": 9u32, "starttime": 100u64},
+            "segment": 7u64,
+            "document": serde_json::to_value(&doc).unwrap(),
+            "image_epoch": 3u64,
+        });
+        let tmp = dir.join("spill.seal.json");
+        std::fs::write(&tmp, serde_json::to_vec(&rec).unwrap()).unwrap();
+        let spilled = vec![crate::service::staging::SpilledRecord {
+            tmp: tmp.clone(),
+            bytes: 1,
+            tick: 0,
+        }];
+        let close_segments = BTreeSet::new();
+        let m = sealed_map(&[], &spilled, &close_segments);
+        assert_eq!(m.len(), 1, "spilled seal consumed");
+        let s = &m[&7];
+        assert_eq!((s.pid, s.starttime, s.image_epoch), (9, 100, 3));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Control 7 mirror: two processes sharing one site — merged
@@ -1254,7 +1494,7 @@ mod tests {
         let open1 = close0.clone();
         let close1 = snap(vec![]);
         let mut sealed = HashMap::new();
-        sealed.insert(1, sealed_doc(vec![(site("lib"), 1, 25)]));
+        sealed.insert(1, seal(sealed_doc(vec![(site("lib"), 1, 25)]), 11, 100, 0));
         let p0 = produce(&open0, &close0, &HashMap::new(), &ctx());
         let p1 = produce(&open1, &close1, &sealed, &ctx());
         let sum: u64 = p0
@@ -1305,7 +1545,7 @@ mod tests {
         let open2 = snap(vec![m(8, None)]);
         let close2 = snap(vec![]);
         let mut sealed = HashMap::new();
-        sealed.insert(1, sealed_doc(vec![(site("lib"), 1, 12)]));
+        sealed.insert(1, seal(sealed_doc(vec![(site("lib"), 1, 12)]), 11, 100, 0));
         let p0 = produce(&open0, &close0, &HashMap::new(), &ctx());
         let p1 = produce(&open1, &close1, &HashMap::new(), &ctx());
         let p2 = produce(&open2, &close2, &sealed, &ctx());
