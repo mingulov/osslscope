@@ -1126,8 +1126,14 @@ fn bad_cgroup_crypto_watch_exit4_names_scope_reason_on_stderr() {
 fn human_watch_prints_identity_and_tracing_health() {
     // Live unprivileged target: Discovery rows total identity, and the
     // tracing-health line states the finite cause exactly once.
+    // Hermetic (R2 concern f): isolated exe-dir, so stray
+    // `target/debug/` companions never flip the absence outcome.
+    let dir = std::env::temp_dir().join(format!("osslscope-watch-identity-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let binary = dir.join("osslscope");
+    std::fs::copy(env!("CARGO_BIN_EXE_osslscope"), &binary).unwrap();
     let mut child = Command::new("sleep").arg("10").spawn().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+    let output = Command::new(&binary)
         .args([
             "scan",
             "--watch",
@@ -1141,6 +1147,7 @@ fn human_watch_prints_identity_and_tracing_health() {
         .unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
     assert!(matches!(output.status.code(), Some(3 | 4)));
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
@@ -1161,10 +1168,15 @@ fn human_watch_with_gaps_never_claims_blindness() {
     // (fail closed). Under root the presence test owns the
     // assertion instead. The tracing blocker still precedes the
     // first sample record in both environments.
+    // Hermetic (R2 concern f): isolated exe-dir (see above).
     let blocking = unsafe { libc::geteuid() } != 0;
+    let dir = std::env::temp_dir().join(format!("osslscope-watch-gaps-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let binary = dir.join("osslscope");
+    std::fs::copy(env!("CARGO_BIN_EXE_osslscope"), &binary).unwrap();
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+    let output = Command::new(&binary)
         .args([
             "scan",
             "--watch",
@@ -1178,6 +1190,7 @@ fn human_watch_with_gaps_never_claims_blindness() {
         .unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     if blocking {
         assert!(
@@ -1194,13 +1207,18 @@ fn human_watch_with_gaps_never_claims_blindness() {
 fn human_watch_states_blindness_when_verified() {
     // Root-only presence: verified gap-free ineligible processes
     // state the boundary.
+    // Hermetic (R2 concern f): isolated exe-dir (see above).
     if unsafe { libc::geteuid() } != 0 {
         eprintln!("SKIP: verified scan needs root");
         return;
     }
+    let dir = std::env::temp_dir().join(format!("osslscope-watch-blind-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let binary = dir.join("osslscope");
+    std::fs::copy(env!("CARGO_BIN_EXE_osslscope"), &binary).unwrap();
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+    let output = Command::new(&binary)
         .args([
             "scan",
             "--watch",
@@ -1214,6 +1232,7 @@ fn human_watch_states_blindness_when_verified() {
         .unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
         text.contains("blindness: no-mapped-openssl"),
