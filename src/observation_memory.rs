@@ -31,6 +31,16 @@ impl MemoryPool {
     pub(crate) fn limit(&self) -> usize {
         self.0.limit
     }
+    /// Non-committal capacity probe: true iff `bytes` would fit
+    /// now. Reads only (no spend, no peak bump), so admission can
+    /// prove a working envelope without holding it.
+    pub(crate) fn fits(&self, bytes: usize) -> bool {
+        self.0
+            .used
+            .get()
+            .checked_add(bytes)
+            .is_some_and(|next| next <= self.0.limit)
+    }
     pub(crate) fn reserve(&self, bytes: usize) -> Option<MemoryLease> {
         let next = self.0.used.get().checked_add(bytes)?;
         if next > self.0.limit {

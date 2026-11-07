@@ -2875,6 +2875,15 @@ impl RunState {
     /// not a global read, so tests stay deterministic). `None`
     /// refuses the admission — pool too tight to even account the
     /// backlog (honest backpressure, never a hole).
+    ///
+    /// T7.4-fix4: admission proves the session's full envelope —
+    /// lease plus one stock parse transient — before reserving.
+    /// The working set is proven, not held (parse transients are
+    /// short-lived; the held lease is unchanged). Without this,
+    /// every lease fits while no parse does, and all members
+    /// starve symmetric silent-zero; now the overflow member
+    /// refuses here and queues with the specific
+    /// `global_state_limit` gap instead.
     fn reserve_session(
         &mut self,
         pool: &MemoryPool,
@@ -2889,6 +2898,11 @@ impl RunState {
         self.backlog_guard = None;
         let guard = pool.reserve(backlog)?;
         self.backlog_guard = Some(guard);
+        let working = crate::provider_observation::objects::session_working_bytes();
+        let envelope = reservation.checked_add(working)?;
+        if !pool.fits(envelope) {
+            return None;
+        }
         pool.reserve(reservation)
     }
     /// 6A per-root ignored-descendant volume (§1.7): delivered
@@ -5374,20 +5388,19 @@ mod tests {
         // ~21.8 MiB is free, so modules ≤ ~4.7 MiB parse and
         // larger ones refuse.
         //
-        // F8d RESTORATION (same round): live evidence (vacuous
-        // 2-pid observation — E2E out20 + the §1.4 unit smoke)
-        // proved the contended state is NOT an acceptable
-        // production steady state — the second session parses
-        // the SAME bytes. Production now serves same-file
-        // parses from a run-shared cache
-        // (`provider_observation::objects::ParseCache`, wired via
-        // `RunState.parsed_cache`), so two sessions over one
-        // module never re-reserve the 22 MiB transient. This
+        // T7.4-fix4: the RESTORATION premise above proved false
+        // in live 2-pid runs — both leases land before either
+        // parse, so the cache never fills and BOTH sessions
+        // refuse the first same-file parse (symmetric
+        // silent-zero). Admission now proves lease + one stock
+        // parse transient per session (`reserve_session`): the
+        // second maximal envelope refuses and queues with the
+        // specific `global_state_limit` gap, so this synthetic
+        // two-max-leases state is unreachable via admission and
+        // the admitted member always keeps parse room. This
         // test's synthetic exhaustion still refuses (the pool
-        // arithmetic is unchanged); only DISTINCT large files
-        // parsed beside two held leases can refuse now
-        // (vanishingly rare — separate libcrypto builds in one
-        // run). BPF map right-sizing stays round-2 work.
+        // arithmetic is unchanged). BPF map right-sizing stays
+        // round-2 work.
         let pool = MemoryPool::new(GLOBAL_BYTES);
         let _coordinator = pool.reserve(COORDINATOR_BYTES + 32_768).unwrap();
         let _scanner = pool.reserve(4096 * 160 + 100 * 4096).unwrap();
@@ -5422,9 +5435,15 @@ mod tests {
         // bound per the loader capacity comment) grow each session
         // reservation (~2.5 MiB at 16 CPUs), so the stock parser
         // scratch no longer fits alongside TWO max sessions. This
-        // test proves the new working set: two sessions +
-        // coordinator + scanner fit (third session refused), and the
-        // stock parser still coexists with ONE session.
+        // test proves the pool arithmetic: two leases +
+        // coordinator + scanner fit (a third lease refused), and
+        // the stock parser still coexists with ONE session.
+        // T7.4-fix4: admission no longer reaches the two-lease
+        // state for maximal sessions — the second envelope
+        // refuses at `reserve_session` (lease + working must
+        // fit) and queues `global_state_limit`. The admitted
+        // member keeps the one-session-plus-parser coexistence
+        // below.
         let pool = MemoryPool::new(GLOBAL_BYTES);
         let _coordinator = pool.reserve(COORDINATOR_BYTES + 32_768).unwrap();
         let _scanner = pool.reserve(4096 * 160 + 100 * 4096).unwrap();
@@ -5442,6 +5461,161 @@ mod tests {
             .reserve(inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
             .unwrap();
         assert!(pool2.peak() <= GLOBAL_BYTES);
+    }
+    #[test]
+    fn second_session_envelope_refused_while_first_holds() {
+        // T7.4-fix4: admission proves lease + one stock parse
+        // transient per session. A pool fitting two leases but
+        // one byte short of the second working set admits the
+        // first session and refuses the second — the pre-fix
+        // over-admit held both leases with room for neither
+        // parse, starving BOTH sessions silent-zero.
+        let working = crate::provider_observation::objects::session_working_bytes();
+        let reservation = 1 << 20;
+        let pool = MemoryPool::new(2 * reservation + working - 1);
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let first = run.reserve_session(&pool, reservation, 0);
+        assert!(first.is_some(), "first envelope must admit");
+        let second = run.reserve_session(&pool, reservation, 0);
+        assert!(
+            second.is_none(),
+            "second envelope must refuse: pool cannot fund its working set"
+        );
+        drop(first);
+        let retry = run.reserve_session(&pool, reservation, 0);
+        assert!(
+            retry.is_some(),
+            "refused envelope recovers after a session ends"
+        );
+    }
+    #[test]
+    fn refused_newcomer_queues_global_state_limit_naming_member() {
+        // T7.4-fix4: the refused envelope queues with the specific
+        // named gap — which limit (`global_state_limit`) plus
+        // which member (incarnation) — and the per-tick Limit
+        // record carries all three fields.
+        fn eligible_snapshot(pid: u32, starttime: u64) -> inventory::Snapshot {
+            let module = inventory::ModuleRecord {
+                info: inventory::ModuleInfo {
+                    sha256: String::new(),
+                    device: 0,
+                    inode: 0,
+                    size_bytes: 0,
+                    architecture: inventory::Architecture::X86_64,
+                    kind: inventory::ObjectKind::OpenSslConsumer,
+                    exports: Vec::new(),
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                },
+                identity_status: inventory::IdentityStatus::Verified,
+            };
+            let record = inventory::ProcessRecord {
+                interval: inventory::CaptureInterval {
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ns: 0,
+                },
+                namespaces: inventory::NamespaceIds {
+                    pid: None,
+                    mount: None,
+                },
+                pid,
+                starttime,
+                modules: vec![module],
+                provider_activation: inventory::ObservationState::Unknown,
+                provider_interfaces: inventory::ObservationState::Unknown,
+                execution: inventory::ObservationState::Unknown,
+            };
+            inventory::Snapshot {
+                interval: inventory::CaptureInterval {
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ns: 0,
+                },
+                scope_record: inventory::ScopeRecord::default(),
+                schema_version: "crypto-watch-test".to_owned(),
+                mode: inventory::SnapshotMode::Snapshot,
+                scope: inventory::Scope::Pids,
+                selected_pids: vec![pid],
+                processes: vec![record],
+                gaps: Vec::new(),
+                totals: inventory::WorkTotals {
+                    processes_attempted: 1,
+                    objects_attempted: 0,
+                    objects_inspected: 0,
+                    read_bytes: 0,
+                },
+                limits: inventory::Limits::default(),
+                capabilities: inventory::Capabilities {
+                    inventory: inventory::InventoryState::Complete,
+                    provider_activation: inventory::ObservationState::Unknown,
+                    provider_interfaces: inventory::ObservationState::Unknown,
+                    execution: inventory::ObservationState::Unknown,
+                },
+                resolve: Default::default(),
+                cgroup_identity: std::collections::BTreeMap::new(),
+            }
+        }
+        let working = crate::provider_observation::objects::session_working_bytes();
+        let reservation = 1 << 20;
+        let pool = MemoryPool::new(2 * reservation + working - 1);
+        // Simulate the admitted first session's held lease.
+        let _held = pool.reserve(reservation).unwrap();
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let snapshot = eligible_snapshot(4242, 1);
+        assert!(
+            eligible(&snapshot.processes[0]),
+            "synthetic record must be eligible (premise)"
+        );
+        let objects = FocusedObjects {
+            observation: Arc::from([0u8; 8]),
+            count: Arc::from([0u8; 8]),
+            count_sha256: [0; 32],
+        };
+        let selection = Selection::default();
+        let cancel = AtomicBool::new(false);
+        let ctx = AdmitCtx {
+            pool: &pool,
+            objects: &objects,
+            reservation,
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel: &cancel,
+            tracing: true,
+            trust_reviewed: false,
+            selection: &selection,
+            max_active: 4,
+        };
+        let mut bytes = Vec::new();
+        let mut sink = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: true,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+        };
+        let mut admitted = Vec::new();
+        run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
+            .unwrap();
+        assert!(admitted.is_empty(), "tight pool must not admit");
+        let identity = Incarnation::from(&snapshot.processes[0]);
+        let entry = run
+            .deferred
+            .get(&DeferredKey::from(&identity))
+            .expect("refused newcomer must queue with the specific gap");
+        assert_eq!(entry.reason, "global_state_limit");
+        run.emit_limit_tick(&mut sink).unwrap();
+        drop(sink);
+        let rows: Vec<serde_json::Value> = String::from_utf8(bytes)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let limit = rows
+            .iter()
+            .find(|r| r["kind"] == "limit" && r["incarnation"]["pid"] == 4242 && r["at_tick"] == 0)
+            .expect("per-tick Limit must name the refused member");
+        assert_eq!(limit["reason"], "global_state_limit");
     }
     #[test]
     fn reincarnation_and_visibility_are_not_inferred_exits() {
@@ -6343,13 +6517,28 @@ mod tests {
         // pool refuses the admission (honest backpressure); a
         // fitting backlog coexists with the lease; a drained
         // backlog shrinks the guard on the next admission.
-        let pool = MemoryPool::new(100);
+        // T7.4-fix4 contract change (the ordering above is
+        // preserved): admission now also proves one stock parse
+        // transient per session, so the pool carries the working
+        // set past guard + lease instead of exhausting at the
+        // lease.
+        let working = crate::provider_observation::objects::session_working_bytes();
+        let pool = MemoryPool::new(100 + working);
         let mut run = RunState::new(BTreeSet::new(), 0, 1);
-        // 60 + 50 > 100: refused (the guard top-up fails first).
-        assert!(run.reserve_session(&pool, 60, 50).is_none());
-        // 60 + 40 == 100: admitted; guard + lease exhaust it.
+        // Backlog alone exceeds the pool: refused (the guard
+        // top-up fails first).
+        assert!(run.reserve_session(&pool, 60, 101 + working).is_none());
+        // 60 + 40 + working == pool: admitted; guard + lease +
+        // proven working exhaust it.
         let lease = run.reserve_session(&pool, 60, 40).expect("fits");
-        assert!(pool.reserve(1).is_none(), "guard + lease exhaust the pool");
+        assert!(
+            pool.reserve(working + 1).is_none(),
+            "only the proven working set remains"
+        );
+        assert!(
+            pool.reserve(working).is_some(),
+            "proven working set fits beside guard + lease"
+        );
         drop(lease);
         // Backlog drained: the guard shrinks (60 + 0) and room
         // returns.

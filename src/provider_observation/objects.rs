@@ -32,6 +32,14 @@ const MAX_STRINGS: u64 = 16 * 1024 * 1024;
 // A parser can retain at most one executable range per program header and
 // one offset per finite API. Reserve this conservative upper bound before
 // hashing, reads, or construction, including source-only inspection.
+/// Largest simultaneously-held parse transient for stock-size
+/// objects: the inventory scratch and the export headroom overlap
+/// on one parse and sum to this total (see `parse_object`).
+/// Admission proves one of these per session so an admitted
+/// member can always complete its parses.
+pub(crate) fn session_working_bytes() -> usize {
+    MAX_STRINGS as usize + MAX_SYMBOLS as usize * 24 + (1 << 20)
+}
 const PARSER_STATE_BYTES: usize = MAX_HEADERS * std::mem::size_of::<Segment>()
     + APIS.len() * std::mem::size_of::<(ObservationApi, u64)>()
     + TYPED_PUBLIC_ROLES.len()
@@ -2061,7 +2069,7 @@ pub(crate) fn parse_object(
     // now prevents re-reading completed inventory on every blocked retry.
     let inventory_bytes = inventory::elf::parser_scratch_bytes(before.len())
         .map_err(|_| ObservationGap::ReadLimit)?;
-    let export_bytes = MAX_STRINGS as usize + MAX_SYMBOLS as usize * 24 + (1 << 20);
+    let export_bytes = session_working_bytes();
     let _inventory = budget
         .memory
         .as_ref()
