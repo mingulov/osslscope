@@ -1316,6 +1316,17 @@ impl FocusedSession {
             _reservation: reservation,
         })
     }
+    /// Admission warm-tier signal: true once this member attached
+    /// callbacks — its parses completed into the run-shared cache,
+    /// so later members most likely clone instead of needing a
+    /// working transient of their own.
+    pub(crate) fn has_attached(&self) -> bool {
+        self.ready
+    }
+    #[cfg(test)]
+    pub(crate) fn set_attached_for_test(&mut self) {
+        self.ready = true;
+    }
     fn apply_batch(
         &mut self,
         batch: ObservationBatch,

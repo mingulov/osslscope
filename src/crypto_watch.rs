@@ -2876,14 +2876,27 @@ impl RunState {
     /// refuses the admission — pool too tight to even account the
     /// backlog (honest backpressure, never a hole).
     ///
-    /// T7.4-fix4: admission proves the session's full envelope —
-    /// lease plus one stock parse transient — before reserving.
-    /// The working set is proven, not held (parse transients are
-    /// short-lived; the held lease is unchanged). Without this,
-    /// every lease fits while no parse does, and all members
-    /// starve symmetric silent-zero; now the overflow member
-    /// refuses here and queues with the specific
-    /// `global_state_limit` gap instead.
+    /// T7.4-fix4: admission proves the session's working
+    /// envelope before reserving, in two tiers. Cold tier (no
+    /// live member attached yet): prove lease plus one stock
+    /// parse transient — the first member can always complete
+    /// its parses, so symmetric starvation (leases held, no
+    /// parse room, cache never filling) is impossible. Warm
+    /// tier (some live member attached): prove the lease only —
+    /// attachment implies that member's parses completed into
+    /// the run cache, so a new member most likely clones (this
+    /// keeps cache-covered followers admitted). The signal is
+    /// deliberately attachment, not cache non-emptiness: the
+    /// scanner prefills small files pre-admission, so a
+    /// warm-but-irrelevant cache must not admit lease-only
+    /// (that re-admits the starvation). The working set is
+    /// proven, not held (parse transients are short-lived; the
+    /// held lease is unchanged). A warm-tier member needing
+    /// DISTINCT uncached files still refuses its parses honestly
+    /// with named gaps and retries (contained self-degrade,
+    /// never symmetric deadlock: the cold-proven first member
+    /// always progresses). Overflow refuses here and queues with
+    /// the specific `global_state_limit` gap.
     fn reserve_session(
         &mut self,
         pool: &MemoryPool,
@@ -2898,10 +2911,13 @@ impl RunState {
         self.backlog_guard = None;
         let guard = pool.reserve(backlog)?;
         self.backlog_guard = Some(guard);
-        let working = crate::provider_observation::objects::session_working_bytes();
-        let envelope = reservation.checked_add(working)?;
-        if !pool.fits(envelope) {
-            return None;
+        let warm = self.active.iter().any(|a| a.session.has_attached());
+        if !warm {
+            let working = crate::provider_observation::objects::session_working_bytes();
+            let envelope = reservation.checked_add(working)?;
+            if !pool.fits(envelope) {
+                return None;
+            }
         }
         pool.reserve(reservation)
     }
@@ -5392,13 +5408,15 @@ mod tests {
         // in live 2-pid runs — both leases land before either
         // parse, so the cache never fills and BOTH sessions
         // refuse the first same-file parse (symmetric
-        // silent-zero). Admission now proves lease + one stock
-        // parse transient per session (`reserve_session`): the
-        // second maximal envelope refuses and queues with the
-        // specific `global_state_limit` gap, so this synthetic
-        // two-max-leases state is unreachable via admission and
-        // the admitted member always keeps parse room. This
-        // test's synthetic exhaustion still refuses (the pool
+        // silent-zero). Admission now proves the working
+        // envelope in two tiers (`reserve_session`): cold (no
+        // live member attached yet) proves lease + one stock
+        // transient, so the first member always keeps parse
+        // room and the cache fills; warm (some member
+        // attached) proves the lease only, so cache-covered
+        // followers still admit. Overflow queues with the
+        // specific `global_state_limit` gap. This test's
+        // synthetic exhaustion still refuses (the pool
         // arithmetic is unchanged). BPF map right-sizing stays
         // round-2 work.
         let pool = MemoryPool::new(GLOBAL_BYTES);
@@ -5438,10 +5456,11 @@ mod tests {
         // test proves the pool arithmetic: two leases +
         // coordinator + scanner fit (a third lease refused), and
         // the stock parser still coexists with ONE session.
-        // T7.4-fix4: admission no longer reaches the two-lease
-        // state for maximal sessions — the second envelope
-        // refuses at `reserve_session` (lease + working must
-        // fit) and queues `global_state_limit`. The admitted
+        // T7.4-fix4: cold admission no longer reaches the
+        // two-lease state for maximal sessions — the second
+        // envelope refuses at `reserve_session` (lease + working
+        // must fit) and queues `global_state_limit` until a
+        // member attaches and warms admission. The admitted
         // member keeps the one-session-plus-parser coexistence
         // below.
         let pool = MemoryPool::new(GLOBAL_BYTES);
@@ -5464,12 +5483,14 @@ mod tests {
     }
     #[test]
     fn second_session_envelope_refused_while_first_holds() {
-        // T7.4-fix4: admission proves lease + one stock parse
-        // transient per session. A pool fitting two leases but
-        // one byte short of the second working set admits the
-        // first session and refuses the second — the pre-fix
-        // over-admit held both leases with room for neither
-        // parse, starving BOTH sessions silent-zero.
+        // T7.4-fix4 cold tier (fresh run, nothing attached):
+        // admission proves lease + one stock parse transient per
+        // session.
+        // A pool fitting two leases but one byte short of the
+        // second working set admits the first session and refuses
+        // the second — the pre-fix over-admit held both leases
+        // with room for neither parse, starving BOTH sessions
+        // silent-zero.
         let working = crate::provider_observation::objects::session_working_bytes();
         let reservation = 1 << 20;
         let pool = MemoryPool::new(2 * reservation + working - 1);
@@ -5616,6 +5637,93 @@ mod tests {
             .find(|r| r["kind"] == "limit" && r["incarnation"]["pid"] == 4242 && r["at_tick"] == 0)
             .expect("per-tick Limit must name the refused member");
         assert_eq!(limit["reason"], "global_state_limit");
+    }
+    #[test]
+    fn cache_warmth_without_attach_keeps_cold_tier() {
+        // T7.4-fix4: cache non-emptiness is NOT the warm signal —
+        // the scanner prefills small files pre-admission, so a
+        // warm-but-irrelevant cache must not admit lease-only
+        // (that re-admits the starvation). Only an attached
+        // member warms admission (see below).
+        let working = crate::provider_observation::objects::session_working_bytes();
+        let reservation = 1 << 20;
+        let pool = MemoryPool::new(2 * reservation + working - 1);
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let first = run
+            .reserve_session(&pool, reservation, 0)
+            .expect("first admits cold");
+        // Warm the run cache with a real parse (roomy side pool).
+        let path = std::env::temp_dir().join(format!("osslscope-fix4-warm-{}", std::process::id()));
+        std::fs::copy("/bin/true", &path).unwrap();
+        {
+            let side = MemoryPool::new(64 << 20);
+            let mut budget = crate::provider_observation::ObservationBudget::default();
+            budget.memory = Some(side);
+            budget.parsed_cache = Some(run.parsed_cache.clone());
+            let mut file = std::fs::File::open(&path).unwrap();
+            crate::provider_observation::objects::parse_object(&mut file, None, &budget)
+                .expect("warm parse fills");
+        }
+        std::fs::remove_file(&path).unwrap();
+        let second = run.reserve_session(&pool, reservation, 0);
+        assert!(
+            second.is_none(),
+            "warmed cache without an attached member must not admit lease-only"
+        );
+        drop(first);
+    }
+    #[test]
+    fn attached_member_warms_admission_lease_only() {
+        // T7.4-fix4 warm tier: a live attached member's parses
+        // completed into the run cache, so a new member most
+        // likely clones — the lease alone admits (this keeps
+        // cache-covered followers, e.g. six_a survivors,
+        // admitted). Pins the readiness wiring; production
+        // readiness implies completed parses (argued at
+        // `reserve_session`, proven live by six_a + 2-pid runs).
+        let working = crate::provider_observation::objects::session_working_bytes();
+        let reservation = 1 << 20;
+        let pool = MemoryPool::new(2 * reservation + working - 1);
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        let first = run
+            .reserve_session(&pool, reservation, 0)
+            .expect("first admits cold");
+        let mut session = FocusedSession::hollow_for_coordinator_tests(
+            4242,
+            1,
+            crate::inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+            &pool,
+        );
+        session.set_attached_for_test();
+        run.active.push(Active {
+            identity: Incarnation {
+                pid: 4242,
+                starttime: 1,
+                namespaces: crate::inventory::NamespaceIds {
+                    pid: None,
+                    mount: None,
+                },
+            },
+            segment: 1,
+            image_epoch: 0,
+            session,
+            ledger: MemberLedger::empty(),
+            admit_ns: 0,
+            suspended: false,
+            cgroup: None,
+            grace_noted: None,
+            loss_seen: [0; 8],
+        });
+        let second = run.reserve_session(&pool, reservation, 0);
+        assert!(
+            second.is_some(),
+            "attached member warms admission to lease-only"
+        );
+        drop(first);
+        drop(second);
     }
     #[test]
     fn reincarnation_and_visibility_are_not_inferred_exits() {
