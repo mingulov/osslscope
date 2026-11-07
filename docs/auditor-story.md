@@ -115,23 +115,35 @@ new evidence it cannot represent.
 ## 3. Gate: violation detection on evidence
 
 Current integrated COMPLETE-window gating remains unqualified.
-These illustrative runs show policy verdicts using the example's
-invocation shape. Exit comments assume no higher priority failure:
+These illustrative runs show policy verdicts using the runnable
+invocation shape (substitute a real service path; the full gate
+shape with companions, workload capture and artifacts is §1
+above and [CI gate recipes](ci-recipes.md)). Exit comments
+assume no higher priority failure:
 
 ```sh
 # Expected crypto executed: policy pass (exit 3 = PARTIAL, no violation).
-osslscope check ... --require-executed HKDF \
-  --format json --out pass.json run -- /path/to/service --foreground
+osslscope check \
+  --require-executed HKDF \
+  --duration 30 --grace 5 \
+  --format json --out pass.json \
+  run -- /path/to/service --foreground
 # verdict: pass, HKDF definite use proved.
 
 # Banned crypto executed: violation (exit 10).
-osslscope check ... --deny-algorithm DES \
-  --format json --out viol.json run -- /path/to/service --foreground
+osslscope check \
+  --deny-algorithm DES \
+  --duration 30 --grace 5 \
+  --format json --out viol.json \
+  run -- /path/to/service --foreground
 # verdict: violation, definite DES use proved.
 
 # Required crypto absent under a relevant gap: inconclusive (exit 11).
-osslscope check ... --require-executed SNMPKDF \
-  --format json --out inconc.json run -- /path/to/service --foreground
+osslscope check \
+  --require-executed SNMPKDF \
+  --duration 30 --grace 5 \
+  --format json --out inconc.json \
+  run -- /path/to/service --foreground
 # verdict: inconclusive, the requirement is unproven, never fabricated.
 ```
 

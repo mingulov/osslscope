@@ -51,15 +51,31 @@ dilute a one-time burst without making its calls application crypto.
 
 ## Observation recipe
 
-- Use provider mode for the module: `--provider
-  .../ossl-modules/fips.so`, without `--builtin`. Run `doctor`
-  with the same selected BPF objects and target settings first.
-  Omit explicit `--members-object`: traversal needs a builtin query
-  anchor, while automatic triple selection can stay harvest-only
-  for file-provider observation.
+- Observe the FIPS workload with automatic discovery in spawn
+  mode — the current surface has no provider-selection flags
+  (`--provider`/`--builtin`/`--members-object` are rejected; see
+  [usage](usage.md#execution-report-and-check)). With a trusted
+  system install the companions resolve implicitly; otherwise
+  pass the same explicit `--observation-object`/`--count-object`
+  pair to `doctor` and capture:
+
+  ```sh
+  osslscope doctor || exit 4
+
+  osslscope report \
+    --duration 30 --format json --out fips.json \
+    --workload-out fips.workload.log \
+    run -- /path/to/fips-workload --args \
+    >fips.driver.log 2>&1
+  ```
+
+  FIPS identity is operator-recorded provenance about the exact
+  observed bytes (provider-class enrollment is deferred on
+  report/check): record the libcrypto build, its source, and the
+  self-test context with the artifact. Counts never certify.
 - Drive representative crypto during the effective count window;
   record whether load/first-use/keygen overlaps it. A load-only
-  attempt or a preloaded `--pid` target may yield no harvest rows;
+  attempt or a preloaded `--pid` target may yield zero sites;
   read the actual typed gaps and exit status rather than assuming
   a fixed `no-query` result.
 - Keep startup and pre-attach limits explicit. `run --` improves
