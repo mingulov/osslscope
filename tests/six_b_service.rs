@@ -1051,3 +1051,50 @@ fn sixb_leaked_spills_retry_in_run() {
         "run summary written, dir: {dir:?}"
     );
 }
+
+/// Small `--grace` still seals + summarizes (S3/WS-A pin): with a
+/// 0.5 s shutdown budget (10× under default), the final close —
+/// drain, seal, summary — completes and the run exits 3 with its
+/// windows + summary intact. Characterization pin (green
+/// pre-propagation too — the unprivileged drain is trivially fast);
+/// the privileged slow-drain end-to-end stays open (see report).
+#[test]
+fn sixb_small_grace_seals_and_summarizes() {
+    let dir = fresh_dir("small-grace");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    let mut svc = bin()
+        .arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--interval")
+        .arg("0.2")
+        .arg("--grace")
+        .arg("0.5")
+        .spawn()
+        .expect("spawn service");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
+    let status = wait_bounded(&mut svc, 30).expect("service exits after TERM");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "cancel-after-windows exits 3, got {status:?}"
+    );
+    assert!(
+        dir.join("window-0000000000.json").is_file(),
+        "window 0 published, dir: {dir:?}"
+    );
+    assert!(
+        dir.join("run-summary.json").is_file(),
+        "run summary written, dir: {dir:?}"
+    );
+}

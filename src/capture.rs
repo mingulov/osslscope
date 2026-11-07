@@ -1437,6 +1437,20 @@ pub trait LifecyclePort {
     ) -> LifecycleClose {
         LifecycleClose::default()
     }
+    /// Close drain capped by an external shutdown deadline (S3/WS-A:
+    /// the service `--grace` remainder). Ports whose drain carries
+    /// its own internal bound honor the EARLIER of the two
+    /// (fail-closed loss + no suffix witness on the cap, exactly
+    /// like the internal bound). Default: the uncapped drain.
+    fn close_drain_capped(
+        &mut self,
+        edge: LifecycleEdge,
+        permit: Option<&crate::count_owner::CountForkPermit<'_>>,
+        deadline: Instant,
+    ) -> LifecycleClose {
+        let _ = deadline;
+        self.close_drain(edge, permit)
+    }
     /// Mark the owned target released (R20-fix round 3, F2): from
     /// here on the target can emit, so per-CPU first sightings gap
     /// their unwitnessed prefix instead of baselining silently.
@@ -3372,6 +3386,37 @@ impl LifecyclePort for KernelLifecycle {
         let deadline = *self
             .close_deadline
             .get_or_insert_with(|| Instant::now() + SYNC_WATERMARK_TIMEOUT);
+        self.close_drain_inner(deadline)
+    }
+
+    fn close_drain_capped(
+        &mut self,
+        edge: LifecycleEdge,
+        permit: Option<&crate::count_owner::CountForkPermit<'_>>,
+        deadline: Instant,
+    ) -> LifecycleClose {
+        let _ = permit; // As above: irrelevant to private-table helpers.
+        if self.dead || self.producer.is_none() {
+            return self.drain_prefix_without_fork(edge);
+        }
+        let internal = *self
+            .close_deadline
+            .get_or_insert_with(|| Instant::now() + SYNC_WATERMARK_TIMEOUT);
+        self.close_drain_inner(cap_close_deadline(internal, deadline))
+    }
+}
+
+/// Effective close-drain deadline (S3/WS-A): the shutdown remainder
+/// caps the port's internal bound — the EARLIER wins, so a service
+/// drain never outlives `--grace`.
+fn cap_close_deadline(internal: Instant, external: Instant) -> Instant {
+    internal.min(external)
+}
+
+impl KernelLifecycle {
+    /// Watermark burst + bounded drain rounds under one explicit
+    /// deadline (shared by the plain and externally-capped drains).
+    fn close_drain_inner(&mut self, deadline: Instant) -> LifecycleClose {
         let mut delta = std::mem::take(&mut self.pending_delta);
         let plan = self.close_cpu_plan();
         let seen = self.producer_burst(
@@ -3591,6 +3636,18 @@ impl LifecyclePort for LiveLifecycle {
         match self {
             LiveLifecycle::Kernel(k) => k.close_drain(edge, permit),
             LiveLifecycle::Polling(p) => p.close_drain(edge, permit),
+        }
+    }
+
+    fn close_drain_capped(
+        &mut self,
+        edge: LifecycleEdge,
+        permit: Option<&crate::count_owner::CountForkPermit<'_>>,
+        deadline: Instant,
+    ) -> LifecycleClose {
+        match self {
+            LiveLifecycle::Kernel(k) => k.close_drain_capped(edge, permit, deadline),
+            LiveLifecycle::Polling(p) => p.close_drain_capped(edge, permit, deadline),
         }
     }
 
@@ -12986,6 +13043,60 @@ pub(crate) mod tests {
         lc.fd = crate::capture_setup::SetupResource::local(socket.into());
         drop(lc);
         drop(peer);
+    }
+
+    /// S3/WS-A: the shutdown remainder caps the close drain — the
+    /// EARLIER of the port's internal bound and the external
+    /// deadline wins, so a service drain never outlives `--grace`
+    /// (fail-closed loss + no suffix witness on the cap, exactly
+    /// like the internal bound).
+    #[test]
+    fn close_drain_cap_takes_earlier_deadline() {
+        let now = Instant::now();
+        let internal = now + Duration::from_secs(2);
+        let external = now + Duration::from_millis(50);
+        assert_eq!(cap_close_deadline(internal, external), external);
+        assert_eq!(cap_close_deadline(external, internal), external);
+        assert_eq!(cap_close_deadline(internal, internal), internal);
+    }
+
+    /// S3/WS-A: without a producer there is no watermark burst to
+    /// bound — the capped drain delegates to the prefix drain,
+    /// identically to the plain drain (fast either way).
+    #[test]
+    fn close_drain_capped_without_producer_matches_plain() {
+        use std::os::unix::net::UnixDatagram;
+        let edge = LifecycleEdge {
+            start_ns: 1000,
+            end_ns: 2000,
+        };
+        let run_plain = || {
+            let (_peer, socket) = UnixDatagram::pair().unwrap();
+            let mut lc = ingest_fixture(HashSet::from([100]), SeqState::default(), false);
+            let close = lc.close_drain(edge, None);
+            lc.fd = crate::capture_setup::SetupResource::local(socket.into());
+            drop(lc);
+            close
+        };
+        let run_capped = || {
+            let (_peer, socket) = UnixDatagram::pair().unwrap();
+            let mut lc = ingest_fixture(HashSet::from([100]), SeqState::default(), false);
+            let t0 = Instant::now();
+            let close =
+                lc.close_drain_capped(edge, None, Instant::now() + Duration::from_millis(50));
+            let dt = t0.elapsed();
+            lc.fd = crate::capture_setup::SetupResource::local(socket.into());
+            drop(lc);
+            (close, dt)
+        };
+        let plain = run_plain();
+        let (capped, dt) = run_capped();
+        assert_eq!(capped, plain);
+        assert!(!capped.suffix_witness);
+        assert!(
+            dt < Duration::from_secs(2),
+            "no-producer drain stays fast: {dt:?}"
+        );
     }
 
     #[test]

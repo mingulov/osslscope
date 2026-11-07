@@ -1990,7 +1990,13 @@ fn close_final_window(mut run: Run) -> ExitCode {
     let seq = run.cycle.as_ref().expect("window open at final close").seq;
     // Drain (the engine retires sessions without readmit; cancel
     // stops admission, never the drain mechanics — mirrors 6A).
-    let drain = run.engine.close_drain(&run.cancel);
+    // The minted shutdown deadline caps the drain itself (S3/WS-A —
+    // a bare assignment would not bound it); seal/cleanup/summary
+    // below draw from the same deadline's remainder.
+    let drain_deadline = run.close_deadline.expect("minted above");
+    let drain = run
+        .engine
+        .close_drain_capped(&run.cancel, Some(drain_deadline));
     match drain {
         Ok(out) => {
             // Stage the drain bytes (spill-capable — a spill failure
@@ -2075,9 +2081,12 @@ fn close_final_window(mut run: Run) -> ExitCode {
 /// with the TERMINAL seal (`exhausted`, no next window ever).
 fn close_terminal_window(mut run: Run) -> BoundaryOut {
     // The ONE shutdown deadline (R1 finding 3 — before the drain,
-    // like the final close).
+    // like the final close), capping the drain itself (S3/WS-A).
     run.close_deadline = Some(Instant::now() + run.cfg.grace);
-    let drain = run.engine.close_drain(&run.cancel);
+    let drain_deadline = run.close_deadline.expect("minted above");
+    let drain = run
+        .engine
+        .close_drain_capped(&run.cancel, Some(drain_deadline));
     match drain {
         Ok(out) => {
             // Close-drain staging (worker-backed spills under the

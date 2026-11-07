@@ -4472,6 +4472,18 @@ impl ServiceEngine {
     /// run IS cancelled — the window-level reason rides the
     /// envelope/summary, never the 6A vocabulary).
     pub(crate) fn close_drain(&mut self, cancel: &AtomicBool) -> io::Result<CloseOut> {
+        self.close_drain_capped(cancel, None)
+    }
+
+    /// 6A close drain with an external shutdown deadline (S3/WS-A):
+    /// the service passes its minted `--grace` deadline so the
+    /// transport drain honors the shutdown remainder instead of
+    /// only its internal bound; `None` keeps the plain drain (6A).
+    pub(crate) fn close_drain_capped(
+        &mut self,
+        cancel: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> io::Result<CloseOut> {
         let mut buf = Vec::new();
         let mut out = Output {
             writer: &mut buf,
@@ -4499,7 +4511,10 @@ impl ServiceEngine {
                 start_ns: run_origin_ns,
                 end_ns: LiveClock.monotonic_ns(),
             };
-            let close = port.close_drain(edge, None);
+            let close = match deadline {
+                Some(d) => port.close_drain_capped(edge, None, d),
+                None => port.close_drain(edge, None),
+            };
             if let Some(delta) = close.delta {
                 run.scan_loss = run.scan_loss.saturating_add(delta.loss);
                 run.signal_dropped = run.signal_dropped.saturating_add(delta.dropped);
