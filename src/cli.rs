@@ -52,6 +52,19 @@ pub(crate) fn exit_code_help_doctor_profiled() -> [&'static str; 3] {
     ]
 }
 
+/// Exit-code lines for report: a finalized observation with no
+/// policy evaluation (the outcome is Pass/NoVerdict only), so
+/// 10/11 are unemittable; PARTIAL lands on 3, setup refusal on 4.
+pub(crate) fn exit_code_help_report() -> [&'static str; 5] {
+    [
+        "  exit 0: completed report",
+        "  exit 1: child, artifact-delivery, or usable runtime failure",
+        "  exit 2: invalid arguments or explicit companion",
+        "  exit 3: PARTIAL report",
+        "  exit 4: setup/environment refusal without usable observation (no verdict)",
+    ]
+}
+
 /// One help line per exit code (mirrors docs/usage.md#exit-codes).
 /// Exits 3/4 additionally print their single stderr reason at runtime
 /// (see `report::exit_reason_line`).

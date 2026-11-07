@@ -1041,19 +1041,51 @@ fn installed_api_six_families_failures_size_queries_and_unused_fetch() {
 }
 
 #[test]
-fn report_check_help_names_exit_codes() {
-    for command in ["report", "check"] {
-        let out = cli(command, &["--help"]);
-        let help = String::from_utf8_lossy(&out.stdout);
+fn report_help_lists_only_emittable_exits() {
+    // 1D-fix1 (codex R1): report evaluates no policy (its outcome
+    // is Pass/NoVerdict only), so 10/11 are unemittable and must
+    // not be advertised; 0/1/2/3/4 all are (see the fix-round
+    // audit for the emitter tally).
+    let out = cli("report", &["--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    for emittable in ["exit 0:", "exit 1:", "exit 2:", "exit 3:", "exit 4:"] {
         assert!(
-            help.contains("exit 3:") && help.contains("exit 4:"),
-            "{command} help must name exit codes, got: {help}"
-        );
-        assert!(
-            help.contains("first run blocked?"),
-            "{command} help must point first runs at doctor, got: {help}"
+            help.contains(emittable),
+            "report help must name {emittable} got: {help}"
         );
     }
+    for unemittable in ["exit 10", "exit 11"] {
+        assert!(
+            !help.contains(unemittable),
+            "report help must not list unemittable {unemittable}, got: {help}"
+        );
+    }
+    assert!(
+        help.contains("first run blocked?"),
+        "report help must point first runs at doctor, got: {help}"
+    );
+}
+
+#[test]
+fn check_help_names_policy_exits() {
+    // 1D-fix1: check genuinely emits 10/11 (rule evaluation folds
+    // into the exit via exit_for), so its table keeps them.
+    let out = cli("check", &["--help"]);
+    let help = String::from_utf8_lossy(&out.stdout);
+    for emittable in ["exit 10:", "exit 11:"] {
+        assert!(
+            help.contains(emittable),
+            "check help must name {emittable} got: {help}"
+        );
+    }
+    assert!(
+        help.contains("exit 3:") && help.contains("exit 4:"),
+        "check help must name exit codes, got: {help}"
+    );
+    assert!(
+        help.contains("first run blocked?"),
+        "check help must point first runs at doctor, got: {help}"
+    );
 }
 
 #[test]
