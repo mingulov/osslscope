@@ -449,6 +449,17 @@ pub fn view_slot(dest: &Destination) -> Option<SlotView> {
     Some(view)
 }
 
+/// Non-consuming slot read (R4 finding 1): availability probes use
+/// this — a finished prior receipt must reconcile before tap
+/// reuse, never be consumed-and-dropped by a liveness check.
+pub fn peek_slot(dest: &Destination) -> Option<SlotView> {
+    let reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+    reg.get(dest).map(|slot| SlotView {
+        live: slot.live,
+        receipt: slot.receipt.clone(),
+    })
+}
+
 /// Map a `Control` to its `close_accounting` outcome word.
 pub fn outcome_of<T>(control: &Control<T>) -> OpOutcome {
     match control {

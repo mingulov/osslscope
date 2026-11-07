@@ -40,7 +40,7 @@ use crate::service::state::{
 };
 use crate::service::stream::{Tap, TapOpenError, resolve_stream};
 use crate::service::worker::{
-    Control, DestClass, Destination, Diagnostics, Gate, WaitPoll, WorkerOut, outcome_of,
+    Control, DestClass, Destination, Diagnostics, Gate, WaitPoll, WorkerOut, outcome_of, peek_slot,
     push_accounting, run_under_control, view_slot,
 };
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -3019,8 +3019,9 @@ enum SinksOut {
 }
 
 /// Boundary sinks (§4.3 step 4): pending-rotation reconcile →
-/// rotation decision → stream marker+ref enqueue → tap drive →
-/// retention + quota. No `--stream` ⟹ retention only.
+/// rotation decision → stream marker+ref enqueue → stale-op
+/// recheck → tap drive → retention + quota. No `--stream` ⟹
+/// retention only.
 /// Rotation-tail reconcile (L6 over the ROTATED file): content-match
 /// the rotated tail against the in-flight records abandoned at
 /// rotation (§7.2 rotation mode — those records were folded
@@ -3094,14 +3095,18 @@ fn reconcile_rotation(run: &mut Run) {
                 // Struck from the (epipe-folded) ledger + counted
                 // recovered (delivered-exactly-once: the fold
                 // claimed the drop, the tail proves the landing —
-                // NET corrects, gross stands).
+                // NET corrects, gross stands; a proof post-delivery
+                // still credits — R4 finding 1, same rule as the
+                // receipt/tail rungs).
                 let seq = rec.seq.unwrap_or(rot.last);
-                let (r, b) = s.queue.strike(
+                let full = rec.full_bytes();
+                let struck = s.queue.strike(
                     seq,
-                    rec.full_bytes(),
+                    full,
                     crate::service::envelope::DropReason::Epipe,
                     rec.fold_token,
                 );
+                let (r, b) = credit_proven_landing(struck, full, rec.fold_token);
                 // Rotation content-match proves the landing (same
                 // proof as the active tail) — a landed marker is
                 // delivered (R3 Gate 4 F4 — mirrors the regular
@@ -3388,6 +3393,40 @@ fn tap_dest(run: &Run) -> Destination {
     }
 }
 
+/// Tap-slot readiness (R4 finding 1): a finished prior receipt
+/// reconciles BEFORE tap reuse/marker delivery — never
+/// consumed-and-dropped by an availability probe. Returns false
+/// when a live worker owns the slot (retry next boundary); true
+/// when the slot is free (a finished receipt reconciled, or an
+/// empty/settled slot consumed).
+fn tap_slot_ready(run: &mut Run, abandon_cause: crate::service::envelope::DropReason) -> bool {
+    let dest = tap_dest(run);
+    match peek_slot(&dest) {
+        None => true,
+        Some(v) if v.live => false,
+        Some(v) => {
+            if let Some(receipt) = v.receipt {
+                let owned = run
+                    .stream
+                    .as_ref()
+                    .is_some_and(|s| s.inflight.iter().any(|r| r.op_id == receipt.op_id));
+                if owned {
+                    reconcile_tap_write(run, receipt.op_id, abandon_cause);
+                    // The reconcile consumed the slot; re-peek
+                    // defensively (anything but free retries next
+                    // boundary — never proceed while occupied).
+                    return peek_slot(&tap_dest(run)).is_none();
+                }
+            }
+            // Receiptless, or an already-settled owner's redundant
+            // receipt (rotation/prior recheck credited it): consume
+            // and proceed.
+            view_slot(&dest);
+            true
+        }
+    }
+}
+
 /// Drive the tap (§§5.2–5.3, 7.2): open while pending (every
 /// boundary), then pop+write while open and queued
 /// (MAX_OUTSTANDING_TAP = 1 — a registered prior refuses the
@@ -3415,9 +3454,10 @@ fn drive_tap_inner(
     // pending — records accumulate + evict oldest as queue_full).
     if !run.stream.as_ref().expect("stream state").tap.is_open() {
         let dest = tap_dest(run);
-        // Successor refused while a prior tap worker is registered
+        // A finished prior receipt reconciles before tap reuse (R4
+        // finding 1); a live prior refuses the successor
         // (fail-closed — retry next boundary, never concurrent).
-        if matches!(view_slot(&dest), Some(v) if v.live) {
+        if !tap_slot_ready(run, abandon_cause) {
             return false;
         }
         let open_budget = close_budget(run);
@@ -3474,7 +3514,10 @@ fn drive_tap_inner(
             }
         }
         let dest = tap_dest(run);
-        if matches!(view_slot(&dest), Some(v) if v.live) {
+        // A finished prior receipt (this drive's or an earlier
+        // boundary's) reconciles before the next dispatch (R4
+        // finding 1); a live prior stops the drive here.
+        if !tap_slot_ready(run, abandon_cause) {
             return false;
         }
         let popped = run.stream.as_mut().and_then(|s| s.queue.pop());
@@ -3659,6 +3702,108 @@ fn retire_if_marker(queue: &mut StreamQueue, kind: &str, seq: u64) {
     }
 }
 
+/// Proven-landing credit (R4 finding 1): `strike` guards the
+/// pending spans (post-delivery ⟹ no-op, never a
+/// double-subtract); the GROSS credit is independent — a proven
+/// landing credits its full bytes even when the spans no-op (gross
+/// retains them; Control 1 subtracts recovery ONCE from gross).
+/// Folded ops only (an unfolded op has no gross bytes to recover).
+fn credit_proven_landing(struck: (u64, u64), full_bytes: u64, fold_token: u64) -> (u64, u64) {
+    if struck == (0, 0) && fold_token != 0 {
+        (1, full_bytes)
+    } else {
+        struck
+    }
+}
+
+/// Settle one in-flight tap op from its worker receipt (the §7.2
+/// outcome ladder's receipt rung): Complete → strike + credit (a
+/// landed marker is delivered); Failed → the marker retires, the
+/// record stays folded; Partial → stays in-flight for the tail
+/// recheck.
+fn settle_tap_receipt(
+    run: &mut Run,
+    rec: &crate::service::stream::InflightRecord,
+    seq: u64,
+    state: crate::service::worker::TapReceiptState,
+    abandon_cause: crate::service::envelope::DropReason,
+) {
+    match state {
+        crate::service::worker::TapReceiptState::Complete { .. } => {
+            let full = rec.full_bytes();
+            let struck = run.stream.as_mut().expect("stream state").queue.strike(
+                seq,
+                full,
+                abandon_cause,
+                rec.fold_token,
+            );
+            let (r, b) = credit_proven_landing(struck, full, rec.fold_token);
+            run.summary.tap_recovered.records += r;
+            run.summary.tap_recovered.bytes += b;
+            if rec.kind == "drop-marker" {
+                if let Some(s) = run.stream.as_mut() {
+                    s.queue.clear_marker(seq);
+                }
+            }
+            // Settles exactly once (no future recheck re-credits).
+            if let Some(s) = run.stream.as_mut() {
+                s.inflight.retain(|r| r.op_id != rec.op_id);
+            }
+        }
+        crate::service::worker::TapReceiptState::Failed { .. } => {
+            // Failed: the bytes never land (the worker is gone) —
+            // a Failed marker retires (it never delivers). The
+            // record stays in-flight until the next recheck drops
+            // it as never-landing.
+            if let Some(s) = run.stream.as_mut() {
+                retire_if_marker(&mut s.queue, &rec.kind, seq);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Settle a consumed receipt's owner (R4 finding 1 — the tap slot
+/// is shared, so a recheck can consume another op's receipt): the
+/// owner settles from its own dispatch record; an already-settled
+/// owner (rotation content-match, prior recheck) makes the receipt
+/// redundant — never a second credit.
+fn settle_receipt_owner(
+    run: &mut Run,
+    receipt: &crate::service::worker::TapReceipt,
+    abandon_cause: crate::service::envelope::DropReason,
+) {
+    let owner = run.stream.as_ref().and_then(|s| {
+        s.inflight
+            .iter()
+            .find(|r| r.op_id == receipt.op_id)
+            .cloned()
+    });
+    let Some(rec) = owner else {
+        return;
+    };
+    let seq = rec.seq.unwrap_or(0);
+    settle_tap_receipt(run, &rec, seq, receipt.state, abandon_cause);
+}
+
+/// Receiptless reconcile (no worker receipt for this op): regular
+/// files tail-re-read (bounded content-match — the L6 resync rule
+/// covers resync-completed partials); FIFOs go uncertain (the bytes
+/// may yet land, unprovable — no tail exists).
+fn reconcile_receiptless(
+    run: &mut Run,
+    rec: &crate::service::stream::InflightRecord,
+    seq: u64,
+    abandon_cause: crate::service::envelope::DropReason,
+    worker_live: bool,
+) {
+    if !rec.fifo {
+        tail_reconcile_regular(run, rec, seq, abandon_cause, worker_live);
+    } else {
+        push_tap_uncertain(run, rec, seq);
+    }
+}
+
 /// Reconcile one detached tap write (§7.2 outcome ladder):
 /// receipt Complete → strike + `tap_recovered`; Partial/Failed →
 /// stays folded (a Failed marker retires — its bytes never land);
@@ -3689,51 +3834,19 @@ fn reconcile_tap_write(
     match slot.and_then(|v| v.receipt) {
         Some(receipt) if receipt.op_id == op_id => {
             // The worker exited with its receipt: settle now.
-            let done = match receipt.state {
-                crate::service::worker::TapReceiptState::Complete { .. } => {
-                    let (r, b) = run.stream.as_mut().expect("stream state").queue.strike(
-                        seq,
-                        rec.full_bytes(),
-                        abandon_cause,
-                        rec.fold_token,
-                    );
-                    run.summary.tap_recovered.records += r;
-                    run.summary.tap_recovered.bytes += b;
-                    if rec.kind == "drop-marker" {
-                        if let Some(s) = run.stream.as_mut() {
-                            s.queue.clear_marker(seq);
-                        }
-                    }
-                    true
-                }
-                crate::service::worker::TapReceiptState::Failed { .. } => {
-                    // Failed: the bytes never land (the worker is
-                    // gone) — a Failed marker retires (it never
-                    // delivers). The record stays in-flight until
-                    // the next recheck drops it as never-landing.
-                    if let Some(s) = run.stream.as_mut() {
-                        retire_if_marker(&mut s.queue, &rec.kind, seq);
-                    }
-                    false
-                }
-                _ => false,
-            };
-            if done {
-                if let Some(s) = run.stream.as_mut() {
-                    s.inflight.retain(|r| r.op_id != op_id);
-                }
-            }
+            settle_tap_receipt(run, &rec, seq, receipt.state, abandon_cause);
+        }
+        Some(receipt) => {
+            // Another op's receipt (the tap slot is shared): its
+            // owner settles from it FIRST (R4 finding 1 — a
+            // consumed receipt is never dropped); then this op
+            // proceeds receiptless + worker-gone (it never owned
+            // this slot, so no worker of its can still be live).
+            settle_receipt_owner(run, &receipt, abandon_cause);
+            reconcile_receiptless(run, &rec, seq, abandon_cause, false);
         }
         _ => {
-            // No receipt: regular files tail-re-read (bounded
-            // content-match — the L6 resync rule covers
-            // resync-completed partials); FIFOs go uncertain (the
-            // bytes may yet land, unprovable — no tail exists).
-            if !rec.fifo {
-                tail_reconcile_regular(run, &rec, seq, abandon_cause, worker_live);
-            } else {
-                push_tap_uncertain(run, &rec, seq);
-            }
+            reconcile_receiptless(run, &rec, seq, abandon_cause, worker_live);
         }
     }
 }
@@ -3783,12 +3896,17 @@ fn tail_reconcile_regular(
     };
     let matched = crate::service::stream::reconcile_tail(&lines, std::slice::from_ref(rec));
     if matched.contains(&rec.op_id) {
-        let (r, b) = run.stream.as_mut().expect("stream state").queue.strike(
+        let full = rec.full_bytes();
+        let struck = run.stream.as_mut().expect("stream state").queue.strike(
             seq,
-            rec.full_bytes(),
+            full,
             abandon_cause,
             rec.fold_token,
         );
+        // A content-proven landing credits even post-delivery (R4
+        // finding 1 — same rule as the receipt rung; exactly once:
+        // the op leaves in-flight below).
+        let (r, b) = credit_proven_landing(struck, full, rec.fold_token);
         run.summary.tap_recovered.records += r;
         run.summary.tap_recovered.bytes += b;
         if rec.kind == "drop-marker" {
@@ -4476,7 +4594,9 @@ fn close_run_end(mut run: Run) -> ExitCode {
         .map(|s| s.inflight.iter().map(|r| r.op_id).collect())
         .unwrap_or_default();
     for op_id in op_ids {
-        let live = matches!(view_slot(&tap_dest(&run)), Some(v) if v.live);
+        // Peek (non-consuming — R4 finding 1): the reconcile below
+        // must see a finished receipt.
+        let live = matches!(peek_slot(&tap_dest(&run)), Some(v) if v.live);
         if live {
             let rec = run
                 .stream
@@ -4737,17 +4857,13 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
     // file — post-rotation, so queued records land in the new
     // file, §6.1).
     enqueue_boundary_records(&mut run, seq, &sha256);
-    // Tap drive (open attempts + writes, MAX_OUTSTANDING_TAP = 1).
-    // A post-open reserved identity ends the run as a tool failure
-    // (the published window stands; the fold resolves exit 1).
-    // Stale ops (below the pre-drive op id) recheck after the
-    // drive (R3 Gate 4 F4 — the "next boundary's recheck" the
-    // reconcile promises; rotation already ran above, so rotated
-    // landings matched first).
+    // Stale ops (below this boundary's first op id) recheck BEFORE
+    // the tap drive (R4 finding 1 — prior receipts reconcile before
+    // tap reuse/marker delivery; rotation already ran above, so
+    // rotated landings matched first). Receipts landing mid-drive
+    // reconcile at the drive's own availability checks
+    // (`tap_slot_ready`) or at the next boundary.
     let recheck_below = run.stream.as_ref().map(|s| s.next_op_id).unwrap_or(0);
-    if drive_tap(&mut run) {
-        return (run, SinksOut::QuotaStop);
-    }
     let stale: Vec<u64> = run
         .stream
         .as_ref()
@@ -4761,6 +4877,12 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
         .unwrap_or_default();
     for op_id in stale {
         reconcile_tap_write(&mut run, op_id, crate::service::envelope::DropReason::Epipe);
+    }
+    // Tap drive (open attempts + writes, MAX_OUTSTANDING_TAP = 1).
+    // A post-open reserved identity ends the run as a tool failure
+    // (the published window stands; the fold resolves exit 1).
+    if drive_tap(&mut run) {
+        return (run, SinksOut::QuotaStop);
     }
     // Retention + quota (§6.2 — enforced at this boundary).
     let retain_budget = close_budget(&run);
@@ -5674,6 +5796,286 @@ mod tests {
             "a doubled run never seals"
         );
         assert_eq!(seq["reserved"]["reason"], "double_signal");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    // --- R4 finding 1 regressions (stale-op/tap reconciliation) ---
+    //
+    // Reviewer schedule: R expired + folded; initial reconciliation
+    // before R lands; R lands fully; the next boundary consumes the
+    // receipt during the tap check; the drive delivers R's marker;
+    // the stale recheck strikes R. RED = `tap_recovered` misses R's
+    // bytes while R is reader-visible and gross retains them (an
+    // over-claim beyond the named uncertain bytes); GREEN = credit
+    // preserved exactly once.
+
+    /// Live `Run` with window `seq` open and an attached stream
+    /// (regular-file tap under the scratch out-DIR).
+    fn r41_run(out: &Path, seq: u64) -> (Run, S4MaskGuard) {
+        let (mut run, guard) = s4_run(out, seq, Vec::new());
+        let tap_path = out.join("stream.jsonl");
+        std::fs::write(&tap_path, b"").unwrap();
+        run.stream = Some(StreamState {
+            tap_path,
+            tap: Tap::pending(),
+            queue: crate::service::queue::StreamQueue::new(65536, 4096),
+            first_record_wall: None,
+            active_first: None,
+            active_last: None,
+            active_records: 0,
+            inflight: Vec::new(),
+            next_op_id: 0,
+            pending_reconcile: None,
+        });
+        (run, guard)
+    }
+
+    fn r41_record(seq: u64) -> Vec<u8> {
+        format!("{{\"kind\":\"window-ref\",\"generation\":1,\"seq\":{seq},\"sha256\":\"abc\"}}")
+            .into_bytes()
+    }
+
+    /// Fold R as an abandoned tap dispatch (op 0): ledger fold +
+    /// the in-flight dispatch record carrying the fold token.
+    fn r41_fold_abandoned(run: &mut Run, content: Vec<u8>, seq: u64) {
+        use crate::service::envelope::DropReason;
+        let full = content.len() as u64 + 1;
+        let s = run.stream.as_mut().expect("stream attached");
+        let token = s.queue.fold(seq, full, DropReason::Epipe);
+        s.inflight.push(crate::service::stream::InflightRecord {
+            op_id: 0,
+            content,
+            kind: "window-ref".to_string(),
+            seq: Some(seq),
+            span: None,
+            fifo: false,
+            fold_token: token,
+        });
+        s.next_op_id = 1;
+    }
+
+    /// Plant a Complete tap receipt for `op_id` in the tap slot (the
+    /// abandoned-worker shape: a zero-budget waiter expires while
+    /// the worker is gated; the release lets it exit with its
+    /// receipt, which `on_exit` stores because the flag is set).
+    fn r41_plant_complete_receipt(run: &Run, op_id: u64, kind: &str, seq: u64, bytes: u64) {
+        use crate::service::worker::{TapReceipt, TapReceiptState};
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let cancel = AtomicBool::new(false);
+        let receipt = TapReceipt {
+            op_id,
+            state: TapReceiptState::Complete { bytes },
+            kind: kind.to_string(),
+            seq: Some(seq),
+            span: None,
+            record_bytes: bytes,
+            dest_path: run
+                .stream
+                .as_ref()
+                .expect("stream attached")
+                .tap_path
+                .display()
+                .to_string(),
+            dest_dev: 0,
+            dest_ino: 0,
+        };
+        let ctrl: Control<u64> = run_under_control(
+            tap_dest(run),
+            Duration::from_millis(0),
+            &cancel,
+            move |_| {
+                let _ = gate_rx.recv();
+                WorkerOut {
+                    value: 1,
+                    receipt: Some(receipt),
+                }
+            },
+            None,
+        );
+        assert!(matches!(ctrl, Control::Expired));
+        gate_tx.send(()).unwrap();
+        // Let the detached exit land (the seal-bound precedent).
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    fn r41_append_tap(out: &Path, content: &[u8]) {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(out.join("stream.jsonl"))
+            .unwrap();
+        f.write_all(content).unwrap();
+        f.write_all(b"\n").unwrap();
+    }
+
+    /// R4 finding 1 (credit independence, tail arm): R's marker
+    /// delivers BEFORE the tail content-match proves R landed — the
+    /// strike no-ops on the delivered span (that protection stays),
+    /// but `tap_recovered` still credits R's proven bytes exactly
+    /// once. RED pre-fix (recovered 0 while R is reader-visible and
+    /// gross retains it); GREEN post-fix.
+    #[test]
+    fn r41_tail_match_after_delivery_still_recovers() {
+        use crate::service::envelope::DropReason;
+        let out = s4_scratch("r41-tail");
+        let (mut run, _guard) = r41_run(&out, 9);
+        let content = r41_record(7);
+        let full = content.len() as u64 + 1;
+        r41_fold_abandoned(&mut run, content.clone(), 7);
+        {
+            let s = run.stream.as_mut().expect("stream attached");
+            s.queue.mark_all(9);
+            s.queue.clear_marker(9);
+        }
+        // R lands fully (reader-visible).
+        r41_append_tap(&out, &content);
+        reconcile_tap_write(&mut run, 0, DropReason::Epipe);
+        let rec = &run.summary.tap_recovered;
+        assert_eq!(
+            (rec.records, rec.bytes),
+            (1, full),
+            "a proven landing credits even post-delivery"
+        );
+        let s = run.stream.as_ref().expect("stream attached");
+        assert!(s.inflight.is_empty(), "R settles exactly once");
+        assert!(
+            s.queue.spans().is_empty(),
+            "the delivered span stays cleared (no double-subtract)"
+        );
+        assert_eq!(s.queue.gross(), (1, full), "gross retains R");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// R4 finding 1 (credit independence, receipt arm): the receipt
+    /// twin of the tail test — R's proof is its worker's Complete
+    /// receipt rather than the tail content-match. RED/GREEN as
+    /// above.
+    #[test]
+    fn r41_receipt_after_delivery_still_recovers() {
+        use crate::service::envelope::DropReason;
+        let out = s4_scratch("r41-receipt");
+        let (mut run, _guard) = r41_run(&out, 9);
+        let content = r41_record(7);
+        let full = content.len() as u64 + 1;
+        r41_fold_abandoned(&mut run, content.clone(), 7);
+        r41_plant_complete_receipt(&run, 0, "window-ref", 7, full);
+        {
+            let s = run.stream.as_mut().expect("stream attached");
+            s.queue.mark_all(9);
+            s.queue.clear_marker(9);
+        }
+        reconcile_tap_write(&mut run, 0, DropReason::Epipe);
+        let rec = &run.summary.tap_recovered;
+        assert_eq!(
+            (rec.records, rec.bytes),
+            (1, full),
+            "a proven landing credits even post-delivery"
+        );
+        let s = run.stream.as_ref().expect("stream attached");
+        assert!(s.inflight.is_empty(), "R settles exactly once");
+        assert!(
+            s.queue.spans().is_empty(),
+            "the delivered span stays cleared (no double-subtract)"
+        );
+        assert_eq!(s.queue.gross(), (1, full), "gross retains R");
+        assert!(
+            view_slot(&tap_dest(&run)).is_none(),
+            "the receipt is consumed"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// R4 finding 1 (ordering — the reviewer's schedule through a
+    /// real boundary): R expired + folded; the initial reconcile
+    /// runs before R lands (worker live — R stays in-flight); R
+    /// lands fully (Complete receipt + reader-visible bytes); the
+    /// next boundary reconciles the stale receipt BEFORE the drive
+    /// delivers R's marker. RED pre-fix (the drive's tap check
+    /// consumes the receipt, the marker delivers, the stale strike
+    /// no-ops — recovered 0 with zero uncertain); GREEN post-fix.
+    #[test]
+    fn r41_stale_receipt_reconciled_before_drive_delivery() {
+        use crate::service::envelope::DropReason;
+        let out = s4_scratch("r41-order");
+        let (mut run, _guard) = r41_run(&out, 9);
+        let content = r41_record(7);
+        let full = content.len() as u64 + 1;
+        r41_fold_abandoned(&mut run, content.clone(), 7);
+        // Boundary N's worker: abandoned (zero budget) while gated.
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let receipt = crate::service::worker::TapReceipt {
+            op_id: 0,
+            state: crate::service::worker::TapReceiptState::Complete { bytes: full },
+            kind: "window-ref".to_string(),
+            seq: Some(7),
+            span: None,
+            record_bytes: full,
+            dest_path: run
+                .stream
+                .as_ref()
+                .expect("stream attached")
+                .tap_path
+                .display()
+                .to_string(),
+            dest_dev: 0,
+            dest_ino: 0,
+        };
+        let cancel = AtomicBool::new(false);
+        let ctrl: Control<u64> = run_under_control(
+            tap_dest(&run),
+            Duration::from_millis(0),
+            &cancel,
+            move |_| {
+                let _ = gate_rx.recv();
+                WorkerOut {
+                    value: 1,
+                    receipt: Some(receipt),
+                }
+            },
+            None,
+        );
+        assert!(matches!(ctrl, Control::Expired), "R expires while gated");
+        // Initial reconciliation before R lands: worker live, no
+        // receipt, empty tail — R stays in-flight, uncredited.
+        reconcile_tap_write(&mut run, 0, DropReason::Epipe);
+        assert_eq!(
+            run.stream.as_ref().expect("stream attached").inflight.len(),
+            1,
+            "R stays in-flight while its worker is live"
+        );
+        assert_eq!(
+            (
+                run.summary.tap_recovered.records,
+                run.summary.tap_recovered.bytes
+            ),
+            (0, 0),
+            "nothing proven yet — nothing credited"
+        );
+        // R lands fully: the worker exits with its Complete receipt
+        // and R's bytes are reader-visible on the tap.
+        gate_tx.send(()).unwrap();
+        r41_append_tap(&out, &content);
+        std::thread::sleep(Duration::from_millis(500));
+        // The next boundary: stale recheck, then the drive.
+        let (run, sinks) = mid_window_sinks(run, "abc".to_string());
+        assert!(matches!(sinks, SinksOut::Continue));
+        let rec = &run.summary.tap_recovered;
+        assert_eq!(
+            (rec.records, rec.bytes),
+            (1, full),
+            "the stale receipt credits before marker delivery"
+        );
+        let s = run.stream.as_ref().expect("stream attached");
+        assert!(s.inflight.is_empty(), "R settles exactly once");
+        assert!(
+            s.queue.spans().is_empty(),
+            "struck + delivered spans clear exactly"
+        );
+        assert_eq!(s.queue.gross(), (1, full), "gross retains R");
+        assert!(
+            run.summary.tap_uncertain.is_empty(),
+            "no uncertainty is named"
+        );
         let _ = std::fs::remove_dir_all(&out);
     }
 }
