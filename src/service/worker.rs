@@ -1251,4 +1251,127 @@ mod tests {
             "RED: handoff contention stalled the abandonment handoff ({dt:?})"
         );
     }
+
+    /// R6-2 RED: A is consumed with a blocked destructor, then
+    /// B1…BN (2 MiB each) are consumed through
+    /// `consume_if_finished` while A stays blocked: later
+    /// results must dispose promptly instead of queueing behind
+    /// A unboundedly. Deterministic at the helper level (the
+    /// manually constructed finished slots are exactly the
+    /// post-race state). RED pre-fix (the serial reaper holds
+    /// every Bi until A releases — the 2 s watchdog per Bi);
+    /// GREEN post-fix (each disposal is isolated; A still
+    /// blocked, the race still consumed, the bound holds).
+    #[test]
+    fn r62_later_results_retained_behind_blocked_destructor() {
+        use std::sync::mpsc;
+        struct BlockingDrop {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            exited: mpsc::Sender<()>,
+        }
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                let _ = self.exited.send(());
+            }
+        }
+        struct Payload {
+            index: usize,
+            _buf: Vec<u8>,
+            dropped: mpsc::Sender<usize>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                let _ = self.dropped.send(self.index);
+            }
+        }
+        const N: usize = 4;
+        let tag = format!(
+            "r62-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        fn finished_slot(dest: &Destination, worker: u64, result: Box<dyn Any + Send>) {
+            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+            reg.insert(
+                dest.clone(),
+                Slot {
+                    worker,
+                    live: false,
+                    result: Some(result),
+                    receipt: None,
+                },
+            );
+        }
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = mpsc::channel::<()>();
+        let dest_a = Destination {
+            class: DestClass::OwnTmp,
+            key: format!("{tag}-a"),
+        };
+        let worker_a = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
+        finished_slot(
+            &dest_a,
+            worker_a,
+            Box::new(BlockingDrop {
+                entered: entered_tx,
+                release: release_rx,
+                exited: exited_tx,
+            }),
+        );
+        consume_if_finished(&dest_a, worker_a);
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("A must reach its destructor off-path");
+        let (dropped_tx, dropped_rx) = mpsc::channel::<usize>();
+        let mut dests = vec![dest_a.clone()];
+        for i in 0..N {
+            let dest = Destination {
+                class: DestClass::OwnTmp,
+                key: format!("{tag}-b{i}"),
+            };
+            let worker = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
+            finished_slot(
+                &dest,
+                worker,
+                Box::new(Payload {
+                    index: i,
+                    _buf: vec![0u8; 2 * 1024 * 1024],
+                    dropped: dropped_tx.clone(),
+                }),
+            );
+            consume_if_finished(&dest, worker);
+            dests.push(dest);
+        }
+        drop(dropped_tx);
+        for _ in 0..N {
+            if dropped_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                // Release so the suite never hangs; the panic
+                // below records the RED.
+                let _ = release_tx.send(());
+                let _ = exited_rx.recv_timeout(Duration::from_secs(10));
+                panic!("RED: later results retained behind A's blocked destructor");
+            }
+        }
+        assert!(
+            exited_rx.try_recv().is_err(),
+            "A must still be blocked once later results dispose"
+        );
+        for dest in &dests {
+            assert!(
+                view_slot(dest).is_none(),
+                "the race stays consumed for {dest:?}"
+            );
+        }
+        let _ = release_tx.send(());
+        exited_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("A disposes once released");
+    }
 }
