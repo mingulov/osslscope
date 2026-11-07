@@ -2860,6 +2860,56 @@ fn cbom_json(doc: &CaptureDocument) -> anyhow::Result<serde_json::Value> {
             }
             .to_string(),
         ));
+        // 1D-D1: policy-signal parity with the JSON `policy`
+        // section (the M1 review-wave-1B signals): per-rule
+        // relevance plus the uncertainty caveats, recomputed from
+        // the record + document exactly like render_json. Scalars
+        // render as text; composites (the unseen list, per-rule
+        // records) render as JSON text (lossless — matcher and
+        // predicate text is unrestricted).
+        for (i, r) in policy.rules.iter().enumerate() {
+            let relevant_complete = crate::policy::relevant_complete(
+                crate::policy::record_rule_area(&r.rule, &r.predicate),
+                doc,
+            );
+            let record = serde_json::json!({
+                "rule": r.rule,
+                "predicate": r.predicate,
+                "relevant_complete": relevant_complete,
+            });
+            metadata.push(prop(
+                &format!("osslscope:policy-rule-{i}"),
+                serde_json::to_string(&record).unwrap_or_else(|_| "{}".to_string()),
+            ));
+        }
+        let param_blind = policy
+            .rules
+            .iter()
+            .any(|r| crate::policy::is_algorithm_rule(&r.rule))
+            && crate::policy::executed_param_blind_ops(doc);
+        metadata.push(prop(
+            "osslscope:policy-param-blind",
+            if param_blind { "true" } else { "false" }.to_string(),
+        ));
+        let unseen: Vec<&str> = policy
+            .rules
+            .iter()
+            .filter(|r| crate::check::is_unseen_deny_provider(&r.rule, r.definite, r.possible))
+            .map(|r| r.predicate.as_str())
+            .collect();
+        metadata.push(prop(
+            "osslscope:policy-unseen-deny-providers",
+            serde_json::to_string(&unseen).unwrap_or_else(|_| "[]".to_string()),
+        ));
+        metadata.push(prop("osslscope:policy-kat-excluded", "0".to_string()));
+        metadata.push(prop(
+            "osslscope:policy-kat-note",
+            crate::policy::KAT_NOTE.to_string(),
+        ));
+        metadata.push(prop(
+            "osslscope:policy-fips-unlabeled-executions",
+            crate::policy::fips_unlabeled_calls(doc).to_string(),
+        ));
     }
     match &doc.status {
         Completeness::Complete => {}

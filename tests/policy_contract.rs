@@ -1049,6 +1049,103 @@ fn fips_and_parameter_ambiguity() {
     assert_eq!(policy_json(&sign_rsa, &v)["param_blind"], false);
 }
 
+/// 1D-D1 (CBOM policy parity): the CBOM verdict carries the same
+/// M1 signals as the JSON `policy` section — per-rule relevance
+/// plus the uncertainty caveats — not just the verdict word.
+/// Fixture: a PASS verdict that is still param-blind (an
+/// algorithm rule met an executed SIGNATURE op) over a
+/// FIPS-counted window, with one unseen deny-provider matcher.
+#[test]
+fn cbom_mirrors_policy_caveat_signals() {
+    let d = complete_doc(vec![
+        site_at(
+            1,
+            0,
+            7,
+            vec![cand("prov-fips", "fips", DIGEST, 7, &["SHA2-256"], false)],
+            CandidateCoverage::Complete,
+        ),
+        site_at(
+            2,
+            0,
+            5,
+            vec![cand(
+                "prov-default",
+                "default",
+                SIGNATURE,
+                21,
+                &["RSA"],
+                false,
+            )],
+            CandidateCoverage::Complete,
+        ),
+    ]);
+    let rules = [
+        PolicyRule::require_executed("SHA2-256"),
+        PolicyRule::deny_provider("legacy"),
+    ];
+    let v = evaluate_document(&rules, &d);
+    assert_eq!(v.overall(), PolicyOutcome::Pass);
+    // Fixture validation on the JSON surface (pre-existing
+    // behavior): the caveats the CBOM must mirror.
+    let pj = policy_json(&d, &v);
+    assert_eq!(pj["verdict"], "pass");
+    assert_eq!(pj["param_blind"], true);
+    assert_eq!(pj["unseen_deny_providers"], serde_json::json!(["legacy"]));
+    assert_eq!(pj["kat_excluded"], 0);
+    assert_eq!(pj["fips_unlabeled_executions"], 7);
+    let mut with_policy = d.clone();
+    with_policy.policy = Some(policy_record(&v));
+    let shipped: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_json(&with_policy).unwrap()).unwrap();
+    assert_eq!(shipped["policy"]["verdict"], "pass");
+    assert_eq!(shipped["policy"]["param_blind"], true);
+    // The CBOM verdict mirrors every signal (names + shapes in the
+    // wave report; scalars as text, composites as JSON text).
+    let cbom: serde_json::Value =
+        serde_json::from_slice(&osslscope::report::render_cbom(&with_policy).unwrap()).unwrap();
+    let meta = cbom_metadata(&cbom);
+    assert_eq!(meta["osslscope:policy-verdict"], "pass");
+    assert_eq!(meta["osslscope:policy-param-blind"], "true");
+    assert_eq!(
+        meta["osslscope:policy-unseen-deny-providers"],
+        serde_json::to_string(&vec!["legacy"]).unwrap()
+    );
+    assert_eq!(meta["osslscope:policy-kat-excluded"], "0");
+    assert_eq!(
+        meta["osslscope:policy-kat-note"],
+        osslscope::policy::KAT_NOTE
+    );
+    assert_eq!(meta["osslscope:policy-fips-unlabeled-executions"], "7");
+    let mut rule_props: Vec<serde_json::Value> = meta
+        .iter()
+        .filter(|(name, _)| name.starts_with("osslscope:policy-rule-"))
+        .map(|(_, value)| serde_json::from_str(value).unwrap())
+        .collect();
+    rule_props.sort_by(|a, b| a["rule"].as_str().cmp(&b["rule"].as_str()));
+    assert_eq!(
+        rule_props,
+        vec![
+            serde_json::json!({
+                "rule": "deny-provider",
+                "predicate": "legacy",
+                "relevant_complete": true,
+            }),
+            serde_json::json!({
+                "rule": "require-executed",
+                "predicate": "SHA2-256",
+                "relevant_complete": true,
+            }),
+        ]
+    );
+    // Additive-only: the pre-existing verdict and window props stay.
+    assert_eq!(
+        meta["osslscope:execution-evidence-completeness"],
+        "COMPLETE"
+    );
+    assert_eq!(meta["osslscope:window-requested-start-ns"], "1000");
+}
+
 /// Query/load/activity counters never shape verdicts; only executed
 /// sites and relevant loss do.
 #[test]
