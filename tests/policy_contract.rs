@@ -4154,6 +4154,36 @@ fn deny_weak_is_inconclusive_over_legacy_scoped_coverage_gaps() {
             assert_eq!(v.rules[0].bounds.definite, 0, "{scope} {kind}");
             assert_eq!(v.rules[0].bounds.possible, Some(0), "{scope} {kind}");
             assert_eq!(v.overall(), PolicyOutcome::Pass, "{scope} {kind}");
+            // Full-chain (review-wave-1D fix round 1): the Pass
+            // verdict must survive into the policy-bearing
+            // document, both shipped renders, and the exit
+            // mapping — a renderer/relevance-reconstruction
+            // regression must fail here, not just on the main legs.
+            let rule = PolicyRule::deny_weak();
+            let mut with_policy = d.clone();
+            with_policy.policy = Some(policy_record(&v));
+            let bytes = osslscope::report::render_json(&with_policy).unwrap();
+            let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(val["policy"]["verdict"], "pass", "{scope} {kind}");
+            assert_eq!(
+                val["policy"]["rules"][0]["relevant_complete"], true,
+                "{scope} {kind}"
+            );
+            let human = osslscope::report::render_human(&with_policy);
+            assert!(human.contains("policy: pass"), "{scope} {kind}:\n{human}");
+            let rule_line = format!(
+                "rule {} ({}): pass (definite=0, possible=0, relevant_complete=true)",
+                rule.name, rule.matcher
+            );
+            assert!(human.contains(&rule_line), "{scope} {kind}:\n{human}");
+            // The document stays PARTIAL (the engine gap remains),
+            // so the gate reports exit 3 — a PARTIAL pass, never a
+            // clean 0.
+            assert_eq!(
+                exit_for(v.overall(), Some(0), &with_policy, &ok_delivery()),
+                3,
+                "{scope} {kind}"
+            );
         }
     }
 }
