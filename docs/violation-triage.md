@@ -32,6 +32,19 @@ and first/last timestamps there. Resolve object fingerprints through
 Use those opaque object fingerprints and available build metadata;
 v2 has no `provider.build_id` field.
 
+A legacy-only `deny-engine` violation has the zero-ref shape:
+`definite=N` with empty `evidence` and no `engine_evidence`.
+The pre-T08 tripwire side input carries counts by entrypoint
+name only — no object/device/inode/offset/generation identity
+exists to cite, so the renderers emit no refs rather than
+fabricate them. The violation is still proved (at least N
+in-window ENGINE executions; `possible: null` means the upper
+bound is unknown): do not read the empty `evidence` as an
+unproven rule. Triage it from the bound (the §4 `deny-engine`
+row) and re-observe with the typed ENGINE plane, whose
+violations carry `engine_evidence` refs into
+`engine_observations`.
+
 Two uncertainty rules matter:
 
 - A required name absent under a relevant gap is an inconclusive

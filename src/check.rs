@@ -1569,6 +1569,7 @@ require-executed=["SHA2-256"]
         assert_eq!(rec.rules[0].definite, 5);
         assert_eq!(rec.rules[0].possible, None);
         assert!(rec.rules[0].evidence.is_empty());
+        assert!(rec.rules[0].engine_evidence.is_empty());
         // Evidence refs sort into canonical order even though
         // evaluation emits current hits before fenced hits.
         let mut cur = site(9, 100, vec![cand("p", "default", 2, 21, &["DES"], true)]);
@@ -1649,6 +1650,55 @@ require-executed=["SHA2-256"]
         assert_eq!(policy.verdict, DocVerdict::Violation);
         assert_eq!(policy.rules[0].definite, 5);
         assert!(policy.rules[0].evidence.is_empty());
+        assert!(policy.rules[0].engine_evidence.is_empty());
+    }
+
+    #[test]
+    fn legacy_only_violation_renders_zero_ref_shape() {
+        // M2 (review-wave-1B): pins the disclosed zero-ref
+        // violation shape — a legacy-only deny-engine violation
+        // carries definite=N with EMPTY evidence[] and no
+        // engine_evidence (the tripwire side input has counts
+        // only, no document identity to cite). The renders must
+        // preserve that shape, never fabricate refs.
+        // violation-triage.md and auditor-story.md disclose this
+        // shape; this test pins the code side of that contract.
+        let quiet = doc(Vec::new());
+        let legacy = serde_json::json!({
+            "engine": {"calls_by_entrypoint": {"ENGINE_init": 5}},
+        });
+        let (verdict, document) = assemble_checked_document(
+            std::slice::from_ref(&PolicyRule::deny_engine()),
+            quiet,
+            &legacy,
+        );
+        assert_eq!(verdict.overall(), PolicyOutcome::Violation);
+        let policy = document.policy.as_ref().expect("assembly attaches policy");
+        assert_eq!(policy.rules.len(), 1);
+        assert_eq!(policy.rules[0].definite, 5);
+        assert_eq!(policy.rules[0].possible, None);
+        assert!(policy.rules[0].evidence.is_empty());
+        assert!(policy.rules[0].engine_evidence.is_empty());
+        let rendered = crate::report::doc_json(&document);
+        let rule = &rendered["policy"]["rules"][0];
+        assert_eq!(rule["definite"], 5);
+        assert!(rule["possible"].is_null());
+        assert_eq!(rule["evidence"], serde_json::json!([]));
+        assert!(
+            rule.get("engine_evidence").is_none(),
+            "zero-ref shape carries no engine refs: {rule}"
+        );
+        let human = crate::report::render_human(&document);
+        assert!(
+            human.contains(
+                "rule deny-engine (engine): violation (definite=5, possible=unknown, relevant_complete=true)"
+            ),
+            "human rule row:\n{human}"
+        );
+        assert!(
+            !human.contains("evidence:"),
+            "zero-ref shape renders no evidence rows:\n{human}"
+        );
     }
 
     #[test]
