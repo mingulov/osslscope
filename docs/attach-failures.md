@@ -25,8 +25,8 @@ exit 4
         |
         +-- message says zero probes attached?
         |     YES -> run `doctor` (env) and `doctor --pid P` /
-        |            `doctor --libcrypto PATH` (target), remediate
-        |            the failing check, re-run
+        |            `doctor --libcrypto PATH --object O --count-object C`
+        |            (target), remediate the failing check, re-run
         |
         +-- otherwise (BPF load / fork / setup maps failure)?
               YES -> run `doctor`, remediate, re-run; a maps/uid
@@ -34,6 +34,12 @@ exit 4
                      file caps plus CAP_SYS_PTRACE (or run as the
                      target user / root)
 ```
+
+Bare `doctor --libcrypto PATH` runs the legacy exact-profile
+diagnostic, not target vetting; the `--object`/`--count-object`
+pair above (installed `$PREFIX/lib/osslscope/` objects or the
+repo-built pair) selects sectioned vetting — see [the built-in
+runbook](builtin-runbook.md) for the object paths.
 
 Requested artifacts are attempted independently even on fatal paths.
 An artifact write/delivery failure is a tool failure (exit 1 when
@@ -70,12 +76,14 @@ failure and exits 4. The checks, in the order to fix them:
 
 ## Target-shape refusals (correct behavior, not bugs)
 
-- **Static binary as `--libcrypto`:** `doctor` exits 4 with a
-  flavor/path-confusion failure -- a static server is not a
-  library. Observe it in `--builtin` provider mode instead (see
-  [the static-target recipe](staging-deploy.md#observe)); a
-  *stripped* unknown static binary needs explicit enrollment for
-  report/check; inspect may expose disclosed zero-row blindness.
+- **Static binary as `--libcrypto`:** sectioned vetting
+  (`doctor --libcrypto PATH` with a vetting flag, as above)
+  exits 4 with a flavor/path-confusion failure -- a static
+  server is not a library. Observe it in `--builtin` provider
+  mode instead (see [the static-target
+  recipe](staging-deploy.md#observe)); a *stripped* unknown
+  static binary needs explicit enrollment for report/check;
+  inspect may expose disclosed zero-row blindness.
 - **Static target under `doctor --pid`:** `no libcrypto.so
   mapped in target` is the designed refusal; same `--builtin`
   path applies.
