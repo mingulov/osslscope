@@ -2192,11 +2192,13 @@ pub fn render_human(doc: &CaptureDocument) -> String {
             if param_blind {
                 s.push_str("  param_blind=true\n");
             }
+            // Each matcher double-quoted ({:?} escaping): a bare
+            // comma join cannot tell ["a,b"] from ["a", "b"].
             let unseen: Vec<String> = policy
                 .rules
                 .iter()
                 .filter(|r| crate::check::is_unseen_deny_provider(&r.rule, r.definite, r.possible))
-                .map(|r| safe_display(&r.predicate))
+                .map(|r| format!("{:?}", safe_display(&r.predicate)))
                 .collect();
             if !unseen.is_empty() {
                 s.push_str(&format!("  unseen_deny_providers={}\n", unseen.join(",")));

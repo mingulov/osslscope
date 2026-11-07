@@ -1880,7 +1880,7 @@ require-executed=["SHA2-256"]
             "human must flag parameter blindness:\n{human}"
         );
         assert!(
-            human.contains("unseen_deny_providers=legacy"),
+            human.contains("unseen_deny_providers=\"legacy\""),
             "human must list unseen deny providers:\n{human}"
         );
         assert!(
@@ -1976,8 +1976,58 @@ require-executed=["SHA2-256"]
         }
         let human = crate::report::render_human(&document);
         assert!(
-            human.contains("unseen_deny_providers=a-provider,z-provider"),
+            human.contains("unseen_deny_providers=\"a-provider\",\"z-provider\""),
             "human must list unseen providers in canonical order:\n{human}"
+        );
+    }
+
+    #[test]
+    fn human_unseen_list_quotes_comma_bearing_matchers() {
+        // A bare comma join cannot tell ["a,b"] from ["a", "b"]:
+        // each matcher renders double-quoted (Rust {:?} escaping),
+        // so the list is unambiguous for any matcher text.
+        let d = crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites: vec![site(
+                1,
+                100,
+                vec![cand("p", "default", 2, 21, &["AES-256-GCM"], false)],
+            )],
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        });
+        assert!(matches!(d.status, crate::evidence::Completeness::Complete));
+        let rules = [PolicyRule::deny_provider("a,b")];
+        let (verdict, document) = assemble_checked_document(&rules, d, &serde_json::Value::Null);
+        assert_eq!(verdict.overall(), PolicyOutcome::Pass);
+        let human = crate::report::render_human(&document);
+        assert!(
+            human.contains("unseen_deny_providers=\"a,b\""),
+            "comma-bearing matcher must be quoted, got:\n{human}"
+        );
+        // The JSON surface agrees on the same derived record.
+        let rendered = crate::report::doc_json(&document);
+        assert_eq!(
+            rendered["policy"]["unseen_deny_providers"],
+            serde_json::json!(["a,b"])
         );
     }
 
