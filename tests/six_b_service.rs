@@ -965,3 +965,89 @@ fn sixb_fifo_lock_admission_fails_fast() {
         "FIFO lock refuses pre-start (exit 2)"
     );
 }
+
+/// Compute a live service run's spill-tag (`pid-starttime-boot8`,
+/// mirroring `RunId::tag`) from outside the process.
+fn run_tag(pid: u32) -> String {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("stat readable");
+    let after = stat.rsplit_once(')').map(|(_, t)| t).unwrap_or("");
+    let starttime = after
+        .split_whitespace()
+        .nth(19)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
+    let boot8: String = boot_id.chars().take(8).collect();
+    format!("{pid}-{starttime}-{boot8}")
+}
+
+/// Leaked spill tmps are retried in-run (RANK-4): files matching
+/// this run's spill prefix but holding no live identity (seeded
+/// here — the relisted-leak shape) are unlinked by a later
+/// boundary's absorb retry, NOT left for the next start. No next
+/// start runs here, so absence at exit proves the in-run unlink
+/// (pre-fix the seeds survive — the queue had no consumer).
+/// Live-identity exclusion is pinned hermetically by the
+/// coordinator `spill_retry_*` unit legs; the run finalizing
+/// normally (exit 3 + windows + summary) proves no live spill
+/// was eaten on the way.
+#[test]
+fn sixb_leaked_spills_retry_in_run() {
+    let dir = fresh_dir("spill-retry");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    let mut svc = bin()
+        .arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--interval")
+        .arg("0.2")
+        .spawn()
+        .expect("spawn service");
+    // Seed AFTER the run owns the out-DIR (startup `clean_tmps`
+    // runs before this — the seeds below are genuinely leaked
+    // mid-run identities, not startup leftovers).
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    assert!(
+        svc.try_wait().expect("try_wait").is_none(),
+        "service alive at seed time"
+    );
+    let tag = run_tag(svc.id());
+    let seed1 = dir.join(format!(".{tag}.tmp.spill.999999.0"));
+    let seed2 = dir.join(format!(".{tag}.tmp.spill.999999.1"));
+    std::fs::write(&seed1, b"{\"leaked\":true}\n").unwrap();
+    std::fs::write(&seed2, b"{\"leaked\":true}\n").unwrap();
+    // Two mid-run boundaries (1 s windows) + the final close:
+    // boundary N re-lists the leaks into the retry queue,
+    // boundary N+1's absorb unlinks them.
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
+    let status = wait_bounded(&mut svc, 30).expect("service exits after TERM");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "cancel-after-windows exits 3, got {status:?}"
+    );
+    assert!(
+        !seed1.exists() && !seed2.exists(),
+        "leaked spill tmps unlinked in-run (no next start ran)"
+    );
+    assert!(
+        dir.join("window-0000000000.json").is_file(),
+        "window 0 published, dir: {dir:?}"
+    );
+    assert!(
+        dir.join("run-summary.json").is_file(),
+        "run summary written, dir: {dir:?}"
+    );
+}

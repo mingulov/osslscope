@@ -216,7 +216,9 @@ struct Run {
     /// Least (pid, starttime) over the RUN's observed members (the
     /// empty-window target fallback, §11.1).
     run_member_floor: Option<(u32, u64)>,
-    /// Leaked spill tmps awaiting absorb-retry (next boundary).
+    /// Leaked spill tmps awaiting absorb-retry (consumed at the
+    /// next boundary — consumed identities only, deduplicated,
+    /// capped at [`MAX_PENDING_SPILL_UNLINKS`]).
     pending_spill_unlinks: Vec<PathBuf>,
     /// Output-format alias (diagnostics shape).
     format: Format,
@@ -2620,7 +2622,10 @@ fn mid_window_judge(
     }
     // Durable (or converged): absorb the consumed spills (OwnTmp —
     // the bytes are coordinator-held, so a leak reconciles via
-    // retry + §4.4 cleanup, never a loss).
+    // retry + §4.4 cleanup, never a loss) AND retry previously
+    // queued consumed identities (RANK-4: the queue has a consumer
+    // at every boundary — consumed identities only, live excluded,
+    // deduplicated; retention accounting untouched).
     let spill_tmps: Vec<PathBuf> = run
         .cycle
         .as_ref()
@@ -2630,7 +2635,13 @@ fn mid_window_judge(
         .iter()
         .map(|r| r.tmp.clone())
         .collect();
-    if !spill_tmps.is_empty() {
+    let live = {
+        let cycle = run.cycle.as_ref().expect("window open at judge");
+        live_spill_set(&cycle.staging, &cycle.piece, cycle.carry_out.as_ref())
+    };
+    let queued = std::mem::take(&mut run.pending_spill_unlinks);
+    let attempt = spill_retry_plan(spill_tmps, queued, &live);
+    if !attempt.is_empty() {
         let absorb_budget = close_budget(&run);
         let absorb_poll = run_wait_poll!(run);
         let absorb: Control<usize> = run_op(
@@ -2645,14 +2656,17 @@ fn mid_window_judge(
             },
             absorb_budget,
             Some(&absorb_poll),
-            move |_gate| {
-                let mut unlinked = 0usize;
-                for tmp in &spill_tmps {
-                    if std::fs::remove_file(tmp).is_ok() {
-                        unlinked += 1;
+            {
+                let attempt = attempt.clone();
+                move |_gate| {
+                    let mut unlinked = 0usize;
+                    for tmp in &attempt {
+                        if std::fs::remove_file(tmp).is_ok() {
+                            unlinked += 1;
+                        }
                     }
+                    WorkerOut::value(unlinked)
                 }
-                WorkerOut::value(unlinked)
             },
         );
         // A non-Done absorb leaks (retried at the next boundary;
@@ -2669,8 +2683,12 @@ fn mid_window_judge(
                 &format!("window {seq}: spill absorb deferred"),
             );
         }
-        queue_leaked_spills(&mut run, seq);
     }
+    // Re-list survivors EVERY boundary (leak detection requires the
+    // listing — queued or not, spilled or not): live-filtered
+    // (minus the just-consumed attempt), deduplicated, capped.
+    let consumed: std::collections::BTreeSet<PathBuf> = attempt.into_iter().collect();
+    queue_leaked_spills(&mut run, seq, &consumed);
     // Release the staging RAM (the envelope holds the bytes now).
     if let Some(cycle) = run.cycle.as_mut() {
         cycle.staging.release();
@@ -2693,10 +2711,108 @@ fn mid_window_judge(
     mid_window_commit(run, close, effective_end_ns, sinks, mode)
 }
 
+/// Bound on queued spill-unlink retries (RANK-4): the retry
+/// queue holds paths only (no bytes); past the cap, further leaks
+/// shed with a diagnostic — the next start's §4.4 `clean_tmps`
+/// backstops (leak, never loss; queue metadata bounded either way).
+const MAX_PENDING_SPILL_UNLINKS: usize = 1024;
+
+/// Live spill identities (RANK-4 deletion authority): the current
+/// window's staging + open piece + carried tick. A re-listed path
+/// in this set is still in use and MUST NOT be unlinked — a
+/// run-prefix re-list alone is NOT deletion authority.
+fn live_spill_set(
+    staging: &Staging,
+    piece: &TickPiece,
+    carry_out: Option<&Carry>,
+) -> std::collections::BTreeSet<PathBuf> {
+    let mut live = std::collections::BTreeSet::new();
+    for r in &staging.spilled {
+        live.insert(r.tmp.clone());
+    }
+    for tmp in staging.spill_files.keys() {
+        live.insert(tmp.clone());
+    }
+    for r in &piece.spilled {
+        live.insert(r.tmp.clone());
+    }
+    if let Some(carry) = carry_out {
+        for r in &carry.spilled {
+            live.insert(r.tmp.clone());
+        }
+    }
+    live
+}
+
+/// This boundary's unlink plan (RANK-4): the window's consumed
+/// spills PLUS queued retries for consumed identities only —
+/// queued paths still live are excluded (they ride their own
+/// window's consume step instead), and the plan deduplicates.
+fn spill_retry_plan(
+    spill_tmps: Vec<PathBuf>,
+    queued: Vec<PathBuf>,
+    live: &std::collections::BTreeSet<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut attempt = spill_tmps;
+    for q in queued {
+        if !live.contains(&q) && !attempt.contains(&q) {
+            attempt.push(q);
+        }
+    }
+    attempt
+}
+
+/// Retry-queue merge outcome (diagnosed on shed, never silent
+/// about pressure; live-skips are routine — carried ticks re-list
+/// while live — and stay quiet).
+struct PendingMerge {
+    added: usize,
+    skipped_live: usize,
+    shed_cap: usize,
+}
+
+/// Dedup-merge re-listed survivors into the retry queue (RANK-4):
+/// live identities are excluded — minus the just-consumed attempt,
+/// whose survivors are consumed-pending-retry, not live — and the
+/// queue is deduplicated and capped at
+/// [`MAX_PENDING_SPILL_UNLINKS`].
+fn merge_pending_spills(
+    pending: &mut Vec<PathBuf>,
+    relisted: Vec<PathBuf>,
+    live: &std::collections::BTreeSet<PathBuf>,
+    consumed: &std::collections::BTreeSet<PathBuf>,
+) -> PendingMerge {
+    let mut out = PendingMerge {
+        added: 0,
+        skipped_live: 0,
+        shed_cap: 0,
+    };
+    for p in relisted {
+        if live.contains(&p) && !consumed.contains(&p) {
+            out.skipped_live += 1;
+            continue;
+        }
+        if pending.contains(&p) {
+            continue;
+        }
+        if pending.len() >= MAX_PENDING_SPILL_UNLINKS {
+            out.shed_cap += 1;
+            continue;
+        }
+        pending.push(p);
+        out.added += 1;
+    }
+    out
+}
+
 /// Re-list this run's spill tmps (worker — read-only) and queue
 /// survivors for the next boundary's absorb retry (leak, never
-/// loss — §4.4 cleanup backstops at the next start).
-fn queue_leaked_spills(run: &mut Run, seq: u64) {
+/// loss — §4.4 cleanup backstops at the next start). Consumed
+/// identities only (live minus the just-consumed attempt is
+/// excluded); deduplicated + capped. Retention quota (windows +
+/// rotated) is untouched — spill tmps are transient, diagnosed
+/// here, never counted as managed.
+fn queue_leaked_spills(run: &mut Run, seq: u64, consumed: &std::collections::BTreeSet<PathBuf>) {
     let prefix = format!(".{}.tmp.spill.", run.tag);
     let relist_budget = close_budget(run);
     let relist_poll = run_wait_poll!(run);
@@ -2731,7 +2847,22 @@ fn queue_leaked_spills(run: &mut Run, seq: u64) {
         },
     );
     if let Control::Done(leaked) = relist {
-        run.pending_spill_unlinks.extend(leaked);
+        let live = {
+            let cycle = run.cycle.as_ref().expect("window open at relist");
+            live_spill_set(&cycle.staging, &cycle.piece, cycle.carry_out.as_ref())
+        };
+        let merged = merge_pending_spills(&mut run.pending_spill_unlinks, leaked, &live, consumed);
+        if merged.shed_cap > 0 {
+            diag_line(
+                &run.diag,
+                &run.format,
+                "warn",
+                &format!(
+                    "window {seq}: spill retry queue +{} live-skipped={} shed={} at cap {}",
+                    merged.added, merged.skipped_live, merged.shed_cap, MAX_PENDING_SPILL_UNLINKS
+                ),
+            );
+        }
     }
 }
 
@@ -4716,6 +4847,107 @@ mod tests {
             spill_abandon_reason(&Error::other("mystery")),
             AbandonReason::IoError
         );
+    }
+
+    /// RANK-4: the live set covers staging + open piece + carried
+    /// tick — every still-in-use identity is deletion-excluded.
+    #[test]
+    fn spill_retry_live_set_covers_staging_piece_and_carry() {
+        use crate::service::staging::SpilledRecord;
+        fn spilled(name: &str) -> SpilledRecord {
+            SpilledRecord {
+                tmp: PathBuf::from(name),
+                bytes: 8,
+                tick: 1,
+                valid: true,
+                seal_segment: None,
+                content_sha: [0u8; 32],
+            }
+        }
+        let mut staging = Staging::new();
+        staging.spilled.push(spilled("/o/.t.tmp.spill.1.0"));
+        staging
+            .spill_files
+            .insert(PathBuf::from("/o/.t.tmp.spill.1.0"), 8);
+        let mut piece = TickPiece::open(2);
+        piece.spilled.push(spilled("/o/.t.tmp.spill.2.0"));
+        let carry = Carry {
+            staged: Vec::new(),
+            spilled: vec![spilled("/o/.t.tmp.spill.0.7")],
+            staged_bytes: 0,
+            from_seq: 9,
+        };
+        let live = live_spill_set(&staging, &piece, Some(&carry));
+        assert!(live.contains(&PathBuf::from("/o/.t.tmp.spill.1.0")));
+        assert!(live.contains(&PathBuf::from("/o/.t.tmp.spill.2.0")));
+        assert!(live.contains(&PathBuf::from("/o/.t.tmp.spill.0.7")));
+        assert_eq!(live.len(), 3, "registry duplicates collapse");
+        assert!(!live.contains(&PathBuf::from("/o/.t.tmp.spill.9.9")));
+    }
+
+    /// RANK-4: the unlink plan retries queued consumed identities
+    /// alongside the window's consumed spills — queued paths still
+    /// live are excluded, and the plan deduplicates.
+    #[test]
+    fn spill_retry_plan_excludes_live_and_dedups() {
+        use std::collections::BTreeSet;
+        let live: BTreeSet<PathBuf> = ["/o/live"].into_iter().map(PathBuf::from).collect();
+        let plan = spill_retry_plan(
+            vec![PathBuf::from("/o/cur")],
+            vec![
+                PathBuf::from("/o/old"),
+                PathBuf::from("/o/live"),
+                PathBuf::from("/o/cur"),
+                PathBuf::from("/o/old"),
+            ],
+            &live,
+        );
+        assert_eq!(plan, vec![PathBuf::from("/o/cur"), PathBuf::from("/o/old")]);
+    }
+
+    /// RANK-4: the re-list merge excludes live identities (minus
+    /// the just-consumed attempt, whose survivors are
+    /// consumed-pending-retry), deduplicates, and caps — overflow
+    /// sheds with a count, never unbounded growth.
+    #[test]
+    fn spill_retry_merge_filters_live_dedups_and_caps() {
+        use std::collections::BTreeSet;
+        let live: BTreeSet<PathBuf> = ["/o/live", "/o/attempted"]
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let consumed: BTreeSet<PathBuf> = ["/o/attempted"].into_iter().map(PathBuf::from).collect();
+        let mut pending = vec![PathBuf::from("/o/queued")];
+        let m = merge_pending_spills(
+            &mut pending,
+            vec![
+                PathBuf::from("/o/live"),
+                PathBuf::from("/o/attempted"),
+                PathBuf::from("/o/queued"),
+                PathBuf::from("/o/new"),
+            ],
+            &live,
+            &consumed,
+        );
+        assert_eq!(m.added, 2);
+        assert_eq!(m.skipped_live, 1);
+        assert_eq!(m.shed_cap, 0);
+        assert!(pending.contains(&PathBuf::from("/o/attempted")));
+        assert!(pending.contains(&PathBuf::from("/o/new")));
+        assert!(!pending.contains(&PathBuf::from("/o/live")));
+        // Cap: a full queue sheds with a count.
+        pending.clear();
+        for n in 0..MAX_PENDING_SPILL_UNLINKS {
+            pending.push(PathBuf::from(format!("/o/p{n}")));
+        }
+        let m = merge_pending_spills(
+            &mut pending,
+            vec![PathBuf::from("/o/overflow")],
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(m.shed_cap, 1);
+        assert_eq!(pending.len(), MAX_PENDING_SPILL_UNLINKS);
     }
 
     /// R3 adjudication (d): the spill sink reports control
