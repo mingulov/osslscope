@@ -3058,9 +3058,10 @@ fn create_stage_temp(
 
 /// Write `bytes` to `path` atomically: a freshly exclusively-created
 /// temp file in the same directory, then rename over the target.
-/// Symlink and non-regular targets are refused without following
-/// them (rename would replace the link/node itself — never what an
-/// artifact `-o` path means); a failed write leaves the target
+/// Symlinks are refused without following them (rename would
+/// replace the link itself — never what an artifact `-o` path
+/// means); non-regular targets are direct-opened (O_NOFOLLOW,
+/// no rename — see below). A failed write leaves the target
 /// untouched instead of truncated. Two creation paths, no umask
 /// read anywhere (delivery never consults process-global creation
 /// state): an existing regular destination keeps its access bits
@@ -3071,8 +3072,11 @@ fn create_stage_temp(
 /// so staging visibility equals final visibility (as before).
 /// Setuid/setgid/sticky bits are never propagated to the fresh inode.
 /// A file appearing between the metadata check and temp creation
-/// takes the new-file path and is renamed over — benign, matching
-/// the old open behavior.
+/// takes the new-file path and is renamed over with the
+/// kernel-derived creation mode — unlike `fs::write`, which would
+/// retain the appeared inode (and its mode). The window is
+/// TOCTOU-inherent (check-then-act); only the staging temp itself
+/// is exclusively created.
 fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
