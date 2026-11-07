@@ -333,6 +333,19 @@ fn is_engine_area(name: &str) -> bool {
         || name.starts_with("legacy:")
 }
 
+/// Loss counters that carry unprobed crypto rather than
+/// engine-area bookkeeping: `legacy.lowlevel_uninstrumented`
+/// counts address-taken low-level imports (the SHA*/MD5/...
+/// families of [`crate::kinds::LOWLEVEL`]) that remain unprobed
+/// even when uniquely resolved (the PARTIAL runbook's low-level
+/// fallback caveat). These stay relevant to provider-area rules
+/// despite the `legacy.` prefix: a deny rule over unobserved
+/// crypto cannot report proved absence. (`:` accepted, like
+/// [`is_engine_area`].)
+fn is_unprobed_crypto_loss(name: &str) -> bool {
+    name == "legacy.lowlevel_uninstrumented" || name == "legacy:lowlevel_uninstrumented"
+}
+
 /// Area of a predicate rule: engine iff it matches exactly the engine
 /// provider class. Compound predicates stay provider-area (fail closed).
 pub fn rule_area(rule: &Rule) -> RuleArea {
@@ -356,9 +369,13 @@ fn gap_relevant_to(area: RuleArea, reason: &GapReason) -> bool {
         | GapReason::UnattributedCalls { .. } => true,
         // Any loss could drop tripwire data, so engine rules trust no
         // loss; engine-internal loss cannot hide provider execution.
+        // Unprobed-crypto carriers are the exception: they share the
+        // `legacy.` prefix but count unobserved crypto, so provider
+        // rules stay blind to them (a deny rule must not report
+        // proved absence over unobserved crypto).
         GapReason::Loss { counter, .. } => match area {
             RuleArea::Engine => true,
-            RuleArea::Provider => !is_engine_area(counter),
+            RuleArea::Provider => !is_engine_area(counter) || is_unprobed_crypto_loss(counter),
         },
         // Coverage scope names are producer-defined: engine rules
         // fail closed on every coverage blind spot, since no name
@@ -995,6 +1012,41 @@ mod tests {
         let pred = Predicate::ProviderClass("fips".to_string());
         assert_eq!(pred.eval(&known), PredicateMatch::No);
         assert_eq!(pred.eval(&unknown), PredicateMatch::Unknown);
+    }
+
+    #[test]
+    fn unprobed_lowlevel_loss_stays_relevant_to_provider_rules() {
+        assert!(is_unprobed_crypto_loss("legacy.lowlevel_uninstrumented"));
+        assert!(is_unprobed_crypto_loss("legacy:lowlevel_uninstrumented"));
+        for name in [
+            "legacy.engine_uninstrumented",
+            "legacy.meth_uninstrumented",
+            "legacy",
+            "discovery.table_aborted",
+        ] {
+            assert!(!is_unprobed_crypto_loss(name), "{name}");
+        }
+        let loss = |counter: &str| GapReason::Loss {
+            counter: counter.to_string(),
+            source: crate::evidence::CounterSource::Discovery,
+            value: 3,
+        };
+        assert!(gap_relevant_to(
+            RuleArea::Provider,
+            &loss("legacy.lowlevel_uninstrumented")
+        ));
+        // Genuinely engine-area losses stay unrelated to provider
+        // rules, and every loss stays relevant to engine rules.
+        for counter in ["legacy.engine_uninstrumented", "legacy.meth_uninstrumented"] {
+            assert!(
+                !gap_relevant_to(RuleArea::Provider, &loss(counter)),
+                "{counter}"
+            );
+            assert!(
+                gap_relevant_to(RuleArea::Engine, &loss(counter)),
+                "{counter}"
+            );
+        }
     }
 
     #[test]

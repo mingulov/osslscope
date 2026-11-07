@@ -3764,3 +3764,87 @@ fn fatal_detail_pids_normalize_on_human_and_json() {
     assert!(detail.contains("/proc/<pid>"), "JSON normalizes: {detail}");
     assert!(!detail.contains(PID), "JSON leaks pid: {detail}");
 }
+
+/// Review wave 1A, Blocker 2 (deny false-pass over unprobed
+/// crypto): `legacy.lowlevel_uninstrumented` counts unprobed
+/// direct-crypto imports (the SHA*/MD5/... families of
+/// `kinds::LOWLEVEL`, which remain unprobed per the PARTIAL
+/// runbook's low-level fallback caveat). A deny rule over a
+/// window whose only gap is that loss MUST NOT report proved
+/// absence (pass with `possible: 0`): the crypto went
+/// unobserved, so the absence is unproven and the rule is
+/// inconclusive — on the verdict and on both renders.
+#[test]
+fn deny_rules_are_inconclusive_over_unprobed_lowlevel_crypto() {
+    let d = doc(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        vec![loss_counter("legacy.lowlevel_uninstrumented")],
+        exact_window(),
+        None,
+    );
+    assert!(
+        matches!(d.status, Completeness::Partial { .. }),
+        "fixture must be PARTIAL"
+    );
+    for rule in [PolicyRule::deny_algorithm("MD5"), PolicyRule::deny_weak()] {
+        let v = evaluate_document(std::slice::from_ref(&rule), &d);
+        assert_eq!(v.rules.len(), 1, "{}", rule.name);
+        let r = &v.rules[0];
+        assert_eq!(r.verdict, RuleVerdict::Inconclusive, "{}", rule.name);
+        assert!(!r.relevant_complete, "{}", rule.name);
+        // No proved-absence claim: the upper bound is unknown.
+        assert_eq!(r.bounds.definite, 0, "{}", rule.name);
+        assert_eq!(r.bounds.possible, None, "{}", rule.name);
+        assert_eq!(v.overall(), PolicyOutcome::Inconclusive, "{}", rule.name);
+        // JSON render carries the same verdict.
+        let pj = policy_json(&d, &v);
+        assert_eq!(pj["verdict"], "inconclusive", "{}", rule.name);
+        assert_eq!(pj["rules"][0]["result"], "inconclusive", "{}", rule.name);
+        assert!(
+            pj["rules"][0]["possible"].is_null(),
+            "{}: JSON must not pin possible=0",
+            rule.name
+        );
+        let mut with_policy = d.clone();
+        with_policy.policy = Some(policy_record(&v));
+        let bytes = osslscope::report::render_json(&with_policy).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["policy"]["verdict"], "inconclusive", "{}", rule.name);
+        // Human render carries the same verdict, never a pass.
+        let human = osslscope::report::render_human(&with_policy);
+        assert!(
+            human.contains("policy: inconclusive"),
+            "{}:\n{human}",
+            rule.name
+        );
+        let rule_line = format!(
+            "rule {} ({}): inconclusive (definite=0, possible=unknown)",
+            rule.name, rule.matcher
+        );
+        assert!(human.contains(&rule_line), "{}:\n{human}", rule.name);
+        // The gate fails closed (exit 11), never a PARTIAL pass.
+        assert_eq!(
+            exit_for(v.overall(), Some(0), &with_policy, &ok_delivery()),
+            11,
+            "{}",
+            rule.name
+        );
+    }
+    // Controls: genuinely engine-area losses keep their irrelevance
+    // to provider-area deny rules (proved absence still holds there).
+    for counter in ["legacy.engine_uninstrumented", "legacy.meth_uninstrumented"] {
+        let d = doc(
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![loss_counter(counter)],
+            exact_window(),
+            None,
+        );
+        let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_algorithm("MD5")), &d);
+        assert_eq!(v.rules[0].verdict, RuleVerdict::Pass, "{counter}");
+        assert_eq!(v.rules[0].bounds.possible, Some(0), "{counter}");
+    }
+}
