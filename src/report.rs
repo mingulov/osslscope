@@ -2194,9 +2194,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
             let unseen: Vec<String> = policy
                 .rules
                 .iter()
-                .filter(|r| {
-                    r.rule == "deny-provider" && r.definite == 0 && r.possible == Some(0)
-                })
+                .filter(|r| r.rule == "deny-provider" && r.definite == 0 && r.possible == Some(0))
                 .map(|r| safe_display(&r.predicate))
                 .collect();
             if !unseen.is_empty() {
@@ -2208,10 +2206,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                     "  fips_unlabeled_executions={}\n",
                     grouped(fips_unlabeled)
                 ));
-                s.push_str(&format!(
-                    "  kat_excluded=0 ({})\n",
-                    crate::policy::KAT_NOTE
-                ));
+                s.push_str(&format!("  kat_excluded=0 ({})\n", crate::policy::KAT_NOTE));
             }
         }
     }

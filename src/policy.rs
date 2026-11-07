@@ -290,8 +290,7 @@ pub const FIPS_PROVIDER_CLASS: &str = "fips";
 /// KATs are never excluded (see [`fips_unlabeled_calls`]).
 /// `policy_json()` and the shipped document section quote this one
 /// string so the two surfaces cannot drift apart.
-pub const KAT_NOTE: &str =
-    "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions";
+pub const KAT_NOTE: &str = "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions";
 
 /// True for operations whose executed algorithm identity has a
 /// parameter-selected component (digest/cipher parameter, never
@@ -384,10 +383,8 @@ pub fn is_algorithm_rule(name: &str) -> bool {
 /// [`Predicate::ProviderClass`], and the constructor-sync test
 /// below fails loudly if that ever changes.
 pub fn record_rule_area(rule: &str, predicate: &str) -> RuleArea {
-    if matches!(
-        rule,
-        "require-provider" | "deny-provider" | "deny-engine"
-    ) && predicate == ENGINE_PROVIDER_CLASS
+    if matches!(rule, "require-provider" | "deny-provider" | "deny-engine")
+        && predicate == ENGINE_PROVIDER_CLASS
     {
         RuleArea::Engine
     } else {

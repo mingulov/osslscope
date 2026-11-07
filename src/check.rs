@@ -1736,11 +1736,7 @@ require-executed=["SHA2-256"]
                 // algorithm-rule upper bounds (No -> Unknown).
                 site(2, 50, vec![cand("p", "default", 3, 1, &["HMAC"], false)]),
                 // FIPS-class site: unlabeled KAT exposure.
-                site(
-                    3,
-                    300,
-                    vec![cand("p", "fips", 2, 7, &["SHA-256"], false)],
-                ),
+                site(3, 300, vec![cand("p", "fips", 2, 7, &["SHA-256"], false)]),
             ],
             fenced: Vec::new(),
             objects: Vec::new(),
@@ -1770,8 +1766,7 @@ require-executed=["SHA2-256"]
             PolicyRule::deny_engine(),
             PolicyRule::deny_algorithm("DES"),
         ];
-        let (verdict, document) =
-            assemble_checked_document(&rules, d, &serde_json::Value::Null);
+        let (verdict, document) = assemble_checked_document(&rules, d, &serde_json::Value::Null);
         assert_eq!(verdict.overall(), PolicyOutcome::Inconclusive);
         // The shipped JSON policy section carries every signal.
         let rendered = crate::report::doc_json(&document);
@@ -1810,10 +1805,7 @@ require-executed=["SHA2-256"]
         // inputs (neither surface may drift from the other).
         let pj = policy_json(&document, &verdict);
         assert_eq!(policy["param_blind"], pj["param_blind"]);
-        assert_eq!(
-            policy["unseen_deny_providers"],
-            pj["unseen_deny_providers"]
-        );
+        assert_eq!(policy["unseen_deny_providers"], pj["unseen_deny_providers"]);
         assert_eq!(policy["kat_excluded"], pj["kat_excluded"]);
         assert_eq!(policy["kat_note"], pj["kat_note"]);
         assert_eq!(
