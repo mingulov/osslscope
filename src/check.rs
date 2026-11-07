@@ -335,15 +335,21 @@ fn parse(argv: &[String]) -> Result<Args, String> {
 
 /// Deny-provider matchers proved absent (definite 0, possible exactly
 /// 0): typo visibility. Ambiguous matchers might be present and are not
-/// listed here.
+/// listed here. Sorted into canonical document order (fix round 1,
+/// finding 2): the shipped renderers follow [`policy_record`] order,
+/// where input order is unrecoverable, so this surface sorts to the
+/// same order — both agree on `["a", "z"]` for input `["z", "a"]`.
 fn unseen_deny_providers(v: &PolicyVerdict) -> Vec<&str> {
-    v.rules
+    let mut out: Vec<&str> = v
+        .rules
         .iter()
         .filter(|r| {
             r.name == "deny-provider" && r.bounds.definite == 0 && r.bounds.possible == Some(0)
         })
         .map(|r| r.matcher.as_str())
-        .collect()
+        .collect();
+    out.sort_unstable();
+    out
 }
 
 /// The parameter caveat fires only when algorithm rules meet executed
@@ -1812,6 +1818,45 @@ require-executed=["SHA2-256"]
             policy["fips_unlabeled_executions"],
             pj["fips_unlabeled_executions"]
         );
+        // Fix round 1 (finding 2a): per-rule relevance must agree
+        // too, keyed by rule identity (name + matcher) — the
+        // section-level asserts above cannot catch one rule whose
+        // rendered relevance drifts from its evaluated relevance.
+        // policy_json names the matcher "value", the shipped
+        // section "predicate"; both carry the constructor matcher.
+        let evaluated_relevance: std::collections::BTreeMap<(&str, &str), bool> = pj["rules"]
+            .as_array()
+            .expect("policy_json rules array")
+            .iter()
+            .map(|r| {
+                (
+                    (
+                        r["rule"].as_str().expect("rule name"),
+                        r["value"].as_str().expect("rule matcher"),
+                    ),
+                    r["relevant_complete"]
+                        .as_bool()
+                        .expect("evaluated relevance"),
+                )
+            })
+            .collect();
+        assert_eq!(evaluated_relevance.len(), rules_json.len());
+        for r in rules_json {
+            let key = (
+                r["rule"].as_str().expect("rendered rule name"),
+                r["predicate"].as_str().expect("rendered predicate"),
+            );
+            let evaluated = evaluated_relevance
+                .get(&key)
+                .unwrap_or_else(|| panic!("rendered rule {key:?} has no evaluated counterpart"));
+            assert_eq!(
+                r["relevant_complete"]
+                    .as_bool()
+                    .expect("rendered relevance"),
+                *evaluated,
+                "relevance drift for rule {key:?}"
+            );
+        }
         // The human block carries the same signals.
         let human = crate::report::render_human(&document);
         assert!(
@@ -1837,6 +1882,94 @@ require-executed=["SHA2-256"]
         assert!(
             human.contains("kat_excluded=0"),
             "human must show the KAT exclusion:\n{human}"
+        );
+    }
+
+    #[test]
+    fn unseen_deny_providers_agree_in_canonical_order() {
+        // Fix round 1 (finding 2b): with TWO unseen providers
+        // supplied out of order, both surfaces must emit the same
+        // list in the same order — and per-rule relevance must
+        // agree by rule identity.
+        //
+        // Order contract: the DOCUMENT RECORD defines the order.
+        // policy_record() sorts rules into canonical document
+        // order, and the shipped renderers (JSON + human) follow
+        // record order — CLI input order is unrecoverable after
+        // that sort. policy_json() therefore sorts its unseen list
+        // to the same canonical order (the smaller change: one
+        // sort here, versus storing input order on the record with
+        // schema + version churn).
+        let d = crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites: vec![site(
+                1,
+                100,
+                vec![cand("p", "default", 2, 21, &["AES-256-GCM"], false)],
+            )],
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        });
+        assert!(matches!(d.status, crate::evidence::Completeness::Complete));
+        // Deliberately out of order: z before a.
+        let rules = [
+            PolicyRule::deny_provider("z-provider"),
+            PolicyRule::deny_provider("a-provider"),
+        ];
+        let (verdict, document) = assemble_checked_document(&rules, d, &serde_json::Value::Null);
+        assert_eq!(verdict.overall(), PolicyOutcome::Pass);
+        let rendered = crate::report::doc_json(&document);
+        let policy = &rendered["policy"];
+        let pj = policy_json(&document, &verdict);
+        // Both surfaces pin canonical (sorted) order, not input order.
+        assert_eq!(
+            pj["unseen_deny_providers"],
+            serde_json::json!(["a-provider", "z-provider"])
+        );
+        assert_eq!(
+            policy["unseen_deny_providers"],
+            serde_json::json!(["a-provider", "z-provider"])
+        );
+        // Per-rule relevance agrees by rule identity.
+        let rendered_rules = policy["rules"].as_array().expect("rules array");
+        let evaluated_rules = pj["rules"].as_array().expect("policy_json rules array");
+        assert_eq!(rendered_rules.len(), 2);
+        assert_eq!(evaluated_rules.len(), 2);
+        for r in rendered_rules {
+            let key = (
+                r["rule"].as_str().unwrap(),
+                r["predicate"].as_str().unwrap(),
+            );
+            let mate = evaluated_rules
+                .iter()
+                .find(|e| (e["rule"].as_str().unwrap(), e["value"].as_str().unwrap()) == key)
+                .unwrap_or_else(|| panic!("no evaluated counterpart for {key:?}"));
+            assert_eq!(r["result"], "pass");
+            assert_eq!(r["relevant_complete"], mate["relevant_complete"]);
+            assert_eq!(r["relevant_complete"], true);
+        }
+        let human = crate::report::render_human(&document);
+        assert!(
+            human.contains("unseen_deny_providers=a-provider,z-provider"),
+            "human must list unseen providers in canonical order:\n{human}"
         );
     }
 
