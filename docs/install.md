@@ -170,7 +170,9 @@ availability.
   reservation/cache property only (an admitted same-file
   session reuses cached offsets without the 22 MiB transient,
   inside the pinned reservation). Admission proves one stock
-  parse transient per session: members beyond pool capacity
+  parse transient per session until a member attaches; attached
+  members warm admission to the lease alone (their parses are
+  cached for followers to clone). Members beyond pool capacity
   refuse with an explicit `global_state_limit` gap instead of
   starving live members. Runtime multi-worker observation is
   not yet qualified and is not claimed here.

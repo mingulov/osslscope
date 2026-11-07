@@ -20,7 +20,9 @@ miss path is honest loss accounting, not equivalent availability:
   reservation/cache property only: an admitted same-file session
   reuses cached offsets without the transient, inside the pinned
   reservation; admission proves one stock parse transient per
-  session, and members beyond pool capacity refuse with an
+  session until a member attaches, then the lease alone
+  (attached members' parses are cached for followers to
+  clone); members beyond pool capacity refuse with an
   explicit `global_state_limit` gap instead of starving live
   members; runtime multi-worker observation is not yet
   qualified and is not claimed here);
