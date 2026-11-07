@@ -1021,7 +1021,9 @@ mod tests {
                 Err(_) => {
                     release_tx.send(()).unwrap();
                     let _ = waiter.join();
-                    panic!("RED ({case}): the abandoning waiter blocked on the raced-in destructor");
+                    panic!(
+                        "RED ({case}): the abandoning waiter blocked on the raced-in destructor"
+                    );
                 }
             }
             let _ = waiter.join();
@@ -1047,7 +1049,10 @@ mod tests {
                     .remove(&dest);
                 let slot = slot.expect("the receipt-bearing slot stays for the reconciler");
                 assert!(slot.result.is_none(), "the raced-in result stays consumed");
-                assert!(slot.receipt.is_some(), "the receipt stays for the reconciler");
+                assert!(
+                    slot.receipt.is_some(),
+                    "the receipt stays for the reconciler"
+                );
             } else {
                 assert!(
                     view_slot(&dest).is_none(),
