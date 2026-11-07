@@ -5651,6 +5651,9 @@ fn trim_nul(log: &[u8]) -> &[u8] {
 /// (F-DIAG-1): the in-error summary stays capped at 2000 chars, but
 /// diagnosis needs the whole multi-hundred-KB text, so it lands in
 /// a temp file whose path the error names. Returns the path written.
+/// Sibling-file counter for verifier-log spills within this process.
+static SPILL_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn spill_verifier_log(prog: &str, log: &[u8]) -> Option<std::path::PathBuf> {
     let safe: String = prog
         .chars()
@@ -5662,12 +5665,33 @@ fn spill_verifier_log(prog: &str, log: &[u8]) -> Option<std::path::PathBuf> {
             }
         })
         .collect();
-    let path = std::env::temp_dir().join(format!(
-        "osslscope-verifier-{safe}-{}.log",
-        std::process::id()
-    ));
-    std::fs::write(&path, log).ok()?;
-    Some(path)
+    let dir = std::env::temp_dir();
+    let pid = std::process::id();
+    // The predictable base name first (established shape), then
+    // numbered siblings: every attempt exclusively creates
+    // (O_EXCL|O_NOFOLLOW), so a pre-created symlink or stale file is
+    // skipped, never followed or truncated.
+    for attempt in 0..100 {
+        let name = if attempt == 0 {
+            format!("osslscope-verifier-{safe}-{pid}.log")
+        } else {
+            let n = SPILL_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            format!("osslscope-verifier-{safe}-{pid}-{n}.log")
+        };
+        let path = dir.join(name);
+        let mut file = match crate::report::exclusive_create(&path, 0o600) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        };
+        use std::io::Write;
+        if file.write_all(log).is_err() {
+            std::fs::remove_file(&path).ok();
+            return None;
+        }
+        return Some(path);
+    }
+    None
 }
 
 #[cfg(test)]
@@ -6308,6 +6332,38 @@ mod tests {
         assert_eq!(trim_nul(b"\0\0"), b"");
         assert_eq!(trim_nul(b""), b"");
         assert_eq!(trim_nul(b"a\0b\0"), b"a\0b");
+    }
+
+    #[test]
+    fn verifier_spill_refuses_precreated_symlink() {
+        let dir = std::env::temp_dir();
+        let target = dir.join(format!(
+            "osslscope-verifier-m6referent-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&target, b"sentinel").unwrap();
+        // Pre-create the exact predictable path the spill would take.
+        let link = dir.join(format!(
+            "osslscope-verifier-symlinkprobe-{}.log",
+            std::process::id()
+        ));
+        // A stale file from an earlier crashed run must not mask the
+        // symlink assertion (nor be followed itself).
+        std::fs::remove_file(&link).ok();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let spilled = spill_verifier_log("symlinkprobe", b"evil-payload");
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"sentinel",
+            "spill must not follow a pre-created symlink"
+        );
+        // The log still lands, beside the refused path.
+        let path = spilled.expect("spill lands on a sibling path");
+        assert_ne!(path, link);
+        assert_eq!(std::fs::read(&path).unwrap(), b"evil-payload");
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
     }
 
     #[test]

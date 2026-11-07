@@ -6,6 +6,7 @@
 use crate::capture;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 /// Default window (P3 exit-5): 3× the 10 s P2 exactness cells that
@@ -2993,6 +2994,111 @@ fn same_artifact_sink(primary: &OutputDest, other: &OutputDest) -> bool {
     }
 }
 
+/// Exclusive-create a file without following symlinks
+/// (`O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`): refuses
+/// pre-existing paths (files and symlinks alike) instead of
+/// following or truncating them. The one primitive both
+/// root-reached writers (artifact delivery, verifier-log spill)
+/// build on.
+pub(crate) fn exclusive_create(
+    path: &std::path::Path,
+    mode: u32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+}
+
+/// Counter for temp/sibling file uniqueness within this process.
+static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// True for exactly `/proc/self/fd/<digits>`: an already-open
+/// descriptor, kernel-managed per-process — never a plantable
+/// symlink, so artifact writes pass through (EPIPE recorded).
+fn is_proc_self_fd(path: &std::path::Path) -> bool {
+    let Some(text) = path.to_str() else {
+        return false;
+    };
+    let Some(rest) = text.strip_prefix("/proc/self/fd/") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Write `bytes` to `path` atomically: a freshly exclusively-created
+/// temp file in the same directory, then rename over the target.
+/// Symlink and non-regular targets are refused without following
+/// them (rename would replace the link/node itself — never what an
+/// artifact `-o` path means); a failed write leaves the target
+/// untouched instead of truncated. Creation mode matches
+/// `fs::write` (`0o666` & umask).
+fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if is_proc_self_fd(path) {
+        return std::fs::write(path, bytes);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            let kind = meta.file_type();
+            if kind.is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "refusing to follow symlink target (pass a regular file path)",
+                ));
+            }
+            if !kind.is_file() {
+                // Devices, FIFOs, sockets, dirs: direct open without
+                // following a final symlink (excluded above;
+                // O_NOFOLLOW stays as belt-and-braces against a swap
+                // race). Same errors as before (EISDIR, ...).
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut direct = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o666)
+                    .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)?;
+                direct.write_all(bytes)?;
+                return Ok(());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    for _ in 0..100 {
+        let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".osslscope-out-{}-{n}.tmp", std::process::id()));
+        let mut file = match exclusive_create(&tmp, 0o666) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = file.write_all(bytes) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        drop(file);
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique temp file beside the target",
+    ))
+}
+
 fn write_dest(dest: &OutputDest, bytes: &[u8]) -> ArtifactOutcome {
     let display = dest_display(dest);
     let result = match dest {
@@ -3002,7 +3108,7 @@ fn write_dest(dest: &OutputDest, bytes: &[u8]) -> ArtifactOutcome {
                 .write_all(bytes)
                 .and_then(|()| std::io::stdout().flush())
         }
-        OutputDest::File(path) => std::fs::write(path, bytes),
+        OutputDest::File(path) => write_file_atomic(path, bytes),
     };
     match result {
         Ok(()) => ArtifactOutcome {
@@ -3069,11 +3175,14 @@ pub fn setup_failure_document(fatal: FatalKind) -> CaptureDocument {
 pub fn write_artifacts(doc: &CaptureDocument, req: &OutputRequest) -> DeliveryResult {
     // Primary + CBOM to the same sink would concatenate (stdout)
     // or overwrite (same file): refuse the CBOM side while the
-    // primary still delivers. Recheck actual file identity after the primary
+    // primary still delivers. Check identity BEFORE the primary
+    // write too: the primary lands via atomic tmp+rename, which
+    // breaks a hardlink alias — the post-write recheck alone would
+    // miss it. Recheck actual file identity after the primary
     // write: a new file or a previously dangling alias is now resolvable.
     let same_sink = match &req.cbom {
         None => false,
-        Some(dest) => req.primary == *dest,
+        Some(dest) => req.primary == *dest || same_artifact_sink(&req.primary, dest),
     };
     let primary_render: Result<Vec<u8>, String> = match req.format {
         OutputFormat::Human => Ok(render_human(doc).into_bytes()),
@@ -3185,6 +3294,89 @@ pub fn warn_empty_companions(objects: &crate::focused_capture::FocusedObjects) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(test)]
+    mod dest_write_tests {
+        use super::*;
+        use std::path::PathBuf;
+
+        fn scratch_dir(tag: &str) -> PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "osslscope-m6-{}-{tag}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        }
+
+        #[test]
+        fn write_dest_refuses_symlink_target() {
+            let dir = scratch_dir("symlink");
+            let target = dir.join("referent.txt");
+            std::fs::write(&target, b"sentinel").unwrap();
+            let link = dir.join("out.json");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let outcome = write_dest(&OutputDest::File(link.clone()), b"payload-bytes");
+            assert!(
+                !outcome.ok,
+                "symlink target must be refused, got: {outcome:?}"
+            );
+            assert_eq!(
+                std::fs::read(&target).unwrap(),
+                b"sentinel",
+                "referent must be untouched"
+            );
+            assert!(outcome.error.is_some());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn write_dest_regular_write_lands_byte_identical() {
+            let dir = scratch_dir("regular");
+            let plain = dir.join("plain.json");
+            let first = write_dest(&OutputDest::File(plain.clone()), b"one");
+            assert!(first.ok, "first write must succeed: {first:?}");
+            assert_eq!(first.bytes, 3);
+            assert_eq!(std::fs::read(&plain).unwrap(), b"one");
+            // Overwrite replaces (no append, no leftover tail).
+            let second = write_dest(&OutputDest::File(plain.clone()), b"two-longer");
+            assert!(second.ok, "overwrite must succeed: {second:?}");
+            assert_eq!(std::fs::read(&plain).unwrap(), b"two-longer");
+            // No temp droppings beside the target.
+            let names: Vec<String> = std::fs::read_dir(&dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(names, vec!["plain.json".to_string()]);
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn write_dest_device_target_keeps_direct_write() {
+            // Device-class targets are not symlinks: direct write as
+            // before (discard), never an atomic rename over the node.
+            let outcome = write_dest(&OutputDest::File(PathBuf::from("/dev/null")), b"x");
+            assert!(outcome.ok, "/dev/null must keep working: {outcome:?}");
+            assert_eq!(outcome.bytes, 1);
+        }
+
+        #[test]
+        fn write_dest_directory_target_still_errors() {
+            // Same error class as before (EISDIR), not a refusal.
+            let dir = scratch_dir("dirtarget");
+            let outcome = write_dest(&OutputDest::File(dir.clone()), b"x");
+            assert!(!outcome.ok, "directory target must fail: {outcome:?}");
+            assert!(
+                outcome.error.as_deref().unwrap().contains("directory"),
+                "EISDIR text preserved, got: {outcome:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
     #[cfg(test)]
     mod preview_admission_tests {
         use super::*;
