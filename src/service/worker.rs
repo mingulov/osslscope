@@ -263,29 +263,42 @@ where
             // receipt needs reconciling (nonce destinations have no
             // successor to reconcile — retention would accumulate
             // unboundedly across closes).
-            let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = reg.get_mut(&dest_key) {
-                if slot.worker == worker {
-                    if exit_flag.load(Ordering::Acquire) {
-                        drop(value);
-                        match receipt {
-                            Some(r) => {
-                                slot.live = false;
-                                slot.receipt = Some(r);
+            // R4 finding 2: the unread result drops OUTSIDE the
+            // registry lock (production values own
+            // `OpenTap{File}` — destructor syscalls inside the
+            // critical section would stall abandonment, which takes
+            // the same mutex with no deadline). Only HashMap ops +
+            // small POD moves run under the lock (slot/receipt
+            // drops are allocator-only — no `Drop` impls, no
+            // syscalls); no holder ever waits on worker progress.
+            let deferred: Option<T> = {
+                let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+                let mut deferred = None;
+                if let Some(slot) = reg.get_mut(&dest_key) {
+                    if slot.worker == worker {
+                        if exit_flag.load(Ordering::Acquire) {
+                            deferred = value;
+                            match receipt {
+                                Some(r) => {
+                                    slot.live = false;
+                                    slot.receipt = Some(r);
+                                }
+                                None => {
+                                    reg.remove(&dest_key);
+                                }
                             }
-                            None => {
-                                reg.remove(&dest_key);
+                        } else {
+                            slot.live = false;
+                            if let Some(v) = value {
+                                slot.result = Some(Box::new(v));
                             }
+                            slot.receipt = receipt;
                         }
-                    } else {
-                        slot.live = false;
-                        if let Some(v) = value {
-                            slot.result = Some(Box::new(v));
-                        }
-                        slot.receipt = receipt;
                     }
                 }
-            }
+                deferred
+            };
+            drop(deferred);
         });
     if spawn.is_err() {
         // Worker-creation failure: Expired immediately, fail-closed.
@@ -298,16 +311,16 @@ where
     loop {
         // Completion check (single map op): only this worker's slot
         // completes this waiter (a successor's slot never does).
-        {
+        // The boxed value unboxes OUTSIDE the lock (R4 finding 2 —
+        // value destruction never runs in the critical section, so
+        // a concurrent abandonment never waits on it).
+        let polled: Option<Option<Box<dyn Any + Send>>> = {
             let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
             match reg.get_mut(&dest) {
                 Some(slot) if slot.worker == worker && !slot.live => {
                     let result = slot.result.take();
                     reg.remove(&dest);
-                    match result.and_then(|b| b.downcast::<T>().ok()).map(|b| *b) {
-                        Some(v) => return Control::Done(v),
-                        None => return Control::Expired,
-                    }
+                    Some(result)
                 }
                 Some(slot) if slot.worker != worker => {
                     // A successor registered: this waiter lost its
@@ -317,7 +330,13 @@ where
                     let _ = slot;
                     return Control::Expired;
                 }
-                _ => {}
+                _ => None,
+            }
+        };
+        if let Some(result) = polled {
+            match result.and_then(|b| b.downcast::<T>().ok()).map(|b| *b) {
+                Some(v) => return Control::Done(v),
+                None => return Control::Expired,
             }
         }
         // Consume signals BEFORE the cancel check (a second stop
@@ -351,21 +370,25 @@ where
 /// the deadline/cancel fired first) so no race retains a result.
 /// Receiptless slots unregister; receipt-bearing slots drop their
 /// (unreadable) result but stay for the reconciler. Short critical
-/// section only (no worker progress needed).
+/// section only (no worker progress needed): the consumed result
+/// drops OUTSIDE the lock (R4 finding 2 — the waiter never waits
+/// on destructor progress, its own or a foreign worker's).
 fn consume_if_finished(dest: &Destination, worker: u64) {
-    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    let finished = matches!(
-        reg.get(dest),
-        Some(slot) if slot.worker == worker && !slot.live
-    );
-    if !finished {
-        return;
-    }
-    if reg.get(dest).is_some_and(|slot| slot.receipt.is_none()) {
-        reg.remove(dest);
-    } else if let Some(slot) = reg.get_mut(dest) {
-        slot.result = None;
-    }
+    let deferred: Option<Box<dyn Any + Send>> = {
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        let finished = matches!(
+            reg.get(dest),
+            Some(slot) if slot.worker == worker && !slot.live
+        );
+        if !finished {
+            None
+        } else if reg.get(dest).is_some_and(|slot| slot.receipt.is_none()) {
+            reg.remove(dest).and_then(|slot| slot.result)
+        } else {
+            reg.get_mut(dest).and_then(|slot| slot.result.take())
+        }
+    };
+    drop(deferred);
 }
 
 /// Worker output: value + optional tap receipt (stored into the
@@ -406,15 +429,23 @@ pub struct SlotView {
 }
 
 pub fn view_slot(dest: &Destination) -> Option<SlotView> {
-    let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
-    let slot = reg.get_mut(dest)?;
-    let view = SlotView {
-        live: slot.live,
-        receipt: slot.receipt.clone(),
+    // A consumed finished slot's unreadable result drops OUTSIDE
+    // the lock (R4 finding 2 — same rule as every other site).
+    let (view, deferred) = {
+        let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+        let slot = reg.get_mut(dest)?;
+        let view = SlotView {
+            live: slot.live,
+            receipt: slot.receipt.clone(),
+        };
+        let deferred = if !slot.live {
+            reg.remove(dest).and_then(|slot| slot.result)
+        } else {
+            None
+        };
+        (view, deferred)
     };
-    if !slot.live {
-        reg.remove(dest);
-    }
+    drop(deferred);
     Some(view)
 }
 
@@ -717,6 +748,124 @@ mod tests {
         assert!(t0.elapsed() < Duration::from_secs(5));
         let dropped = diag.abandon(Duration::from_secs(2));
         assert!(dropped > 0, "flood must drop + count, got {dropped}");
+    }
+
+    /// R4 finding 2: abandonment returns within its budget while a
+    /// FOREIGN worker's result destructor is still blocked — result
+    /// destruction runs outside the registry lock, so the waiter's
+    /// abandonment path never waits on worker-held state. RED
+    /// pre-fix (the waiter blocks on the mutex the destructor
+    /// holds); GREEN post-fix. The R3-F2 race leg
+    /// (`t74_seal_bound`, no retained results) stays green.
+    #[test]
+    fn abandonment_returns_while_foreign_destructor_blocks() {
+        use std::sync::mpsc;
+        struct BlockingDrop {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            exited: mpsc::Sender<()>,
+        }
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                let _ = self.exited.send(());
+            }
+        }
+        let tag = format!(
+            "r42-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        // Op A: abandoned immediately (zero budget, worker gated),
+        // then released — the flagged exit drops its value.
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (exited_tx, exited_rx) = mpsc::channel::<()>();
+        let dest_a = Destination {
+            class: DestClass::OwnTmp,
+            key: format!("{tag}-a"),
+        };
+        let cancel_a = AtomicBool::new(false);
+        let ctrl_a: Control<BlockingDrop> = run_under_control(
+            dest_a.clone(),
+            Duration::from_millis(0),
+            &cancel_a,
+            move |_gate| {
+                let _ = gate_rx.recv();
+                WorkerOut::value(BlockingDrop {
+                    entered: entered_tx,
+                    release: release_rx,
+                    exited: exited_tx,
+                })
+            },
+            None,
+        );
+        assert!(matches!(ctrl_a, Control::Expired));
+        gate_tx.send(()).unwrap();
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the abandoned value's destructor must run");
+        // Op B (a different destination on the same global
+        // registry): its abandonment must return within budget
+        // while A's destructor is still blocked on `release`.
+        let dest_b = Destination {
+            class: DestClass::OwnTmp,
+            key: format!("{tag}-b"),
+        };
+        let (done_tx, done_rx) = mpsc::channel::<(bool, Duration)>();
+        let waiter = std::thread::spawn(move || {
+            let cancel_b = AtomicBool::new(false);
+            let t0 = Instant::now();
+            let ctrl_b: Control<u64> = run_under_control(
+                dest_b,
+                Duration::from_millis(200),
+                &cancel_b,
+                move |gate| {
+                    while !gate.abandoned() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    WorkerOut::value(7)
+                },
+                None,
+            );
+            let _ = done_tx.send((matches!(ctrl_b, Control::Expired), t0.elapsed()));
+        });
+        match done_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok((is_expired, dt)) => {
+                assert!(is_expired, "B must abandon with Expired, not hang");
+                assert!(
+                    exited_rx.try_recv().is_err(),
+                    "A's destructor must still be blocked when B abandons"
+                );
+                assert!(
+                    dt < Duration::from_secs(2),
+                    "abandonment must return within budget, took {dt:?}"
+                );
+            }
+            Err(_) => {
+                release_tx.send(()).unwrap();
+                let _ = waiter.join();
+                panic!("RED: abandonment waited on worker-held destructor progress");
+            }
+        }
+        release_tx.send(()).unwrap();
+        exited_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the destructor exits once released");
+        let _ = waiter.join();
+        // Settle: A's receiptless abandoned slot self-reclaims.
+        for _ in 0..400 {
+            if view_slot(&dest_a).is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(view_slot(&dest_a).is_none(), "A's slot must self-reclaim");
     }
 
     /// S4 expedite independence: a wait poll over a FRESH cancel
