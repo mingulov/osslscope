@@ -347,7 +347,8 @@ where
         if cancel.load(Ordering::Relaxed) {
             // Abandonment path: flag + epoch, then the registry
             // short critical section (never worker-dependent), NO
-            // blocking syscall.
+            // blocking syscall (a consumed raced-in result leaves
+            // for the deferred reaper — never dropped here).
             flag.store(true, Ordering::Release);
             epoch.fetch_add(1, Ordering::AcqRel);
             consume_if_finished(&dest, worker);
@@ -371,8 +372,10 @@ where
 /// Receiptless slots unregister; receipt-bearing slots drop their
 /// (unreadable) result but stay for the reconciler. Short critical
 /// section only (no worker progress needed): the consumed result
-/// drops OUTSIDE the lock (R4 finding 2 — the waiter never waits
-/// on destructor progress, its own or a foreign worker's).
+/// leaves for the deferred reaper (R5 finding 2 — the waiter never
+/// waits on destructor progress, its own or a foreign worker's;
+/// dropping here would run a raced-in `OpenTap{File}` close on the
+/// abandonment path).
 fn consume_if_finished(dest: &Destination, worker: u64) {
     let deferred: Option<Box<dyn Any + Send>> = {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -388,7 +391,53 @@ fn consume_if_finished(dest: &Destination, worker: u64) {
             reg.get_mut(dest).and_then(|slot| slot.result.take())
         }
     };
-    drop(deferred);
+    if let Some(boxed) = deferred {
+        deferred_drop(boxed);
+    }
+}
+
+/// Deferred result disposal (R5 finding 2): the abandoning waiter
+/// hands a consumed raced-in result here instead of dropping it —
+/// the value's destructor (production values own `OpenTap{File}`,
+/// whose close is a blocking syscall past budget) runs on a
+/// dedicated detached reaper thread, never on the abandonment
+/// path. The waiter performs only a non-blocking channel send
+/// (allocator-only, never destructor progress, never a blocking
+/// syscall), so the frozen "abandonment performs no blocking
+/// syscall and reclaims nothing" rule (D-record:1524 — a rule
+/// about the waiter's path: no join, no result drop, return
+/// within budget whatever the worker/destructor does) holds:
+/// consumption is unchanged (the registry slot unregisters or
+/// takes exactly as before — no retained results, the R3-F2 race
+/// stays consumed) while reclamation moves off-path. If the
+/// reaper is unavailable (thread-spawn failure), the value is
+/// leaked rather than dropped — bounded abandonment wins over
+/// reclamation, and leaked memory is unreachable (never a
+/// retained registry result).
+fn deferred_drop(deferred: Box<dyn Any + Send>) {
+    if let Err(failed) = reaper_tx().send(deferred) {
+        std::mem::forget(failed.0);
+    }
+}
+
+/// The reaper channel (spawned once, lazily, on first deferred
+/// disposal; detached — process exit reaps it with the workers).
+fn reaper_tx() -> &'static std::sync::mpsc::Sender<Box<dyn Any + Send>> {
+    static REAPER: OnceLock<std::sync::mpsc::Sender<Box<dyn Any + Send>>> = OnceLock::new();
+    REAPER.get_or_init(|| {
+        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Any + Send>>();
+        // On spawn failure the closure (owning `rx`) drops, so every
+        // send fails and `deferred_drop` leaks — bounded, never
+        // blocking.
+        let _ = std::thread::Builder::new()
+            .name("sixb-reaper".to_string())
+            .spawn(move || {
+                for deferred in rx {
+                    drop(deferred);
+                }
+            });
+        tx
+    })
 }
 
 /// Worker output: value + optional tap receipt (stored into the
@@ -877,6 +926,135 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(view_slot(&dest_a).is_none(), "A's slot must self-reclaim");
+    }
+
+    /// R5 finding 2: an abandoning waiter must not synchronously
+    /// destroy a result caught by the completion race — disposal
+    /// runs OFF the waiter's path (deferred reaper) while the race
+    /// stays consumed (no retained results). Deterministic at the
+    /// helper level: the manually constructed finished slot is
+    /// exactly the post-race state (the worker stored T and set
+    /// live=false after the waiter's last completion check, before
+    /// the waiter's abandonment consume). RED pre-fix (the waiter
+    /// blocks on the raced-in destructor — the 5 s watchdog);
+    /// GREEN post-fix (the consume returns in-budget with the
+    /// destructor still blocked; the result is eventually disposed
+    /// without retention). Both slot arms (receiptless unregister
+    /// + receipt-bearing take) ride the same disposal.
+    #[test]
+    fn abandonment_defers_raced_in_blocked_result() {
+        use std::sync::mpsc;
+        struct BlockingDrop {
+            entered: mpsc::Sender<()>,
+            release: mpsc::Receiver<()>,
+            exited: mpsc::Sender<()>,
+        }
+        impl Drop for BlockingDrop {
+            fn drop(&mut self) {
+                let _ = self.entered.send(());
+                let _ = self.release.recv();
+                let _ = self.exited.send(());
+            }
+        }
+        let tag = format!(
+            "r52-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        for (case, with_receipt) in [("bare", false), ("receipt", true)] {
+            let (entered_tx, entered_rx) = mpsc::channel::<()>();
+            let (release_tx, release_rx) = mpsc::channel::<()>();
+            let (exited_tx, exited_rx) = mpsc::channel::<()>();
+            let dest = Destination {
+                class: DestClass::OwnTmp,
+                key: format!("{tag}-{case}"),
+            };
+            // A real sequence id (never collides with a live worker).
+            let worker = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
+            let receipt = with_receipt.then(|| TapReceipt {
+                op_id: 3,
+                state: TapReceiptState::Complete { bytes: 9 },
+                kind: "window-ref".to_string(),
+                seq: Some(3),
+                span: None,
+                record_bytes: 9,
+                dest_path: "/tmp/x".to_string(),
+                dest_dev: 1,
+                dest_ino: 2,
+            });
+            {
+                let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
+                reg.insert(
+                    dest.clone(),
+                    Slot {
+                        worker,
+                        live: false,
+                        result: Some(Box::new(BlockingDrop {
+                            entered: entered_tx,
+                            release: release_rx,
+                            exited: exited_tx,
+                        })),
+                        receipt,
+                    },
+                );
+            }
+            // The abandoning waiter's consume runs on its own thread
+            // under a watchdog (RED must fail, never hang the suite).
+            let (done_tx, done_rx) = mpsc::channel::<()>();
+            let dest_w = dest.clone();
+            let t0 = Instant::now();
+            let waiter = std::thread::spawn(move || {
+                consume_if_finished(&dest_w, worker);
+                let _ = done_tx.send(());
+            });
+            match done_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => {
+                    let dt = t0.elapsed();
+                    assert!(
+                        dt < Duration::from_secs(2),
+                        "{case}: the consume must return in-budget, took {dt:?}"
+                    );
+                }
+                Err(_) => {
+                    release_tx.send(()).unwrap();
+                    let _ = waiter.join();
+                    panic!("RED ({case}): the abandoning waiter blocked on the raced-in destructor");
+                }
+            }
+            let _ = waiter.join();
+            // Disposal started off-path (entered) while still blocked
+            // (no exit) — the waiter never waited on it.
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the deferred destructor must run off-path");
+            assert!(
+                exited_rx.try_recv().is_err(),
+                "{case}: the destructor must still be blocked when the waiter returns"
+            );
+            // Release: the result is eventually disposed (no leak) and
+            // the race stays consumed (no retained result).
+            release_tx.send(()).unwrap();
+            exited_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the deferred result must dispose once released");
+            if with_receipt {
+                let slot = registry()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&dest);
+                let slot = slot.expect("the receipt-bearing slot stays for the reconciler");
+                assert!(slot.result.is_none(), "the raced-in result stays consumed");
+                assert!(slot.receipt.is_some(), "the receipt stays for the reconciler");
+            } else {
+                assert!(
+                    view_slot(&dest).is_none(),
+                    "the receiptless slot unregisters"
+                );
+            }
+        }
     }
 
     /// S4 expedite independence: a wait poll over a FRESH cancel
