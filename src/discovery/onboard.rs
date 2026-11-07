@@ -1279,9 +1279,10 @@ pub fn check_arch(bytes: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-const ENROLL_REMEDIATION: &str = "enroll this build with --table (measure the query offset \
-     from an unstripped twin; see docs/builtin-runbook.md), or pass \
-     --force-offset for a one-shot run";
+const ENROLL_REMEDIATION: &str = "observe an unstripped build (automatic symtab route \
+     needs no enrollment), or vet explicit enrollment with \
+     doctor --table/--force-offset (see docs/builtin-runbook.md); \
+     report/check do not consume enrollment files";
 
 /// Qualify libcrypto (or static-exe) bytes for builtin-mode dispatch
 /// observation: arch → flavor → provider class → supported anchor.
@@ -2087,6 +2088,31 @@ mod tests {
         assert_eq!(
             t.by_build_id(&"a".repeat(40)).unwrap().class,
             ProviderClass::ThirdParty
+        );
+    }
+
+    #[test]
+    fn enroll_remediation_is_runnable_on_every_surface() {
+        // report/check reject --table/--force-offset at parse time,
+        // so the Unknown-qualification remediation must not prescribe
+        // them as report/check flags; every clause below runs
+        // somewhere real (automatic symtab observation, or
+        // doctor-only enrollment vetting).
+        assert!(
+            ENROLL_REMEDIATION.contains("automatic symtab route"),
+            "must offer the automatic symtab route: {ENROLL_REMEDIATION}"
+        );
+        assert!(
+            ENROLL_REMEDIATION.contains("doctor --table/--force-offset"),
+            "enrollment vetting must name its runnable command: {ENROLL_REMEDIATION}"
+        );
+        assert!(
+            ENROLL_REMEDIATION.contains("report/check do not consume enrollment files"),
+            "must say report/check cannot take the file: {ENROLL_REMEDIATION}"
+        );
+        assert!(
+            !ENROLL_REMEDIATION.contains("pass --force-offset for a one-shot run"),
+            "must not prescribe rejected flags: {ENROLL_REMEDIATION}"
         );
     }
 
