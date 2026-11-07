@@ -2068,16 +2068,27 @@ fn close_final_window(mut run: Run) -> ExitCode {
             // Stage the drain bytes (spill-capable — a spill failure
             // here abandons pre-close, like the run loop's; spills
             // run on workers under the shutdown remainder — R1
-            // finding 3).
+            // finding 3). Close-critical staging survives the first
+            // stop (fresh cancel — shutdown preemption is EXPECTED
+            // at close, not a failure; only the double cancels, via
+            // the poll, and then the divert below expedites —
+            // mirroring the in-run spills).
             let mut spill_fail: Option<std::io::Error> = None;
             let tick = run.tick_id;
             let spill_budget = close_budget(&run);
-            let spill_poll = run_wait_poll!(run);
+            let spill_cancel = AtomicBool::new(false);
+            let spill_poll = wait_poll_for(
+                &run.signals,
+                &spill_cancel,
+                &run.cancel_latched,
+                &run.double_signal,
+                &run.reload_pending,
+            );
             let mut spill_sink = spill_sink_for(
                 &run.diag,
                 &run.format,
                 &mut run.summary,
-                &run.cancel,
+                &spill_cancel,
                 Some(&spill_poll),
                 spill_budget,
             );
@@ -2106,6 +2117,14 @@ fn close_final_window(mut run: Run) -> ExitCode {
             }
             drop(spill_sink);
             if let Some(e) = spill_fail {
+                // A double observed during close staging expedites
+                // (R1 finding 3): immediate stop, never the
+                // abandonment mapping (the funnel backstops this,
+                // but the explicit divert keeps errno noise out of
+                // the double exit).
+                if double_observed(&run) {
+                    return double_signal_exit(run);
+                }
                 // Spill-write failure: abandon pre-close with the
                 // disambiguated reason (R3 adjudication d — expiry
                 // is not disk-full), like the run loop's.
@@ -2157,15 +2176,27 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
         Ok(out) => {
             // Close-drain staging (worker-backed spills under the
             // shutdown remainder — R1 finding 3, like the final).
+            // Close-critical staging survives the first stop (fresh
+            // cancel — shutdown preemption is EXPECTED at close,
+            // not a failure; only the double cancels, via the poll,
+            // and then the divert below expedites — mirroring the
+            // in-run spills).
             let mut spill_fail: Option<std::io::Error> = None;
             let tick = run.tick_id;
             let spill_budget = close_budget(&run);
-            let spill_poll = run_wait_poll!(run);
+            let spill_cancel = AtomicBool::new(false);
+            let spill_poll = wait_poll_for(
+                &run.signals,
+                &spill_cancel,
+                &run.cancel_latched,
+                &run.double_signal,
+                &run.reload_pending,
+            );
             let mut spill_sink = spill_sink_for(
                 &run.diag,
                 &run.format,
                 &mut run.summary,
-                &run.cancel,
+                &spill_cancel,
                 Some(&spill_poll),
                 spill_budget,
             );
@@ -2191,6 +2222,14 @@ fn close_terminal_window(mut run: Run) -> BoundaryOut {
             }
             drop(spill_sink);
             if let Some(e) = spill_fail {
+                // A double observed during close staging expedites
+                // (R1 finding 3): immediate stop, never the
+                // abandonment mapping (the funnel backstops this,
+                // but the explicit divert keeps errno noise out of
+                // the double exit).
+                if double_observed(&run) {
+                    return BoundaryOut::Exit(double_signal_exit(run));
+                }
                 // Spill-write failure (the record can neither stage
                 // nor spill): Control-2 pre-publish disposition —
                 // abandon with the disambiguated reason (R3
