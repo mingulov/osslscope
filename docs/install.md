@@ -167,10 +167,13 @@ when the pool is contended — miss-fallback is not equivalent
 availability.
 
 - Cap (≤16 distinct files, stable): hits fit — demonstrated
-  reservation/cache property only (a same-file second session
-  reuses cached offsets without the 22 MiB transient, inside the
-  pinned reservation). Runtime multi-worker observation is not
-  yet qualified and is not claimed here.
+  reservation/cache property only (an admitted same-file
+  session reuses cached offsets without the 22 MiB transient,
+  inside the pinned reservation). Admission proves one stock
+  parse transient per session: members beyond pool capacity
+  refuse with an explicit `global_state_limit` gap instead of
+  starving live members. Runtime multi-worker observation is
+  not yet qualified and is not claimed here.
 - Full (16 cached): further distinct files always miss
   (uncached; may gap under contention).
 - Churn (Stamps changing across snapshots, e.g. upgrades or

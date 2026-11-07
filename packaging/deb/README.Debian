@@ -17,9 +17,12 @@ with a StateLimit/ReadLimit gap when the pool is contended. The
 miss path is honest loss accounting, not equivalent availability:
 
 - up to 16 distinct stable files: hits fit (demonstrated
-  reservation/cache property only: a same-file second session
+  reservation/cache property only: an admitted same-file session
   reuses cached offsets without the transient, inside the pinned
-  reservation; runtime multi-worker observation is not yet
+  reservation; admission proves one stock parse transient per
+  session, and members beyond pool capacity refuse with an
+  explicit `global_state_limit` gap instead of starving live
+  members; runtime multi-worker observation is not yet
   qualified and is not claimed here);
 - cache full: further distinct files always miss;
 - churning Stamps (upgrades, container layer turnover): new
