@@ -158,6 +158,65 @@ fn admit_sink(out: &Path, stream: Option<&Path>) -> Result<Option<PathBuf>, Stri
     Ok(Some(resolved))
 }
 
+/// Test-only scripted engine (S4 close-staging regressions):
+/// canned close-drain bytes + a canned snapshot, served through
+/// the same four methods the coordinator calls on
+/// `ServiceEngine`. The close path under test (staging, spill
+/// sink, seal reads, assemble, publish, judge, sinks, seal,
+/// summary, the §7.3 fold) is 100% production; only the engine
+/// I/O is scripted (an unprivileged test process cannot observe
+/// real members). Zero production impact (`cfg(test)` only; the
+/// startup path never runs under `cfg(test)` — no lib unit test
+/// calls it — so its substitution below is compile-only
+/// scaffolding).
+#[cfg(test)]
+struct FakeCloseEngine {
+    drain_bytes: Vec<u8>,
+    snap: Snapshot,
+}
+
+#[cfg(test)]
+impl FakeCloseEngine {
+    fn for_test() -> Self {
+        Self {
+            drain_bytes: Vec::new(),
+            snap: Snapshot {
+                at_ns: 0,
+                stable: true,
+                members: Vec::new(),
+                run: crate::service::snapshot::RunTallies::default(),
+                polling: false,
+            },
+        }
+    }
+
+    fn pump_iteration(
+        &mut self,
+        _cancel: &AtomicBool,
+    ) -> std::io::Result<crate::crypto_watch::IterationOut> {
+        unreachable!("test engine never pumps (close-path tests only)");
+    }
+
+    fn snapshot(&self, _flip_to: Option<u64>) -> Snapshot {
+        self.snap.clone()
+    }
+
+    fn snapshot_sealed(&self, _sealed_gen: u64) -> Snapshot {
+        self.snap.clone()
+    }
+
+    fn close_drain_capped(
+        &mut self,
+        _cancel: &AtomicBool,
+        _deadline: Option<Instant>,
+    ) -> std::io::Result<crate::crypto_watch::CloseOut> {
+        Ok(crate::crypto_watch::CloseOut {
+            bytes: self.drain_bytes.clone(),
+            code: 3,
+        })
+    }
+}
+
 /// Live run state (owned by the coordinator; destructured at exit
 /// into the summary + the §7.3 fold).
 struct Run {
@@ -170,6 +229,9 @@ struct Run {
     _lock: DirLock,
     signals: SignalFd,
     cancel: AtomicBool,
+    #[cfg(test)]
+    engine: FakeCloseEngine,
+    #[cfg(not(test))]
     engine: ServiceEngine,
     /// Pool-budget guards (companion bytes; sessions lease from the
     /// engine's clone of the same pool).
@@ -1632,6 +1694,10 @@ fn open_first_window(
         accum_exceeded: None,
         accum_cut: false,
     };
+    // Test-build engine substitution (compile-only scaffolding —
+    // no lib unit test reaches this path; see `FakeCloseEngine`).
+    #[cfg(test)]
+    let engine = FakeCloseEngine::for_test();
     let run = Run {
         cfg,
         run_id,
@@ -4996,5 +5062,492 @@ mod tests {
         assert_eq!(*fail, SpillControlFail::Expired);
         assert_eq!(spill_abandon_reason(&err), AbandonReason::IoError);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- S4 close-staging regressions (shut fix) ---
+    //
+    // The close path under test is 100% production
+    // (`close_final_window` / `close_mid_window` → staging, spill
+    // sink, seal reads, assemble, publish, judge, sinks, seal,
+    // summary, the §7.3 fold); only the engine I/O is scripted
+    // (`FakeCloseEngine` — an unprivileged test process cannot
+    // observe real members). Signals are REAL (raised through the
+    // installed signalfd, consumed via the loop-top edge), so the
+    // sticky-cancel state is production-shaped, not hand-set.
+    // Serial suite (process-wide signal mask — see signals.rs).
+    use crate::evidence::{
+        CandidateCoverage, CandidateIdentity, CaptureWindow, FinalizeInput, LegacyCallPartition,
+        ObjectId, OpensslVersion, SiteExecution, SiteKey, TargetRecord, finalize,
+    };
+
+    fn s4_site(seg: u64, i: u32) -> SiteKey {
+        SiteKey {
+            object: ObjectId(format!("libt74s4-{seg}-{i}")),
+            device: 7,
+            inode: 8,
+            offset: u64::from(i),
+        }
+    }
+
+    fn s4_target(pid: u32) -> TargetRecord {
+        TargetRecord::new(pid, "t".to_string(), String::new(), String::new())
+    }
+
+    /// Proving-shape retirement seal document: 9000 sites × 211
+    /// calls with candidates — multi-MB JSON, thousands of sites,
+    /// ~1.9M calls per seal (≈5.7M across the three-seal drain,
+    /// mirroring the proving dry's 20,725 sites / 5.7M calls at
+    /// the same order of magnitude).
+    fn s4_seal_doc(seg: u64, pid: u32) -> crate::evidence::CaptureDocument {
+        let sites: Vec<SiteExecution> = (0..9000u32)
+            .map(|i| SiteExecution {
+                site: s4_site(seg, i),
+                generation: 1,
+                candidates: (0..3u32)
+                    .map(|c| {
+                        CandidateIdentity::new(
+                            ObjectId(format!("libt74s4-c{c}")),
+                            "prov".to_string(),
+                            c,
+                            c + 1,
+                            vec!["AES-GCM".to_string(), "SHA-512".to_string()],
+                            false,
+                        )
+                    })
+                    .collect(),
+                candidates_coverage: CandidateCoverage::Complete,
+                calls: 211,
+                first_ns: 1,
+                last_ns: 90,
+                installed_at: None,
+            })
+            .collect();
+        finalize(FinalizeInput {
+            corpse_wait: None,
+            window: CaptureWindow {
+                requested_start_ns: 0,
+                requested_end_ns: 100,
+                effective_start_ns: 0,
+                effective_end_ns: 100,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites,
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: Vec::new(),
+            fatal: None,
+            target: s4_target(pid),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        })
+    }
+
+    fn s4_seal_line(seg: u64, pid: u32) -> Vec<u8> {
+        let doc = s4_seal_doc(seg, pid);
+        let rec = serde_json::json!({
+            "kind": "process_observation",
+            "incarnation": {"pid": pid, "starttime": 100u64},
+            "segment": seg,
+            "document": serde_json::to_value(&doc).unwrap(),
+            "image_epoch": 3u64,
+        });
+        serde_json::to_vec(&rec).unwrap()
+    }
+
+    /// Three-seal close drain (~15 MB): the first seal stages, the
+    /// rest spill (the tick staged cap is 8 MiB) — the proving
+    /// shape (mixed staged + spilled seals at close).
+    fn s4_drain_bytes() -> Vec<u8> {
+        let mut out = Vec::new();
+        for (seg, pid) in [(101u64, 9001u32), (102, 9002), (103, 9003)] {
+            let line = s4_seal_line(seg, pid);
+            eprintln!("s4 seal seg={seg}: {} bytes", line.len());
+            out.extend_from_slice(&line);
+            out.push(b'\n');
+        }
+        eprintln!("s4 drain total: {} bytes", out.len());
+        out
+    }
+
+    struct S4MaskGuard;
+    impl Drop for S4MaskGuard {
+        fn drop(&mut self) {
+            crate::service::signals::restore_test_mask();
+        }
+    }
+
+    fn s4_scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "t74s4-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Assemble a live `Run` with window `seq` open and the
+    /// scripted engine serving `drain` (+ empty snapshots): the
+    /// state a real run holds just before its run-final close.
+    fn s4_run(out: &Path, seq: u64, drain: Vec<u8>) -> (Run, S4MaskGuard) {
+        // NOTE: installs the process-wide mask (serial suite).
+        let signals = SignalFd::install().expect("signalfd installs");
+        let guard = S4MaskGuard;
+        let run_id = RunId {
+            pid: 4242,
+            starttime: 999,
+            boot_id: "t74s4boot".to_string(),
+        };
+        let lock = DirLock::take(out, &run_id, wall_ns().unwrap_or(0)).expect("lock takes");
+        let mut cfg = ServiceConfig::default();
+        cfg.out = out.to_path_buf();
+        cfg.pids = vec![4242];
+        let snap = Snapshot {
+            at_ns: monotonic_ns(),
+            stable: true,
+            members: Vec::new(),
+            run: crate::service::snapshot::RunTallies::default(),
+            polling: false,
+        };
+        let cycle = Cycle {
+            seq,
+            requested_start_ns: 0,
+            requested_end_ns: 1_000_000_000,
+            effective_start_ns: 0,
+            open: snap.clone(),
+            staging: Staging::new(),
+            piece: TickPiece::open(1),
+            carry_out: None,
+            carried_in: None,
+            open_tick_id: 1,
+            fatal: None,
+            accum_exceeded: None,
+            accum_cut: false,
+        };
+        let run = Run {
+            cfg,
+            run_id,
+            tag: "t74s4".to_string(),
+            generation: 1,
+            out: out.to_path_buf(),
+            diag: Diagnostics::spawn(),
+            _lock: lock,
+            signals,
+            cancel: AtomicBool::new(false),
+            engine: FakeCloseEngine {
+                drain_bytes: drain,
+                snap,
+            },
+            _leases: Vec::new(),
+            cancel_latched: AtomicBool::new(false),
+            double_signal: AtomicBool::new(false),
+            reload_pending: AtomicBool::new(false),
+            close_deadline: None,
+            policy: PolicyState {
+                active: None,
+                active_rules: None,
+                pending: None,
+                displaced: 0,
+                adopted: 0,
+                rejected: 0,
+                last_rejection: None,
+            },
+            stream: None,
+            cycle: Some(cycle),
+            summary: SummaryAccum::new(),
+            fold: RunFold::new(),
+            first_seq: None,
+            tool_failure: None,
+            origin_ns: 0,
+            tick_ns: 200_000_000,
+            tick_id: 1,
+            run_member_floor: None,
+            pending_spill_unlinks: Vec::new(),
+            format: Format::Json,
+        };
+        (run, guard)
+    }
+
+    /// One loop-top signal edge: drain + consume a batch (exactly
+    /// `run_loop`'s edge — the production SIGTERM path).
+    fn s4_consume_batch(run: &mut Run) {
+        let sigs = run.signals.drain();
+        consume_signals(run, sigs);
+    }
+
+    fn s4_read_json(path: &Path) -> serde_json::Value {
+        let bytes = std::fs::read(path).unwrap_or_else(|_| panic!("{path:?} exists"));
+        serde_json::from_slice(&bytes).unwrap_or_else(|_| panic!("{path:?} is valid JSON"))
+    }
+
+    /// S4 main regression: close with staging-spill under shutdown
+    /// cancel PUBLISHES the final window carrying its (large)
+    /// retirement seals — shutdown preemption must not cancel
+    /// close-critical staging. RED pre-fix (Cancelled spill →
+    /// abandoned/IoError + zero seals); GREEN post-fix.
+    #[test]
+    fn s4_close_final_publishes_large_seals_under_shutdown_cancel() {
+        let out = s4_scratch("final-seals");
+        let drain = s4_drain_bytes();
+        let (mut run, _guard) = s4_run(&out, 0, drain);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        assert!(
+            run.cancel_latched.load(Ordering::SeqCst) && run.cancel.load(Ordering::SeqCst),
+            "SIGTERM latched the shutdown cancel"
+        );
+        let code = close_final_window(run);
+        assert_eq!(
+            code,
+            ExitCode::from(3),
+            "signal-cut close with a finalized window exits 3"
+        );
+        let win = s4_read_json(&out.join(crate::service::state::window_name(0)));
+        let seals: Vec<&serde_json::Value> = win["crypto_watch"]
+            .as_array()
+            .expect("crypto_watch array")
+            .iter()
+            .filter(|r| r["kind"] == "process_observation")
+            .collect();
+        assert_eq!(
+            seals.len(),
+            3,
+            "all three seals ride crypto_watch[] verbatim"
+        );
+        for s in &seals {
+            let n = s["document"]["sites"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            assert!(
+                n >= 2000,
+                "proving-shape seal carries thousands of sites, got {n}"
+            );
+        }
+        let members = win["members"].as_array().expect("members array");
+        assert_eq!(members.len(), 3, "absent-open seals project members");
+        assert!(
+            members.iter().all(|m| m["retired"].as_bool() == Some(true)),
+            "sealed members retired"
+        );
+        let sum = s4_read_json(&out.join("run-summary.json"));
+        assert_eq!(
+            sum["abandoned"].as_array().map(|a| a.len()),
+            Some(0),
+            "no abandoned window"
+        );
+        assert_eq!(sum["exit"], 3);
+        let ops = sum["close_accounting"]
+            .as_array()
+            .expect("close_accounting array");
+        assert!(
+            ops.iter()
+                .any(|o| o["op"] == "spill_write" && o["outcome"] == "done"),
+            "close spill ran to judgment: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|o| o["outcome"] == "done"),
+            "no Cancelled/Expired/Failed at close: {ops:?}"
+        );
+        let seq = s4_read_json(&out.join("sequence.json"));
+        assert_eq!(
+            seq["reserved"]["state"], "committed",
+            "sealed, not merely written"
+        );
+        assert_eq!(seq["next_seq"], 1);
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// S4 terminal twin: the terminal close stages its drain
+    /// through the same fixed path (reached here via the MAX-seq
+    /// mid-close diversion).
+    #[test]
+    fn s4_close_terminal_publishes_large_seals_under_shutdown_cancel() {
+        let out = s4_scratch("terminal-seals");
+        let drain = s4_drain_bytes();
+        let (mut run, _guard) = s4_run(&out, u64::MAX, drain);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        let code = match close_mid_window(run) {
+            BoundaryOut::Exit(code) => code,
+            BoundaryOut::Continue(_) => panic!("terminal close always ends the run"),
+        };
+        assert_eq!(
+            code,
+            ExitCode::from(3),
+            "signal-cut terminal close with a finalized window exits 3"
+        );
+        let win = s4_read_json(&out.join(crate::service::state::window_name(u64::MAX)));
+        let seals: Vec<&serde_json::Value> = win["crypto_watch"]
+            .as_array()
+            .expect("crypto_watch array")
+            .iter()
+            .filter(|r| r["kind"] == "process_observation")
+            .collect();
+        assert_eq!(
+            seals.len(),
+            3,
+            "all three seals ride crypto_watch[] verbatim"
+        );
+        let sum = s4_read_json(&out.join("run-summary.json"));
+        assert_eq!(
+            sum["abandoned"].as_array().map(|a| a.len()),
+            Some(0),
+            "no abandoned window"
+        );
+        let seq = s4_read_json(&out.join("sequence.json"));
+        assert_eq!(
+            seq["reserved"]["state"], "committed",
+            "sealed, not merely written"
+        );
+        assert_eq!(seq["exhausted"], true, "terminal seal exhausts");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// S4 honest-abandon pin: a REAL errno at close staging (EEXIST
+    /// through the real spill write — the leaked-tmp shape
+    /// production already tolerates) still abandons honestly with
+    /// the loud `io_error` disposition (the ENOSPC→`disk_full` /
+    /// EIO→`io_error` mapping itself is pinned by
+    /// `spill_failures_disambiguate_control_from_disk_full`).
+    #[test]
+    fn s4_close_final_spill_errno_abandons_honestly() {
+        let out = s4_scratch("errno-abandon");
+        for idx in 0..3u64 {
+            std::fs::write(
+                out.join(format!(".t74s4.tmp.spill.1.{idx}")),
+                b"{\"blocker\":true}\n",
+            )
+            .unwrap();
+        }
+        let drain = s4_drain_bytes();
+        let (mut run, _guard) = s4_run(&out, 0, drain);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        let code = close_final_window(run);
+        assert_eq!(
+            code,
+            ExitCode::from(4),
+            "zero finalized + interrupted exits 4"
+        );
+        assert!(
+            !out.join(crate::service::state::window_name(0)).exists(),
+            "abandoned window never publishes"
+        );
+        let sum = s4_read_json(&out.join("run-summary.json"));
+        let abandoned = sum["abandoned"].as_array().expect("abandoned array");
+        assert_eq!(abandoned.len(), 1, "exactly the final window abandoned");
+        assert_eq!(
+            abandoned[0]["reason"], "io_error",
+            "honest errno disposition"
+        );
+        assert_eq!(sum["exit"], 4);
+        let ops = sum["close_accounting"]
+            .as_array()
+            .expect("close_accounting array");
+        assert!(
+            ops.iter()
+                .any(|o| o["op"] == "spill_write" && o["outcome"] == "done"),
+            "the spill worker ran to judgment (errno is loud): {ops:?}"
+        );
+        let seq = s4_read_json(&out.join("sequence.json"));
+        assert_eq!(seq["reserved"]["state"], "abandoned");
+        assert_eq!(seq["reserved"]["reason"], "io_error");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// S4 expedite pin: a second stop during close staging still
+    /// expedites with the immediate DoubleSignal disposition —
+    /// never the abandonment mapping (both REAL signals through
+    /// the real signalfd; the spill itself fails so the divert
+    /// arm, not the publish arm, is exercised).
+    #[test]
+    fn s4_close_final_spill_double_signal_diverts_immediate() {
+        let out = s4_scratch("double-divert");
+        for idx in 0..3u64 {
+            std::fs::write(
+                out.join(format!(".t74s4.tmp.spill.1.{idx}")),
+                b"{\"blocker\":true}\n",
+            )
+            .unwrap();
+        }
+        let drain = s4_drain_bytes();
+        let (mut run, _guard) = s4_run(&out, 0, drain);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        assert!(
+            run.double_signal.load(Ordering::SeqCst),
+            "second SIGTERM latched double"
+        );
+        let code = close_final_window(run);
+        assert_eq!(
+            code,
+            ExitCode::from(4),
+            "double-signal zero-finalized exits 4"
+        );
+        assert!(
+            !out.join(crate::service::state::window_name(0)).exists(),
+            "doubled close never publishes"
+        );
+        let sum = s4_read_json(&out.join("run-summary.json"));
+        let abandoned = sum["abandoned"].as_array().expect("abandoned array");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(
+            abandoned[0]["reason"], "double_signal",
+            "expedite disposition"
+        );
+        let seq = s4_read_json(&out.join("sequence.json"));
+        assert_eq!(seq["reserved"]["state"], "abandoned");
+        assert_eq!(seq["reserved"]["reason"], "double_signal");
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// S4 expedite-preservation pin: even when close staging
+    /// SUCCEEDS (fresh cancel), a doubled close still diverts —
+    /// the run ends DoubleSignal, never sealed/committed.
+    #[test]
+    fn s4_doubled_close_with_healthy_staging_diverts_unsealed() {
+        let out = s4_scratch("double-healthy");
+        let drain = s4_drain_bytes();
+        let (mut run, _guard) = s4_run(&out, 0, drain);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        unsafe { libc::raise(libc::SIGTERM) };
+        s4_consume_batch(&mut run);
+        assert!(
+            run.double_signal.load(Ordering::SeqCst),
+            "second SIGTERM latched double"
+        );
+        let code = close_final_window(run);
+        assert_eq!(
+            code,
+            ExitCode::from(4),
+            "double-signal zero-finalized exits 4"
+        );
+        let sum = s4_read_json(&out.join("run-summary.json"));
+        let abandoned = sum["abandoned"].as_array().expect("abandoned array");
+        assert_eq!(abandoned.len(), 1);
+        assert_eq!(
+            abandoned[0]["reason"], "double_signal",
+            "expedite disposition"
+        );
+        let seq = s4_read_json(&out.join("sequence.json"));
+        assert_eq!(
+            seq["reserved"]["state"], "abandoned",
+            "a doubled run never seals"
+        );
+        assert_eq!(seq["reserved"]["reason"], "double_signal");
+        let _ = std::fs::remove_dir_all(&out);
     }
 }

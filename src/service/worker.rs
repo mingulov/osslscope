@@ -718,4 +718,48 @@ mod tests {
         let dropped = diag.abandon(Duration::from_secs(2));
         assert!(dropped > 0, "flood must drop + count, got {dropped}");
     }
+
+    /// S4 expedite independence: a wait poll over a FRESH cancel
+    /// observes the second stop independently of the sticky run
+    /// cancel — the first `Term` drained while the first-stop latch
+    /// is already set stores the wait's cancel + the double latch
+    /// (the poll never reads the run cancel — it only drains
+    /// signalfd into the latches). Close-critical staging relies on
+    /// this: fresh cancel + this poll survives the first stop and
+    /// still expedites on the second.
+    #[test]
+    fn wait_poll_second_term_expedites_despite_sticky_run_cancel() {
+        struct MaskGuard;
+        impl Drop for MaskGuard {
+            fn drop(&mut self) {
+                crate::service::signals::restore_test_mask();
+            }
+        }
+        // NOTE: installs the process-wide mask (serial suite).
+        let signals = SignalFd::install().expect("signalfd installs");
+        let _guard = MaskGuard;
+        // Post-first-stop state: the run cancel is sticky-true and
+        // the first-stop latch is set; this wait's cancel is fresh.
+        let run_cancel = AtomicBool::new(true);
+        let latched = AtomicBool::new(true);
+        let double = AtomicBool::new(false);
+        let reload = AtomicBool::new(false);
+        let wait_cancel = AtomicBool::new(false);
+        let poll = WaitPoll::new(&signals, &wait_cancel, &latched, &double, &reload);
+        unsafe { libc::raise(libc::SIGTERM) };
+        poll.poll();
+        assert!(
+            wait_cancel.load(Ordering::SeqCst),
+            "second stop must cancel the fresh wait"
+        );
+        assert!(
+            double.load(Ordering::SeqCst),
+            "second stop must latch double"
+        );
+        assert!(
+            run_cancel.load(Ordering::SeqCst),
+            "the poll never clears the sticky run cancel"
+        );
+        assert!(signals.drain().is_empty(), "the poll consumed the signal");
+    }
 }

@@ -4736,6 +4736,10 @@ impl ServiceEngine {
     /// generation WITHOUT flipping — MAX+1 is unrepresentable, so no
     /// flip target exists. Unreachable in practice; frozen for
     /// MAXGATE fidelity.
+    // Test builds serve snapshots from `FakeCloseEngine`
+    // (`Run.engine` is the fake under `cfg(test)`), so the real
+    // sealed snapshot has no test-build caller.
+    #[cfg_attr(test, allow(dead_code))]
     pub(crate) fn snapshot_sealed(&self, sealed_gen: u64) -> crate::service::snapshot::Snapshot {
         self.snapshot_impl(None, Some(sealed_gen))
     }
