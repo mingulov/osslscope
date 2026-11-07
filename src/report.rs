@@ -3018,6 +3018,15 @@ pub(crate) fn exclusive_create(
 /// Counter for temp/sibling file uniqueness within this process.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Current process umask, read without changing it (set-then-restore
+/// in one step). Artifact delivery runs on one thread and the suite
+/// runs serially, so no concurrent creation observes the swap.
+fn current_umask() -> u32 {
+    let mask = unsafe { libc::umask(0) };
+    unsafe { libc::umask(mask) };
+    mask as u32
+}
+
 /// True for exactly `/proc/self/fd/<digits>`: an already-open
 /// descriptor, kernel-managed per-process — never a plantable
 /// symlink, so artifact writes pass through (EPIPE recorded).
@@ -3031,19 +3040,45 @@ fn is_proc_self_fd(path: &std::path::Path) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
+/// Exclusively create an unpublished staging temp in `dir`, always
+/// mode `0o600` (& ~umask): staging stays owner-private until the
+/// final chmod+rename publishes the destination mode. Returns the
+/// temp path (for rename/cleanup) and the open file.
+fn create_stage_temp(
+    dir: &std::path::Path,
+) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
+    for _ in 0..100 {
+        let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(".osslscope-out-{}-{n}.tmp", std::process::id()));
+        match exclusive_create(&tmp, 0o600) {
+            Ok(file) => return Ok((tmp, file)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create a unique temp file beside the target",
+    ))
+}
+
 /// Write `bytes` to `path` atomically: a freshly exclusively-created
 /// temp file in the same directory, then rename over the target.
 /// Symlink and non-regular targets are refused without following
 /// them (rename would replace the link/node itself — never what an
 /// artifact `-o` path means); a failed write leaves the target
-/// untouched instead of truncated. Creation mode matches
-/// `fs::write` (`0o666` & umask).
+/// untouched instead of truncated. Staging is always owner-private
+/// (`0o600`); the published mode preserves an existing regular
+/// destination's access bits (the pre-atomic `fs::write` kept the
+/// inode), while new files keep the `0o666 & !umask` default.
+/// Setuid/setgid/sticky bits are never propagated to the fresh inode.
 fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
     if is_proc_self_fd(path) {
         return std::fs::write(path, bytes);
     }
-    match std::fs::symlink_metadata(path) {
+    let preserved_mode: Option<u32> = match std::fs::symlink_metadata(path) {
         Ok(meta) => {
             let kind = meta.file_type();
             if kind.is_symlink() {
@@ -3068,37 +3103,35 @@ fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
                 direct.write_all(bytes)?;
                 return Ok(());
             }
+            Some(meta.permissions().mode() & 0o777)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e),
-    }
+    };
     let dir = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    for _ in 0..100 {
-        let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let tmp = dir.join(format!(".osslscope-out-{}-{n}.tmp", std::process::id()));
-        let mut file = match exclusive_create(&tmp, 0o666) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        };
-        if let Err(e) = file.write_all(bytes) {
-            std::fs::remove_file(&tmp).ok();
-            return Err(e);
-        }
-        drop(file);
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            std::fs::remove_file(&tmp).ok();
-            return Err(e);
-        }
-        return Ok(());
+    let (tmp, mut file) = create_stage_temp(dir)?;
+    if let Err(e) = file.write_all(bytes) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not create a unique temp file beside the target",
-    ))
+    // Publish the destination mode before the rename (fchmod on the
+    // open fd: no path race): existing access bits win over umask
+    // exactly as the old in-place open did; new files take the
+    // `0o666 & !umask` default.
+    let published = preserved_mode.unwrap_or(0o666 & !current_umask());
+    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(published)) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    drop(file);
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        std::fs::remove_file(&tmp).ok();
+        return Err(e);
+    }
+    Ok(())
 }
 
 fn write_dest(dest: &OutputDest, bytes: &[u8]) -> ArtifactOutcome {
@@ -3315,6 +3348,22 @@ mod tests {
         }
 
         #[test]
+        fn stage_temp_stays_owner_private() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = scratch_dir("stagepriv");
+            let (tmp, file) = create_stage_temp(&dir).unwrap();
+            let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode & 0o077,
+                0,
+                "staging temp must grant nothing to group/other: {mode:04o}"
+            );
+            drop(file);
+            std::fs::remove_file(&tmp).ok();
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
         fn write_dest_refuses_symlink_target() {
             let dir = scratch_dir("symlink");
             let target = dir.join("referent.txt");
@@ -3374,6 +3423,70 @@ mod tests {
             assert!(
                 outcome.error.as_deref().unwrap().contains("directory"),
                 "EISDIR text preserved, got: {outcome:?}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn write_dest_overwrite_preserves_restrictive_mode() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = scratch_dir("restrictive");
+            let dest = dir.join("report.json");
+            std::fs::write(&dest, b"old-bytes").unwrap();
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let outcome = write_dest(&OutputDest::File(dest.clone()), b"new-bytes");
+            assert!(outcome.ok, "overwrite must succeed: {outcome:?}");
+            assert_eq!(std::fs::read(&dest).unwrap(), b"new-bytes");
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "overwrite widened a private destination: {mode:04o}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn write_artifacts_preserves_restrictive_modes_on_both_legs() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = scratch_dir("bothlegs");
+            let primary = dir.join("primary.json");
+            let cbom = dir.join("sbom.json");
+            for path in [&primary, &cbom] {
+                std::fs::write(path, b"old").unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let document = crate::capture::profiled::preview_document_for_test(true);
+            let req = OutputRequest {
+                format: OutputFormat::Json,
+                primary: OutputDest::File(primary.clone()),
+                cbom: Some(OutputDest::File(cbom.clone())),
+            };
+            let result = write_artifacts(&document, &req);
+            assert!(result.primary.ok, "primary must deliver: {result:?}");
+            let cbom_outcome = result.cbom.as_ref().expect("cbom outcome present");
+            assert!(cbom_outcome.ok, "cbom must deliver: {result:?}");
+            for path in [&primary, &cbom] {
+                let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                assert_eq!(
+                    mode, 0o600,
+                    "delivery widened a private destination {path:?}: {mode:04o}"
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn write_dest_new_file_honors_umask_default() {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = scratch_dir("newfile");
+            let dest = dir.join("fresh.json");
+            let outcome = write_dest(&OutputDest::File(dest.clone()), b"bytes");
+            assert!(outcome.ok, "new file must be created: {outcome:?}");
+            let expected = 0o666 & !current_umask();
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, expected,
+                "new file must keep the 0o666 & !umask default: {mode:04o}"
             );
             std::fs::remove_dir_all(&dir).ok();
         }
