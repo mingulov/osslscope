@@ -2807,7 +2807,7 @@ fn check_byte_rows(path: &str, bytes: &[u8], static_exe: bool, ctx: &TargetCtx) 
 
 // ---- entry point ----
 
-const USAGE: &str = "usage: osslscope doctor [--pid PID | --libcrypto PATH | --exe PATH] [--table FILE] [--force-offset N] [--provider-table FILE] [--object O] [--count-object C] [--members-object M] [--format human|json]";
+const USAGE: &str = "usage: osslscope doctor [--pid PID | --exe PATH | --libcrypto PATH with a vetting flag] [--table FILE] [--force-offset N] [--provider-table FILE] [--object O] [--count-object C] [--members-object M] [--format human|json]";
 
 pub fn run(args: &[String]) -> ExitCode {
     run_with_resolver(args, crate::package::commands::resolve_command_objects)
@@ -2852,9 +2852,7 @@ fn run_with_resolver(
         if a == "--help" || a == "-h" {
             println!("{USAGE}");
             println!("  no target: environment + installed-objects preflight");
-            println!(
-                "  --pid PID | --exe PATH: also vet the target (same qualification as report/check)"
-            );
+            println!("  --pid PID | --exe PATH: also vet the target (doctor-only vetting)");
             println!(
                 "  --libcrypto PATH with a vetting flag (--table/--force-offset/--provider-table/--object/--members-object): vet that path (bare --libcrypto selects the legacy exact-profile diagnostic)"
             );
