@@ -3421,6 +3421,45 @@ mod tests {
         }
 
         #[test]
+        fn write_dest_skips_symlinked_first_staging_temp() {
+            // 1C-M6: a planted symlink at the first staging-temp
+            // name must neither divert nor fail the write — the
+            // O_EXCL already-exists skip advances to the next
+            // counter name, the payload lands, and the link
+            // referent is untouched.
+            let dir = scratch_dir("stagetempsymlink");
+            let referent = dir.join("referent.txt");
+            std::fs::write(&referent, b"sentinel").unwrap();
+            // The next staging name this process will try (same
+            // construction as create_stage_temp; the suite runs
+            // serially, so no other writer can burn the counter
+            // between this load and the write below).
+            let n = WRITE_COUNTER.load(Ordering::Relaxed);
+            let first = dir.join(format!(".osslscope-out-{}-{n}.tmp", std::process::id()));
+            std::os::unix::fs::symlink(&referent, &first).unwrap();
+            let dest = dir.join("out.json");
+            let outcome = write_dest(&OutputDest::File(dest.clone()), b"payload-bytes");
+            assert!(
+                outcome.ok,
+                "write must skip the symlinked staging temp: {outcome:?}"
+            );
+            assert_eq!(std::fs::read(&dest).unwrap(), b"payload-bytes");
+            assert_eq!(
+                std::fs::read(&referent).unwrap(),
+                b"sentinel",
+                "link referent must be untouched"
+            );
+            assert!(
+                std::fs::symlink_metadata(&first)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "planted link must survive the write"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
         fn write_dest_regular_write_lands_byte_identical() {
             let dir = scratch_dir("regular");
             let plain = dir.join("plain.json");
