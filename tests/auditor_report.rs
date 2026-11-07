@@ -799,8 +799,8 @@ fn story_output_conforms() {
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, CounterKind,
     CounterSource, CounterUnits, DispositionRecord, ExpectedScope, FinalizeInput, GapCounter,
-    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult,
-    PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, TargetRecord, finalize,
+    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
+    SiteKey, TargetRecord, finalize,
 };
 use osslscope::report::render_json;
 use osslscope::schema::{check_v2_semantics, validate_v2};
@@ -961,46 +961,11 @@ fn auditor_v2_fixture() -> CaptureDocument {
         ),
         openssl: OpensslVersion::verified("3.0.14".to_string()),
         disposition: Some(DispositionRecord::exited(0)),
-        policy: Some(PolicyRecord {
-            verdict: PolicyVerdict::Violation,
-            rules: vec![
-                PolicyRuleResult {
-                    rule: "deny-algorithm".to_string(),
-                    predicate: "algorithm=DES".to_string(),
-                    result: RuleVerdict::Violation,
-                    definite: 440,
-                    possible: Some(440),
-                    evidence: vec![
-                        osslscope::evidence::PolicyEvidenceRef {
-                            object: obj(FP_A),
-                            device: 8,
-                            inode: 100,
-                            offset: 0x1000,
-                            generation: 0,
-                            calls: 400,
-                        },
-                        osslscope::evidence::PolicyEvidenceRef {
-                            object: obj(FP_A),
-                            device: 8,
-                            inode: 100,
-                            offset: 0x1000,
-                            generation: 2,
-                            calls: 40,
-                        },
-                    ],
-                    engine_evidence: Vec::new(),
-                },
-                PolicyRuleResult {
-                    rule: "deny-weak".to_string(),
-                    predicate: "weak-alias".to_string(),
-                    result: RuleVerdict::Pass,
-                    definite: 0,
-                    possible: Some(0),
-                    evidence: Vec::new(),
-                    engine_evidence: Vec::new(),
-                },
-            ],
-        }),
+        // Fix round 1 (finding 1): NO hand-built record — the
+        // policy section is derived through real evaluation below,
+        // so the golden can never pin impossible (bounds, verdict,
+        // relevance) state again.
+        policy: None,
         // Honest by construction: every candidate above is
         // default-class, so all 500 counted calls (400 + 0 + 60
         // current, 40 fenced) land non-legacy-exclusive.
@@ -1016,7 +981,7 @@ fn auditor_v2_fixture() -> CaptureDocument {
     // Round 2, residual M: the lossy traversal content finalizes
     // PARTIAL (the traversal Loss counters above), like
     // assembly's — never COMPLETE.
-    let doc = finalize(input);
+    let mut doc = finalize(input);
     assert!(
         matches!(
             doc.status,
@@ -1025,6 +990,23 @@ fn auditor_v2_fixture() -> CaptureDocument {
         "lossy-traversal auditor fixture must be PARTIAL: {:?}",
         doc.status
     );
+    // Fix round 1 (finding 1): derive the record through the same
+    // evaluate→record path production uses (integration tests
+    // cannot reach the pub(crate) assembly, and the legacy input
+    // here is empty, so evaluate + record is exactly assembly's
+    // behavior on this document). The traversal losses are
+    // provider-relevant, so both rules render
+    // relevant_complete=false with unknown upper bounds: DES
+    // violation (440, null) on definite evidence, weak
+    // inconclusive (0, null) — never a deny pass over a relevant
+    // gap. Predicates are the constructor matchers ("DES",
+    // "weak"), the strings production actually emits.
+    let rules = [
+        osslscope::policy::PolicyRule::deny_algorithm("DES"),
+        osslscope::policy::PolicyRule::deny_weak(),
+    ];
+    let verdict = osslscope::policy::evaluate_document(&rules, &doc);
+    doc.policy = Some(osslscope::check::policy_record(&verdict));
     doc
 }
 
@@ -1338,6 +1320,11 @@ fn tampered_v2_documents_rejected() {
         "definite exceeds possible",
         Some("semantics"),
         Box::new(|d: &mut Value| {
+            // Fix round 1 (finding 1): the golden's upper bound is
+            // now unknown (null, skipped by the check by design),
+            // so the tamper pins a finite upper to keep exercising
+            // the definite-within-possible rejection.
+            d["policy"]["rules"][0]["possible"] = Value::from(440);
             d["policy"]["rules"][0]["definite"] = Value::from(441);
         }),
     ));

@@ -136,8 +136,8 @@
             "offset": 4096
           }
         ],
-        "possible": 440,
-        "predicate": "algorithm=DES",
+        "possible": null,
+        "predicate": "DES",
         "relevant_complete": false,
         "result": "violation",
         "rule": "deny-algorithm"
@@ -145,10 +145,10 @@
       {
         "definite": 0,
         "evidence": [],
-        "possible": 0,
-        "predicate": "weak-alias",
+        "possible": null,
+        "predicate": "weak",
         "relevant_complete": false,
-        "result": "pass",
+        "result": "inconclusive",
         "rule": "deny-weak"
       }
     ],
