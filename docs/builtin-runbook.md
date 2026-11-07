@@ -56,19 +56,24 @@ qualification themselves.
 ## Recipe
 
 1. Ask doctor what it sees. For a live process mapping the
-   library:
+   library (sectioned `doctor` needs package admission first:
+   pass the explicit harvest/count pair from the installed
+   package tree — a bare run exits 4 with
+   `package admission refused` before any target row runs):
 
    ```sh
-   osslscope doctor --pid <pid>
+   osslscope doctor --pid <pid> \
+     --object /usr/lib/osslscope/osslscope-harvest \
+     --count-object /usr/lib/osslscope/osslscope-count
    ```
 
+   (With a repo build instead of a package install, use the
+   `crates/ebpf/target/...` pair from step 4.)
    `dispatch-anchor: supported via table|symtab` means the
    anchor resolves with no enrollment. `unqualified build`
    means proceed to enrollment (step 4) to vet it.
    (`build-id: unknown` alone is not the verdict; the
-   anchor row is.) Sectioned `doctor` needs package admission
-   first (a release install, or the explicit object pair from
-   step 4). The verdict qualifies the anchor only — live
+   anchor row is.) The verdict qualifies the anchor only — live
    `report`/`check` observe with or without it.
 
    A bare `doctor --libcrypto PATH` instead runs the legacy
