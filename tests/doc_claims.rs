@@ -127,6 +127,19 @@ fn m3_examples_and_response_tables_are_current() {
         runbook.contains("`visibility-lost`"),
         "partial-runbook.md must row the v2.7 visibility-lost reason"
     );
+    // Fix round 1 (finding 3): the retirement row must quote the
+    // exact wire spelling the renderer emits (`report.rs` renders
+    // `"retired"`, pinned by
+    // `output_contract::r33_corpse_retirement_renders_membership_and_validates`) —
+    // never the capitalized prose form.
+    assert!(
+        runbook.contains("`membership.state=\"retired\"`"),
+        "partial-runbook.md must quote the wire spelling membership.state=\"retired\""
+    );
+    assert!(
+        !runbook.contains("reads `Retired`"),
+        "partial-runbook.md must not use the capitalized Retired spelling"
+    );
 }
 
 /// M3: the proof-boundary doc no longer presents v0.3 as
