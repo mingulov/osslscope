@@ -119,7 +119,9 @@ The DEB ships the D-record §1.4 installed-service layout:
 - `/lib/systemd/system/osslscope-service.service` — the frozen unit
   (runs `/usr/bin/osslscope service --config
   /etc/osslscope/service.toml` as root with a
-  `CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE` bounding set; windows land in
+  `CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE+CAP_CHECKPOINT_RESTORE+CAP_DAC_READ_SEARCH`
+  bounding set (§1.4 Amendment A1: the two verification caps are
+  required for foreign-identity verification); windows land in
   the `StateDirectory` out-DIR below).
 - `/etc/osslscope/service.toml` — the default service config (a
   conffile: edits survive upgrades). It pins the code-default

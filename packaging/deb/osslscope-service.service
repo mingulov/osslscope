@@ -16,7 +16,11 @@ StateDirectory=osslscope
 # selected. The unit runs as root, so any non-root target is
 # foreign — the shipped unit carries it. Drop it only when every
 # target runs as root.
-CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE
+# +CAP_CHECKPOINT_RESTORE +CAP_DAC_READ_SEARCH: §1.4 Amendment A1
+# (ratified) — required for foreign-identity verification; without
+# them foreign members gap identity_unverified and attach finds
+# zero sites.
+CapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH
 
 [Install]
 WantedBy=multi-user.target
