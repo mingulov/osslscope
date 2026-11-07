@@ -415,6 +415,8 @@ fn consume_if_finished(dest: &Destination, worker: u64) {
 /// reclamation, and leaked memory is unreachable (never a
 /// retained registry result).
 fn deferred_drop(deferred: Box<dyn Any + Send>) {
+    #[cfg(test)]
+    red_send_gate();
     if let Err(failed) = reaper_tx().send(deferred) {
         std::mem::forget(failed.0);
     }
@@ -479,6 +481,38 @@ fn red_setup_gate() {
 fn red_setup_release() {
     RED_SETUP_ARMED.store(false, Ordering::SeqCst);
     if let Some(gate) = RED_SETUP_GATE.get() {
+        let _ = gate.0.send(());
+    }
+}
+
+/// RED discriminator gate (R6-1(ii), tests only): while armed,
+/// the abandonment handoff blocks — the direct gate on the
+/// handoff/contention point, no libc fault injection.
+#[cfg(test)]
+static RED_SEND_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static RED_SEND_GATE: OnceLock<(
+    std::sync::mpsc::Sender<()>,
+    Mutex<std::sync::mpsc::Receiver<()>>,
+)> = OnceLock::new();
+#[cfg(test)]
+fn red_send_gate() {
+    if RED_SEND_ARMED.load(Ordering::SeqCst) {
+        let gate = RED_SEND_GATE.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            (tx, Mutex::new(rx))
+        });
+        let _ = gate
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(Duration::from_secs(30));
+    }
+}
+#[cfg(test)]
+fn red_send_release() {
+    RED_SEND_ARMED.store(false, Ordering::SeqCst);
+    if let Some(gate) = RED_SEND_GATE.get() {
         let _ = gate.0.send(());
     }
 }
@@ -1182,6 +1216,39 @@ mod tests {
         assert!(
             dt < Duration::from_secs(2),
             "RED: first-use setup stalled the abandonment handoff ({dt:?})"
+        );
+    }
+
+    /// R6-1(ii) RED: handoff contention — the disposal facility
+    /// is contended and a raced-in result arrives: the
+    /// abandonment handoff must still return in-budget. The
+    /// armed send gate is the contended handoff (gated
+    /// directly, no libc fault injection). RED pre-fix (the
+    /// waiter path performs the handoff inline — the 2 s
+    /// watchdog); GREEN post-fix (bounded handoff with an
+    /// accounted fallback).
+    #[test]
+    fn r61_handoff_contention_can_stall_abandonment() {
+        use std::sync::mpsc;
+        RED_SEND_ARMED.store(true, Ordering::SeqCst);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let t0 = Instant::now();
+        let waiter = std::thread::spawn(move || {
+            // The abandonment handoff (old shape: inline).
+            deferred_drop(Box::new(vec![0u8; 8]));
+            let _ = done_tx.send(());
+        });
+        if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+            // Release so the suite never hangs; the elapsed
+            // assert below records the RED.
+            red_send_release();
+        }
+        let _ = waiter.join();
+        RED_SEND_ARMED.store(false, Ordering::SeqCst);
+        let dt = t0.elapsed();
+        assert!(
+            dt < Duration::from_secs(2),
+            "RED: handoff contention stalled the abandonment handoff ({dt:?})"
         );
     }
 }
