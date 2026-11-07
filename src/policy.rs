@@ -1173,6 +1173,9 @@ mod tests {
                     gap_relevant_to(RuleArea::Provider, &gap),
                     "{scope}: {gap:?}"
                 );
+                // M3 (review-wave-1D): legacy scopes stay relevant to
+                // engine-area rules too (every coverage gap does).
+                assert!(gap_relevant_to(RuleArea::Engine, &gap), "{scope}: {gap:?}");
             }
         }
         // Genuinely engine-area scopes stay unrelated to provider

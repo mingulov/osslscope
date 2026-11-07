@@ -3924,6 +3924,7 @@ fn deny_weak_is_inconclusive_over_legacy_scoped_coverage_gaps() {
         ),
         (
             "UndiscoveredSites",
+            // Synthetic attached>discovered: isolates one UndiscoveredSites gap (gaps() is per-kind).
             ScopeCoverage {
                 scope: "legacy".to_string(),
                 expected: ExpectedScope::Applicable { sites: 2 },
@@ -4020,22 +4021,42 @@ fn deny_weak_is_inconclusive_over_legacy_scoped_coverage_gaps() {
     }
     // Controls: genuinely engine-area scopes keep their irrelevance
     // to provider-area deny rules (proved absence still holds there).
+    // All three gap kinds run the same fixtures as the legacy legs
+    // above (scope swapped only — kind derivation is scope-agnostic).
     for scope in ["engine", "engine.tripwire"] {
-        let d = doc(
-            Vec::new(),
-            Vec::new(),
-            vec![ScopeCoverage {
-                scope: scope.to_string(),
-                expected: ExpectedScope::Unknown,
-                discovered: 0,
-                attached: 0,
-            }],
-            Vec::new(),
-            exact_window(),
-            None,
-        );
-        let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &d);
-        assert_eq!(v.rules[0].verdict, RuleVerdict::Pass, "{scope}");
-        assert_eq!(v.rules[0].bounds.possible, Some(0), "{scope}");
+        for (kind, cov) in &cases {
+            let mut cov = cov.clone();
+            cov.scope = scope.to_string();
+            let d = doc(
+                Vec::new(),
+                Vec::new(),
+                vec![cov],
+                Vec::new(),
+                exact_window(),
+                None,
+            );
+            match &d.status {
+                Completeness::Partial { reasons } => {
+                    assert_eq!(reasons.len(), 1, "{scope} {kind}: one gap");
+                    let gap_scope = match &reasons[0] {
+                        GapReason::UnknownDenominator { scope }
+                        | GapReason::UndiscoveredSites { scope, .. }
+                        | GapReason::UnattachedSites { scope, .. } => scope,
+                        other => panic!("{scope} {kind}: unexpected gap {other:?}"),
+                    };
+                    assert_eq!(gap_scope, scope, "{scope} {kind}: gap scope");
+                }
+                other => panic!("{scope} {kind}: PARTIAL, got {other:?}"),
+            }
+            let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &d);
+            assert_eq!(v.rules[0].verdict, RuleVerdict::Pass, "{scope} {kind}");
+            // M4 (review-wave-1D): explicit relevance, mirroring the
+            // Inconclusive legs' `!relevant_complete` (Pass implies it,
+            // but the control should say so).
+            assert!(v.rules[0].relevant_complete, "{scope} {kind}");
+            assert_eq!(v.rules[0].bounds.definite, 0, "{scope} {kind}");
+            assert_eq!(v.rules[0].bounds.possible, Some(0), "{scope} {kind}");
+            assert_eq!(v.overall(), PolicyOutcome::Pass, "{scope} {kind}");
+        }
     }
 }
