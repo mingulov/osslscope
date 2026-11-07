@@ -1561,7 +1561,7 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
         let unseen: Vec<&str> = policy
             .rules
             .iter()
-            .filter(|r| r.rule == "deny-provider" && r.definite == 0 && r.possible == Some(0))
+            .filter(|r| crate::check::is_unseen_deny_provider(&r.rule, r.definite, r.possible))
             .map(|r| r.predicate.as_str())
             .collect();
         let fips_unlabeled = crate::policy::fips_unlabeled_calls(doc);
@@ -2195,7 +2195,7 @@ pub fn render_human(doc: &CaptureDocument) -> String {
             let unseen: Vec<String> = policy
                 .rules
                 .iter()
-                .filter(|r| r.rule == "deny-provider" && r.definite == 0 && r.possible == Some(0))
+                .filter(|r| crate::check::is_unseen_deny_provider(&r.rule, r.definite, r.possible))
                 .map(|r| safe_display(&r.predicate))
                 .collect();
             if !unseen.is_empty() {

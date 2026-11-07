@@ -333,6 +333,16 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     })
 }
 
+/// Unseen deny-provider predicate over one (rule, definite,
+/// possible) triple: deny-provider matchers proved absent (definite
+/// 0, possible exactly 0) — typo visibility. ONE definition shared
+/// by `policy_json` and both shipped renderers (JSON policy section,
+/// human block), so a drift fails the agreement tests loudly
+/// instead of listing different typos per surface.
+pub(crate) fn is_unseen_deny_provider(rule: &str, definite: u64, possible: Option<u64>) -> bool {
+    rule == "deny-provider" && definite == 0 && possible == Some(0)
+}
+
 /// Deny-provider matchers proved absent (definite 0, possible exactly
 /// 0): typo visibility. Ambiguous matchers might be present and are not
 /// listed here. Sorted into canonical document order (fix round 1,
@@ -343,9 +353,7 @@ fn unseen_deny_providers(v: &PolicyVerdict) -> Vec<&str> {
     let mut out: Vec<&str> = v
         .rules
         .iter()
-        .filter(|r| {
-            r.name == "deny-provider" && r.bounds.definite == 0 && r.bounds.possible == Some(0)
-        })
+        .filter(|r| is_unseen_deny_provider(r.name, r.bounds.definite, r.bounds.possible))
         .map(|r| r.matcher.as_str())
         .collect();
     out.sort_unstable();
