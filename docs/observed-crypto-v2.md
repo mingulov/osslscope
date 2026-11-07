@@ -427,7 +427,7 @@ verbatim from `tests/goldens/report-v2-violation.json`
         }
       ],
       "possible": 550,
-      "predicate": "algorithm=DES",
+      "predicate": "DES",
       "relevant_complete": true,
       "result": "violation",
       "rule": "deny-algorithm"
@@ -436,7 +436,7 @@ verbatim from `tests/goldens/report-v2-violation.json`
       "definite": 0,
       "evidence": [],
       "possible": 0,
-      "predicate": "weak-alias",
+      "predicate": "weak",
       "relevant_complete": true,
       "result": "pass",
       "rule": "deny-weak"

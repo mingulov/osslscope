@@ -67,7 +67,7 @@
         "definite": 0,
         "evidence": [],
         "possible": 100,
-        "predicate": "algorithm=AES-256-GCM",
+        "predicate": "AES-256-GCM",
         "relevant_complete": true,
         "result": "inconclusive",
         "rule": "deny-algorithm"

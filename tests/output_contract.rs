@@ -18,9 +18,8 @@ use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureContext, CaptureDocument, CaptureWindow,
     Completeness, CounterKind, CounterSource, CounterUnits, DispositionRecord, EngineObservation,
     EngineWindow, ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter,
-    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, PolicyRecord, PolicyRuleResult,
-    PolicyVerdict, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey, SysctlContext, TargetRecord,
-    engine_index, finalize, stamp_context,
+    LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
+    SiteKey, SysctlContext, TargetRecord, engine_index, finalize, stamp_context,
 };
 use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -552,24 +551,6 @@ fn v25_execution_doc() -> CaptureDocument {
     doc
 }
 
-fn evidence_ref(
-    object: &str,
-    device: u64,
-    inode: u64,
-    offset: u64,
-    generation: u32,
-    calls: u64,
-) -> osslscope::evidence::PolicyEvidenceRef {
-    osslscope::evidence::PolicyEvidenceRef {
-        object: obj(object),
-        device,
-        inode,
-        offset,
-        generation,
-        calls,
-    }
-}
-
 /// Violation check document: definite DES use (current + fenced) +
 /// evaluated policy with site evidence.
 fn violation_doc() -> CaptureDocument {
@@ -608,34 +589,16 @@ fn violation_doc() -> CaptureDocument {
         CounterSource::KernelMap,
         0,
     )];
-    input.policy = Some(PolicyRecord {
-        verdict: PolicyVerdict::Violation,
-        rules: vec![
-            PolicyRuleResult {
-                rule: "deny-algorithm".to_string(),
-                predicate: "algorithm=DES".to_string(),
-                result: RuleVerdict::Violation,
-                definite: 550,
-                possible: Some(550),
-                evidence: vec![
-                    evidence_ref(FP_A, 8, 100, 0x1000, 0, 500),
-                    evidence_ref(FP_A, 8, 100, 0x1000, 1, 50),
-                ],
-                engine_evidence: Vec::new(),
-            },
-            PolicyRuleResult {
-                rule: "deny-weak".to_string(),
-                predicate: "weak-alias".to_string(),
-                result: RuleVerdict::Pass,
-                definite: 0,
-                possible: Some(0),
-                evidence: Vec::new(),
-                engine_evidence: Vec::new(),
-            },
-        ],
-    });
-    let doc = finalize_honest(input);
+    // Policy derives through real evaluation (codex R2): predicates
+    // are the constructor matchers production emits ("DES", "weak"),
+    // never hand-built strings.
+    let mut doc = finalize_honest(input);
     assert!(matches!(doc.status, Completeness::Complete));
+    let verdict = evaluate_document(
+        &[PolicyRule::deny_algorithm("DES"), PolicyRule::deny_weak()],
+        &doc,
+    );
+    doc.policy = Some(policy_record(&verdict));
     doc
 }
 
@@ -665,19 +628,9 @@ fn runtime_violation_doc() -> CaptureDocument {
         1,
     )];
     input.fatal = Some(FatalKind::Runtime("discovery finish: boom".to_string()));
-    input.policy = Some(PolicyRecord {
-        verdict: PolicyVerdict::Violation,
-        rules: vec![PolicyRuleResult {
-            rule: "deny-algorithm".to_string(),
-            predicate: "algorithm=DES".to_string(),
-            result: RuleVerdict::Violation,
-            definite: 500,
-            possible: None,
-            evidence: vec![evidence_ref(FP_A, 8, 100, 0x1000, 0, 500)],
-            engine_evidence: Vec::new(),
-        }],
-    });
-    let doc = finalize_honest(input);
+    let mut doc = finalize_honest(input);
+    let verdict = evaluate_document(&[PolicyRule::deny_algorithm("DES")], &doc);
+    doc.policy = Some(policy_record(&verdict));
     assert!(matches!(
         doc.status,
         Completeness::Fatal {
@@ -712,19 +665,10 @@ fn inconclusive_doc() -> CaptureDocument {
         discovered: 1,
         attached: 1,
     }];
-    input.policy = Some(PolicyRecord {
-        verdict: PolicyVerdict::Inconclusive,
-        rules: vec![PolicyRuleResult {
-            rule: "deny-algorithm".to_string(),
-            predicate: "algorithm=AES-256-GCM".to_string(),
-            result: RuleVerdict::Inconclusive,
-            definite: 0,
-            possible: Some(100),
-            evidence: Vec::new(),
-            engine_evidence: Vec::new(),
-        }],
-    });
-    finalize_honest(input)
+    let mut doc = finalize_honest(input);
+    let verdict = evaluate_document(&[PolicyRule::deny_algorithm("AES-256-GCM")], &doc);
+    doc.policy = Some(policy_record(&verdict));
+    doc
 }
 
 /// Pass check document: definite SHA use, denied DES cleanly absent.
@@ -746,19 +690,10 @@ fn pass_doc() -> CaptureDocument {
         discovered: 1,
         attached: 1,
     }];
-    input.policy = Some(PolicyRecord {
-        verdict: PolicyVerdict::Pass,
-        rules: vec![PolicyRuleResult {
-            rule: "deny-algorithm".to_string(),
-            predicate: "algorithm=DES".to_string(),
-            result: RuleVerdict::Pass,
-            definite: 0,
-            possible: Some(0),
-            evidence: Vec::new(),
-            engine_evidence: Vec::new(),
-        }],
-    });
-    finalize_honest(input)
+    let mut doc = finalize_honest(input);
+    let verdict = evaluate_document(&[PolicyRule::deny_algorithm("DES")], &doc);
+    doc.policy = Some(policy_record(&verdict));
+    doc
 }
 
 fn json_of(doc: &CaptureDocument) -> Value {
@@ -1493,8 +1428,9 @@ fn xorshift_shuffled<T: Clone>(mut v: Vec<T>, seed: u64) -> Vec<T> {
 
 fn shuffled_variants() -> Vec<CaptureDocument> {
     // Same evidence in several randomized arrival orders (sites,
-    // candidates, objects, coverage, counters, policy rules all
-    // shuffled): finalize canonicalizes every list.
+    // candidates, objects, coverage, counters all shuffled):
+    // finalize canonicalizes every list, and the derived policy is
+    // canonically sorted per variant.
     let base_sites = vec![
         site_at(
             FP_A,
@@ -1562,33 +1498,16 @@ fn shuffled_variants() -> Vec<CaptureDocument> {
                 ],
                 0xabc + round,
             );
-            input.policy = Some(PolicyRecord {
-                verdict: PolicyVerdict::Pass,
-                rules: xorshift_shuffled(
-                    vec![
-                        PolicyRuleResult {
-                            rule: "deny-algorithm".to_string(),
-                            predicate: "algorithm=DES".to_string(),
-                            result: RuleVerdict::Pass,
-                            definite: 0,
-                            possible: Some(0),
-                            evidence: Vec::new(),
-                            engine_evidence: Vec::new(),
-                        },
-                        PolicyRuleResult {
-                            rule: "deny-weak".to_string(),
-                            predicate: "weak-alias".to_string(),
-                            result: RuleVerdict::Pass,
-                            definite: 0,
-                            possible: Some(0),
-                            evidence: Vec::new(),
-                            engine_evidence: Vec::new(),
-                        },
-                    ],
-                    0xdef + round,
-                ),
-            });
-            finalize_honest(input)
+            // Policy derives through real evaluation per variant
+            // (canonically sorted — the arrival-order shuffle must
+            // not move it).
+            let mut doc = finalize_honest(input);
+            let verdict = evaluate_document(
+                &[PolicyRule::deny_algorithm("DES"), PolicyRule::deny_weak()],
+                &doc,
+            );
+            doc.policy = Some(policy_record(&verdict));
+            doc
         })
         .collect()
 }
