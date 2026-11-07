@@ -116,8 +116,10 @@ shows the same prediction before you run).
 
    A `fallback` section with a per-version `delta` re-enables
    rung 4 for the named versions — but only through this
-   explicit file. Exit 0 needs `CAP_BPF`+`CAP_PERFMON` (or
-   root); without them the target/table rows still run but the
+   explicit file. Exit 0 needs effective `CAP_BPF`+`CAP_PERFMON`
+   or effective `CAP_SYS_ADMIN`, with no UID-0 exemption (root
+   with dropped caps fails like any unprivileged user);
+   without them the target/table rows still run but the
    verdict fails closed on `caps`.
 
 `--table` also works with `doctor --pid`: the same file drives
