@@ -99,19 +99,31 @@ shows the same prediction before you run).
 
    `report`/`check` do not consume this file: table enrollment
    is deferred-by-design beyond v0.2. Only `doctor` still vets
-   explicit enrollment, with the same file:
+   explicit enrollment, with the same file — but sectioned
+   `doctor` needs package admission first: either a release
+   install whose binary carries the matching embedded package
+   contract, or an explicit harvest/count object pair
+   (dev-built binaries embed no contract, so a bare
+   `--exe --table` run exits 4 with `package admission refused`
+   before any target check runs). Vet with the pair from the
+   repo build (or the installed `$PREFIX/lib/osslscope/` pair):
 
    ```sh
-   osslscope doctor --exe ./my-app --table my-table.json
+   osslscope doctor --exe ./my-app --table my-table.json \
+     --object crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest \
+     --count-object crates/ebpf/target/bpfel-unknown-none/release/osslscope-count
    ```
 
    A `fallback` section with a per-version `delta` re-enables
    rung 4 for the named versions — but only through this
-   explicit file.
+   explicit file. Exit 0 needs `CAP_BPF`+`CAP_PERFMON` (or
+   root); without them the target/table rows still run but the
+   verdict fails closed on `caps`.
 
 `--table` also works with `doctor --pid`: the same file drives
-vetting (the `--libcrypto` diagnostics take no enrollment
-flags), so doctor agrees with the backend.
+vetting with the same admission requirement (the `--libcrypto`
+diagnostics take no enrollment flags), so doctor agrees with
+the backend.
 
 ## Provider-class enrollment
 

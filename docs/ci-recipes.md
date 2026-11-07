@@ -66,6 +66,10 @@ osslscope check \
   >driver.log 2>&1                             # observer diagnostics only
 ```
 
+Expect exit 11 on a fresh gate: Unknown-only evidence is
+inconclusive, so the gate fails closed pending gap triage (see
+Exit handling below).
+
 User-owned-prefix variant (same selected objects on both commands):
 
 ```sh
