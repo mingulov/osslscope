@@ -48,8 +48,9 @@ fn flags_in_position<'a>(args: &'a [String], value_flags: &[&str]) -> Vec<&'a st
     out
 }
 
-/// Doctor dispatch route (precedence: discovery > profiled >
-/// sectioned > focused).
+/// Doctor dispatch route (precedence: discovery > sectioned
+/// (--libcrypto with a sectioned flag is a vetting intent) >
+/// profiled (bare --libcrypto only) > focused).
 #[derive(Debug, PartialEq, Eq)]
 enum DoctorRoute {
     Discovery,
@@ -84,12 +85,17 @@ fn doctor_route(args: &[String]) -> DoctorRoute {
     let flags = flags_in_position(args, &value_flags);
     if flags.contains(&"--discovery") {
         DoctorRoute::Discovery
-    } else if flags.contains(&"--libcrypto") {
-        // Combining --libcrypto with sectioned flags is a usage
-        // error inside profiled::run (pinned by its tests).
-        DoctorRoute::Profiled
     } else if SECTIONED.iter().any(|f| flags.contains(f)) {
+        // Sectioned selectors route to sectioned vetting — including
+        // --libcrypto combos (vetting intents: the sectioned parser
+        // vets --libcrypto with enrollment flags and rejects two
+        // target selectors with one clear usage error).
         DoctorRoute::Sectioned
+    } else if flags.contains(&"--libcrypto") {
+        // Bare --libcrypto (+ shared --count-object/--format
+        // companions only): the historical v0.2 exact-profile
+        // diagnostic (usage.md "Legacy foreground diagnostic").
+        DoctorRoute::Profiled
     } else {
         // Bare --count-object/--observation-object stay on the
         // focused self-controls (explicit-companion override path).
@@ -290,14 +296,15 @@ mod preview_tests {
             ]),
             DoctorRoute::Sectioned
         );
-        // Precedence: discovery > profiled > sectioned.
+        // Precedence: discovery > sectioned > profiled (bare
+        // --libcrypto only).
         assert_eq!(
             route(&["--discovery", "--pid", "1"]),
             DoctorRoute::Discovery
         );
         assert_eq!(
             route(&["--libcrypto", "lib", "--pid", "1"]),
-            DoctorRoute::Profiled
+            DoctorRoute::Sectioned
         );
         // Flag-shaped VALUES never route: a companion file literally
         // named --pid/--discovery/--libcrypto stays a focused value.
@@ -326,6 +333,70 @@ mod preview_tests {
         // --flag=value is not a flag in any sub-parser (all reject
         // it): routing matches the naive-guard behavior exactly.
         assert_eq!(route(&["--pid=1"]), DoctorRoute::Focused);
+    }
+
+    #[test]
+    fn doctor_route_libcrypto_vetting_combos_reach_sectioned() {
+        fn route(words: &[&str]) -> DoctorRoute {
+            doctor_route(&words.iter().map(|w| w.to_string()).collect::<Vec<_>>())
+        }
+        // Bare --libcrypto (+ shared companions only) stays on the
+        // historical v0.2 exact-profile diagnostic.
+        assert_eq!(route(&["--libcrypto", "lib"]), DoctorRoute::Profiled);
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--count-object", "c"]),
+            DoctorRoute::Profiled
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--format", "json"]),
+            DoctorRoute::Profiled
+        );
+        assert_eq!(
+            route(&["--libcrypto", "x", "--help"]),
+            DoctorRoute::Profiled
+        );
+        // Vetting intents reach the sectioned vetting path (whose
+        // USAGE advertises --libcrypto and whose parser vets it).
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--table", "t"]),
+            DoctorRoute::Sectioned
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--force-offset", "1"]),
+            DoctorRoute::Sectioned
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--provider-table", "p"]),
+            DoctorRoute::Sectioned
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--object", "o"]),
+            DoctorRoute::Sectioned
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--members-object", "m"]),
+            DoctorRoute::Sectioned
+        );
+        // A second target selector is a sectioned usage error, never
+        // a v0.2 profiled rejection.
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--pid", "1"]),
+            DoctorRoute::Sectioned
+        );
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--exe", "x"]),
+            DoctorRoute::Sectioned
+        );
+        // Discovery still wins over everything.
+        assert_eq!(
+            route(&["--discovery", "--libcrypto", "lib"]),
+            DoctorRoute::Discovery
+        );
+        // Documented legacy conflicts keep the legacy route.
+        assert_eq!(
+            route(&["--libcrypto", "lib", "--observation-object", "o"]),
+            DoctorRoute::Profiled
+        );
     }
 
     #[test]

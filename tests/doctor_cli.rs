@@ -295,6 +295,39 @@ fn doctor_dead_pid_exit2_names_no_such_process() {
 }
 
 #[test]
+fn doctor_libcrypto_table_combo_reaches_sectioned_vetting() {
+    // --libcrypto with a vetting flag reaches the sectioned parser
+    // (whose USAGE advertises --libcrypto), never profiled's v0.2
+    // rejection: a bad --table names itself, exit 2, before any
+    // package admission runs.
+    let out = doctor(&[
+        "--libcrypto",
+        "/nonexistent-lib.so",
+        "--table",
+        "/nonexistent-table.json",
+    ]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("bad --table"),
+        "sectioned vetting reached, got: {stderr}"
+    );
+}
+
+#[test]
+fn doctor_libcrypto_pid_combo_reports_one_target_selector() {
+    // Two target selectors are a sectioned usage error, never a
+    // v0.2 profiled rejection.
+    let out = doctor(&["--pid", "1", "--libcrypto", "x"]);
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("use one target selector"),
+        "sectioned conflict error, got: {stderr}"
+    );
+}
+
+#[test]
 fn doctor_profiled_exit4_names_reason_on_stderr() {
     let out = doctor(&["--libcrypto", "/bin/true"]);
     assert_eq!(out.status.code(), Some(4));

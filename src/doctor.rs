@@ -2853,7 +2853,10 @@ fn run_with_resolver(
             println!("{USAGE}");
             println!("  no target: environment + installed-objects preflight");
             println!(
-                "  --pid PID | --libcrypto PATH | --exe PATH: also vet the target (same qualification as report/check)"
+                "  --pid PID | --exe PATH: also vet the target (same qualification as report/check)"
+            );
+            println!(
+                "  --libcrypto PATH with a vetting flag (--table/--force-offset/--provider-table/--object/--members-object): vet that path (bare --libcrypto selects the legacy exact-profile diagnostic)"
             );
             println!(
                 "  --exe PATH: pre-exec spawn prediction (same rule as `run --` automatic discovery)"
