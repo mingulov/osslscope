@@ -33,8 +33,10 @@ native backing and retained-descriptor identity checks before attachment.
 Inventory remains useful when trace access, relocation or attachment is denied.
 
 JSON output is a stream of `osslscope.discovery.provider.v1` records, one JSON
-object per line. Both commands emit an initial `snapshot`, optional subsequent
-`snapshot`/`observation` records and a final `end`. Each snapshot embeds the
+object per line. Scan and inspect emit an initial `snapshot`, optional subsequent
+`snapshot`/`observation` records and a final `end`. `doctor --discovery --json`
+instead emits a single `record: "doctor"` object carrying the capability
+states (see below). Each snapshot embeds the
 unchanged safe `osslscope.discovery.v1` inventory. Facts, finite gaps and
 capabilities are separate fields. Capture intervals include observer elapsed
 start/end times and measured drain lag; facts carry their monotonic timestamps.
@@ -90,6 +92,19 @@ a development build.
 states without consulting a target profile or build admission catalogue.
 Feature checks do not qualify a target's attachment, provider behavior or
 complete coverage. Target access and attachment remain scope dependent.
+Its `--json` form emits one record:
+
+```json
+{"schema_version": "osslscope.discovery.provider.v1", "record": "doctor",
+ "capabilities": {"inventory": "available", "companion": "available",
+  "producer": "available", "bpf": "available", "user_read": "available",
+  "ring_buffer": "available", "uprobe_multi": "available",
+  "historical_activation": "unknown", "execution": "not_observed"}}
+```
+
+Each capability is `available`, `denied`, `unavailable`, or
+`not_checked`; the trailing `historical_activation`/`execution`
+disclaimers match the other commands' meaning rows.
 
 Exit codes are 0 for completed inventory and supported observation, 3 for useful
 inventory with access/resource/trace gaps or interruption, 4 for no usable

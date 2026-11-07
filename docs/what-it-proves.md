@@ -1,6 +1,28 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Observation meaning and limits
 
+## Who should NOT adopt (read before installing)
+
+Do not adopt when any of these holds; the tool fails closed and
+tells you, but it cannot qualify what it cannot observe:
+
+- Below-floor kernels: observation needs Linux 6.9+ BPF features
+  (`uprobe_multi`, ring buffers, `probe_read_user`, cookie);
+  `doctor` gates on its functional feature probe, never the
+  release number (see [CI recipes](ci-recipes.md#runner-image)).
+- Open qualification: current integrated COMPLETE-window live
+  and package qualification is unfinished, so gate on actual
+  policy verdicts and disclosed gaps (see
+  [CI recipes](ci-recipes.md)).
+- Structural low-level gaps: address-taken (`GLOB_DAT`) imports
+  stay uninstrumented (see [the PARTIAL
+  runbook](partial-runbook.md)).
+- Unadmitted anchors: unknown stripped builds without a symtab
+  have no supported anchor for vetting (see [the built-in
+  runbook](builtin-runbook.md)).
+- Static or vendored crypto (no libcrypto mapping) stays blind:
+  the observer reports a gap, never an inferred claim.
+
 ## Historical v0.3 discovery and observation
 
 The remainder of this section was written for v0.3 and is frozen

@@ -31,6 +31,7 @@ sudo reboot
 
 ```sh
 sudo dpkg -i osslscope_<ver>-1_amd64.deb   # or: sudo dnf install ./osslscope-<ver>-1.*.x86_64.rpm
+sudo apt-get install -f -y                # if dpkg left Depends: libcap2-bin (setcap) unconfigured
 getcap /usr/bin/osslscope                  # expect: cap_bpf,cap_perfmon+ep
 ```
 
