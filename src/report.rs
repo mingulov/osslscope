@@ -3018,15 +3018,6 @@ pub(crate) fn exclusive_create(
 /// Counter for temp/sibling file uniqueness within this process.
 static WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Current process umask, read without changing it (set-then-restore
-/// in one step). Artifact delivery runs on one thread and the suite
-/// runs serially, so no concurrent creation observes the swap.
-fn current_umask() -> u32 {
-    let mask = unsafe { libc::umask(0) };
-    unsafe { libc::umask(mask) };
-    mask as u32
-}
-
 /// True for exactly `/proc/self/fd/<digits>`: an already-open
 /// descriptor, kernel-managed per-process — never a plantable
 /// symlink, so artifact writes pass through (EPIPE recorded).
@@ -3040,17 +3031,20 @@ fn is_proc_self_fd(path: &std::path::Path) -> bool {
     !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Exclusively create an unpublished staging temp in `dir`, always
-/// mode `0o600` (& ~umask): staging stays owner-private until the
-/// final chmod+rename publishes the destination mode. Returns the
-/// temp path (for rename/cleanup) and the open file.
+/// Exclusively create an unpublished staging temp in `dir` at
+/// creation `mode` (the kernel still applies umask + default ACL):
+/// the caller picks `0o600` when it will fchmod to a preserved mode
+/// before rename (staging stays owner-private), `0o666` when the
+/// kernel-derived creation mode IS the final mode (no chmod after).
+/// Returns the temp path (for rename/cleanup) and the open file.
 fn create_stage_temp(
     dir: &std::path::Path,
+    mode: u32,
 ) -> std::io::Result<(std::path::PathBuf, std::fs::File)> {
     for _ in 0..100 {
         let n = WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!(".osslscope-out-{}-{n}.tmp", std::process::id()));
-        match exclusive_create(&tmp, 0o600) {
+        match exclusive_create(&tmp, mode) {
             Ok(file) => return Ok((tmp, file)),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e),
@@ -3067,11 +3061,18 @@ fn create_stage_temp(
 /// Symlink and non-regular targets are refused without following
 /// them (rename would replace the link/node itself — never what an
 /// artifact `-o` path means); a failed write leaves the target
-/// untouched instead of truncated. Staging is always owner-private
-/// (`0o600`); the published mode preserves an existing regular
-/// destination's access bits (the pre-atomic `fs::write` kept the
-/// inode), while new files keep the `0o666 & !umask` default.
+/// untouched instead of truncated. Two creation paths, no umask
+/// read anywhere (delivery never consults process-global creation
+/// state): an existing regular destination keeps its access bits
+/// (the pre-atomic `fs::write` kept the inode) via owner-private
+/// `0o600` staging fchmod'd before rename, while a new file is
+/// staged at `0o666` and renamed with NO chmod — the kernel derives
+/// umask + default ACL exactly as the old `fs::write` creation did,
+/// so staging visibility equals final visibility (as before).
 /// Setuid/setgid/sticky bits are never propagated to the fresh inode.
+/// A file appearing between the metadata check and temp creation
+/// takes the new-file path and is renamed over — benign, matching
+/// the old open behavior.
 fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -3112,19 +3113,27 @@ fn write_file_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(std::path::Path::new("."));
-    let (tmp, mut file) = create_stage_temp(dir)?;
+    // Existing destinations stage owner-private and publish the
+    // preserved access bits before rename (fchmod on the open fd: no
+    // path race); new files stage at `0o666` so the kernel derives
+    // umask + default ACL, exactly the old `fs::write` creation
+    // semantics — and are renamed with NO chmod, so no userspace
+    // arithmetic can override the kernel-derived policy.
+    let stage_mode = if preserved_mode.is_some() {
+        0o600
+    } else {
+        0o666
+    };
+    let (tmp, mut file) = create_stage_temp(dir, stage_mode)?;
     if let Err(e) = file.write_all(bytes) {
         std::fs::remove_file(&tmp).ok();
         return Err(e);
     }
-    // Publish the destination mode before the rename (fchmod on the
-    // open fd: no path race): existing access bits win over umask
-    // exactly as the old in-place open did; new files take the
-    // `0o666 & !umask` default.
-    let published = preserved_mode.unwrap_or(0o666 & !current_umask());
-    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(published)) {
-        std::fs::remove_file(&tmp).ok();
-        return Err(e);
+    if let Some(published) = preserved_mode {
+        if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(published)) {
+            std::fs::remove_file(&tmp).ok();
+            return Err(e);
+        }
     }
     drop(file);
     if let Err(e) = std::fs::rename(&tmp, path) {
@@ -3347,11 +3356,34 @@ mod tests {
             dir
         }
 
+        /// RAII umask fixture: installs `mask` for the test body and
+        /// restores the previous mask on drop (even on assertion
+        /// panic). Process-global by kernel design — sound only
+        /// because the suite runs serially (`RUST_TEST_THREADS=1`
+        /// per `docs/build.md`).
+        struct UmaskGuard(u32);
+        impl UmaskGuard {
+            fn set(mask: u32) -> Self {
+                let old = unsafe { libc::umask(mask as libc::mode_t) };
+                UmaskGuard(old as u32)
+            }
+        }
+        impl Drop for UmaskGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umask(self.0 as libc::mode_t);
+                }
+            }
+        }
+
         #[test]
         fn stage_temp_stays_owner_private() {
             use std::os::unix::fs::PermissionsExt;
             let dir = scratch_dir("stagepriv");
-            let (tmp, file) = create_stage_temp(&dir).unwrap();
+            // The existing-file staging path (`0o600`, fchmod'd to
+            // the preserved mode before rename) grants nothing to
+            // group/other at creation under any umask.
+            let (tmp, file) = create_stage_temp(&dir, 0o600).unwrap();
             let mode = std::fs::metadata(&tmp).unwrap().permissions().mode() & 0o777;
             assert_eq!(
                 mode & 0o077,
@@ -3477,16 +3509,77 @@ mod tests {
 
         #[test]
         fn write_dest_new_file_honors_umask_default() {
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let dir = scratch_dir("newfile");
+            // Kernel-derived default in this ACL-less directory
+            // (plain create(0666)): the reference the delivery must
+            // match — no userspace umask arithmetic involved.
+            let reference = dir.join("reference.tmp");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o666)
+                .open(&reference)
+                .unwrap();
+            let expected = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+            std::fs::remove_file(&reference).ok();
             let dest = dir.join("fresh.json");
             let outcome = write_dest(&OutputDest::File(dest.clone()), b"bytes");
             assert!(outcome.ok, "new file must be created: {outcome:?}");
-            let expected = 0o666 & !current_umask();
             let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
             assert_eq!(
                 mode, expected,
-                "new file must keep the 0o666 & !umask default: {mode:04o}"
+                "new file must keep the kernel-derived 0o666 default: {mode:04o}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        #[test]
+        fn write_dest_new_file_honors_restrictive_default_acl() {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            use std::process::Command;
+            let dir = scratch_dir("restrictacl");
+            // Restrictive default ACL: the kernel derives 0600 for new
+            // files here under any umask (verified: plain create(0666)
+            // lands 0600 under both 022 and 077). Loud failure if the
+            // filesystem cannot express the fixture — never silent.
+            let out = Command::new("setfacl")
+                .args(["-d", "-m", "u::rwx,g::---,o::---"])
+                .arg(&dir)
+                .output()
+                .expect("setfacl must run for the default-ACL control");
+            assert!(
+                out.status.success(),
+                "setfacl must install the restrictive default ACL on {dir:?}: {out:?}"
+            );
+            // Pin umask 022 (the reported scenario): without the
+            // fixture, `0o666 & !umask` arithmetic passes vacuously
+            // under a restrictive ambient mask and the control would
+            // not discriminate. Serial suite only (see UmaskGuard).
+            let _mask = UmaskGuard::set(0o022);
+            // Reference: plain create(0666) in the same directory,
+            // proving the kernel-derived creation policy this
+            // delivery must match.
+            let reference = dir.join("reference.tmp");
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o666)
+                .open(&reference)
+                .unwrap();
+            let expected = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                expected, 0o600,
+                "fixture must derive 0600, got {expected:04o}"
+            );
+            std::fs::remove_file(&reference).ok();
+            let dest = dir.join("fresh.json");
+            let outcome = write_dest(&OutputDest::File(dest.clone()), b"bytes");
+            assert!(outcome.ok, "new file must be created: {outcome:?}");
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "new-file delivery overrode the restrictive default ACL: {mode:04o}"
             );
             std::fs::remove_dir_all(&dir).ok();
         }
