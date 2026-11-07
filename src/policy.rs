@@ -352,6 +352,19 @@ fn is_unprobed_crypto_loss(name: &str) -> bool {
     name == "legacy.lowlevel_uninstrumented" || name == "legacy:lowlevel_uninstrumented"
 }
 
+/// Coverage scopes that may carry unprobed crypto despite the
+/// engine-area exemption: the `legacy` probe plan bundles
+/// low-level-crypto probes with engine-area probes under one scope
+/// string, and capture emits a single `ScopeCoverage` with scope
+/// `"legacy"` — so a blind legacy scope can hide unobserved
+/// low-level crypto the way the unprobed-crypto Loss counter could.
+/// Provider-area rules stay blind to these (a deny rule must not
+/// report proved absence over unobserved crypto). (`:` accepted,
+/// like [`is_engine_area`].)
+fn is_legacy_scope(scope: &str) -> bool {
+    scope == "legacy" || scope.starts_with("legacy.") || scope.starts_with("legacy:")
+}
+
 /// Area of a predicate rule: engine iff it matches exactly the engine
 /// provider class. Compound predicates stay provider-area (fail closed).
 pub fn rule_area(rule: &Rule) -> RuleArea {
@@ -413,12 +426,14 @@ fn gap_relevant_to(area: RuleArea, reason: &GapReason) -> bool {
         // Coverage scope names are producer-defined: engine rules
         // fail closed on every coverage blind spot, since no name
         // proves the gap is disjoint from ENGINE use. Provider rules
-        // ignore explicitly engine-area scopes only.
+        // ignore explicitly engine-area scopes only — except legacy
+        // scopes, which bundle low-level-crypto probes with
+        // engine-area probes and so can hide unobserved crypto.
         GapReason::UnknownDenominator { scope }
         | GapReason::UndiscoveredSites { scope, .. }
         | GapReason::UnattachedSites { scope, .. } => match area {
             RuleArea::Engine => true,
-            RuleArea::Provider => !is_engine_area(scope),
+            RuleArea::Provider => !is_engine_area(scope) || is_legacy_scope(scope),
         },
     }
 }
@@ -1119,6 +1134,58 @@ mod tests {
                 gap_relevant_to(RuleArea::Engine, &loss(counter)),
                 "{counter}"
             );
+        }
+    }
+
+    #[test]
+    fn legacy_scoped_coverage_gaps_stay_relevant_to_provider_rules() {
+        assert!(is_legacy_scope("legacy"));
+        assert!(is_legacy_scope("legacy.lowlevel"));
+        assert!(is_legacy_scope("legacy:lowlevel"));
+        for name in [
+            "engine",
+            "engine.tripwire",
+            "legacyx",
+            "engineered",
+            "default",
+            "",
+        ] {
+            assert!(!is_legacy_scope(name), "{name}");
+        }
+        let gaps = |scope: &str| {
+            [
+                GapReason::UnknownDenominator {
+                    scope: scope.to_string(),
+                },
+                GapReason::UndiscoveredSites {
+                    scope: scope.to_string(),
+                    missing: 1,
+                },
+                GapReason::UnattachedSites {
+                    scope: scope.to_string(),
+                    missing: 1,
+                },
+            ]
+        };
+        for scope in ["legacy", "legacy.lowlevel", "legacy:lowlevel"] {
+            for gap in gaps(scope) {
+                assert!(
+                    gap_relevant_to(RuleArea::Provider, &gap),
+                    "{scope}: {gap:?}"
+                );
+            }
+        }
+        // Genuinely engine-area scopes stay unrelated to provider
+        // rules, and every coverage gap stays relevant to engine
+        // rules.
+        for scope in ["engine", "engine.tripwire"] {
+            for gap in gaps(scope) {
+                assert!(
+                    !gap_relevant_to(RuleArea::Provider, &gap),
+                    "{scope}: {gap:?}"
+                );
+                assert!(gap_relevant_to(RuleArea::Engine, &gap), "{scope}: {gap:?}");
+            }
         }
     }
 

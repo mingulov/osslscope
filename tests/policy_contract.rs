@@ -23,9 +23,9 @@ use osslscope::discovery::session::{
 use osslscope::evidence::{
     CandidateCoverage, CandidateIdentity, CaptureDocument, CaptureWindow, Completeness,
     CounterKind, CounterSource, CounterUnits, EngineObservation, EngineWindow, ExpectedScope,
-    FatalKind, FencedGeneration, FinalizeInput, GapCounter, LegacyCallPartition, MatchBounds,
-    ObjectId, ObjectRecord, OpensslVersion, RuleVerdict, ScopeCoverage, SiteExecution, SiteKey,
-    TargetRecord, engine_index, finalize,
+    FatalKind, FencedGeneration, FinalizeInput, GapCounter, GapReason, LegacyCallPartition,
+    MatchBounds, ObjectId, ObjectRecord, OpensslVersion, RuleVerdict, ScopeCoverage, SiteExecution,
+    SiteKey, TargetRecord, engine_index, finalize,
 };
 use osslscope::policy::{ENGINE_PROVIDER_CLASS, PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -605,8 +605,19 @@ fn relevant_vs_unrelated_gaps() {
         Row {
             name: "engine coverage gap is unrelated to require-provider",
             rule: PolicyRule::require_provider("default"),
-            doc: with_gap(vec![coverage_gap("legacy.engine")], Vec::new()),
+            doc: with_gap(vec![coverage_gap("engine.tripwire")], Vec::new()),
             expected: RuleVerdict::Violation,
+        },
+        Row {
+            // 1C-F1 (Option B): `legacy.engine` is a legacy scope, and
+            // legacy scopes bundle low-level-crypto probes with
+            // engine-area probes — so the gap is relevant to
+            // provider-area rules and the unmet requirement is
+            // unproven (Inconclusive), not a proved Violation.
+            name: "legacy-scoped coverage gap is relevant to require-provider",
+            rule: PolicyRule::require_provider("default"),
+            doc: with_gap(vec![coverage_gap("legacy.engine")], Vec::new()),
+            expected: RuleVerdict::Inconclusive,
         },
         Row {
             name: "engine loss is relevant to deny-engine",
@@ -3883,5 +3894,148 @@ fn deny_rules_are_inconclusive_over_unprobed_lowlevel_crypto() {
         let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_algorithm("MD5")), &d);
         assert_eq!(v.rules[0].verdict, RuleVerdict::Pass, "{counter}");
         assert_eq!(v.rules[0].bounds.possible, Some(0), "{counter}");
+    }
+}
+
+/// Review wave 1C-F1 (Option B, legacy-scope coverage relevance): a
+/// blind `legacy` scope bundles low-level-crypto probes with
+/// engine-area probes under one scope string
+/// (`discovery/legacy.rs` `module_plan`; `capture.rs` emits a single
+/// `ScopeCoverage` with scope `"legacy"`), so a legacy-scoped
+/// coverage gap can hide unobserved low-level crypto — the same hole
+/// class as Wave 1A's Loss counter (superseded plan / unbuilt plan /
+/// undiscovered / unattached sites). A provider-area deny rule over
+/// a window whose ONLY gap is legacy-scoped MUST NOT report proved
+/// absence (pass with `possible: 0`): the absence is unproven and
+/// the rule is inconclusive — on the verdict and on both renders.
+/// All three coverage gap kinds run the full chain (finalize →
+/// verdict → renders → exit).
+#[test]
+fn deny_weak_is_inconclusive_over_legacy_scoped_coverage_gaps() {
+    let cases: Vec<(&str, ScopeCoverage)> = vec![
+        (
+            "UnknownDenominator",
+            ScopeCoverage {
+                scope: "legacy".to_string(),
+                expected: ExpectedScope::Unknown,
+                discovered: 0,
+                attached: 0,
+            },
+        ),
+        (
+            "UndiscoveredSites",
+            ScopeCoverage {
+                scope: "legacy".to_string(),
+                expected: ExpectedScope::Applicable { sites: 2 },
+                discovered: 1,
+                attached: 2,
+            },
+        ),
+        (
+            "UnattachedSites",
+            ScopeCoverage {
+                scope: "legacy".to_string(),
+                expected: ExpectedScope::Applicable { sites: 2 },
+                discovered: 2,
+                attached: 1,
+            },
+        ),
+    ];
+    for (kind, cov) in &cases {
+        let d = doc(
+            Vec::new(),
+            Vec::new(),
+            vec![cov.clone()],
+            Vec::new(),
+            exact_window(),
+            None,
+        );
+        match &d.status {
+            Completeness::Partial { reasons } => {
+                assert_eq!(
+                    reasons.len(),
+                    1,
+                    "{kind}: fixture must carry exactly one gap"
+                );
+                let is_kind = match &reasons[0] {
+                    GapReason::UnknownDenominator { scope } => {
+                        *kind == "UnknownDenominator" && scope == "legacy"
+                    }
+                    GapReason::UndiscoveredSites { scope, .. } => {
+                        *kind == "UndiscoveredSites" && scope == "legacy"
+                    }
+                    GapReason::UnattachedSites { scope, .. } => {
+                        *kind == "UnattachedSites" && scope == "legacy"
+                    }
+                    other => panic!("{kind}: unexpected gap {other:?}"),
+                };
+                assert!(is_kind, "{kind}: wrong gap kind: {:?}", reasons[0]);
+            }
+            other => panic!("{kind}: fixture must be PARTIAL, got {other:?}"),
+        }
+        let rule = PolicyRule::deny_weak();
+        let v = evaluate_document(std::slice::from_ref(&rule), &d);
+        assert_eq!(v.rules.len(), 1, "{kind}");
+        let r = &v.rules[0];
+        assert_eq!(r.verdict, RuleVerdict::Inconclusive, "{kind}");
+        assert!(!r.relevant_complete, "{kind}");
+        // No proved-absence claim: the upper bound is unknown.
+        assert_eq!(r.bounds.definite, 0, "{kind}");
+        assert_eq!(r.bounds.possible, None, "{kind}");
+        assert_eq!(v.overall(), PolicyOutcome::Inconclusive, "{kind}");
+        // JSON render carries the same verdict.
+        let pj = policy_json(&d, &v);
+        assert_eq!(pj["verdict"], "inconclusive", "{kind}");
+        assert_eq!(pj["rules"][0]["result"], "inconclusive", "{kind}");
+        assert!(
+            pj["rules"][0]["possible"].is_null(),
+            "{kind}: JSON must not pin possible=0"
+        );
+        let mut with_policy = d.clone();
+        with_policy.policy = Some(policy_record(&v));
+        let bytes = osslscope::report::render_json(&with_policy).unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(val["policy"]["verdict"], "inconclusive", "{kind}");
+        // M1 (review-wave-1B): the shipped JSON carries the per-rule
+        // relevance behind the verdict, not just the test-only
+        // policy_json surface.
+        assert_eq!(
+            val["policy"]["rules"][0]["relevant_complete"], false,
+            "{kind}"
+        );
+        // Human render carries the same verdict, never a pass.
+        let human = osslscope::report::render_human(&with_policy);
+        assert!(human.contains("policy: inconclusive"), "{kind}:\n{human}");
+        let rule_line = format!(
+            "rule {} ({}): inconclusive (definite=0, possible=unknown, relevant_complete=false)",
+            rule.name, rule.matcher
+        );
+        assert!(human.contains(&rule_line), "{kind}:\n{human}");
+        // The gate fails closed (exit 11), never a PARTIAL pass.
+        assert_eq!(
+            exit_for(v.overall(), Some(0), &with_policy, &ok_delivery()),
+            11,
+            "{kind}"
+        );
+    }
+    // Controls: genuinely engine-area scopes keep their irrelevance
+    // to provider-area deny rules (proved absence still holds there).
+    for scope in ["engine", "engine.tripwire"] {
+        let d = doc(
+            Vec::new(),
+            Vec::new(),
+            vec![ScopeCoverage {
+                scope: scope.to_string(),
+                expected: ExpectedScope::Unknown,
+                discovered: 0,
+                attached: 0,
+            }],
+            Vec::new(),
+            exact_window(),
+            None,
+        );
+        let v = evaluate_document(std::slice::from_ref(&PolicyRule::deny_weak()), &d);
+        assert_eq!(v.rules[0].verdict, RuleVerdict::Pass, "{scope}");
+        assert_eq!(v.rules[0].bounds.possible, Some(0), "{scope}");
     }
 }
