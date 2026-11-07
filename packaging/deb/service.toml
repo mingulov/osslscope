@@ -23,9 +23,10 @@ rotate-interval = 3600
 retain-windows = 2880
 retain-bytes = 1073741824
 # §1.4: the StateDirectory out-DIR. The unit runs root with a
-# CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE bounding set (no DAC override),
-# so the out-DIR must stay root-writable — keep this default unless
-# the replacement is writable by the service.
+# CAP_BPF+CAP_PERFMON+CAP_SYS_PTRACE+CAP_CHECKPOINT_RESTORE+CAP_DAC_READ_SEARCH
+# bounding set (§1.4 Amendment A1), so the out-DIR must stay
+# root-writable — keep this default unless the replacement is
+# writable by the service.
 out = "/var/lib/osslscope/windows"
 # Target selection (exactly one shape — pick ONE):
 # Observe explicit PIDs (repeatable across restarts only while the
