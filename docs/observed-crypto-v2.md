@@ -377,15 +377,31 @@ truncation), and violation evidence cites the matched
 partitions' sites with partition calls.
 Each rule carries three-valued `result`, conserved
 `definite`/`possible` bounds (`possible: null` means the upper
-bound is unknown; `definite` never exceeds a known `possible`) and
-site `evidence` for definite matches. Every evidence ref resolves
-to a listed site key and, summed per site within one rule, never
-claims more calls than that site executed (citing one site from
-two rules stays legal: bounds are per-predicate). Values verbatim
-from `tests/goldens/report-v2-violation.json`:
+bound is unknown; `definite` never exceeds a known `possible`),
+per-rule `relevant_complete` (true iff no gap relevant to that
+rule's area remains — this is what explains a PARTIAL
+pass/inconclusive mix), and site `evidence` for definite
+matches. Every evidence ref resolves to a listed site key and,
+summed per site within one rule, never claims more calls than
+that site executed (citing one site from two rules stays legal:
+bounds are per-predicate). The section also carries
+`param_blind` (algorithm rules meet executed parameter-blind
+operations), `unseen_deny_providers` (deny-provider matchers
+proved absent — typo visibility), `kat_excluded` (always 0) with
+`kat_note`, and `fips_unlabeled_executions` (FIPS-class calls
+that may include self-tests). The human block shows
+`relevant_complete` on every rule line and repeats the firing
+caveats as `param_blind`, `unseen_deny_providers`,
+`fips_unlabeled_executions` and `kat_excluded` lines. Values
+verbatim from `tests/goldens/report-v2-violation.json`
+(`output_contract::v2_goldens_pinned`):
 
 ```json
 {
+  "fips_unlabeled_executions": 0,
+  "kat_excluded": 0,
+  "kat_note": "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions",
+  "param_blind": false,
   "rules": [
     {
       "definite": 550,
@@ -409,6 +425,7 @@ from `tests/goldens/report-v2-violation.json`:
       ],
       "possible": 550,
       "predicate": "algorithm=DES",
+      "relevant_complete": true,
       "result": "violation",
       "rule": "deny-algorithm"
     },
@@ -417,10 +434,12 @@ from `tests/goldens/report-v2-violation.json`:
       "evidence": [],
       "possible": 0,
       "predicate": "weak-alias",
+      "relevant_complete": true,
       "result": "pass",
       "rule": "deny-weak"
     }
   ],
+  "unseen_deny_providers": [],
   "verdict": "violation"
 }
 ```

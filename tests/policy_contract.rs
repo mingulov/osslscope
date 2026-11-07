@@ -3836,6 +3836,14 @@ fn deny_rules_are_inconclusive_over_unprobed_lowlevel_crypto() {
                 "{} ({counter})",
                 rule.name
             );
+            // M1 (review-wave-1B): the shipped JSON carries the
+            // per-rule relevance behind the verdict, not just the
+            // test-only policy_json surface.
+            assert_eq!(
+                val["policy"]["rules"][0]["relevant_complete"], false,
+                "{} ({counter})",
+                rule.name
+            );
             // Human render carries the same verdict, never a pass.
             let human = osslscope::report::render_human(&with_policy);
             assert!(
@@ -3844,7 +3852,7 @@ fn deny_rules_are_inconclusive_over_unprobed_lowlevel_crypto() {
                 rule.name
             );
             let rule_line = format!(
-                "rule {} ({}): inconclusive (definite=0, possible=unknown)",
+                "rule {} ({}): inconclusive (definite=0, possible=unknown, relevant_complete=false)",
                 rule.name, rule.matcher
             );
             assert!(

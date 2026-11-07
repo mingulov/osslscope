@@ -18,8 +18,8 @@
 use crate::capture;
 use crate::evidence::{CaptureDocument, PolicyRecord, RuleVerdict};
 use crate::policy::{
-    PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback, evaluate_document,
-    executed_param_blind_ops, fips_unlabeled_calls,
+    KAT_NOTE, PolicyOutcome, PolicyRule, PolicyVerdict, apply_legacy_engine_fallback,
+    evaluate_document, executed_param_blind_ops, fips_unlabeled_calls, is_algorithm_rule,
 };
 use crate::policy_config::RuleSet;
 use crate::report::{OutputDest, OutputFormat, OutputRequest};
@@ -350,10 +350,7 @@ fn unseen_deny_providers(v: &PolicyVerdict) -> Vec<&str> {
 /// parameter-blind operations — the ambiguity that actually shaped a
 /// bound, not a blanket flag.
 fn param_blind(doc: &CaptureDocument, v: &PolicyVerdict) -> bool {
-    v.rules
-        .iter()
-        .any(|r| matches!(r.name, "deny-algorithm" | "require-executed"))
-        && executed_param_blind_ops(doc)
+    v.rules.iter().any(|r| is_algorithm_rule(r.name)) && executed_param_blind_ops(doc)
 }
 
 /// Legacy ENGINE tripwire calls from the pre-T08 `legacy` block
@@ -461,7 +458,7 @@ pub fn policy_json(doc: &CaptureDocument, v: &PolicyVerdict) -> serde_json::Valu
         "unseen_deny_providers": unseen_deny_providers(v),
         "param_blind": param_blind(doc, v),
         "kat_excluded": 0,
-        "kat_note": "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions",
+        "kat_note": KAT_NOTE,
         "fips_unlabeled_executions": fips_unlabeled_calls(doc),
     })
 }
@@ -1652,6 +1649,153 @@ require-executed=["SHA2-256"]
         assert_eq!(policy.verdict, DocVerdict::Violation);
         assert_eq!(policy.rules[0].definite, 5);
         assert!(policy.rules[0].evidence.is_empty());
+    }
+
+    #[test]
+    fn shipped_policy_section_carries_uncertainty_signals() {
+        // M1 (review-wave-1B): the shipped JSON policy section and
+        // the human block must carry the uncertainty signals that
+        // policy_json() computes — param_blind, unseen deny
+        // providers, KAT/FIPS exposure, and per-rule
+        // relevant_complete — instead of leaving them visible only
+        // through the test-only policy_json() surface.
+        //
+        // One window carries all four signals: an executed
+        // parameter-blind (MAC) site, a FIPS-class site, and an
+        // engine-area-only loss gap (PARTIAL with mixed per-rule
+        // relevance: the deny-engine rule goes inconclusive while
+        // the deny-provider rule passes).
+        let d = crate::evidence::finalize(FinalizeInput {
+            corpse_wait: None,
+            window: CaptureWindow {
+                requested_start_ns: 1_000,
+                requested_end_ns: 2_000,
+                effective_start_ns: 1_000,
+                effective_end_ns: 2_000,
+                signal_cut: false,
+                count_admission: None,
+            },
+            sites: vec![
+                // Exact (CIPHER) AES site: clean DES absence here.
+                site(
+                    1,
+                    100,
+                    vec![cand("p", "default", 2, 21, &["AES-256-GCM"], false)],
+                ),
+                // Executed parameter-blind (MAC) site: poisons
+                // algorithm-rule upper bounds (No -> Unknown).
+                site(2, 50, vec![cand("p", "default", 3, 1, &["HMAC"], false)]),
+                // FIPS-class site: unlabeled KAT exposure.
+                site(
+                    3,
+                    300,
+                    vec![cand("p", "fips", 2, 7, &["SHA-256"], false)],
+                ),
+            ],
+            fenced: Vec::new(),
+            objects: Vec::new(),
+            coverage: Vec::new(),
+            counters: vec![GapCounter {
+                name: "engine.poll_loss".to_string(),
+                kind: CounterKind::Loss,
+                units: CounterUnits::Events,
+                source: CounterSource::Lifecycle,
+                value: 1,
+            }],
+            fatal: None,
+            target: TargetRecord::unknown(),
+            openssl: OpensslVersion::unknown(),
+            disposition: None,
+            policy: None,
+            legacy_partition: LegacyCallPartition::default(),
+            engine_observations: Vec::new(),
+            traversal: None,
+        });
+        assert!(matches!(
+            d.status,
+            crate::evidence::Completeness::Partial { .. }
+        ));
+        let rules = [
+            PolicyRule::deny_provider("legacy"),
+            PolicyRule::deny_engine(),
+            PolicyRule::deny_algorithm("DES"),
+        ];
+        let (verdict, document) =
+            assemble_checked_document(&rules, d, &serde_json::Value::Null);
+        assert_eq!(verdict.overall(), PolicyOutcome::Inconclusive);
+        // The shipped JSON policy section carries every signal.
+        let rendered = crate::report::doc_json(&document);
+        let policy = &rendered["policy"];
+        assert_eq!(policy["param_blind"], true);
+        assert_eq!(
+            policy["unseen_deny_providers"],
+            serde_json::json!(["legacy"])
+        );
+        assert_eq!(policy["kat_excluded"], 0);
+        assert_eq!(
+            policy["kat_note"],
+            "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions"
+        );
+        assert_eq!(policy["fips_unlabeled_executions"], 300);
+        let rules_json = policy["rules"].as_array().expect("rules array");
+        assert_eq!(rules_json.len(), 3);
+        for r in rules_json {
+            match r["rule"].as_str().unwrap() {
+                "deny-algorithm" => {
+                    assert_eq!(r["result"], "inconclusive");
+                    assert_eq!(r["relevant_complete"], true);
+                }
+                "deny-engine" => {
+                    assert_eq!(r["result"], "inconclusive");
+                    assert_eq!(r["relevant_complete"], false);
+                }
+                "deny-provider" => {
+                    assert_eq!(r["result"], "pass");
+                    assert_eq!(r["relevant_complete"], true);
+                }
+                other => panic!("unexpected rule {other}"),
+            }
+        }
+        // The shipped section agrees with policy_json on the same
+        // inputs (neither surface may drift from the other).
+        let pj = policy_json(&document, &verdict);
+        assert_eq!(policy["param_blind"], pj["param_blind"]);
+        assert_eq!(
+            policy["unseen_deny_providers"],
+            pj["unseen_deny_providers"]
+        );
+        assert_eq!(policy["kat_excluded"], pj["kat_excluded"]);
+        assert_eq!(policy["kat_note"], pj["kat_note"]);
+        assert_eq!(
+            policy["fips_unlabeled_executions"],
+            pj["fips_unlabeled_executions"]
+        );
+        // The human block carries the same signals.
+        let human = crate::report::render_human(&document);
+        assert!(
+            human.contains("relevant_complete=true"),
+            "human must show complete rules:\n{human}"
+        );
+        assert!(
+            human.contains("relevant_complete=false"),
+            "human must show incomplete rules:\n{human}"
+        );
+        assert!(
+            human.contains("param_blind=true"),
+            "human must flag parameter blindness:\n{human}"
+        );
+        assert!(
+            human.contains("unseen_deny_providers=legacy"),
+            "human must list unseen deny providers:\n{human}"
+        );
+        assert!(
+            human.contains("fips_unlabeled_executions=300"),
+            "human must count FIPS exposure:\n{human}"
+        );
+        assert!(
+            human.contains("kat_excluded=0"),
+            "human must show the KAT exclusion:\n{human}"
+        );
     }
 
     #[test]

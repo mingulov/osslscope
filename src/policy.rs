@@ -286,6 +286,13 @@ pub const ENGINE_PROVIDER_CLASS: &str = "engine";
 /// like any other execution (fail closed) and are tallied separately.
 pub const FIPS_PROVIDER_CLASS: &str = "fips";
 
+/// KAT-exclusion note for policy renders (M1 review-wave-1B):
+/// KATs are never excluded (see [`fips_unlabeled_calls`]).
+/// `policy_json()` and the shipped document section quote this one
+/// string so the two surfaces cannot drift apart.
+pub const KAT_NOTE: &str =
+    "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions";
+
 /// True for operations whose executed algorithm identity has a
 /// parameter-selected component (digest/cipher parameter, never
 /// captured): MAC, KDF, SIGNATURE, and ASYM_CIPHER (OAEP digest).
@@ -356,6 +363,35 @@ pub fn rule_area(rule: &Rule) -> RuleArea {
             RuleArea::Engine
         }
         _ => RuleArea::Provider,
+    }
+}
+
+/// True for the algorithm rules whose bounds the parameter caveat
+/// can shape (`deny-algorithm`, `require-executed`): shared by
+/// `policy_json()` and the shipped renderers so the two surfaces
+/// test the same rule set.
+pub fn is_algorithm_rule(name: &str) -> bool {
+    matches!(name, "deny-algorithm" | "require-executed")
+}
+
+/// Area of a RENDERED policy rule, reconstructed from the document
+/// record's `(rule, predicate)` strings (M1 review-wave-1B): the
+/// T11 renderers recompute per-rule `relevant_complete` from the
+/// record without the original [`Rule`], so this mirrors
+/// [`rule_area`] exactly. Engine iff the predicate names the engine
+/// class on a provider-class rule — only `require-provider`,
+/// `deny-provider` and `deny-engine` construct
+/// [`Predicate::ProviderClass`], and the constructor-sync test
+/// below fails loudly if that ever changes.
+pub fn record_rule_area(rule: &str, predicate: &str) -> RuleArea {
+    if matches!(
+        rule,
+        "require-provider" | "deny-provider" | "deny-engine"
+    ) && predicate == ENGINE_PROVIDER_CLASS
+    {
+        RuleArea::Engine
+    } else {
+        RuleArea::Provider
     }
 }
 
@@ -962,6 +998,46 @@ mod tests {
         for op in [0, 1, 2, 5, 10, 11, 14, 15, 20, 21, 22, 99] {
             assert!(!param_blind_op(op), "op {op} must stay exact");
         }
+    }
+
+    #[test]
+    fn record_rule_area_mirrors_rule_area_for_every_constructor() {
+        // M1 (review-wave-1B): the renderers reconstruct the rule
+        // area from record strings; every PolicyRule constructor
+        // must agree with rule_area, including the engine-class
+        // matcher on provider rules (area follows the predicate,
+        // not the rule name).
+        let cases = [
+            PolicyRule::require_provider("default"),
+            PolicyRule::require_provider("engine"),
+            PolicyRule::deny_provider("legacy"),
+            PolicyRule::deny_provider("engine"),
+            PolicyRule::deny_engine(),
+            PolicyRule::deny_algorithm("DES"),
+            PolicyRule::deny_weak(),
+            PolicyRule::require_executed("AES-256-GCM"),
+            PolicyRule::deny_selector("obj", "id"),
+            PolicyRule::require_selector("obj", "id"),
+        ];
+        for c in &cases {
+            assert_eq!(
+                record_rule_area(c.name, &c.matcher),
+                rule_area(&c.rule),
+                "record area must mirror rule area for {}:{}",
+                c.name,
+                c.matcher
+            );
+        }
+        // The engine predicate on a non-provider-class rule stays
+        // provider-area (name alone never promotes).
+        assert_eq!(
+            record_rule_area("deny-algorithm", "engine"),
+            RuleArea::Provider
+        );
+        assert_eq!(
+            record_rule_area("deny-provider", "engine"),
+            RuleArea::Engine
+        );
     }
 
     #[test]

@@ -95,6 +95,10 @@
     "version": "3.5.1"
   },
   "policy": {
+    "fips_unlabeled_executions": 0,
+    "kat_excluded": 0,
+    "kat_note": "executions are unlabeled (no KAT discriminator); exclusion vacuous — see fips_unlabeled_executions",
+    "param_blind": false,
     "rules": [
       {
         "definite": 550,
@@ -118,6 +122,7 @@
         ],
         "possible": 550,
         "predicate": "algorithm=DES",
+        "relevant_complete": true,
         "result": "violation",
         "rule": "deny-algorithm"
       },
@@ -126,10 +131,12 @@
         "evidence": [],
         "possible": 0,
         "predicate": "weak-alias",
+        "relevant_complete": true,
         "result": "pass",
         "rule": "deny-weak"
       }
     ],
+    "unseen_deny_providers": [],
     "verdict": "violation"
   },
   "schema_version": "observed-crypto-v2.4",

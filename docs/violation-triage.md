@@ -14,8 +14,14 @@ not establish any rule: read its bounds and evidence. See
 The v2 JSON has aggregate `policy.verdict` and `policy.rules[]`.
 Select rules with `result: "violation"`; there is no separate
 `policy.violations[]` carrier. Each rule has `rule`, `predicate`,
-`result`, `definite`, `possible` and `evidence`, plus
-`engine_evidence` when present. `possible: null` means the upper
+`result`, `definite`, `possible`, per-rule `relevant_complete`
+and `evidence`, plus `engine_evidence` when present. The section
+also carries `param_blind`, `unseen_deny_providers`,
+`kat_excluded`/`kat_note` and `fips_unlabeled_executions` (the
+human block shows `relevant_complete` on every rule line and
+repeats firing caveats as `param_blind`,
+`unseen_deny_providers`, `fips_unlabeled_executions` and
+`kat_excluded` lines). `possible: null` means the upper
 bound is unknown (`src/check.rs` `policy_record`, `src/report.rs`).
 
 Resolve site evidence refs by object/device/inode/offset and
@@ -37,9 +43,11 @@ Two uncertainty rules matter:
   yields 1, and child/delivery failures can also yield 1.
 - Algorithm rules cannot recover parameter-selected digest/cipher
   identities in MAC, KDF, SIGNATURE or ASYM_CIPHER operations.
-  Parameter values and key sizes are never captured. The current
-  v2 human footer does not emit a dedicated parameter warning on
-  every run; apply this limitation when interpreting any output.
+  Parameter values and key sizes are never captured. The v2
+  policy block flags this per run: `param_blind: true` in JSON
+  (plus a human `param_blind=true` line) when algorithm rules
+  meet executed parameter-blind operations. Apply this
+  limitation when interpreting any output.
 
 ## 2. Walk to the owning service
 

@@ -1547,6 +1547,23 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
         });
     }
     if let Some(policy) = &doc.policy {
+        // M1 (review-wave-1B): the shipped section carries the
+        // same uncertainty signals as check::policy_json —
+        // recomputed here from the record + document (per-rule
+        // relevance via the record area mirror) so output-only
+        // consumers see them. Additive keys only.
+        let param_blind = policy
+            .rules
+            .iter()
+            .any(|r| crate::policy::is_algorithm_rule(&r.rule))
+            && crate::policy::executed_param_blind_ops(doc);
+        let unseen: Vec<&str> = policy
+            .rules
+            .iter()
+            .filter(|r| r.rule == "deny-provider" && r.definite == 0 && r.possible == Some(0))
+            .map(|r| r.predicate.as_str())
+            .collect();
+        let fips_unlabeled = crate::policy::fips_unlabeled_calls(doc);
         out["policy"] = serde_json::json!({
             "verdict": match policy.verdict {
                 PolicyVerdict::Pass => "pass",
@@ -1561,6 +1578,10 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
                     "result": rule_verdict_str(r.result),
                     "definite": r.definite,
                     "possible": r.possible,
+                    "relevant_complete": crate::policy::relevant_complete(
+                        crate::policy::record_rule_area(&r.rule, &r.predicate),
+                        doc,
+                    ),
                     "evidence": r.evidence.iter().map(|e| serde_json::json!({
                         "object": e.object.0,
                         "device": e.device,
@@ -1588,6 +1609,11 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
                 }
                 rule
             }).collect::<Vec<_>>(),
+            "param_blind": param_blind,
+            "unseen_deny_providers": unseen,
+            "kat_excluded": 0,
+            "kat_note": crate::policy::KAT_NOTE,
+            "fips_unlabeled_executions": fips_unlabeled,
         });
     }
     // R05: typed ENGINE observations render only when observed
@@ -2120,8 +2146,12 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                     .possible
                     .map(grouped)
                     .unwrap_or_else(|| "unknown".to_string());
+                let relevant_complete = crate::policy::relevant_complete(
+                    crate::policy::record_rule_area(&rule.rule, &rule.predicate),
+                    doc,
+                );
                 s.push_str(&format!(
-                    "  rule {} ({}): {} (definite={}, possible={possible})\n",
+                    "  rule {} ({}): {} (definite={}, possible={possible}, relevant_complete={relevant_complete})\n",
                     safe_display(&rule.rule),
                     safe_display(&rule.predicate),
                     rule_verdict_str(rule.result),
@@ -2148,6 +2178,40 @@ pub fn render_human(doc: &CaptureDocument) -> String {
                         grouped(evidence.calls),
                     ));
                 }
+            }
+            // M1 (review-wave-1B): uncertainty caveats render only
+            // when they fire (the established optional-section
+            // rule); the JSON section always carries the full
+            // machine surface.
+            let param_blind = policy
+                .rules
+                .iter()
+                .any(|r| crate::policy::is_algorithm_rule(&r.rule))
+                && crate::policy::executed_param_blind_ops(doc);
+            if param_blind {
+                s.push_str("  param_blind=true\n");
+            }
+            let unseen: Vec<String> = policy
+                .rules
+                .iter()
+                .filter(|r| {
+                    r.rule == "deny-provider" && r.definite == 0 && r.possible == Some(0)
+                })
+                .map(|r| safe_display(&r.predicate))
+                .collect();
+            if !unseen.is_empty() {
+                s.push_str(&format!("  unseen_deny_providers={}\n", unseen.join(",")));
+            }
+            let fips_unlabeled = crate::policy::fips_unlabeled_calls(doc);
+            if fips_unlabeled > 0 {
+                s.push_str(&format!(
+                    "  fips_unlabeled_executions={}\n",
+                    grouped(fips_unlabeled)
+                ));
+                s.push_str(&format!(
+                    "  kat_excluded=0 ({})\n",
+                    crate::policy::KAT_NOTE
+                ));
             }
         }
     }

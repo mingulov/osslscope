@@ -554,6 +554,10 @@
                 "minimum": 0,
                 "maximum": 18446744073709551615
               },
+              "relevant_complete": {
+                "description": "Per-rule relevant completeness (optional): true iff no gap relevant to this rule's area remains. Explains why one rule passed while another went inconclusive under PARTIAL.",
+                "type": "boolean"
+              },
               "evidence": {
                 "description": "Site evidence for definite matches; every ref resolves to a site listed in this document.",
                 "type": "array",
@@ -578,6 +582,27 @@
               }
             }
           }
+        },
+        "param_blind": {
+          "description": "Parameter-blindness caveat (optional): true when algorithm rules meet executed parameter-blind operations (MAC/KDF/SIGNATURE/ASYM_CIPHER), whose parameter-selected identities are never captured.",
+          "type": "boolean"
+        },
+        "unseen_deny_providers": {
+          "description": "Deny-provider matchers proved absent (optional): definite 0 with possible exactly 0. Typo visibility; ambiguous matchers are never listed here.",
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "kat_excluded": {
+          "description": "KAT executions excluded from policy evidence (optional): always 0 — executions are unlabeled, so exclusion is vacuous.",
+          "$ref": "#/$defs/u64"
+        },
+        "kat_note": {
+          "description": "Why kat_excluded is vacuous (optional).",
+          "type": "string"
+        },
+        "fips_unlabeled_executions": {
+          "description": "Executed calls touching the FIPS provider class (optional): may include self-test executions, which are never excluded.",
+          "$ref": "#/$defs/u64"
         }
       }
     },
