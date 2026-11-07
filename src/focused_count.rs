@@ -554,6 +554,17 @@ impl FocusedCounter {
             .len()
             .saturating_add(self.engine_attachments.len())
     }
+    /// Refusal diagnostic (readback only): fold spend vs ceiling
+    /// plus live links vs cap, so a site-bulk refusal names the
+    /// fold-planning charge vs the link cap.
+    pub(crate) fn refusal_accounting(&self) -> (usize, usize, usize, usize) {
+        (
+            self.fold.state_bytes,
+            self.limits.max_state_bytes,
+            self.active_link_count(),
+            self.limits.max_links,
+        )
+    }
     /// Retire count for the ENGINE plane's dead-link check.
     pub(crate) fn engine_epoch(&self) -> u64 {
         self.engine_epoch

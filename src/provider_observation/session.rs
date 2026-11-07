@@ -2088,6 +2088,17 @@ impl ProviderSession {
     /// D3 membership epoch and mapped-object generation domains. This proves
     /// current process/code binding, not renewal of a borrowed table lease;
     /// the controller owns invalidation, batch discard and fresh-return rearm.
+    /// Refusal diagnostic (readback only): session budget spend vs
+    /// ceiling plus shared-pool used vs limit, so a site-bulk
+    /// refusal names its gate instead of collapsing to `focused.limit`.
+    pub(crate) fn refusal_accounting(&self) -> (usize, usize, Option<(usize, usize)>) {
+        let pool = self.budget.memory.as_ref().map(|p| (p.used(), p.limit()));
+        (
+            self.budget.spent_state(),
+            self.budget.limits.max_state_bytes,
+            pool,
+        )
+    }
     pub fn revalidate_candidate(
         &self,
         candidate: &VerifiedSiteCandidate,

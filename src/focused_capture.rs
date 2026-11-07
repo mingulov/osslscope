@@ -582,6 +582,43 @@ pub(crate) fn process_batch(
         return Ok(BatchProgress::Deferred);
     }
     let valid = attached.is_ok();
+    // Refusal diagnostic (stderr only; no behavior change): when a
+    // site-bulk batch attaches nothing or carries a limit gap, name
+    // the refusing gate — counter fold/link vs session budget vs
+    // shared pool — with per-member attribution. The gap set below
+    // is exactly the `focused.limit` set above.
+    if !valid
+        || batch.gaps.iter().any(|g| {
+            matches!(
+                g,
+                ObservationGap::ProcessLimit
+                    | ObservationGap::ObjectLimit
+                    | ObservationGap::LinkLimit
+                    | ObservationGap::SiteLimit
+                    | ObservationGap::FactLimit
+                    | ObservationGap::StateLimit
+                    | ObservationGap::ReadLimit
+            )
+        })
+    {
+        let (fold_spent, fold_max, links, max_links) = counter.refusal_accounting();
+        let (budget_spent, budget_max, pool) = session.refusal_accounting();
+        eprintln!(
+            "osslscope: focused site-bulk refused (pid={}, static={}, learned={}, gaps={:?}, attach={:?}, fold={}/{}, links={}/{}, budget={}/{}, pool={:?})",
+            pid,
+            batch.static_candidates.len(),
+            batch.learned_sites.len(),
+            batch.gaps,
+            attached.as_ref().err(),
+            fold_spent,
+            fold_max,
+            links,
+            max_links,
+            budget_spent,
+            budget_max,
+            pool,
+        );
+    }
     if valid {
         *state_bytes = admitted.unwrap();
     }

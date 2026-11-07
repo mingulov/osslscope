@@ -24,6 +24,13 @@ impl MemoryPool {
     pub(crate) fn peak(&self) -> usize {
         self.0.peak.get()
     }
+    /// Live spend (diagnostic readback; the peak above is monotonic).
+    pub(crate) fn used(&self) -> usize {
+        self.0.used.get()
+    }
+    pub(crate) fn limit(&self) -> usize {
+        self.0.limit
+    }
     pub(crate) fn reserve(&self, bytes: usize) -> Option<MemoryLease> {
         let next = self.0.used.get().checked_add(bytes)?;
         if next > self.0.limit {
