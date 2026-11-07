@@ -590,7 +590,27 @@ fn spill_sink_for<'a>(
             },
         );
         match wrote {
-            Control::Done(result) => result,
+            Control::Done(result) => {
+                // R4 finding 3: the spill op executed and returned
+                // an errno ⟹ `Failed`, never `Done` (frozen failure
+                // accounting: `failed` = executed + errored). The
+                // sink owns no fenced refusal, so `Done(Err)` is
+                // unambiguously an executed error (ENOSPC/EIO/…).
+                // `run_op` recorded `Done` (it cannot see inside the
+                // value); reclassify the entry it just pushed (same
+                // thread, synchronous — exactly one entry). The errno
+                // diagnostic + the R3 adj-d abandonment reason ride
+                // the existing `abandon_on_spill_failure` path,
+                // untouched.
+                if result.is_err() {
+                    if let Some(last) = accum.close_accounting.last_mut() {
+                        debug_assert!(last.op == "spill_write");
+                        debug_assert!(last.outcome == OpOutcome::Done);
+                        last.outcome = OpOutcome::Failed;
+                    }
+                }
+                result
+            }
             Control::Cancelled => Err(std::io::Error::other(SpillControlFail::Cancelled)),
             Control::Expired => Err(std::io::Error::other(SpillControlFail::Expired)),
             Control::SpawnFailed => Err(std::io::Error::other(SpillControlFail::SpawnFailed)),
@@ -5103,6 +5123,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// R4 finding 3: a spill op that executes and returns an errno
+    /// (EEXIST through the real spill write — the leaked-tmp shape
+    /// production already tolerates) records `Failed` in
+    /// `close_accounting`, never `Done` (frozen failure accounting:
+    /// `failed` = the op executed and returned an error). RED
+    /// pre-fix (records `done`); GREEN post-fix. The S4 twin
+    /// (`s4_close_final_spill_errno_abandons_honestly`) pins the
+    /// same rule at the close path.
+    #[test]
+    fn spill_sink_errno_records_failed() {
+        let name = format!(
+            "spill-errno-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "t74-spillerrno-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(&name), b"{\"blocker\":true}\n").unwrap();
+        let diag = Diagnostics::spawn();
+        let format = Format::Json;
+        let mut accum = SummaryAccum::new();
+        let cancel = AtomicBool::new(false);
+        let mut sink = spill_sink_for(
+            &diag,
+            &format,
+            &mut accum,
+            &cancel,
+            None,
+            Duration::from_secs(5),
+        );
+        let err = sink(&dir.join(&name), b"{}").expect_err("EEXIST spill must error");
+        drop(sink);
+        diag.abandon(Duration::from_millis(50));
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::EEXIST),
+            "the op executed and errored with a real errno"
+        );
+        assert!(
+            accum
+                .close_accounting
+                .iter()
+                .any(|o| o.op == "spill_write" && o.outcome == OpOutcome::Failed),
+            "executed-and-errored spill must record failed: {:?}",
+            accum.close_accounting
+        );
+        assert!(
+            !accum
+                .close_accounting
+                .iter()
+                .any(|o| o.op == "spill_write" && o.outcome == OpOutcome::Done),
+            "an errno spill must never record done: {:?}",
+            accum.close_accounting
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- S4 close-staging regressions (shut fix) ---
     //
     // The close path under test is 100% production
@@ -5495,7 +5582,7 @@ mod tests {
             .expect("close_accounting array");
         assert!(
             ops.iter()
-                .any(|o| o["op"] == "spill_write" && o["outcome"] == "done"),
+                .any(|o| o["op"] == "spill_write" && o["outcome"] == "failed"),
             "the spill worker ran to judgment (errno is loud): {ops:?}"
         );
         let seq = s4_read_json(&out.join("sequence.json"));
