@@ -424,7 +424,18 @@ fn deferred_drop(deferred: Box<dyn Any + Send>) {
 /// disposal; detached — process exit reaps it with the workers).
 fn reaper_tx() -> &'static std::sync::mpsc::Sender<Box<dyn Any + Send>> {
     static REAPER: OnceLock<std::sync::mpsc::Sender<Box<dyn Any + Send>>> = OnceLock::new();
-    REAPER.get_or_init(|| {
+    reaper_tx_in(&REAPER)
+}
+
+/// RED-gated init (R6-1(i)): the same lazy init against an
+/// explicit lock so the first-use schedule is deterministic at
+/// the helper level (a fresh lock = a fresh process).
+fn reaper_tx_in(
+    lock: &OnceLock<std::sync::mpsc::Sender<Box<dyn Any + Send>>>,
+) -> &std::sync::mpsc::Sender<Box<dyn Any + Send>> {
+    lock.get_or_init(|| {
+        #[cfg(test)]
+        red_setup_gate();
         let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Any + Send>>();
         // On spawn failure the closure (owning `rx`) drops, so every
         // send fails and `deferred_drop` leaks — bounded, never
@@ -438,6 +449,38 @@ fn reaper_tx() -> &'static std::sync::mpsc::Sender<Box<dyn Any + Send>> {
             });
         tx
     })
+}
+
+/// RED discriminator gate (R6-1(i), tests only): while armed,
+/// first-use reaper setup blocks — the direct gate on the setup
+/// point, no libc fault injection.
+#[cfg(test)]
+static RED_SETUP_ARMED: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static RED_SETUP_GATE: OnceLock<(
+    std::sync::mpsc::Sender<()>,
+    Mutex<std::sync::mpsc::Receiver<()>>,
+)> = OnceLock::new();
+#[cfg(test)]
+fn red_setup_gate() {
+    if RED_SETUP_ARMED.load(Ordering::SeqCst) {
+        let gate = RED_SETUP_GATE.get_or_init(|| {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            (tx, Mutex::new(rx))
+        });
+        let _ = gate
+            .1
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recv_timeout(Duration::from_secs(30));
+    }
+}
+#[cfg(test)]
+fn red_setup_release() {
+    RED_SETUP_ARMED.store(false, Ordering::SeqCst);
+    if let Some(gate) = RED_SETUP_GATE.get() {
+        let _ = gate.0.send(());
+    }
 }
 
 /// Worker output: value + optional tap receipt (stored into the
@@ -1104,5 +1147,41 @@ mod tests {
             "the poll never clears the sticky run cancel"
         );
         assert!(signals.drain().is_empty(), "the poll consumed the signal");
+    }
+
+    /// R6-1(i) RED: fresh-process first-use — the disposal
+    /// facility is uninitialized and setup stalls: the
+    /// abandonment handoff must still return in-budget. The
+    /// fresh lock is the fresh process; the armed setup gate is
+    /// the stalled setup (gated directly, no libc fault
+    /// injection). RED pre-fix (init runs on the waiter path —
+    /// the 2 s watchdog); GREEN post-fix (setup never runs on
+    /// abandonment).
+    #[test]
+    fn r61_first_use_setup_can_stall_abandonment() {
+        use std::sync::mpsc;
+        let lock: OnceLock<mpsc::Sender<Box<dyn Any + Send>>> = OnceLock::new();
+        RED_SETUP_ARMED.store(true, Ordering::SeqCst);
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let t0 = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // The abandonment handoff (old shape:
+                // init-on-path).
+                let _ = reaper_tx_in(&lock).send(Box::new(1u64));
+                let _ = done_tx.send(());
+            });
+            if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
+                // Release so the suite never hangs; the
+                // elapsed assert below records the RED.
+                red_setup_release();
+            }
+        });
+        RED_SETUP_ARMED.store(false, Ordering::SeqCst);
+        let dt = t0.elapsed();
+        assert!(
+            dt < Duration::from_secs(2),
+            "RED: first-use setup stalled the abandonment handoff ({dt:?})"
+        );
     }
 }
