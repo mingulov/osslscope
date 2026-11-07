@@ -632,12 +632,16 @@ impl DisposalFacility {
                     unsafe {
                         (*cell.ptr.get()).write(raw);
                     }
-                    cell.seq.store(pos.wrapping_add(1), Ordering::Release);
+                    // Counted BEFORE publication: each dequeue's
+                    // decrement happens-after its item's
+                    // increment, so the depth never wraps
+                    // transiently.
                     let now = self
                         .depth_now
                         .fetch_add(1, Ordering::Relaxed)
                         .wrapping_add(1);
                     self.depth_peak.fetch_max(now, Ordering::Relaxed);
+                    cell.seq.store(pos.wrapping_add(1), Ordering::Release);
                     return Ok(());
                 }
             } else if diff < 0 {
