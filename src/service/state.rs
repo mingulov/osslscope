@@ -306,18 +306,68 @@ pub struct DirLock {
     prior: Option<Vec<u8>>,
 }
 
+/// Bounded pre-take read for [`DirLock::take`] (RANK-1): the
+/// §6.2 byte-identical restore needs the full prior bytes, so the
+/// read is capped at [`STATE_FILE_CAP`] (a larger lock file is
+/// foreign — take refuses WITHOUT mutating, so no restore is
+/// owed). Transient read failures keep the historical `.ok()`
+/// tolerance (`None`, and the lock open below surfaces hard
+/// errors); `O_NONBLOCK` keeps a TOCTOU-swapped FIFO from
+/// blocking (the write-open then fails fast with `ENXIO`).
+fn read_lock_prior(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let mut f = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match f.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > STATE_FILE_CAP {
+                    return Err(std::io::Error::other("service.lock exceeds state cap"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return Ok(None),
+        }
+    }
+    Ok(Some(buf))
+}
+
 impl DirLock {
     /// Take the lock, writing `{ schema, run_id, started_wall_ns }`
     /// first. A held lock refuses with `AlreadyExists` (caller exits
     /// 2 "out-DIR locked"). The pre-take bytes are retained for
-    /// [`DirLock::restore`].
+    /// [`DirLock::restore`]. Admission never blocks on lockfile
+    /// content (non-regular paths refuse; the prior read is
+    /// `O_NONBLOCK` + capped) — startup cannot stall here.
     pub fn take(dir: &Path, run_id: &RunId, started_wall_ns: u64) -> std::io::Result<Self> {
         let path = dir.join("service.lock");
-        let prior = std::fs::read(&path).ok();
+        // Non-blocking admission (RANK-1): never open/read content
+        // on a non-regular lock path — a FIFO/socket/dir/device at
+        // `service.lock` refuses immediately instead of blocking in
+        // open/read while startup has no worker budget to bound it.
+        // Lock identity semantics are unchanged (only a regular
+        // file — or an absent path — can carry lock identity).
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if !meta.file_type().is_file() {
+                return Err(std::io::Error::other("service.lock is not a regular file"));
+            }
+        }
+        let prior = read_lock_prior(&path)?;
         let file = OpenOptions::new()
             .write(true)
             .create(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(&path)?;
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
@@ -556,6 +606,37 @@ mod tests {
         drop(first);
         // Released on drop (kernel semantics on crash).
         let _ = DirLock::take(&dir, &run_id(), 3).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_lock_refuses_non_regular_path_without_blocking() {
+        let dir = std::env::temp_dir().join(format!("sixb-lock-nr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A directory at the lock path refuses (same for a FIFO —
+        // covered live by `sixb_fifo_lock_admission_fails_fast`).
+        std::fs::create_dir(dir.join("service.lock")).unwrap();
+        let err = DirLock::take(&dir, &run_id(), 1).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert!(dir.join("service.lock").is_dir(), "no mutation on refusal");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dir_lock_refuses_over_cap_prior_without_mutating() {
+        let dir = std::env::temp_dir().join(format!("sixb-lock-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = vec![b'x'; STATE_FILE_CAP + 1];
+        std::fs::write(dir.join("service.lock"), &big).unwrap();
+        let err = DirLock::take(&dir, &run_id(), 1).unwrap_err();
+        assert_ne!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read(dir.join("service.lock")).unwrap(),
+            big,
+            "over-cap refusal mutates nothing (no restore owed)"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

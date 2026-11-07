@@ -910,3 +910,58 @@ fn dir_snapshot(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     out.sort();
     out
 }
+
+/// FIFO at `service.lock` fails fast (RANK-1 startup admission
+/// hang): startup admission never blocks in lockfile open/read,
+/// so the run refuses (exit 2) on a `--timeout` scale even with
+/// pending TERM+INT — the reviewer's probe shape (FIFO lock +
+/// `--timeout 0.1` + TERM+INT, blocked >400 ms pre-fix).
+#[test]
+fn sixb_fifo_lock_admission_fails_fast() {
+    let dir = fresh_dir("fifo-lock");
+    let lock = dir.join("service.lock");
+    let c = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id().to_string();
+    let mut svc = bin()
+        .arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--interval")
+        .arg("0.2")
+        .arg("--timeout")
+        .arg("0.1")
+        .arg("--grace")
+        .arg("0.05")
+        .spawn()
+        .expect("spawn service");
+    // Reviewer shape: let admission settle, then TERM+INT.
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    if svc.try_wait().expect("try_wait").is_none() {
+        unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
+        unsafe { libc::kill(svc.id() as i32, libc::SIGINT) };
+    }
+    let status = wait_bounded(&mut svc, 10);
+    if status.is_none() {
+        let _ = svc.kill();
+        let _ = svc.wait();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        status.is_some(),
+        "FIFO lock admission hung >10s despite TERM+INT"
+    );
+    assert_eq!(
+        status.unwrap().code(),
+        Some(2),
+        "FIFO lock refuses pre-start (exit 2)"
+    );
+}

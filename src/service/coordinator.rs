@@ -706,6 +706,15 @@ fn run_service(cfg: ServiceConfig) -> ExitCode {
         Ok(s) => s,
         Err(e) => return refuse2(&format!("signals unavailable: {e}")),
     };
+    // Startup deadline (RANK-1/WS-A): minted BEFORE any admission
+    // I/O (lockfile reads included) so every later startup worker
+    // draws from a deadline that already exists; signals arriving
+    // mid-startup queue in the mask (none lost) and are consumed
+    // at the first run-loop poll. The lock take itself is
+    // non-blocking admission (type gate + capped prior read), so
+    // no lock path can stall startup past signal response.
+    let startup_deadline = Instant::now() + cfg.timeout;
+    let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
     // The out-DIR is the unit of durability (§4) — create it when
     // missing (T7.4's: a service that cannot create its workspace
     // cannot run; refusal here would strand fresh deploys).
@@ -745,12 +754,6 @@ fn run_service(cfg: ServiceConfig) -> ExitCode {
     let format = cfg.format;
     let mut accum = SummaryAccum::new();
     let cancel = AtomicBool::new(false);
-    // Startup deadline: recovery reads, first reserve, first
-    // admission run on workers under `--timeout` (§7.2). Signals
-    // arriving mid-startup queue in the mask (none lost) and are
-    // consumed at the first run-loop poll.
-    let startup_deadline = Instant::now() + cfg.timeout;
-    let startup_budget = || startup_deadline.saturating_duration_since(Instant::now());
     // `--reset-sequence`: fresh state, generation+1, reserved null,
     // policy-status untouched (§4.3).
     if cfg.reset_sequence {
