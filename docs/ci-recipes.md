@@ -35,14 +35,11 @@ getcap /usr/bin/osslscope                  # expect: cap_bpf,cap_perfmon+ep
 ```
 
 Current packages contain the host binary and install docs only.
-Build the matching harvest/count/members roles with the pinned
-toolchains (see [build](build.md)). For implicit traversal, install
-through `scripts/install-dev.sh` into a trusted system prefix with
-its matching receipt; three copied files do not establish it.
-Selection searches trusted directories for a triple before a
-pair; pair fallback requires members to be absent everywhere.
+Build the matching observation/focused-count companions with the
+pinned toolchains (see [build](build.md)). For implicit selection,
+install through `scripts/install-dev.sh` into a trusted system
+prefix with its matching receipt; copied files do not establish it.
 Alternatively use the explicit local-prefix recipe below.
-Deliberate harvest/count-only installs remain valid without traversal.
 If the install hook
 warned about caps, re-apply:
 `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope`.
@@ -53,39 +50,36 @@ See [install](install.md).
 Preflight with the same objects the gate will use, then gate.
 With a trusted system install, both resolve the BPF objects
 implicitly; with a user-owned prefix (never trusted implicitly),
-pass the same explicit harvest/count/members flags to both:
+pass the same explicit `--observation-object`/`--count-object`
+paths to both:
 
 ```sh
 osslscope doctor || exit 4                      # preflight first, always
 
 osslscope check \
-  --provider /path/to/libcrypto.so.3 --builtin \
   --deny-weak --deny-provider legacy \
   --require-executed ML-KEM-768 \
   --duration 30 --grace 5 \
-  --format json --out gate.json --image-digest "$IMAGE_DIGEST" \
+  --format json --out gate.json \
   --workload-out workload.log \
   run -- ./my-app --smoke-test \
   >driver.log 2>&1                             # observer diagnostics only
 ```
 
-User-owned-prefix variant (normal three-role install, same selected
-objects on both commands):
+User-owned-prefix variant (same selected objects on both commands):
 
 ```sh
 PFX="$HOME/.local"
-"$PFX/bin/osslscope" doctor --object "$PFX/lib/osslscope/osslscope-harvest" \
-  --count-object "$PFX/lib/osslscope/osslscope-count" \
-  --members-object "$PFX/lib/osslscope/osslscope-members" || exit 4
+"$PFX/bin/osslscope" doctor \
+  --observation-object "$PFX/lib/osslscope/osslscope-provider-observation" \
+  --count-object "$PFX/lib/osslscope/osslscope-focused-count" || exit 4
 
 "$PFX/bin/osslscope" check \
-  --provider /path/to/libcrypto.so.3 --builtin \
-  --object "$PFX/lib/osslscope/osslscope-harvest" \
-  --count-object "$PFX/lib/osslscope/osslscope-count" \
-  --members-object "$PFX/lib/osslscope/osslscope-members" \
+  --observation-object "$PFX/lib/osslscope/osslscope-provider-observation" \
+  --count-object "$PFX/lib/osslscope/osslscope-focused-count" \
   --deny-weak --deny-provider legacy \
   --require-executed ML-KEM-768 --duration 30 --grace 5 \
-  --format json --out gate.json --image-digest "$IMAGE_DIGEST" \
+  --format json --out gate.json \
   --workload-out workload.log \
   run -- ./my-app --smoke-test >driver.log 2>&1
 ```
@@ -94,20 +88,17 @@ Notes:
 
 - `check` needs at least one rule; a ruleless pass is a usage
   error (exit 2), never a green gate.
-- `--builtin` observes libcrypto's built-in provider; drop it
-  and point `--provider` at a provider `.so` to observe an
-  external provider module instead. Omit explicit `--members-object`
-  for that mode: traversal requires a builtin query anchor;
-  automatic triple selection can degrade to harvest-only.
-- `--image-digest` records the container digest in the actionability
-  tuple (empty string on bare metal).
+- Observation covers the target process with the automatically
+  selected companions; the current surface has no
+  provider-selection flags (the v0.2 `--provider`/`--builtin`
+  flags are removed — see [usage](usage.md#execution-report-and-check)).
 - `--workload-out workload.log` captures the workload's own
   stdout/stderr to a file; without it the workload output goes
   to /dev/null and observer stdout stays a pure artifact
   channel. Observer diagnostics stay in `driver.log` and are
   never oracle input.
 - Defaults when flags are omitted: `--duration 30`,
-  `--settle 2`, `--timeout 60`, `--grace 5` (all seconds).
+  `--timeout 60`, `--grace 5` (all seconds).
   <!-- source: defaults: src/report.rs, src/check.rs, src/capture.rs -->
 
 ## Exit handling

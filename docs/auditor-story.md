@@ -12,18 +12,17 @@ live or package qualification. Current output must be recaptured.
 ## 1. Capture: report + CBOM
 
 One window, spawn mode, JSON evidence plus a CycloneDX CBOM.
-With a trusted system install the BPF objects resolve
+With a trusted system install the companions resolve
 implicitly when the selected roles pass trust/receipt checks.
-Otherwise pass the same explicit harvest/count/members paths to
-`doctor` and capture, as in [install](install.md). Deliberate
-pair-only installs stay harvest-only:
+Otherwise pass the same explicit `--observation-object` /
+`--count-object` paths to `doctor` and capture, as in
+[install](install.md):
 
 ```sh
 osslscope doctor || exit 4
 
 osslscope report \
-  --provider /path/to/libcrypto.so.3 --builtin \
-  --duration 30 --settle 5 \
+  --duration 30 \
   --format json --out story.json --cbom story.cdx.json \
   --workload-out story.workload.log \
   run -- /path/to/service --foreground \

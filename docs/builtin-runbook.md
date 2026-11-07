@@ -69,20 +69,22 @@ shows the same prediction before you run).
    file offset; confirm by checking the value falls inside the
    `PT_LOAD` (R E) segment's file range (`readelf -lW`).
 
-3. Use it for one run:
+3. Run without enrollment flags. Explicit offset/table
+   enrollment is deferred-by-design on `report`/`check` (both
+   reject `--table` outright, and `--force-offset` outside the
+   legacy `--libcrypto` diagnostics), and the current surface
+   admits static entry shapes automatically, without build
+   enrollment:
 
    ```sh
-   osslscope report --force-offset 0x27df00 run -- ./my-app --serve
-   osslscope inspect --pid 1234 --provider /path/to/libcrypto.so.3 \
-     --object crates/ebpf/target/bpfel-unknown-none/release/osslscope-harvest \
-     --builtin --force-offset 0x27df00 --out inspect.json
+   osslscope report --duration 30 --format json run -- ./my-app --serve
+   osslscope inspect --pid 1234
    ```
 
-   `--force-offset` takes decimal or `0x` hex. Require independent
-   confirmation of the anchor and expected rows under representative
-   traffic. Zero rows can reflect a dead offset or a missing trigger;
-   diagnose both, never ship a guess. COMPLETE coverage alone does
-   not validate the offset or settle candidate identity.
+   Require expected rows under representative traffic. Zero
+   rows can reflect a missing trigger or an unadmitted shape;
+   diagnose both, never ship a guess. COMPLETE coverage alone
+   does not settle candidate identity.
 
 4. To persist it, write a `--table` entry (only `build_id`,
    `query_offset`, `anchor`, and `anchor_offset` are required):
@@ -95,15 +97,21 @@ shows the same prediction before you run).
       "anchor_offset": 2612560}]}
    ```
 
-   Then `osslscope report --table my-table.json run -- ...`
-   (or the same flag on `inspect`/`check`/`doctor`). A
-   `fallback` section with a per-version `delta` re-enables
+   `report`/`check` do not consume this file: table enrollment
+   is deferred-by-design beyond v0.2. Only `doctor` still vets
+   explicit enrollment, with the same file:
+
+   ```sh
+   osslscope doctor --exe ./my-app --table my-table.json
+   ```
+
+   A `fallback` section with a per-version `delta` re-enables
    rung 4 for the named versions — but only through this
    explicit file.
 
-`--table` also works with `doctor --libcrypto` and
-`doctor --pid`: the same file drives vetting and capture, so
-doctor agrees with the backend.
+`--table` also works with `doctor --pid`: the same file drives
+vetting (the `--libcrypto` diagnostics take no enrollment
+flags), so doctor agrees with the backend.
 
 ## Provider-class enrollment
 

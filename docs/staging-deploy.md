@@ -23,12 +23,11 @@ Requirements for the ephemeral container:
   `CAP_BPF`+`CAP_PERFMON` on the osslscope binary (plus
   `CAP_SYS_PTRACE` when the target runs as a foreign uid), or
   full privilege as the documented fallback.
-- Carries the matching osslscope binary and harvest/count/members
-  development roles (explicit `--object`, `--count-object`,
-  `--members-object`) plus access to the target provider file.
-  A deliberate pair-only image stays harvest-only. Current package
-  builders do not supply BPF; implicit traversal requires a trusted
-  install with matching receipt, not three loose files.
+- Carries the matching osslscope binary and the
+  observation/focused-count companion pair (explicit
+  `--observation-object`, `--count-object`). Current package
+  builders do not supply BPF; implicit selection requires a trusted
+  install with matching receipt, not loose files.
 
 Example (Kubernetes; plain-docker equivalent uses
 `--pid container:<name> --privileged --rm`):
@@ -44,19 +43,19 @@ artifacts out, exit. Nothing persists in the target.
 ## Observe
 
 ```sh
-osslscope doctor --pid <PID> \
-  --object ./osslscope-harvest --count-object ./osslscope-count \
-  --members-object ./osslscope-members
-osslscope report --provider /path/to/libcrypto.so.3 --builtin \
-  --object ./osslscope-harvest --count-object ./osslscope-count \
-  --members-object ./osslscope-members \
+osslscope doctor \
+  --observation-object ./osslscope-provider-observation \
+  --count-object ./osslscope-focused-count || exit 4
+osslscope report \
+  --observation-object ./osslscope-provider-observation \
+  --count-object ./osslscope-focused-count \
   --duration 60 --format json --out staging.json --cbom staging.cbom.json \
   --pid <PID>
 ```
 
 Generate real traffic during the window (staging load or a
-handshake driver). Harvest needs observed provider queries; an idle
-or preloaded target can yield no rows. Read actual typed reasons,
+handshake driver). The observer needs in-window crypto activity;
+an idle or preloaded target can yield no rows. Read actual typed reasons,
 physical-site counts and policy evidence. Affected GLOB_DAT imports
 remain uninstrumented and surface as `loss` with
 `legacy.lowlevel_uninstrumented`; this is not a universal TLS
@@ -65,14 +64,14 @@ not qualify this current live-attach recipe. Current integrated
 COMPLETE-window qualification remains open; switching to `run --`
 improves custody without guaranteeing startup/first-call coverage.
 
-For a statically linked target, point `--provider` at the
-static binary with `--builtin` (unstripped: harvest resolves
-via supported symtab; unknown stripped: report/check need explicit
-enrollment, while inspect can expose zero-row blindness).
-For a FIPS provider module, use provider mode (`--provider
-.../fips.so`, not `--builtin`), omitting explicit `--members-object`
-from both preflight and capture, per
-[the FIPS interim rule](fips-interim.md).
+For a statically linked target, observe the process the same
+way: the current surface has no provider-selection flags (the
+v0.2 `--provider`/`--builtin` flags are removed).
+Stripped-binary offset enrollment (`--force-offset`/`--table`)
+is deferred-by-design on `report`/`check` (see [the built-in
+runbook](builtin-runbook.md)). For a FIPS provider module,
+triage KAT/self-test executions per [the FIPS interim
+rule](fips-interim.md).
 
 ## Gate-disable procedure
 
