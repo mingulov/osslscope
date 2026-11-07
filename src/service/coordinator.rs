@@ -3870,7 +3870,7 @@ fn tail_reconcile_regular(
 ) {
     let tail_budget = close_budget(run);
     let tail_poll = run_wait_poll!(run);
-    let tail: Control<std::io::Result<(Vec<Vec<u8>>, Vec<u8>, bool)>> = run_op(
+    let tail: Control<std::io::Result<crate::service::stream::TailSplit>> = run_op(
         &run.diag,
         &run.format,
         &mut run.summary,

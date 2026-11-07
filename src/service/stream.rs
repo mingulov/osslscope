@@ -355,10 +355,9 @@ pub fn read_tail_lines(path: &Path, max_bytes: u64) -> std::io::Result<Vec<Vec<u
 /// the window (no `\n` in the window but the file is longer — the
 /// returned suffix is then a lower bound, never equated with a
 /// record).
-pub fn read_tail_split(
-    path: &Path,
-    max_bytes: u64,
-) -> std::io::Result<(Vec<Vec<u8>>, Vec<u8>, bool)> {
+pub type TailSplit = (Vec<Vec<u8>>, Vec<u8>, bool);
+
+pub fn read_tail_split(path: &Path, max_bytes: u64) -> std::io::Result<TailSplit> {
     use std::io::Seek as _;
     let mut file = File::open(path)?;
     let end = file.seek(std::io::SeekFrom::End(0))?;
