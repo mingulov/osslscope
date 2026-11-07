@@ -1930,8 +1930,8 @@ fn predict_spawn_lib_with(
 /// is still the pre-exec image: its maps predict nothing). The
 /// NEEDED closure (direct and transitive) predicts the dynamic lib
 /// file(s); otherwise the exe itself is the static candidate.
-/// Scripts (non-ELF) cannot be predicted: Unknown with explicit
-/// `--provider` remediation, never a guess. Multiple distinct
+/// Scripts (non-ELF) cannot be predicted: Unknown naming the
+/// interpreter path, never a guess. Multiple distinct
 /// libcryptos in the closure are dual-load: refused like `--pid`.
 pub fn discover_spawn(
     argv: &[String],
@@ -1953,7 +1953,7 @@ fn discover_spawn_with(
                 "spawn target {} is not an ELF binary (script or data?)",
                 pred.exe.display()
             ),
-            remediation: "run the interpreter binary directly, or pass the target libcrypto with --provider explicitly".to_string(),
+            remediation: "run the interpreter binary directly".to_string(),
         });
     }
     if let Err(e) = check_arch(&pred.exe_bytes) {
@@ -1970,9 +1970,7 @@ fn discover_spawn_with(
                 "cannot resolve NEEDED {wanted} for {} (loader search exhausted)",
                 pred.exe.display()
             ),
-            remediation: "pass the libcrypto file with --provider explicitly, or fix \
-                 LD_LIBRARY_PATH/rpath so the loader finds it"
-                .to_string(),
+            remediation: "fix LD_LIBRARY_PATH/rpath so the loader finds it".to_string(),
         });
     }
     if pred.libs.len() >= 2 {
@@ -1995,7 +1993,7 @@ fn discover_spawn_with(
                     "dependency closure of {} unscanned past bounds (cannot exclude a second libcrypto)",
                     pred.exe.display()
                 ),
-                remediation: "pass the libcrypto file with --provider explicitly".to_string(),
+                remediation: "check the closure files are readable, or vet the known libcrypto file directly (doctor --libcrypto FILE with a vetting flag)".to_string(),
             });
         }
         let path = &pred.libs[0];
@@ -2013,7 +2011,7 @@ fn discover_spawn_with(
                 "dependency closure of {} unscanned past bounds (cannot prove no libcrypto)",
                 pred.exe.display()
             ),
-            remediation: "pass the libcrypto file with --provider explicitly".to_string(),
+            remediation: "check the closure files are readable, or vet the known libcrypto file directly (doctor --libcrypto FILE with a vetting flag)".to_string(),
         });
     }
     Ok(qualify_libcrypto_bytes(

@@ -877,7 +877,156 @@ fn spawn_unresolvable_libcrypto_is_unknown() {
             remediation,
         } => {
             assert!(reason.contains("libcrypto.so.9"), "{reason}");
-            assert!(remediation.contains("--provider"), "{remediation}");
+            // 1D-R3: the --provider clause is unrunnable on every
+            // live command (doctor lacks the flag; report/check
+            // reject it) — the loader-search fix stands alone.
+            assert!(
+                remediation.contains("LD_LIBRARY_PATH/rpath"),
+                "{remediation}"
+            );
+            assert!(!remediation.contains("--provider"), "{remediation}");
+        }
+        other => panic!("want Unknown, got {other:?}"),
+    }
+}
+
+/// App with 300 unresolvable non-crypto NEEDED entries (past
+/// `MAX_NEEDED_PER_FILE`): prediction goes incomplete with no
+/// libcrypto miss. One stub build copied to 300 names (fast);
+/// `--no-as-needed` keeps every entry. `with_libcrypto` adds a
+/// resolved libcrypto for the libs==1 arm. Deterministic and
+/// privilege-proof (no permission games).
+fn build_many_needed_app(test: &str, with_libcrypto: bool) -> Option<PathBuf> {
+    if !have_gcc() {
+        eprintln!("SKIP {test}: no gcc (fixture build unavailable)");
+        return None;
+    }
+    let dir = scratch(test);
+    let stub_src = dir.join("stub.c");
+    std::fs::write(&stub_src, "int stub_anchor(void) { return 1; }\n").unwrap();
+    let stubdir = dir.join("stubs");
+    std::fs::create_dir_all(&stubdir).unwrap();
+    let first = stubdir.join("stub000.so");
+    let st = Command::new("gcc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&first)
+        .arg(&stub_src)
+        .output()
+        .unwrap();
+    assert!(st.status.success());
+    for i in 1..300u32 {
+        std::fs::copy(&first, stubdir.join(format!("stub{i:03}.so"))).unwrap();
+    }
+    let libdir = dir.join("fakelib");
+    std::fs::create_dir_all(&libdir).unwrap();
+    let app_src = dir.join("app.c");
+    if with_libcrypto {
+        std::fs::write(&app_src, FAKE_APP_SRC).unwrap();
+        let libc_src = dir.join("fake.c");
+        std::fs::write(&libc_src, FAKE_LIBC_SRC).unwrap();
+        let lib = libdir.join("libcrypto.so.3");
+        let st = Command::new("gcc")
+            .args([
+                "-shared",
+                "-fPIC",
+                "-g",
+                "-Wl,--soname,libcrypto.so.3",
+                "-o",
+            ])
+            .arg(&lib)
+            .arg(&libc_src)
+            .output()
+            .unwrap();
+        assert!(st.status.success());
+    } else {
+        std::fs::write(&app_src, "int main(void) { return 0; }\n").unwrap();
+    }
+    let mut cmd = Command::new("gcc");
+    cmd.args(["-g", "-o"])
+        .arg(dir.join("app"))
+        .arg(&app_src)
+        .arg("-Wl,--no-as-needed")
+        .arg(format!("-L{}", stubdir.display()));
+    if with_libcrypto {
+        // First: prediction scans only the first 256 NEEDED
+        // entries, so the libcrypto entry must precede the stubs.
+        cmd.arg(format!("-L{}", libdir.display()))
+            .arg("-l:libcrypto.so.3")
+            .arg("-Wl,-rpath,$ORIGIN/fakelib");
+    }
+    for i in 0..300u32 {
+        cmd.arg(format!("-l:stub{i:03}.so"));
+    }
+    // Unresolvable at prediction time: the stubs live in a
+    // link-only dir (no rpath, empty env, absent from defaults).
+    let st = cmd.output().unwrap();
+    assert!(
+        st.status.success(),
+        "many-needed link failed: {}",
+        String::from_utf8_lossy(&st.stderr)
+    );
+    Some(dir.join("app"))
+}
+
+#[test]
+fn spawn_incomplete_closure_single_lib_names_vetting() {
+    // 1D-R3: one resolved lib but an unscanned past-bounds
+    // closure — Unknown whose remediation is runnable in the
+    // rendering command (doctor), never --provider.
+    let Some(app) = build_many_needed_app("spawn-incomplete-one", true) else {
+        return;
+    };
+    let table = shipped();
+    let enrollment = ProviderTable::empty();
+    let opts = qualify_opts(&table, &enrollment);
+    let env = spawn_env(
+        "/nonexistent-osslscope-xyz",
+        Some("/nonexistent-osslscope-xyz"),
+    );
+    let argv = vec![app.to_string_lossy().into_owned()];
+    let pred = onboard::predict_spawn_lib(&argv, &env).unwrap();
+    assert!(pred.incomplete, "300 NEEDED must trip the per-file cap");
+    assert_eq!(pred.libs.len(), 1, "libs: {:?}", pred.libs);
+    match onboard::discover_spawn(&argv, &opts, &env).unwrap() {
+        TargetQualification::Unknown {
+            reason,
+            remediation,
+        } => {
+            assert!(reason.contains("unscanned past bounds"), "{reason}");
+            assert!(remediation.contains("doctor --libcrypto"), "{remediation}");
+            assert!(!remediation.contains("--provider"), "{remediation}");
+        }
+        other => panic!("want Unknown, got {other:?}"),
+    }
+}
+
+#[test]
+fn spawn_incomplete_closure_no_lib_names_vetting() {
+    // 1D-R3: the libs==0 incomplete arm carries the same runnable
+    // remediation (no libcrypto NEEDED at all here).
+    let Some(app) = build_many_needed_app("spawn-incomplete-zero", false) else {
+        return;
+    };
+    let table = shipped();
+    let enrollment = ProviderTable::empty();
+    let opts = qualify_opts(&table, &enrollment);
+    let env = spawn_env(
+        "/nonexistent-osslscope-xyz",
+        Some("/nonexistent-osslscope-xyz"),
+    );
+    let argv = vec![app.to_string_lossy().into_owned()];
+    let pred = onboard::predict_spawn_lib(&argv, &env).unwrap();
+    assert!(pred.incomplete, "300 NEEDED must trip the per-file cap");
+    assert!(pred.libs.is_empty(), "libs: {:?}", pred.libs);
+    assert!(pred.unresolved.is_empty());
+    match onboard::discover_spawn(&argv, &opts, &env).unwrap() {
+        TargetQualification::Unknown {
+            reason,
+            remediation,
+        } => {
+            assert!(reason.contains("unscanned past bounds"), "{reason}");
+            assert!(remediation.contains("doctor --libcrypto"), "{remediation}");
+            assert!(!remediation.contains("--provider"), "{remediation}");
         }
         other => panic!("want Unknown, got {other:?}"),
     }
@@ -1285,8 +1434,14 @@ fn spawn_path_lookup_and_scripts() {
     std::fs::write(&script, "#!/bin/sh\nexec /bin/true\n").unwrap();
     let argv = vec![script.to_string_lossy().into_owned()];
     match onboard::discover_spawn(&argv, &opts, &env).unwrap() {
-        TargetQualification::Unknown { reason, .. } => {
+        TargetQualification::Unknown {
+            reason,
+            remediation,
+        } => {
             assert!(reason.contains("not an ELF binary"), "{reason}");
+            // 1D-R3: interpreter path only — the --provider clause
+            // named a flag no live command accepts.
+            assert_eq!(remediation, "run the interpreter binary directly");
         }
         other => panic!("want Unknown for a script, got {other:?}"),
     }
