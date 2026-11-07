@@ -1,7 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Observation meaning and limits
 
-## Current v0.3 discovery and observation
+## Historical v0.3 discovery and observation
+
+The remainder of this section was written for v0.3 and is frozen
+history in a v0.5.0 tree: do not read it as current coverage.
+For the live contract see [the v2 document
+reference](observed-crypto-v2.md), [the PARTIAL
+runbook](partial-runbook.md), and [the v0.4.0 current-state alpha
+notes](release-v0.4.0.md).
 
 Normal `scan`/`inspect` discover mapped OpenSSL-compatible objects and provider
 interfaces without an enrolled build or supplied offset. Watch samples changes;

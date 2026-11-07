@@ -100,8 +100,11 @@ The committed fixture controls cover
 violation document with one added unknown key. These source/fixture
 controls are distinct from a new live run.
 
-Compatibility is deliberate: producers emit exactly
-`observed-crypto-v2.2`, readers accept `observed-crypto-v2` and
+Compatibility is deliberate: producers emit `observed-crypto-v2.4`
+through `observed-crypto-v2.7` (`src/evidence.rs` is the emitter
+of record: v2.5 for certified execution attribution, v2.6 for a
+sampled sysctl context, v2.7 for owned-corpse retirement),
+readers accept `observed-crypto-v2` and
 `observed-crypto-v2.<digits>` and reject every other major, and
 minor versions add OPTIONAL keys only. A v2.0 validator fails
 closed on v2.1 keys it does not know (upgrade the validator);

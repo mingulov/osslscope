@@ -57,7 +57,9 @@ General rules:
 
 ## Terminal count uncertainty
 
-Current development emits `observed-crypto-v2.2`. It preserves positive
+Current producers emit `observed-crypto-v2.4` through
+`observed-crypto-v2.7` (`src/evidence.rs` is the emitter of
+record). They preserve positive
 current/fenced observations when count completion fails. A count loss
 event is not a measured missing call: pending writers, unread keys and
 unavailable counter components leave call upper bounds unknown.
@@ -79,7 +81,7 @@ unavailable counter components leave call upper bounds unknown.
 terminal admission, stopping, close and read. Zero grace waits for no
 new count I/O. A late cleanup result does not promote the finalized
 capture or supply a fresh observation window. Keep requested scope,
-programmed admission and effective coverage distinct; v2.2 can preserve
+programmed admission and effective coverage distinct; v2.2 and later preserve
 actual admitted timestamps beyond a conservative effective endpoint.
 
 These count controls do not close discovery, member/return/continuation,
@@ -95,6 +97,7 @@ See [the development proof boundary](what-it-proves.md#terminal-count-proof-in-d
 | `startup-gap` (`missing_ns`) | blind | The effective window starts `missing_ns` after the requested start: executions before readiness are unobserved. `--pid` has unavoidable pre-attach blindness. | Prefer `run --` for target custody and drive representative warmup/traffic; neither establishes first-call or COMPLETE coverage. Read the actual effective window and loss reasons. See [staging deploy](staging-deploy.md) for live attach. |
 | `tail-gap` (`missing_ns`) | blind | The effective window ends `missing_ns` before the requested end: the tail of the window went unobserved. | Same discipline as `over_budget` above: quit-before-expiry, split windows, or a fitting `--duration`. |
 | `signal-cut` (no fields) | blind | SIGTERM/SIGINT cut the window; signal-cut windows are always PARTIAL by construction. | Size the CI timeout per [the recipes](ci-recipes.md#ci-timeout) and re-run undisturbed. |
+| `visibility-lost` (`cause`, `start_ns`, `end_ns`) | blind | Owned-corpse retirement (v2.7 documents only): the controller waited `[start_ns,end_ns)` for an owned maps-empty target, then retired it; the interval is unobserved by construction and the `membership` leg reads `Retired`. | Read the retired interval and the membership leg; never treat retired time as covered. Re-run for a fresh window when that coverage matters. |
 
 ## Structural coverage caveats
 

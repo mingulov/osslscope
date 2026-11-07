@@ -3,9 +3,13 @@
 //!
 //! [`check_version`] accepts historical v1.x documents; its schema is
 //! `schemas/observed-crypto-v1.json`. Live report/check producers emit
-//! `observed-crypto-v2.4`; [`check_version_v2`], [`validate_v2`] and
-//! [`check_v2_semantics`] own that contract. Minor additions are optional;
-//! field readers ignore unknown keys while validators stay strict.
+//! `observed-crypto-v2.4` through `observed-crypto-v2.7`
+//! (`src/evidence.rs` is the emitter of record: v2.5 when the window
+//! certified execution attribution, v2.6 when a sysctl context was
+//! sampled, v2.7 when the capture retired an owned corpse);
+//! [`check_version_v2`], [`validate_v2`] and [`check_v2_semantics`]
+//! own that contract. Minor additions are optional; field readers
+//! ignore unknown keys while validators stay strict.
 
 /// True iff a v1.x reader accepts this `schema_version`: accepts
 /// `observed-crypto-v1` (implicit .0) and `observed-crypto-v1.<minor>`;

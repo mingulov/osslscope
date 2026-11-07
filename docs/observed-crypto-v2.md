@@ -31,7 +31,10 @@ qualification. Human and CBOM metadata carry the same Count identity/profile gap
 
 ## Reader contract
 
-Producers emit exactly `observed-crypto-v2.4`. Readers accept
+Producers emit `observed-crypto-v2.4` through `observed-crypto-v2.7`
+(`src/evidence.rs` is the emitter of record: v2.5 when the window
+certified execution attribution, v2.6 when a sysctl context was
+sampled, v2.7 when the capture retired an owned corpse). Readers accept
 `observed-crypto-v2` and `observed-crypto-v2.<digits>` and reject
 every other major (`src/schema.rs` `check_version_v2`, pinned by
 `compat_matrix_v2` and `output_contract::schema_version_gate`).
@@ -453,11 +456,12 @@ its provider and backing objects, op, funcid, calls, generation and
 the report window. Ambiguous, unknown-coverage and quiet sites
 contribute no components; omitted ambiguous/unknown counts plus
 evidence refs stay explicit metadata, values verbatim from
-`tests/goldens/cbom-v2-complete.json` (whitespace compressed):
+`tests/goldens/cbom-v2-complete.json` (whitespace compressed;
+`output_contract::v2_goldens_pinned`):
 
 ```json
 {"metadata": {"properties": [
-  {"name": "osslscope:schema-version", "value": "observed-crypto-v2.2"},
+  {"name": "osslscope:schema-version", "value": "observed-crypto-v2.4"},
   {"name": "osslscope:execution-evidence-completeness", "value": "COMPLETE"},
   {"name": "osslscope:omitted-ambiguous-sites", "value": "1"},
   {"name": "osslscope:omitted-ambiguous-calls", "value": "100"},
@@ -499,10 +503,11 @@ and hints never mint components.
 ## Human report
 
 Byte-verbatim `tests/goldens/report-v2-complete.txt` (golden
-shape, with recorded execution context):
+shape, with recorded execution context;
+`output_contract::v2_goldens_pinned`):
 
 ```text
-osslscope report (observed-crypto-v2.2): pid=7 (demo) window=0..100ns effective=0..100ns
+osslscope report (observed-crypto-v2.4): pid=7 (demo) window=0..100ns effective=0..100ns
 duration: requested=100ns effective=100ns (monotonic; authoritative)
 kernel: 6.9.0-test
 wall: start=1700000000000000000 end=1700000030000000000 (unix-ns; context only)
@@ -514,8 +519,8 @@ sites (4, 900 calls):
   site build:012345 file-offset=4096 gen=0: 500 calls, definite: AES-128-GCM (CIPHER) via default
   site build:012345 file-offset=8192 gen=0: 300 calls, definite: SHA-256 (DIGEST) via default
   site build:fedcba file-offset=4096 gen=0: 100 calls, AMBIGUOUS (2 candidates, attribution uncertain):
-    candidate: provider=build:fedcba class=default op=CIPHER funcid=21 algs=[AES-256-GCM]
-    candidate: provider=build:fedcba class=default op=CIPHER funcid=21 algs=[ARIA-256-GCM] weak
+    candidate: provider=build:fedcba class=default op=CIPHER funcid=FUNC21 algs=[AES-256-GCM]
+    candidate: provider=build:fedcba class=default op=CIPHER funcid=FUNC21 algs=[ARIA-256-GCM] weak
   site unverified:8 file-offset=12288 gen=0: 0 calls, quiet (no calls in window)
 
 coverage:
