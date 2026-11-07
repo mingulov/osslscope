@@ -1692,7 +1692,7 @@ fn h5_t3_every_device_site_names_one_domain() {
         // native dev_t by type (raw, consumed raw at admission).
         ("src/focused_capture.rs", "raw", "device: meta.dev(),", 1),
         // Admission stores the evidence encoding (holds on every
-        // filesystem, not just major-0 where raw==encoded).
+        // filesystem, not just major-0 low-minor where raw==encoded).
         (
             "src/focused_capture.rs",
             "stat",

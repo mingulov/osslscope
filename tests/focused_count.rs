@@ -41,6 +41,27 @@ fn native_device_roundtrips_through_maps_encoding() {
     );
 }
 #[test]
+fn major_zero_high_minor_raw_differs_but_guards_stay_encoded() {
+    // 1D-fix1 (codex R1): raw==encoded holds only for major-0
+    // minor<256 — device 0:256 packs minor bits above bit 8 in
+    // the glibc dev_t (0x100000) while the evidence encoding is
+    // (major<<32)|minor (0x100).
+    let raw = libc::makedev(0, 256);
+    let encoded = osslscope::plan::encode_device(0, 256);
+    assert_eq!(encoded, 0x100);
+    assert_eq!(raw, 0x100000);
+    assert_ne!(encoded, raw);
+    // Both sides of every fixed guard use the encoded word: the
+    // fresh-stat side is encoded before comparing, so the audit's
+    // domain rule holds even where raw!=encoded.
+    assert_eq!(evidence_device(raw), encoded);
+    // Positive control pinning the qualified claim: major-0
+    // minor<256 still coincides numerically.
+    let low_raw = libc::makedev(0, 51);
+    assert_eq!(osslscope::plan::encode_device(0, 51), low_raw);
+    assert_eq!(evidence_device(low_raw), low_raw);
+}
+#[test]
 fn physical_site_deduplicates_attachment_and_conserves_calls() {
     let mut fold = CountFold::new(CountLimits::default()).unwrap();
     let mut links = 0;
