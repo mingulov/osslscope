@@ -627,6 +627,35 @@ fn no_libcrypto_non_crypto_process_is_unsupported() {
     ));
 }
 
+#[test]
+fn static_tail_notcrypto_remediation_names_doctor_vetting() {
+    // 1D-fix1 (codex R1): the static-exe NotCrypto remediation is
+    // live-reachable across the cross-prediction TOCTOU race (a
+    // script at first prediction, atomically replaced by a
+    // noncrypto ELF before the second), so the dead `--provider`
+    // clause is replaced with runnable doctor-context advice in
+    // the 1D-R3 sibling style.
+    let exe = std::env::current_exe().unwrap();
+    let bytes = std::fs::read(&exe).unwrap();
+    let table = shipped();
+    let enrollment = ProviderTable::empty();
+    let opts = qualify_opts(&table, &enrollment);
+    match onboard::qualify_libcrypto_bytes(&bytes, &exe, true, &opts) {
+        TargetQualification::Unsupported {
+            reason,
+            remediation,
+        } => {
+            assert!(reason.contains("not a crypto library"), "{reason}");
+            assert_eq!(
+                remediation,
+                "observe a process linked against OpenSSL 3.x/4.x, or vet its runtime-loaded libcrypto directly (doctor --libcrypto FILE with a vetting flag)"
+            );
+            assert!(!remediation.contains("--provider"), "{remediation}");
+        }
+        other => panic!("want Unsupported for a non-crypto exe, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider class (T09 interface) inside onboarding.
 // ---------------------------------------------------------------------------

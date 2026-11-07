@@ -1354,7 +1354,7 @@ pub fn qualify_libcrypto_bytes(
                 // Static candidates may still load OpenSSL at
                 // runtime (dlopen): say so in the fix.
                 let remediation = if static_exe {
-                    "observe a process linked against OpenSSL 3.x/4.x (or pass its libcrypto with --provider if it loads OpenSSL at runtime)"
+                    "observe a process linked against OpenSSL 3.x/4.x, or vet its runtime-loaded libcrypto directly (doctor --libcrypto FILE with a vetting flag)"
                 } else {
                     "observe a process linked against OpenSSL 3.x/4.x"
                 };
