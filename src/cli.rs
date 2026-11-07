@@ -9,11 +9,46 @@ use std::process::ExitCode;
 /// docs/provider-observation.md.
 pub(crate) fn exit_code_help_observation() -> [&'static str; 5] {
     [
-        "exit 0: completed inventory/observation",
-        "exit 1: internal or output failure",
-        "exit 2: invalid arguments",
-        "exit 3: useful inventory/observation with gaps, or interruption",
-        "exit 4: no usable requested inventory/observation",
+        "  exit 0: completed inventory/observation",
+        "  exit 1: internal or output failure",
+        "  exit 2: invalid arguments",
+        "  exit 3: useful inventory/observation with gaps, or interruption",
+        "  exit 4: no usable requested inventory/observation",
+    ]
+}
+
+/// Exit-code lines for sectioned doctor vetting: checks fail
+/// closed (exit 4 covers both failed checks and refused package
+/// admission); there is no PARTIAL exit 3 and no policy verdict.
+pub(crate) fn exit_code_help_doctor() -> [&'static str; 4] {
+    [
+        "  exit 0: preflight passed",
+        "  exit 1: internal failure",
+        "  exit 2: invalid arguments",
+        "  exit 4: checks failed or package admission refused (fail-closed)",
+    ]
+}
+
+/// Exit-code lines for doctor capability checks (focused
+/// self-controls, discovery): unavailable lands on exit 3; there
+/// is no fail-closed exit 4 and no policy verdict.
+pub(crate) fn exit_code_help_doctor_capability() -> [&'static str; 4] {
+    [
+        "  exit 0: all capabilities available",
+        "  exit 1: output failure",
+        "  exit 2: invalid arguments",
+        "  exit 3: capabilities unavailable",
+    ]
+}
+
+/// Exit-code lines for the legacy exact-profile diagnostic
+/// (bare `doctor --libcrypto`): checks fail closed; there is no
+/// internal-failure exit 1, no PARTIAL 3, no policy verdict.
+pub(crate) fn exit_code_help_doctor_profiled() -> [&'static str; 3] {
+    [
+        "  exit 0: preflight passed (preflight only)",
+        "  exit 2: invalid arguments",
+        "  exit 4: preflight failed (fail-closed)",
     ]
 }
 

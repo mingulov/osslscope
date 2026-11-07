@@ -520,13 +520,25 @@ fn userns_target_map_files_refusal_carries_errno_and_actor() {
 
 #[test]
 fn scan_help_names_exit_codes() {
+    // Inventory emits 0/1/2/3/4 only (policy verdicts 10/11 are
+    // unemittable here — same defect class as the provider table).
     for command in ["scan", "inspect"] {
         let out = cli(&[command, "--help"]);
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
-            stdout.contains("exit 3:") && stdout.contains("exit 4:"),
-            "{command} help must name exit codes, got: {stdout}"
+            stdout.contains("  exit 0:")
+                && stdout.contains("  exit 1:")
+                && stdout.contains("  exit 2:")
+                && stdout.contains("  exit 3:")
+                && stdout.contains("  exit 4:"),
+            "{command} help must name emittable exits, got: {stdout}"
         );
+        for unemittable in ["exit 10", "exit 11"] {
+            assert!(
+                !stdout.contains(unemittable),
+                "{command} help must not list unemittable {unemittable}, got: {stdout}"
+            );
+        }
         assert!(
             stdout.contains("first run blocked?"),
             "{command} help must point first runs at doctor, got: {stdout}"

@@ -51,7 +51,7 @@ pub(crate) fn run(args: &[String]) -> ExitCode {
         match arg.as_str() {
             "--help" | "-h" if args.len() == 1 => {
                 println!("{USAGE}");
-                for line in crate::cli::exit_code_help() {
+                for line in crate::cli::exit_code_help_doctor_capability() {
                     println!("{line}");
                 }
                 println!("{}", crate::cli::blocked_pointer_sub());

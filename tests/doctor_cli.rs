@@ -157,12 +157,23 @@ fn doctor_bare_still_runs_self_controls() {
 
 #[test]
 fn doctor_sectioned_help_names_exit_codes() {
+    // Sectioned vetting emits 0/1/2/4 only (checks fail closed, no
+    // PARTIAL exit 3, no policy verdicts 10/11).
     let out = doctor(&["--pid", "1", "--help"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
-        "sectioned help must name exit codes, got: {stdout}"
+        stdout.contains("  exit 0:")
+            && stdout.contains("  exit 1:")
+            && stdout.contains("  exit 2:")
+            && stdout.contains("  exit 4:"),
+        "sectioned help must name emittable exits, got: {stdout}"
     );
+    for unemittable in ["exit 3:", "exit 10", "exit 11"] {
+        assert!(
+            !stdout.contains(unemittable),
+            "sectioned help must not list unemittable {unemittable}, got: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("first run blocked?"),
         "sectioned help must point first runs at doctor, got: {stdout}"
@@ -171,12 +182,23 @@ fn doctor_sectioned_help_names_exit_codes() {
 
 #[test]
 fn doctor_focused_help_names_exit_codes() {
+    // Focused self-controls emit 0/1/2/3 only (unavailable lands
+    // on 3; no fail-closed 4, no policy verdicts 10/11).
     let out = doctor(&["--help"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
-        "focused help must name exit codes, got: {stdout}"
+        stdout.contains("  exit 0:")
+            && stdout.contains("  exit 1:")
+            && stdout.contains("  exit 2:")
+            && stdout.contains("  exit 3:"),
+        "focused help must name emittable exits, got: {stdout}"
     );
+    for unemittable in ["exit 4:", "exit 10", "exit 11"] {
+        assert!(
+            !stdout.contains(unemittable),
+            "focused help must not list unemittable {unemittable}, got: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("first run blocked?"),
         "focused help must point first runs at doctor, got: {stdout}"
@@ -185,12 +207,22 @@ fn doctor_focused_help_names_exit_codes() {
 
 #[test]
 fn doctor_profiled_help_names_exit_codes() {
+    // The legacy exact-profile diagnostic emits 0/2/4 only (no
+    // internal-failure exit 1, no PARTIAL 3, no policy 10/11).
     let out = doctor(&["--libcrypto", "x", "--help"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
-        "profiled help must name exit codes, got: {stdout}"
+        stdout.contains("  exit 0:")
+            && stdout.contains("  exit 2:")
+            && stdout.contains("  exit 4:"),
+        "profiled help must name emittable exits, got: {stdout}"
     );
+    for unemittable in ["exit 1:", "exit 3:", "exit 10", "exit 11"] {
+        assert!(
+            !stdout.contains(unemittable),
+            "profiled help must not list unemittable {unemittable}, got: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("first run blocked?"),
         "profiled help must point first runs at doctor, got: {stdout}"
@@ -199,12 +231,23 @@ fn doctor_profiled_help_names_exit_codes() {
 
 #[test]
 fn doctor_discovery_help_names_exit_codes() {
+    // Discovery capability checks emit 0/1/2/3 only (unavailable
+    // lands on 3; no fail-closed 4, no policy verdicts 10/11).
     let out = doctor(&["--discovery", "--help"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("exit 3:") && stdout.contains("exit 4:"),
-        "discovery help must name exit codes, got: {stdout}"
+        stdout.contains("  exit 0:")
+            && stdout.contains("  exit 1:")
+            && stdout.contains("  exit 2:")
+            && stdout.contains("  exit 3:"),
+        "discovery help must name emittable exits, got: {stdout}"
     );
+    for unemittable in ["exit 4:", "exit 10", "exit 11"] {
+        assert!(
+            !stdout.contains(unemittable),
+            "discovery help must not list unemittable {unemittable}, got: {stdout}"
+        );
+    }
     assert!(
         stdout.contains("first run blocked?"),
         "discovery help must point first runs at doctor, got: {stdout}"

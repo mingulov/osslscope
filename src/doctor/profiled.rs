@@ -56,7 +56,7 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
         println!(
             "  runtime BPF permissions and attachment are checked by report/check before releasing the child"
         );
-        for line in crate::cli::exit_code_help() {
+        for line in crate::cli::exit_code_help_doctor_profiled() {
             println!("{line}");
         }
         println!("{}", crate::cli::blocked_pointer_sub());

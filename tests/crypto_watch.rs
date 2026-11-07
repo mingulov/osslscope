@@ -1032,10 +1032,23 @@ fn observe_crypto_help_names_exit_codes() {
         "crypto watch help must exit 0"
     );
     let help = String::from_utf8(output.stdout).unwrap();
+    // Crypto watch emits 0/1/2/3/4 only (policy verdicts 10/11
+    // are unemittable here — same defect class as the provider
+    // table).
     assert!(
-        help.contains("exit 3:") && help.contains("exit 4:"),
-        "crypto watch help must name exit codes, got: {help}"
+        help.contains("  exit 0:")
+            && help.contains("  exit 1:")
+            && help.contains("  exit 2:")
+            && help.contains("  exit 3:")
+            && help.contains("  exit 4:"),
+        "crypto watch help must name emittable exits, got: {help}"
     );
+    for unemittable in ["exit 10", "exit 11"] {
+        assert!(
+            !help.contains(unemittable),
+            "crypto watch help must not list unemittable {unemittable}, got: {help}"
+        );
+    }
     assert!(
         help.contains("first run blocked?"),
         "crypto watch help must point first runs at doctor, got: {help}"
