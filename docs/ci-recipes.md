@@ -34,13 +34,20 @@ sudo dpkg -i osslscope_<ver>-1_amd64.deb   # or: sudo dnf install ./osslscope-<v
 getcap /usr/bin/osslscope                  # expect: cap_bpf,cap_perfmon+ep
 ```
 
-Current packages contain the host binary and install docs only.
-Build the matching observation/focused-count companions with the
-pinned toolchains (see [build](build.md)). For implicit selection,
-install through `scripts/install-dev.sh` into a trusted system
-prefix with its matching receipt; copied files do not establish it.
-Alternatively use the explicit local-prefix recipe below.
-If the install hook
+Current packages ship the binary, all five BPF roles and the
+matching receipt — no separate companion build is needed (the
+pinned-toolchain build in [build](build.md) is what the package
+itself is built from). `dpkg -c` on a freshly built
+`osslscope_0.5.0-1_amd64.deb` lists `usr/bin/osslscope`,
+`usr/lib/osslscope/osslscope-{harvest,count,members,
+provider-observation,focused-count}` and
+`usr/share/osslscope/install-manifest.json` (plus install docs,
+licenses and notices; the RPM carries the same tree below
+`/usr`). With a trusted system install, `doctor` and the gate
+resolve the BPF objects implicitly when the receipt checks pass;
+loose copies outside the package establish nothing. Use the
+explicit local-prefix recipe below only for non-package
+(user-owned) installs. If the install hook
 warned about caps, re-apply:
 `sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope`.
 See [install](install.md).
