@@ -155,13 +155,16 @@ Select `policy.rules[]` entries whose `result` is `violation`.
 Their `rule`, `predicate`, conserved definite/possible bounds and
 site `evidence` refs (object/device/inode/offset, generation, calls)
 explain the rule; optional `engine_evidence` refs identify ENGINE
-observations. The one exception is the legacy-only `deny-engine`
+observations. The one exception among positive-execution
+violations is the legacy-only `deny-engine`
 violation (the zero-ref shape): `definite=N` with empty
 `evidence` and no `engine_evidence` -- the pre-T08 tripwire
 counts executions without document identity, so there are no
 refs to resolve. The violation is still proved; only the join
 has nothing to join against (see [violation
-triage](violation-triage.md) for the full shape). There is no
+triage](violation-triage.md) for the full shape). Clean-absence
+`require-*` violations likewise carry no refs -- nothing
+executed, so there is nothing to cite. There is no
 separate `violations[]` wire field;
 the rest of the actionability tuple -- window edges,
 pid/comm, container id, image digest, provider display paths
