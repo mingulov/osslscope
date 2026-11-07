@@ -30,10 +30,14 @@ sudo reboot
 ## Setup phase (privileged, once per runner)
 
 ```sh
-sudo dpkg -i osslscope_<ver>-1_amd64.deb   # or: sudo dnf install ./osslscope-<ver>-1.*.x86_64.rpm
-sudo apt-get install -f -y                # if dpkg left Depends: libcap2-bin (setcap) unconfigured
+# or: sudo dnf install ./osslscope-<ver>-1.*.x86_64.rpm (resolves Depends automatically)
+sudo dpkg -i osslscope_<ver>-1_amd64.deb || sudo apt-get install -f -y  # repair Depends: libcap2-bin (setcap) if dpkg left it unconfigured
 getcap /usr/bin/osslscope                  # expect: cap_bpf,cap_perfmon+ep
 ```
+
+(The `||` guard keeps the repair reachable under `set -e`:
+a failing `dpkg` would otherwise exit the step before the
+fallback runs. A failed repair still fails the step.)
 
 Current packages ship the binary, all five BPF roles and the
 matching receipt — no separate companion build is needed (the
