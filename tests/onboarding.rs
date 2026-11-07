@@ -1316,19 +1316,21 @@ fn spawn_dual_load_refused_and_doctor_agrees() {
         }
         other => panic!("want Unsupported(dual-load), got {other:?}"),
     }
-    // doctor --exe agrees: exit 4, dispatch-anchor names dual-load.
-    let bin = env!("CARGO_BIN_EXE_osslscope");
-    let out = Command::new(bin)
-        .arg("doctor")
-        .arg("--exe")
-        .arg(&app)
-        .arg("--format")
-        .arg("json")
-        .env_remove("LD_LIBRARY_PATH")
-        .output()
-        .expect("run doctor");
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
+    // doctor --exe agrees: exit 4, dispatch-anchor names dual-load
+    // (1D-D3: admitted past the gate; the old exit-2 pin dated from
+    // the pre-sectioned era — exit 4 fail-closed is the correct
+    // refusal, now carrying the dispatch row).
+    let app_arg = app.to_string_lossy().into_owned();
+    let Some((code, doc)) = admitted_doctor_json(&["--exe", &app_arg]) else {
+        return;
+    };
+    assert_eq!(code, Some(4), "{doc}");
+    let row = check_row(&doc, "dispatch-anchor");
+    assert_eq!(row["status"], "fail", "{doc}");
+    assert!(
+        row["message"].as_str().unwrap().contains("dual-load"),
+        "{doc}"
+    );
 }
 
 /// Anchor functions, no rodata version string: a non-rdynamic exe
@@ -1469,14 +1471,46 @@ fn doctor_json(args: &[&str]) -> serde_json::Value {
     serde_json::from_str(&stdout).expect("doctor --format json parses")
 }
 
-fn doctor_usage_refused(args: &[&str]) {
+/// Explicit harvest/count objects for admitted sectioned runs
+/// (built by the nightly BPF toolchain; absent on hosts without
+/// it). `None` with a loud skip when missing.
+fn admitted_objects() -> Option<(PathBuf, PathBuf)> {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("crates/ebpf/target/bpfel-unknown-none/release");
+    let harvest = dir.join("osslscope-harvest");
+    let count = dir.join("osslscope-count");
+    if harvest.is_file() && count.is_file() {
+        Some((harvest, count))
+    } else {
+        eprintln!("SKIP admitted doctor leg: BPF role objects not built");
+        None
+    }
+}
+
+/// Admitted `doctor --format json` run over the given target
+/// selector: explicit objects (past the admission gate) plus the
+/// selector. Returns the exit code and the parsed document, or
+/// `None` (loud skip) without built objects.
+fn admitted_doctor_json(target: &[&str]) -> Option<(Option<i32>, serde_json::Value)> {
+    let (harvest, count) = admitted_objects()?;
     let out = Command::new(env!("CARGO_BIN_EXE_osslscope"))
         .arg("doctor")
-        .args(args)
+        .args(target)
+        .arg("--object")
+        .arg(&harvest)
+        .arg("--count-object")
+        .arg(&count)
+        .arg("--format")
+        .arg("json")
+        // Deterministic prediction: a polluted environment must not
+        // shadow fixture rpaths.
+        .env_remove("LD_LIBRARY_PATH")
         .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(2));
-    assert!(out.stdout.is_empty());
+        .expect("run doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let doc: serde_json::Value =
+        serde_json::from_str(&stdout).expect("doctor --format json parses");
+    Some((out.status.code(), doc))
 }
 
 fn check_row<'a>(doc: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
@@ -1525,7 +1559,6 @@ fn doctor_exe_predicts_spawn_target() {
     };
     // doctor --exe runs the same prediction as `run --` auto:
     // NEEDED libcrypto via rpath, symtab rung, dispatch pass.
-    doctor_usage_refused(&["--exe", &app.to_string_lossy(), "--format", "json"]);
     let table = shipped();
     let enrollment = ProviderTable::empty();
     let opts = qualify_opts(&table, &enrollment);
@@ -1539,6 +1572,22 @@ fn doctor_exe_predicts_spawn_target() {
         panic!("spawn fixture must qualify");
     };
     assert_eq!(target.resolution, Some(Resolution::Symtab));
+    // 1D-D3: the CLI leg runs admitted (the old exit-2 pin dated
+    // from the pre-sectioned era; unadmitted runs now fail closed
+    // at the admission gate instead). Exit stays unpinned: target
+    // rows pass, so it varies with ambient privilege.
+    let Some((_code, doc)) = admitted_doctor_json(&["--exe", &app.to_string_lossy()]) else {
+        return;
+    };
+    let row = check_row(&doc, "dispatch-anchor");
+    assert_eq!(row["status"], "pass", "{doc}");
+    assert!(
+        row["message"]
+            .as_str()
+            .unwrap()
+            .contains("supported via symtab"),
+        "{doc}"
+    );
 }
 
 #[test]
@@ -1550,11 +1599,23 @@ fn doctor_exe_script_fails_arch_with_clear_message() {
     let dir = scratch("doctor-exe-script");
     let script = dir.join("run.sh");
     std::fs::write(&script, "#!/bin/sh\nexec /bin/true\n").unwrap();
-    doctor_usage_refused(&["--exe", &script.to_string_lossy(), "--format", "json"]);
     assert!(
         onboard::check_arch(&std::fs::read(&script).unwrap())
             .unwrap_err()
             .contains("not an ELF")
+    );
+    // 1D-D3: admitted, the script fails arch with the clear
+    // message (exit 4: the arch failure fails the run closed on
+    // any privilege).
+    let Some((code, doc)) = admitted_doctor_json(&["--exe", &script.to_string_lossy()]) else {
+        return;
+    };
+    assert_eq!(code, Some(4), "{doc}");
+    let row = check_row(&doc, "arch");
+    assert_eq!(row["status"], "fail", "{doc}");
+    assert!(
+        row["message"].as_str().unwrap().contains("not an ELF"),
+        "{doc}"
     );
 }
 
@@ -2067,9 +2128,21 @@ fn fix2_run_set_explicit_pair_provenance_kept() {
 
 #[test]
 fn doctor_pid_reports_cold_gap_preflight() {
-    // Foreign attach is deferred in the preview. Lower-level cold-gap rows
-    // remain covered by the existing private post-admission target tests.
-    doctor_usage_refused(&["--pid", "1", "--format", "json"]);
+    // 1D-D3: admitted, --pid reports the cold-gap preflight row
+    // (the old exit-2 pin dated from the pre-sectioned era).
+    // Exit stays unpinned: it varies with target readability.
+    let Some((_code, doc)) = admitted_doctor_json(&["--pid", "1"]) else {
+        return;
+    };
+    let row = check_row(&doc, "cold-gap-preflight");
+    assert_eq!(row["status"], "degraded", "{doc}");
+    assert!(
+        row["message"]
+            .as_str()
+            .unwrap()
+            .contains("blind to pre-attach"),
+        "{doc}"
+    );
 }
 
 // ---------------------------------------------------------------------------
