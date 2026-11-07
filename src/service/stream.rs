@@ -346,6 +346,19 @@ impl OpenTap {
 /// unterminated prefix is held, never a line). Blank lines are kept
 /// (the caller skips them — resync artifacts, never counted).
 pub fn read_tail_lines(path: &Path, max_bytes: u64) -> std::io::Result<Vec<Vec<u8>>> {
+    Ok(read_tail_split(path, max_bytes)?.0)
+}
+
+/// Bounded tail split (§§6.1/7.2, R5 finding 1): complete lines
+/// PLUS the held unterminated suffix (the bytes a drive-phase
+/// resync `\n` would terminate) PLUS whether that suffix ran past
+/// the window (no `\n` in the window but the file is longer — the
+/// returned suffix is then a lower bound, never equated with a
+/// record).
+pub fn read_tail_split(
+    path: &Path,
+    max_bytes: u64,
+) -> std::io::Result<(Vec<Vec<u8>>, Vec<u8>, bool)> {
     use std::io::Seek as _;
     let mut file = File::open(path)?;
     let end = file.seek(std::io::SeekFrom::End(0))?;
@@ -362,7 +375,8 @@ pub fn read_tail_lines(path: &Path, max_bytes: u64) -> std::io::Result<Vec<Vec<u
         }
     }
     // Trailing bytes without `\n` are a held prefix, not a line.
-    Ok(lines)
+    let truncated = !buf.contains(&b'\n') && end > max_bytes;
+    Ok((lines, buf[start..].to_vec(), truncated))
 }
 
 /// Uniform reconcile (§7.2 TAP + L6): every in-flight record whose

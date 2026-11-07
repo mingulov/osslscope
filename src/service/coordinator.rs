@@ -3870,7 +3870,7 @@ fn tail_reconcile_regular(
 ) {
     let tail_budget = close_budget(run);
     let tail_poll = run_wait_poll!(run);
-    let tail: Control<std::io::Result<Vec<Vec<u8>>>> = run_op(
+    let tail: Control<std::io::Result<(Vec<Vec<u8>>, Vec<u8>, bool)>> = run_op(
         &run.diag,
         &run.format,
         &mut run.summary,
@@ -3884,10 +3884,10 @@ fn tail_reconcile_regular(
         Some(&tail_poll),
         {
             let path = run.stream.as_ref().expect("stream state").tap_path.clone();
-            move |_gate| WorkerOut::value(crate::service::stream::read_tail_lines(&path, 8 << 20))
+            move |_gate| WorkerOut::value(crate::service::stream::read_tail_split(&path, 8 << 20))
         },
     );
-    let Control::Done(Ok(lines)) = tail else {
+    let Control::Done(Ok((lines, held, truncated))) = tail else {
         // Tail unreadable: the bytes are unprovable → uncertain
         // (regular-file no-receipt with an unreadable tail is the
         // honest uncertain — not a silent fold).
@@ -3922,6 +3922,17 @@ fn tail_reconcile_regular(
         // (the detached worker may land bytes after this read) —
         // the record stays in-flight for the next boundary's
         // recheck.
+    } else if !truncated && !rec.content.is_empty() && held == rec.content {
+        // Resync-completable (R5 finding 1): the worker is gone and
+        // no complete line matches, but the record's FULL content
+        // is the held unterminated suffix — the drive-phase resync
+        // `\n` completes exactly this record reader-visible, so the
+        // "never landing" removal must NOT fire here. The record
+        // stays in-flight through the drive; the post-drive recheck
+        // credits it through the match arm above exactly once (or
+        // retains it again if the drive wrote nothing). A short
+        // prefix (partial content) still settles below — resync
+        // terminates it into a line that never matches.
     } else {
         // Content absent with the worker gone: never landing (no
         // worker to land it, no bytes to match — rotation already
@@ -4883,6 +4894,32 @@ fn mid_window_sinks(mut run: Run, sha256: String) -> (Run, SinksOut) {
     // (the published window stands; the fold resolves exit 1).
     if drive_tap(&mut run) {
         return (run, SinksOut::QuotaStop);
+    }
+    // Post-drive recheck (R5 finding 1): the drive's resync `\n`
+    // may have completed a retained partial into a reader-visible
+    // record — it re-resolves through the SAME ladder (a completed
+    // record credits exactly once via the match arm + in-flight
+    // removal; a still-unterminated one retains again; a proven
+    // unlandable one settles ≤1 boundary early with identical
+    // terminal accounting — its tail-proved absence from the
+    // active file means no later rotation match could credit it
+    // either). Receipt-before-reuse is untouched (the pre-drive
+    // pass above still runs first). Regular files only: FIFO
+    // survivors keep their exact prior timing (no tail exists, no
+    // resync completes them — they resolve at the next boundary).
+    let survivors: Vec<u64> = run
+        .stream
+        .as_ref()
+        .map(|s| {
+            s.inflight
+                .iter()
+                .filter(|r| r.op_id < recheck_below && !r.fifo)
+                .map(|r| r.op_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for op_id in survivors {
+        reconcile_tap_write(&mut run, op_id, crate::service::envelope::DropReason::Epipe);
     }
     // Retention + quota (§6.2 — enforced at this boundary).
     let retain_budget = close_budget(&run);
@@ -5898,6 +5935,60 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
     }
 
+    /// Plant a Partial tap receipt for `op_id` in the tap slot
+    /// (the abandoned-worker shape, R5 finding 1 twin of
+    /// `r41_plant_complete_receipt`: a zero-budget waiter expires
+    /// while the worker is gated; the release lets it exit with its
+    /// receipt, which `on_exit` stores because the flag is set).
+    /// `written` = landed bytes (all content, newline failed);
+    /// `full` = the whole record bytes.
+    fn r51_plant_partial_receipt(
+        run: &Run,
+        op_id: u64,
+        kind: &str,
+        seq: u64,
+        written: u64,
+        full: u64,
+    ) {
+        use crate::service::worker::{TapReceipt, TapReceiptState};
+        let (gate_tx, gate_rx) = std::sync::mpsc::channel::<()>();
+        let cancel = AtomicBool::new(false);
+        let receipt = TapReceipt {
+            op_id,
+            state: TapReceiptState::Partial { bytes: written },
+            kind: kind.to_string(),
+            seq: Some(seq),
+            span: None,
+            record_bytes: full,
+            dest_path: run
+                .stream
+                .as_ref()
+                .expect("stream attached")
+                .tap_path
+                .display()
+                .to_string(),
+            dest_dev: 0,
+            dest_ino: 0,
+        };
+        let ctrl: Control<u64> = run_under_control(
+            tap_dest(run),
+            Duration::from_millis(0),
+            &cancel,
+            move |_| {
+                let _ = gate_rx.recv();
+                WorkerOut {
+                    value: 1,
+                    receipt: Some(receipt),
+                }
+            },
+            None,
+        );
+        assert!(matches!(ctrl, Control::Expired));
+        gate_tx.send(()).unwrap();
+        // Let the detached exit land (the seal-bound precedent).
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
     fn r41_append_tap(out: &Path, content: &[u8]) {
         use std::io::Write as _;
         let mut f = std::fs::OpenOptions::new()
@@ -6064,6 +6155,80 @@ mod tests {
             (rec.records, rec.bytes),
             (1, full),
             "the stale receipt credits before marker delivery"
+        );
+        let s = run.stream.as_ref().expect("stream attached");
+        assert!(s.inflight.is_empty(), "R settles exactly once");
+        assert!(
+            s.queue.spans().is_empty(),
+            "struck + delivered spans clear exactly"
+        );
+        assert_eq!(s.queue.gross(), (1, full), "gross retains R");
+        assert!(
+            run.summary.tap_uncertain.is_empty(),
+            "no uncertainty is named"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// R5 finding 1 (resync-completable partial retained through the
+    /// drive — the reviewer's schedule through a real boundary): R
+    /// expired + folded; the worker lands all R content but the
+    /// terminating newline fails; the initial reconciliation
+    /// consumes the Partial receipt (R stays in-flight); the next
+    /// boundary (no rotation) must NOT remove R pre-drive — the
+    /// drive's resync `\n` completes R reader-visible, and R
+    /// credits exactly once through the proven-landing ladder. RED
+    /// pre-fix (R removed pre-drive, then the drive's resync
+    /// completes R with recovered=0 — O=B); GREEN post-fix. The
+    /// L6 newline test does not cover this ordering (no boundary).
+    #[test]
+    fn r51_partial_retained_through_drive_resync() {
+        use crate::service::envelope::DropReason;
+        let out = s4_scratch("r51-resync");
+        let (mut run, _guard) = r41_run(&out, 9);
+        let content = r41_record(7);
+        let full = content.len() as u64 + 1;
+        r41_fold_abandoned(&mut run, content.clone(), 7);
+        // Boundary N's worker lands all R content (newline fails)
+        // and exits with its Partial receipt.
+        r51_plant_partial_receipt(&run, 0, "window-ref", 7, content.len() as u64, full);
+        std::fs::write(out.join("stream.jsonl"), &content).unwrap();
+        // Initial reconciliation consumes the Partial receipt; R
+        // stays in-flight, uncredited.
+        reconcile_tap_write(&mut run, 0, DropReason::Epipe);
+        assert_eq!(
+            run.stream.as_ref().expect("stream attached").inflight.len(),
+            1,
+            "a consumed Partial receipt leaves R in-flight"
+        );
+        assert_eq!(
+            (
+                run.summary.tap_recovered.records,
+                run.summary.tap_recovered.bytes
+            ),
+            (0, 0),
+            "nothing proven yet — nothing credited"
+        );
+        assert!(
+            view_slot(&tap_dest(&run)).is_none(),
+            "the Partial receipt is consumed"
+        );
+        // The next boundary: stale recheck, then the drive.
+        let (run, sinks) = mid_window_sinks(run, "abc".to_string());
+        assert!(matches!(sinks, SinksOut::Continue));
+        // The schedule holds on both colors: the drive's resync
+        // completes R into a reader-visible record.
+        let lines =
+            crate::service::stream::read_tail_lines(&out.join("stream.jsonl"), 8 << 20).unwrap();
+        assert!(
+            lines.contains(&content),
+            "the drive's resync completes R reader-visible"
+        );
+        let rec = &run.summary.tap_recovered;
+        assert_eq!(
+            (rec.records, rec.bytes),
+            (1, full),
+            "a resync-completed partial credits exactly once (RED: removed pre-drive, O=B)"
         );
         let s = run.stream.as_ref().expect("stream attached");
         assert!(s.inflight.is_empty(), "R settles exactly once");
