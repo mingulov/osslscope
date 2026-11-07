@@ -3,6 +3,20 @@
 //! taxonomy 0/1/2/3/4/10 (see usage.md).
 use std::process::ExitCode;
 
+/// Exit-code lines for observation surfaces (scan/inspect
+/// provider observation): policy verdicts 10/11 are unemittable
+/// here, and interruption lands on exit 3 — see
+/// docs/provider-observation.md.
+pub(crate) fn exit_code_help_observation() -> [&'static str; 5] {
+    [
+        "exit 0: completed inventory/observation",
+        "exit 1: internal or output failure",
+        "exit 2: invalid arguments",
+        "exit 3: useful inventory/observation with gaps, or interruption",
+        "exit 4: no usable requested inventory/observation",
+    ]
+}
+
 /// One help line per exit code (mirrors docs/usage.md#exit-codes).
 /// Exits 3/4 additionally print their single stderr reason at runtime
 /// (see `report::exit_reason_line`).

@@ -537,6 +537,30 @@ fn observe_providers_help_names_exit_codes() {
 }
 
 #[test]
+fn observe_providers_help_lists_only_emittable_exits() {
+    // Provider observation emits 0/1/2/3/4 only (policy exits
+    // 10/11 are unemittable here); interruption lands on exit 3
+    // per docs/provider-observation.md.
+    let f = Fixture::new();
+    for command in ["scan", "inspect"] {
+        let output = f.cli(&[command, "--observe-providers", "--help"]);
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !help.contains("exit 10"),
+            "{command} help must not list unemittable exit 10, got: {help}"
+        );
+        assert!(
+            !help.contains("exit 11"),
+            "{command} help must not list unemittable exit 11, got: {help}"
+        );
+        assert!(
+            help.contains("exit 3:") && help.contains("interruption"),
+            "{command} help must land interruption on exit 3, got: {help}"
+        );
+    }
+}
+
+#[test]
 fn no_usable_scope_exit4_names_reason_on_stderr() {
     // Deterministic exit 4: dead pid under provider observation.
     let f = Fixture::new();
