@@ -699,9 +699,14 @@ impl Drop for DisposalFacility {
 
 /// Reaper loop: poll the ring and dispose each payload. The
 /// waiter never signals (a signal would take a lock on the
-/// abandonment path), so the reaper polls. Test-local facilities
-/// exit once their test drops them (the global facility's
-/// `OnceLock` share keeps its reaper alive).
+/// abandonment path), so the reaper polls. Each payload drops on
+/// its own detached disposer thread (R6-2: one blocked
+/// destructor cannot pin later results — each disposal is
+/// isolated, and a panicking destructor kills only its own
+/// thread, never the reaper). A disposer-spawn failure leaks
+/// loudly (counted, never silent). Test-local facilities exit
+/// once their test drops them (the global facility's `OnceLock`
+/// share keeps its reaper alive).
 fn reaper_loop(fac: Arc<DisposalFacility>) {
     while !fac.started.load(Ordering::Acquire) {
         if Arc::strong_count(&fac) == 1 {
@@ -715,11 +720,52 @@ fn reaper_loop(fac: Arc<DisposalFacility>) {
         }
         match fac.try_dequeue() {
             Some(item) => {
-                fac.dispatched.fetch_add(1, Ordering::Relaxed);
-                drop(item);
+                // Raw across the spawn boundary: the closure
+                // owns only a `Copy` pointer, so a spawn failure
+                // drops it without running the destructor — and
+                // the spare below recovers the value for the
+                // loud leak.
+                let raw = SendPtr(Box::into_raw(item));
+                let spare = raw.0;
+                match std::thread::Builder::new()
+                    .name("sixb-disp".to_string())
+                    .spawn(move || {
+                        // SAFETY: `raw` came from
+                        // `Box::into_raw` of this same value;
+                        // the reaper dequeued it exactly once.
+                        drop(unsafe { Box::from_raw(raw.into_ptr()) });
+                    }) {
+                    Ok(_) => {
+                        fac.dispatched.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(_) => {
+                        DISPOSAL_SPAWN_FAILED.fetch_add(1, Ordering::Relaxed);
+                        // SAFETY: the spawn failed, so the
+                        // closure never ran — this is the only
+                        // reconstruction.
+                        std::mem::forget(unsafe { Box::from_raw(spare) });
+                    }
+                }
             }
             None => std::thread::sleep(DISPOSAL_POLL),
         }
+    }
+}
+
+/// A `Send` pointer-cell for the spawn boundary (the reaper
+/// hands each dequeued payload to its disposer exactly once).
+struct SendPtr(*mut (dyn Any + Send));
+
+// SAFETY: transferred exactly once, reaper → disposer, across a
+// successful spawn; the pointed-to value is `Box<dyn Any +
+// Send>`.
+unsafe impl Send for SendPtr {}
+
+impl SendPtr {
+    /// By-value accessor (captures the `Send` wrapper whole —
+    /// field access would capture the bare `!Send` pointer).
+    fn into_ptr(self) -> *mut (dyn Any + Send) {
+        self.0
     }
 }
 
@@ -1550,23 +1596,21 @@ mod tests {
         }
     }
 
-    /// R6-2 RED: A is consumed with a blocked destructor, then
-    /// B1…BN (2 MiB each) are consumed through
-    /// `consume_if_finished` while A stays blocked: later
-    /// results must dispose promptly instead of queueing behind
-    /// A unboundedly. Deterministic at the helper level (the
-    /// manually constructed finished slots are exactly the
-    /// post-race state). RED pre-fix (the serial reaper holds
-    /// every Bi until A releases — the 2 s watchdog per Bi);
-    /// GREEN post-fix (each disposal is isolated; A still
-    /// blocked, the race still consumed, the bound holds).
+    /// R6-2: A is consumed with a blocked destructor, then
+    /// B1…BN (2 MiB each) are consumed through the abandonment
+    /// path while A stays blocked: later results dispose
+    /// promptly (each disposal is isolated — never queued
+    /// behind A), the race stays consumed, and queue depth stays
+    /// within the stated bound with no overflow. Deterministic
+    /// at the helper level (the manually constructed finished
+    /// slots are exactly the post-race state). RED pre-fix (one
+    /// blocked destructor retained later results unboundedly);
+    /// GREEN post-fix.
     #[test]
-    #[ignore = "R6-2 RED until per-disposal isolation lands"]
-    fn r62_later_results_retained_behind_blocked_destructor() {
+    fn r62_later_results_dispose_while_first_blocked() {
         use std::sync::mpsc;
-        // Warm the facility (production registration does this;
-        // the pin constructs slots manually).
-        ensure_disposal();
+        let fac = launch_test_facility(8, false);
+        let before = disposal_stats();
         struct BlockingDrop {
             entered: mpsc::Sender<()>,
             release: mpsc::Receiver<()>,
@@ -1627,7 +1671,7 @@ mod tests {
                 exited: exited_tx,
             }),
         );
-        consume_if_finished(&dest_a, worker_a);
+        consume_if_finished_with(&dest_a, worker_a, Some(&fac));
         entered_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("A must reach its destructor off-path");
@@ -1648,18 +1692,14 @@ mod tests {
                     dropped: dropped_tx.clone(),
                 }),
             );
-            consume_if_finished(&dest, worker);
+            consume_if_finished_with(&dest, worker, Some(&fac));
             dests.push(dest);
         }
         drop(dropped_tx);
         for _ in 0..N {
-            if dropped_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-                // Release so the suite never hangs; the panic
-                // below records the RED.
-                let _ = release_tx.send(());
-                let _ = exited_rx.recv_timeout(Duration::from_secs(10));
-                panic!("RED: later results retained behind A's blocked destructor");
-            }
+            dropped_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("later results must dispose while A stays blocked");
         }
         assert!(
             exited_rx.try_recv().is_err(),
@@ -1671,6 +1711,18 @@ mod tests {
                 "the race stays consumed for {dest:?}"
             );
         }
+        let after = disposal_stats();
+        assert_eq!(
+            after.full - before.full,
+            0,
+            "nothing may overflow while A stays blocked"
+        );
+        assert_eq!(after.contended - before.contended, 0);
+        assert_eq!(after.setup_miss - before.setup_miss, 0);
+        assert!(
+            fac.depth_peak() <= 8,
+            "queue depth stays within the stated bound"
+        );
         let _ = release_tx.send(());
         exited_rx
             .recv_timeout(Duration::from_secs(10))
