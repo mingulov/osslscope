@@ -157,8 +157,9 @@ pub struct EngineCount {
 /// with site rows — 2048 leaves headroom for both planes.
 pub(crate) const MAX_ENGINE_PROBES: usize = 2048;
 /// One ENGINE tripwire probe to attach: caller-module path plus file
-/// offset, with the expected attach-time file identity (native stat
-/// domain) for TOCTOU verification.
+/// offset, with the expected attach-time file identity
+/// (evidence-encoded stat word, like `FileBytes.dev`) for TOCTOU
+/// verification.
 #[derive(Clone, Debug)]
 pub(crate) struct EngineProbePlan {
     pub path: String,
@@ -865,13 +866,17 @@ impl FocusedCounter {
             // with it.
             let pin = File::open(module).map_err(|_| CountFailure::Attach)?;
             let stat = pin.metadata().map_err(|_| CountFailure::Attach)?;
+            // Plans carry evidence-encoded devices: encode the fresh
+            // stat side before comparing (raw dev_t never meets an
+            // encoded word — they agree only on major-0 filesystems).
+            let stat_dev = evidence_device(stat.dev());
             // Every plan for this module must agree with the opened
             // file: a swapped file — or disagreeing plans — refuses
             // the whole batch rather than attaching half-bound.
             let consistent = unique
                 .iter()
                 .filter(|&&i| probes[i].path == *module)
-                .all(|&i| stat.dev() == probes[i].device && stat.ino() == probes[i].inode);
+                .all(|&i| stat_dev == probes[i].device && stat.ino() == probes[i].inode);
             if !consistent {
                 return Err(CountFailure::Identity);
             }
@@ -2035,7 +2040,7 @@ mod startup_controls {
             .map(|p| EngineProbePlan {
                 path: p.module.clone(),
                 offset: p.offset,
-                device: meta.dev(),
+                device: evidence_device(meta.dev()),
                 inode: meta.ino(),
                 sha256: digest,
             })
@@ -2266,7 +2271,7 @@ mod startup_controls {
             .map(|p| EngineProbePlan {
                 path: p.module.clone(),
                 offset: p.offset,
-                device: meta.dev(),
+                device: evidence_device(meta.dev()),
                 inode: meta.ino(),
                 sha256: digest,
             })
@@ -2512,14 +2517,14 @@ mod startup_controls {
             EngineProbePlan {
                 path: probe.module.clone(),
                 offset: probe.offset,
-                device: meta.dev(),
+                device: evidence_device(meta.dev()),
                 inode: meta.ino(),
                 sha256: digest,
             },
             EngineProbePlan {
                 path: alias.to_str().unwrap().to_string(),
                 offset: probe.offset,
-                device: meta.dev(),
+                device: evidence_device(meta.dev()),
                 inode: meta.ino(),
                 sha256: digest,
             },
@@ -2706,7 +2711,7 @@ mod startup_controls {
         let plans = vec![EngineProbePlan {
             path: probe.module.clone(),
             offset: probe.offset,
-            device: meta.dev(),
+            device: evidence_device(meta.dev()),
             inode: meta.ino(),
             sha256: digest,
         }];
@@ -3780,7 +3785,7 @@ mod budget_tests {
         let plans = vec![EngineProbePlan {
             path: exe.to_str().unwrap().to_string(),
             offset: 0x1000,
-            device: meta.dev(),
+            device: evidence_device(meta.dev()),
             inode: meta.ino(),
             sha256: [0u8; 32],
         }];

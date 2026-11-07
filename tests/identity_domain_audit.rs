@@ -1606,6 +1606,186 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let ns = [ns.device.to_ne_bytes(), ns.inode.to_ne_bytes()].concat();",
             3,
         ),
+        // 1D-D3 (engine identity domain): the focused ENGINE path
+        // admits libcrypto/caller devices as evidence-encoded stat
+        // words (evidence_device), matching FileBytes.dev and the
+        // document's SiteKey.device — raw dev_t never meets an
+        // encoded word. The admission check itself stays raw-vs-raw
+        // (ModuleInfo native dev_t vs fresh fstat); everything
+        // stored or compared past it is encoded.
+        (
+            "src/focused_capture.rs",
+            "raw",
+            ".any(|m| m.info.device == fresh.dev() && m.info.inode == fresh.ino())",
+            1,
+        ),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "device: evidence_device(fresh.dev()),",
+            2,
+        ),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "if lib.device != device || lib.inode != inode {",
+            1,
+        ),
+        // Caller-set watch baseline/current: fresh native fstat
+        // tuples on both sides of the diff (raw-vs-raw).
+        (
+            "src/focused_capture.rs",
+            "raw",
+            "let identity = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));",
+            2,
+        ),
+        // Identity-bound reads: FileBytes.dev (encoded) against
+        // encoded admitted/fresh identities (stat-vs-stat).
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "Ok(fb) if fb.dev == lib.device && fb.ino == lib.inode => fb,",
+            1,
+        ),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "Ok(fb) if fb.dev == evidence_device(fresh.dev()) && fb.ino == fresh.ino() => fb,",
+            1,
+        ),
+        // Probe-plan identity: encoded libcrypto word shaped for
+        // the planner; encoded caller identities keyed, stored,
+        // and rendered (render_device over encoded words).
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "(crate::plan::render_device(lc.dev), lc.ino),",
+            1,
+        ),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            ".map(|m| (m.path.clone(), (m.device, m.inode)))",
+            1,
+        ),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "(found.device, found.inode, String::new()),",
+            1,
+        ),
+        ("src/focused_capture.rs", "stat", "device: found.device,", 1),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "dev: crate::plan::render_device(plan.device),",
+            1,
+        ),
+        ("src/focused_capture.rs", "stat", "device: lib.device,", 1),
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "crate::plan::render_device(*device)",
+            1,
+        ),
+        // session_tests ModuleInfo fixture: ModuleInfo.device is
+        // native dev_t by type (raw, consumed raw at admission).
+        ("src/focused_capture.rs", "raw", "device: meta.dev(),", 1),
+        // Admission stores the evidence encoding (holds on every
+        // filesystem, not just major-0 where raw==encoded).
+        (
+            "src/focused_capture.rs",
+            "stat",
+            "assert_eq!(admitted.device, evidence_device(meta.dev()));",
+            1,
+        ),
+        // Engine-plan alias dedupe keys plan-vs-plan triples
+        // (same encoded field both sides).
+        (
+            "src/focused_count.rs",
+            "stat",
+            "if let Some(&u) = seen.get(&(p.device, p.inode, p.offset)) {",
+            1,
+        ),
+        (
+            "src/focused_count.rs",
+            "stat",
+            "seen.insert((p.device, p.inode, p.offset), unique.len());",
+            1,
+        ),
+        // Attach-time TOCTOU check: the fresh stat side is encoded
+        // before meeting the encoded plan devices (stat-vs-stat).
+        (
+            "src/focused_count.rs",
+            "stat",
+            "let stat_dev = evidence_device(stat.dev());",
+            1,
+        ),
+        (
+            "src/focused_count.rs",
+            "stat",
+            ".all(|&i| stat_dev == probes[i].device && stat.ino() == probes[i].inode);",
+            1,
+        ),
+        // startup_controls fixtures over read_file_bound bytes:
+        // FileBytes.dev is encoded (render over encoded words).
+        (
+            "src/focused_count.rs",
+            "stat",
+            "(crate::plan::render_device(lc.dev), lc.ino),",
+            4,
+        ),
+        // EngineProbePlan fixtures carry encoded devices (the
+        // struct's domain; the attach check encodes its side).
+        (
+            "src/focused_count.rs",
+            "stat",
+            "device: evidence_device(meta.dev()),",
+            6,
+        ),
+        // 6A exe identity: fresh fstat tuples compared across
+        // samples for exec detection (raw-vs-raw).
+        (
+            "src/crypto_watch.rs",
+            "raw",
+            ".map(|m| (m.dev(), m.ino()))",
+            1,
+        ),
+        // Gap display triples: run-local grouping keys for the
+        // human gap block (same local precedent as
+        // inventory/mod.rs) — rendered, never cross-domain joined.
+        (
+            "src/crypto_watch.rs",
+            "local",
+            "self.pending_gaps.push((gap.reason, gap.device, gap.pid));",
+            1,
+        ),
+        (
+            "src/inventory/watch.rs",
+            "local",
+            "let triples = gaps.iter().map(|g| (g.reason.word(), g.device, g.pid));",
+            1,
+        ),
+        (
+            "src/provider_observation/cli.rs",
+            "local",
+            "gaps.iter().map(|g| (g.reason.word(), g.device, g.pid)),",
+            1,
+        ),
+        // 6B tap identity proof: fresh native fstat vs fresh
+        // native fstat of reserved sinks (raw-vs-raw).
+        (
+            "src/service/stream.rs",
+            "raw",
+            "let id = (meta.dev(), meta.ino());",
+            1,
+        ),
+        (
+            "src/service/stream.rs",
+            "raw",
+            ".map(|m| (m.dev(), m.ino()) == id)",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

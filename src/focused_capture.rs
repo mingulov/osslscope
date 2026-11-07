@@ -7,7 +7,7 @@ use crate::{
     evidence::*,
     focused_count::{
         CountCandidate, CountFailure, CountLimits, CountSample, EngineCount, EngineProbePlan,
-        FocusedCounter,
+        FocusedCounter, evidence_device,
     },
     inventory::{
         self,
@@ -366,9 +366,10 @@ fn engine_news(prev: &mut BTreeMap<u32, u64>, engine: &[EngineCount]) -> Vec<(u6
     news
 }
 /// Libcrypto admitted for ENGINE probe planning: maps path plus
-/// fresh stat-domain identity, cross-checked against the admitted
-/// inventory record (a dlopen/exec race skips this snapshot; the
-/// maps dev-string is never compared — btrfs/overlay diverge it).
+/// fresh evidence-encoded stat identity, cross-checked against the
+/// admitted inventory record (a dlopen/exec race skips this
+/// snapshot; the maps dev-string is never compared —
+/// btrfs/overlay diverge it).
 struct AdmittedLibcrypto {
     path: String,
     device: u64,
@@ -450,7 +451,7 @@ fn select_engine_libcrypto(
         .any(|m| m.info.device == fresh.dev() && m.info.inode == fresh.ino())
         .then(|| AdmittedLibcrypto {
             path,
-            device: fresh.dev(),
+            device: evidence_device(fresh.dev()),
             inode: fresh.ino(),
         })
 }
@@ -632,8 +633,9 @@ pub(crate) fn process_batch(
 /// behind an explicit gap.
 const MAX_ENGINE_PLAN_MODULES: usize = 16;
 /// One maps-consistent caller module scanned for ENGINE probe
-/// planning: path, bytes, fresh stat identity, and the content
-/// digest the offsets were parsed from (the attach re-hashes).
+/// planning: path, bytes, fresh evidence-encoded stat identity,
+/// and the content digest the offsets were parsed from (the attach
+/// re-hashes).
 struct ScannedCallerModule {
     path: String,
     bytes: Vec<u8>,
@@ -1582,7 +1584,7 @@ impl FocusedSession {
                 continue;
             }
             let fb = match crate::plan::read_file_bound(path) {
-                Ok(fb) if fb.dev == fresh.dev() && fb.ino == fresh.ino() => fb,
+                Ok(fb) if fb.dev == evidence_device(fresh.dev()) && fb.ino == fresh.ino() => fb,
                 _ => {
                     skipped += 1;
                     continue;
@@ -1597,7 +1599,7 @@ impl FocusedSession {
             mod_bufs.push(ScannedCallerModule {
                 path: path.clone(),
                 bytes: fb.bytes.to_vec(),
-                device: fresh.dev(),
+                device: evidence_device(fresh.dev()),
                 inode: fresh.ino(),
                 sha256: Sha256::digest(&fb.bytes).into(),
             });
@@ -2581,7 +2583,7 @@ mod session_tests {
         let admitted = select_engine_libcrypto(&maps, std::slice::from_ref(&module))
             .expect("matching identity admits");
         assert_eq!(admitted.path, fake.to_str().unwrap());
-        assert_eq!(admitted.device, meta.dev());
+        assert_eq!(admitted.device, evidence_device(meta.dev()));
         assert_eq!(admitted.inode, meta.ino());
         // Swapped-away file (maps ino stale) refuses.
         let stale_maps = vec![crate::discovery::maps::Mapping {
