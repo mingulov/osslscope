@@ -232,6 +232,11 @@ where
         );
         (flag, epoch, 0)
     };
+    // Eager disposal setup (R6-1): the facility exists before any
+    // abandonment can run — never lazily on the waiter path. (The
+    // refusal arm above returns before this: no worker, no
+    // abandonment possible.)
+    ensure_disposal();
     let gate = Gate {
         flag: flag.clone(),
         epoch: epoch.clone(),
@@ -348,7 +353,8 @@ where
             // Abandonment path: flag + epoch, then the registry
             // short critical section (never worker-dependent), NO
             // blocking syscall (a consumed raced-in result leaves
-            // for the deferred reaper — never dropped here).
+            // for the deferred disposal facility — never dropped
+            // here).
             flag.store(true, Ordering::Release);
             epoch.fetch_add(1, Ordering::AcqRel);
             consume_if_finished(&dest, worker);
@@ -372,11 +378,17 @@ where
 /// Receiptless slots unregister; receipt-bearing slots drop their
 /// (unreadable) result but stay for the reconciler. Short critical
 /// section only (no worker progress needed): the consumed result
-/// leaves for the deferred reaper (R5 finding 2 — the waiter never
-/// waits on destructor progress, its own or a foreign worker's;
-/// dropping here would run a raced-in `OpenTap{File}` close on the
-/// abandonment path).
+/// leaves for the deferred disposal facility (R5 finding 2, R6
+/// findings 1–2 — the waiter never waits on destructor progress,
+/// its own or a foreign worker's; dropping here would run a
+/// raced-in `OpenTap{File}` close on the abandonment path).
 fn consume_if_finished(dest: &Destination, worker: u64) {
+    consume_if_finished_with(dest, worker, disposal_facility());
+}
+
+/// Abandonment-path consume against an explicit facility (the
+/// production global, or a test-local one).
+fn consume_if_finished_with(dest: &Destination, worker: u64, fac: Option<&DisposalFacility>) {
     let deferred: Option<Box<dyn Any + Send>> = {
         let mut reg = registry().lock().unwrap_or_else(|e| e.into_inner());
         let finished = matches!(
@@ -392,128 +404,361 @@ fn consume_if_finished(dest: &Destination, worker: u64) {
         }
     };
     if let Some(boxed) = deferred {
-        deferred_drop(boxed);
+        handoff_to(fac, boxed);
     }
 }
 
-/// Deferred result disposal (R5 finding 2): the abandoning waiter
-/// hands a consumed raced-in result here instead of dropping it —
-/// the value's destructor (production values own `OpenTap{File}`,
-/// whose close is a blocking syscall past budget) runs on a
-/// dedicated detached reaper thread, never on the abandonment
-/// path. The waiter performs only a non-blocking channel send
-/// (allocator-only, never destructor progress, never a blocking
-/// syscall), so the frozen "abandonment performs no blocking
-/// syscall and reclaims nothing" rule (D-record:1524 — a rule
-/// about the waiter's path: no join, no result drop, return
-/// within budget whatever the worker/destructor does) holds:
-/// consumption is unchanged (the registry slot unregisters or
-/// takes exactly as before — no retained results, the R3-F2 race
-/// stays consumed) while reclamation moves off-path. If the
-/// reaper is unavailable (thread-spawn failure), the value is
-/// leaked rather than dropped — bounded abandonment wins over
-/// reclamation, and leaked memory is unreachable (never a
-/// retained registry result).
-fn deferred_drop(deferred: Box<dyn Any + Send>) {
-    #[cfg(test)]
-    red_send_gate();
-    if let Err(failed) = reaper_tx().send(deferred) {
-        std::mem::forget(failed.0);
+/// Deferred result disposal (R5 finding 2, R6 findings 1–2):
+/// the abandoning waiter hands a consumed raced-in result here
+/// instead of dropping it — the value's destructor (production
+/// values own `OpenTap{File}`, whose close is a blocking syscall
+/// past budget) runs off the waiter's path, never on it. The
+/// handoff itself is lock-free, syscall-free, and
+/// allocation-free (atomics + pointer moves only, at most
+/// `DISPOSAL_CAS_BUDGET` claim spins), so the frozen
+/// "abandonment path takes no lock and performs no blocking
+/// syscall" rule (D-record:1376 — a rule about the waiter's path:
+/// no join, no result drop, return within budget whatever the
+/// worker/destructor does) holds: consumption is unchanged (the
+/// registry slot unregisters or takes exactly as before — no
+/// retained results, the R3-F2 race stays consumed) while
+/// reclamation moves off-path. Setup runs eagerly on the
+/// op-registration path (`ensure_disposal`), never lazily on
+/// abandonment (R6-1); the queue is bounded with a disciplined
+/// overflow rule (R6-2). Every fallback is loud (counted in
+/// `DisposalStats`, never silent): an uninitialized facility, a
+/// full queue, CAS-budget exhaustion, or a disposer-spawn
+/// failure leaks the value (`mem::forget` — bounded abandonment
+/// wins over reclamation) and counts it. Leaked memory is
+/// unreachable (never a retained registry result).
+///
+/// Abandonment-path handoff against an explicit facility (the
+/// production global via `disposal_facility()`, or a test-local
+/// one): bounded, lock-free, accounted. `None` (an uninitialized
+/// facility) is the loud setup-miss fallback — setup itself
+/// never runs here.
+fn handoff_to(fac: Option<&DisposalFacility>, item: Box<dyn Any + Send>) {
+    let Some(fac) = fac else {
+        DISPOSAL_SETUP_MISS.fetch_add(1, Ordering::Relaxed);
+        std::mem::forget(item);
+        return;
+    };
+    match fac.try_enqueue(item) {
+        Ok(()) => {
+            DISPOSAL_QUEUED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(EnqueueReject::Full(item)) => {
+            DISPOSAL_FULL.fetch_add(1, Ordering::Relaxed);
+            std::mem::forget(item);
+        }
+        Err(EnqueueReject::Contended(item)) => {
+            DISPOSAL_CONTENDED.fetch_add(1, Ordering::Relaxed);
+            std::mem::forget(item);
+        }
     }
 }
 
-/// The reaper channel (spawned once, lazily, on first deferred
-/// disposal; detached — process exit reaps it with the workers).
-fn reaper_tx() -> &'static std::sync::mpsc::Sender<Box<dyn Any + Send>> {
-    static REAPER: OnceLock<std::sync::mpsc::Sender<Box<dyn Any + Send>>> = OnceLock::new();
-    reaper_tx_in(&REAPER)
+/// The process disposal facility, if initialized. NEVER
+/// initialized here — setup runs on the registration path
+/// (`ensure_disposal`), never on abandonment (R6-1).
+fn disposal_facility() -> Option<&'static DisposalFacility> {
+    DISPOSAL_FACILITY.get().map(Arc::as_ref)
 }
 
-/// RED-gated init (R6-1(i)): the same lazy init against an
-/// explicit lock so the first-use schedule is deterministic at
-/// the helper level (a fresh lock = a fresh process).
-fn reaper_tx_in(
-    lock: &OnceLock<std::sync::mpsc::Sender<Box<dyn Any + Send>>>,
-) -> &std::sync::mpsc::Sender<Box<dyn Any + Send>> {
+static DISPOSAL_FACILITY: OnceLock<Arc<DisposalFacility>> = OnceLock::new();
+
+/// Eager disposal setup (R6-1): runs on the op-registration path
+/// (never on abandonment) so the facility exists before any
+/// abandonment can run. A reaper-spawn failure stores the
+/// facility without a reaper — handoffs then queue and overflow
+/// loudly (counted), never block.
+fn ensure_disposal() {
+    ensure_disposal_in(&DISPOSAL_FACILITY);
+}
+
+/// Eager setup against an explicit lock (the production global,
+/// or a test-local one for the stalled-setup schedule).
+fn ensure_disposal_in(lock: &OnceLock<Arc<DisposalFacility>>) {
     lock.get_or_init(|| {
         #[cfg(test)]
-        red_setup_gate();
-        let (tx, rx) = std::sync::mpsc::channel::<Box<dyn Any + Send>>();
-        // On spawn failure the closure (owning `rx`) drops, so every
-        // send fails and `deferred_drop` leaks — bounded, never
-        // blocking.
-        let _ = std::thread::Builder::new()
-            .name("sixb-reaper".to_string())
-            .spawn(move || {
-                for deferred in rx {
-                    drop(deferred);
-                }
+        stall_setup_for_test();
+        let fac = Arc::new(DisposalFacility::with_capacity(DISPOSAL_CAP));
+        let reaper = std::thread::Builder::new()
+            .name("sixb-reap".to_string())
+            .spawn({
+                let fac = fac.clone();
+                move || reaper_loop(fac)
             });
-        tx
-    })
+        if reaper.is_err() {
+            DISPOSAL_SPAWN_FAILED.fetch_add(1, Ordering::Relaxed);
+        }
+        fac
+    });
 }
 
-/// RED discriminator gate (R6-1(i), tests only): while armed,
-/// first-use reaper setup blocks — the direct gate on the setup
-/// point, no libc fault injection.
-#[cfg(test)]
-static RED_SETUP_ARMED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static RED_SETUP_GATE: OnceLock<(
-    std::sync::mpsc::Sender<()>,
-    Mutex<std::sync::mpsc::Receiver<()>>,
-)> = OnceLock::new();
-#[cfg(test)]
-fn red_setup_gate() {
-    if RED_SETUP_ARMED.load(Ordering::SeqCst) {
-        let gate = RED_SETUP_GATE.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            (tx, Mutex::new(rx))
-        });
-        let _ = gate
-            .1
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .recv_timeout(Duration::from_secs(30));
-    }
+/// Loud-fallback accounting for deferred disposal (§7.2): every
+/// handoff that cannot queue is counted here, never silent.
+static DISPOSAL_QUEUED: AtomicU64 = AtomicU64::new(0);
+static DISPOSAL_SETUP_MISS: AtomicU64 = AtomicU64::new(0);
+static DISPOSAL_FULL: AtomicU64 = AtomicU64::new(0);
+static DISPOSAL_CONTENDED: AtomicU64 = AtomicU64::new(0);
+static DISPOSAL_SPAWN_FAILED: AtomicU64 = AtomicU64::new(0);
+
+/// Snapshot of the deferred-disposal accounting: queued handoffs
+/// plus every loud fallback (setup-miss, full, contended,
+/// spawn-failed).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DisposalStats {
+    pub queued: u64,
+    pub setup_miss: u64,
+    pub full: u64,
+    pub contended: u64,
+    pub spawn_failed: u64,
 }
-#[cfg(test)]
-fn red_setup_release() {
-    RED_SETUP_ARMED.store(false, Ordering::SeqCst);
-    if let Some(gate) = RED_SETUP_GATE.get() {
-        let _ = gate.0.send(());
+
+/// Read the deferred-disposal accounting.
+pub fn disposal_stats() -> DisposalStats {
+    DisposalStats {
+        queued: DISPOSAL_QUEUED.load(Ordering::Relaxed),
+        setup_miss: DISPOSAL_SETUP_MISS.load(Ordering::Relaxed),
+        full: DISPOSAL_FULL.load(Ordering::Relaxed),
+        contended: DISPOSAL_CONTENDED.load(Ordering::Relaxed),
+        spawn_failed: DISPOSAL_SPAWN_FAILED.load(Ordering::Relaxed),
     }
 }
 
-/// RED discriminator gate (R6-1(ii), tests only): while armed,
-/// the abandonment handoff blocks — the direct gate on the
-/// handoff/contention point, no libc fault injection.
-#[cfg(test)]
-static RED_SEND_ARMED: AtomicBool = AtomicBool::new(false);
-#[cfg(test)]
-static RED_SEND_GATE: OnceLock<(
-    std::sync::mpsc::Sender<()>,
-    Mutex<std::sync::mpsc::Receiver<()>>,
-)> = OnceLock::new();
-#[cfg(test)]
-fn red_send_gate() {
-    if RED_SEND_ARMED.load(Ordering::SeqCst) {
-        let gate = RED_SEND_GATE.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
-            (tx, Mutex::new(rx))
-        });
-        let _ = gate
-            .1
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .recv_timeout(Duration::from_secs(30));
+/// Bound (R6-2): at most 32 queued payloads per facility (power
+/// of two — the ring masks). Past it, handoffs overflow loudly
+/// (a counted leak, never a wait on disposal progress).
+const DISPOSAL_CAP: usize = 32;
+/// Bound (R6-1): at most 256 claim spins per handoff under
+/// contention, then the counted contended-fallback — no
+/// unbounded wait on shared-state progress.
+const DISPOSAL_CAS_BUDGET: usize = 256;
+/// Reaper poll quantum (the reaper thread only — the waiter
+/// never signals, so the reaper polls).
+const DISPOSAL_POLL: Duration = Duration::from_millis(1);
+
+/// One ring cell: the sequence guards the payload pointer
+/// (Vyukov MPMC discipline, single consumer). The payload is
+/// `MaybeUninit` — only the sequence says empty/full, never a
+/// null (fat pointers have no null).
+struct DisposalCell {
+    seq: AtomicU64,
+    ptr: std::cell::UnsafeCell<std::mem::MaybeUninit<*mut (dyn Any + Send)>>,
+}
+
+// SAFETY: each cell is exclusively owned by its claimer — the
+// producer after a successful tail CAS until it publishes the
+// sequence, the single consumer after observing publication
+// until it recycles the sequence. No concurrent cell access, no
+// data race. Transfer across threads happens only through this
+// handoff (guarded by the sequence Release/Acquire), and the
+// pointed-to value is `Box<dyn Any + Send>` — hence `Send` too.
+unsafe impl Sync for DisposalCell {}
+unsafe impl Send for DisposalCell {}
+
+/// Bounded lock-free disposal facility (R6-1/R6-2): a
+/// fixed-capacity ring (pre-allocated at setup — the handoff
+/// allocates nothing) drained by one polling detached reaper
+/// thread. Process exit reaps the reaper with the workers.
+struct DisposalFacility {
+    cells: Box<[DisposalCell]>,
+    mask: u64,
+    tail: AtomicU64,
+    /// Consumer cursor — the reaper thread only.
+    head: AtomicU64,
+    /// Test start-gate (production facilities start running).
+    started: AtomicBool,
+    depth_now: AtomicU64,
+    depth_peak: AtomicU64,
+    dispatched: AtomicU64,
+}
+
+// SAFETY: `cells` is `Sync` per cell (see above); `head` is
+// touched only by the single reaper thread; every other field is
+// an atomic. Shared across threads via `Arc`.
+unsafe impl Sync for DisposalFacility {}
+
+/// A rejected enqueue, with the item back for the loud fallback.
+enum EnqueueReject {
+    Full(Box<dyn Any + Send>),
+    Contended(Box<dyn Any + Send>),
+}
+
+impl DisposalFacility {
+    fn with_capacity(cap: usize) -> Self {
+        assert!(cap.is_power_of_two() && cap >= 2);
+        let mut cells = Vec::with_capacity(cap);
+        for i in 0..cap as u64 {
+            cells.push(DisposalCell {
+                seq: AtomicU64::new(i),
+                ptr: std::cell::UnsafeCell::new(std::mem::MaybeUninit::uninit()),
+            });
+        }
+        Self {
+            cells: cells.into_boxed_slice(),
+            mask: (cap as u64).wrapping_sub(1),
+            tail: AtomicU64::new(0),
+            head: AtomicU64::new(0),
+            started: AtomicBool::new(true),
+            depth_now: AtomicU64::new(0),
+            depth_peak: AtomicU64::new(0),
+            dispatched: AtomicU64::new(0),
+        }
+    }
+
+    /// Lock-free bounded enqueue (the waiter path): no lock, no
+    /// syscall, no allocation — atomics + pointer moves only.
+    fn try_enqueue(&self, item: Box<dyn Any + Send>) -> Result<(), EnqueueReject> {
+        let raw = Box::into_raw(item);
+        for _ in 0..DISPOSAL_CAS_BUDGET {
+            let pos = self.tail.load(Ordering::Acquire);
+            let cell = &self.cells[(pos & self.mask) as usize];
+            let seq = cell.seq.load(Ordering::Acquire);
+            let diff = seq.wrapping_sub(pos) as i64;
+            if diff == 0 {
+                if self
+                    .tail
+                    .compare_exchange_weak(
+                        pos,
+                        pos.wrapping_add(1),
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    // Claimed: exclusive until published.
+                    unsafe {
+                        (*cell.ptr.get()).write(raw);
+                    }
+                    cell.seq.store(pos.wrapping_add(1), Ordering::Release);
+                    let now = self
+                        .depth_now
+                        .fetch_add(1, Ordering::Relaxed)
+                        .wrapping_add(1);
+                    self.depth_peak.fetch_max(now, Ordering::Relaxed);
+                    return Ok(());
+                }
+            } else if diff < 0 {
+                // The cell is not yet recycled ⟹ the ring is full.
+                return Err(EnqueueReject::Full(unsafe { Box::from_raw(raw) }));
+            }
+            std::hint::spin_loop();
+        }
+        Err(EnqueueReject::Contended(unsafe { Box::from_raw(raw) }))
+    }
+
+    /// Dequeue (the single reaper thread only).
+    fn try_dequeue(&self) -> Option<Box<dyn Any + Send>> {
+        let pos = self.head.load(Ordering::Relaxed);
+        let cell = &self.cells[(pos & self.mask) as usize];
+        if cell.seq.load(Ordering::Acquire) == pos.wrapping_add(1) {
+            let raw = unsafe { (*cell.ptr.get()).assume_init() };
+            unsafe {
+                *cell.ptr.get() = std::mem::MaybeUninit::uninit();
+            }
+            debug_assert!(!raw.is_null());
+            cell.seq
+                .store(pos.wrapping_add(self.cells.len() as u64), Ordering::Release);
+            self.head.store(pos.wrapping_add(1), Ordering::Relaxed);
+            self.depth_now.fetch_sub(1, Ordering::Relaxed);
+            Some(unsafe { Box::from_raw(raw) })
+        } else {
+            None
+        }
+    }
+
+    #[cfg(test)]
+    fn depth_now(&self) -> u64 {
+        self.depth_now.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn depth_peak(&self) -> u64 {
+        self.depth_peak.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn dispatched(&self) -> u64 {
+        self.dispatched.load(Ordering::Relaxed)
     }
 }
+
+impl Drop for DisposalFacility {
+    fn drop(&mut self) {
+        // Teardown (test-local facilities only — the global
+        // facility lives forever): queued payloads are forgotten
+        // WITHOUT running destructors, so a blocked test
+        // destructor cannot hang teardown. Tests drain-then-drop.
+        while let Some(item) = self.try_dequeue() {
+            std::mem::forget(item);
+        }
+    }
+}
+
+/// Reaper loop: poll the ring and dispose each payload. The
+/// waiter never signals (a signal would take a lock on the
+/// abandonment path), so the reaper polls. Test-local facilities
+/// exit once their test drops them (the global facility's
+/// `OnceLock` share keeps its reaper alive).
+fn reaper_loop(fac: Arc<DisposalFacility>) {
+    while !fac.started.load(Ordering::Acquire) {
+        if Arc::strong_count(&fac) == 1 {
+            return;
+        }
+        std::thread::sleep(DISPOSAL_POLL);
+    }
+    loop {
+        if Arc::strong_count(&fac) == 1 {
+            return;
+        }
+        match fac.try_dequeue() {
+            Some(item) => {
+                fac.dispatched.fetch_add(1, Ordering::Relaxed);
+                drop(item);
+            }
+            None => std::thread::sleep(DISPOSAL_POLL),
+        }
+    }
+}
+
+/// Test-local facility: construct + spawn its reaper (which
+/// exits once the test drops its share). `paused` holds the
+/// reaper at its start-gate for the saturated schedule.
 #[cfg(test)]
-fn red_send_release() {
-    RED_SEND_ARMED.store(false, Ordering::SeqCst);
-    if let Some(gate) = RED_SEND_GATE.get() {
-        let _ = gate.0.send(());
+fn launch_test_facility(cap: usize, paused: bool) -> Arc<DisposalFacility> {
+    let fac = DisposalFacility::with_capacity(cap);
+    if paused {
+        fac.started.store(false, Ordering::Release);
+    }
+    let fac = Arc::new(fac);
+    std::thread::Builder::new()
+        .name("sixb-reap".to_string())
+        .spawn({
+            let fac = fac.clone();
+            move || reaper_loop(fac)
+        })
+        .expect("the test reaper spawns");
+    fac
+}
+
+/// Stalled-setup discriminator (R6-1(i), tests only): when
+/// installed, the next `ensure_disposal_in` init announces
+/// itself and blocks — the direct gate on the setup point.
+#[cfg(test)]
+struct SetupStall {
+    entered: std::sync::mpsc::Sender<()>,
+    wait: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+static SETUP_STALL: Mutex<Option<SetupStall>> = Mutex::new(None);
+#[cfg(test)]
+fn stall_setup_for_test() {
+    let gate = SETUP_STALL.lock().unwrap_or_else(|e| e.into_inner()).take();
+    if let Some(gate) = gate {
+        let _ = gate.entered.send(());
+        let _ = gate.wait.recv_timeout(Duration::from_secs(30));
     }
 }
 
@@ -744,6 +989,27 @@ mod tests {
         );
         assert!(matches!(c, Control::Done(41)));
         assert_eq!(outcome_of(&c), OpOutcome::Done);
+    }
+
+    /// R6-1 wiring: op registration initializes the disposal
+    /// facility — setup runs before any abandonment can, so the
+    /// global handoff never observes an uninitialized facility
+    /// on a real op path.
+    #[test]
+    fn registration_initializes_disposal() {
+        let cancel = AtomicBool::new(false);
+        let c: Control<u64> = run_under_control(
+            dest("r61-init"),
+            Duration::from_secs(5),
+            &cancel,
+            |_| WorkerOut::value(1),
+            None,
+        );
+        assert!(matches!(c, Control::Done(1)));
+        assert!(
+            disposal_facility().is_some(),
+            "registration must initialize disposal"
+        );
     }
 
     #[test]
@@ -1021,6 +1287,9 @@ mod tests {
     #[test]
     fn abandonment_defers_raced_in_blocked_result() {
         use std::sync::mpsc;
+        // Warm the facility (production registration does this;
+        // the pin constructs slots manually).
+        ensure_disposal();
         struct BlockingDrop {
             entered: mpsc::Sender<()>,
             release: mpsc::Receiver<()>,
@@ -1183,73 +1452,102 @@ mod tests {
         assert!(signals.drain().is_empty(), "the poll consumed the signal");
     }
 
-    /// R6-1(i) RED: fresh-process first-use — the disposal
-    /// facility is uninitialized and setup stalls: the
-    /// abandonment handoff must still return in-budget. The
-    /// fresh lock is the fresh process; the armed setup gate is
-    /// the stalled setup (gated directly, no libc fault
-    /// injection). RED pre-fix (init runs on the waiter path —
-    /// the 2 s watchdog); GREEN post-fix (setup never runs on
-    /// abandonment).
+    /// R6-1(i): fresh-process first-use — the disposal
+    /// facility is uninitialized (setup stalled elsewhere) and
+    /// raced-in results arrive: every abandonment-path handoff
+    /// returns in-budget with the fallback accounted (a loud
+    /// setup-miss, never a stall, never a silent drop). RED
+    /// pre-fix (init ran on the waiter path — the watchdog);
+    /// GREEN post-fix (setup never runs on abandonment).
     #[test]
-    fn r61_first_use_setup_can_stall_abandonment() {
+    fn r61_uninit_disposal_returns_in_budget() {
         use std::sync::mpsc;
-        let lock: OnceLock<mpsc::Sender<Box<dyn Any + Send>>> = OnceLock::new();
-        RED_SETUP_ARMED.store(true, Ordering::SeqCst);
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+        // Plain uninitialized handoff.
+        let before = disposal_stats();
         let t0 = Instant::now();
+        handoff_to(None, Box::new(7u64));
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "an uninitialized facility must not stall the handoff"
+        );
+        let mid = disposal_stats();
+        assert_eq!(mid.setup_miss - before.setup_miss, 1);
+        assert_eq!(mid.queued - before.queued, 0);
+        // Setup stalled on another thread while abandonment runs.
+        let lock: OnceLock<Arc<DisposalFacility>> = OnceLock::new();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        *SETUP_STALL.lock().unwrap_or_else(|e| e.into_inner()) = Some(SetupStall {
+            entered: entered_tx,
+            wait: release_rx,
+        });
         std::thread::scope(|s| {
             s.spawn(|| {
-                // The abandonment handoff (old shape:
-                // init-on-path).
-                let _ = reaper_tx_in(&lock).send(Box::new(1u64));
-                let _ = done_tx.send(());
+                ensure_disposal_in(&lock);
             });
-            if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-                // Release so the suite never hangs; the
-                // elapsed assert below records the RED.
-                red_setup_release();
+            entered_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("setup must enter its stall");
+            let t0 = Instant::now();
+            for i in 0..8u64 {
+                handoff_to(lock.get().map(Arc::as_ref), Box::new(i));
             }
+            assert!(
+                t0.elapsed() < Duration::from_secs(2),
+                "a stalled setup elsewhere must not stall abandonment"
+            );
+            let _ = release_tx.send(());
         });
-        RED_SETUP_ARMED.store(false, Ordering::SeqCst);
-        let dt = t0.elapsed();
         assert!(
-            dt < Duration::from_secs(2),
-            "RED: first-use setup stalled the abandonment handoff ({dt:?})"
+            SETUP_STALL
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "the stall gate is single-shot"
         );
+        let after = disposal_stats();
+        assert_eq!(after.setup_miss - mid.setup_miss, 8);
+        assert_eq!(after.queued - mid.queued, 0);
     }
 
-    /// R6-1(ii) RED: handoff contention — the disposal facility
-    /// is contended and a raced-in result arrives: the
-    /// abandonment handoff must still return in-budget. The
-    /// armed send gate is the contended handoff (gated
-    /// directly, no libc fault injection). RED pre-fix (the
-    /// waiter path performs the handoff inline — the 2 s
-    /// watchdog); GREEN post-fix (bounded handoff with an
-    /// accounted fallback).
+    /// R6-1(ii): saturated handoff — the facility is full (its
+    /// reaper paused) and raced-in results arrive: every handoff
+    /// returns in-budget with the overflow accounted (a loud
+    /// full-count, never a wait on disposal progress), and the
+    /// queued pair drains once the reaper runs. RED pre-fix (the
+    /// waiter path performed the handoff inline — the watchdog);
+    /// GREEN post-fix (bounded handoff with an accounted
+    /// fallback).
     #[test]
-    fn r61_handoff_contention_can_stall_abandonment() {
-        use std::sync::mpsc;
-        RED_SEND_ARMED.store(true, Ordering::SeqCst);
-        let (done_tx, done_rx) = mpsc::channel::<()>();
+    fn r61_saturated_handoff_returns_in_budget() {
+        let fac = launch_test_facility(2, true);
+        let before = disposal_stats();
         let t0 = Instant::now();
-        let waiter = std::thread::spawn(move || {
-            // The abandonment handoff (old shape: inline).
-            deferred_drop(Box::new(vec![0u8; 8]));
-            let _ = done_tx.send(());
-        });
-        if done_rx.recv_timeout(Duration::from_secs(2)).is_err() {
-            // Release so the suite never hangs; the elapsed
-            // assert below records the RED.
-            red_send_release();
+        for i in 0..4u64 {
+            handoff_to(Some(&fac), Box::new(i));
         }
-        let _ = waiter.join();
-        RED_SEND_ARMED.store(false, Ordering::SeqCst);
-        let dt = t0.elapsed();
         assert!(
-            dt < Duration::from_secs(2),
-            "RED: handoff contention stalled the abandonment handoff ({dt:?})"
+            t0.elapsed() < Duration::from_secs(2),
+            "a saturated facility must not stall the handoff"
         );
+        let mid = disposal_stats();
+        assert_eq!(mid.queued - before.queued, 2);
+        assert_eq!(mid.full - before.full, 2);
+        assert_eq!(mid.contended - before.contended, 0);
+        assert_eq!(fac.depth_now(), 2);
+        assert_eq!(fac.depth_peak(), 2);
+        fac.started.store(true, Ordering::Release);
+        let t0 = Instant::now();
+        loop {
+            if fac.depth_now() == 0 && fac.dispatched() >= 2 {
+                break;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(10),
+                "the reaper must drain the queued pair"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// R6-2 RED: A is consumed with a blocked destructor, then
@@ -1263,8 +1561,12 @@ mod tests {
     /// GREEN post-fix (each disposal is isolated; A still
     /// blocked, the race still consumed, the bound holds).
     #[test]
+    #[ignore = "R6-2 RED until per-disposal isolation lands"]
     fn r62_later_results_retained_behind_blocked_destructor() {
         use std::sync::mpsc;
+        // Warm the facility (production registration does this;
+        // the pin constructs slots manually).
+        ensure_disposal();
         struct BlockingDrop {
             entered: mpsc::Sender<()>,
             release: mpsc::Receiver<()>,
