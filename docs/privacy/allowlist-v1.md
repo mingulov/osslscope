@@ -247,6 +247,7 @@ TRUNC_SEQ
 API_TOTALS
 API_THREADS
 API_WINDOW
+TRACE_MODE
 EVENTS
 CONFIG
 MEMBERS
@@ -587,10 +588,15 @@ The operational public EVP path branches before legacy argument capture. Its
 29 exact exported symbols (digest/cipher/MAC/KDF/PKEY/RAND) are a signature
 registry, independent of algorithm admission. Only task/namespace identity,
 observer cookies and documented C `int` return scalars participate. It performs
-no target argument, buffer, name or opaque-context reads and emits no hot-call
-ring messages. `API_TOTALS` holds 1024 cookie-bound 72-byte scalar aggregates;
-`API_THREADS` holds at most 4096 cookie/thread keys and bounded depth/overflow
-state (no arguments); `API_WINDOW` holds the admitted monotonic interval. Per-CPU
+no target argument, buffer, name or opaque-context reads and, in off/metadata
+trace modes, emits no hot-call ring messages. `API_TOTALS` holds 1024
+cookie-bound 72-byte scalar aggregates; `API_THREADS` holds at most 4096
+cookie/thread keys and bounded depth/overflow state (no arguments);
+`API_WINDOW` holds the admitted monotonic interval; `TRACE_MODE` holds the
+observer-programmed trace-mode word (no target data). In edge-bearing modes
+the operational path additionally emits ATTEMPT/RESULT edge records carrying
+pairing keys and return classes only — still no arguments, buffers, names, or
+raw return scalars. Per-CPU
 counters are summed only in the final snapshot. Final snapshots are read once after disarming;
 unpaired/depth/map/tail/unsupported-return and attachment/finality gaps remain
 explicit. These entries never join callback totals, policy assets or CBOM.
