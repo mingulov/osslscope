@@ -35,6 +35,7 @@ set -eu
 
 HOST_TOOLCHAIN="1.88.0"
 BPF_TOOLCHAIN="nightly-2026-05-20"
+BPF_LINKER_PIN="0.10.4"
 BPF_BINS="osslscope-harvest osslscope-count osslscope-members osslscope-provider-observation osslscope-focused-count"
 BPF_TARGET="bpfel-unknown-none"
 
@@ -159,8 +160,14 @@ if [ "$MODE" != "host" ]; then
     rustup component list --toolchain "$BPF_TOOLCHAIN" --installed 2>/dev/null | grep -q '^rust-src' \
         || fail_prereq "rust-src missing on $BPF_TOOLCHAIN (bpfel needs -Z build-std=core)" "rustup component add --toolchain $BPF_TOOLCHAIN rust-src"
     command -v bpf-linker >/dev/null 2>&1 \
-        || fail_prereq "bpf-linker not found on PATH" "install bpf-linker 0.10.4 manually (e.g. cargo install --locked bpf-linker --version 0.10.4)"
+        || fail_prereq "bpf-linker not found on PATH" "install bpf-linker $BPF_LINKER_PIN manually (e.g. cargo install --locked bpf-linker --version $BPF_LINKER_PIN)"
     BPF_LINKER_VER="$(bpf-linker --version 2>/dev/null || echo bpf-linker-unknown)"
+    # Exact pin: a missing or wrong-version linker miscompiles the
+    # BPF objects, so both refuse here (exit 3) in every BPF mode —
+    # check-only and build share these prereqs, and there is no
+    # silent fallback. Host-only builds need no linker and skip this.
+    [ "$BPF_LINKER_VER" = "bpf-linker $BPF_LINKER_PIN" ] \
+        || fail_prereq "bpf-linker is '$BPF_LINKER_VER', need exactly 'bpf-linker $BPF_LINKER_PIN'" "install bpf-linker $BPF_LINKER_PIN manually (e.g. cargo install --locked bpf-linker --version $BPF_LINKER_PIN)"
 fi
 
 # Cargo build-std reads the separately installed source tree, not compiler

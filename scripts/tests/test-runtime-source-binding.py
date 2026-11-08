@@ -23,7 +23,7 @@ if tool=='rustup':
   print(root/'tools'/('pinned-nightly-rustc' if any('nightly-' in arg for arg in args) else 'pinned-host-rustc'))
  else: print('rust-src')
  sys.exit()
-if tool=='bpf-linker': print('bpf-linker 0.10.4');sys.exit()
+if tool=='bpf-linker': print(os.environ.get('SOURCE_BINDING_LINKER_VERSION','bpf-linker 0.10.4'));sys.exit()
 nightly=any('nightly-' in arg for arg in args)
 if tool=='rustc' or tool.endswith('-rustc'):
  nightly=nightly or tool in ('pinned-nightly-rustc','alternate-rustc')
@@ -203,6 +203,44 @@ class BuildSourceBinding(unittest.TestCase):
             with self.subTest(options=options):
                 run=self.build(options);self.assertEqual(run.returncode,0,run.stdout+run.stderr)
                 self.assertIsNone(json.loads(self.manifest.read_bytes()).get('bpf_runtime_source'))
+
+    def linkerless_path(self):
+        # Fixture tools first, then a linker-free system tail: no
+        # bpf-linker may leak in from the ambient PATH.
+        return str(self.bin)+os.pathsep+'/usr/bin'+os.pathsep+'/bin'
+
+    def test_linker_missing_refuses_check_only(self):
+        (self.bin/'bpf-linker').unlink()
+        run=self.build(('--check-only',),PATH=self.linkerless_path())
+        self.assertEqual(run.returncode,3,run.stdout+run.stderr)
+        self.assertIn('bpf-linker not found',run.stderr)
+        self.assertIn('0.10.4',run.stderr)
+        self.assertFalse(self.manifest.exists())
+
+    def test_linker_wrong_version_refuses_check_only(self):
+        run=self.build(('--check-only',),SOURCE_BINDING_LINKER_VERSION='bpf-linker 0.9.1')
+        self.assertEqual(run.returncode,3,run.stdout+run.stderr)
+        self.assertIn('0.9.1',run.stderr)
+        self.assertIn('0.10.4',run.stderr)
+        self.assertFalse(self.manifest.exists())
+
+    def test_linker_wrong_version_refuses_build(self):
+        run=self.build((),SOURCE_BINDING_LINKER_VERSION='bpf-linker 0.10.5')
+        self.assertEqual(run.returncode,3,run.stdout+run.stderr)
+        self.assertIn('0.10.4',run.stderr)
+        self.assertFalse(self.manifest.exists())
+
+    def test_linker_pinned_version_passes_check_only(self):
+        run=self.build(('--check-only',))
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+        self.assertIn('bpf-linker 0.10.4',run.stdout)
+
+    def test_host_only_ignores_linker_absence(self):
+        # Host-only builds need no BPF linker; the pin applies to
+        # BPF modes only, where a wrong linker would miscompile.
+        (self.bin/'bpf-linker').unlink()
+        run=self.build(('--host-only','--check-only'),PATH=self.linkerless_path())
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
 
 
 if __name__=='__main__':
