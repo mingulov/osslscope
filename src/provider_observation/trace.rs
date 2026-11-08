@@ -4,22 +4,18 @@
 //! counts, §6D-3 histograms, §6D-7 record JSON, status/modes CLI) belong
 //! to T8.2b/c; this module produces paired edges, terminal buckets,
 //! retained detail, and counters.
+use super::wire::contract as c;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
-/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
-pub const TRACE_MODE_OFF: u32 = 0;
-/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
-pub const TRACE_MODE_METADATA: u32 = 1;
-/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
-pub const TRACE_MODE_LATENCY: u32 = 2;
-/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
-pub const TRACE_MODE_STATUS: u32 = 3;
-/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
-pub const TRACE_MODE_ALL: u32 = 4;
+/// `TRACE_MODE` map words (§6D-9 order, single-sourced from the BPF contract).
+pub use c::{
+    TRACE_MODE_ALL, TRACE_MODE_LATENCY, TRACE_MODE_METADATA, TRACE_MODE_OFF, TRACE_MODE_STATUS,
+};
 
 /// Edge-bearing predicate (§6D-0 D0-1): only 2/3/4 pair.
-pub fn trace_mode_edge_bearing(_mode: u32) -> bool {
-    todo!()
+pub fn trace_mode_edge_bearing(mode: u32) -> bool {
+    c::trace_edge_bearing(mode)
 }
 
 /// ATTEMPT/RESULT family (§6D-1).
@@ -36,13 +32,22 @@ pub enum TraceFamily {
 impl TraceFamily {
     /// Stable slot for received-count arrays.
     pub fn index(self) -> usize {
-        todo!()
+        match self {
+            TraceFamily::Lifecycle => 0,
+            TraceFamily::Fetch => 1,
+            TraceFamily::PublicApi => 2,
+        }
     }
 }
 
 /// Family demux BEFORE unknown-ID rejection (§6D-1). `None` ⟺ {0} ∪ {73+}.
-pub fn demux(_api: u32) -> Option<TraceFamily> {
-    todo!()
+pub fn demux(api: u32) -> Option<TraceFamily> {
+    match api {
+        1..=9 | 16..=19 => Some(TraceFamily::Lifecycle),
+        10..=15 => Some(TraceFamily::Fetch),
+        20..=72 => Some(TraceFamily::PublicApi),
+        _ => None,
+    }
 }
 
 /// Pair key (§6D-6): thread key + cookie + invocation.
@@ -62,8 +67,18 @@ pub struct PairKey {
 
 /// `key_hash16` (§6D-6): lowercase hex of the first 8 bytes of SHA-256
 /// over `le64(cookie) || le64(generation)`.
-pub fn key_hash16(_cookie: u64, _generation: u64) -> String {
-    todo!()
+pub fn key_hash16(cookie: u64, generation: u64) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cookie.to_le_bytes());
+    hasher.update(generation.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Decoded ATTEMPT edge (producer input).
@@ -152,9 +167,22 @@ pub struct RetainedEdge {
 }
 
 impl RetainedEdge {
-    /// Accounted bytes: canonical compact-encoding length.
+    /// Accounted bytes: canonical compact-encoding length
+    /// (`{"k":…,"pid":…,"tid":…,"gen":…,"h":"…","inv":…,"api":…,"ns":…,"o":…}`).
     pub fn retained_bytes(&self) -> usize {
-        todo!()
+        format!(
+            "{{\"k\":{},\"pid\":{},\"tid\":{},\"gen\":{},\"h\":\"{}\",\"inv\":{},\"api\":{},\"ns\":{},\"o\":{}}}",
+            self.kind,
+            self.key.pid,
+            self.key.tid,
+            self.key.generation,
+            key_hash16(self.key.cookie, self.key.generation),
+            self.key.invocation,
+            self.api,
+            self.monotonic_ns,
+            self.outcome,
+        )
+        .len()
     }
 }
 
@@ -226,7 +254,6 @@ pub struct TraceTotals {
 }
 
 /// Trace data-plane producer: demux + pairing + caps + counters.
-#[allow(dead_code)]
 pub struct TraceProducer {
     /// Active mode word.
     mode: u32,
@@ -261,7 +288,7 @@ pub struct TraceProducer {
     /// Window unpaired ATTEMPTs.
     unpaired_entries: u64,
     /// Window unpaired RESULTs.
-    pub(crate) unpaired_results: u64,
+    unpaired_results: u64,
     /// Window received.
     received: ReceivedCounts,
     /// Window nonmonotonic pairs.
@@ -286,69 +313,299 @@ struct PendingEdge {
 impl TraceProducer {
     /// Frozen defaults: mode off, §6D-5 caps.
     pub fn new() -> Self {
-        todo!()
+        Self::with_caps(TRACE_DETAIL_MAX_ROWS, TRACE_DETAIL_MAX_BYTES)
     }
 
     /// Test/custom budgets; production uses [`TraceProducer::new`].
-    pub fn with_caps(_max_rows: usize, _max_bytes: usize) -> Self {
-        todo!()
+    pub fn with_caps(max_rows: usize, max_bytes: usize) -> Self {
+        Self {
+            mode: TRACE_MODE_OFF,
+            max_rows,
+            max_bytes,
+            pending_attempts: HashMap::new(),
+            pending_results: HashMap::new(),
+            window: 0,
+            last_loss: [0; 8],
+            totals: TraceTotals::default(),
+            detail: Vec::new(),
+            detail_bytes: 0,
+            capped: false,
+            dropped: 0,
+            pairs: Vec::new(),
+            exemplars: Vec::new(),
+            paired: 0,
+            unpaired_entries: 0,
+            unpaired_results: 0,
+            received: ReceivedCounts::default(),
+            nonmonotonic_pairs: 0,
+            rejected_unknown_api: 0,
+        }
     }
 
     /// Host mode gate (BPF map programmed separately by the session).
-    pub fn set_mode(&mut self, _mode: u32) {
-        todo!()
+    pub fn set_mode(&mut self, mode: u32) {
+        self.mode = mode;
     }
 
     /// Active mode word.
     pub fn mode(&self) -> u32 {
-        todo!()
+        self.mode
     }
 
     /// Feed a decoded ATTEMPT (received always counted; pairing gated).
-    pub fn attempt(&mut self, _edge: AttemptEdge) {
-        todo!()
+    pub fn attempt(&mut self, edge: AttemptEdge) {
+        if let Some(family) = demux(edge.api) {
+            let slot = family.index();
+            self.received.attempts[slot] = self.received.attempts[slot].saturating_add(1);
+            self.totals.received.attempts[slot] =
+                self.totals.received.attempts[slot].saturating_add(1);
+        }
+        if !trace_mode_edge_bearing(self.mode) {
+            return;
+        }
+        self.retain(RetainedEdge {
+            kind: 1,
+            key: edge.key,
+            api: edge.api,
+            monotonic_ns: edge.monotonic_ns,
+            outcome: 0,
+        });
+        if let Some(held) = self.pending_results.remove(&edge.key) {
+            self.pair(
+                edge.key,
+                edge.api,
+                edge.monotonic_ns,
+                held.monotonic_ns,
+                held.outcome,
+            );
+        } else if self.pending_attempts.contains_key(&edge.key) {
+            // Duplicate ATTEMPT on a live key (BPF never emits this):
+            // the newcomer is the anomaly — conserve it as unpaired
+            // immediately and keep the pairable original pending.
+            self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+            self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+        } else {
+            self.pending_attempts.insert(
+                edge.key,
+                PendingEdge {
+                    window: self.window,
+                    api: edge.api,
+                    monotonic_ns: edge.monotonic_ns,
+                    outcome: 0,
+                },
+            );
+        }
     }
 
     /// Feed a decoded RESULT (received always counted; pairing gated).
-    pub fn result(&mut self, _edge: ResultEdge) {
-        todo!()
+    pub fn result(&mut self, edge: ResultEdge) {
+        if let Some(family) = demux(edge.api) {
+            let slot = family.index();
+            self.received.results[slot] = self.received.results[slot].saturating_add(1);
+            self.totals.received.results[slot] =
+                self.totals.received.results[slot].saturating_add(1);
+        }
+        if !trace_mode_edge_bearing(self.mode) {
+            return;
+        }
+        self.retain(RetainedEdge {
+            kind: 2,
+            key: edge.key,
+            api: edge.api,
+            monotonic_ns: edge.monotonic_ns,
+            outcome: edge.outcome,
+        });
+        if let Some(held) = self.pending_attempts.remove(&edge.key) {
+            self.pair(
+                edge.key,
+                held.api,
+                held.monotonic_ns,
+                edge.monotonic_ns,
+                edge.outcome,
+            );
+        } else if self.pending_results.contains_key(&edge.key) {
+            // Duplicate RESULT on a live key: conserve the newcomer
+            // as unpaired immediately, keep the original pending.
+            self.unpaired_results = self.unpaired_results.saturating_add(1);
+            self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+        } else {
+            self.pending_results.insert(
+                edge.key,
+                PendingEdge {
+                    window: self.window,
+                    api: edge.api,
+                    monotonic_ns: edge.monotonic_ns,
+                    outcome: edge.outcome,
+                },
+            );
+        }
     }
 
     /// Count one decode-domain unknown-ID record.
     pub fn reject_unknown(&mut self) {
-        todo!()
+        self.rejected_unknown_api = self.rejected_unknown_api.saturating_add(1);
+        self.totals.rejected_unknown_api = self.totals.rejected_unknown_api.saturating_add(1);
     }
 
     /// Seal the current window; `loss_abs` is the cumulative 8-lane read.
     pub fn close_window(
         &mut self,
-        _window_seq: u64,
-        _now_ns: u64,
-        _loss_abs: [u64; 8],
+        window_seq: u64,
+        now_ns: u64,
+        loss_abs: [u64; 8],
     ) -> ClosedTraceWindow {
-        todo!()
+        let current = self.window;
+        let stale_attempts: Vec<PairKey> = self
+            .pending_attempts
+            .iter()
+            .filter(|(_, held)| held.window < current)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale_attempts {
+            if let Some(held) = self.pending_attempts.remove(&key) {
+                self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+                self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+                self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
+            }
+        }
+        let stale_results: Vec<PairKey> = self
+            .pending_results
+            .iter()
+            .filter(|(_, held)| held.window < current)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale_results {
+            if let Some(held) = self.pending_results.remove(&key) {
+                self.unpaired_results = self.unpaired_results.saturating_add(1);
+                self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+                self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
+            }
+        }
+        let mut ring_loss = [0u64; 8];
+        for index in 0..8 {
+            ring_loss[index] = loss_abs[index].saturating_sub(self.last_loss[index]);
+            self.last_loss[index] = loss_abs[index];
+        }
+        let sealed = ClosedTraceWindow {
+            window_seq,
+            mode: self.mode,
+            paired: self.paired,
+            unpaired_entries: self.unpaired_entries,
+            unpaired_results: self.unpaired_results,
+            received: self.received,
+            depth_exceeded: ring_loss[2],
+            dropped: self.dropped,
+            capped: self.capped,
+            nonmonotonic_pairs: self.nonmonotonic_pairs,
+            rejected_unknown_api: self.rejected_unknown_api,
+            ring_loss,
+            detail: std::mem::take(&mut self.detail),
+            pairs: std::mem::take(&mut self.pairs),
+            exemplars: std::mem::take(&mut self.exemplars),
+        };
+        if sealed.capped {
+            self.totals.capped_windows = self.totals.capped_windows.saturating_add(1);
+        }
+        self.totals.windows = self.totals.windows.saturating_add(1);
+        self.detail_bytes = 0;
+        self.capped = false;
+        self.dropped = 0;
+        self.paired = 0;
+        self.unpaired_entries = 0;
+        self.unpaired_results = 0;
+        self.received = ReceivedCounts::default();
+        self.nonmonotonic_pairs = 0;
+        self.rejected_unknown_api = 0;
+        self.window = self.window.saturating_add(1);
+        sealed
     }
 
     /// Terminal finalize: every held edge lands unpaired.
-    pub fn finalize(&mut self, _now_ns: u64) {
-        todo!()
+    pub fn finalize(&mut self, now_ns: u64) {
+        for (key, held) in std::mem::take(&mut self.pending_attempts) {
+            self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+            self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+            self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
+        }
+        for (key, held) in std::mem::take(&mut self.pending_results) {
+            self.unpaired_results = self.unpaired_results.saturating_add(1);
+            self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+            self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
+        }
     }
 
     /// Cumulative totals.
     pub fn totals(&self) -> TraceTotals {
-        todo!()
+        self.totals
+    }
+
+    fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, class: u32) {
+        // §6D-3: zero/negative deltas are unusable durations but real pairs.
+        let nonmonotonic = result_ns <= attempt_ns;
+        let duration_ns = if nonmonotonic {
+            0
+        } else {
+            result_ns - attempt_ns
+        };
+        self.pairs.push(PairedEdge {
+            key,
+            api,
+            class,
+            attempt_ns,
+            result_ns,
+            duration_ns,
+            nonmonotonic,
+        });
+        self.paired = self.paired.saturating_add(1);
+        self.totals.paired = self.totals.paired.saturating_add(1);
+        if nonmonotonic {
+            self.nonmonotonic_pairs = self.nonmonotonic_pairs.saturating_add(1);
+            self.totals.nonmonotonic_pairs = self.totals.nonmonotonic_pairs.saturating_add(1);
+        }
+    }
+
+    fn retain(&mut self, row: RetainedEdge) {
+        if self.capped {
+            self.dropped = self.dropped.saturating_add(1);
+            self.totals.dropped = self.totals.dropped.saturating_add(1);
+            return;
+        }
+        let bytes = row.retained_bytes();
+        if self.detail.len() >= self.max_rows
+            || self.detail_bytes.saturating_add(bytes) > self.max_bytes
+        {
+            self.capped = true;
+            self.dropped = self.dropped.saturating_add(1);
+            self.totals.dropped = self.totals.dropped.saturating_add(1);
+            return;
+        }
+        self.detail.push(row);
+        self.detail_bytes = self.detail_bytes.saturating_add(bytes);
+    }
+
+    fn push_exemplar(&mut self, dir: ExemplarDir, key: PairKey, held: PendingEdge, now_ns: u64) {
+        let seen = self.exemplars.iter().filter(|e| e.dir == dir).count();
+        if seen >= 8 {
+            return;
+        }
+        self.exemplars.push(TraceExemplar {
+            dir,
+            key_hash16: key_hash16(key.cookie, key.generation),
+            api: held.api,
+            age_ns: now_ns.saturating_sub(held.monotonic_ns),
+        });
     }
 }
 
 impl Default for TraceProducer {
     fn default() -> Self {
-        todo!()
+        Self::new()
     }
 }
 
 /// Subset check (§6D-4): trace depth overflow ⊇ aggregate depth overflow.
-pub fn depth_subset_holds(_trace_depth_exceeded: u64, _aggregate_depth: u64) -> bool {
-    todo!()
+pub fn depth_subset_holds(trace_depth_exceeded: u64, aggregate_depth: u64) -> bool {
+    trace_depth_exceeded >= aggregate_depth
 }
 
 #[cfg(test)]
@@ -725,6 +982,22 @@ mod tests {
         let w1 = p.close_window(1, 3000, [1, 2, 5, 4, 5, 6, 7, 8]);
         assert_eq!(w1.ring_loss, [0, 0, 2, 0, 0, 0, 0, 0]);
         assert_eq!(w1.depth_exceeded, 2);
+    }
+
+    #[test]
+    fn duplicate_edges_conserve_newcomer_unpaired() {
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.attempt(attempt(k, 20, 1100));
+        p.result(result(k, 20, 1500, 1));
+        p.finalize(2000);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!(t.unpaired_entries, 1);
+        assert_eq!(t.unpaired_results, 0);
+        let ra: u64 = t.received.attempts.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
     }
 
     #[test]

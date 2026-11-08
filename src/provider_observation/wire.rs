@@ -50,7 +50,7 @@ fn outcome(v: u32) -> Result<ApiOutcome, ObservationGap> {
         0 => ApiOutcome::Unknown,
         1 => ApiOutcome::Success,
         // §6D-0 D0-4: the frozen `Failure <- {failure, empty, retry}` fold.
-        2 | 3 | 4 => ApiOutcome::Failure,
+        2..=4 => ApiOutcome::Failure,
         _ => return Err(ObservationGap::InvalidWire),
     })
 }
