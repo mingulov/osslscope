@@ -81,6 +81,36 @@ pub fn key_hash16(cookie: u64, generation: u64) -> String {
     out
 }
 
+/// Hash-bound pairing identity for producer outputs (§6D-6): the full
+/// pairing identity MINUS the raw cookie. Pairing maps keep full keys;
+/// everything leaving the pairing core carries this form.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct HashedKey {
+    /// Executing pid.
+    pub pid: u32,
+    /// Executing tid.
+    pub tid: u32,
+    /// Scope/authority generation.
+    pub generation: u64,
+    /// `key_hash16` over the cookie.
+    pub key_hash16: String,
+    /// Pending-path invocation counter.
+    pub invocation: u64,
+}
+
+impl HashedKey {
+    /// Bind a full pairing key to its output form.
+    pub fn of(key: &PairKey) -> Self {
+        Self {
+            pid: key.pid,
+            tid: key.tid,
+            generation: key.generation,
+            key_hash16: key_hash16(key.cookie, key.generation),
+            invocation: key.invocation,
+        }
+    }
+}
+
 /// Decoded ATTEMPT edge (producer input).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct AttemptEdge {
@@ -106,10 +136,10 @@ pub struct ResultEdge {
 }
 
 /// A paired ATTEMPT/RESULT (§6D-6).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct PairedEdge {
-    /// Pair key.
-    pub key: PairKey,
+    /// Hash-bound pair key (never the raw cookie).
+    pub key: HashedKey,
     /// API ID.
     pub api: u32,
     /// RAW return class (0..4, §6D-2 function value).
@@ -152,12 +182,12 @@ pub const TRACE_DETAIL_MAX_ROWS: usize = 4096;
 pub const TRACE_DETAIL_MAX_BYTES: usize = 1_048_576;
 
 /// One retained detail row: a received edge.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RetainedEdge {
     /// 1 = ATTEMPT, 2 = RESULT.
     pub kind: u32,
-    /// Pair key.
-    pub key: PairKey,
+    /// Hash-bound pair key (never the raw cookie).
+    pub key: HashedKey,
     /// API ID.
     pub api: u32,
     /// Producer timestamp.
@@ -176,7 +206,7 @@ impl RetainedEdge {
             self.key.pid,
             self.key.tid,
             self.key.generation,
-            key_hash16(self.key.cookie, self.key.generation),
+            self.key.key_hash16,
             self.key.invocation,
             self.api,
             self.monotonic_ns,
@@ -365,7 +395,7 @@ impl TraceProducer {
         }
         self.retain(RetainedEdge {
             kind: 1,
-            key: edge.key,
+            key: HashedKey::of(&edge.key),
             api: edge.api,
             monotonic_ns: edge.monotonic_ns,
             outcome: 0,
@@ -410,7 +440,7 @@ impl TraceProducer {
         }
         self.retain(RetainedEdge {
             kind: 2,
-            key: edge.key,
+            key: HashedKey::of(&edge.key),
             api: edge.api,
             monotonic_ns: edge.monotonic_ns,
             outcome: edge.outcome,
@@ -548,7 +578,7 @@ impl TraceProducer {
             result_ns - attempt_ns
         };
         self.pairs.push(PairedEdge {
-            key,
+            key: HashedKey::of(&key),
             api,
             class,
             attempt_ns,
@@ -878,7 +908,7 @@ mod tests {
         probe.attempt(attempt(k, 20, 1000));
         let one = RetainedEdge {
             kind: 1,
-            key: k,
+            key: HashedKey::of(&k),
             api: 20,
             monotonic_ns: 1000,
             outcome: 0,
@@ -998,6 +1028,33 @@ mod tests {
         assert_eq!(t.unpaired_results, 0);
         let ra: u64 = t.received.attempts.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
+    }
+
+    #[test]
+    fn outputs_carry_hashes_not_cookies() {
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        p.attempt(attempt(key(10, 11, 1, 101, 8), 22, 1100));
+        let w0 = p.close_window(0, 2000, [0; 8]);
+        assert_eq!(w0.pairs.len(), 1);
+        assert_eq!(w0.pairs[0].key.key_hash16, key_hash16(100, 1));
+        assert_eq!(
+            (
+                w0.pairs[0].key.pid,
+                w0.pairs[0].key.tid,
+                w0.pairs[0].key.generation,
+                w0.pairs[0].key.invocation
+            ),
+            (10, 11, 1, 7)
+        );
+        assert_eq!(w0.detail.len(), 3);
+        assert_eq!(w0.detail[0].key.key_hash16, key_hash16(100, 1));
+        let w = p.close_window(1, 3000, [0; 8]);
+        assert_eq!(w.unpaired_entries, 1);
+        assert_eq!(w.exemplars.len(), 1);
+        assert_eq!(w.exemplars[0].key_hash16, key_hash16(101, 1));
     }
 
     #[test]
