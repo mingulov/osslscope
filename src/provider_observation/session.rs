@@ -416,6 +416,7 @@ pub struct ProviderSession {
     loss: PerCpuArray<MapData, u64>,
     api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate>,
     api_window: Array<MapData, c::Range>,
+    trace_mode: Array<MapData, u32>,
     api_owners: BTreeMap<u64, (u32, u64, u32)>,
     startup: BTreeMap<u32, Vec<Attachment>>,
     targets: BTreeMap<u32, Target>,
@@ -1982,6 +1983,7 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
         ("API_TOTALS", 5, 8, 72, 1024),
         ("API_THREADS", 1, 24, 16, 4096),
         ("API_WINDOW", 2, 4, 16, 1),
+        ("TRACE_MODE", 2, 4, 4, 1),
         ("ALG_CLASS", 1, 8, 42, 1024),
         ("TRIP_CLASS", 1, 8, 22, 64),
     ];
@@ -2230,6 +2232,11 @@ impl ProviderSession {
                 0,
             )
             .map_err(|_| ObservationGap::BpfUnavailable)?;
+        let mut trace_mode = Array::try_from(map(&loaded, "TRACE_MODE")?)
+            .map_err(|_| ObservationGap::InvalidObject)?;
+        trace_mode
+            .set(0, 0u32, 0)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
         Ok(Self {
             gate,
             final_drain: false,
@@ -2238,6 +2245,7 @@ impl ProviderSession {
             api_totals: PerCpuHashMap::try_from(map(&loaded, "API_TOTALS")?)
                 .map_err(|_| ObservationGap::InvalidObject)?,
             api_window,
+            trace_mode,
             api_owners: BTreeMap::new(),
             startup: BTreeMap::new(),
             events: RingBuf::try_from(map(&loaded, "EVENTS")?)
@@ -4194,6 +4202,16 @@ impl ProviderSession {
         }
         self.api_window
             .set(0, c::Range { start, end }, 0)
+            .map_err(|_| ObservationGap::BpfUnavailable)
+    }
+    /// Program the `TRACE_MODE` word (§6D-0 D0-1, §6D-9 order). Modes are
+    /// restart-scoped; any word outside 2/3/4 runs the maps-only path.
+    pub fn set_trace_mode(&mut self, mode: u32) -> Result<(), ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
+        self.trace_mode
+            .set(0, mode, 0)
             .map_err(|_| ObservationGap::BpfUnavailable)
     }
     fn retire_startup(&mut self, pid: u32, b: &mut ObservationBatch) -> StartupRetire {
@@ -7967,13 +7985,14 @@ mod tests {
         // (typed admission/bind/pending frames, exact-name/digest index,
         // selector dictionary, thread identity, partition/control/segment
         // index/loss; REL itself pre-existed) and the typed entry/return pair.
-        assert_eq!(prepared.maps.len(), 34);
+        // T8.2a adds the TRACE_MODE legacy map (§6D-0 D0-1): 34 -> 35.
+        assert_eq!(prepared.maps.len(), 35);
         assert_eq!(prepared.progs.len(), 8);
         for root in &prepared.progs {
             assert!(root.map_fixups.iter().any(|site| site.map == "ADMIT"));
         }
         let (prepared, source) = split_source_preparation(prepared);
-        assert_eq!((prepared.maps.len(), prepared.progs.len()), (16, 2));
+        assert_eq!((prepared.maps.len(), prepared.progs.len()), (17, 2));
         assert_eq!((source.maps.len(), source.progs.len()), (18, 6));
         let all_maps: std::collections::BTreeSet<_> = prepared
             .maps

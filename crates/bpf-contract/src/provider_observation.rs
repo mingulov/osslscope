@@ -366,6 +366,20 @@ pub const fn operational_outcome(api: u32, rv: u64) -> u32 {
 pub const fn operational_api(api: u32) -> bool {
     api >= 20 && api <= 72
 }
+/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
+pub const TRACE_MODE_OFF: u32 = 0;
+/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
+pub const TRACE_MODE_METADATA: u32 = 1;
+/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
+pub const TRACE_MODE_LATENCY: u32 = 2;
+/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
+pub const TRACE_MODE_STATUS: u32 = 3;
+/// `TRACE_MODE` map words (§6D-9 order, shared BPF/host).
+pub const TRACE_MODE_ALL: u32 = 4;
+/// Edge-bearing predicate (§6D-0 D0-1): only 2/3/4 emit operational edges.
+pub const fn trace_edge_bearing(mode: u32) -> bool {
+    matches!(mode, 2..=4)
+}
 /// Cookie-bound scalars; no target handles or arguments. Counters are per CPU.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -386,4 +400,29 @@ pub struct ApiAggregate {
 pub struct ApiThreadKey {
     pub thread: ThreadKey,
     pub cookie: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trace_mode_words_match_frozen_order() {
+        assert_eq!(
+            (
+                TRACE_MODE_OFF,
+                TRACE_MODE_METADATA,
+                TRACE_MODE_LATENCY,
+                TRACE_MODE_STATUS,
+                TRACE_MODE_ALL
+            ),
+            (0, 1, 2, 3, 4)
+        );
+        for mode in [0, 1, 5, 6, 100, u32::MAX] {
+            assert!(!trace_edge_bearing(mode), "mode {mode}");
+        }
+        for mode in [2, 3, 4] {
+            assert!(trace_edge_bearing(mode), "mode {mode}");
+        }
+    }
 }

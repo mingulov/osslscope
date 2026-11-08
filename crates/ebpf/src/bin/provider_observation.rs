@@ -52,6 +52,8 @@ static TRIP_CLASS: HashMap<u64, TripClassValue> = HashMap::with_max_entries(64, 
 #[map]
 static API_WINDOW: Array<Range> = Array::with_max_entries(1, 0);
 #[map]
+static TRACE_MODE: Array<u32> = Array::with_max_entries(1, 0);
+#[map]
 static API_TOTALS: PerCpuHashMap<u64, ApiAggregate> = PerCpuHashMap::with_max_entries(1024, 0);
 #[map]
 static API_THREADS: HashMap<ApiThreadKey, Thread> = HashMap::with_max_entries(4096, 0);
@@ -146,6 +148,11 @@ pub fn operational_return(cookie: u64, key: &ThreadKey, api: u32, rv: u64) {
             _ => api_increment(core::ptr::addr_of_mut!((*total).unsupported_return)),
         }
     }
+}
+/// §6D-0 D0-1 mode gate: unreadable/missing entry reads as off (fail-closed).
+#[inline(always)]
+fn trace_operational() -> bool {
+    trace_edge_bearing(TRACE_MODE.get(0).copied().unwrap_or(TRACE_MODE_OFF))
 }
 #[inline(always)]
 fn loss(n: u32) {
@@ -286,7 +293,10 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     };
     if operational_api(cfg.api) {
         operational_entry(cookie, &key);
-        return 0;
+        if !trace_operational() {
+            return 0;
+        }
+        // Edge-bearing: fall through to the shared Pending/emit path (D0-2/D0-3).
     }
     let mut thread = unsafe { THREADS.get(&key).copied() }.unwrap_or_default();
     let old_depth = thread.depth;
@@ -846,7 +856,19 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     if let Some((cfg, key)) = identity(cookie) {
         if operational_api(cfg.api) {
-            operational_return(cookie, &key, cfg.api, ctx.ret());
+            let rv = ctx.ret();
+            operational_return(cookie, &key, cfg.api, rv);
+            if trace_operational() {
+                let mut tkey = ThreadKey::default();
+                let mut pend = Pending::default();
+                if pop_return(cookie, &mut tkey, &mut pend) {
+                    let mut r = Record::default();
+                    base(&pend, &tkey, RESULT, &mut r);
+                    r.status = 0;
+                    r.outcome = operational_outcome(pend.api, rv);
+                    emit(&r);
+                }
+            }
             return 0;
         }
     }
