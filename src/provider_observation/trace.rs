@@ -220,8 +220,8 @@ pub const TRACE_DETAIL_MAX_BYTES: usize = 1_048_576;
 /// by F3) — so it is FIXED-CAPPED correctness state with
 /// kernel-mirrored bounds. BPF `PENDING`/`THREADS`/`API_THREADS`
 /// are 4096-entry maps; the host mirrors 4096 per pairing
-/// structure (pending ATTEMPTs, pending RESULTs, scopes,
-/// tombstones). FIFO eviction (oldest first): every evicted
+/// structure (pending ATTEMPTs, pending RESULTs, scopes, retire
+/// epochs). FIFO eviction (oldest first): every evicted
 /// pending counts unpaired immediately (+ exemplar) but NEVER
 /// advances the high-water (eviction ≠ consumption — the
 /// counterpart may still arrive; terminal buckets stay
@@ -353,24 +353,26 @@ pub struct TraceProducer {
     max_rows: usize,
     /// Byte budget.
     max_bytes: usize,
-    /// Pending ATTEMPTs by key (G1: ≤ cap, FIFO-evicted).
-    pending_attempts: HashMap<PairKey, PendingEdge>,
+    /// Pending ATTEMPTs by epoch-tagged key (G1: ≤ cap, FIFO-evicted).
+    pending_attempts: HashMap<EpochKey, PendingEdge>,
     /// FIFO index: (insert window, sequence) → key. Bounded by
     /// the cap (exactly one entry per pending).
-    pending_attempt_order: BTreeMap<(u64, u64), PairKey>,
-    /// Pending RESULTs by key (G1: ≤ cap, FIFO-evicted).
-    pending_results: HashMap<PairKey, PendingEdge>,
+    pending_attempt_order: BTreeMap<(u64, u64), EpochKey>,
+    /// Pending RESULTs by epoch-tagged key (G1: ≤ cap, FIFO-evicted).
+    pending_results: HashMap<EpochKey, PendingEdge>,
     /// FIFO index for pending RESULTs (bounded by the cap).
-    pending_result_order: BTreeMap<(u64, u64), PairKey>,
+    pending_result_order: BTreeMap<(u64, u64), EpochKey>,
     /// Per-scope invocation high-water (F3: consumed keys never re-pair).
     inv_hw: HashMap<ScopeKey, ScopeHw>,
     /// FIFO index for scopes (bounded by the cap).
     scope_order: BTreeMap<(u64, u64), ScopeKey>,
-    /// G3 tombstones: (pid,tid) → retire record (≤ cap,
-    /// FIFO-evicted; recorded in off-mode too).
-    retired: BTreeMap<(u32, u32), RetiredScope>,
-    /// FIFO index for tombstones (bounded by the cap).
-    retired_order: BTreeMap<(u64, u64), (u32, u32)>,
+    /// Retire epochs (fix3, replaces the G3 retire markers): (pid,tid) →
+    /// retire record (≤ cap, FIFO-evicted; bumped in off-mode
+    /// too). Absent ⟺ epoch 0 (never retired — feeds never
+    /// insert here, so the map holds retired tids only).
+    epochs: BTreeMap<(u32, u32), RetireEpoch>,
+    /// FIFO index for retire epochs (bounded by the cap).
+    epoch_order: BTreeMap<(u64, u64), (u32, u32)>,
     /// Insertion sequence (monotonic; wrapping — 2^64 inserts
     /// unreachable, and every index entry dies with its map).
     order_seq: u64,
@@ -427,8 +429,22 @@ struct PendingEdge {
     seq: u64,
 }
 
+/// Epoch-tagged pairing key (fix3): the retire epoch is part of
+/// the pairing identity, so cross-incarnation edges never pair.
+/// Wire keys are UNCHANGED (outputs still bind the bare
+/// `PairKey` — `HashedKey::of`, exemplars, `key_hash16`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct EpochKey {
+    /// The tid's retire epoch at feed time (`epoch_of`).
+    epoch: u64,
+    /// Full wire pairing key.
+    key: PairKey,
+}
+
 /// Pairing scope: the THREADS-row scope (contract `ThreadKey` —
-/// `pid`, `tid`, `generation` — the key `invocation` counts under).
+/// `pid`, `tid`, `generation` — the key `invocation` counts
+/// under), qualified by the retire epoch (HW is per-epoch,
+/// dropped at bump — fix3).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ScopeKey {
     /// Executing pid.
@@ -437,31 +453,35 @@ struct ScopeKey {
     tid: u32,
     /// Scope/authority generation.
     generation: u64,
+    /// Retire epoch (high-water namespace).
+    epoch: u64,
 }
 
 impl ScopeKey {
-    /// Project a full pairing key to its scope.
-    fn of(key: &PairKey) -> Self {
+    /// Project an epoch-tagged pairing key to its scope.
+    fn of(key: &EpochKey) -> Self {
         Self {
-            pid: key.pid,
-            tid: key.tid,
-            generation: key.generation,
+            pid: key.key.pid,
+            tid: key.key.tid,
+            generation: key.key.generation,
+            epoch: key.epoch,
         }
     }
 }
 
-/// G3 tombstone visibility: a retired scope's edges go
-/// immediate-unpaired for this many producer windows, then the
-/// scope is fresh (HW=None).
-const TRACE_TOMBSTONE_WINDOWS: u64 = 2;
-
-/// G3 tombstone: a retired (pid,tid)'s recorded retire window
-/// (covers EVERY generation for the tid).
+/// Retire epoch record (fix3, replaces the G3 retire marker): a
+/// retired (pid,tid)'s incarnation counter (covers EVERY
+/// generation for the tid). The boundary is PERMANENT — no
+/// window-counted expiry can be outrun by a late edge (codex
+/// R3-2); the session bumps only after a full retire-drain
+/// proves no old-incarnation edge remains queued.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct RetiredScope {
-    /// Producer window of the retire.
-    retire_window: u64,
-    /// Insertion sequence (FIFO order key with `retire_window`).
+struct RetireEpoch {
+    /// Current retire epoch (1 after the first bump; absent ⟺ 0).
+    epoch: u64,
+    /// Producer window of the insert (FIFO order key with `seq`).
+    insert_window: u64,
+    /// Insertion sequence.
     seq: u64,
 }
 
@@ -498,8 +518,8 @@ impl TraceProducer {
             pending_result_order: BTreeMap::new(),
             inv_hw: HashMap::new(),
             scope_order: BTreeMap::new(),
-            retired: BTreeMap::new(),
-            retired_order: BTreeMap::new(),
+            epochs: BTreeMap::new(),
+            epoch_order: BTreeMap::new(),
             order_seq: 0,
             window: 0,
             last_loss: [0; 8],
@@ -557,35 +577,34 @@ impl TraceProducer {
             monotonic_ns: edge.monotonic_ns,
             outcome: 0,
         });
-        // G3: tombstoned scope — immediate unpaired (visible +
-        // exemplar, NEVER paired, NEVER silent), never a touch
-        // (immediate-unpaired must not refresh the scope clock).
-        if self.tombstoned(edge.key.pid, edge.key.tid) {
-            self.unpaired_entries = self.unpaired_entries.saturating_add(1);
-            self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
-            self.push_live_exemplar(ExemplarDir::Entry, edge.key, edge.api);
-            return;
-        }
+        // fix3: tag with the tid's current retire epoch — the epoch
+        // is part of the pairing identity, so a pre-bump hold never
+        // pairs with a post-bump edge (no window-counted rejection:
+        // the new incarnation pairs from invocation 1 immediately).
+        let ekey = EpochKey {
+            epoch: self.epoch_of(edge.key.pid, edge.key.tid),
+            key: edge.key,
+        };
         // F4: a held RESULT pairs only in its arrival window
         // (frozen §6D-6 is forward-only: the RESULT lands in the
         // ATTEMPT's SAME or NEXT window — same-window inversion
         // still pairs, cross-window reverse carry never does).
         let held_same_window = self
             .pending_results
-            .get(&edge.key)
+            .get(&ekey)
             .is_some_and(|held| held.window == self.window);
         if held_same_window {
             let held = self
-                .pending_result_remove(&edge.key)
+                .pending_result_remove(&ekey)
                 .expect("held RESULT just observed");
             self.pair(
-                edge.key,
+                ekey,
                 edge.api,
                 edge.monotonic_ns,
                 held.monotonic_ns,
                 held.outcome,
             );
-        } else if self.pending_results.contains_key(&edge.key) {
+        } else if self.pending_results.contains_key(&ekey) {
             // G2: cross-window held RESULT — STALE. It can never
             // pair afterward (any same-key future ATTEMPT lands
             // same-or-later window = reverse or dup), so evict it
@@ -596,15 +615,15 @@ impl TraceProducer {
             // from the high-water; window attribution is identical
             // to close-expiry. Load-bearing order: evict-stale →
             // HW → pending.
-            if let Some(held) = self.pending_result_remove(&edge.key) {
+            if let Some(held) = self.pending_result_remove(&ekey) {
                 self.unpaired_results = self.unpaired_results.saturating_add(1);
                 self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
-                self.push_live_exemplar(ExemplarDir::Result, edge.key, held.api);
+                self.push_live_exemplar(ExemplarDir::Result, ekey.key, held.api);
             }
-            if self.is_hw_dup(&edge.key) {
+            if self.is_hw_dup(&ekey) {
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
-            } else if self.pending_attempts.contains_key(&edge.key) {
+            } else if self.pending_attempts.contains_key(&ekey) {
                 // The anomaly when an ATTEMPT is already live
                 // (same bucket as the HW-dup above — both
                 // conserve the newcomer as unpaired immediately).
@@ -612,21 +631,21 @@ impl TraceProducer {
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
             } else {
                 // Fresh key: pending-then-correct as before.
-                self.pending_attempt_insert(edge.key, edge.api, edge.monotonic_ns);
+                self.pending_attempt_insert(ekey, edge.api, edge.monotonic_ns);
             }
-        } else if self.pending_attempts.contains_key(&edge.key) {
+        } else if self.pending_attempts.contains_key(&ekey) {
             // Duplicate ATTEMPT on a live key (BPF never emits this):
             // the newcomer is the anomaly — conserve it as unpaired
             // immediately and keep the pairable original pending.
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
-        } else if self.is_hw_dup(&edge.key) {
+        } else if self.is_hw_dup(&ekey) {
             // F3: consumed-or-older invocation with no live state —
             // a replay, never a re-pair (frozen §6D-6).
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
         } else {
-            self.pending_attempt_insert(edge.key, edge.api, edge.monotonic_ns);
+            self.pending_attempt_insert(ekey, edge.api, edge.monotonic_ns);
         }
     }
 
@@ -654,34 +673,31 @@ impl TraceProducer {
             monotonic_ns: edge.monotonic_ns,
             outcome: edge.outcome,
         });
-        // G3: tombstoned scope — immediate unpaired (visible +
-        // exemplar, NEVER paired, NEVER silent), never a touch.
-        if self.tombstoned(edge.key.pid, edge.key.tid) {
-            self.unpaired_results = self.unpaired_results.saturating_add(1);
-            self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
-            self.push_live_exemplar(ExemplarDir::Result, edge.key, edge.api);
-            return;
-        }
-        if let Some(held) = self.pending_attempt_remove(&edge.key) {
+        // fix3: epoch tag (see `attempt` — same boundary).
+        let ekey = EpochKey {
+            epoch: self.epoch_of(edge.key.pid, edge.key.tid),
+            key: edge.key,
+        };
+        if let Some(held) = self.pending_attempt_remove(&ekey) {
             self.pair(
-                edge.key,
+                ekey,
                 held.api,
                 held.monotonic_ns,
                 edge.monotonic_ns,
                 edge.outcome,
             );
-        } else if self.pending_results.contains_key(&edge.key) {
+        } else if self.pending_results.contains_key(&ekey) {
             // Duplicate RESULT on a live key: conserve the newcomer
             // as unpaired immediately, keep the original pending.
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
-        } else if self.is_hw_dup(&edge.key) {
+        } else if self.is_hw_dup(&ekey) {
             // F3: consumed-or-older invocation with no live state —
             // a replay, never a re-pair (frozen §6D-6).
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
         } else {
-            self.pending_result_insert(edge.key, edge.api, edge.monotonic_ns, edge.outcome);
+            self.pending_result_insert(ekey, edge.api, edge.monotonic_ns, edge.outcome);
         }
     }
 
@@ -701,7 +717,7 @@ impl TraceProducer {
         let current = self.window;
         // G1: close-time stale-key vectors are bounded by the
         // caps — at most one stale key per held edge (no change).
-        let stale_attempts: Vec<PairKey> = self
+        let stale_attempts: Vec<EpochKey> = self
             .pending_attempts
             .iter()
             .filter(|(_, held)| held.window < current)
@@ -711,21 +727,17 @@ impl TraceProducer {
             if let Some(held) = self.pending_attempt_remove(&key) {
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
-                self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
-                // G3: a tombstoned scope's history is void —
-                // expiry under the tombstone never advances the
-                // HW. Pre-retire holds always expire under it
-                // (holds live ≤1 window, the tombstone lasts 2),
-                // so the scope is fresh (HW=None) afterward.
-                // `pair()` needs no guard: a fed edge in a
-                // tombstoned scope returns before pairing, and
-                // both key halves share the scope.
-                if !self.tombstone_active(key.pid, key.tid) {
+                self.push_exemplar(ExemplarDir::Entry, key.key, held, now_ns);
+                // fix3: a stale-epoch hold's HW namespace is dead
+                // (feeds tag the current epoch, which never recurs
+                // backward) — advancing it would write an unreadable
+                // scope, so only current-epoch expiry advances.
+                if key.epoch == self.epoch_of(key.key.pid, key.key.tid) {
                     self.advance_hw(&key);
                 }
             }
         }
-        let stale_results: Vec<PairKey> = self
+        let stale_results: Vec<EpochKey> = self
             .pending_results
             .iter()
             .filter(|(_, held)| held.window < current)
@@ -735,9 +747,9 @@ impl TraceProducer {
             if let Some(held) = self.pending_result_remove(&key) {
                 self.unpaired_results = self.unpaired_results.saturating_add(1);
                 self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
-                self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
-                // G3: tombstoned history is void (see above).
-                if !self.tombstone_active(key.pid, key.tid) {
+                self.push_exemplar(ExemplarDir::Result, key.key, held, now_ns);
+                // fix3: stale-epoch HW is dead (see above).
+                if key.epoch == self.epoch_of(key.key.pid, key.key.tid) {
                     self.advance_hw(&key);
                 }
             }
@@ -760,21 +772,9 @@ impl TraceProducer {
                 self.scope_order.remove(&(hw.insert_window, hw.seq));
             }
         }
-        // G3: expired tombstones drop at roll (the scope is
-        // already fresh — see `tombstoned`).
-        let current = self.window;
-        let expired: Vec<(u32, u32)> = self
-            .retired
-            .iter()
-            .filter(|(_, r)| current.saturating_sub(r.retire_window) >= TRACE_TOMBSTONE_WINDOWS)
-            .map(|(who, _)| *who)
-            .collect();
-        // Bounded by the pairing cap (one entry per tombstone).
-        for who in expired {
-            if let Some(r) = self.retired.remove(&who) {
-                self.retired_order.remove(&(r.retire_window, r.seq));
-            }
-        }
+        // fix3: epochs NEVER expire by clock (the boundary is
+        // permanent — entries leave only via FIFO cap eviction,
+        // with coupled expiry of the victim's pending).
         let mut ring_loss = [0u64; 8];
         for index in 0..8 {
             ring_loss[index] = loss_abs[index].saturating_sub(self.last_loss[index]);
@@ -822,9 +822,9 @@ impl TraceProducer {
         for (key, held) in std::mem::take(&mut self.pending_attempts) {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
-            self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
-            // G3: tombstoned history is void (see close-time expiry).
-            if !self.tombstone_active(key.pid, key.tid) {
+            self.push_exemplar(ExemplarDir::Entry, key.key, held, now_ns);
+            // fix3: stale-epoch HW is dead (see close-time expiry).
+            if key.epoch == self.epoch_of(key.key.pid, key.key.tid) {
                 self.advance_hw(&key);
             }
         }
@@ -832,8 +832,8 @@ impl TraceProducer {
         for (key, held) in std::mem::take(&mut self.pending_results) {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
-            self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
-            if !self.tombstone_active(key.pid, key.tid) {
+            self.push_exemplar(ExemplarDir::Result, key.key, held, now_ns);
+            if key.epoch == self.epoch_of(key.key.pid, key.key.tid) {
                 self.advance_hw(&key);
             }
         }
@@ -845,17 +845,121 @@ impl TraceProducer {
         self.totals
     }
 
-    /// G3: retire a CONFIRMED-DEAD tid's pairing scopes. Called
-    /// from `remove_thread_rows` (the sole cleanup funnel),
-    /// covering EVERY generation for the tid; fires in off-mode
-    /// too (no edges flow, but the tombstone is recorded for
-    /// the next edge-bearing feed). The scope HWs are dropped
-    /// and a (pid,tid) tombstone is recorded: fed edges go
-    /// immediate-unpaired (visible + exemplar, NEVER paired,
-    /// NEVER silent) for 2 windows, then the scope is fresh
-    /// (HW=None) and pairs again. Tombstone storage is
-    /// FIXED-CAPPED (FIFO, same kernel-mirrored bound).
+    /// The tid's current retire epoch (absent ⟺ 0 — never
+    /// retired). Feeds tag edges with this; it never recurs
+    /// backward except via epoch-cap eviction (whose coupled
+    /// expiry keeps the fallback sound — see `retire_scope`).
+    fn epoch_of(&self, pid: u32, tid: u32) -> u64 {
+        self.epochs.get(&(pid, tid)).map_or(0, |r| r.epoch)
+    }
+
+    /// fix3: retire a CONFIRMED-DEAD tid's pairing scopes. Called
+    /// from `remove_thread_rows` (the sole cleanup funnel) AFTER
+    /// a full retire-drain proves no old-incarnation edge remains
+    /// queued (drain-then-bump); covering EVERY generation for
+    /// the tid; fires in off-mode too (no edges flow, but the
+    /// bump is recorded for the next edge-bearing feed). The HW
+    /// scopes are dropped (HW is per-epoch) and the epoch bumps:
+    /// pre-bump holds (old epoch) never pair with post-bump edges
+    /// (new epoch), and the new incarnation pairs from invocation
+    /// 1 immediately. Epoch storage is FIXED-CAPPED (FIFO, same
+    /// kernel-mirrored bound); evicting an epoch expires the
+    /// victim's pending WITH it (coupled expiry — protection
+    /// loss retires the protected state, codex R3-3).
     pub(crate) fn retire_scope(&mut self, pid: u32, tid: u32) {
+        self.drop_tid_scopes(pid, tid);
+        let who = (pid, tid);
+        let next = self
+            .epochs
+            .get(&who)
+            .map_or(1, |r| r.epoch.saturating_add(1));
+        if let Some(old) = self.epochs.get(&who) {
+            let order = (old.insert_window, old.seq);
+            self.epoch_order.remove(&order);
+        } else if self.epochs.len() >= TRACE_PAIRING_CAP {
+            // New entry past the cap: evict the oldest epoch with
+            // COUPLED EXPIRY (finding-3 analog — never silent,
+            // never mispairing).
+            if let Some((&order, &victim)) = self.epoch_order.iter().next() {
+                self.epoch_order.remove(&order);
+                self.epochs.remove(&victim);
+                let _ = self.expire_tid_pending(victim.0, victim.1);
+                self.drop_tid_scopes(victim.0, victim.1);
+            }
+        }
+        let window = self.window;
+        let seq = self.next_seq();
+        self.epoch_order.insert((window, seq), who);
+        self.epochs.insert(
+            who,
+            RetireEpoch {
+                epoch: next,
+                insert_window: window,
+                seq,
+            },
+        );
+    }
+
+    /// fix3: the retire-drain budget-exceeded path — the bump is
+    /// SKIPPED (the tid stays unretired: same epoch, HW intact).
+    /// The tid's pending expires immediately (unpaired + exemplar,
+    /// never silently — a live old hold plus a recycled same-key
+    /// edge would otherwise mispair through live-state
+    /// precedence), and the HW shield extends past the expired
+    /// holds (current epoch only — stale-epoch HW is dead), so
+    /// recycled low invocations and late old edges land
+    /// visible-unpaired. Conservation exact; the session records
+    /// the visible skip signal (`DrainOverrun`).
+    pub(crate) fn retire_scope_skipped(&mut self, pid: u32, tid: u32) {
+        let (attempts, results) = self.expire_tid_pending(pid, tid);
+        // Bounded by 2× the pairing cap (one entry per expired hold).
+        for key in attempts.into_iter().chain(results) {
+            // fix3: shield only the live namespace (see close-time expiry).
+            if key.epoch == self.epoch_of(pid, tid) {
+                self.advance_hw(&key);
+            }
+        }
+    }
+
+    /// Expire EVERY pending hold of a (pid,tid) (all epochs, all
+    /// generations) as unpaired + exemplar. Returns the expired
+    /// keys per direction (bounded by the pairing cap each) so
+    /// callers can advance or drop HW per path.
+    fn expire_tid_pending(&mut self, pid: u32, tid: u32) -> (Vec<EpochKey>, Vec<EpochKey>) {
+        // Bounded by the pairing cap per direction (one stale key
+        // per held edge, like the close-time sweeps).
+        let stale_attempts: Vec<EpochKey> = self
+            .pending_attempts
+            .keys()
+            .filter(|key| key.key.pid == pid && key.key.tid == tid)
+            .copied()
+            .collect();
+        for key in &stale_attempts {
+            if let Some(held) = self.pending_attempt_remove(key) {
+                self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+                self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+                self.push_live_exemplar(ExemplarDir::Entry, key.key, held.api);
+            }
+        }
+        let stale_results: Vec<EpochKey> = self
+            .pending_results
+            .keys()
+            .filter(|key| key.key.pid == pid && key.key.tid == tid)
+            .copied()
+            .collect();
+        for key in &stale_results {
+            if let Some(held) = self.pending_result_remove(key) {
+                self.unpaired_results = self.unpaired_results.saturating_add(1);
+                self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+                self.push_live_exemplar(ExemplarDir::Result, key.key, held.api);
+            }
+        }
+        (stale_attempts, stale_results)
+    }
+
+    /// Drop EVERY HW scope of a (pid,tid) (all epochs, all
+    /// generations) with index cleanup.
+    fn drop_tid_scopes(&mut self, pid: u32, tid: u32) {
         let dead: Vec<ScopeKey> = self
             .inv_hw
             .keys()
@@ -868,53 +972,6 @@ impl TraceProducer {
                 self.scope_order.remove(&(hw.insert_window, hw.seq));
             }
         }
-        let who = (pid, tid);
-        if let Some(old) = self.retired.get(&who) {
-            let order = (old.retire_window, old.seq);
-            self.retired_order.remove(&order);
-        }
-        if self.retired.len() >= TRACE_PAIRING_CAP {
-            if let Some((&order, &victim)) = self.retired_order.iter().next() {
-                self.retired_order.remove(&order);
-                self.retired.remove(&victim);
-            }
-        }
-        let window = self.window;
-        let seq = self.next_seq();
-        self.retired_order.insert((window, seq), who);
-        self.retired.insert(
-            who,
-            RetiredScope {
-                retire_window: window,
-                seq,
-            },
-        );
-    }
-
-    /// Feed-path tombstone probe: true while the (pid,tid)
-    /// tombstone is live (2 windows); an expired tombstone is
-    /// dropped here (the scope is already fresh — its HW was
-    /// removed at retire and nothing advanced it under the
-    /// tombstone) and reports false.
-    fn tombstoned(&mut self, pid: u32, tid: u32) -> bool {
-        let who = (pid, tid);
-        let Some(r) = self.retired.get(&who) else {
-            return false;
-        };
-        if self.window.saturating_sub(r.retire_window) < TRACE_TOMBSTONE_WINDOWS {
-            return true;
-        }
-        let r = self.retired.remove(&who).expect("tombstone just observed");
-        self.retired_order.remove(&(r.retire_window, r.seq));
-        false
-    }
-
-    /// Pure tombstone probe for expiry paths (no lazy drop —
-    /// the close sweep owns removal).
-    fn tombstone_active(&self, pid: u32, tid: u32) -> bool {
-        self.retired
-            .get(&(pid, tid))
-            .is_some_and(|r| self.window.saturating_sub(r.retire_window) < TRACE_TOMBSTONE_WINDOWS)
     }
 
     /// Next FIFO insertion sequence.
@@ -927,7 +984,7 @@ impl TraceProducer {
     /// Insert a held ATTEMPT (G1: cap-enforced FIFO). Callers
     /// insert absent keys — a present key is replaced with its
     /// index entry refreshed so the order index stays exact.
-    fn pending_attempt_insert(&mut self, key: PairKey, api: u32, monotonic_ns: u64) {
+    fn pending_attempt_insert(&mut self, key: EpochKey, api: u32, monotonic_ns: u64) {
         if let Some(old) = self.pending_attempts.get(&key) {
             let order = (old.window, old.seq);
             self.pending_attempt_order.remove(&order);
@@ -953,14 +1010,14 @@ impl TraceProducer {
     }
 
     /// Index-maintaining removal of a held ATTEMPT.
-    fn pending_attempt_remove(&mut self, key: &PairKey) -> Option<PendingEdge> {
+    fn pending_attempt_remove(&mut self, key: &EpochKey) -> Option<PendingEdge> {
         let held = self.pending_attempts.remove(key)?;
         self.pending_attempt_order.remove(&(held.window, held.seq));
         Some(held)
     }
 
     /// Insert a held RESULT (G1: cap-enforced FIFO).
-    fn pending_result_insert(&mut self, key: PairKey, api: u32, monotonic_ns: u64, outcome: u32) {
+    fn pending_result_insert(&mut self, key: EpochKey, api: u32, monotonic_ns: u64, outcome: u32) {
         if let Some(old) = self.pending_results.get(&key) {
             let order = (old.window, old.seq);
             self.pending_result_order.remove(&order);
@@ -986,7 +1043,7 @@ impl TraceProducer {
     }
 
     /// Index-maintaining removal of a held RESULT.
-    fn pending_result_remove(&mut self, key: &PairKey) -> Option<PendingEdge> {
+    fn pending_result_remove(&mut self, key: &EpochKey) -> Option<PendingEdge> {
         let held = self.pending_results.remove(key)?;
         self.pending_result_order.remove(&(held.window, held.seq));
         Some(held)
@@ -1004,7 +1061,7 @@ impl TraceProducer {
         if let Some(held) = self.pending_attempts.remove(&key) {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
-            self.push_live_exemplar(ExemplarDir::Entry, key, held.api);
+            self.push_live_exemplar(ExemplarDir::Entry, key.key, held.api);
         }
     }
 
@@ -1018,7 +1075,7 @@ impl TraceProducer {
         if let Some(held) = self.pending_results.remove(&key) {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
-            self.push_live_exemplar(ExemplarDir::Result, key, held.api);
+            self.push_live_exemplar(ExemplarDir::Result, key.key, held.api);
         }
     }
 
@@ -1063,7 +1120,7 @@ impl TraceProducer {
     /// stamp the scope clock, or rejections self-perpetuate
     /// stale HW (the recycled-tid feedback loop). Idle-drop keys
     /// on accepted arrivals only.
-    fn touch_scope(&mut self, key: &PairKey) {
+    fn touch_scope(&mut self, key: &EpochKey) {
         let window = self.window;
         self.scope_or_insert(ScopeKey::of(key)).last_window = window;
     }
@@ -1073,21 +1130,25 @@ impl TraceProducer {
     /// in either direction — live state means unconsumed (nested
     /// per-thread invocations interleave, so a live counterpart
     /// always pairs and the high-water never overrides it).
-    fn is_hw_dup(&self, key: &PairKey) -> bool {
+    fn is_hw_dup(&self, key: &EpochKey) -> bool {
         self.inv_hw
             .get(&ScopeKey::of(key))
-            .is_some_and(|scope| scope.hw.is_some_and(|hw| key.invocation <= hw))
+            .is_some_and(|scope| scope.hw.is_some_and(|hw| key.key.invocation <= hw))
     }
 
     /// Advance the scope high-water past a consumed invocation
     /// (pair/expiry/finalize). Deliberately not activity: the
     /// idle-drop clock runs on arrivals, not bookkeeping.
-    fn advance_hw(&mut self, key: &PairKey) {
+    fn advance_hw(&mut self, key: &EpochKey) {
         let entry = self.scope_or_insert(ScopeKey::of(key));
-        entry.hw = Some(entry.hw.map_or(key.invocation, |hw| hw.max(key.invocation)));
+        entry.hw = Some(
+            entry
+                .hw
+                .map_or(key.key.invocation, |hw| hw.max(key.key.invocation)),
+        );
     }
 
-    fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, outcome: u32) {
+    fn pair(&mut self, key: EpochKey, api: u32, attempt_ns: u64, result_ns: u64, outcome: u32) {
         // G3: accept-path stamp (the pair accepts the newcomer).
         self.touch_scope(&key);
         self.advance_hw(&key);
@@ -1184,11 +1245,7 @@ impl TraceProducer {
             "result index"
         );
         assert_eq!(self.inv_hw.len(), self.scope_order.len(), "scope index");
-        assert_eq!(
-            self.retired.len(),
-            self.retired_order.len(),
-            "tombstone index"
-        );
+        assert_eq!(self.epochs.len(), self.epoch_order.len(), "epoch index");
         for ((window, seq), key) in &self.pending_attempt_order {
             let held = self
                 .pending_attempts
@@ -1207,9 +1264,9 @@ impl TraceProducer {
             let hw = self.inv_hw.get(scope).expect("scope order resolves");
             assert_eq!((hw.insert_window, hw.seq), (*window, *seq));
         }
-        for ((window, seq), who) in &self.retired_order {
-            let r = self.retired.get(who).expect("tombstone order resolves");
-            assert_eq!((r.retire_window, r.seq), (*window, *seq));
+        for ((window, seq), who) in &self.epoch_order {
+            let r = self.epochs.get(who).expect("epoch order resolves");
+            assert_eq!((r.insert_window, r.seq), (*window, *seq));
         }
     }
 }
@@ -1457,96 +1514,31 @@ mod tests {
     }
 
     #[test]
-    fn retire_scope_recycle_matrix() {
-        // G3 (codex R2-3): death + recycle + low invocations. A
-        // retired scope's edges go immediate-unpaired (visible +
-        // exemplar, NEVER paired, NEVER silent) for 2 windows,
-        // then the scope is fresh (HW=None) and pairs again. No
-        // cross-incarnation mispair; conservation exact; retire
-        // covers EVERY generation for the tid.
-        let mut p = edge_bearing();
-        for generation in [1u64, 2] {
-            for inv in 1..=50u64 {
-                let k = key(10, 11, generation, 100 + inv, inv);
-                p.attempt(attempt(k, 20, 1000 + inv));
-                p.result(result(k, 20, 2000 + inv, 1));
-            }
-        }
-        assert_eq!(p.totals().paired, 100);
-        p.retire_scope(10, 11);
-        // Retire window (0): recycled low invocations are
-        // visible-unpaired in BOTH generations, never paired.
-        let r0 = key(10, 11, 1, 500, 1);
-        p.attempt(attempt(r0, 20, 3000));
-        p.result(result(r0, 20, 3100, 1));
-        let r0b = key(10, 11, 2, 501, 2);
-        p.attempt(attempt(r0b, 20, 3200));
-        p.result(result(r0b, 20, 3300, 1));
-        // An untouched scope still pairs mid-tombstone (isolation).
-        let other = key(10, 12, 1, 600, 1);
-        p.attempt(attempt(other, 20, 3400));
-        p.result(result(other, 20, 3500, 1));
-        assert_eq!(p.totals().paired, 101);
-        assert_eq!(
-            (p.totals().unpaired_entries, p.totals().unpaired_results),
-            (2, 2)
-        );
-        let w0 = p.close_window(0, 4000, [0; 8]);
-        let entries = w0
-            .exemplars
-            .iter()
-            .filter(|e| e.dir == ExemplarDir::Entry)
-            .count();
-        let results = w0
-            .exemplars
-            .iter()
-            .filter(|e| e.dir == ExemplarDir::Result)
-            .count();
-        assert_eq!((entries, results), (2, 2));
-        // Window 1: still tombstoned.
-        let r1 = key(10, 11, 1, 502, 3);
-        p.attempt(attempt(r1, 20, 5000));
-        p.result(result(r1, 20, 5100, 1));
-        assert_eq!(p.totals().paired, 101);
-        p.close_window(1, 6000, [0; 8]);
-        // Window 2: scope fresh — recycled low invocations (≤
-        // the old HW of 50 — rejected pre-fix) pair again.
-        for generation in [1u64, 2] {
-            let f = key(10, 11, generation, 600 + generation, generation + 10);
-            p.attempt(attempt(f, 20, 7000 + generation));
-            p.result(result(f, 20, 7100 + generation, 1));
-        }
-        p.finalize(8000);
-        let t = p.totals();
-        assert_eq!(t.paired, 103);
-        assert_eq!((t.unpaired_entries, t.unpaired_results), (3, 3));
-        let ra: u64 = t.received.attempts.iter().sum();
-        let rr: u64 = t.received.results.iter().sum();
-        assert_eq!(ra, t.paired + t.unpaired_entries);
-        assert_eq!(rr, t.paired + t.unpaired_results);
-    }
-
-    #[test]
-    fn retire_scope_queued_old_record_never_pairs() {
-        // G3: an old-incarnation ATTEMPT held at retire time must
-        // never pair with a late (queued) same-key RESULT — the
-        // late edge goes immediate-unpaired (+ exemplar), the hold
-        // expires unpaired. No cross-incarnation mispair;
-        // conservation exact.
+    fn retire_epoch_queued_old_record_never_pairs() {
+        // fix3: an old-incarnation ATTEMPT held at bump time must
+        // never pair with a late same-key RESULT (different epoch):
+        // the hold expires unpaired, the late edge pends under the
+        // new epoch and expires unpaired. No cross-incarnation
+        // mispair; conservation exact.
         let mut p = edge_bearing();
         let k = key(10, 11, 1, 100, 7);
         p.attempt(attempt(k, 20, 1000));
         p.retire_scope(10, 11);
         p.result(result(k, 20, 1500, 1));
         assert_eq!(p.totals().paired, 0);
-        assert_eq!(p.totals().unpaired_results, 1);
+        assert_eq!(
+            p.totals().unpaired_results,
+            0,
+            "late edge pends, then expires"
+        );
         let w0 = p.close_window(0, 2000, [0; 8]);
-        assert_eq!(p.totals().unpaired_entries, 0);
-        assert_eq!(w0.exemplars.len(), 1);
-        assert_eq!(w0.exemplars[0].dir, ExemplarDir::Result);
+        assert_eq!(
+            (w0.paired, w0.unpaired_entries, w0.unpaired_results),
+            (0, 0, 0)
+        );
         let w1 = p.close_window(1, 3000, [0; 8]);
-        assert_eq!(w1.exemplars.len(), 1);
-        assert_eq!(w1.exemplars[0].dir, ExemplarDir::Entry);
+        assert_eq!((w1.unpaired_entries, w1.unpaired_results), (1, 1));
+        assert_eq!(w1.exemplars.len(), 2);
         p.finalize(4000);
         let t = p.totals();
         assert_eq!(
@@ -1560,17 +1552,19 @@ mod tests {
     }
 
     #[test]
-    fn retire_scope_bounded_and_off_mode() {
-        // G3: tombstone storage is FIXED-CAPPED (FIFO), and the
-        // hook fires in off-mode too (no edges, no panic — the
-        // tombstone is recorded for the next edge-bearing feed).
+    fn retire_epoch_bounded_and_off_mode() {
+        // fix3: epoch storage is FIXED-CAPPED (FIFO), and the bump
+        // fires in off-mode too (no edges, no panic — the epoch is
+        // recorded for the next edge-bearing feed, which pairs
+        // immediately in the fresh epoch).
         let mut p = TraceProducer::new();
         p.retire_scope(10, 11);
-        assert_eq!(p.retired.len(), 1);
+        assert_eq!(p.epochs.len(), 1);
+        assert_eq!(p.epoch_of(10, 11), 1);
         for i in 0..5000u32 {
             p.retire_scope(100 + (i % 7), 2000 + i);
         }
-        assert!(p.retired.len() <= TRACE_PAIRING_CAP);
+        assert!(p.epochs.len() <= TRACE_PAIRING_CAP);
         p.check_indexes();
         p.retire_scope(7, 7);
         p.set_mode(TRACE_MODE_LATENCY);
@@ -1581,7 +1575,7 @@ mod tests {
         let t = p.totals();
         assert_eq!(
             (t.paired, t.unpaired_entries, t.unpaired_results),
-            (0, 1, 1)
+            (1, 0, 0)
         );
     }
 
@@ -2291,5 +2285,186 @@ mod tests {
         assert_eq!(w.api_results[20], 10);
         let h = &w.histograms[1];
         assert_eq!((h.count, h.sum), (10, 10_000));
+    }
+
+    #[test]
+    fn three_window_late_mixed_colliding_keys_never_pair() {
+        // fix3 (codex R3-2): drain-then-bump shape — the old-incarnation
+        // edge was externally queued at retire time, so the session's
+        // retire-drain fed it PRE-bump (epoch 0); the recycled same-key
+        // counterpart arrives 3 windows post-bump (epoch 1). Cross-epoch
+        // → NEVER pair, both unpaired, no fabricated duration — across
+        // an ARBITRARY gap (the epoch boundary is permanent; no
+        // window-counted expiry can be outrun).
+        let mut p = edge_bearing();
+        // k1: colliding — old A drained pre-bump, recycled R 3 windows later.
+        let k1 = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k1, 20, 1000));
+        // k2: complete old pair drained pre-bump (preserved).
+        let k2 = key(10, 11, 1, 101, 8);
+        p.attempt(attempt(k2, 20, 1100));
+        p.result(result(k2, 20, 1500, 1));
+        p.retire_scope(10, 11);
+        // The boundary is a permanent epoch, not a window-counted marker.
+        assert_eq!(p.epoch_of(10, 11), 1);
+        assert_eq!(p.epoch_of(10, 12), 0, "untouched tid stays epoch 0");
+        p.close_window(0, 2000, [0; 8]);
+        p.close_window(1, 3000, [0; 8]);
+        p.close_window(2, 4000, [0; 8]);
+        assert_eq!(p.epoch_of(10, 11), 1, "no window-counted expiry");
+        p.result(result(k1, 20, 9000, 1));
+        // k3: clean recycled pair post-bump (new incarnation unaffected).
+        let k3 = key(10, 11, 1, 102, 1);
+        p.attempt(attempt(k3, 20, 9100));
+        p.result(result(k3, 20, 9500, 1));
+        p.close_window(3, 9999, [0; 8]);
+        p.finalize(10_000);
+        let t = p.totals();
+        assert_eq!(t.paired, 2, "k2 old + k3 new pair; k1 never");
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (1, 1));
+        assert_eq!(t.nonmonotonic_pairs, 0);
+        assert_eq!(t.class_counts.iter().sum::<u64>(), t.paired);
+        let hist_total: u64 = t.histograms.iter().map(|h| h.count).sum();
+        assert_eq!(hist_total, 2, "only real pairs histogrammed");
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn feed_after_epoch_eviction_never_mispairs() {
+        // fix3 (codex R3-3): retire, 4096 other retires (cap evicts the
+        // first protection), then the recycled same-key RESULT. The
+        // evicted hold surfaces unpaired (+ evicted count) and the
+        // recycled edge NEVER pairs with it: 0+1+1, conservation exact.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.retire_scope(10, 11);
+        for i in 0..4096u32 {
+            p.retire_scope(100 + (i % 7), 2000 + i);
+        }
+        p.result(result(k, 20, 1500, 1));
+        assert_eq!(p.totals().paired, 0, "evicted hold must never pair");
+        p.close_window(0, 2000, [0; 8]);
+        p.close_window(1, 3000, [0; 8]);
+        p.finalize(4000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (0, 1, 1)
+        );
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn retire_epoch_recycle_matrix() {
+        // fix3: epochs replace window-counted markers — old-old pairs preserved iff
+        // drained pre-bump; the new incarnation pairs clean from
+        // invocation 1 IMMEDIATELY (no 2-window rejection); cross-bump
+        // same-key halves never pair.
+        let mut p = edge_bearing();
+        // Old incarnation: complete pairs (both gens) + one dangling hold.
+        for generation in [1u64, 2] {
+            for inv in 1..=10u64 {
+                let k = key(10, 11, generation, 100 + inv, inv);
+                p.attempt(attempt(k, 20, 1000 + inv));
+                p.result(result(k, 20, 2000 + inv, 1));
+            }
+        }
+        let dangling = key(10, 11, 1, 500, 11);
+        p.attempt(attempt(dangling, 20, 1500));
+        assert_eq!(p.totals().paired, 20);
+        p.retire_scope(10, 11);
+        // Immediately post-bump: recycled SAME keys pair clean (inv ≤ old HW).
+        for generation in [1u64, 2] {
+            for inv in 1..=10u64 {
+                let k = key(10, 11, generation, 100 + inv, inv);
+                p.attempt(attempt(k, 20, 3000 + inv));
+                p.result(result(k, 20, 4000 + inv, 1));
+            }
+        }
+        assert_eq!(p.totals().paired, 40, "new incarnation pairs immediately");
+        // Cross-bump: dangling old hold's late counterpart never pairs.
+        p.result(result(dangling, 20, 5000, 1));
+        assert_eq!(p.totals().paired, 40);
+        // Untouched scope pairs throughout (isolation).
+        let other = key(10, 12, 1, 600, 1);
+        p.attempt(attempt(other, 20, 5100));
+        p.result(result(other, 20, 5200, 1));
+        p.close_window(0, 6000, [0; 8]);
+        p.close_window(1, 7000, [0; 8]);
+        p.finalize(8000);
+        let t = p.totals();
+        assert_eq!(t.paired, 41);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (1, 1));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn retire_skip_expires_pending_and_shields() {
+        // fix3: the retire-drain budget-exceeded path (the session skips
+        // the bump — stays unretired). The tid's pending expires
+        // immediately (unpaired + exemplar, never silently) and the HW
+        // shield extends past the expired holds, so recycled low
+        // invocations AND late old edges land visible-unpaired instead
+        // of mispairing. No pair, no corruption, conservation exact.
+        let mut p = edge_bearing();
+        // Old incarnation: pairs (HW 10) + two dangling holds (one per dir).
+        for inv in 1..=10u64 {
+            let k = key(10, 11, 1, 100 + inv, inv);
+            p.attempt(attempt(k, 20, 1000 + inv));
+            p.result(result(k, 20, 2000 + inv, 1));
+        }
+        let held_a = key(10, 11, 1, 500, 11);
+        p.attempt(attempt(held_a, 20, 1500));
+        let held_r = key(10, 11, 1, 501, 12);
+        p.result(result(held_r, 20, 1600, 1));
+        assert_eq!(p.totals().paired, 10);
+        // Budget exceeded → skip the bump (epoch stays 0), expire + shield.
+        p.retire_scope_skipped(10, 11);
+        assert_eq!(p.epoch_of(10, 11), 0, "skipped bump stays unretired");
+        assert_eq!(p.totals().paired, 10);
+        assert_eq!(
+            (p.totals().unpaired_entries, p.totals().unpaired_results),
+            (1, 1)
+        );
+        // Recycled low invocations (≤ old HW): visible dup-unpaired, never pair.
+        let r1 = key(10, 11, 1, 600, 1);
+        p.attempt(attempt(r1, 20, 3000));
+        p.result(result(r1, 20, 3100, 1));
+        assert_eq!(p.totals().paired, 10);
+        // Expired-hold invocations (11, 12 — shield extended): dup-unpaired too.
+        let r2 = key(10, 11, 1, 601, 11);
+        p.attempt(attempt(r2, 20, 3200));
+        let r3 = key(10, 11, 1, 602, 12);
+        p.result(result(r3, 20, 3300, 1));
+        assert_eq!(p.totals().paired, 10);
+        let w0 = p.close_window(0, 4000, [0; 8]);
+        assert!(
+            w0.exemplars.iter().any(|e| e.dir == ExemplarDir::Entry),
+            "skipped hold leaves an Entry exemplar: {:?}",
+            w0.exemplars
+        );
+        assert!(
+            w0.exemplars.iter().any(|e| e.dir == ExemplarDir::Result),
+            "skipped hold leaves a Result exemplar: {:?}",
+            w0.exemplars
+        );
+        p.finalize(5000);
+        let t = p.totals();
+        assert_eq!(t.paired, 10);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (3, 3));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
     }
 }

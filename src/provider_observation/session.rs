@@ -82,6 +82,26 @@ impl ObservationBatch {
             self.gaps.push(g)
         }
     }
+    /// Chain an earlier-consumed batch BEHIND this one (the
+    /// retire-carry path: this carry is older, the argument was
+    /// consumed later). Facts and signal vectors append in
+    /// consumption order; gaps fold through the deduping `gap`
+    /// (set semantics preserved — chaining equals consuming both
+    /// in one batch).
+    fn append_batch(&mut self, other: ObservationBatch) {
+        self.facts.extend(other.facts);
+        for g in other.gaps {
+            self.gap(g);
+        }
+        self.refusals.extend(other.refusals);
+        self.learned_sites.extend(other.learned_sites);
+        self.static_candidates.extend(other.static_candidates);
+        self.api_activity.extend(other.api_activity);
+        self.refreshed_processes.extend(other.refreshed_processes);
+        self.exec_witnesses.extend(other.exec_witnesses);
+        self.exec_deferred.extend(other.exec_deferred);
+        self.additive_refreshes.extend(other.additive_refreshes);
+    }
 }
 /// A verified historical advertisement, never an executed asset. No serde/Debug.
 #[derive(Clone)]
@@ -350,6 +370,17 @@ thread_local! { static EXPIRE_STATIC: std::cell::Cell<bool> = const { std::cell:
 pub(crate) const TYPED_COOKIE_FIRST: u64 = 1 << 31;
 /// One past the last typed cookie (u32 range end, exclusive).
 pub(crate) const TYPED_COOKIE_END: u64 = 1 << 32;
+/// fix3: retire-drain event budget. The EVENTS ring holds 1 MiB
+/// (`provider_observation.rs:33`) of exact-96 B records (contract
+/// `EVENT_SIZE`), so ≤ 10,922 records fit resident; 65,536 ≈ 6×
+/// that absorbs a full ring plus in-flight commits plus
+/// concurrent producer arrivals during the drain. Past it the
+/// bump is skipped (stay unretired + visible `DrainOverrun`) —
+/// an unprovable-empty ring must never bump. Worst-case work is
+/// bounded (65,536 `consume` calls) on a rare path
+/// (confirmed-thread-death cleanup); output stays budget-guarded
+/// inside `consume`.
+const RETIRE_DRAIN_BUDGET: usize = 65_536;
 /// Session record for one admitted typed site: the physical identity the
 /// counter observes plus the attribution IDs the kernel emits. The
 /// finalizer joins these records against strict SITE_BIND reads.
@@ -467,6 +498,14 @@ pub struct ProviderSession {
     /// Pre-seal fences (exec/exit/reuse) never flag: the member
     /// seals instead of resuming.
     unfence_after_drain: BTreeSet<u32>,
+    /// fix3: retire-drain carry — events the retire-drain consumed
+    /// between ticks (facts/gaps/signals conserved, never dropped).
+    /// The next `drain`/`reconcile_records` takes it as its batch
+    /// head, so carried content emits first, in consumption order.
+    /// Empty unless a retire-drain consumed (zero batch delta
+    /// otherwise); a drop-without-close loses it exactly like the
+    /// base loses unconsumed ring backlog.
+    retire_carry: ObservationBatch,
     roles: Roles,
     aliases: super::assembly::Sequences,
     budget: ObservationBudget,
@@ -2277,6 +2316,7 @@ impl ProviderSession {
             fenced: BTreeMap::new(),
             fence_withheld: 0,
             unfence_after_drain: BTreeSet::new(),
+            retire_carry: ObservationBatch::default(),
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
             setup_state_spent: budget.spent_state(),
@@ -2669,13 +2709,22 @@ impl ProviderSession {
     /// nonzero count as uncertainty — an accepted exit must never
     /// leave possible stale rows unrecorded.
     pub(crate) fn remove_thread_rows(&mut self, pid: u32, tid: u32) -> u64 {
-        // G3 (T8.2a-fix2): the incarnation ended — retire the
-        // tid's trace scopes FIRST (every generation), independent
-        // of per-row removal success: stale HW must never judge a
-        // recycled tid number (tombstoned 2 windows, then fresh).
-        // Sole funnel: every cleanup path (focused task-exit +
-        // coordinator revalidation) lands here.
-        self.trace.retire_scope(pid, tid);
+        // fix3 (drain-then-bump): the incarnation ended — drain the
+        // ring to empty FIRST (every queued old-incarnation edge
+        // feeds under the OLD epoch), then bump the tid's retire
+        // epoch. The bump is skipped when the drain budget
+        // exhausts (stay unretired: pending expired + HW shield
+        // extended, never corruption — see `retire_scope_skipped`;
+        // the `DrainOverrun` gap rides the carry into the next
+        // batch as the visible skip signal). Trace-first,
+        // independent of per-row removal success. Sole funnel:
+        // every cleanup path (focused task-exit + coordinator
+        // revalidation) lands here.
+        if self.retire_drain() {
+            self.trace.retire_scope(pid, tid);
+        } else {
+            self.trace.retire_scope_skipped(pid, tid);
+        }
         // N10: every cleanup failure counts (enumeration errors +
         // deletion failures) — the caller records nonzero counts
         // as uncertainty. Removal stays best-effort per key; the
@@ -2691,6 +2740,66 @@ impl ProviderSession {
             .saturating_add(api_failures)
             .saturating_add(self.api_threads.remove_dead(&dead_api));
         failures
+    }
+    /// fix3: retire-drain — consume the EVENTS ring to empty
+    /// through the SAME per-event path as the tick drain
+    /// (`decode_transport` + unknown-API probe + `consume`, with
+    /// decode-error alias invalidation), so every queued
+    /// old-incarnation edge feeds the pairing producer under the
+    /// OLD epoch before the bump. Consumed content lands in the
+    /// retire carry (emitted first by the next drain — conserved,
+    /// never dropped). Returns true on a PROVEN-empty ring (two
+    /// consecutive empty polls — the second closes the
+    /// reserve/commit race where a record commits between our last
+    /// consume and the emptiness check). Returns false past
+    /// `RETIRE_DRAIN_BUDGET` (the caller skips the bump; a
+    /// `DrainOverrun` gap rides the carry as the visible skip
+    /// signal). No deadline and no `emitted` check: the count
+    /// budget bounds CPU, while `consume` itself bounds OUTPUT
+    /// (over-limit facts fold to `FactLimit`/`StateLimit` gaps
+    /// per fact — no silent drops, no unbounded facts).
+    fn retire_drain(&mut self) -> bool {
+        let mut scratch = ObservationBatch::default();
+        let mut consumed = 0usize;
+        let mut empty_polls = 0u32;
+        loop {
+            if consumed >= RETIRE_DRAIN_BUDGET {
+                scratch.gap(ObservationGap::DrainOverrun);
+                self.retire_carry.append_batch(scratch);
+                return false;
+            }
+            // Borrow-confined like the tick drain: the ring borrow
+            // ends inside this statement (the decoded event is
+            // owned), so `consume` may take `&mut self` below.
+            let event = match self.events.next() {
+                Some(bytes) => {
+                    let event = wire::decode_transport(&bytes);
+                    if event.is_err() && wire::rejected_unknown_api(&bytes) {
+                        self.trace.reject_unknown();
+                    }
+                    Some(event)
+                }
+                None => None,
+            };
+            let Some(event) = event else {
+                empty_polls += 1;
+                if empty_polls >= 2 {
+                    self.retire_carry.append_batch(scratch);
+                    return true;
+                }
+                continue;
+            };
+            empty_polls = 0;
+            consumed += 1;
+            match event {
+                Ok(e) => self.consume(e, &mut scratch),
+                Err(g) => {
+                    self.aliases.clear();
+                    invalidate_algorithms(&mut scratch);
+                    scratch.gap(g);
+                }
+            }
+        }
     }
     /// 6A suspension for retained-unknown members (§2.4): evict the
     /// live target into the `refreshing` handoff WITHOUT gaps or
@@ -2902,7 +3011,10 @@ impl ProviderSession {
         &mut self,
         records: &[inventory::ProcessRecord],
     ) -> ObservationBatch {
-        let mut b = ObservationBatch::default();
+        // fix3: the retire carry (if any) heads this batch — content
+        // the retire-drain consumed between ticks emits first, in
+        // consumption order (empty carry ⟺ `default`, zero delta).
+        let mut b = std::mem::take(&mut self.retire_carry);
         if self.closed || self.final_drain || !self.gate.admitting() {
             b.gap(ObservationGap::Invalidated);
             return b;
@@ -3394,7 +3506,10 @@ impl ProviderSession {
         Ok(())
     }
     pub fn drain(&mut self, deadline: Instant) -> ObservationBatch {
-        let mut b = ObservationBatch::default();
+        // fix3: the retire carry (if any) heads this batch (see
+        // `reconcile_records` — same conservation; the final drain
+        // funnels through here, so close emits the carry too).
+        let mut b = std::mem::take(&mut self.retire_carry);
         if self.last_drain.elapsed() > Duration::from_millis(200) {
             b.gap(ObservationGap::SnapshotLag)
         }
