@@ -2,8 +2,9 @@
 //! 6D trace data plane (T8.2a): mode words, family demux, pairing core,
 //! detail caps, and lane surfacing. Output projections (§6D-2 class
 //! counts, §6D-3 histograms, §6D-7 record JSON, status/modes CLI) belong
-//! to T8.2b/c; this module produces paired edges, terminal buckets,
-//! retained detail, and counters.
+//! to T8.2b/c; this module produces streaming folds (per-class counts,
+//! per-class latency distributions, per-API edge counts), retained
+//! detail, exemplars, and counters.
 use super::wire::contract as c;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -147,23 +148,42 @@ pub struct ResultEdge {
     pub outcome: u32,
 }
 
-/// A paired ATTEMPT/RESULT (§6D-6).
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct PairedEdge {
-    /// Hash-bound pair key (never the raw cookie).
-    pub key: HashedKey,
-    /// API ID.
-    pub api: u32,
-    /// RAW return class (0..4, §6D-2 function value).
-    pub class: u32,
-    /// ATTEMPT timestamp.
-    pub attempt_ns: u64,
-    /// RESULT timestamp.
-    pub result_ns: u64,
-    /// `result_ns - attempt_ns`; valid iff `!nonmonotonic`.
-    pub duration_ns: u64,
-    /// Zero/negative delta (§6D-3 exclusion; still a pair).
-    pub nonmonotonic: bool,
+/// Frozen §6D-3 finite histogram edges (ns, ascending, verbatim).
+pub const TRACE_HISTOGRAM_EDGES: [u64; 18] = [
+    50, 100, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000, 64000, 128000, 256000, 512000,
+    1000000, 2000000, 5000000, 10000000,
+];
+
+/// One §6D-3 default-keyed latency distribution: cumulative buckets
+/// in `le` order (`buckets[18]` counts ≤ `+Inf`, so `buckets[18] ==
+/// count` always) plus saturating `sum` (ns) + `count`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct TraceHistogram {
+    /// Cumulative bucket counts (element `i` = observations ≤ edge
+    /// `i`; element 18 = observations ≤ `+Inf`).
+    pub buckets: [u64; 19],
+    /// Saturating sum of folded durations (ns).
+    pub sum: u64,
+    /// Folded observation count.
+    pub count: u64,
+}
+
+impl TraceHistogram {
+    /// Fold one usable operational duration (ns, §6D-3).
+    fn fold(&mut self, duration_ns: u64) {
+        let mut index = TRACE_HISTOGRAM_EDGES.len();
+        for (at, edge) in TRACE_HISTOGRAM_EDGES.iter().enumerate() {
+            if duration_ns <= *edge {
+                index = at;
+                break;
+            }
+        }
+        for bucket in self.buckets.iter_mut().skip(index) {
+            *bucket = bucket.saturating_add(1);
+        }
+        self.sum = self.sum.saturating_add(duration_ns);
+        self.count = self.count.saturating_add(1);
+    }
 }
 
 /// Unpaired-exemplar direction (§6D-6).
@@ -266,8 +286,18 @@ pub struct ClosedTraceWindow {
     pub ring_loss: [u64; 8],
     /// Retained detail rows (keep-first, capped).
     pub detail: Vec<RetainedEdge>,
-    /// Window pairs (streaming-exact under caps).
-    pub pairs: Vec<PairedEdge>,
+    /// Window pairs by class ID (§6D-2/§6D-7 `class_window`; sums to
+    /// `paired`. 2c projection order: success/failure/empty/retry/
+    /// unknown = slots 1/2/3/4/0).
+    pub class_counts: [u64; 5],
+    /// Window latency distributions by class ID (§6D-3 default
+    /// keying; operational pairs only).
+    pub histograms: [TraceHistogram; 5],
+    /// Window ATTEMPT edges by API ID (§6D-10 multiset/fetch
+    /// inputs; slot 0 unused).
+    pub api_attempts: [u64; 73],
+    /// Window RESULT edges by API ID (slot 0 unused).
+    pub api_results: [u64; 73],
     /// Exemplars (≤8 per direction).
     pub exemplars: Vec<TraceExemplar>,
 }
@@ -275,6 +305,10 @@ pub struct ClosedTraceWindow {
 /// Cumulative session totals.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct TraceTotals {
+    /// Cumulative pairs by class ID (2c's `class_epoch` input).
+    pub class_counts: [u64; 5],
+    /// Cumulative latency distributions by class ID.
+    pub histograms: [TraceHistogram; 5],
     /// Cumulative pairs.
     pub paired: u64,
     /// Cumulative unpaired ATTEMPTs.
@@ -323,8 +357,14 @@ pub struct TraceProducer {
     capped: bool,
     /// Window dropped rows.
     dropped: u64,
-    /// Window pairs.
-    pairs: Vec<PairedEdge>,
+    /// Window pairs by class ID.
+    class_counts: [u64; 5],
+    /// Window latency distributions by class ID.
+    histograms: [TraceHistogram; 5],
+    /// Window ATTEMPT edges by API ID.
+    api_attempts: [u64; 73],
+    /// Window RESULT edges by API ID.
+    api_results: [u64; 73],
     /// Window exemplars.
     exemplars: Vec<TraceExemplar>,
     /// Window paired count.
@@ -409,7 +449,10 @@ impl TraceProducer {
             detail_bytes: 0,
             capped: false,
             dropped: 0,
-            pairs: Vec::new(),
+            class_counts: [0; 5],
+            histograms: [TraceHistogram::default(); 5],
+            api_attempts: [0; 73],
+            api_results: [0; 73],
             exemplars: Vec::new(),
             paired: 0,
             unpaired_entries: 0,
@@ -437,6 +480,13 @@ impl TraceProducer {
             self.received.attempts[slot] = self.received.attempts[slot].saturating_add(1);
             self.totals.received.attempts[slot] =
                 self.totals.received.attempts[slot].saturating_add(1);
+        }
+        // F2: received-domain per-API partition (§6D-10
+        // multiset/fetch inputs) — folds for EVERY edge
+        // regardless of mode or caps.
+        if (edge.api as usize) < self.api_attempts.len() {
+            let slot = edge.api as usize;
+            self.api_attempts[slot] = self.api_attempts[slot].saturating_add(1);
         }
         if !trace_mode_edge_bearing(self.mode) {
             return;
@@ -519,6 +569,12 @@ impl TraceProducer {
             self.received.results[slot] = self.received.results[slot].saturating_add(1);
             self.totals.received.results[slot] =
                 self.totals.received.results[slot].saturating_add(1);
+        }
+        // F2: received-domain per-API partition — folds for EVERY
+        // edge regardless of mode or caps.
+        if (edge.api as usize) < self.api_results.len() {
+            let slot = edge.api as usize;
+            self.api_results[slot] = self.api_results[slot].saturating_add(1);
         }
         if !trace_mode_edge_bearing(self.mode) {
             return;
@@ -631,7 +687,10 @@ impl TraceProducer {
             rejected_unknown_api: self.rejected_unknown_api,
             ring_loss,
             detail: std::mem::take(&mut self.detail),
-            pairs: std::mem::take(&mut self.pairs),
+            class_counts: std::mem::take(&mut self.class_counts),
+            histograms: std::mem::take(&mut self.histograms),
+            api_attempts: std::mem::replace(&mut self.api_attempts, [0; 73]),
+            api_results: std::mem::replace(&mut self.api_results, [0; 73]),
             exemplars: std::mem::take(&mut self.exemplars),
         };
         if sealed.capped {
@@ -719,15 +778,18 @@ impl TraceProducer {
         } else {
             result_ns - attempt_ns
         };
-        self.pairs.push(PairedEdge {
-            key: HashedKey::of(&key),
-            api,
-            class,
-            attempt_ns,
-            result_ns,
-            duration_ns,
-            nonmonotonic,
-        });
+        // F2: streaming fold into fixed small state (5 class counts
+        // + 5 distributions + counters) — exact under caps. "Pairs
+        // COMPLETE under caps" (§6D-5) means counts complete:
+        // retaining every pair row would contradict
+        // fixed-small-state, so no pair rows are kept.
+        let slot = class as usize;
+        self.class_counts[slot] = self.class_counts[slot].saturating_add(1);
+        self.totals.class_counts[slot] = self.totals.class_counts[slot].saturating_add(1);
+        if !nonmonotonic && demux(api) == Some(TraceFamily::PublicApi) {
+            self.histograms[slot].fold(duration_ns);
+            self.totals.histograms[slot].fold(duration_ns);
+        }
         self.paired = self.paired.saturating_add(1);
         self.totals.paired = self.totals.paired.saturating_add(1);
         if nonmonotonic {
@@ -885,11 +947,13 @@ mod tests {
         assert_eq!(w.paired, 1);
         assert_eq!(w.unpaired_entries, 0);
         assert_eq!(w.unpaired_results, 0);
-        assert_eq!(w.pairs.len(), 1);
-        let pair = &w.pairs[0];
-        assert_eq!(pair.class, 3);
-        assert_eq!(pair.duration_ns, 500);
-        assert!(!pair.nonmonotonic);
+        assert_eq!(w.class_counts, [0, 0, 0, 1, 0]);
+        assert_eq!(w.nonmonotonic_pairs, 0);
+        let h = &w.histograms[3];
+        assert_eq!((h.count, h.sum), (1, 500));
+        assert_eq!(&h.buckets[0..3], &[0, 0, 0]);
+        assert_eq!(h.buckets[3], 1);
+        assert_eq!(h.buckets[18], h.count);
         assert_eq!(w.received.attempts, [0, 0, 1]);
         assert_eq!(w.received.results, [0, 0, 1]);
     }
@@ -1111,9 +1175,23 @@ mod tests {
         p.result(result(op, 20, 1700, 3));
         let w = p.close_window(0, 2000, [0; 8]);
         assert_eq!(w.paired, 3);
-        let mut got: Vec<(u32, u32)> = w.pairs.iter().map(|e| (e.api, e.class)).collect();
-        got.sort_unstable();
-        assert_eq!(got, vec![(2, 0), (10, 0), (20, 3)]);
+        // Per-family attribution through the folds: fetch +
+        // lifecycle land class-0, the operational pair keeps its
+        // raw outcome class — and only the operational pair is
+        // histogrammed (duration 500).
+        assert_eq!(w.class_counts, [2, 0, 0, 1, 0]);
+        assert_eq!(w.class_counts.iter().sum::<u64>(), w.paired);
+        for (c, h) in w.histograms.iter().enumerate() {
+            if c == 3 {
+                assert_eq!((h.count, h.sum), (1, 500));
+            } else {
+                assert_eq!((h.count, h.sum), (0, 0), "class {c}");
+            }
+        }
+        assert_eq!(
+            (w.api_attempts[2], w.api_attempts[10], w.api_attempts[20]),
+            (1, 1, 1)
+        );
     }
 
     #[test]
@@ -1204,7 +1282,7 @@ mod tests {
         assert_eq!(w.detail.len(), 4);
         assert_eq!(w.dropped, 16);
         assert_eq!(w.paired, 10);
-        assert_eq!(w.pairs.len(), 10);
+        assert_eq!(w.class_counts.iter().sum::<u64>(), w.paired);
         assert_eq!(w.unpaired_entries, 0);
         assert_eq!(w.unpaired_results, 0);
     }
@@ -1257,7 +1335,9 @@ mod tests {
         let w = p.close_window(0, 5000, [0; 8]);
         assert_eq!(w.paired, 3);
         assert_eq!(w.nonmonotonic_pairs, 2);
-        assert_eq!(w.pairs.iter().filter(|e| e.nonmonotonic).count(), 2);
+        let hist_total: u64 = w.histograms.iter().map(|h| h.count).sum();
+        assert_eq!(hist_total, 1);
+        assert_eq!((w.histograms[1].count, w.histograms[1].sum), (1, 500));
     }
 
     #[test]
@@ -1347,23 +1427,102 @@ mod tests {
         p.result(result(k, 20, 1500, 1));
         p.attempt(attempt(key(10, 11, 1, 101, 8), 22, 1100));
         let w0 = p.close_window(0, 2000, [0; 8]);
-        assert_eq!(w0.pairs.len(), 1);
-        assert_eq!(w0.pairs[0].key.key_hash16, key_hash16(100, 1));
-        assert_eq!(
-            (
-                w0.pairs[0].key.pid,
-                w0.pairs[0].key.tid,
-                w0.pairs[0].key.generation,
-                w0.pairs[0].key.invocation
-            ),
-            (10, 11, 1, 7)
-        );
+        assert_eq!(w0.paired, 1);
         assert_eq!(w0.detail.len(), 3);
         assert_eq!(w0.detail[0].key.key_hash16, key_hash16(100, 1));
         let w = p.close_window(1, 3000, [0; 8]);
         assert_eq!(w.unpaired_entries, 1);
         assert_eq!(w.exemplars.len(), 1);
         assert_eq!(w.exemplars[0].key_hash16, key_hash16(101, 1));
+    }
+
+    #[test]
+    fn folds_are_exact_under_forced_caps() {
+        // F2 (codex R1-2): caps bind DETAIL, never accounting —
+        // a capped window's class/histogram/per-API folds stay
+        // COMPLETE (frozen §6D-5: fixed small state).
+        let mut p = TraceProducer::with_caps(4, usize::MAX);
+        p.set_mode(TRACE_MODE_ALL);
+        for i in 0..10u64 {
+            let k = key(10, 11, 1, 100 + i, i + 1);
+            p.attempt(attempt(k, 20, 1000 + i));
+            p.result(result(k, 20, 2000 + i, 1));
+        }
+        let w = p.close_window(0, 5000, [0; 8]);
+        assert!(w.capped);
+        assert_eq!(w.detail.len(), 4);
+        assert_eq!(w.dropped, 16);
+        assert_eq!(w.paired, 10);
+        assert_eq!(w.class_counts, [0, 10, 0, 0, 0]);
+        assert_eq!(w.class_counts.iter().sum::<u64>(), w.paired);
+        let h = &w.histograms[1];
+        assert_eq!((h.count, h.sum), (10, 10_000));
+        assert_eq!(&h.buckets[0..4], &[0, 0, 0, 0]);
+        assert!(h.buckets[4..].iter().all(|b| *b == 10));
+        assert_eq!(h.buckets[18], h.count);
+        for (c, h) in w.histograms.iter().enumerate() {
+            if c != 1 {
+                assert_eq!((h.count, h.sum), (0, 0), "class {c}");
+            }
+        }
+        assert_eq!(w.api_attempts[20], 10);
+        assert_eq!(w.api_results[20], 10);
+        assert_eq!(w.api_attempts.iter().sum::<u64>(), 10);
+        assert_eq!(w.api_results.iter().sum::<u64>(), 10);
+    }
+
+    #[test]
+    fn histogram_fold_is_cumulative_and_operational_only() {
+        // F2 + F5: cumulative buckets in `le` order (§6D-3),
+        // fetch pairs and nonmonotonic pairs never histogrammed
+        // (but still counted in `paired` + class totals).
+        let mut p = edge_bearing();
+        let op = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(op, 20, 1000));
+        p.result(result(op, 20, 1500, 1));
+        let fetch = key(10, 11, 1, 101, 8);
+        p.attempt(attempt(fetch, 10, 2000));
+        p.result(result(fetch, 10, 2600, 1));
+        let skew = key(10, 11, 1, 102, 9);
+        p.attempt(attempt(skew, 22, 5000));
+        p.result(result(skew, 22, 4000, 2));
+        let w = p.close_window(0, 6000, [0; 8]);
+        assert_eq!(w.paired, 3);
+        assert_eq!(w.nonmonotonic_pairs, 1);
+        assert_eq!(w.class_counts, [1, 1, 1, 0, 0]);
+        let h = &w.histograms[1];
+        assert_eq!((h.count, h.sum), (1, 500));
+        assert_eq!(&h.buckets[0..3], &[0, 0, 0]);
+        assert!(h.buckets[3..].iter().all(|b| *b == 1));
+        assert_eq!(h.buckets[18], h.count);
+        for (c, h) in w.histograms.iter().enumerate() {
+            if c != 1 {
+                assert_eq!((h.count, h.sum), (0, 0), "class {c}");
+            }
+        }
+        assert_eq!(w.api_attempts[10], 1);
+        assert_eq!(w.api_attempts[20], 1);
+        assert_eq!(w.api_attempts[22], 1);
+    }
+
+    #[test]
+    fn totals_fold_classes_and_histograms_across_windows() {
+        // F2: the epoch fold (2c's `class_epoch` input) accumulates
+        // per-class counts + distributions over sealed windows.
+        let mut p = edge_bearing();
+        let a = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        p.close_window(0, 2000, [0; 8]);
+        let b = key(10, 11, 1, 101, 8);
+        p.attempt(attempt(b, 20, 3000));
+        p.result(result(b, 20, 4000, 2));
+        p.close_window(1, 5000, [0; 8]);
+        let t = p.totals();
+        assert_eq!(t.paired, 2);
+        assert_eq!(t.class_counts, [0, 1, 1, 0, 0]);
+        assert_eq!((t.histograms[1].count, t.histograms[1].sum), (1, 500));
+        assert_eq!((t.histograms[2].count, t.histograms[2].sum), (1, 1000));
     }
 
     #[test]

@@ -197,9 +197,36 @@ fn trace_live_smoke_pairs_operational_edges() {
         "fetch attempts: {:?}",
         window.received.attempts
     );
-    assert!(window.pairs.iter().all(|pair| pair.class <= 4));
-    assert!(window.pairs.iter().any(|pair| pair.class == 1));
+    assert_eq!(window.class_counts.iter().sum::<u64>(), window.paired);
+    assert!(
+        window.class_counts[1] >= 1,
+        "operational successes fold class-1 (only operational folds nonzero): {:?}",
+        window.class_counts
+    );
+    assert!(
+        window.class_counts[0] >= 1,
+        "fetch pairs fold class-0: {:?}",
+        window.class_counts
+    );
+    for (c, h) in window.histograms.iter().enumerate() {
+        assert_eq!(h.buckets[18], h.count, "class {c} cumulative invariant");
+    }
+    let hist_total: u64 = window.histograms.iter().map(|h| h.count).sum();
+    assert!(
+        hist_total + window.nonmonotonic_pairs + window.class_counts[0] >= window.paired,
+        "histogram coverage: hist={hist_total} nonmono={} class0={} paired={}",
+        window.nonmonotonic_pairs,
+        window.class_counts[0],
+        window.paired
+    );
+    assert_eq!(
+        window.api_attempts.iter().sum::<u64>(),
+        received_attempts,
+        "per-API partition mirrors family received counts"
+    );
+    assert_eq!(window.api_results.iter().sum::<u64>(), received_results);
     assert_eq!(totals.paired, window.paired);
+    assert_eq!(totals.class_counts, window.class_counts);
     assert!(!window.capped);
     assert_eq!(window.dropped, 0);
 }
@@ -230,7 +257,17 @@ fn off_mode_matches_base(mode: u32) {
     assert_eq!(window.unpaired_results, 0);
     assert_eq!(window.dropped, 0);
     assert!(window.detail.is_empty());
-    assert!(window.pairs.is_empty());
+    assert_eq!(window.class_counts, [0; 5]);
+    assert!(
+        window.histograms.iter().all(|h| h.count == 0 && h.sum == 0),
+        "no pairing in off modes"
+    );
+    assert!(window.api_attempts[20..=72].iter().all(|c| *c == 0));
+    assert!(
+        window.api_attempts[10] >= OPS,
+        "fetch per-API counts fold ungated: {}",
+        window.api_attempts[10]
+    );
     assert_eq!(
         window.received.attempts[trace::TraceFamily::PublicApi.index()],
         0,
