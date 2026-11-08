@@ -659,18 +659,11 @@ impl TraceProducer {
     fn advance_hw(&mut self, key: &PairKey) {
         let scope = ScopeKey::of(key);
         let window = self.window;
-        let entry = self
-            .inv_hw
-            .entry(scope)
-            .or_insert(ScopeHw {
-                hw: None,
-                last_window: window,
-            });
-        entry.hw = Some(
-            entry
-                .hw
-                .map_or(key.invocation, |hw| hw.max(key.invocation)),
-        );
+        let entry = self.inv_hw.entry(scope).or_insert(ScopeHw {
+            hw: None,
+            last_window: window,
+        });
+        entry.hw = Some(entry.hw.map_or(key.invocation, |hw| hw.max(key.invocation)));
     }
 
     fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, class: u32) {
