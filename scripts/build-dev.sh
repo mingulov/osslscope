@@ -121,6 +121,14 @@ run_pinned_cargo() {
     # A fixed default sysroot is part of this recipe. An explicitly present
     # empty encoded flag set overrides ambient build/target flags, while the
     # scalar config overrides disable separate host-table flag selection.
+    # The blanking is load-bearing, not hygiene: ambient RUSTFLAGS leak
+    # into every cargo invocation, so `-C target-cpu=native` breaks the
+    # bpfel link (host CPU features reach bpf-linker) and `--sysroot ALT`
+    # silently redirects compilation while the manifest still binds the
+    # pinned source identity. Custom Rust flags are outside this pinned
+    # recipe; see docs/build.md. Proof:
+    # scripts/tests/test-runtime-source-binding.py
+    # (test_environment_build_and_target_flags_cannot_redirect_source).
     RUSTC="$_cargo_rustc" CARGO_BUILD_RUSTC="$_cargo_rustc" \
         CARGO_ENCODED_RUSTFLAGS='' RUSTFLAGS='' \
         CARGO_UNSTABLE_HOST_CONFIG=false CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST=false \

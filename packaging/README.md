@@ -128,8 +128,9 @@ written offer or future human source service is inferred.
 
 The preparation helper validates the payload and creates an ordinary Cargo
 `vendor/` source replacement for both workspaces without a registry index.
-Installed pinned compilers, bpf-linker and ordinary system development/runtime
-prerequisites remain external. Runtime originals preserve the full
+Installed pinned compilers, bpf-linker 0.10.4 and ordinary system development/runtime
+prerequisites remain external (the builder requires exactly `bpf-linker 0.10.4`
+in the manifest). Runtime originals preserve the full
 compiler_builtins conjunctive expression and LLVM exception, Unicode permission
 texts, library copyright inventories and the reviewed native-runtime notices.
 Read the recipe for the precise source boundary and tool prerequisites.

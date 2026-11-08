@@ -1,10 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Build from source
 
-Build the v0.4.0 automatic observation candidate for Linux x86-64 using pinned host/BPF
+Build the v0.5.0 automatic observation candidate for Linux x86-64 using pinned host/BPF
 toolchains and locked dependencies. Compilation and pure object preparation
 are separate from installed verifier/runtime qualification; see the
-[release qualification procedure](release-v0.4.0.md). The historical exact-profile
+[release qualification procedure](release-v0.4.0.md) (latest qualification
+record; no v0.5.0 record exists yet). The historical exact-profile
 diagnostic is selected only with `--libcrypto`.
 
 The host/common, BPF programs and independent BPF contract have distinct terms
@@ -31,7 +32,12 @@ only) on a cache miss. `CARGO_BUILD_JOBS` defaults to 2.
 - Linux x86-64.
 - Rust 1.88.0 (host) via rustup, plus nightly-2026-05-20 with the
   `rust-src` component (BPF `-Z build-std=core`).
-- `bpf-linker` 0.10.4 on `PATH`.
+- `bpf-linker` exactly 0.10.4 on `PATH` (BPF modes only;
+  `--host-only` needs no linker). `--check-only` and the build
+  share the prerequisite gate: a missing linker or any other
+  version fails hard with exit 3 and an install hint — there is
+  no silent fallback, because the wrong linker miscompiles the
+  BPF objects.
 - `python3` (3.11 or newer), `sha256sum`, `file`, `readelf`.
 
 Check what the script sees:
@@ -50,11 +56,51 @@ target directories, and the job/network/mode selection.
 ./scripts/build-dev.sh --bpf-only     # all five BPF objects only
 ./scripts/build-dev.sh --release      # host in release mode (BPF is always release)
 ./scripts/build-dev.sh --offline      # refuse any network; fail if the cache is incomplete
+./scripts/build-dev.sh --online       # allow network for every cargo call (locked set only)
 ```
 
 `--manifest PATH` redirects the manifest; `--jobs N` overrides the
 job bound. Exit codes: 0 ok, 2 usage, 3 missing prerequisite,
 1 build failure.
+
+Network modes (every cargo call passes `--locked` in all three):
+`--offline` refuses any network and fails on a cache miss; `--online`
+runs every cargo call with network allowed; the default (neither flag)
+tries `--offline` first and retries once online on a cache miss only.
+The manifest records the selected mode and which path was used.
+
+Identity-v2 dev admission (full default mode only):
+
+```sh
+./scripts/build-dev.sh --identity-v2-inputs FILE --identity-v2-dir DIR
+```
+
+Both flags are required together and are refused with `--host-only`
+or `--bpf-only`. `FILE` must name an existing inputs file; `DIR` is
+created when missing but must be fresh — the script refuses a
+directory that already holds `dev-admission.json`. The run freezes
+custody plus the four identity BPF roles, builds the observer-only
+host binary against them, and writes the dev admission
+(`dev-admission.json`) under `DIR`; `OSSL_PACKAGE_RECORD_DIR` points
+at `DIR` only for that host build.
+
+`CARGO_TARGET_DIR` (or `build.target-dir`) is honored: cargo writes
+where it points, and the script resolves both real target directories
+through `cargo metadata` — `--check-only` prints them and the manifest
+records them (`host_target_dir`, `bpf_target_dir`,
+`cargo_target_dir_env`). Only the per-invocation cargo log capture
+stays fixed under `<repo>/target/.cargo-log-*/`.
+
+Ambient Rust flags are normalized, not honored: every cargo invocation
+runs with `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` blanked and unstable
+host-config selection disabled, so ambient flags cannot redirect the
+pinned sysroot or leak host options into the BPF link. The blanking is
+load-bearing — `-C target-cpu=native` breaks the bpfel link and
+`--sysroot ALT` would silently redirect compilation while the manifest
+still binds the pinned source identity — so custom Rust flags are
+outside this pinned recipe. Proof:
+`scripts/tests/test-runtime-source-binding.py`
+(`test_environment_build_and_target_flags_cannot_redirect_source`).
 
 ## Fresh-archive build
 
