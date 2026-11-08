@@ -410,8 +410,27 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     };
     let old_depth = thread.depth;
     let Some(invocation) = thread.enter() else {
-        if THREADS.insert(key, thread, 0).is_err() {
-            loss(LOSS_MAP)
+        // fix6 (R6-4 backstop): a None with `next == MAX` DELETES
+        // the row instead of inserting it — persisting a MAX row
+        // would wedge every later entry (returns clear only
+        // `overflow`), turning transient CAS exhaustion into
+        // permanent per-thread blindness. Depth-overflow Nones
+        // still insert (their overflow arms `skip_return`
+        // pairing). Creation-time refusal (above) makes fresh MAX
+        // rows unreachable; a pre-existing MAX row needs 2^64
+        // emits (unreachable) — the delete is pure defense in
+        // depth, distinguished by `next`, not freshness.
+        match enter_none_disposition(thread.next) {
+            EnterNoneDisposition::Delete => {
+                if THREADS.remove(&key).is_err() {
+                    loss(LOSS_MAP)
+                }
+            }
+            EnterNoneDisposition::Insert => {
+                if THREADS.insert(key, thread, 0).is_err() {
+                    loss(LOSS_MAP)
+                }
+            }
         }
         loss(LOSS_DEPTH);
         return 0;
@@ -953,6 +972,10 @@ pub fn pop_return(
     let Some((_, key)) = identity(cookie) else {
         return false;
     };
+    // fix6 (R6-4 return-miss audit): userspace numeric cleanup may
+    // delete this row mid-call — the miss emits NOTHING (LOSS_PAIR
+    // + false; both `observation_return` callers return without
+    // emitting) and no return path dereferences a missing row.
     let Some(mut thread) = (unsafe { THREADS.get(&key).copied() }) else {
         loss(LOSS_PAIR);
         return false;

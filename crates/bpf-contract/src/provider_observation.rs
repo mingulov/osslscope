@@ -221,6 +221,31 @@ impl Thread {
     }
 }
 
+/// `enter()`-None arm disposition (fix6, R6-4 backstop): what the
+/// BPF entry path does with the row when `enter()` refuses.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EnterNoneDisposition {
+    /// Delete the row (a `next == MAX` row would wedge every
+    /// later entry — returns clear only `overflow`).
+    Delete,
+    /// (Re)insert the row (depth-overflow Nones need their
+    /// overflow to arm `skip_return` pairing).
+    Insert,
+}
+
+/// Pure disposition for the `enter()`-None arm: delete iff
+/// `next == MAX`. Distinguished by the counter value, NOT by
+/// row freshness (a fresh MAX row and a pre-existing MAX row
+/// both delete; depth-overflow and normal rows both insert).
+/// BPF-safe (`const`, no allocation) and host-unit-tested.
+pub const fn enter_none_disposition(next: u64) -> EnterNoneDisposition {
+    if next == u64::MAX {
+        EnterNoneDisposition::Delete
+    } else {
+        EnterNoneDisposition::Insert
+    }
+}
+
 /// Exact finite load taxonomy, unrolled to avoid a compiler-local memcmp
 /// subprogram that the strict reachable-subset loader cannot relocate.
 #[inline(always)]
@@ -474,6 +499,65 @@ mod tests {
         assert_eq!(core::mem::offset_of!(Record, invocation), 48);
         assert_eq!(core::mem::offset_of!(Record, start_time_ns), 96);
         assert_eq!(core::mem::offset_of!(Record, seed), 104);
+    }
+
+    #[test]
+    fn enter_none_disposition_pins_max_delete_overflow_insert() {
+        // fix6 (R6-4 backstop): the `enter()`-None arm disposition —
+        // distinguished by `next == MAX`, NOT by freshness. A MAX
+        // row must be DELETED (persisting it wedges every later
+        // entry — returns clear only `overflow`); depth-overflow
+        // Nones still INSERT (their overflow arms `skip_return`
+        // pairing).
+        // MAX + fresh → delete (unreachable post-refusal, still deletes).
+        let fresh_max = Thread {
+            seed: 7,
+            next: u64::MAX,
+            depth: 0,
+            overflow: 0,
+        };
+        assert_eq!(
+            enter_none_disposition(fresh_max.next),
+            EnterNoneDisposition::Delete
+        );
+        // MAX + pre-existing → delete (the backstop: a saturated row).
+        let old_max = Thread {
+            seed: 3,
+            next: u64::MAX,
+            depth: 2,
+            overflow: 0,
+        };
+        assert_eq!(
+            enter_none_disposition(old_max.next),
+            EnterNoneDisposition::Delete
+        );
+        // Depth-overflow (MAX_DEPTH breached, overflow armed) → insert.
+        let overflow = Thread {
+            seed: 3,
+            next: 41,
+            depth: MAX_DEPTH,
+            overflow: 1,
+        };
+        assert_eq!(
+            enter_none_disposition(overflow.next),
+            EnterNoneDisposition::Insert
+        );
+        // Normal next (only reachable via depth/overflow) → insert.
+        let normal = Thread {
+            seed: 3,
+            next: 41,
+            depth: 1,
+            overflow: 0,
+        };
+        assert_eq!(
+            enter_none_disposition(normal.next),
+            EnterNoneDisposition::Insert
+        );
+        // Boundary: only EXACT max deletes.
+        assert_eq!(
+            enter_none_disposition(u64::MAX - 1),
+            EnterNoneDisposition::Insert
+        );
     }
 
     #[test]
