@@ -1148,8 +1148,10 @@ mod tests {
         // non-operational A-frames, operational overflow B +
         // blind C): C longjmps; B's rejected return discards C's
         // stale T-marker and pops its own O-marker; every A pops
-        // its own frame. (RED pre-fix: this schedule asserted the
-        // exact [(8,7)..(2,1)] cascade — quoted in the fix8 report.)
+        // its own frame. (RED pre-fix: this schedule cascaded the
+        // exact [(8,7)..(2,1)] through the old cookie-blind counter
+        // rule; the cascade shape stays pinned post-fix by
+        // `fix8_same_cookie_skip_still_cascades_impossibility`.)
         const A: u64 = 0xA11CE;
         const B: u64 = 0xB00B;
         const C: u64 = 0xC10C;

@@ -248,7 +248,7 @@ pub const fn pending_release_value(current: u64) -> Option<u64> {
 /// Batched release of `n` removed frames (Task 0 verifier fix): one
 /// atomic CAS instead of `n` sequential single-release CAS loops, so
 /// the BPF discard path makes ONE quota call per return instead of up
-/// to 27 (the 27-in-loop calls blew the verifier's jump budget —
+/// to 24 (ceiling 27; the in-loop calls blew the verifier's jump budget —
 /// `observation_return` failed to load with E2BIG). All-or-nothing:
 /// `Some(current - n)` iff the batch keeps the counter above the two
 /// fixed reservations and within the cap; else `None` (the caller
