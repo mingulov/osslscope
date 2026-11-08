@@ -7264,9 +7264,10 @@ mod tests {
                 flags: m.flags,
             })
             .collect();
-        // Independent fixed total for the actual sixteen ordinary provider maps
-        // on sixteen possible CPUs, excluding the separately owned ADMIT gate.
-        let required = 7_166_360;
+        // Independent fixed total for the actual seventeen ordinary provider maps
+        // on sixteen possible CPUs, excluding the separately owned ADMIT gate
+        // (T8.2a: TRACE_MODE adds (4 + 8 + 128) * 1 + 65536 = 65676).
+        let required = 7_232_036;
         let budget = ObservationBudget::new(ObservationLimits {
             max_state_bytes: required - 1,
             ..Default::default()
@@ -7366,7 +7367,8 @@ mod tests {
         // from real objects. No assertion here may skip: each arm either
         // asserts or panics.
         let full = synthetic_full_preparation();
-        assert_eq!(full.maps.len(), 34, "mirror must track the full map shape");
+        // T8.2a: TRACE_MODE (§6D-0 D0-1) grows the full shape 34 -> 35.
+        assert_eq!(full.maps.len(), 35, "mirror must track the full map shape");
         assert_eq!(full.progs.len(), 8, "mirror must track the full root shape");
         let pool = crate::observation_memory::MemoryPool::new(256 << 20);
         let gate = crate::writer_gate::fake_for_shape_tests(&pool).unwrap();
@@ -7380,7 +7382,7 @@ mod tests {
         let (legacy, source) = split_source_preparation(full);
         let legacy_roots: Vec<_> = legacy.progs.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(legacy_roots, ["observation_entry", "observation_return"]);
-        assert_eq!(legacy.maps.len(), 16);
+        assert_eq!(legacy.maps.len(), 17);
         assert_eq!(legacy.maps.iter().filter(|m| m.name == "ADMIT").count(), 1);
         for map in &legacy.maps {
             assert!(
