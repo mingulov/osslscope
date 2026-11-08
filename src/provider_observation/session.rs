@@ -17866,6 +17866,182 @@ mod fix4_retire {
     }
 }
 
+/// Fix5 F4: BPF global-seq seeding behavioral test (R5-2).
+///
+/// Privileged live-attach test: real object, real workload, real
+/// BPF entry path. Deletes a live THREADS row via the REAL session
+/// cleanup on a live session (R5-2's exact hazard: numeric cleanup
+/// racing a live row) + re-emits → the re-created row seeds HIGH
+/// (never restarts at 1). `#[ignore]`d with graceful skip when
+/// caps/object are absent; run under sudo in M4.
+#[cfg(test)]
+mod fix5_seeding {
+    use super::*;
+    use std::io::{BufRead, BufReader, Write};
+    use std::process::{Child, Command, Stdio};
+
+    struct Owned(Child);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            drop(self.0.stdin.take());
+            let _ = self.0.wait();
+        }
+    }
+
+    fn gated() -> Option<Vec<u8>> {
+        if unsafe { libc::geteuid() } != 0 {
+            eprintln!("SKIP fix5 seeding: need root");
+            return None;
+        }
+        let path = std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF")?;
+        std::fs::read(path).ok()
+    }
+
+    fn build_workload(dir: &std::path::Path) -> std::path::PathBuf {
+        let app = dir.join("seed_digest_loop");
+        assert!(
+            Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/trace_digest_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        app
+    }
+
+    /// One G batch (60 fetch+digest ops) + wait for its done line.
+    fn run_batch(
+        stdin: &mut std::process::ChildStdin,
+        rx: &std::sync::mpsc::Receiver<String>,
+        n: usize,
+    ) {
+        stdin.write_all(b"G").unwrap();
+        stdin.flush().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if Instant::now() >= deadline {
+                panic!("VOID: seeding batch {n} did not finish within 120s");
+            }
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(line) if line.starts_with("done ") => {
+                    assert_eq!(line, "done ok=60 fetched=60", "seeding batch {n}");
+                    return;
+                }
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        }
+    }
+
+    fn thread_rows(s: &ProviderSession, pid: u32, tid: u32) -> Vec<(c::ThreadKey, c::Thread)> {
+        s.threads
+            .keys()
+            .filter_map(|r| r.ok())
+            .filter(|k| k.pid == pid && k.tid == tid)
+            .filter_map(|k| s.threads.get(&k, 0).ok().map(|v| (k, v)))
+            .collect()
+    }
+
+    #[test]
+    #[ignore = "fix5 seeding: requires root + OSSL_PROVIDER_OBSERVATION_TEST_BPF (sudo M4 run)"]
+    fn fix5_deleted_live_row_never_restarts() {
+        let Some(object) = gated() else {
+            eprintln!("SKIP fix5 seeding: need root + object");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("osslscope-seed5-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let app = build_workload(&dir);
+        let mut child = Owned(
+            Command::new(&app)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut first = BufReader::new(child.0.stdout.take().unwrap());
+        let mut line = String::new();
+        first.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in first.lines() {
+                match line {
+                    Ok(line) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let pid = child.0.id();
+        let mut scanner = crate::inventory::scope::ScopedScanner::new(
+            crate::inventory::scope::Selection {
+                pids: vec![pid],
+                ..Default::default()
+            },
+            crate::inventory::Limits::default(),
+        )
+        .unwrap();
+        let mut s = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        s.set_trace_mode(super::trace::TRACE_MODE_LATENCY).unwrap();
+        let setup = s.reconcile(&scanner.snapshot());
+        assert!(
+            !setup.gaps.iter().any(|g| matches!(
+                g,
+                ObservationGap::AttachFailed
+                    | ObservationGap::BpfUnavailable
+                    | ObservationGap::SymbolUnavailable
+            )),
+            "setup: {:?}",
+            setup.gaps
+        );
+        // Warmup batch: absorbs first-batch-cold effects (provider
+        // init/fetch caching changes the BPF enter count by a couple
+        // — observed 482 vs 481 without warmup), so the two measured
+        // batches below execute identical enter counts.
+        run_batch(child.0.stdin.as_mut().unwrap(), &rx, 0);
+        let _ = s.drain(Instant::now() + Duration::from_secs(30));
+        // Symmetric double-delete: two fresh rows under identical
+        // warm batches. Row A seeds s, row B seeds s+1 (consecutive
+        // global-seq creations), so B.next - A.next = 1 exactly —
+        // the strict inequality below measures the seed advance
+        // directly. R5-2's exact hazard drives each deletion:
+        // numeric cleanup deleting a LIVE row.
+        let mut created = Vec::new();
+        for n in 1..=2 {
+            let failures = s.remove_thread_rows(pid, pid);
+            assert_eq!(failures, 0, "live-row cleanup {n} deletes cleanly");
+            run_batch(child.0.stdin.as_mut().unwrap(), &rx, n);
+            let _ = s.drain(Instant::now() + Duration::from_secs(30));
+            let rows = thread_rows(&s, pid, pid);
+            assert_eq!(rows.len(), 1, "re-created row {n} present");
+            created.push(rows[0].1.next);
+        }
+        let (a, b) = (created[0], created[1]);
+        eprintln!("seed5: fresh-row next a={a} b={b}");
+        assert!(a >= 2, "fresh row never restarts at 1: a={a}");
+        assert!(
+            b > a,
+            "consecutive creations seed strictly higher (global seq): a={a} b={b}"
+        );
+        child.0.stdin.as_mut().unwrap().write_all(b"X").unwrap();
+        drop(child.0.stdin.take());
+        assert!(child.0.wait().unwrap().success());
+        let _ = s.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "../../tests/support/provider_forwarder.rs"]
 mod startup_fixture;
