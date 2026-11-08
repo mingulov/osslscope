@@ -1084,11 +1084,19 @@ fn native_static_lookalike_getter_and_shared_site() {
 
 #[test]
 fn operational_calls_cannot_enter_the_cold_fact_ring() {
-    for api in 20u32..=48 {
-        for kind in [1, 2, 3, 4, 5, 6] {
+    // T8.2a (§6D-0 D0-4): operational ATTEMPT/RESULT decode as
+    // trace-plane edges; every other kind stays rejected for
+    // operational APIs — they cannot mint cold facts.
+    for api in 20u32..=72 {
+        for kind in [1, 2] {
             let mut bytes = record(kind);
             bytes[12..16].copy_from_slice(&api.to_le_bytes());
-            assert!(wire::decode(&bytes).is_err());
+            assert!(wire::decode(&bytes).is_ok(), "api {api} kind {kind}");
+        }
+        for kind in [3, 4, 5, 6, 7] {
+            let mut bytes = record(kind);
+            bytes[12..16].copy_from_slice(&api.to_le_bytes());
+            assert!(wire::decode(&bytes).is_err(), "api {api} kind {kind}");
         }
     }
 }
