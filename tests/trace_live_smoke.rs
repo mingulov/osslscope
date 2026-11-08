@@ -95,13 +95,29 @@ fn spawn(app: &std::path::Path) -> (Owned, mpsc::Receiver<String>) {
     (child, rx)
 }
 
-fn drive(
-    mode: u32,
-) -> (
-    trace::ClosedTraceWindow,
-    trace::TraceTotals,
-    po::ObservationBatch,
-) {
+fn is_fetch_fact(fact: &po::ObservationFact) -> bool {
+    matches!(
+        fact.api,
+        po::ObservationApi::Inventoried(
+            osslscope::inventory::Api::EvpMdFetch
+                | osslscope::inventory::Api::EvpCipherFetch
+                | osslscope::inventory::Api::EvpMacFetch
+                | osslscope::inventory::Api::EvpKdfFetch
+                | osslscope::inventory::Api::EvpSignatureFetch
+                | osslscope::inventory::Api::EvpKemFetch
+        )
+    )
+}
+
+struct Driven {
+    window: trace::ClosedTraceWindow,
+    totals: trace::TraceTotals,
+    op_facts: u64,
+    fetch_facts: u64,
+    batch: po::ObservationBatch,
+}
+
+fn drive(mode: u32) -> Driven {
     let object = gated().expect("live lane gates");
     let scratch = ScratchDir(
         std::env::temp_dir().join(format!("osslscope-trace-smoke-{}", std::process::id())),
@@ -132,6 +148,19 @@ fn drive(
         setup.gaps
     );
     child.0.stdin.as_mut().unwrap().write_all(b"G").unwrap();
+    // F1: tally cold facts across EVERY drain batch (facts are
+    // emitted per drain — the close batch alone cannot witness a
+    // per-edge leak into the fact ring).
+    let mut op_facts = 0u64;
+    let mut fetch_facts = 0u64;
+    let mut tally = |batch: &po::ObservationBatch| {
+        op_facts += batch
+            .facts
+            .iter()
+            .filter(|f| matches!(f.api, po::ObservationApi::Operational(_)))
+            .count() as u64;
+        fetch_facts += batch.facts.iter().filter(|f| is_fetch_fact(f)).count() as u64;
+    };
     let deadline = Instant::now() + Duration::from_secs(120);
     let done = loop {
         if Instant::now() >= deadline {
@@ -141,13 +170,13 @@ fn drive(
             Ok(line) if line.starts_with("done ") => break line,
             Ok(_) => continue,
             Err(_) => {
-                session.drain(Instant::now() + Duration::from_millis(100));
+                tally(&session.drain(Instant::now() + Duration::from_millis(100)));
             }
         }
     };
     assert_eq!(done, format!("done ok={OPS} fetched={OPS}"));
     for _ in 0..5 {
-        session.drain(Instant::now() + Duration::from_millis(200));
+        tally(&session.drain(Instant::now() + Duration::from_millis(200)));
     }
     let window = session.close_trace_window(0);
     let totals = session.trace_totals();
@@ -155,7 +184,14 @@ fn drive(
     drop(child.0.stdin.take());
     assert!(child.0.wait().unwrap().success());
     let batch = session.close();
-    (window, totals, batch)
+    tally(&batch);
+    Driven {
+        window,
+        totals,
+        op_facts,
+        fetch_facts,
+        batch,
+    }
 }
 
 #[test]
@@ -164,9 +200,15 @@ fn trace_live_smoke_pairs_operational_edges() {
     if gated().is_none() {
         return;
     }
-    let (window, totals, _batch) = drive(trace::TRACE_MODE_LATENCY);
+    let Driven {
+        window,
+        totals,
+        op_facts,
+        fetch_facts,
+        ..
+    } = drive(trace::TRACE_MODE_LATENCY);
     eprintln!(
-        "smoke: paired={} unpaired_e={} unpaired_r={} op_attempts={} fetch_attempts={} ring_loss={:?} dropped={} capped={}",
+        "smoke: paired={} unpaired_e={} unpaired_r={} op_attempts={} fetch_attempts={} ring_loss={:?} dropped={} capped={} classes={:?} op_facts={} fetch_facts={}",
         window.paired,
         window.unpaired_entries,
         window.unpaired_results,
@@ -175,6 +217,9 @@ fn trace_live_smoke_pairs_operational_edges() {
         window.ring_loss,
         window.dropped,
         window.capped,
+        window.class_counts,
+        op_facts,
+        fetch_facts,
     );
     assert_eq!(window.mode, trace::TRACE_MODE_LATENCY);
     if window.paired < MIN_PAIRS {
@@ -225,6 +270,16 @@ fn trace_live_smoke_pairs_operational_edges() {
         "per-API partition mirrors family received counts"
     );
     assert_eq!(window.api_results.iter().sum::<u64>(), received_results);
+    assert_eq!(
+        op_facts, 0,
+        "F1: operational edges must not mint cold facts"
+    );
+    assert_eq!(
+        fetch_facts,
+        window.received.attempts[trace::TraceFamily::Fetch.index()]
+            + window.received.results[trace::TraceFamily::Fetch.index()],
+        "F1: every fetch edge still files its BASE cold fact"
+    );
     assert_eq!(totals.paired, window.paired);
     assert_eq!(totals.class_counts, window.class_counts);
     assert!(!window.capped);
@@ -243,7 +298,12 @@ fn trace_mode_gate_off_is_base_identical() {
 }
 
 fn off_mode_matches_base(mode: u32) {
-    let (window, totals, batch) = drive(mode);
+    let Driven {
+        window,
+        totals,
+        batch,
+        ..
+    } = drive(mode);
     eprintln!(
         "off-gate: paired={} op_attempts={} fetch_attempts={} ring_loss={:?}",
         window.paired,

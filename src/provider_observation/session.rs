@@ -3635,6 +3635,14 @@ impl ProviderSession {
         }
         b
     }
+    /// F1: operational ATTEMPT/RESULT live in the trace plane only.
+    /// `consume` feeds them to the pairing producer, then returns
+    /// before cold-fact assembly — 12 hot records per op would
+    /// otherwise exhaust `FactLimit`/`StateLimit`. Fetch/lifecycle
+    /// edges (and every other kind) flow through byte-identical.
+    fn trace_plane_only(kind: u32, api: u32) -> bool {
+        (kind == c::ATTEMPT || kind == c::RESULT) && c::operational_api(api)
+    }
     fn consume(&mut self, event: wire::Transport, b: &mut ObservationBatch) {
         let r = event.record();
         // 6A fence: post-edge records never bind, never project —
@@ -3697,6 +3705,9 @@ impl ProviderSession {
                     outcome: r.outcome,
                 });
             }
+        }
+        if Self::trace_plane_only(r.kind, r.api) {
+            return;
         }
         let hash = attachment.site.object_hash().clone();
         let advertisers = attachment.advertisers.clone();
@@ -5543,6 +5554,28 @@ fn object_id(site: &VerifiedSite) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trace_plane_only_gates_operational_edges() {
+        use super::ProviderSession;
+        use super::wire::contract as c;
+        // F1 (codex R1-1): operational ATTEMPT/RESULT return right
+        // after the trace feed (trace plane only — never cold
+        // facts); fetch/lifecycle edges flow to cold-fact assembly
+        // byte-identical, as do all other kinds.
+        for api in [20, 45, 72] {
+            assert!(ProviderSession::trace_plane_only(c::ATTEMPT, api));
+            assert!(ProviderSession::trace_plane_only(c::RESULT, api));
+        }
+        for api in [1, 6, 7, 9, 10, 15, 16, 19] {
+            assert!(!ProviderSession::trace_plane_only(c::ATTEMPT, api));
+            assert!(!ProviderSession::trace_plane_only(c::RESULT, api));
+        }
+        assert!(!ProviderSession::trace_plane_only(c::ATTEMPT, 0));
+        assert!(!ProviderSession::trace_plane_only(c::RESULT, 73));
+        assert!(!ProviderSession::trace_plane_only(c::INIT, 20));
+        assert!(!ProviderSession::trace_plane_only(c::IMPLEMENTATION, 45));
+        assert!(!ProviderSession::trace_plane_only(c::GAP, 20));
+    }
     /// N10 fake thread-row map: BTreeMap rows plus injectable
     /// enumeration/deletion failures, exercising the shared
     /// cleanup logic without BPF.
