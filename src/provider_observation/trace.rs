@@ -629,7 +629,8 @@ impl TraceProducer {
         // fix3: tag with the tid's current retire epoch — the epoch
         // is part of the pairing identity, so a pre-bump hold never
         // pairs with a post-bump edge (no window-counted rejection:
-        // the new incarnation pairs from invocation 1 immediately).
+        // the new incarnation pairs immediately from its high-seeded
+        // invocations — fix5: BPF seeds HIGH, never 1).
         // fix4: tag with the BPF-stamped incarnation too — soundness
         // against recycled tids (both orders) comes from the stamp,
         // not from the drain barrier (which is best-effort ordering).
@@ -924,7 +925,8 @@ impl TraceProducer {
     /// the next edge-bearing feed). The HW scopes are dropped (HW
     /// is per-epoch) and the epoch bumps: pre-bump holds (old
     /// epoch) never pair with post-bump edges (new epoch), and
-    /// the new incarnation pairs from invocation 1 immediately.
+    /// the new incarnation pairs immediately from its high-seeded
+    /// invocations (fix5: BPF seeds HIGH, never 1).
     /// Epoch storage is FIXED-CAPPED (FIFO, same
     /// kernel-mirrored bound); evicting an epoch expires the
     /// victim's pending WITH it (coupled expiry — protection
@@ -2621,9 +2623,10 @@ mod tests {
     #[test]
     fn retire_epoch_recycle_matrix() {
         // fix3: epochs replace window-counted markers — old-old pairs preserved iff
-        // drained pre-bump; the new incarnation pairs clean from
-        // invocation 1 IMMEDIATELY (no 2-window rejection); cross-bump
-        // same-key halves never pair.
+        // drained pre-bump; the new incarnation pairs clean IMMEDIATELY
+        // (no 2-window rejection); cross-bump same-key halves never
+        // pair. (fix5: the forged post-bump invocations 1..=10 below
+        // exercise the epoch namespace — real recycled tids seed HIGH.)
         let mut p = edge_bearing();
         // Old incarnation: complete pairs (both gens) + one dangling hold.
         for generation in [1u64, 2] {
@@ -2637,7 +2640,8 @@ mod tests {
         p.attempt(attempt(dangling, 20, 1500));
         assert_eq!(p.totals().paired, 20);
         p.retire_scope(10, 11);
-        // Immediately post-bump: recycled SAME keys pair clean (inv ≤ old HW).
+        // Immediately post-bump: recycled SAME keys pair clean (inv ≤ old HW;
+        // forged reuse — the dropped epoch HW is what this pins).
         for generation in [1u64, 2] {
             for inv in 1..=10u64 {
                 let k = key(10, 11, generation, 100 + inv, inv);
