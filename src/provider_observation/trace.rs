@@ -1059,10 +1059,10 @@ impl TraceProducer {
     }
 
     /// Mark scope activity on ACCEPT paths only (pending-insert
-    /// + pair — G3): an immediate-unpaired edge must NEVER stamp
-    /// the scope clock, or rejections self-perpetuate stale HW
-    /// (the recycled-tid feedback loop). Idle-drop keys on
-    /// accepted arrivals only.
+    /// and pair — G3): an immediate-unpaired edge must NEVER
+    /// stamp the scope clock, or rejections self-perpetuate
+    /// stale HW (the recycled-tid feedback loop). Idle-drop keys
+    /// on accepted arrivals only.
     fn touch_scope(&mut self, key: &PairKey) {
         let window = self.window;
         self.scope_or_insert(ScopeKey::of(key)).last_window = window;
