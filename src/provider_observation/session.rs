@@ -17781,6 +17781,17 @@ impl ProviderSession {
 /// evidence. RED on the old get-then-stamp order
 /// (copy-2/miss-2/stamp-3), GREEN on tick-before-read.
 ///
+/// fix8 (R8-3) masking bound (INHERENT — disclosed, not chased):
+/// with 1 ns ticks, a set and its trailing stamp (µs apart) ALWAYS
+/// land on different ticks, so the black-box oracle cannot align
+/// them exactly — an old-order defect CAN hide (copy@2-miss,
+/// stamp@3: the strict `<` never counts it). Sensitivity is shown
+/// via RED runs (the old order fires — re-demonstrated every fix),
+/// not exhaustively; the strict `<` stays as the sound zero-FP
+/// oracle. A start barrier + non-vacuity asserts (below) keep the
+/// soak honest: fully-vacuous (`0 <= 0`) runs fail loudly instead
+/// of greening.
+///
 /// `#[ignore]`d with graceful skip when map creation fails (no
 /// caps); run under sudo in M4.
 #[cfg(test)]
@@ -17850,8 +17861,14 @@ mod fix7_receipt_soak {
         s.set_loss_tick_clock(origin, 1);
         let log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(AtomicBool::new(false));
+        // fix8 (R8-3): start barrier — the injector signals its
+        // first completed bump before round 0, so a stillborn
+        // injector (or a starved one) fails LOUDLY below instead
+        // of greening vacuously (`0 <= 0` on every round).
+        let first_bump = Arc::new(AtomicBool::new(false));
         let worker_log = Arc::clone(&log);
         let worker_done = Arc::clone(&done);
+        let worker_first = Arc::clone(&first_bump);
         let injector = std::thread::spawn(move || {
             let mut loss: PerCpuArray<MapData, u64> = injector_loss;
             let mut count = 0u64;
@@ -17868,11 +17885,21 @@ mod fix7_receipt_soak {
                 // completed before that receipt's read.
                 let tick = loss_tick_of(LiveClock.monotonic_ns(), origin, 1);
                 worker_log.lock().unwrap().push(tick);
+                worker_first.store(true, Ordering::Release);
             }
         });
+        let barrier_start = Instant::now();
+        while !first_bump.load(Ordering::Acquire) {
+            assert!(
+                barrier_start.elapsed() < Duration::from_secs(10),
+                "soak barrier: no injector bump inside 10 s (vacuous run refused)"
+            );
+            std::thread::yield_now();
+        }
         let start = Instant::now();
         let mut rounds = 0u32;
         let mut prev_seq = 0u64;
+        let mut certified_rounds = 0u32;
         while rounds < 2000 && start.elapsed() < Duration::from_secs(60) {
             let batch = s.drain(Instant::now() + Duration::from_millis(100));
             assert!(
@@ -17893,11 +17920,20 @@ mod fix7_receipt_soak {
                 certified <= totals,
                 "round {rounds}: {certified} bumps stamped below receipt {receipt} but totals={totals}"
             );
+            certified_rounds += u32::from(certified > 0);
             rounds += 1;
         }
         done.store(true, Ordering::Relaxed);
         injector.join().expect("injector join");
         assert_eq!(rounds, 2000, "soak must complete all rounds inside 60 s");
+        // fix8 (R8-3): non-vacuity — the barrier bump plus a live
+        // injector guarantee both; a run observing nothing fails
+        // here instead of greening on `0 <= 0`.
+        assert!(!log.lock().unwrap().is_empty(), "soak observed no bumps");
+        assert!(
+            certified_rounds > 0,
+            "soak certified no round (vacuous oracle)"
+        );
     }
 }
 
