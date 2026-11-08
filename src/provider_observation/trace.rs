@@ -556,14 +556,32 @@ impl TraceProducer {
                 held.outcome,
             );
         } else if self.pending_results.contains_key(&edge.key) {
-            // Cross-window held RESULT: the key is unconsumed, so
-            // live-state precedence skips the high-water — the
-            // newcomer goes pending (pending-then-correct), or is
-            // the anomaly when an ATTEMPT is already live.
-            if self.pending_attempts.contains_key(&edge.key) {
+            // G2: cross-window held RESULT — STALE. It can never
+            // pair afterward (any same-key future ATTEMPT lands
+            // same-or-later window = reverse or dup), so evict it
+            // as unpaired-R immediately (+ exemplar, no HW
+            // advance — the newcomer below may be the legitimate
+            // pair). Killing it at block time leaves no lingering
+            // dead state whose liveness could shield later dups
+            // from the high-water; window attribution is identical
+            // to close-expiry. Load-bearing order: evict-stale →
+            // HW → pending.
+            if let Some(held) = self.pending_result_remove(&edge.key) {
+                self.unpaired_results = self.unpaired_results.saturating_add(1);
+                self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+                self.push_live_exemplar(ExemplarDir::Result, edge.key, held.api);
+            }
+            if self.is_hw_dup(&edge.key) {
+                self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+                self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+            } else if self.pending_attempts.contains_key(&edge.key) {
+                // The anomaly when an ATTEMPT is already live
+                // (same bucket as the HW-dup above — both
+                // conserve the newcomer as unpaired immediately).
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
             } else {
+                // Fresh key: pending-then-correct as before.
                 self.pending_attempt_insert(edge.key, edge.api, edge.monotonic_ns);
             }
         } else if self.pending_attempts.contains_key(&edge.key) {
@@ -1296,6 +1314,63 @@ mod tests {
         assert_eq!(w1.unpaired_results, 1);
         assert_eq!(w1.unpaired_entries, 0);
         p.result(result(k, 20, 3000, 1));
+        p.finalize(3500);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (0, 1));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn f4_block_evicts_stale_orphan_never_repairs() {
+        // G2 (codex R2-2): the exact 6-step trace. The stale
+        // cross-window R-orphan is evicted as unpaired-R the
+        // moment it blocks a same-key ATTEMPT (it can never pair
+        // afterward), so its liveness cannot shield later dups
+        // from the high-water: 1 pair + 1E + 2R.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.result(result(k, 20, 1000, 1));
+        p.close_window(0, 1500, [0; 8]);
+        p.attempt(attempt(k, 20, 2000));
+        p.result(result(k, 20, 2500, 1));
+        p.attempt(attempt(k, 20, 2600));
+        p.result(result(k, 20, 2700, 1));
+        p.finalize(3000);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!(t.unpaired_entries, 1);
+        assert_eq!(t.unpaired_results, 2);
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+        let w = p.close_window(1, 3100, [0; 8]);
+        assert!(
+            w.exemplars
+                .iter()
+                .any(|e| e.dir == ExemplarDir::Result && e.key_hash16 == key_hash16(100, 1)),
+            "evicted orphan leaves a Result exemplar: {:?}",
+            w.exemplars
+        );
+    }
+
+    #[test]
+    fn reverse_carry_without_early_close() {
+        // G2: reverse carry WITHOUT the early close — the stale
+        // R-orphan is evicted (visible) at the blocking ATTEMPT,
+        // not at the next close; the fresh pair still completes.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.result(result(k, 20, 1000, 1));
+        p.close_window(0, 1500, [0; 8]);
+        p.attempt(attempt(k, 20, 2000));
+        assert_eq!(p.totals().unpaired_results, 1);
+        p.result(result(k, 20, 2500, 1));
+        p.close_window(1, 3000, [0; 8]);
         p.finalize(3500);
         let t = p.totals();
         assert_eq!(t.paired, 1);
