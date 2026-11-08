@@ -201,9 +201,13 @@ fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
 // across incarnations in either recycle order. An unprogrammed or
 // out-of-range offset stamps 0, which the host decoder rejects
 // (fail-closed); the loader refuses to run with such an offset.
+//
+// The stamp is computed ONCE per program at the top level and threaded
+// down: inlining the task-read CFG into `base` re-verifies it at every
+// emission site and doubles program-load time (verifier state explosion).
 #[inline(never)]
 #[no_mangle]
-pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record) {
+pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record, stamp: u64) {
     *out = Record {
         version: VERSION,
         kind,
@@ -217,7 +221,7 @@ pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record) {
         invocation: p.invocation,
         ..Record::default()
     };
-    out.start_time_ns = incarnation_stamp(p.cookie);
+    out.start_time_ns = stamp;
 }
 #[inline(always)]
 fn incarnation_stamp(cookie: u64) -> u64 {
@@ -314,6 +318,12 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     let Some((cfg, key)) = identity(cookie) else {
         return 0;
     };
+    // fix4: single stamp per program, threaded to every emission site.
+    // The return probe's cookie always equals the stored entry cookie
+    // (`pop_return` rejects mismatches), so this is the same CONFIG
+    // lookup `base` used to do — without re-verifying the task-read
+    // CFG at each of the eight emission sites.
+    let stamp = incarnation_stamp(cookie);
     if operational_api(cfg.api) {
         operational_entry(cookie, &key);
         if !trace_operational() {
@@ -406,32 +416,32 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         )
     {
         let mut r = Record::default();
-        base(&p, &key, ATTEMPT, &mut r);
+        base(&p, &key, ATTEMPT, &mut r, stamp);
         r.status = p.name;
         emit(&r)
     }
     if matches!(p.api, PUBLIC_UNQUERY | TEARDOWN | UNQUERY_CALLBACK) {
-        invalidate(&p, &key, if p.api == TEARDOWN { 3 } else { 2 });
+        invalidate(&p, &key, if p.api == TEARDOWN { 3 } else { 2 }, stamp);
     }
     0
 }
 #[inline(never)]
 #[no_mangle]
-pub fn invalidate(p: &Pending, key: &ThreadKey, status: u32) {
+pub fn invalidate(p: &Pending, key: &ThreadKey, status: u32, stamp: u64) {
     // Invalidate advertisement leases, independently of retained code lifetimes.
     if let Some(member) = MEMBERS.get_ptr_mut(&key.pid) {
         unsafe { (*member).epoch = 0 }
     }
     let mut r = Record::default();
-    base(p, key, INVALIDATION, &mut r);
+    base(p, key, INVALIDATION, &mut r, stamp);
     r.status = status;
     emit(&r);
 }
 #[inline(never)]
 #[no_mangle]
-pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64) {
+pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64) {
     let mut r = Record::default();
-    base(p, key, INIT, &mut r);
+    base(p, key, INIT, &mut r, stamp);
     r.outcome = int_outcome(rv);
     emit(&r);
     if r.outcome != 1 {
@@ -448,9 +458,9 @@ pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64) {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn getter_return(p: &Pending, key: &ThreadKey, table: u64) {
+pub fn getter_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) {
     let mut r = Record::default();
-    base(p, key, INIT, &mut r);
+    base(p, key, INIT, &mut r, stamp);
     r.outcome = if table == 0 { 2 } else { 1 };
     emit(&r);
     if table != 0 {
@@ -708,8 +718,8 @@ pub extern "C" fn dispatch_slot(index: u64, context: u64) -> u64 {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
-    let cacheability = query_result(p, key, table);
+pub fn query_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) {
+    let cacheability = query_result(p, key, table, stamp);
     if table == 0 {
         return;
     }
@@ -719,6 +729,7 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
         table,
         cacheability,
         stopped: 0,
+        stamp,
     };
     let result = unsafe {
         helpers::bpf_loop(
@@ -736,9 +747,9 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64) {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn query_result(p: &Pending, key: &ThreadKey, table: u64) -> u32 {
+pub fn query_result(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) -> u32 {
     let mut r = Record::default();
-    base(p, key, QUERY, &mut r);
+    base(p, key, QUERY, &mut r, stamp);
     r.operation = p.operation;
     r.outcome = if table == 0 { 2 } else { 1 };
     r.cacheability = match unsafe { helpers::bpf_probe_read_user(p.arg2 as *const u32) } {
@@ -766,6 +777,7 @@ struct AlgorithmScan {
     table: u64,
     cacheability: u32,
     stopped: u32,
+    stamp: u64,
 }
 #[inline(never)]
 #[no_mangle]
@@ -801,7 +813,13 @@ pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
     };
     let mut record = Record::default();
     let p = unsafe { &*scan.pending };
-    base(p, unsafe { &*scan.thread }, ALGORITHM_BEGIN, &mut record);
+    base(
+        p,
+        unsafe { &*scan.thread },
+        ALGORITHM_BEGIN,
+        &mut record,
+        scan.stamp,
+    );
     record.operation = p.operation;
     record.cacheability = scan.cacheability;
     let r = &mut record;
@@ -877,6 +895,8 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
         return 0;
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
+    // fix4: single stamp per program (see `observation_entry`).
+    let stamp = incarnation_stamp(cookie);
     if let Some((cfg, key)) = identity(cookie) {
         if operational_api(cfg.api) {
             let rv = ctx.ret();
@@ -886,7 +906,7 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
                 let mut pend = Pending::default();
                 if pop_return(cookie, &mut tkey, &mut pend) {
                     let mut r = Record::default();
-                    base(&pend, &tkey, RESULT, &mut r);
+                    base(&pend, &tkey, RESULT, &mut r, stamp);
                     r.status = 0;
                     r.outcome = operational_outcome(pend.api, rv);
                     emit(&r);
@@ -902,21 +922,21 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
     }
     let rv: u64 = ctx.ret();
     if p.api == PROVIDER_INIT {
-        init_return(&p, &key, rv)
+        init_return(&p, &key, rv, stamp)
     } else if p.api == GET_DISPATCH {
-        getter_return(&p, &key, rv)
+        getter_return(&p, &key, rv, stamp)
     } else if query_api(p.api) {
-        query_return(&p, &key, rv)
+        query_return(&p, &key, rv, stamp)
     } else if !matches!(p.api, PUBLIC_UNQUERY | TEARDOWN | UNQUERY_CALLBACK) {
-        api_return(&p, &key, rv);
+        api_return(&p, &key, rv, stamp);
     }
     0
 }
 #[inline(never)]
 #[no_mangle]
-pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64) {
+pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64) {
     let mut r = Record::default();
-    base(p, key, RESULT, &mut r);
+    base(p, key, RESULT, &mut r, stamp);
     r.status = p.name;
     r.outcome = if matches!(p.api, UNLOAD | ADD_BUILTIN) {
         int_outcome(rv)
@@ -927,7 +947,7 @@ pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64) {
     };
     emit(&r);
     if p.api == UNLOAD && r.outcome == 1 {
-        invalidate(p, key, 1)
+        invalidate(p, key, 1, stamp)
     }
     if p.api == ADD_BUILTIN && r.outcome == 1 {
         if code_ok(key.pid, p.arg2) {
