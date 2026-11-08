@@ -210,7 +210,13 @@ fn trace_mode_gate_off_is_base_identical() {
     if gated().is_none() {
         return;
     }
-    let (window, totals, batch) = drive(trace::TRACE_MODE_OFF);
+    for mode in [trace::TRACE_MODE_OFF, trace::TRACE_MODE_METADATA] {
+        off_mode_matches_base(mode);
+    }
+}
+
+fn off_mode_matches_base(mode: u32) {
+    let (window, totals, batch) = drive(mode);
     eprintln!(
         "off-gate: paired={} op_attempts={} fetch_attempts={} ring_loss={:?}",
         window.paired,
@@ -218,8 +224,8 @@ fn trace_mode_gate_off_is_base_identical() {
         window.received.attempts[trace::TraceFamily::Fetch.index()],
         window.ring_loss,
     );
-    assert_eq!(window.mode, trace::TRACE_MODE_OFF);
-    assert_eq!(window.paired, 0);
+    assert_eq!(window.mode, mode);
+    assert_eq!(window.paired, 0, "mode {mode}");
     assert_eq!(window.unpaired_entries, 0);
     assert_eq!(window.unpaired_results, 0);
     assert_eq!(window.dropped, 0);
