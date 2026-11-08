@@ -417,6 +417,7 @@ pub struct ProviderSession {
     api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate>,
     api_window: Array<MapData, c::Range>,
     trace_mode: Array<MapData, u32>,
+    trace: super::trace::TraceProducer,
     api_owners: BTreeMap<u64, (u32, u64, u32)>,
     startup: BTreeMap<u32, Vec<Attachment>>,
     targets: BTreeMap<u32, Target>,
@@ -2246,6 +2247,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             api_window,
             trace_mode,
+            trace: super::trace::TraceProducer::new(),
             api_owners: BTreeMap::new(),
             startup: BTreeMap::new(),
             events: RingBuf::try_from(map(&loaded, "EVENTS")?)
@@ -3554,7 +3556,13 @@ impl ProviderSession {
                 break;
             }
             let event = match self.events.next() {
-                Some(bytes) => wire::decode_transport(&bytes),
+                Some(bytes) => {
+                    let event = wire::decode_transport(&bytes);
+                    if event.is_err() && wire::rejected_unknown_api(&bytes) {
+                        self.trace.reject_unknown();
+                    }
+                    event
+                }
                 None => break,
             };
             match event {
@@ -3663,6 +3671,32 @@ impl ProviderSession {
         {
             b.gap(ObservationGap::AmbiguousSite);
             return;
+        }
+        // 6D trace data plane: every decoded ATTEMPT/RESULT edge feeds the
+        // pairing producer (mode-gated inside; fence/binding already applied).
+        // The RESULT class comes from the RAW record outcome (D0-4 C1).
+        if r.kind == c::ATTEMPT || r.kind == c::RESULT {
+            let key = super::trace::PairKey {
+                pid: r.pid,
+                tid: r.tid,
+                generation: r.generation,
+                cookie: r.cookie,
+                invocation: r.invocation,
+            };
+            if r.kind == c::ATTEMPT {
+                self.trace.attempt(super::trace::AttemptEdge {
+                    key,
+                    api: r.api,
+                    monotonic_ns: r.monotonic_ns,
+                });
+            } else {
+                self.trace.result(super::trace::ResultEdge {
+                    key,
+                    api: r.api,
+                    monotonic_ns: r.monotonic_ns,
+                    outcome: r.outcome,
+                });
+            }
         }
         let hash = attachment.site.object_hash().clone();
         let advertisers = attachment.advertisers.clone();
@@ -4212,7 +4246,18 @@ impl ProviderSession {
         }
         self.trace_mode
             .set(0, mode, 0)
-            .map_err(|_| ObservationGap::BpfUnavailable)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        self.trace.set_mode(mode);
+        Ok(())
+    }
+    /// Seal the current trace window (§6D-6/§6D-7 data plane).
+    pub fn close_trace_window(&mut self, window_seq: u64) -> super::trace::ClosedTraceWindow {
+        self.trace
+            .close_window(window_seq, LiveClock.monotonic_ns(), self.loss_totals)
+    }
+    /// Cumulative trace totals.
+    pub fn trace_totals(&self) -> super::trace::TraceTotals {
+        self.trace.totals()
     }
     fn retire_startup(&mut self, pid: u32, b: &mut ObservationBatch) -> StartupRetire {
         let outcome = Self::retire_startup_with(
@@ -5174,6 +5219,7 @@ impl ProviderSession {
                 }
             }
         }
+        self.trace.finalize(LiveClock.monotonic_ns());
         self.closed = true;
         b
     }
