@@ -7,7 +7,7 @@
 //! detail, exemplars, and counters.
 use super::wire::contract as c;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// `TRACE_MODE` map words (§6D-9 order, single-sourced from the BPF contract).
 pub use c::{
@@ -213,6 +213,22 @@ pub const TRACE_DETAIL_MAX_ROWS: usize = 4096;
 /// Retained detail bytes per window (§6D-5: 1 MiB).
 pub const TRACE_DETAIL_MAX_BYTES: usize = 1_048_576;
 
+/// Pairing-correctness cap, G1 (§6D-5 reading): ACCOUNTING
+/// (distributions + counters) is O(1) fixed small state, but
+/// pairing-correctness state (pending/HW) CANNOT be O(1) —
+/// distinguishing dup from fresh needs consumed-memory (proven
+/// by F3) — so it is FIXED-CAPPED correctness state with
+/// kernel-mirrored bounds. BPF `PENDING`/`THREADS`/`API_THREADS`
+/// are 4096-entry maps; the host mirrors 4096 per pairing
+/// structure (pending ATTEMPTs, pending RESULTs, scopes,
+/// tombstones). FIFO eviction (oldest first): every evicted
+/// pending counts unpaired immediately (+ exemplar) but NEVER
+/// advances the high-water (eviction ≠ consumption — the
+/// counterpart may still arrive; terminal buckets stay
+/// correct). Single-sourced from the kernel bound so the
+/// mirror cannot drift.
+pub const TRACE_PAIRING_CAP: usize = c::MAX_PENDING as usize;
+
 /// One retained detail row: a received edge.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RetainedEdge {
@@ -337,12 +353,22 @@ pub struct TraceProducer {
     max_rows: usize,
     /// Byte budget.
     max_bytes: usize,
-    /// Pending ATTEMPTs by key.
+    /// Pending ATTEMPTs by key (G1: ≤ cap, FIFO-evicted).
     pending_attempts: HashMap<PairKey, PendingEdge>,
-    /// Pending RESULTs by key.
+    /// FIFO index: (insert window, sequence) → key. Bounded by
+    /// the cap (exactly one entry per pending).
+    pending_attempt_order: BTreeMap<(u64, u64), PairKey>,
+    /// Pending RESULTs by key (G1: ≤ cap, FIFO-evicted).
     pending_results: HashMap<PairKey, PendingEdge>,
+    /// FIFO index for pending RESULTs (bounded by the cap).
+    pending_result_order: BTreeMap<(u64, u64), PairKey>,
     /// Per-scope invocation high-water (F3: consumed keys never re-pair).
     inv_hw: HashMap<ScopeKey, ScopeHw>,
+    /// FIFO index for scopes (bounded by the cap).
+    scope_order: BTreeMap<(u64, u64), ScopeKey>,
+    /// Insertion sequence (monotonic; wrapping — 2^64 inserts
+    /// unreachable, and every index entry dies with its map).
+    order_seq: u64,
     /// Current window sequence.
     window: u64,
     /// Last-seen cumulative lanes.
@@ -392,6 +418,8 @@ struct PendingEdge {
     monotonic_ns: u64,
     /// RAW outcome (RESULT only).
     outcome: u32,
+    /// Insertion sequence (FIFO order key with `window`).
+    seq: u64,
 }
 
 /// Pairing scope: the THREADS-row scope (contract `ThreadKey` —
@@ -425,6 +453,11 @@ struct ScopeHw {
     hw: Option<u64>,
     /// Internal window of the last observed edge in this scope.
     last_window: u64,
+    /// Insertion window (FIFO order key with `seq`; NEVER
+    /// refreshed — eviction is insertion-ordered, not LRU).
+    insert_window: u64,
+    /// Insertion sequence.
+    seq: u64,
 }
 
 impl TraceProducer {
@@ -440,8 +473,12 @@ impl TraceProducer {
             max_rows,
             max_bytes,
             pending_attempts: HashMap::new(),
+            pending_attempt_order: BTreeMap::new(),
             pending_results: HashMap::new(),
+            pending_result_order: BTreeMap::new(),
             inv_hw: HashMap::new(),
+            scope_order: BTreeMap::new(),
+            order_seq: 0,
             window: 0,
             last_loss: [0; 8],
             totals: TraceTotals::default(),
@@ -509,8 +546,7 @@ impl TraceProducer {
             .is_some_and(|held| held.window == self.window);
         if held_same_window {
             let held = self
-                .pending_results
-                .remove(&edge.key)
+                .pending_result_remove(&edge.key)
                 .expect("held RESULT just observed");
             self.pair(
                 edge.key,
@@ -528,15 +564,7 @@ impl TraceProducer {
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
             } else {
-                self.pending_attempts.insert(
-                    edge.key,
-                    PendingEdge {
-                        window: self.window,
-                        api: edge.api,
-                        monotonic_ns: edge.monotonic_ns,
-                        outcome: 0,
-                    },
-                );
+                self.pending_attempt_insert(edge.key, edge.api, edge.monotonic_ns);
             }
         } else if self.pending_attempts.contains_key(&edge.key) {
             // Duplicate ATTEMPT on a live key (BPF never emits this):
@@ -550,15 +578,7 @@ impl TraceProducer {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
         } else {
-            self.pending_attempts.insert(
-                edge.key,
-                PendingEdge {
-                    window: self.window,
-                    api: edge.api,
-                    monotonic_ns: edge.monotonic_ns,
-                    outcome: 0,
-                },
-            );
+            self.pending_attempt_insert(edge.key, edge.api, edge.monotonic_ns);
         }
     }
 
@@ -587,7 +607,7 @@ impl TraceProducer {
             outcome: edge.outcome,
         });
         self.touch_scope(&edge.key);
-        if let Some(held) = self.pending_attempts.remove(&edge.key) {
+        if let Some(held) = self.pending_attempt_remove(&edge.key) {
             self.pair(
                 edge.key,
                 held.api,
@@ -606,15 +626,7 @@ impl TraceProducer {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
         } else {
-            self.pending_results.insert(
-                edge.key,
-                PendingEdge {
-                    window: self.window,
-                    api: edge.api,
-                    monotonic_ns: edge.monotonic_ns,
-                    outcome: edge.outcome,
-                },
-            );
+            self.pending_result_insert(edge.key, edge.api, edge.monotonic_ns, edge.outcome);
         }
     }
 
@@ -632,6 +644,8 @@ impl TraceProducer {
         loss_abs: [u64; 8],
     ) -> ClosedTraceWindow {
         let current = self.window;
+        // G1: close-time stale-key vectors are bounded by the
+        // caps — at most one stale key per held edge (no change).
         let stale_attempts: Vec<PairKey> = self
             .pending_attempts
             .iter()
@@ -639,7 +653,7 @@ impl TraceProducer {
             .map(|(key, _)| *key)
             .collect();
         for key in stale_attempts {
-            if let Some(held) = self.pending_attempts.remove(&key) {
+            if let Some(held) = self.pending_attempt_remove(&key) {
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
                 self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
@@ -653,7 +667,7 @@ impl TraceProducer {
             .map(|(key, _)| *key)
             .collect();
         for key in stale_results {
-            if let Some(held) = self.pending_results.remove(&key) {
+            if let Some(held) = self.pending_result_remove(&key) {
                 self.unpaired_results = self.unpaired_results.saturating_add(1);
                 self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
                 self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
@@ -666,8 +680,18 @@ impl TraceProducer {
         // host-side duplication, and live pending always keeps its
         // scope (pending arrives recently by construction).
         let current = self.window;
-        self.inv_hw
-            .retain(|_, scope| current.saturating_sub(scope.last_window) <= 1);
+        let idle_scopes: Vec<ScopeKey> = self
+            .inv_hw
+            .iter()
+            .filter(|(_, scope)| current.saturating_sub(scope.last_window) > 1)
+            .map(|(scope, _)| *scope)
+            .collect();
+        // G1: bounded by the scope cap (one entry per scope).
+        for scope in idle_scopes {
+            if let Some(hw) = self.inv_hw.remove(&scope) {
+                self.scope_order.remove(&(hw.insert_window, hw.seq));
+            }
+        }
         let mut ring_loss = [0u64; 8];
         for index in 0..8 {
             ring_loss[index] = loss_abs[index].saturating_sub(self.last_loss[index]);
@@ -718,12 +742,14 @@ impl TraceProducer {
             self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
             self.advance_hw(&key);
         }
+        self.pending_attempt_order.clear();
         for (key, held) in std::mem::take(&mut self.pending_results) {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
             self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
             self.advance_hw(&key);
         }
+        self.pending_result_order.clear();
     }
 
     /// Cumulative totals.
@@ -731,17 +757,148 @@ impl TraceProducer {
         self.totals
     }
 
+    /// Next FIFO insertion sequence.
+    fn next_seq(&mut self) -> u64 {
+        let seq = self.order_seq;
+        self.order_seq = self.order_seq.wrapping_add(1);
+        seq
+    }
+
+    /// Insert a held ATTEMPT (G1: cap-enforced FIFO). Callers
+    /// insert absent keys — a present key is replaced with its
+    /// index entry refreshed so the order index stays exact.
+    fn pending_attempt_insert(&mut self, key: PairKey, api: u32, monotonic_ns: u64) {
+        if let Some(old) = self.pending_attempts.get(&key) {
+            let order = (old.window, old.seq);
+            self.pending_attempt_order.remove(&order);
+        }
+        if self.pending_attempts.len() >= TRACE_PAIRING_CAP {
+            self.evict_oldest_attempt();
+        }
+        let window = self.window;
+        let seq = self.next_seq();
+        self.pending_attempt_order.insert((window, seq), key);
+        self.pending_attempts.insert(
+            key,
+            PendingEdge {
+                window,
+                api,
+                monotonic_ns,
+                outcome: 0,
+                seq,
+            },
+        );
+    }
+
+    /// Index-maintaining removal of a held ATTEMPT.
+    fn pending_attempt_remove(&mut self, key: &PairKey) -> Option<PendingEdge> {
+        let held = self.pending_attempts.remove(key)?;
+        self.pending_attempt_order.remove(&(held.window, held.seq));
+        Some(held)
+    }
+
+    /// Insert a held RESULT (G1: cap-enforced FIFO).
+    fn pending_result_insert(&mut self, key: PairKey, api: u32, monotonic_ns: u64, outcome: u32) {
+        if let Some(old) = self.pending_results.get(&key) {
+            let order = (old.window, old.seq);
+            self.pending_result_order.remove(&order);
+        }
+        if self.pending_results.len() >= TRACE_PAIRING_CAP {
+            self.evict_oldest_result();
+        }
+        let window = self.window;
+        let seq = self.next_seq();
+        self.pending_result_order.insert((window, seq), key);
+        self.pending_results.insert(
+            key,
+            PendingEdge {
+                window,
+                api,
+                monotonic_ns,
+                outcome,
+                seq,
+            },
+        );
+    }
+
+    /// Index-maintaining removal of a held RESULT.
+    fn pending_result_remove(&mut self, key: &PairKey) -> Option<PendingEdge> {
+        let held = self.pending_results.remove(key)?;
+        self.pending_result_order.remove(&(held.window, held.seq));
+        Some(held)
+    }
+
+    /// Evict the oldest pending ATTEMPT (FIFO cap enforcement):
+    /// visible unpaired count + exemplar, NEVER an HW advance
+    /// (eviction ≠ consumption — the counterpart may still
+    /// arrive; terminal buckets stay correct).
+    fn evict_oldest_attempt(&mut self) {
+        let Some((&order, &key)) = self.pending_attempt_order.iter().next() else {
+            return;
+        };
+        self.pending_attempt_order.remove(&order);
+        if let Some(held) = self.pending_attempts.remove(&key) {
+            self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+            self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+            self.push_live_exemplar(ExemplarDir::Entry, key, held.api);
+        }
+    }
+
+    /// Evict the oldest pending RESULT (FIFO cap enforcement):
+    /// visible unpaired count + exemplar, never an HW advance.
+    fn evict_oldest_result(&mut self) {
+        let Some((&order, &key)) = self.pending_result_order.iter().next() else {
+            return;
+        };
+        self.pending_result_order.remove(&order);
+        if let Some(held) = self.pending_results.remove(&key) {
+            self.unpaired_results = self.unpaired_results.saturating_add(1);
+            self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+            self.push_live_exemplar(ExemplarDir::Result, key, held.api);
+        }
+    }
+
+    /// Evict the oldest scope (FIFO): drops HW ONLY — pending
+    /// entries are self-sufficient (keyed pairing needs no HW),
+    /// so held pairs still complete. Disclosed residual: a
+    /// consumed key in an evicted scope can re-pair (same class
+    /// as the idle-expiry residual).
+    fn evict_oldest_scope(&mut self) {
+        let Some((&order, &scope)) = self.scope_order.iter().next() else {
+            return;
+        };
+        self.scope_order.remove(&order);
+        self.inv_hw.remove(&scope);
+    }
+
+    /// Cap-enforced scope entry (sole scope-insert path: touch +
+    /// HW advance both funnel here).
+    fn scope_or_insert(&mut self, scope: ScopeKey) -> &mut ScopeHw {
+        if !self.inv_hw.contains_key(&scope) {
+            if self.inv_hw.len() >= TRACE_PAIRING_CAP {
+                self.evict_oldest_scope();
+            }
+            let window = self.window;
+            let seq = self.next_seq();
+            self.scope_order.insert((window, seq), scope);
+            self.inv_hw.insert(
+                scope,
+                ScopeHw {
+                    hw: None,
+                    last_window: window,
+                    insert_window: window,
+                    seq,
+                },
+            );
+        }
+        self.inv_hw.get_mut(&scope).expect("scope just inserted")
+    }
+
     /// Mark scope activity: every post-gate edge arrival stamps the
     /// scope's window (idle-drop keys on arrivals only).
     fn touch_scope(&mut self, key: &PairKey) {
         let window = self.window;
-        self.inv_hw
-            .entry(ScopeKey::of(key))
-            .or_insert(ScopeHw {
-                hw: None,
-                last_window: window,
-            })
-            .last_window = window;
+        self.scope_or_insert(ScopeKey::of(key)).last_window = window;
     }
 
     /// F3 replay check: a consumed-or-older invocation with NO live
@@ -759,12 +916,7 @@ impl TraceProducer {
     /// (pair/expiry/finalize). Deliberately not activity: the
     /// idle-drop clock runs on arrivals, not bookkeeping.
     fn advance_hw(&mut self, key: &PairKey) {
-        let scope = ScopeKey::of(key);
-        let window = self.window;
-        let entry = self.inv_hw.entry(scope).or_insert(ScopeHw {
-            hw: None,
-            last_window: window,
-        });
+        let entry = self.scope_or_insert(ScopeKey::of(key));
         entry.hw = Some(entry.hw.map_or(key.invocation, |hw| hw.max(key.invocation)));
     }
 
@@ -828,6 +980,59 @@ impl TraceProducer {
             api: held.api,
             age_ns: now_ns.saturating_sub(held.monotonic_ns),
         });
+    }
+
+    /// Live exemplar (eviction/immediate paths): the feed path
+    /// carries no clock, so age is 0 (just observed — for an
+    /// evicted hold this understates its hold time; the count,
+    /// never the age, is the conserved quantity). Self-capping
+    /// (≤8 per direction per window) like close-time exemplars.
+    fn push_live_exemplar(&mut self, dir: ExemplarDir, key: PairKey, api: u32) {
+        let seen = self.exemplars.iter().filter(|e| e.dir == dir).count();
+        if seen >= 8 {
+            return;
+        }
+        self.exemplars.push(TraceExemplar {
+            dir,
+            key_hash16: key_hash16(key.cookie, key.generation),
+            api,
+            age_ns: 0,
+        });
+    }
+
+    /// Test-only FIFO-index integrity pin: every index entry
+    /// resolves to its map entry and back.
+    #[cfg(test)]
+    fn check_indexes(&self) {
+        assert_eq!(
+            self.pending_attempts.len(),
+            self.pending_attempt_order.len(),
+            "attempt index"
+        );
+        assert_eq!(
+            self.pending_results.len(),
+            self.pending_result_order.len(),
+            "result index"
+        );
+        assert_eq!(self.inv_hw.len(), self.scope_order.len(), "scope index");
+        for ((window, seq), key) in &self.pending_attempt_order {
+            let held = self
+                .pending_attempts
+                .get(key)
+                .expect("attempt order resolves");
+            assert_eq!((held.window, held.seq), (*window, *seq));
+        }
+        for ((window, seq), key) in &self.pending_result_order {
+            let held = self
+                .pending_results
+                .get(key)
+                .expect("result order resolves");
+            assert_eq!((held.window, held.seq), (*window, *seq));
+        }
+        for ((window, seq), scope) in &self.scope_order {
+            let hw = self.inv_hw.get(scope).expect("scope order resolves");
+            assert_eq!((hw.insert_window, hw.seq), (*window, *seq));
+        }
     }
 }
 
@@ -1269,6 +1474,14 @@ mod tests {
     }
 
     #[test]
+    fn pairing_cap_mirrors_kernel() {
+        // G1: the host pairing bound IS the kernel PENDING bound
+        // (single-sourced — the mirror cannot drift).
+        assert_eq!(TRACE_PAIRING_CAP, 4096);
+        assert_eq!(TRACE_PAIRING_CAP, c::MAX_PENDING as usize);
+    }
+
+    #[test]
     fn caps_rows_keep_first_and_pairs_survive() {
         let mut p = TraceProducer::with_caps(4, usize::MAX);
         p.set_mode(TRACE_MODE_ALL);
@@ -1532,5 +1745,153 @@ mod tests {
         assert!(depth_subset_holds(4, 4));
         assert!(!depth_subset_holds(3, 5));
         assert!(!depth_subset_holds(0, 1));
+    }
+
+    #[test]
+    fn pairing_pending_caps_fifo_evict_visible() {
+        // G1 (codex R2-1): pending maps are FIXED-CAPPED at the
+        // kernel-mirrored bound (4096). Flood 3×cap sequential
+        // unpaireables per direction: lens stay ≤ cap DURING the
+        // feed, every eviction is a visible unpaired count (+
+        // exemplar), tightly interleaved legit pairs still pair,
+        // conservation stays exact.
+        let mut p = edge_bearing();
+        let cap = 4096usize;
+        let mut legit = 0u64;
+        for i in 0..3 * cap as u64 {
+            let k = key(10 + (i % 50) as u32, 1000 + i as u32, 1, 100 + i, i + 1);
+            p.attempt(attempt(k, 20, 1000 + i));
+            if i % 1000 == 999 {
+                let l = key(7, 7, 1, 900_000 + legit, 5000 + legit);
+                p.attempt(attempt(l, 20, 5_000_000 + legit));
+                p.result(result(l, 20, 5_000_001 + legit, 1));
+                legit += 1;
+            }
+            if i % 512 == 511 {
+                assert!(
+                    p.pending_attempts.len() <= cap,
+                    "attempts {}",
+                    p.pending_attempts.len()
+                );
+                assert!(p.inv_hw.len() <= cap, "scopes {}", p.inv_hw.len());
+                p.check_indexes();
+            }
+        }
+        for i in 0..3 * cap as u64 {
+            let k = key(
+                20 + (i % 50) as u32,
+                500_000 + i as u32,
+                1,
+                700_000 + i,
+                i + 1,
+            );
+            p.result(result(k, 20, 9_000_000 + i, 1));
+            if i % 512 == 511 {
+                assert!(
+                    p.pending_results.len() <= cap,
+                    "results {}",
+                    p.pending_results.len()
+                );
+                assert!(p.inv_hw.len() <= cap, "scopes {}", p.inv_hw.len());
+                p.check_indexes();
+            }
+        }
+        p.check_indexes();
+        p.finalize(20_000_000);
+        let w = p.close_window(0, 20_000_001, [0; 8]);
+        let t = p.totals();
+        assert_eq!(legit, 12);
+        assert_eq!(t.paired, legit);
+        assert_eq!(t.unpaired_entries, 3 * cap as u64);
+        assert_eq!(t.unpaired_results, 3 * cap as u64);
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+        let entries = w
+            .exemplars
+            .iter()
+            .filter(|e| e.dir == ExemplarDir::Entry)
+            .count();
+        let results = w
+            .exemplars
+            .iter()
+            .filter(|e| e.dir == ExemplarDir::Result)
+            .count();
+        assert_eq!((entries, results), (8, 8));
+    }
+
+    #[test]
+    fn scope_cap_evicts_hw_only_pending_self_sufficient() {
+        // G1: scopes FIXED-CAPPED (4096, kernel THREADS mirror).
+        // Eviction drops HW only: held pendings still pair, a
+        // consumed key in an EVICTED scope re-pairs (disclosed
+        // residual, same class as idle-expiry) while a RETAINED
+        // scope still dups (F3 intact under caps).
+        let mut p = edge_bearing();
+        for i in 0..5000u64 {
+            let f = key(100, 2000 + i as u32, 1, 5000 + i, 10);
+            p.attempt(attempt(f, 20, 1000 + i));
+            p.result(result(f, 20, 2_000_000 + i, 1));
+        }
+        assert!(p.inv_hw.len() <= 4096, "scopes {}", p.inv_hw.len());
+        p.check_indexes();
+        let k = key(100, 2000, 1, 5000, 11);
+        p.attempt(attempt(k, 20, 50_000));
+        p.result(result(k, 20, 50_001, 1));
+        let r = key(100, 2001, 1, 5001, 10);
+        p.attempt(attempt(r, 20, 60_000));
+        p.result(result(r, 20, 60_001, 1));
+        let d = key(100, 6999, 1, 9999, 10);
+        p.attempt(attempt(d, 20, 70_000));
+        p.result(result(d, 20, 70_001, 1));
+        p.finalize(80_000);
+        let t = p.totals();
+        assert_eq!(t.paired, 5002);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (1, 1));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn folds_exact_under_forced_caps_with_unmatched_flood() {
+        // G1 extension of the forced-caps pin: DETAIL caps bind
+        // rows while pairing caps bind state — folds stay
+        // COMPLETE and pairing lens stay ≤ cap under an unmatched
+        // flood (the R2-forced-cap hole: immediate pairs only).
+        let mut p = TraceProducer::with_caps(4, usize::MAX);
+        p.set_mode(TRACE_MODE_ALL);
+        for i in 0..10u64 {
+            let k = key(10, 11, 1, 100 + i, i + 1);
+            p.attempt(attempt(k, 20, 1000 + i));
+            p.result(result(k, 20, 2000 + i, 1));
+        }
+        let cap = 4096usize;
+        for i in 0..3 * cap as u64 {
+            let u = key(30, 800_000 + i as u32, 1, 900_000 + i, 1);
+            p.attempt(attempt(u, 20, 100_000 + i));
+        }
+        assert!(
+            p.pending_attempts.len() <= cap,
+            "attempts {}",
+            p.pending_attempts.len()
+        );
+        assert!(p.inv_hw.len() <= cap, "scopes {}", p.inv_hw.len());
+        p.check_indexes();
+        p.finalize(20_000_000);
+        let w = p.close_window(0, 20_000_001, [0; 8]);
+        assert!(w.capped);
+        assert_eq!(w.detail.len(), 4);
+        assert_eq!(w.dropped, 20 + 3 * cap as u64 - 4);
+        assert_eq!(w.paired, 10);
+        assert_eq!(w.class_counts, [0, 10, 0, 0, 0]);
+        assert_eq!(w.unpaired_entries, 3 * cap as u64);
+        assert_eq!(w.unpaired_results, 0);
+        assert_eq!(w.api_attempts[20], 10 + 3 * cap as u64);
+        assert_eq!(w.api_results[20], 10);
+        let h = &w.histograms[1];
+        assert_eq!((h.count, h.sum), (10, 10_000));
     }
 }
