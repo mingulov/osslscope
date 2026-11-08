@@ -151,32 +151,33 @@ pub struct Thread {
     pub seed: u64,
     /// Window-blind entries outstanding (fix7, R7-3): calls whose
     /// ENTRY was rejected by the operational window (resolved
-    /// identity, closed window — the call executes unobserved)
-    /// and whose returns will execute-but-reject. Each such entry
-    /// arms exactly one tombstone (`blind_entry`); window-rejected
-    /// returns consume T-first (`blind_return`). ACCEPTED returns
-    /// never touch this counter (their skip reads `overflow`
-    /// only), so blind tombstones can never hijack a framed
-    /// return the way a bare overflow unit does.
+    /// identity, closed window — the call executes unobserved).
+    /// fix8 (R8-2): this counter is now the FALLBACK — blind
+    /// entries slot a positional T-marker first and arm a
+    /// tombstone (`blind_entry`) only on marker refusal
+    /// (collision, quota, map). fix7's "returns will
+    /// execute-but-reject" does NOT hold under longjmp (the kernel
+    /// discards the skipped uretprobe instance — the return never
+    /// runs — orphaning a fungible tombstone for the next rejected
+    /// return to eat, which recurs the cascade); slotted markers
+    /// are discarded instead (never shifting frames). Slotted
+    /// returns pop their own slot and never touch this counter;
+    /// counter-owned rejected returns consume T-first
+    /// (`blind_return`); ACCEPTED returns never touch it (an
+    /// accepted return provably owns no blind unit — its entry
+    /// was accepted and the window never reopens).
     ///
     /// WHY a separate counter rather than the naive "rejected
     /// returns consume overflow": a window-rejected return either
-    /// OWNS an overflow marker (its entry was accepted, then
-    /// overflowed — the R7-3 shape — and must consume) or OWNS
-    /// NOTHING (its entry was window-rejected — and must not
-    /// consume, else it steals a same-cookie overflow owner's
-    /// marker and shifts the cascade the other way). Entry-time
-    /// window state is lost by return time, so the entry records
-    /// it here. SOUND under the never-reopen window (programmed
-    /// once per capture): tombstone-first attribution is then
-    /// EXACT — at a marker-owner's rejected return T==0 always
-    /// (T>0 would need a closed-entry before its open-entry ⟹
-    /// reopen), so it consumes its own overflow unit; at a
-    /// nothing-owner's rejected return T>=1 (its own), so outer
-    /// markers survive. Past the precondition (mixed T+O) counts
-    /// still balance fungibly (pinned below).
-    /// `API_THREADS` rows carry a vestigial 0 (blind is armed
-    /// only on the shared trace machine's closed-window entries).
+    /// OWNS an overflow unit (its entry was accepted, then
+    /// overflowed — the R7-3 shape — and must consume) or OWNS a
+    /// blind unit (its entry was window-rejected — and must not
+    /// consume the overflow unit, else it steals a same-cookie
+    /// overflow owner's unit and shifts the cascade the other
+    /// way). Entry-time window state is lost by return time, so
+    /// the entry records its kind here. `API_THREADS` rows carry
+    /// a vestigial 0 (blind is armed only on the shared trace
+    /// machine's closed-window entries).
     pub blind: u32,
 }
 /// fix8 (R8-2): `PendingKey.reserved` slot kind. Frames keep 0
@@ -315,11 +316,13 @@ impl Thread {
     }
     /// Arm one window-blind tombstone: the ENTRY was rejected by
     /// the operational window (resolved identity, closed window),
-    /// so the executing call owns no frame and no overflow marker
-    /// — but its return WILL execute (and reject), and must then
-    /// consume exactly this tombstone rather than stealing an
-    /// outer overflow marker. Saturating (2^32 nested blind calls
-    /// is unreachable — bounded by thread stack depth).
+    /// so the executing call owns no frame and no overflow unit —
+    /// and its return (if it executes — longjmp can skip it, R8-2)
+    /// must then consume exactly this tombstone rather than
+    /// stealing an outer overflow unit. fix8: called only on
+    /// T-marker refusal (the slotted marker is the primary arm).
+    /// Saturating (2^32 nested blind calls is unreachable —
+    /// bounded by thread stack depth).
     pub fn blind_entry(&mut self) {
         self.blind = self.blind.saturating_add(1);
     }
@@ -693,7 +696,10 @@ mod tests {
     /// regression pins below go RED if the production rule is
     /// neutered. Single-cookie (the shift needs same-cookie
     /// frames); blind/tombstone calls never pop, so their cookie
-    /// is irrelevant to the model.
+    /// is irrelevant to the model. fix8: this pins the COUNTER
+    /// semantics (aggregate machine + counter-fallback arms —
+    /// unchanged); the trace machine's positional pop path is
+    /// pinned by `Fix8Model` below.
     struct Fix7Model {
         thread: Thread,
         frames: [u64; MAX_DEPTH as usize],

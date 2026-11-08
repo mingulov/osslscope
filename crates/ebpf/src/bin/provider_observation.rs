@@ -433,9 +433,10 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some((cfg, key)) = identity(cookie) else {
-        // fix7 (R7-3): a closed-window entry arms its blind
-        // tombstone (no-op for every other rejection arm); the
-        // call still executes unobserved.
+        // fix7 (R7-3): a closed-window entry arms its blind unit
+        // (fix8: a positional T-marker first, the fungible
+        // tombstone on marker refusal; no-op for every other
+        // rejection arm); the call still executes unobserved.
         blind_arm_entry(cookie);
         return 0;
     };
