@@ -136,13 +136,21 @@ The DEB ships the D-record §1.4 installed-service layout:
 Prerequisite: a 6.9+ kernel. Ubuntu 24.04 servers default to the
 6.8 GA kernel, which is below the support floor — install the HWE
 kernel first (recipe: [Runner image](ci-recipes.md#runner-image)).
-On a below-floor kernel, `doctor` fails the `kernel` check
-(`wrong kernel: … (feature probe, not uname; release … informational)`
-with the remediation `need a kernel with kprobe-load + ringbuf +
-uprobe-multi + probe_read_user (6.9+ verified; 6.12-LTS oldest
-tested)`) and the `token-support` row reads `BPF_TOKEN_CREATE
-absent (pre-6.9? — informational only; file-caps path needs
-multi+ringbuf+cookie, not tokens)`.
+`doctor` never compares the release number: the `kernel` row runs
+feature probes (kprobe-load, ringbuf, uprobe-multi, probe_read_user)
+and the release is informational only. A below-floor kernel usually
+fails a probe (`wrong kernel: … (feature probe, not uname; release …
+informational)` with the remediation `need a kernel with kprobe-load
++ ringbuf + uprobe-multi + probe_read_user (6.9+ verified; 6.12-LTS
+oldest tested)`), but probes can also pass (`features ok …
+(informational)`) or fail closed with a permission diagnostic
+(denied-with-caps attribution, or `kernel features unverifiable
+without CAP_BPF` when caps are missing). The `token-support` row is
+independently informational — `BPF_TOKEN_CREATE present (6.9+ floor
+signal; …)`, `BPF_TOKEN_CREATE absent (pre-6.9? — informational only;
+file-caps path needs multi+ringbuf+cookie, not tokens)`, or `token
+existence unverifiable without CAP_BPF (informational only)` —
+whatever the kernel verdict.
 
 The package installs but never enables the unit. Select targets in
 `/etc/osslscope/service.toml` BEFORE enabling: with the stock
@@ -156,16 +164,22 @@ systemctl is-active osslscope-service
 sudo journalctl -u osslscope-service -n 20
 ```
 
-Exit 2 at startup always means the config was refused (no target
-selection, an unknown key, or a bad value) — never a crash.
-Recovery: fix `/etc/osslscope/service.toml`, then `sudo systemctl
-restart osslscope-service` (if the unit already sits in `failed`
-behind a start-rate trip from an older unit, `sudo systemctl
-reset-failed osslscope-service` first).
+Exit 2 at startup is startup/admission refusal — never a crash.
+Config causes (no target selection, an unknown key, or a bad value)
+refuse in CLI admission; operational causes refuse in `run_service`
+before any window opens: signals unavailable, an uncreatable `--out`,
+a refused `--stream` tap, `--reset-sequence` against an out-DIR that
+holds windows, an unreadable out-DIR or run identity, and a locked or
+un-lockable out-DIR. All refuse with exit 2 by design. Recovery: fix
+the cause the journal names — the refusal line is specific (e.g.
+`osslscope service: --out not creatable: Not a directory (os error
+20)`) — then `sudo systemctl restart osslscope-service` (if the unit
+already sits in `failed` behind a start-rate trip from an older unit,
+`sudo systemctl reset-failed osslscope-service` first).
 
 Policy reloads go through `systemctl reload` (SIGHUP at the next
 window boundary). `Restart=on-failure` restarts abnormal deaths
-after 5 s; exit 2 (config refused) (§1.4 Amendment A2: the stock
+after 5 s; exit 2 (startup/admission refused) (§1.4 Amendment A2: the stock
 config refuses with exit 2, so prevention holds the unit stopped
 instead of restart-looping) and exit 4 (scope unavailable —
 nothing finalized, operator needed) hold the unit stopped without

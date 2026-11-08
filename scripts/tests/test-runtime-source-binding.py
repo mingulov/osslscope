@@ -76,36 +76,51 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def expand_response_files(flags):
+    # Mirror rustc's `@file` rules (probed on both pinned rustcs,
+    # 1.88.0 + nightly-2026-05-20): a standalone `@file` arg
+    # expands to its lines spliced into the sequence (one arg per
+    # line; space-separated single lines do NOT split), so a
+    # `-C`/`--codegen` on either side of the boundary pairs with
+    # a `linker=` on the other. Expansion is ONE level only — a
+    # nested `@` line stays literal (both rustcs: `multiple input
+    # filenames provided ... `@<inner>``). Unreadable files are
+    # dropped: rustc refuses them (`failed to load argument
+    # file`), so no successful build can carry one.
+    expanded = []
+    for flag in flags:
+        if flag.startswith('@') and len(flag) > 1:
+            try:
+                with open(flag[1:]) as resp:
+                    expanded.extend(resp.read().splitlines())
+            except OSError:
+                continue
+        else:
+            expanded.append(flag)
+    return expanded
+
+
 def flags_carry_linker(flags):
-    for i, flag in enumerate(flags):
-        if flag == '-C' and i + 1 < len(flags) and flags[i + 1].startswith('linker'):
+    args = expand_response_files(flags)
+    for i, flag in enumerate(args):
+        if flag == '-C' and i + 1 < len(args) and args[i + 1].startswith('linker'):
             return True
         if flag.startswith('-Clinker'):
             return True
-        if flag == '--codegen' and i + 1 < len(flags) and flags[i + 1].startswith('linker'):
+        if flag == '--codegen' and i + 1 < len(args) and args[i + 1].startswith('linker'):
             return True
         if flag.startswith('--codegen=linker'):
             return True
-        if flag.startswith('@') and len(flag) > 1:
-            # Response file: pinned rustc splits on newlines (one
-            # arg per line; space-separated single lines do NOT
-            # split) and refuses unreadable files, so only a
-            # readable file's lines can smuggle a linker.
-            try:
-                with open(flag[1:]) as resp:
-                    nested = resp.read().splitlines()
-            except OSError:
-                continue
-            if flags_carry_linker(nested):
-                return True
     return False
 
 
 class FlagsCarryLinkerSpellings(unittest.TestCase):
-    # Oracle coverage for every linker spelling the pinned rustc
-    # accepts (probed on 1.88.0: `--codegen linker=` and
-    # `--codegen=linker=` both link through the named binary;
-    # `@file` args split on newlines, one arg per line).
+    # Oracle coverage for every linker spelling the pinned rustcs
+    # accept (probed on 1.88.0 + nightly-2026-05-20: `--codegen
+    # linker=` and `--codegen=linker=` both link through the named
+    # binary; `@file` expands into the sequence one arg per line,
+    # pairing across the boundary either way; nested `@` stays
+    # literal and is never expanded).
     def test_detected_spellings(self):
         self.assertTrue(flags_carry_linker(['-C', 'linker=/usr/bin/false']))
         self.assertTrue(flags_carry_linker(['-Clinker=/usr/bin/false']))
@@ -122,6 +137,41 @@ class FlagsCarryLinkerSpellings(unittest.TestCase):
     def test_benign_flags_ignored(self):
         self.assertFalse(flags_carry_linker(['-C', 'opt-level=2', '--codegen', 'opt-level=2']))
         self.assertFalse(flags_carry_linker([]))
+
+    def test_split_response_file_spelling(self):
+        # rustc expands `@file` into the arg sequence BEFORE
+        # parsing, so `-C` + `@file` carrying `linker=` links
+        # through the named binary (probed on both pinned rustcs:
+        # `linking with `/usr/bin/false` failed`).
+        with tempfile.NamedTemporaryFile('w', suffix='.rsp', delete=False) as resp:
+            resp.write('linker=/usr/bin/false\n')
+            path = resp.name
+        self.addCleanup(os.unlink, path)
+        self.assertTrue(flags_carry_linker(['-C', '@' + path]))
+
+    def test_reverse_split_response_file_spelling(self):
+        # The reverse split: `@file` carrying `-C` followed by a
+        # separate `linker=` token (same probe result on both
+        # pinned rustcs).
+        with tempfile.NamedTemporaryFile('w', suffix='.rsp', delete=False) as resp:
+            resp.write('-C\n')
+            path = resp.name
+        self.addCleanup(os.unlink, path)
+        self.assertTrue(flags_carry_linker(['@' + path, 'linker=/usr/bin/false']))
+
+    def test_nested_response_reference_not_expanded(self):
+        # rustc does NOT recursively expand: a nested `@inner`
+        # line is a literal arg (probed on both pinned rustcs:
+        # `multiple input filenames provided ... `@<inner>``).
+        with tempfile.NamedTemporaryFile('w', suffix='.rsp', delete=False) as inner:
+            inner.write('-C\nlinker=/usr/bin/false\n')
+            inner_path = inner.name
+        self.addCleanup(os.unlink, inner_path)
+        with tempfile.NamedTemporaryFile('w', suffix='.rsp', delete=False) as outer:
+            outer.write('@' + inner_path + '\n')
+            outer_path = outer.name
+        self.addCleanup(os.unlink, outer_path)
+        self.assertFalse(flags_carry_linker(['@' + outer_path]))
 
 
 class BuildSourceBinding(unittest.TestCase):
