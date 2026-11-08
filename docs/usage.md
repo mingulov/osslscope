@@ -566,7 +566,7 @@ release can strand a stopped child and requires external cleanup.
 | Code | Meaning |
 | --- | --- |
 | 0 | Help or successful doctor controls; no complete execution claim. |
-| 1 | Child failure, artifact delivery failure or usable runtime failure. |
+| 1 | Child failure, artifact delivery failure or runtime failure (with or without usable observation). |
 | 2 | Invalid arguments/policy or invalid explicit companion. |
 | 3 | PARTIAL report or doctor unavailable/denied capability. |
 | 4 | Report/check setup/environment refusal without usable observation. |

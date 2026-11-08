@@ -1872,7 +1872,7 @@ fn coverage_checks(maps: &[maps::Mapping], libcrypto: &str, lib_bytes: &[u8]) ->
         ),
         Check::info(
             "coverage-scope",
-            "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
+            "automatic discovery observes the in-libcrypto default provider only".into(),
         ),
     ];
     let modules = legacy::target_modules(maps, libcrypto);
@@ -3244,7 +3244,7 @@ fn run_admitted_doctor(
         target_checks.extend(check_target_file(&path, &tctx));
         target_checks.push(Check::info(
             "coverage-scope",
-            "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
+            "automatic discovery observes the in-libcrypto default provider only".into(),
         ));
     } else if let Some(exe_arg) = exe_path {
         // --exe: pre-exec spawn prediction (same rule as `run --`
@@ -3354,7 +3354,7 @@ fn run_admitted_doctor(
                 }
                 target_checks.push(Check::info(
                     "coverage-scope",
-                    "automatic discovery observes the in-libcrypto default provider; file providers need explicit --provider".into(),
+                    "automatic discovery observes the in-libcrypto default provider only".into(),
                 ));
                 target_checks.push(spawn_coverage_note());
             }

@@ -6,8 +6,9 @@
 //! diff, verifies single-domain operation, and re-pins with a
 //! domain tag (reviewed, not silent).
 //!
-//! Scope (greppable device-identity sites, production code only —
-//! `mod tests` bodies are skipped):
+//! Scope (greppable device-identity sites across `src/`, including
+//! the `startup_controls`, `budget_tests` and `session_tests` test
+//! modules — only column-0 `mod tests` bodies are skipped):
 //!
 //! - `device_id_of_dev_str` / `parse_dev_str` (domain-free
 //!   decoders — the CALLER's domain governs the join)

@@ -87,9 +87,12 @@ failure and exits 4. The checks, in the order to fix them:
 - **Static target under `doctor --pid`:** `no libcrypto.so
   mapped in target` is the designed refusal; same `--builtin`
   path applies.
-- **FIPS libcrypto unknown to the build-id table:** provider-mode
-  observation (`--provider .../fips.so`, not `--builtin`) is the
-  supported FIPS path; see [the FIPS interim rule](fips-interim.md).
+- **FIPS libcrypto unknown to the build-id table:** observe it with
+  automatic discovery per [the FIPS interim rule](fips-interim.md) —
+  `report`/`check` accept no provider-selection flag (`--provider`
+  is rejected as a legacy discovery flag without `--libcrypto`,
+  and `--libcrypto` selects legacy diagnostics only). The focused
+  controller proceeds with or without a resolvable anchor.
 - **`--pid` on a pre-loaded provider** can miss discovery when no
   post-attach query occurs. Inspect uses harvest reasons such as
   `no-query`; report/check use typed coverage/window/loss reasons.

@@ -58,7 +58,7 @@ pub(crate) fn exit_code_help_doctor_profiled() -> [&'static str; 3] {
 pub(crate) fn exit_code_help_report() -> [&'static str; 5] {
     [
         "  exit 0: completed report",
-        "  exit 1: child, artifact-delivery, or usable runtime failure",
+        "  exit 1: child, artifact-delivery, or runtime failure",
         "  exit 2: invalid arguments or explicit companion",
         "  exit 3: PARTIAL report",
         "  exit 4: setup/environment refusal without usable observation (no verdict)",
@@ -71,7 +71,7 @@ pub(crate) fn exit_code_help_report() -> [&'static str; 5] {
 pub(crate) fn exit_code_help() -> [&'static str; 7] {
     [
         "  exit 0: ok (help or successful controls; no complete-execution claim)",
-        "  exit 1: child, artifact-delivery, or usable runtime failure",
+        "  exit 1: child, artifact-delivery, or runtime failure",
         "  exit 2: invalid arguments, policy, or explicit companion",
         "  exit 3: PARTIAL report or unavailable/denied capability",
         "  exit 4: setup/environment refusal without usable observation (no verdict)",
