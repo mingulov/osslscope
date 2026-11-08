@@ -25,5 +25,6 @@ pub use objects::{
 pub use schema::*;
 
 pub mod session;
+pub mod trace;
 pub mod wire;
 pub use session::{ObservationBatch, ProviderSession, VerifiedSiteCandidate};
