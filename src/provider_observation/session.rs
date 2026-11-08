@@ -3591,6 +3591,14 @@ impl ProviderSession {
     /// delta belonging to records still queued for drain (R5-1);
     /// fix6 (R6-3): live dirty drains peek too (clean-gated drain;
     /// §6 fixup: terminal dirty drains consume — see the gate).
+    /// fix7 (R7-1 verdict (i)): the batch downgrade is
+    /// CONSERVATIVE defense-in-depth, not required soundness —
+    /// assembly is gap-safe (per-invocation identity +
+    /// continuity joins: complete survivors are valid, partial
+    /// ones fail closed), so intact publication of complete
+    /// survivors would be correct; the downgrade over-approximates
+    /// (downgrade ⊇ affected). The ACCOUNTING (`loss_totals`) is
+    /// independently load-bearing for the coordinator ledger.
     fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
@@ -3654,20 +3662,27 @@ impl ProviderSession {
     /// baseline to 3 while the totals stayed 0, and the later
     /// detection propagated `[3,6)`, omitting tick 2).
     ///
-    /// No-under-downgrade: every emitted batch is validated AFTER
-    /// its content was consumed (drain batches by the consuming
-    /// poll, reconcile batches by this peek; retire-drain content
-    /// lands in the carry and is validated by whichever emits it
-    /// next). A delta overlapping both a reconcile batch and
-    /// queued drain records downgrades BOTH (the peek sees
-    /// total > last_loss; the drain later sees total' >= total >
-    /// last_loss and accounts totals += total' - last_loss once).
-    /// `last_loss` advances only at drain, so any delta since the
-    /// last drain is caught by the next drain no matter how many
-    /// peeks observed it — nothing is consumed without
-    /// accounting. The drain-side downgrade is cumulative and may
-    /// cover records that arrived before the loss instant
-    /// (over-conservative, sound: downgrade ⊇ affected).
+    /// Conservative-validation order (fix7 restatement of the
+    /// old "no-under-downgrade" note — R7-1 verdict (i)): every
+    /// emitted batch is validated AFTER its content was consumed
+    /// (drain batches by the consuming poll, reconcile batches by
+    /// this peek; retire-drain content lands in the carry and is
+    /// validated by whichever emits it next). A delta overlapping
+    /// both a reconcile batch and queued drain records downgrades
+    /// BOTH (the peek sees total > last_loss; the drain later sees
+    /// total' >= total > last_loss and accounts totals += total' -
+    /// last_loss once). `last_loss` advances only at drain, so any
+    /// delta since the last drain is caught by the next drain no
+    /// matter how many peeks observed it — nothing is consumed
+    /// without accounting. The downgrade is CONSERVATIVE (complete
+    /// survivors are valid without it — assembly joins are
+    /// per-invocation-identity + continuity-checked — so intact
+    /// publication would be correct) and cumulative: it may cover
+    /// records that arrived before the loss instant
+    /// (over-conservative, sound-direction: downgrade ⊇ affected).
+    /// The load-bearing half of this poll is the ACCOUNTING
+    /// (`loss_totals` exactness for the coordinator), not the
+    /// downgrade.
     fn peek_loss_lanes(&mut self, b: &mut ObservationBatch) {
         let content = !b.facts.is_empty() || !b.learned_sites.is_empty();
         for index in 0..8 {
@@ -3909,10 +3924,14 @@ impl ProviderSession {
         // the partial batch, leave the baseline for the drain that
         // consumes the survivors). An unconditional poll steals the
         // delta from still-queued records (their drain sees no
-        // delta → intact attribution — the pre-fix5 defect R6-3).
-        // Persistent-dirty sessions downgrade everything until a
-        // clean drain — honest (the backlog is genuinely suspect),
-        // availability-only.
+        // delta — the pre-fix5 defect R6-3). fix7 (R7-1 verdict
+        // (i)): intact publication of COMPLETE survivors is
+        // CORRECT (gap-safe assembly — the delta hit other
+        // records), so the gate keeps a CONSERVATIVE contract
+        // (downgrade ⊇ affected) plus EXACT accounting, not a
+        // soundness-required one. Persistent-dirty sessions
+        // downgrade everything until a clean drain — honest and
+        // conservative, availability-only.
         //
         // Fixup (§6): terminal drains CONSUME — the final drain
         // funnels through here too, and a dirty final drain must
@@ -7350,6 +7369,218 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fix7_post_loss_complete_cold_fact_labels_valid() {
+        // fix7 F1 (R7-1 verdict (i) pin, cold-fact plane): a
+        // complete alias run after loss (dropped decoy records on
+        // another thread + the poll's `clear()`) still labels its
+        // Algorithm AND its Implementation — the delta hit other
+        // records, so intact publication is CORRECT. The wiped
+        // decoy sequence fails closed, never resurrected.
+        let base = c::Record {
+            pid: 1,
+            tid: 2,
+            cookie: 3,
+            generation: 4,
+            invocation: 5,
+            api: c::QUERY_CALLBACK,
+            operation: 1,
+            cacheability: 1,
+            outcome: 1,
+            start_time_ns: 0x5A44,
+            ..c::Record::default()
+        };
+        let mut batch = ObservationBatch::default();
+        let budget = ObservationBudget::default();
+        let mut aliases = super::super::assembly::Sequences::default();
+        // Decoy sequence on another thread; its middle is LOST
+        // (never fed) and the poll clears mid-flight.
+        let mut decoy = base;
+        decoy.tid = 9;
+        decoy.invocation = 6;
+        assert!(
+            assemble_payload(
+                wire::Transport::Begin(decoy),
+                &mut aliases,
+                &budget,
+                &mut batch
+            )
+            .is_none()
+        );
+        aliases.clear();
+        assert!(
+            assemble_payload(
+                wire::Transport::End(decoy),
+                &mut aliases,
+                &budget,
+                &mut batch
+            )
+            .is_some()
+        );
+        // Main sequence completes after the loss: labeled.
+        assert!(
+            assemble_payload(
+                wire::Transport::Begin(base),
+                &mut aliases,
+                &budget,
+                &mut batch
+            )
+            .is_none()
+        );
+        let mut alias = base;
+        alias.status = 0;
+        alias.algorithm = 0;
+        alias.outcome = 0;
+        alias.function = 10;
+        assert!(
+            assemble_payload(
+                wire::Transport::Alias(alias),
+                &mut aliases,
+                &budget,
+                &mut batch
+            )
+            .is_none()
+        );
+        let mut end = base;
+        end.function = 1;
+        end.status = 0;
+        match assemble_payload(wire::Transport::End(end), &mut aliases, &budget, &mut batch) {
+            Some(ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            }) => {
+                assert_eq!(algorithm, AlgorithmId::try_from(0).unwrap());
+                assert_eq!(alias_quality.status, AliasStatus::Complete);
+                assert!(!alias_quality.weak);
+            }
+            other => panic!("complete run must label its Algorithm, got {other:?}"),
+        }
+        // ... and its Implementation.
+        let mut imp = base;
+        imp.kind = c::IMPLEMENTATION;
+        imp.algorithm = c::OTHER;
+        imp.function = 5;
+        imp.outcome = 0;
+        imp.status = 0;
+        imp.code = 0;
+        imp.version = c::VERSION;
+        imp.size = c::EVENT_SIZE as u32;
+        let bytes =
+            unsafe { std::slice::from_raw_parts((&imp as *const c::Record).cast(), c::EVENT_SIZE) };
+        let event = wire::Transport::Event(wire::decode(bytes).expect("valid impl record"));
+        match assemble_payload(event, &mut aliases, &budget, &mut batch) {
+            Some(ObservationPayload::Implementation {
+                algorithm,
+                alias_quality,
+                ..
+            }) => {
+                assert_eq!(algorithm, AlgorithmId::try_from(0).unwrap());
+                assert_eq!(alias_quality.status, AliasStatus::Complete);
+            }
+            other => panic!("complete run must label its Implementation, got {other:?}"),
+        }
+    }
+    #[test]
+    fn fix7_broken_cold_fact_sequence_withholds_label() {
+        // fix7 F1 (R7-1 verdict (i) pin, cold-fact plane): a gap
+        // inside the alias run withholds the label — Algorithm
+        // and Implementation fall back to `other()` +
+        // `Unavailable` with a gap — never a wrong label.
+        let base = c::Record {
+            pid: 1,
+            tid: 2,
+            cookie: 3,
+            generation: 4,
+            invocation: 5,
+            api: c::QUERY_CALLBACK,
+            operation: 1,
+            cacheability: 1,
+            outcome: 1,
+            start_time_ns: 0x5A44,
+            ..c::Record::default()
+        };
+        let mut batch = ObservationBatch::default();
+        let budget = ObservationBudget::default();
+        let mut aliases = super::super::assembly::Sequences::default();
+        assert!(
+            assemble_payload(
+                wire::Transport::Begin(base),
+                &mut aliases,
+                &budget,
+                &mut batch
+            )
+            .is_none()
+        );
+        // The middle alias (index 1) is LOST: index 2 arrives
+        // instead and continuity rejects + poisons.
+        for index in [0u32, 2] {
+            let mut alias = base;
+            alias.status = index;
+            alias.algorithm = 0;
+            alias.outcome = 0;
+            alias.function = 10;
+            assert!(
+                assemble_payload(
+                    wire::Transport::Alias(alias),
+                    &mut aliases,
+                    &budget,
+                    &mut batch
+                )
+                .is_none()
+            );
+        }
+        let mut end = base;
+        end.function = 2;
+        end.status = 0;
+        match assemble_payload(wire::Transport::End(end), &mut aliases, &budget, &mut batch) {
+            Some(ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            }) => {
+                assert_eq!(algorithm, super::super::assembly::other());
+                assert_eq!(alias_quality.status, AliasStatus::Unavailable);
+            }
+            other => panic!("broken run must withhold its Algorithm, got {other:?}"),
+        }
+        assert!(
+            batch.gaps.contains(&ObservationGap::InvalidWire),
+            "continuity break must gap: {:?}",
+            batch.gaps
+        );
+        let mut imp = base;
+        imp.kind = c::IMPLEMENTATION;
+        imp.algorithm = c::OTHER;
+        imp.function = 5;
+        imp.outcome = 0;
+        imp.status = 0;
+        imp.code = 0;
+        imp.version = c::VERSION;
+        imp.size = c::EVENT_SIZE as u32;
+        let bytes =
+            unsafe { std::slice::from_raw_parts((&imp as *const c::Record).cast(), c::EVENT_SIZE) };
+        let event = wire::Transport::Event(wire::decode(bytes).expect("valid impl record"));
+        match assemble_payload(event, &mut aliases, &budget, &mut batch) {
+            Some(ObservationPayload::Implementation {
+                algorithm,
+                alias_quality,
+                ..
+            }) => {
+                assert_eq!(algorithm, super::super::assembly::other());
+                assert_eq!(alias_quality.status, AliasStatus::Unavailable);
+            }
+            other => panic!("broken run must withhold its Implementation, got {other:?}"),
+        }
+        assert!(
+            batch.gaps.iter().any(|g| matches!(
+                g,
+                ObservationGap::InvalidWire | ObservationGap::IntervalUnknown
+            )),
+            "broken implementation must gap: {:?}",
+            batch.gaps
+        );
+    }
     #[test]
     fn role_conflicts_retire_both_discovery_orders_and_cannot_rearm() {
         for (first, second) in [

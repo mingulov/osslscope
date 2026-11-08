@@ -2119,6 +2119,56 @@ mod tests {
     }
 
     #[test]
+    fn fix7_dropped_attempt_leaves_result_unpaired_and_later_pair_valid() {
+        // fix7 F1 (R7-1 verdict (i) pin, pairing plane): a lost
+        // ATTEMPT never lets its RESULT pair with anything else
+        // (different invocation = different EpochKey) — the orphan
+        // expires unpaired-visible — and a post-loss complete pair
+        // on another invocation pairs valid.
+        let mut p = edge_bearing();
+        let lost = key(10, 11, 1, 100, 7);
+        let later = key(10, 11, 1, 100, 8);
+        p.result(result(lost, 20, 1000, 1));
+        p.close_window(0, 1500, [0; 8]);
+        let w1 = p.close_window(1, 2500, [0; 8]);
+        assert_eq!((w1.paired, w1.unpaired_results), (0, 1));
+        p.attempt(attempt(later, 20, 3000));
+        p.result(result(later, 20, 3500, 1));
+        p.close_window(2, 4000, [0; 8]);
+        p.finalize(4500);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (0, 1));
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+    #[test]
+    fn fix7_dropped_result_leaves_attempt_unpaired_and_later_pair_valid() {
+        // fix7 F1 (R7-1 verdict (i) pin, pairing plane): a lost
+        // RESULT never lets its ATTEMPT pair with anything else —
+        // the orphan expires unpaired-visible (+ exemplar) — and a
+        // post-loss complete pair on another invocation pairs
+        // valid. No cross-invocation mispair exists.
+        let mut p = edge_bearing();
+        let lost = key(10, 11, 1, 100, 7);
+        let later = key(10, 11, 1, 100, 8);
+        p.attempt(attempt(lost, 20, 1000));
+        p.close_window(0, 1500, [0; 8]);
+        let w1 = p.close_window(1, 2500, [0; 8]);
+        assert_eq!((w1.paired, w1.unpaired_entries), (0, 1));
+        assert_eq!(w1.exemplars.len(), 1);
+        assert_eq!(w1.exemplars[0].dir, ExemplarDir::Entry);
+        p.attempt(attempt(later, 20, 3000));
+        p.result(result(later, 20, 3500, 1));
+        p.close_window(2, 4000, [0; 8]);
+        p.finalize(4500);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (1, 0));
+        let ra: u64 = t.received.attempts.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+    }
+    #[test]
     fn pairing_cross_generation_forbidden() {
         let mut p = edge_bearing();
         p.attempt(attempt(key(10, 11, 1, 100, 7), 20, 1000));

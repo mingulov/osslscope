@@ -335,6 +335,77 @@ mod tests {
         );
     }
     #[test]
+    fn fix7_post_loss_complete_sequence_labels_valid() {
+        // fix7 F1 (R7-1 verdict (i) pin, alias plane): loss is a
+        // dropped record and/or the poll's `clear()` — a sequence
+        // that COMPLETES after loss labels valid (the delta hit
+        // other records); a sequence wiped mid-flight stays
+        // unreachable (fail-closed, never resurrected).
+        let q = query();
+        let mut s = Sequences::default();
+        let b = ObservationBudget::default();
+        s.begin(&q, &b).unwrap();
+        s.alias(&known(q, 0)).unwrap();
+        s.end(&end(q, 1, 0)).unwrap();
+        assert_eq!(u16::from(s.implementation(&q).unwrap().0), 0);
+        // The loss poll's clear wipes every open AND ended
+        // sequence; the old row's records no longer address
+        // anything.
+        s.clear();
+        assert!(s.implementation(&q).is_err());
+        // A fresh complete sequence after the clear labels valid.
+        let mut m = q;
+        m.invocation += 1;
+        s.begin(&m, &b).unwrap();
+        s.alias(&known(m, 0)).unwrap();
+        s.end(&end(m, 1, 0)).unwrap();
+        assert_eq!(u16::from(s.implementation(&m).unwrap().0), 0);
+    }
+    #[test]
+    fn fix7_each_dropped_position_fails_closed_and_poisons() {
+        // fix7 F1 (R7-1 verdict (i) pin, alias plane): EVERY
+        // within-sequence gap fails closed with an exact gap —
+        // no dropped position can yield a wrong label — and a
+        // poisoned sequence can never complete afterward, while a
+        // FRESH invocation self-heals (replace + complete valid).
+        let q = query();
+        let b = ObservationBudget::default();
+        // Dropped BEGIN: nothing addresses the thread.
+        let mut s = Sequences::default();
+        assert_eq!(s.alias(&known(q, 0)), Err(ObservationGap::IntervalUnknown));
+        assert_eq!(s.end(&end(q, 1, 0)), Err(ObservationGap::IntervalUnknown));
+        assert_eq!(s.implementation(&q), Err(ObservationGap::IntervalUnknown));
+        // Dropped middle ALIAS: continuity rejects + poisons.
+        let mut s = Sequences::default();
+        s.begin(&q, &b).unwrap();
+        s.alias(&known(q, 0)).unwrap();
+        assert_eq!(s.alias(&known(q, 2)), Err(ObservationGap::InvalidWire));
+        assert_eq!(s.end(&end(q, 2, 0)), Err(ObservationGap::IntervalUnknown));
+        assert!(s.implementation(&q).is_err());
+        // Dropped END: implementation fails AND poisons (a mere
+        // "not yet" would still allow the end — it does not).
+        let mut s = Sequences::default();
+        s.begin(&q, &b).unwrap();
+        s.alias(&known(q, 0)).unwrap();
+        assert_eq!(s.implementation(&q), Err(ObservationGap::IntervalUnknown));
+        assert_eq!(s.end(&end(q, 1, 0)), Err(ObservationGap::IntervalUnknown));
+        // Count mismatch (dropped trailing ALIAS): end rejects.
+        let mut s = Sequences::default();
+        s.begin(&q, &b).unwrap();
+        s.alias(&known(q, 0)).unwrap();
+        assert_eq!(s.end(&end(q, 2, 0)), Err(ObservationGap::InvalidWire));
+        assert!(s.implementation(&q).is_err());
+        // Self-heal: a fresh invocation replaces the poisoned
+        // sequence (standard IntervalUnknown for the un-ended old
+        // one) and completes valid.
+        let mut next = q;
+        next.invocation += 1;
+        assert_eq!(s.begin(&next, &b), Err(ObservationGap::IntervalUnknown));
+        s.alias(&known(next, 0)).unwrap();
+        s.end(&end(next, 1, 0)).unwrap();
+        assert_eq!(u16::from(s.implementation(&next).unwrap().0), 0);
+    }
+    #[test]
     fn internal_wire_rejects_unregistered_metadata_and_code() {
         let q = query();
         assert!(decode(known(q, 0)).is_ok());
