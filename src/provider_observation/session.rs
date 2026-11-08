@@ -2814,7 +2814,12 @@ impl ProviderSession {
                 Ok(e) => self.consume(e, &mut scratch),
                 Err(g) => {
                     self.aliases.clear();
+                    // fix4 (R4-2): a decode error invalidates the
+                    // WHOLE carry (pre-existing + scratch), not
+                    // just this drain's scratch — carried
+                    // attribution is exactly as suspect.
                     invalidate_algorithms(&mut scratch);
+                    invalidate_algorithms(&mut self.retire_carry);
                     scratch.gap(g);
                 }
             }
@@ -3036,6 +3041,9 @@ impl ProviderSession {
         let mut b = std::mem::take(&mut self.retire_carry);
         if self.closed || self.final_drain || !self.gate.admitting() {
             b.gap(ObservationGap::Invalidated);
+            // fix4: this exit also emits the taken carry — validate
+            // it exactly like the tail exit (see below).
+            self.poll_loss_lanes(&mut b);
             return b;
         }
         // R5-3: pending retries drain FIRST — before the release
@@ -3266,6 +3274,12 @@ impl ProviderSession {
         }
         b.gap(ObservationGap::IntervalUnknown);
         b.refusals.extend(self.budget.take_refusals());
+        // fix4 (R4-2): the carry taken above was consumed by
+        // retire-drains — validate the whole batch (carry first)
+        // before emitting, exactly like `drain` does. Poll LAST:
+        // retire-drains fire mid-reconcile, and only a
+        // post-consumption poll catches overlapping loss.
+        self.poll_loss_lanes(&mut b);
         b
     }
     fn add_target(
@@ -3540,6 +3554,55 @@ impl ProviderSession {
         b.gap(ObservationGap::SamplingPartial);
         Ok(())
     }
+    /// fix4 (R4-2): the single LOSS-validation site. Polls all
+    /// eight loss lanes AFTER the caller consumed ring content and
+    /// downgrades the WHOLE batch (carry included) on any delta
+    /// or read failure. Called by `drain` (after its ring loop)
+    /// AND by `reconcile_records` (at the end, both exits — the
+    /// carry it flushes was consumed by retire-drains and must
+    /// validate exactly like drain-emitted content). One function,
+    /// two call sites — the two emission points cannot drift.
+    fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
+        for index in 0..8 {
+            match self.loss.get(&(index as u32), 0) {
+                Ok(values) => {
+                    self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
+                    // N4: stamp the read's containing tick (0
+                    // without a clock — fail-closed: an unstamped
+                    // read cannot advance the baseline).
+                    self.loss_read_tick[index] = self
+                        .loss_tick_clock
+                        .map(|(origin, tick_ns)| {
+                            loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns)
+                        })
+                        .unwrap_or(0);
+                    let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
+                    if total > self.last_loss[index] {
+                        self.loss_totals[index] =
+                            self.loss_totals[index].saturating_add(total - self.last_loss[index]);
+                        self.aliases.clear();
+                        invalidate_algorithms(b);
+                        b.gap(match index {
+                            0 => ObservationGap::QueueLoss,
+                            1 => ObservationGap::PendingLimit,
+                            2 => ObservationGap::DepthLimit,
+                            3 => ObservationGap::UnpairedReturn,
+                            4 => ObservationGap::TargetReadFailed,
+                            5 => ObservationGap::RelocationRefused,
+                            6 => ObservationGap::DispatchPartial,
+                            _ => ObservationGap::NamespaceChanged,
+                        });
+                        self.last_loss[index] = total;
+                    }
+                }
+                Err(_) => {
+                    self.aliases.clear();
+                    invalidate_algorithms(b);
+                    b.gap(ObservationGap::BpfUnavailable);
+                }
+            }
+        }
+    }
     pub fn drain(&mut self, deadline: Instant) -> ObservationBatch {
         // fix3: the retire carry (if any) heads this batch (see
         // `reconcile_records` — same conservation; the final drain
@@ -3741,45 +3804,7 @@ impl ProviderSession {
                 self.fenced.remove(&pid);
             }
         }
-        for index in 0..8 {
-            match self.loss.get(&(index as u32), 0) {
-                Ok(values) => {
-                    self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
-                    // N4: stamp the read's containing tick (0
-                    // without a clock — fail-closed: an unstamped
-                    // read cannot advance the baseline).
-                    self.loss_read_tick[index] = self
-                        .loss_tick_clock
-                        .map(|(origin, tick_ns)| {
-                            loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns)
-                        })
-                        .unwrap_or(0);
-                    let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
-                    if total > self.last_loss[index] {
-                        self.loss_totals[index] =
-                            self.loss_totals[index].saturating_add(total - self.last_loss[index]);
-                        self.aliases.clear();
-                        invalidate_algorithms(&mut b);
-                        b.gap(match index {
-                            0 => ObservationGap::QueueLoss,
-                            1 => ObservationGap::PendingLimit,
-                            2 => ObservationGap::DepthLimit,
-                            3 => ObservationGap::UnpairedReturn,
-                            4 => ObservationGap::TargetReadFailed,
-                            5 => ObservationGap::RelocationRefused,
-                            6 => ObservationGap::DispatchPartial,
-                            _ => ObservationGap::NamespaceChanged,
-                        });
-                        self.last_loss[index] = total;
-                    }
-                }
-                Err(_) => {
-                    self.aliases.clear();
-                    invalidate_algorithms(&mut b);
-                    b.gap(ObservationGap::BpfUnavailable);
-                }
-            }
-        }
+        self.poll_loss_lanes(&mut b);
         for pid in terminal {
             // R4-4: a deferred startup retire keeps rows and
             // aliases alike for the retry.
@@ -17590,6 +17615,171 @@ mod fix4_retire {
         // Per-family conservation (each pair holds one attempt + one result).
         assert_eq!(ra, t.paired + t.unpaired_entries, "attempt conservation");
         assert_eq!(rr, t.paired + t.unpaired_results, "result conservation");
+    }
+
+    /// Alias-plane payload words (operation/algorithm/function/
+    /// outcome/status/cacheability), bundled past the clippy arity lint.
+    struct AliasWords(u32, u32, u32, u32, u32, u32);
+
+    /// Forge an alias-plane record image (ALGORITHM_BEGIN / ALIAS /
+    /// ALIAS_END) with a forged incarnation stamp (one
+    /// incarnation — the sequence genuinely belongs together).
+    fn alias_bytes(
+        kind: u32,
+        pid: u32,
+        tid: u32,
+        invocation: u64,
+        mono_ns: u64,
+        words: AliasWords,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; c::EVENT_SIZE];
+        for (at, v) in [
+            (0, c::VERSION),
+            (4, kind),
+            (8, c::EVENT_SIZE as u32),
+            (12, ALIAS_API),
+            (16, pid),
+            (20, tid),
+        ] {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [
+            (24, ALIAS_COOKIE),
+            (32, GENERATION),
+            (40, mono_ns),
+            (48, invocation),
+        ] {
+            b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        let AliasWords(operation, algorithm, function, outcome, status, cacheability) = words;
+        b[56..60].copy_from_slice(&outcome.to_le_bytes());
+        b[60..64].copy_from_slice(&operation.to_le_bytes());
+        b[64..68].copy_from_slice(&algorithm.to_le_bytes());
+        b[68..72].copy_from_slice(&function.to_le_bytes());
+        b[72..76].copy_from_slice(&cacheability.to_le_bytes());
+        b[76..80].copy_from_slice(&status.to_le_bytes());
+        b[96..104].copy_from_slice(&OLD_START.to_le_bytes());
+        b
+    }
+
+    /// Consume forged bytes into the retire carry through the real
+    /// `consume` (exactly what `retire_drain` calls per decoded
+    /// event — the ring transport itself is unforgeable from
+    /// userspace, so the take/consume/restore composition stands in
+    /// for the ring read; decode IS exercised for real).
+    fn feed_carry(session: &mut ProviderSession, bytes: &[u8]) {
+        let event = wire::decode_transport(bytes).expect("forged bytes must decode");
+        let mut carry = std::mem::take(&mut session.retire_carry);
+        session.consume(event, &mut carry);
+        session.retire_carry.append_batch(carry);
+    }
+
+    /// F3c (R4-2 shape): carry-before-drain. The retire path
+    /// consumes attribution-bearing records; reconcile emits
+    /// BEFORE any drain with an overlapping LOSS delta: the
+    /// attribution must be downgraded (`other`/`Unavailable`)
+    /// with a loss gap present — never published intact.
+    #[test]
+    #[ignore = "fix4 F3c: requires BPF map privileges (sudo M4 run)"]
+    fn fix4_carry_before_drain_loss_validated() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP fix4 F3c: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // A known-class alias segment (resolved through the same
+        // `kinds` tables the decoder enforces).
+        let label = crate::kinds::alg_class_label(0).expect("registry class 0");
+        let canon = crate::kinds::algorithm_semantic_id(label).expect("class 0 canon");
+        let weak = u32::from(crate::kinds::is_weak_alg(label));
+        // Retire-drain-equivalent consumption into the carry.
+        feed_carry(
+            &mut s,
+            &alias_bytes(
+                c::ALGORITHM_BEGIN,
+                pid,
+                tid,
+                7,
+                100,
+                AliasWords(1, 0, 0, 1, 0, 1),
+            ),
+        );
+        feed_carry(
+            &mut s,
+            &alias_bytes(
+                c::ALIAS,
+                pid,
+                tid,
+                7,
+                110,
+                AliasWords(1, 0, u32::from(canon), weak, 0, 1),
+            ),
+        );
+        feed_carry(
+            &mut s,
+            &alias_bytes(
+                c::ALIAS_END,
+                pid,
+                tid,
+                7,
+                120,
+                AliasWords(1, c::OTHER, 1, 0, 0, 1),
+            ),
+        );
+        // Premise: the carry holds one attributed Algorithm fact.
+        assert_eq!(s.retire_carry.facts.len(), 1, "carry premise: one fact");
+        let (pre_alg, pre_status) = match &s.retire_carry.facts[0].payload {
+            ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            } => (*algorithm, alias_quality.status),
+            other => panic!("carry premise: Algorithm payload, got {other:?}"),
+        };
+        let known = crate::provider_observation::AlgorithmId::try_from(0).unwrap();
+        assert_eq!(pre_alg, known, "carry premise: known-class attribution");
+        assert_eq!(
+            pre_status,
+            crate::provider_observation::AliasStatus::Complete,
+            "carry premise: clean fold status"
+        );
+        // Overlapping LOSS_RING delta (cpu0=3) before reconcile.
+        let cpus = aya::util::nr_cpus().map_err(|(_, e)| e).expect("nr_cpus");
+        let mut values = vec![0u64; cpus];
+        values[0] = 3;
+        let percpu = aya::maps::PerCpuValues::try_from(values).expect("percpu values");
+        s.loss
+            .set(0, percpu, 0)
+            .expect("loss injection must succeed");
+        // Reconcile emits BEFORE any drain (no drain call in this test).
+        let batch = s.reconcile_records(std::slice::from_ref(&fix.record));
+        assert_eq!(batch.facts.len(), 1, "downgraded, never dropped");
+        match &batch.facts[0].payload {
+            ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            } => {
+                assert_eq!(
+                    *algorithm,
+                    assembly::other(),
+                    "LOSS overlap downgrades the algorithm"
+                );
+                assert_eq!(
+                    alias_quality.status,
+                    crate::provider_observation::AliasStatus::Unavailable,
+                    "LOSS overlap withholds the quality"
+                );
+            }
+            other => panic!("expected Algorithm payload, got {other:?}"),
+        }
+        assert!(
+            batch.gaps.contains(&ObservationGap::QueueLoss),
+            "loss gap present: {:?}",
+            batch.gaps
+        );
     }
 }
 
