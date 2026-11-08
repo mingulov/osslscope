@@ -254,6 +254,7 @@ MEMBERS
 NAMESPACE
 RANGES
 THREADS
+INV_SEQ
 PENDING
 LOSS
 ALG_CLASS
@@ -553,7 +554,8 @@ payload are transport fields. Future positive operation/function IDs remain
 numeric identities rather than registry admission decisions.
 
 `PENDING` holds bounded per-thread call pairing and required argument operands
-only until return; `THREADS` holds bounded nesting/invocation state. Neither is
+only until return; `THREADS` holds bounded nesting/invocation state; `INV_SEQ`
+holds one observer-owned u64 seed counter (no target data). None is
 enumerated to public output. `CONFIG`, `MEMBERS`, `NAMESPACE`, and `RANGES` hold
 observer-owned attachment, process/namespace and executable-range admission
 state. There is no persisted returned-table cursor map. The classifier maps
