@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Install from source
 
-The v0.4.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
+The v0.5.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
 manifest-verified install. Source/install simulations do not qualify actual
 BPF loading, provider behavior or a platform.
 
@@ -133,8 +133,22 @@ The DEB ships the D-record §1.4 installed-service layout:
   `sequence.json`, `run-summary.json`, and the stream tap (when
   configured) live here.
 
-The package installs but never enables the unit. To run it, select
-targets in `/etc/osslscope/service.toml`, then:
+Prerequisite: a 6.9+ kernel. Ubuntu 24.04 servers default to the
+6.8 GA kernel, which is below the support floor — install the HWE
+kernel first (recipe: [Runner image](ci-recipes.md#runner-image)).
+On a below-floor kernel, `doctor` fails the `kernel` check
+(`wrong kernel: … (feature probe, not uname; release … informational)`
+with the remediation `need a kernel with kprobe-load + ringbuf +
+uprobe-multi + probe_read_user (6.9+ verified; 6.12-LTS oldest
+tested)`) and the `token-support` row reads `BPF_TOKEN_CREATE
+absent (pre-6.9? — informational only; file-caps path needs
+multi+ringbuf+cookie, not tokens)`.
+
+The package installs but never enables the unit. Select targets in
+`/etc/osslscope/service.toml` BEFORE enabling: with the stock
+config (no selection) the service refuses at startup with exit 2
+(`service requires at least one of --pid/--cgroup` in the journal)
+and the unit stays stopped without restarting. To run it:
 
 ```sh
 sudo systemctl enable --now osslscope-service
@@ -142,13 +156,21 @@ systemctl is-active osslscope-service
 sudo journalctl -u osslscope-service -n 20
 ```
 
+Exit 2 at startup always means the config was refused (no target
+selection, an unknown key, or a bad value) — never a crash.
+Recovery: fix `/etc/osslscope/service.toml`, then `sudo systemctl
+restart osslscope-service` (if the unit already sits in `failed`
+behind a start-rate trip from an older unit, `sudo systemctl
+reset-failed osslscope-service` first).
+
 Policy reloads go through `systemctl reload` (SIGHUP at the next
 window boundary). `Restart=on-failure` restarts abnormal deaths
-after 5 s; exit 4 (scope unavailable — nothing finalized, operator
-needed) holds the unit stopped, as does the start-rate backstop
-(5 starts per 300 s). Removing the package stops the unit and keeps
-both the conffile and the out-DIR; upgrades preserve a modified
-config and leave a running unit alone until it is restarted.
+after 5 s; exit 2 (config refused) and exit 4 (scope unavailable —
+nothing finalized, operator needed) hold the unit stopped without
+restarting, as does the start-rate backstop (5 starts per 300 s).
+Removing the package stops the unit and keeps both the conffile
+and the out-DIR; upgrades preserve a modified config and leave a
+running unit alone until it is restarted.
 
 ## Watch capacity and ParseCache
 

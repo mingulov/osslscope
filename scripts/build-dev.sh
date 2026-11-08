@@ -131,6 +131,11 @@ run_pinned_cargo() {
     # flags are outside this pinned recipe; see docs/build.md. Proof:
     # scripts/tests/test-runtime-source-binding.py
     # (test_environment_build_and_target_flags_cannot_redirect_source).
+    # NOT cleared here, by design: RUSTC_WRAPPER /
+    # RUSTC_WORKSPACE_WRAPPER (env and config forms) and native host
+    # linker selectors all survive this blanking — wrappers wrap the
+    # pinned rustc above and can rewrite its args, so they stay
+    # trusted; see the trust note in docs/build.md.
     RUSTC="$_cargo_rustc" CARGO_BUILD_RUSTC="$_cargo_rustc" \
         CARGO_ENCODED_RUSTFLAGS='' RUSTFLAGS='' \
         CARGO_UNSTABLE_HOST_CONFIG=false CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST=false \
@@ -173,10 +178,11 @@ if [ "$MODE" != "host" ]; then
     command -v bpf-linker >/dev/null 2>&1 \
         || fail_prereq "bpf-linker not found on PATH" "install bpf-linker $BPF_LINKER_PIN manually (e.g. cargo install --locked bpf-linker --version $BPF_LINKER_PIN)"
     BPF_LINKER_VER="$(bpf-linker --version 2>/dev/null || echo bpf-linker-unknown)"
-    # Exact pin: a missing or wrong-version linker miscompiles the
-    # BPF objects, so both refuse here (exit 3) in every BPF mode —
-    # check-only and build share these prereqs, and there is no
-    # silent fallback. Host-only builds need no linker and skip this.
+    # Exact pin: a missing linker refuses here (exit 3) — only a
+    # wrong-version one would miscompile the BPF objects — so both
+    # cases refuse in every BPF mode: check-only and build share
+    # these prereqs, and there is no silent fallback. Host-only
+    # builds need no linker and skip this.
     [ "$BPF_LINKER_VER" = "bpf-linker $BPF_LINKER_PIN" ] \
         || fail_prereq "bpf-linker is '$BPF_LINKER_VER', need exactly 'bpf-linker $BPF_LINKER_PIN'" "install bpf-linker $BPF_LINKER_PIN manually (e.g. cargo install --locked bpf-linker --version $BPF_LINKER_PIN)"
     # Bind the CHECKED executable to compilation: cargo's linker
@@ -186,10 +192,18 @@ if [ "$MODE" != "host" ]; then
     # remove it — so the manifest would record 0.10.4 while cargo
     # links with another binary. Binding (not rejecting) keeps
     # legitimate ambient settings working, and the env form wins over
-    # every config-file form. A `-C linker` smuggled through any
+    # every config-file form. A `-C linker` smuggled through a blanked
     # rustflags channel would still last-win over this binding, so the
     # binding is airtight only together with the RUSTFLAGS blanking in
-    # run_pinned_cargo, which suppresses every rustflags channel.
+    # run_pinned_cargo, which suppresses every env/config rustflags
+    # channel — except nightly profile rustflags (`[unstable]
+    # profile-rustflags` + `[profile.*].rustflags`), which blanking
+    # cannot reach. That exception cannot substitute the linker:
+    # pinned cargo (1.97.0-nightly 4d1f98451) emits profile flags
+    # (compiler/mod.rs:1367) before the bound `-C linker=` (:1427 via
+    # add_codegen_linker), so the bound linker last-wins; other
+    # profile flags can nevertheless survive. This tree's own
+    # manifests set no profile rustflags.
     # Proof: scripts/tests/test-runtime-source-binding.py
     # (test_bpf_linker_override_env_cannot_divert_selection and the
     # config/smuggling cases next to it).

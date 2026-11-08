@@ -27,6 +27,10 @@ sudo reboot
 # after reboot: uname -r must show a 6.9+ kernel
 ```
 
+Installers: the same floor gates the [DEB/service
+install](install.md#installed-service-deb) (prerequisite block
+there; this recipe stays the single source).
+
 ## Setup phase (privileged, once per runner)
 
 ```sh

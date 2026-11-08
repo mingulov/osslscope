@@ -115,7 +115,15 @@ host-config selection disabled, so ambient flags cannot redirect the
 pinned sysroot, leak host options into the BPF link, or smuggle a
 `-C linker` past the bound linker. The blanked empty set overrides
 `RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, per-target rustflags variables,
-and config-file rustflags tables alike. The blanking is load-bearing:
+and config-file rustflags tables alike. One channel survives
+blanking: nightly profile rustflags (`[unstable] profile-rustflags`
+plus `[profile.*].rustflags`) are emitted from manifest/config, not
+the blanked variables. That exception cannot substitute the linker
+— pinned cargo (1.97.0-nightly `4d1f98451`) emits profile flags
+before the bound `-C linker=` (`src/cargo/core/compiler/mod.rs`:
+profile args at line 1367, `add_codegen_linker` at line 1427), so
+the bound linker last-wins — but other profile flags can survive.
+This tree's own manifests set none. The blanking is load-bearing:
 `-C target-cpu=native` breaks the bpfel link (observed as a real
 artifact-level failure) and `--sysroot ALT` would silently redirect
 compilation while the manifest still binds the pinned source identity
@@ -124,6 +132,13 @@ demonstration is fixture-level, host-only) — so custom Rust flags are
 outside this pinned recipe. Proof:
 `scripts/tests/test-runtime-source-binding.py`
 (`test_environment_build_and_target_flags_cannot_redirect_source`).
+
+Trust assumption: `RUSTC_WRAPPER`/`RUSTC_WORKSPACE_WRAPPER` (env and
+config forms) are not cleared by the blanking — a wrapper wraps the
+pinned rustc invocation and can rewrite its arguments — and native
+host linker selectors likewise survive; only the BPF target linker
+is bound. Wrappers stay trusted by design (see `run_pinned_cargo`
+in `scripts/build-dev.sh`).
 
 ## Fresh-archive build
 

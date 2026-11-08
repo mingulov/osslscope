@@ -82,7 +82,46 @@ def flags_carry_linker(flags):
             return True
         if flag.startswith('-Clinker'):
             return True
+        if flag == '--codegen' and i + 1 < len(flags) and flags[i + 1].startswith('linker'):
+            return True
+        if flag.startswith('--codegen=linker'):
+            return True
+        if flag.startswith('@') and len(flag) > 1:
+            # Response file: pinned rustc splits on newlines (one
+            # arg per line; space-separated single lines do NOT
+            # split) and refuses unreadable files, so only a
+            # readable file's lines can smuggle a linker.
+            try:
+                with open(flag[1:]) as resp:
+                    nested = resp.read().splitlines()
+            except OSError:
+                continue
+            if flags_carry_linker(nested):
+                return True
     return False
+
+
+class FlagsCarryLinkerSpellings(unittest.TestCase):
+    # Oracle coverage for every linker spelling the pinned rustc
+    # accepts (probed on 1.88.0: `--codegen linker=` and
+    # `--codegen=linker=` both link through the named binary;
+    # `@file` args split on newlines, one arg per line).
+    def test_detected_spellings(self):
+        self.assertTrue(flags_carry_linker(['-C', 'linker=/usr/bin/false']))
+        self.assertTrue(flags_carry_linker(['-Clinker=/usr/bin/false']))
+        self.assertTrue(flags_carry_linker(['--codegen', 'linker=/usr/bin/false']))
+        self.assertTrue(flags_carry_linker(['--codegen=linker=/usr/bin/false']))
+
+    def test_response_file_spelling(self):
+        with tempfile.NamedTemporaryFile('w', suffix='.rsp', delete=False) as resp:
+            resp.write('-C\nlinker=/usr/bin/false\n')
+            path = resp.name
+        self.addCleanup(os.unlink, path)
+        self.assertTrue(flags_carry_linker(['@' + path]))
+
+    def test_benign_flags_ignored(self):
+        self.assertFalse(flags_carry_linker(['-C', 'opt-level=2', '--codegen', 'opt-level=2']))
+        self.assertFalse(flags_carry_linker([]))
 
 
 class BuildSourceBinding(unittest.TestCase):
@@ -232,9 +271,12 @@ class BuildSourceBinding(unittest.TestCase):
         if not tools.exists():
             tools.mkdir()
             for name in self.LINKERLESS_TOOLS:
-                target = shutil.which(name)
-                self.assertIsNotNone(target,'system tool missing: '+name)
-                (tools/name).symlink_to(target)
+                found = shutil.which(name)
+                self.assertIsNotNone(found,'system tool missing: '+name)
+                # Absolutize: which() can return a relative hit (PATH
+                # with `.` or relative entries), which would make the
+                # private link self-referencing or dangling.
+                (tools/name).symlink_to(os.path.abspath(found))
         path = str(self.bin)+os.pathsep+str(tools)
         self.assertIsNone(shutil.which('bpf-linker',path=path),
                           'bpf-linker leaked into the linkerless PATH')
@@ -284,6 +326,15 @@ class BuildSourceBinding(unittest.TestCase):
         # linker through cargo's own selection variable, and no
         # `-C linker` may arrive through rustflags (which would
         # last-win over the binding under real cargo).
+        # Oracle limit: this fixture verifies PROPAGATION of the
+        # binding (env + flags per cargo call), not cargo's
+        # effective selection — no linker configuration is ever
+        # evaluated and no linker is ever invoked here. Effective
+        # selection is proven by the end-to-end hostile builds
+        # (Wave 2 fix-1 report, F1 GREEN proofs: full BPF build
+        # under hostile linker env + config exits 0 with the bound
+        # path as the sole `-C linker=`; controller review
+        # replicates with an independent hostile setup).
         checked=str(self.bin/'bpf-linker')
         calls=[call for call in self.linker_calls() if call['nightly'] and not call['metadata']]
         self.assertTrue(calls,'no BPF compilation cargo calls logged')
@@ -299,8 +350,15 @@ class BuildSourceBinding(unittest.TestCase):
 
     def test_bpf_linker_config_file_cannot_divert_selection(self):
         config=self.product/'.cargo/config.toml';config.parent.mkdir(exist_ok=True)
+        # The cfg entry must MATCH bpfel, or the subtest is vacuous:
+        # `cfg(unix)` never matches bpfel-unknown-none (`rustc
+        # --print cfg --target bpfel-unknown-none` lists no `unix`;
+        # target_os="none"), so a unix-gated linker could never
+        # apply under real cargo. `target_arch = "bpf"` DOES match
+        # (same probe), so this entry would select the hostile
+        # linker under real cargo and the binding must beat it.
         bodies={'triple': '[target.bpfel-unknown-none]\nlinker = "/usr/bin/false"\n',
-                'cfg': '[target."cfg(unix)"]\nlinker = "/usr/bin/false"\n'}
+                'cfg': '[target."cfg(target_arch = \\"bpf\\")"]\nlinker = "/usr/bin/false"\n'}
         for name, body in bodies.items():
             with self.subTest(table=name):
                 config.write_text(body)

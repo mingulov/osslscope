@@ -18,7 +18,9 @@ fn deb_input(name: &str) -> PathBuf {
 /// `[Unit]`/`[Install]` scaffolding the brief's enable/start/stop/
 /// restart lifecycle requires (`[Install]` carries `WantedBy`, so
 /// `enable` works; `StartLimit*` live in `[Unit]` per systemd.unit).
-const FROZEN_UNIT: &str = "# D-record §1.4 frozen — changes need a §1.4 amendment (+ minor bump).\n[Unit]\nDescription=osslscope continuous OpenSSL observer service\nStartLimitIntervalSec=300\nStartLimitBurst=5\n\n[Service]\nType=simple\nExecStart=/usr/bin/osslscope service --config /etc/osslscope/service.toml\nExecReload=/bin/kill -HUP $MAINPID\nRestart=on-failure\nRestartSec=5\nRestartPreventExitStatus=4\nStateDirectory=osslscope\n# +CAP_SYS_PTRACE: §1.4 grants it iff foreign-uid targets are\n# selected. The unit runs as root, so any non-root target is\n# foreign — the shipped unit carries it. Drop it only when every\n# target runs as root.\n# +CAP_CHECKPOINT_RESTORE +CAP_DAC_READ_SEARCH: §1.4 Amendment A1\n# (ratified) — required for foreign-identity verification; without\n# them foreign members gap identity_unverified and attach finds\n# zero sites.\nCapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH\n\n[Install]\nWantedBy=multi-user.target\n";
+/// Wave 3 added exit 2 to the prevention list (config-failure must
+/// not restart-loop); the §1.4 amendment ratifying it is pending.
+const FROZEN_UNIT: &str = "# D-record §1.4 frozen — changes need a §1.4 amendment (+ minor bump).\n[Unit]\nDescription=osslscope continuous OpenSSL observer service\nStartLimitIntervalSec=300\nStartLimitBurst=5\n\n[Service]\nType=simple\nExecStart=/usr/bin/osslscope service --config /etc/osslscope/service.toml\nExecReload=/bin/kill -HUP $MAINPID\nRestart=on-failure\nRestartSec=5\nRestartPreventExitStatus=2 4\nStateDirectory=osslscope\n# +CAP_SYS_PTRACE: §1.4 grants it iff foreign-uid targets are\n# selected. The unit runs as root, so any non-root target is\n# foreign — the shipped unit carries it. Drop it only when every\n# target runs as root.\n# +CAP_CHECKPOINT_RESTORE +CAP_DAC_READ_SEARCH: §1.4 Amendment A1\n# (ratified) — required for foreign-identity verification; without\n# them foreign members gap identity_unverified and attach finds\n# zero sites.\nCapabilityBoundingSet=CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH\n\n[Install]\nWantedBy=multi-user.target\n";
 
 #[test]
 fn deb_unit_file_matches_frozen_section_1_4() {
@@ -26,6 +28,35 @@ fn deb_unit_file_matches_frozen_section_1_4() {
         .expect("shipped unit packaging/deb/osslscope-service.service present");
     let text = String::from_utf8(bytes).expect("shipped unit is UTF-8 (systemd requirement)");
     assert_eq!(text, FROZEN_UNIT);
+}
+
+#[test]
+fn deb_unit_file_excludes_config_failure_from_restart() {
+    // S1: the stock config selects no targets, so a fresh enable
+    // exits 2 — the unit must NOT restart that (nor the exit-4
+    // scope refusal); only abnormal deaths restart.
+    let bytes = std::fs::read(deb_input("osslscope-service.service"))
+        .expect("shipped unit packaging/deb/osslscope-service.service present");
+    let text = String::from_utf8(bytes).expect("shipped unit is UTF-8 (systemd requirement)");
+    let line = text
+        .lines()
+        .find(|l| l.starts_with("RestartPreventExitStatus="))
+        .expect("unit carries a RestartPreventExitStatus stanza");
+    let statuses: Vec<&str> = line["RestartPreventExitStatus=".len()..]
+        .split_whitespace()
+        .collect();
+    assert!(
+        statuses.contains(&"2"),
+        "config-failure exit 2 must not restart: {line}"
+    );
+    assert!(
+        statuses.contains(&"4"),
+        "scope-refusal exit 4 must not restart: {line}"
+    );
+    assert!(
+        text.lines().any(|l| l == "Restart=on-failure"),
+        "restart policy stays on-failure"
+    );
 }
 
 #[test]
