@@ -299,7 +299,7 @@ FROZEN_UNIT = (
     "# +exit 2 to RestartPreventExitStatus: §1.4 Amendment A2\n"
     "# (ratified) — stock config selects no targets → service refuses\n"
     "# with exit 2 → without prevention the unit restart-loops 5×/300s\n"
-    "# then fails; exit 2 is config-refused (never a crash), so holding\n"
+    "# then fails; exit 2 is startup/admission-refused (never a crash), so holding\n"
     "# the unit stopped is correct.\n"
     "RestartPreventExitStatus=2 4\n"
     "StateDirectory=osslscope\n"
