@@ -3578,7 +3578,8 @@ impl ProviderSession {
     /// accounting site (`last_loss`/`loss_totals` advance here and
     /// nowhere else). `reconcile_records` (both exits) uses the
     /// peek below instead: a reconcile-time consume would steal a
-    /// delta belonging to records still queued for drain (R5-1).
+    /// delta belonging to records still queued for drain (R5-1);
+    /// fix6 (R6-3): dirty drains peek too (clean-gated drain).
     fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
@@ -3870,7 +3871,31 @@ impl ProviderSession {
                 self.fenced.remove(&pid);
             }
         }
-        self.poll_loss_lanes(&mut b);
+        // fix6 (R6-3): clean-gated LOSS accounting — CONSUME (the
+        // poll below, advancing `last_loss`/`loss_totals`) only
+        // when the ring loop exhausted the backlog; a dirty drain
+        // (deadline-expiry / FactLimit break, including
+        // zero-consumed + `DrainOverrun`) PEEKS instead (downgrade
+        // the partial batch, leave the baseline for the drain that
+        // consumes the survivors). An unconditional poll steals the
+        // delta from still-queued records (their drain sees no
+        // delta → intact attribution — the pre-fix5 defect R6-3).
+        // Persistent-dirty sessions downgrade everything until a
+        // clean drain — honest (the backlog is genuinely suspect),
+        // availability-only.
+        //
+        // Close/final caveat: the final drain funnels through here
+        // too — a dirty final drain peeks (signals) rather than
+        // consumes, and the dirt is never silent (a dirty break
+        // always rides `DrainOverrun`/`FactLimit` on this batch,
+        // and `finalize_until` appends `IntervalUnknown`).
+        // Terminal accounting is account-or-signal: clean drains
+        // consume, dirty drains signal.
+        if drained_clean {
+            self.poll_loss_lanes(&mut b);
+        } else {
+            self.peek_loss_lanes(&mut b);
+        }
         for pid in terminal {
             // R4-4: a deferred startup retire keeps rows and
             // aliases alike for the retry.

@@ -387,15 +387,13 @@ fn attributed_downgraded(batch: &po::ObservationBatch) -> (usize, usize) {
     (attributed, downgraded)
 }
 
-#[test]
-#[ignore = "live lane only (TRACE_LIVE_SMOKE=1 + root + fresh object)"]
-fn fix5_f3d_queued_drain_loss_downgrades_drain_batch() {
+fn flood_queued(tag: &str) -> Option<Flooded> {
     let object = match gated() {
         Some(object) => object,
-        None => return,
+        None => return None,
     };
     let scratch = ScratchDir(
-        std::env::temp_dir().join(format!("osslscope-trace-f3d-{}", std::process::id())),
+        std::env::temp_dir().join(format!("osslscope-trace-{tag}-{}", std::process::id())),
     );
     let _ = fs::remove_dir_all(&scratch.0);
     fs::create_dir(&scratch.0).unwrap();
@@ -451,6 +449,37 @@ fn fix5_f3d_queued_drain_loss_downgrades_drain_batch() {
             "flood batch {n}"
         );
     }
+    Some(Flooded {
+        _scratch: scratch,
+        child,
+        scanner,
+        session,
+    })
+}
+
+/// Flooded-but-undrained live session (fix5 F3d / fix6 dirty-drain
+/// share this prefix): real attach, 40 x 60 fetch+digest ops with
+/// NO drain, so the ring holds queued survivors under a LOSS_RING
+/// overrun by capacity arithmetic.
+struct Flooded {
+    _scratch: ScratchDir,
+    child: Owned,
+    scanner: ScopedScanner,
+    session: po::ProviderSession,
+}
+
+#[test]
+#[ignore = "live lane only (TRACE_LIVE_SMOKE=1 + root + fresh object)"]
+fn fix5_f3d_queued_drain_loss_downgrades_drain_batch() {
+    let Some(flooded) = flood_queued("f3d") else {
+        return;
+    };
+    let Flooded {
+        _scratch,
+        mut child,
+        mut scanner,
+        mut session,
+    } = flooded;
     // Reconcile with an empty carry (no retire ran — the child is
     // alive): the queued records stay queued for drain.
     let reconciled = session.reconcile(&scanner.snapshot());
@@ -488,6 +517,72 @@ fn fix5_f3d_queued_drain_loss_downgrades_drain_batch() {
     assert_eq!(
         downgraded, attributed,
         "every queued attribution overlapping loss downgrades"
+    );
+    child.0.stdin.as_mut().unwrap().write_all(b"X").unwrap();
+    drop(child.0.stdin.take());
+    assert!(child.0.wait().unwrap().success());
+    let _ = session.close();
+}
+
+#[test]
+#[ignore = "live lane only (TRACE_LIVE_SMOKE=1 + root + fresh object)"]
+fn fix6_dirty_drain_does_not_steal_loss_from_queued_records() {
+    // fix6 (R6-3): LOSS delta + complete sequences queued → drain
+    // with an EXPIRED deadline (consumes nothing — dirty) → the
+    // next drain consumes the survivors WITH the delta (downgraded
+    // + gap). On current code the dirty drain advances the LOSS
+    // baseline over records it never consumed, so the survivors
+    // publish INTACT (RED).
+    let Some(flooded) = flood_queued("f3dirty") else {
+        return;
+    };
+    let Flooded {
+        _scratch,
+        mut child,
+        scanner: _,
+        mut session,
+    } = flooded;
+    // Expired deadline: the ring loop breaks before consuming
+    // anything (dirty — DrainOverrun rides this batch).
+    let dirty = session.drain(Instant::now());
+    eprintln!(
+        "f3dirty: dirty_facts={} dirty_gaps={:?}",
+        dirty.facts.len(),
+        dirty.gaps
+    );
+    assert!(
+        dirty.facts.is_empty(),
+        "premise: expired drain consumes nothing: {} facts",
+        dirty.facts.len()
+    );
+    assert!(
+        dirty.gaps.contains(&po::ObservationGap::DrainOverrun),
+        "premise: expired drain signals dirty: {:?}",
+        dirty.gaps
+    );
+    // The next drain consumes the queued survivors: the batch
+    // overlaps the overrun, so every attribution in it downgrades
+    // + the lane gap rides WITH the affected content.
+    let drained = session.drain(Instant::now() + Duration::from_secs(30));
+    eprintln!(
+        "f3dirty: drain_facts={} drain_gaps={:?}",
+        drained.facts.len(),
+        drained.gaps
+    );
+    assert!(
+        drained.gaps.contains(&po::ObservationGap::QueueLoss),
+        "survivors must carry the overlapping lane gap: {:?}",
+        drained.gaps
+    );
+    let (attributed, downgraded) = attributed_downgraded(&drained);
+    assert!(
+        attributed >= 1,
+        "premise: queued survivors must attribute: facts={}",
+        drained.facts.len()
+    );
+    assert_eq!(
+        downgraded, attributed,
+        "every queued survivor overlapping loss downgrades"
     );
     child.0.stdin.as_mut().unwrap().write_all(b"X").unwrap();
     drop(child.0.stdin.take());
