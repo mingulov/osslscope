@@ -206,12 +206,32 @@ fn loss(n: u32) {
 }
 #[inline(always)]
 fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
+    identity_inner(cookie, true)
+}
+/// fix7 (R7-3): closed-window probe — `Some` IFF the identity
+/// resolves fully EXCEPT the operational window is closed. The
+/// window arm is the ONLY rejection that keeps the call on this
+/// row (every other arm — CONFIG/ns/task/tgid/member/
+/// generation — means a different task or row and must not touch
+/// it). Non-operational APIs never resolve here (their identity
+/// has no window arm, so a failed `identity()` fails here too).
+/// Never fires loss (the failed `identity()` already did, if the
+/// task query failed). The window never reopens (programmed once
+/// per capture), so a call rejected here stays rejected.
+#[inline(always)]
+fn identity_closed_window(cookie: u64) -> Option<(Config, ThreadKey)> {
+    identity_inner(cookie, false)
+}
+#[inline(always)]
+fn identity_inner(cookie: u64, enforce_window: bool) -> Option<(Config, ThreadKey)> {
     let cfg = unsafe { *CONFIG.get(&cookie)? };
     let ns = NAMESPACE.get(0)?;
     let mut ids = bpf_pidns_info { pid: 0, tgid: 0 };
     let rv = unsafe { helpers::bpf_get_ns_current_pid_tgid(ns.device, ns.inode, &mut ids, 8) };
     if rv != 0 {
-        loss(LOSS_NAMESPACE);
+        if enforce_window {
+            loss(LOSS_NAMESPACE);
+        }
         return None;
     }
     if ids.tgid != cfg.pid {
@@ -221,7 +241,11 @@ fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
     if operational_api(cfg.api) {
         let window = API_WINDOW.get(0)?;
         let now = unsafe { helpers::bpf_ktime_get_ns() };
-        if now < window.start || now >= window.end {
+        let closed = now < window.start || now >= window.end;
+        if enforce_window && closed {
+            return None;
+        }
+        if !enforce_window && !closed {
             return None;
         }
     }
@@ -236,6 +260,28 @@ fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
             generation: cfg.generation,
         },
     ))
+}
+/// fix7 (R7-3): arm one blind tombstone for a closed-window
+/// entry (out-of-line: the entry frame is stack-pressured and
+/// this runs only on the cold reject path). The executing call
+/// owns no frame and no marker — but its return WILL execute
+/// (and reject), and must then consume exactly this tombstone
+/// rather than stealing an outer overflow marker. No row ⟹ no
+/// arm (a balanced no-op: the return will find no row — or a
+/// fresh one with no units — and likewise consume nothing).
+#[inline(never)]
+#[no_mangle]
+pub fn blind_arm_entry(cookie: u64) {
+    let Some((_, key)) = identity_closed_window(cookie) else {
+        return;
+    };
+    let Some(mut thread) = (unsafe { THREADS.get(&key).copied() }) else {
+        return;
+    };
+    thread.blind_entry();
+    if THREADS.insert(key, thread, 0).is_err() {
+        loss(LOSS_MAP);
+    }
 }
 // Explicit output avoids aggregate-return ABI and keeps construction spills
 // out of the query frame on kernels with a combined 512-byte stack limit.
@@ -366,6 +412,10 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     }
     let cookie = unsafe { helpers::bpf_get_attach_cookie(ctx.as_ptr()) };
     let Some((cfg, key)) = identity(cookie) else {
+        // fix7 (R7-3): a closed-window entry arms its blind
+        // tombstone (no-op for every other rejection arm); the
+        // call still executes unobserved.
+        blind_arm_entry(cookie);
         return 0;
     };
     // fix4: single stamp per program, threaded to every emission site.
@@ -388,10 +438,12 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     // seed. Otherwise the row is born `{ seed: s, next: 0, ... }`:
     // invocations restart at 1 per row BY DESIGN (scoped by the
     // seed — the fix5 "never restarts" claim INVERTS). `depth`/
-    // `overflow` keep resetting: the old incarnation's nesting died
-    // with its row, and depth overflow reports LOSS_DEPTH at enter
-    // time (the None arm below) rather than inheriting a stale
-    // counter.
+    // `overflow`/`blind` keep resetting: the old incarnation's
+    // nesting died with its row (outstanding blind tombstones die
+    // with it too — their returns find a fresh row with no units
+    // and consume nothing, a balanced no-op), and depth overflow
+    // reports LOSS_DEPTH at enter time (the None arm below) rather
+    // than inheriting a stale counter.
     let mut thread = match unsafe { THREADS.get(&key).copied() } {
         Some(thread) => thread,
         None => {
@@ -405,6 +457,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
                 next: 0,
                 depth: 0,
                 overflow: 0,
+                blind: 0,
             }
         }
     };
@@ -970,6 +1023,20 @@ pub fn pop_return(
     out_seed: &mut u64,
 ) -> bool {
     let Some((_, key)) = identity(cookie) else {
+        // fix7 (R7-3): bookkeeping/emission separation — a return
+        // rejected by the OPERATIONAL WINDOW still consumes its
+        // OWN marker (own blind tombstone first, else its overflow
+        // marker — T==0 at a rejected return proves marker
+        // ownership under the never-reopen window), marker only,
+        // NEVER a pop. Every other rejection arm cannot attribute
+        // (different task/row): consume nothing, as before.
+        if let Some((_, key)) = identity_closed_window(cookie) {
+            if let Some(mut thread) = unsafe { THREADS.get(&key).copied() } {
+                if thread.blind_return() && THREADS.insert(key, thread, 0).is_err() {
+                    loss(LOSS_MAP);
+                }
+            }
+        }
         return false;
     };
     // fix6 (R6-4 return-miss audit): userspace numeric cleanup may

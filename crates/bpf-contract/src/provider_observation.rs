@@ -149,6 +149,35 @@ pub struct Thread {
     /// `failed_entry` never touch it). `API_THREADS` rows carry a
     /// vestigial 0 (their `next` is write-only — never emitted).
     pub seed: u64,
+    /// Window-blind entries outstanding (fix7, R7-3): calls whose
+    /// ENTRY was rejected by the operational window (resolved
+    /// identity, closed window — the call executes unobserved)
+    /// and whose returns will execute-but-reject. Each such entry
+    /// arms exactly one tombstone (`blind_entry`); window-rejected
+    /// returns consume T-first (`blind_return`). ACCEPTED returns
+    /// never touch this counter (their skip reads `overflow`
+    /// only), so blind tombstones can never hijack a framed
+    /// return the way a bare overflow unit does.
+    ///
+    /// WHY a separate counter rather than the naive "rejected
+    /// returns consume overflow": a window-rejected return either
+    /// OWNS an overflow marker (its entry was accepted, then
+    /// overflowed — the R7-3 shape — and must consume) or OWNS
+    /// NOTHING (its entry was window-rejected — and must not
+    /// consume, else it steals a same-cookie overflow owner's
+    /// marker and shifts the cascade the other way). Entry-time
+    /// window state is lost by return time, so the entry records
+    /// it here. SOUND under the never-reopen window (programmed
+    /// once per capture): tombstone-first attribution is then
+    /// EXACT — at a marker-owner's rejected return T==0 always
+    /// (T>0 would need a closed-entry before its open-entry ⟹
+    /// reopen), so it consumes its own overflow unit; at a
+    /// nothing-owner's rejected return T>=1 (its own), so outer
+    /// markers survive. Past the precondition (mixed T+O) counts
+    /// still balance fungibly (pinned below).
+    /// `API_THREADS` rows carry a vestigial 0 (blind is armed
+    /// only on the shared trace machine's closed-window entries).
+    pub blind: u32,
 }
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -211,8 +240,57 @@ impl Thread {
         self.depth = self.depth.saturating_sub(1);
         self.overflow = self.overflow.saturating_add(1);
     }
+    /// Cross-edge skip, ACCEPTED returns only: consume one
+    /// overflow marker armed by an earlier overflowed (or
+    /// entry-failed) call on this thread. Counter-only, no depth
+    /// change, no frame pop — the matching entry pushed no frame,
+    /// so the return emits nothing. Never touches `blind` (blind
+    /// tombstones belong to window-rejected calls and are consumed
+    /// only by window-rejected returns — accepted returns must not
+    /// hijack them, and tombstones must not hijack framed
+    /// returns).
+    ///
+    /// fix7 (R7-3) follow-on to the documented cross-edge skip: a
+    /// return REJECTED by the operational window used to consume
+    /// nothing, orphaning its overflow marker for the next
+    /// accepted return — which consumed it WITHOUT popping its
+    /// own frame, so the FOLLOWING same-cookie return popped the
+    /// wrong frame (frame-shift + cascade, up to 7 mislabeled
+    /// RESULTs). Rejected returns now consume T-first-then-O via
+    /// `blind_return` (marker only, never a pop); accepted
+    /// behavior here is unchanged.
     pub fn skip_return(&mut self) -> bool {
         if self.overflow != 0 {
+            self.overflow -= 1;
+            true
+        } else {
+            false
+        }
+    }
+    /// Arm one window-blind tombstone: the ENTRY was rejected by
+    /// the operational window (resolved identity, closed window),
+    /// so the executing call owns no frame and no overflow marker
+    /// — but its return WILL execute (and reject), and must then
+    /// consume exactly this tombstone rather than stealing an
+    /// outer overflow marker. Saturating (2^32 nested blind calls
+    /// is unreachable — bounded by thread stack depth).
+    pub fn blind_entry(&mut self) {
+        self.blind = self.blind.saturating_add(1);
+    }
+    /// Consume one unit for a WINDOW-REJECTED return (resolved
+    /// identity, closed window): its own blind tombstone first,
+    /// else one overflow marker (under the never-reopen window,
+    /// T==0 at a rejected return proves marker ownership — see
+    /// `blind`). Marker only — NEVER a pop (a rejected return has
+    /// no addressable frame; popping would steal same-cookie
+    /// frames). Returns whether a unit was consumed. Rejections
+    /// that cannot attribute (tgid/generation/CONFIG mismatch —
+    /// a different row) must NOT call this.
+    pub fn blind_return(&mut self) -> bool {
+        if self.blind != 0 {
+            self.blind -= 1;
+            true
+        } else if self.overflow != 0 {
             self.overflow -= 1;
             true
         } else {
@@ -515,6 +593,7 @@ mod tests {
             next: u64::MAX,
             depth: 0,
             overflow: 0,
+            blind: 0,
         };
         assert_eq!(
             enter_none_disposition(fresh_max.next),
@@ -526,6 +605,7 @@ mod tests {
             next: u64::MAX,
             depth: 2,
             overflow: 0,
+            blind: 0,
         };
         assert_eq!(
             enter_none_disposition(old_max.next),
@@ -537,6 +617,7 @@ mod tests {
             next: 41,
             depth: MAX_DEPTH,
             overflow: 1,
+            blind: 0,
         };
         assert_eq!(
             enter_none_disposition(overflow.next),
@@ -548,6 +629,7 @@ mod tests {
             next: 41,
             depth: 1,
             overflow: 0,
+            blind: 0,
         };
         assert_eq!(
             enter_none_disposition(normal.next),
@@ -560,15 +642,262 @@ mod tests {
         );
     }
 
+    /// fix7 F3: host model of the BPF return-path bookkeeping —
+    /// a fixed frame stack (the depth-indexed PENDING analog)
+    /// driven ONLY through production `Thread` methods, so the
+    /// regression pins below go RED if the production rule is
+    /// neutered. Single-cookie (the shift needs same-cookie
+    /// frames); blind/tombstone calls never pop, so their cookie
+    /// is irrelevant to the model.
+    struct Fix7Model {
+        thread: Thread,
+        frames: [u64; MAX_DEPTH as usize],
+        emitted: [(u64, u64); MAX_DEPTH as usize],
+        emitted_len: usize,
+    }
+    impl Fix7Model {
+        fn new() -> Self {
+            Self {
+                thread: Thread::default(),
+                frames: [0; MAX_DEPTH as usize],
+                emitted: [(0, 0); MAX_DEPTH as usize],
+                emitted_len: 0,
+            }
+        }
+        /// Frame an entry (production `enter` + PENDING push at
+        /// the pre-increment depth).
+        fn frame(&mut self) -> u64 {
+            let slot = self.thread.depth as usize;
+            let inv = self.thread.enter().expect("framed entry");
+            self.frames[slot] = inv;
+            inv
+        }
+        /// Overflow an entry (production `enter` → None: no frame).
+        fn overflow(&mut self) {
+            assert_eq!(self.thread.enter(), None);
+        }
+        /// Window-rejected entry (production `blind_entry`).
+        fn blind_enter(&mut self) {
+            self.thread.blind_entry();
+        }
+        /// Window-rejected return (production `blind_return` —
+        /// marker only, never a pop, never an emission).
+        /// Returns whether a unit was consumed.
+        fn reject(&mut self) -> bool {
+            self.thread.blind_return()
+        }
+        /// Accepted return that MUST skip (overflow owner): pins
+        /// skip-true + depth unchanged + no emission.
+        fn accept_skip(&mut self) {
+            let depth = self.thread.depth;
+            assert!(self.thread.skip_return(), "overflow owner must skip");
+            assert_eq!(self.thread.depth, depth);
+        }
+        /// Accepted return of invocation `rv` that MUST pop its
+        /// frame; records the (frame, rv) emission.
+        fn accept_pop(&mut self, rv: u64) {
+            assert!(
+                !self.thread.skip_return(),
+                "framed return of {rv} must not skip"
+            );
+            assert!(self.thread.depth > 0);
+            self.thread.depth -= 1;
+            let frame = self.frames[self.thread.depth as usize];
+            self.emitted[self.emitted_len] = (frame, rv);
+            self.emitted_len += 1;
+        }
+        /// Every emission paired its own frame with its own rv.
+        fn assert_aligned(&self) {
+            for (i, &(frame, rv)) in self.emitted[..self.emitted_len].iter().enumerate() {
+                assert_eq!(frame, rv, "emission {i} mislabeled");
+            }
+        }
+    }
     #[test]
-    fn thread_value_is_24_with_seed_at_16() {
+    fn fix7_blind_return_resyncs_r73_cascade() {
+        // fix7 F3 regression (R7-3): the R7-3 schedule — 8
+        // same-cookie framed calls, a nested overflow, the
+        // overflow owner's return window-rejected — resyncs ALL 7
+        // cascade levels (not 1): the rejected return consumes its
+        // own marker, then every framed return pops its own frame
+        // with its own rv. (RED pre-fix: 7 mislabels under the
+        // consume-nothing rule — quoted in the fix7 report.)
+        let mut m = Fix7Model::new();
+        let mut invs = [0u64; 8];
+        for slot in invs.iter_mut() {
+            *slot = m.frame();
+        }
+        assert_eq!(invs, [1, 2, 3, 4, 5, 6, 7, 8]);
+        m.overflow();
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (8, 1, 0)
+        );
+        assert!(m.reject(), "marker-owner's rejected return consumes");
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 0));
+        for rv in invs.iter().rev() {
+            m.accept_pop(*rv);
+        }
+        assert_eq!(m.emitted_len, 8);
+        m.assert_aligned();
+        assert_eq!(
+            m.emitted,
+            [
+                (8, 8),
+                (7, 7),
+                (6, 6),
+                (5, 5),
+                (4, 4),
+                (3, 3),
+                (2, 2),
+                (1, 1)
+            ]
+        );
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 0, 0)
+        );
+    }
+    #[test]
+    fn fix7_blind_entry_keeps_entry_rejected_returns_from_stealing() {
+        // fix7 F3 regression (R7-3 soundness): the mirror shape an
+        // unconditional consume-on-reject would BREAK — a
+        // same-cookie overflow owner X with a window-rejected
+        // operational call E nested inside it. E's return consumes
+        // its OWN tombstone (outer marker survives); X's accepted
+        // return then skips its own marker; frames pop own. Every
+        // return consumes exactly its owned unit.
+        let mut m = Fix7Model::new();
+        for _ in 0..8 {
+            m.frame();
+        }
+        m.overflow();
+        m.blind_enter();
+        assert_eq!((m.thread.overflow, m.thread.blind), (1, 1));
+        assert!(m.reject(), "nothing-owner consumes its tombstone");
+        assert_eq!(
+            (m.thread.overflow, m.thread.blind),
+            (1, 0),
+            "the outer marker must survive E's return"
+        );
+        m.accept_skip();
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 0));
+        for rv in (1..=8u64).rev() {
+            m.accept_pop(rv);
+        }
+        m.assert_aligned();
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 0, 0)
+        );
+    }
+    #[test]
+    fn fix7_normal_overflow_skip_unchanged() {
+        // fix7 F3 no-change pin (R7-3): plain overflow with NO
+        // rejection behaves exactly as before — the overflow
+        // owner's accepted return skips, framed returns pop own,
+        // `blind` stays 0 throughout (never armed, never read).
+        let mut m = Fix7Model::new();
+        for _ in 0..8 {
+            m.frame();
+        }
+        m.overflow();
+        assert_eq!(m.thread.blind, 0);
+        m.accept_skip();
+        assert_eq!(m.thread.blind, 0);
+        for rv in (1..=8u64).rev() {
+            m.accept_pop(rv);
+        }
+        m.assert_aligned();
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 0, 0)
+        );
+    }
+    #[test]
+    fn fix7_same_cookie_nesting_unchanged() {
+        // fix7 F3 no-change pin (R7-3): 8-deep same-cookie nesting
+        // with no overflow and no rejection — strict LIFO pops,
+        // `blind` never armed.
+        let mut m = Fix7Model::new();
+        for _ in 0..8 {
+            m.frame();
+        }
+        assert_eq!(m.thread.blind, 0);
+        for rv in (1..=8u64).rev() {
+            m.accept_pop(rv);
+        }
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 0, 0)
+        );
+    }
+    #[test]
+    fn fix7_mixed_tombstone_and_marker_balances_fungibly() {
+        // fix7 F3 defense-in-depth (R7-3): T-outer/O-inner is
+        // UNREACHABLE under the never-reopen window (it would need
+        // a closed-entry before an open-entry), but even there
+        // counts balance: the inner marker-owner's rejected return
+        // takes the tombstone, the outer nothing-owner's takes the
+        // marker — two rejected returns, two units, frames pop own.
+        let mut m = Fix7Model::new();
+        for _ in 0..8 {
+            m.frame();
+        }
+        m.blind_enter();
+        m.overflow();
+        assert_eq!((m.thread.overflow, m.thread.blind), (1, 1));
+        assert!(m.reject());
+        assert!(m.reject());
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 0));
+        for rv in (1..=8u64).rev() {
+            m.accept_pop(rv);
+        }
+        m.assert_aligned();
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 0, 0)
+        );
+    }
+    #[test]
+    fn fix7_blind_counter_units() {
+        // fix7 F3 unit pins (R7-3): empty reject consumes nothing;
+        // skip ignores blind; tombstones nest; saturation holds.
+        let mut t = Thread::default();
+        assert!(!t.blind_return());
+        assert_eq!((t.overflow, t.blind), (0, 0));
+        t.blind_entry();
+        t.blind_entry();
+        for _ in 0..8 {
+            assert!(t.enter().is_some());
+        }
+        assert_eq!(t.enter(), None);
+        assert_eq!((t.overflow, t.blind), (1, 2));
+        assert!(t.skip_return(), "accepted skip reads overflow only");
+        assert_eq!((t.overflow, t.blind), (0, 2));
+        assert!(t.blind_return());
+        assert_eq!((t.overflow, t.blind), (0, 1));
+        assert!(t.blind_return());
+        assert_eq!((t.overflow, t.blind), (0, 0));
+        assert!(!t.blind_return());
+        t.blind = u32::MAX;
+        t.blind_entry();
+        assert_eq!(t.blind, u32::MAX, "tombstones saturate, never wrap");
+    }
+    #[test]
+    fn thread_value_is_32_with_blind_at_24() {
         // fix6 (R6-1): THREADS/API_THREADS value 16→24 B, seed
-        // APPENDED (existing field offsets unchanged). The loader
-        // `specs()` mirrors these sizes exactly.
-        assert_eq!(core::mem::size_of::<Thread>(), 24);
+        // APPENDED (existing field offsets unchanged). fix7 (R7-3):
+        // 24→32 B, blind APPENDED after seed (all existing offsets
+        // unchanged). The loader `specs()` mirrors these sizes
+        // exactly.
+        assert_eq!(core::mem::size_of::<Thread>(), 32);
         assert_eq!(core::mem::offset_of!(Thread, next), 0);
         assert_eq!(core::mem::offset_of!(Thread, depth), 8);
         assert_eq!(core::mem::offset_of!(Thread, overflow), 12);
         assert_eq!(core::mem::offset_of!(Thread, seed), 16);
+        assert_eq!(core::mem::offset_of!(Thread, blind), 24);
     }
 }
