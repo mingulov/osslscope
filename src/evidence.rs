@@ -2321,11 +2321,11 @@ mod bounded_projection_tests {
     #[test]
     fn fix8_f1_incomplete_recycled_projects_unknown() {
         // fix8 F1 (R8-1) shape (b): complete F1(A) + missing-END
-        // recycled F2 (assembly `other()` = u16::MAX, filtered to
-        // unknown at interning) with a consumed delta. The batch
-        // carries IntervalUnknown but projection gating
-        // (`batch_invalidates_advertisements`) does not reject on
-        // it — so namespacing (not gating) must keep F2 off A's
+        // recycled F2, forged at the projection boundary as assembly
+        // `other()` (= u16::MAX, filtered to unknown at interning).
+        // Upstream the batch carries IntervalUnknown, which projection
+        // gating (`batch_invalidates_advertisements`) does not reject
+        // on — so namespacing (not gating) must keep F2 off A's
         // label. RED pre-fix: F2 shares F1's ID, projects A.
         let f1 = learned_id(5, 100);
         let f2 = learned_id(6, 200);

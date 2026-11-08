@@ -349,20 +349,24 @@ impl Thread {
 
 /// `enter()`-None arm disposition (fix6, R6-4 backstop): what the
 /// BPF entry path does with the row when `enter()` refuses.
+/// fix8 (R8-2): non-MAX Nones slot a positional overflow marker
+/// first and (re)insert the row only on marker refusal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EnterNoneDisposition {
     /// Delete the row (a `next == MAX` row would wedge every
     /// later entry — returns clear only `overflow`).
     Delete,
-    /// (Re)insert the row (depth-overflow Nones need their
-    /// overflow to arm `skip_return` pairing).
+    /// Slot an overflow marker, else (re)insert the row
+    /// (marker-refused Nones need their overflow to arm
+    /// `skip_return` pairing).
     Insert,
 }
 
 /// Pure disposition for the `enter()`-None arm: delete iff
 /// `next == MAX`. Distinguished by the counter value, NOT by
 /// row freshness (a fresh MAX row and a pre-existing MAX row
-/// both delete; depth-overflow and normal rows both insert).
+/// both delete; depth-overflow and normal rows both take the
+/// marker-first arm, inserting only on marker refusal).
 /// BPF-safe (`const`, no allocation) and host-unit-tested.
 pub const fn enter_none_disposition(next: u64) -> EnterNoneDisposition {
     if next == u64::MAX {
@@ -1235,7 +1239,11 @@ mod tests {
         // X's O-marker inner at one level. X returns first (LIFO
         // execution) — accepted AND rejected variants — and must
         // pop its own O without touching E's lateral T; E then pops
-        // its own T.
+        // its own T. (E-then-X placement is reverse-temporal under
+        // the global never-reopening window — E-blind means post-end,
+        // X-open means inside, so X's entry came first — pinned here
+        // as lateral-isolation characterization, not a realizable
+        // schedule.)
         const A: u64 = 0xA11CE;
         const X: u64 = 0xB00B;
         const E: u64 = 0xC10C;
