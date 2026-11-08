@@ -437,7 +437,19 @@ impl TraceProducer {
             outcome: 0,
         });
         self.touch_scope(&edge.key);
-        if let Some(held) = self.pending_results.remove(&edge.key) {
+        // F4: a held RESULT pairs only in its arrival window
+        // (frozen §6D-6 is forward-only: the RESULT lands in the
+        // ATTEMPT's SAME or NEXT window — same-window inversion
+        // still pairs, cross-window reverse carry never does).
+        let held_same_window = self
+            .pending_results
+            .get(&edge.key)
+            .is_some_and(|held| held.window == self.window);
+        if held_same_window {
+            let held = self
+                .pending_results
+                .remove(&edge.key)
+                .expect("held RESULT just observed");
             self.pair(
                 edge.key,
                 edge.api,
@@ -445,6 +457,25 @@ impl TraceProducer {
                 held.monotonic_ns,
                 held.outcome,
             );
+        } else if self.pending_results.contains_key(&edge.key) {
+            // Cross-window held RESULT: the key is unconsumed, so
+            // live-state precedence skips the high-water — the
+            // newcomer goes pending (pending-then-correct), or is
+            // the anomaly when an ATTEMPT is already live.
+            if self.pending_attempts.contains_key(&edge.key) {
+                self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+                self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+            } else {
+                self.pending_attempts.insert(
+                    edge.key,
+                    PendingEdge {
+                        window: self.window,
+                        api: edge.api,
+                        monotonic_ns: edge.monotonic_ns,
+                        outcome: 0,
+                    },
+                );
+            }
         } else if self.pending_attempts.contains_key(&edge.key) {
             // Duplicate ATTEMPT on a live key (BPF never emits this):
             // the newcomer is the anomaly — conserve it as unpaired
@@ -964,6 +995,47 @@ mod tests {
         let w1 = p.close_window(1, 3000, [0; 8]);
         assert_eq!(w1.paired, 1);
         assert_eq!((w1.unpaired_entries, w1.unpaired_results), (0, 0));
+    }
+
+    #[test]
+    fn reverse_carry_never_pairs() {
+        // F4 (codex R1-4): R(N) → close → A(N+1) must NOT pair
+        // (frozen §6D-6: the RESULT lands in the ATTEMPT's SAME
+        // or NEXT window — forward only). R expires unpaired; A
+        // goes pending, then pairs with a fresh RESULT
+        // (pending-then-correct); conservation stays exact.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.result(result(k, 20, 1000, 1));
+        p.close_window(0, 1500, [0; 8]);
+        p.attempt(attempt(k, 20, 2000));
+        let w1 = p.close_window(1, 2500, [0; 8]);
+        assert_eq!(w1.paired, 0);
+        assert_eq!(w1.unpaired_results, 1);
+        assert_eq!(w1.unpaired_entries, 0);
+        p.result(result(k, 20, 3000, 1));
+        p.finalize(3500);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (0, 1));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn same_window_inversion_still_pairs() {
+        // F4: same-window R-then-A arrival inversion keeps
+        // pairing (only the cross-window reverse carry is
+        // forbidden).
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.result(result(k, 20, 1500, 1));
+        p.attempt(attempt(k, 20, 1000));
+        let w = p.close_window(0, 2000, [0; 8]);
+        assert_eq!(w.paired, 1);
+        assert_eq!((w.unpaired_entries, w.unpaired_results), (0, 0));
     }
 
     #[test]
