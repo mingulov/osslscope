@@ -17786,7 +17786,6 @@ impl ProviderSession {
 #[cfg(test)]
 mod fix7_receipt_soak {
     use super::*;
-    use crate::capture::ClockPort as _;
     use std::sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
