@@ -281,8 +281,8 @@ class CurrentPackage(unittest.TestCase):
 
 #: Frozen D-record §1.4 unit bytes (mirrors the Rust freeze test in
 #: tests/service_packaging.rs — both must change only via a §1.4
-#: amendment; wave 3 added exit 2 to the prevention list, amendment
-#: pending). Module-level so the constant is importable.
+#: amendment; wave 3 added exit 2 to the prevention list, ratified
+#: by §1.4 Amendment A2). Module-level so the constant is importable.
 FROZEN_UNIT = (
     "# D-record §1.4 frozen — changes need a §1.4 amendment (+ minor bump).\n"
     "[Unit]\n"
@@ -296,6 +296,11 @@ FROZEN_UNIT = (
     "ExecReload=/bin/kill -HUP $MAINPID\n"
     "Restart=on-failure\n"
     "RestartSec=5\n"
+    "# +exit 2 to RestartPreventExitStatus: §1.4 Amendment A2\n"
+    "# (ratified) — stock config selects no targets → service refuses\n"
+    "# with exit 2 → without prevention the unit restart-loops 5×/300s\n"
+    "# then fails; exit 2 is config-refused (never a crash), so holding\n"
+    "# the unit stopped is correct.\n"
     "RestartPreventExitStatus=2 4\n"
     "StateDirectory=osslscope\n"
     "# +CAP_SYS_PTRACE: §1.4 grants it iff foreign-uid targets are\n"

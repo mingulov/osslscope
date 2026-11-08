@@ -10,6 +10,11 @@ ExecStart=/usr/bin/osslscope service --config /etc/osslscope/service.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+# +exit 2 to RestartPreventExitStatus: §1.4 Amendment A2
+# (ratified) — stock config selects no targets → service refuses
+# with exit 2 → without prevention the unit restart-loops 5×/300s
+# then fails; exit 2 is config-refused (never a crash), so holding
+# the unit stopped is correct.
 RestartPreventExitStatus=2 4
 StateDirectory=osslscope
 # +CAP_SYS_PTRACE: §1.4 grants it iff foreign-uid targets are

@@ -165,7 +165,9 @@ reset-failed osslscope-service` first).
 
 Policy reloads go through `systemctl reload` (SIGHUP at the next
 window boundary). `Restart=on-failure` restarts abnormal deaths
-after 5 s; exit 2 (config refused) and exit 4 (scope unavailable —
+after 5 s; exit 2 (config refused) (§1.4 Amendment A2: the stock
+config refuses with exit 2, so prevention holds the unit stopped
+instead of restart-looping) and exit 4 (scope unavailable —
 nothing finalized, operator needed) hold the unit stopped without
 restarting, as does the start-rate backstop (5 starts per 300 s).
 Removing the package stops the unit and keeps both the conffile
