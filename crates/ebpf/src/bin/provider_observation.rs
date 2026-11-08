@@ -57,6 +57,48 @@ static TRACE_MODE: Array<u32> = Array::with_max_entries(1, 0);
 static API_TOTALS: PerCpuHashMap<u64, ApiAggregate> = PerCpuHashMap::with_max_entries(1024, 0);
 #[map]
 static API_THREADS: HashMap<ApiThreadKey, Thread> = HashMap::with_max_entries(4096, 0);
+// fix5 (R5-2): process-global invocation seed. THREADS-miss seeds `next`
+// from a fetch-add here (stride 1) instead of 0, so a recycled tid never
+// restarts at 1 inside its own stamp. BPF-internal; the host never reads
+// or writes this map (it appears in the loader spec only so the object
+// shape stays exact).
+#[map]
+static INV_SEQ: Array<u64> = Array::with_max_entries(1, 0);
+// fix5 (R5-2): fetch the next global seed. Returns the PRE-add value;
+// `Thread::enter` adds 1, so the first-ever creation still yields
+// invocation 1 and every later creation is strictly greater (monotonic
+// within a tid: no reuse, all recycle orders safe, no userspace
+// coordination). Implemented as a bounded CAS loop (the same
+// `atomic_cxchg` pattern `source_state::claim_pending` already ships):
+// a single-instruction fetch-add (`atomic_xadd` → XADD-with-fetch) is
+// not expressible at the pinned `--cpu generic` (LLVM rejects use of
+// the XADD return value), while cmpxchg on a 1-elem array value is
+// already proven in this object. Each successful CAS hands out a
+// unique seed, so issuance is strictly monotonic. Exhaustion (8
+// consecutive races) or a saturated counter returns u64::MAX, which
+// `enter` refuses (LOSS_DEPTH) — fail-closed, never a reused
+// invocation. Wraparound past MAX is impossible: the CAS never
+// advances a saturated counter.
+#[inline(always)]
+fn seed_next() -> u64 {
+    use core::intrinsics::{atomic_cxchg, AtomicOrdering::SeqCst};
+    let Some(cell) = INV_SEQ.get_ptr_mut(0) else {
+        return u64::MAX;
+    };
+    let mut current = unsafe { atomic_cxchg::<u64, { SeqCst }, { SeqCst }>(cell, 0, 0).0 };
+    for _ in 0..8 {
+        if current == u64::MAX {
+            return u64::MAX;
+        }
+        let (observed, claimed) =
+            unsafe { atomic_cxchg::<u64, { SeqCst }, { SeqCst }>(cell, current, current + 1) };
+        if claimed {
+            return current;
+        }
+        current = observed;
+    }
+    u64::MAX
+}
 #[inline(always)]
 fn api_increment(pointer: *mut u64) {
     // This non-preemptible program owns its CPU cell; no ring or raw operands.
@@ -331,7 +373,18 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         }
         // Edge-bearing: fall through to the shared Pending/emit path (D0-2/D0-3).
     }
-    let mut thread = unsafe { THREADS.get(&key).copied() }.unwrap_or_default();
+    // fix5 (R5-2): seed ONLY `next` on creation. `depth`/`overflow`
+    // keep resetting: the old incarnation's nesting died with its row,
+    // and depth overflow reports LOSS_DEPTH at enter time (the None arm
+    // below) rather than inheriting a stale counter.
+    let mut thread = match unsafe { THREADS.get(&key).copied() } {
+        Some(thread) => thread,
+        None => Thread {
+            next: seed_next(),
+            depth: 0,
+            overflow: 0,
+        },
+    };
     let old_depth = thread.depth;
     let Some(invocation) = thread.enter() else {
         if THREADS.insert(key, thread, 0).is_err() {

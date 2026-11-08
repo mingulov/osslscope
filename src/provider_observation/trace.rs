@@ -476,8 +476,10 @@ struct EpochKey {
 /// `pid`, `tid`, `generation` — the key `invocation` counts
 /// under), qualified by the retire epoch (HW is per-epoch,
 /// dropped at bump — fix3) AND the task incarnation (HW is
-/// per-incarnation — fix4: a recycled tid's continuing or
-/// restarting invocation counter never aliases the old one).
+/// per-incarnation — fix4: a recycled tid's invocation counter
+/// never aliases the old one; fix5: BPF row creation seeds from
+/// a global fetch-add, so counters never restart at all and
+/// per-incarnation HW stands as defense in depth).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ScopeKey {
     /// Executing pid.
@@ -976,9 +978,12 @@ impl TraceProducer {
     /// edge would otherwise mispair through live-state
     /// precedence), and the HW shield extends past the expired
     /// holds (current epoch only — stale-epoch HW is dead), so
-    /// recycled low invocations and late old edges land
-    /// visible-unpaired. Conservation exact; the session records
-    /// the visible skip signal (`DrainOverrun`).
+    /// late old edges (invocations at or below the old HW) land
+    /// visible dup-unpaired — fix5: recycled tids seed HIGH from
+    /// the BPF global counter, so their new edges land in a fresh
+    /// incarnation scope above the shield and pair normally.
+    /// Conservation exact; the session records the visible skip
+    /// signal (`DrainOverrun`).
     pub(crate) fn retire_scope_skipped(&mut self, pid: u32, tid: u32) {
         let (attempts, results) = self.expire_tid_pending(pid, tid);
         // Bounded by 2× the pairing cap (one entry per expired hold).
@@ -1651,14 +1656,18 @@ mod tests {
         // fix4: same-stamp edges pair (legitimate — it really
         // happened), and the high-water is per-incarnation: a
         // consumed invocation in the old incarnation never
-        // suppresses the recycled same-invocation call.
+        // suppresses the recycled same-invocation call (fix5:
+        // BPF never re-emits invocation 7 — the forged reuse
+        // below pins the stamp-namespace isolation as defense
+        // in depth, not a reachable BPF shape).
         let mut p = edge_bearing();
         let k = key(10, 11, 1, 100, 7);
         p.attempt(attempt_stamped(k, 20, 1000, STAMP));
         p.result(result_stamped(k, 20, 1500, 1, STAMP));
         assert_eq!(p.totals().paired, 1, "same-stamp pair forms");
-        // Recycled tid reuses invocation 7 under a new stamp: not
-        // an HW dup (the old scope's HW is namespaced away).
+        // Forged recycled-tid reuse of invocation 7 under a new
+        // stamp: not an HW dup (the old scope's HW is namespaced
+        // away).
         p.attempt(attempt_stamped(k, 20, 2000, STAMP_NEW));
         p.result(result_stamped(k, 20, 2500, 1, STAMP_NEW));
         p.finalize(3000);
@@ -2658,7 +2667,9 @@ mod tests {
             (p.totals().unpaired_entries, p.totals().unpaired_results),
             (1, 1)
         );
-        // Recycled low invocations (≤ old HW): visible dup-unpaired, never pair.
+        // Forged low invocation (≤ old HW): visible dup-unpaired,
+        // never pairs (fix5: real recycled tids seed above the HW
+        // and pair — this forging exercises the shield mechanism).
         let r1 = key(10, 11, 1, 600, 1);
         p.attempt(attempt(r1, 20, 3000));
         p.result(result(r1, 20, 3100, 1));

@@ -2032,6 +2032,10 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
         ("TRACE_MODE", 2, 4, 4, 1),
         ("ALG_CLASS", 1, 8, 42, 1024),
         ("TRIP_CLASS", 1, 8, 22, 64),
+        // fix5 (R5-2): BPF-internal global invocation seed (1-elem array
+        // of u64). Listed so the object shape stays exact; the host
+        // never opens this map.
+        ("INV_SEQ", 2, 4, 8, 1),
     ];
     shapes
         .into_iter()
@@ -2714,9 +2718,12 @@ impl ProviderSession {
     /// contract: absence-confirming Exit (fresh triple + task-dir
     /// absence + window coverage) — removal itself is best-effort
     /// per key (a row re-created after our removal belongs to a
-    /// live recycled tid and self-heals on its next hit; orphaned
-    /// PENDING frames stay BPF-bounded and fail visible on cookie
-    /// mismatch, never silently). Returns the cleanup-failure
+    /// live recycled tid and self-heals on its next hit; fix5:
+    /// the re-created row seeds HIGH from the BPF global INV_SEQ
+    /// counter, so it can never re-emit an invocation inside its
+    /// own stamp — R5-2 closed; orphaned PENDING frames stay
+    /// BPF-bounded and fail visible on cookie mismatch, never
+    /// silently). Returns the cleanup-failure
     /// count (enumeration + deletion); the caller records a
     /// nonzero count as uncertainty — an accepted exit must never
     /// leave possible stale rows unrecorded.
@@ -8258,13 +8265,15 @@ mod tests {
         // selector dictionary, thread identity, partition/control/segment
         // index/loss; REL itself pre-existed) and the typed entry/return pair.
         // T8.2a adds the TRACE_MODE legacy map (§6D-0 D0-1): 34 -> 35.
-        assert_eq!(prepared.maps.len(), 35);
+        // T8.2a fix5 adds the BPF-internal INV_SEQ legacy map (R5-2
+        // global invocation seed): 35 -> 36.
+        assert_eq!(prepared.maps.len(), 36);
         assert_eq!(prepared.progs.len(), 8);
         for root in &prepared.progs {
             assert!(root.map_fixups.iter().any(|site| site.map == "ADMIT"));
         }
         let (prepared, source) = split_source_preparation(prepared);
-        assert_eq!((prepared.maps.len(), prepared.progs.len()), (17, 2));
+        assert_eq!((prepared.maps.len(), prepared.progs.len()), (18, 2));
         assert_eq!((source.maps.len(), source.progs.len()), (18, 6));
         let all_maps: std::collections::BTreeSet<_> = prepared
             .maps
@@ -17239,6 +17248,12 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
 ///
 /// `#[ignore]`d with graceful skip-with-message when map creation
 /// fails (no caps — the INCONCLUSIVE pattern); run under sudo in M4.
+///
+/// fix5: the forged cross-incarnation invocation reuse below (inv 1
+/// under both OLD and NEW stamps) exercises the stamp-namespace
+/// isolation as defense in depth — real BPF row creation seeds
+/// from the global INV_SEQ counter and never re-emits an
+/// invocation within a tid.
 #[cfg(test)]
 mod fix4_retire {
     use super::*;
