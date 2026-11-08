@@ -50,6 +50,18 @@ pub fn demux(api: u32) -> Option<TraceFamily> {
     }
 }
 
+/// Fold-input class (F5 / frozen §6D-2 arm 1): operational pairs
+/// keep the raw outcome class; fetch and lifecycle pairs classify
+/// class 0 `unknown` BY FUNCTION. Total over the demux: unknown
+/// IDs (unreachable on the wire-valid path — the decoder arm owns
+/// validity) also fold 0.
+fn pair_class(api: u32, outcome: u32) -> u32 {
+    match demux(api) {
+        Some(TraceFamily::PublicApi) => outcome.min(4),
+        _ => 0,
+    }
+}
+
 /// Pair key (§6D-6): thread key + cookie + invocation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct PairKey {
@@ -697,8 +709,9 @@ impl TraceProducer {
         entry.hw = Some(entry.hw.map_or(key.invocation, |hw| hw.max(key.invocation)));
     }
 
-    fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, class: u32) {
+    fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, outcome: u32) {
         self.advance_hw(&key);
+        let class = pair_class(api, outcome);
         // §6D-3: zero/negative deltas are unusable durations but real pairs.
         let nonmonotonic = result_ns <= attempt_ns;
         let duration_ns = if nonmonotonic {
@@ -1077,6 +1090,48 @@ mod tests {
         assert_eq!(t.paired, 0);
         assert_eq!(t.unpaired_entries, 1);
         assert_eq!(t.unpaired_results, 1);
+    }
+
+    #[test]
+    fn fetch_and_lifecycle_pairs_fold_class_zero() {
+        // F5 (codex R1-5): fetch (10..=15) and lifecycle (1..=6)
+        // pairs classify class 0 by function (frozen §6D-2 arm
+        // 1 — `operational_api` covers 20..=72 only);
+        // operational pairs keep the raw outcome class.
+        // Per-family attribution, not global: each (api, class).
+        let mut p = edge_bearing();
+        let fetch = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(fetch, 10, 1000));
+        p.result(result(fetch, 10, 1500, 1));
+        let life = key(10, 11, 1, 101, 8);
+        p.attempt(attempt(life, 2, 1100));
+        p.result(result(life, 2, 1600, 2));
+        let op = key(10, 11, 1, 102, 9);
+        p.attempt(attempt(op, 20, 1200));
+        p.result(result(op, 20, 1700, 3));
+        let w = p.close_window(0, 2000, [0; 8]);
+        assert_eq!(w.paired, 3);
+        let mut got: Vec<(u32, u32)> = w.pairs.iter().map(|e| (e.api, e.class)).collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(2, 0), (10, 0), (20, 3)]);
+    }
+
+    #[test]
+    fn pair_class_normalizes_by_family() {
+        // F5 helper pin: total over the demux, all five outcomes.
+        for api in (1..=9).chain(10..=15).chain(16..=19) {
+            for outcome in 0..=4 {
+                assert_eq!(pair_class(api, outcome), 0, "api {api}");
+            }
+        }
+        for api in 20..=72 {
+            for outcome in 0..=4 {
+                assert_eq!(pair_class(api, outcome), outcome, "api {api}");
+            }
+        }
+        for api in [0, 73, 100, u32::MAX] {
+            assert_eq!(pair_class(api, 1), 0, "api {api}");
+        }
     }
 
     #[test]
