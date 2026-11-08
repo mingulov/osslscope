@@ -263,12 +263,14 @@ fn identity_inner(cookie: u64, enforce_window: bool) -> Option<(Config, ThreadKe
 }
 /// fix7 (R7-3): arm one blind tombstone for a closed-window
 /// entry (out-of-line: the entry frame is stack-pressured and
-/// this runs only on the cold reject path). The executing call
-/// owns no frame and no marker — but its return WILL execute
-/// (and reject), and must then consume exactly this tombstone
-/// rather than stealing an outer overflow marker. No row ⟹ no
-/// arm (a balanced no-op: the return will find no row — or a
-/// fresh one with no units — and likewise consume nothing).
+/// this runs only on the cold reject path). fix8 (R8-2): the arm
+/// is positional first — a blind marker slotted at the current
+/// depth, LIFO-matched by the rejecting return (skip-safe: a
+/// longjmp'd marker is discarded, never shifting frames). Marker
+/// refusal (same-kind collision, quota, map) arms the fungible
+/// tombstone — exactly the old arm. No row ⟹ no arm (a balanced
+/// no-op: the return will find no row — or a fresh one with no
+/// units — and likewise consume nothing).
 #[inline(never)]
 #[no_mangle]
 pub fn blind_arm_entry(cookie: u64) {
@@ -278,6 +280,25 @@ pub fn blind_arm_entry(cookie: u64) {
     let Some(mut thread) = (unsafe { THREADS.get(&key).copied() }) else {
         return;
     };
+    let claimed = source_state::claim_pending();
+    let placed = claimed
+        && PENDING
+            .insert(
+                PendingKey {
+                    thread: key,
+                    depth: thread.depth,
+                    reserved: PENDING_BLIND_MARKER,
+                },
+                Pending::marker(cookie),
+                1,
+            )
+            .is_ok();
+    if placed {
+        return;
+    }
+    if claimed && !source_state::release_pending() {
+        loss(LOSS_MAP);
+    }
     thread.blind_entry();
     if THREADS.insert(key, thread, 0).is_err() {
         loss(LOSS_MAP);
@@ -462,27 +483,49 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         }
     };
     let old_depth = thread.depth;
-    let Some(invocation) = thread.enter() else {
+    let Some(invocation) = thread.enter_frame() else {
         // fix6 (R6-4 backstop): a None with `next == MAX` DELETES
         // the row instead of inserting it — persisting a MAX row
         // would wedge every later entry (returns clear only
         // `overflow`/`blind`, never `next`), turning transient CAS
         // exhaustion into permanent per-thread blindness.
-        // Depth-overflow Nones still insert (their overflow arms
-        // `skip_return` pairing). Creation-time refusal (above)
-        // makes fresh MAX rows unreachable; a pre-existing MAX row
-        // needs 2^64 emits (unreachable) — the delete is pure
-        // defense in depth, distinguished by `next`, not freshness.
-        match enter_none_disposition(thread.next) {
-            EnterNoneDisposition::Delete => {
-                if THREADS.remove(&key).is_err() {
-                    loss(LOSS_MAP)
-                }
+        // Creation-time refusal (above) makes fresh MAX rows
+        // unreachable; a pre-existing MAX row needs 2^64 emits
+        // (unreachable) — the delete is pure defense in depth,
+        // distinguished by `next`, not freshness. fix8 (R8-2):
+        // every other None slots a positional overflow marker when
+        // it can (LIFO-matched pops, skip-safe); marker refusal
+        // (same-kind collision, quota, map) arms the fungible
+        // counter — exactly the old Insert arm. The row is
+        // pre-existing here (a fresh row never refuses a frame),
+        // so a placed marker writes no row.
+        if enter_none_disposition(thread.next) == EnterNoneDisposition::Delete {
+            if THREADS.remove(&key).is_err() {
+                loss(LOSS_MAP)
             }
-            EnterNoneDisposition::Insert => {
-                if THREADS.insert(key, thread, 0).is_err() {
-                    loss(LOSS_MAP)
-                }
+            loss(LOSS_DEPTH);
+            return 0;
+        }
+        let claimed = source_state::claim_pending();
+        let placed = claimed
+            && PENDING
+                .insert(
+                    PendingKey {
+                        thread: key,
+                        depth: old_depth,
+                        reserved: PENDING_OVERFLOW_MARKER,
+                    },
+                    Pending::marker(cookie),
+                    1,
+                )
+                .is_ok();
+        if !placed {
+            if claimed && !source_state::release_pending() {
+                loss(LOSS_MAP);
+            }
+            thread.overflow = thread.overflow.saturating_add(1);
+            if THREADS.insert(key, thread, 0).is_err() {
+                loss(LOSS_MAP)
             }
         }
         loss(LOSS_DEPTH);
@@ -508,7 +551,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
             PENDING.get(&PendingKey {
                 thread: key,
                 depth: old_depth - 1,
-                reserved: 0,
+                reserved: PENDING_FRAME,
             })
         };
         if let Some(parent) = parent {
@@ -522,7 +565,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     let pk = PendingKey {
         thread: key,
         depth: old_depth,
-        reserved: 0,
+        reserved: PENDING_FRAME,
     };
     if !source_state::claim_pending() {
         thread.failed_entry();
@@ -1014,6 +1057,147 @@ pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
 // emitting), so no seed choice arises there — the pre-delete ATTEMPT
 // expires unpaired-visible. `*out_seed` is untouched on every
 // failure path (callers only read it after `true`).
+/// fix8 (R8-2): discard slots strictly deeper than `mine_level`
+/// (stale skipped inners — deeper is strictly inner: an outer
+/// slot at level L proves L outers outstanding, so depth would
+/// exceed any shallower entry — and an outstanding inner with me
+/// returning is execution-impossible). Both paths discard all
+/// kinds (a deeper T slot is stale-proven the same way; only the
+/// ownership SEARCH excludes T for accepted returns — an
+/// accepted return provably owns no blind marker, but still reaps
+/// deeper blind garbage). Absent slots skip silent; a failed
+/// quota release fires LOSS_MAP (as on the pop path).
+#[inline(never)]
+#[no_mangle]
+pub fn discard_deeper(
+    key: &ThreadKey,
+    depth: u32,
+    mine_level: u32,
+    include_t: u32,
+    thread: &mut Thread,
+) {
+    let top = if depth > MAX_DEPTH { MAX_DEPTH } else { depth };
+    for step in 0..9u32 {
+        if step > top {
+            break;
+        }
+        let level = top - step;
+        if level <= mine_level {
+            break;
+        }
+        let frame_key = PendingKey {
+            thread: *key,
+            depth: level,
+            reserved: PENDING_FRAME,
+        };
+        if PENDING.remove(&frame_key).is_ok() {
+            if !source_state::release_pending() {
+                loss(LOSS_MAP);
+            }
+            thread.depth = thread.depth.saturating_sub(1);
+        }
+        if include_t != 0 {
+            let t_key = PendingKey {
+                thread: *key,
+                depth: level,
+                reserved: PENDING_BLIND_MARKER,
+            };
+            if PENDING.remove(&t_key).is_ok() && !source_state::release_pending() {
+                loss(LOSS_MAP);
+            }
+        }
+        let o_key = PendingKey {
+            thread: *key,
+            depth: level,
+            reserved: PENDING_OVERFLOW_MARKER,
+        };
+        if PENDING.remove(&o_key).is_ok() && !source_state::release_pending() {
+            loss(LOSS_MAP);
+        }
+    }
+}
+/// fix8 (R8-2): fast-path guard — whether any marker (either
+/// kind, any cookie) sits at `level`. A same-cookie owner must
+/// take the slow path to its own deeper marker; a foreign deeper
+/// marker is a skipped inner the slow path discards.
+#[inline(always)]
+fn marker_at(key: &ThreadKey, level: u32) -> bool {
+    let o_key = PendingKey {
+        thread: *key,
+        depth: level,
+        reserved: PENDING_OVERFLOW_MARKER,
+    };
+    if unsafe { PENDING.get(&o_key) }.is_some() {
+        return true;
+    }
+    let t_key = PendingKey {
+        thread: *key,
+        depth: level,
+        reserved: PENDING_BLIND_MARKER,
+    };
+    unsafe { PENDING.get(&t_key) }.is_some()
+}
+/// fix8 (R8-2): slow pop search — the deepest slot owned by
+/// `cookie` (fetch-only; `*out` packs level << 32 | kind). Frames
+/// sort before their lateral markers (a frame is always inner to
+/// same-level markers: it wounded past them), T before O (the
+/// reverse nesting — an accepted overflow inside a closed blind —
+/// needs a window reopen). Accepted returns exclude T (an
+/// accepted return provably owns a frame or an overflow marker:
+/// its entry was accepted, and the window never reopens).
+#[inline(never)]
+#[no_mangle]
+pub fn find_mine(
+    key: &ThreadKey,
+    depth: u32,
+    cookie: u64,
+    include_t: u32,
+    out: &mut u64,
+) -> bool {
+    let top = if depth > MAX_DEPTH { MAX_DEPTH } else { depth };
+    for step in 0..9u32 {
+        if step > top {
+            break;
+        }
+        let level = top - step;
+        let frame_key = PendingKey {
+            thread: *key,
+            depth: level,
+            reserved: PENDING_FRAME,
+        };
+        if let Some(p) = unsafe { PENDING.get(&frame_key).copied() } {
+            if p.cookie == cookie {
+                *out = (level as u64) << 32 | PENDING_FRAME as u64;
+                return true;
+            }
+        }
+        if include_t != 0 {
+            let t_key = PendingKey {
+                thread: *key,
+                depth: level,
+                reserved: PENDING_BLIND_MARKER,
+            };
+            if let Some(p) = unsafe { PENDING.get(&t_key).copied() } {
+                if p.cookie == cookie {
+                    *out = (level as u64) << 32 | PENDING_BLIND_MARKER as u64;
+                    return true;
+                }
+            }
+        }
+        let o_key = PendingKey {
+            thread: *key,
+            depth: level,
+            reserved: PENDING_OVERFLOW_MARKER,
+        };
+        if let Some(p) = unsafe { PENDING.get(&o_key).copied() } {
+            if p.cookie == cookie {
+                *out = (level as u64) << 32 | PENDING_OVERFLOW_MARKER as u64;
+                return true;
+            }
+        }
+    }
+    false
+}
 #[inline(never)]
 #[no_mangle]
 pub fn pop_return(
@@ -1023,17 +1207,71 @@ pub fn pop_return(
     out_seed: &mut u64,
 ) -> bool {
     let Some((_, key)) = identity(cookie) else {
-        // fix7 (R7-3): bookkeeping/emission separation — a return
-        // rejected by the OPERATIONAL WINDOW still consumes its
-        // OWN marker (own blind tombstone first, else its overflow
-        // marker — T==0 at a rejected return proves marker
-        // ownership under the never-reopen window), marker only,
-        // NEVER a pop. Every other rejection arm cannot attribute
-        // (different task/row): consume nothing, as before.
+        // fix8 (R8-2): a return rejected by the OPERATIONAL WINDOW
+        // pops its OWN slot (frame or either marker — always
+        // suppressed, never emitted) after discarding deeper stale
+        // slots (a deeper slot with me returning is a skipped inner
+        // — execution-impossible otherwise). fix7's
+        // consume-T-first survives only for counter-owned returns
+        // (marker refusal was rare and is now rarer). Every other
+        // rejection arm cannot attribute (different task/row):
+        // consume nothing, as before.
         if let Some((_, key)) = identity_closed_window(cookie) {
             if let Some(mut thread) = unsafe { THREADS.get(&key).copied() } {
-                if thread.blind_return() && THREADS.insert(key, thread, 0).is_err() {
-                    loss(LOSS_MAP);
+                if thread.depth > 0 {
+                    let pk = PendingKey {
+                        thread: key,
+                        depth: thread.depth - 1,
+                        reserved: PENDING_FRAME,
+                    };
+                    if let Some(p) = unsafe { PENDING.get(&pk).copied() } {
+                        if p.cookie == cookie && !marker_at(&key, thread.depth) {
+                            if PENDING.remove(&pk).is_err() {
+                                loss(LOSS_MAP);
+                                return false;
+                            }
+                            if !source_state::release_pending() {
+                                loss(LOSS_MAP);
+                            }
+                            thread.depth -= 1;
+                            if THREADS.insert(key, thread, 0).is_err() {
+                                loss(LOSS_MAP);
+                            }
+                            return false;
+                        }
+                    }
+                }
+                let mut found = 0u64;
+                if find_mine(&key, thread.depth, cookie, 1, &mut found) {
+                    let mine_level = (found >> 32) as u32;
+                    let mine_kind = (found & 0xffff_ffff) as u32;
+                    discard_deeper(&key, thread.depth, mine_level, 1, &mut thread);
+                    let mk = PendingKey {
+                        thread: key,
+                        depth: mine_level,
+                        reserved: mine_kind,
+                    };
+                    let Some(_p) = (unsafe { PENDING.get(&mk).copied() }) else {
+                        loss(LOSS_PAIR);
+                        return false;
+                    };
+                    if PENDING.remove(&mk).is_err() {
+                        loss(LOSS_MAP);
+                        return false;
+                    }
+                    if !source_state::release_pending() {
+                        loss(LOSS_MAP);
+                    }
+                    if mine_kind == PENDING_FRAME {
+                        thread.depth = thread.depth.saturating_sub(1);
+                    }
+                    if THREADS.insert(key, thread, 0).is_err() {
+                        loss(LOSS_MAP);
+                    }
+                } else if thread.blind_return() {
+                    if THREADS.insert(key, thread, 0).is_err() {
+                        loss(LOSS_MAP);
+                    }
                 }
             }
         }
@@ -1047,48 +1285,86 @@ pub fn pop_return(
         loss(LOSS_PAIR);
         return false;
     };
+    // fix8 (R8-2) fast path: the framed return pops its own frame
+    // directly (the common case) — but ONLY when no marker sits at
+    // the current depth (a same-cookie marker-owner's return must
+    // NOT hijack the outer frame; a deeper marker of any cookie is
+    // a skipped inner the slow path discards). Anything else falls
+    // to the slow positional search.
+    if thread.depth > 0 {
+        let pk = PendingKey {
+            thread: key,
+            depth: thread.depth - 1,
+            reserved: PENDING_FRAME,
+        };
+        if let Some(p) = unsafe { PENDING.get(&pk).copied() } {
+            if p.cookie == cookie && !marker_at(&key, thread.depth) {
+                if PENDING.remove(&pk).is_err() {
+                    loss(LOSS_MAP);
+                    return false;
+                }
+                if !source_state::release_pending() {
+                    loss(LOSS_MAP);
+                }
+                thread.depth -= 1;
+                if THREADS.insert(key, thread, 0).is_err() {
+                    loss(LOSS_MAP);
+                    return false;
+                }
+                *out_key = key;
+                *out_pending = p;
+                *out_seed = thread.seed;
+                return p.suppressed == 0;
+            }
+        }
+    }
+    let mut found = 0u64;
+    if find_mine(&key, thread.depth, cookie, 0, &mut found) {
+        let mine_level = (found >> 32) as u32;
+        let mine_kind = (found & 0xffff_ffff) as u32;
+        discard_deeper(&key, thread.depth, mine_level, 1, &mut thread);
+        let mk = PendingKey {
+            thread: key,
+            depth: mine_level,
+            reserved: mine_kind,
+        };
+        let Some(p) = (unsafe { PENDING.get(&mk).copied() }) else {
+            loss(LOSS_PAIR);
+            return false;
+        };
+        if PENDING.remove(&mk).is_err() {
+            loss(LOSS_MAP);
+            return false;
+        }
+        if !source_state::release_pending() {
+            loss(LOSS_MAP);
+        }
+        if mine_kind == PENDING_FRAME {
+            thread.depth = thread.depth.saturating_sub(1);
+        }
+        if THREADS.insert(key, thread, 0).is_err() {
+            loss(LOSS_MAP);
+            return false;
+        }
+        *out_key = key;
+        *out_pending = p;
+        // The live row's seed (immutable since creation — `enter`/
+        // depth bookkeeping never touches it). On a recreated row this
+        // is the FRESH seed (orphaned-return rule above).
+        *out_seed = thread.seed;
+        return p.suppressed == 0;
+    }
+    // No slot of mine: a counter-owned return consumes its overflow
+    // unit (an accepted return provably owns no blind unit); a
+    // unit-less return is unpaired (fail-closed, as before).
     if thread.skip_return() {
         if THREADS.insert(key, thread, 0).is_err() {
             loss(LOSS_MAP)
         }
         return false;
     }
-    if thread.depth == 0 {
-        loss(LOSS_PAIR);
-        return false;
-    }
-    let pk = PendingKey {
-        thread: key,
-        depth: thread.depth - 1,
-        reserved: 0,
-    };
-    let Some(p) = (unsafe { PENDING.get(&pk).copied() }) else {
-        loss(LOSS_PAIR);
-        return false;
-    };
-    if p.cookie != cookie {
-        loss(LOSS_PAIR);
-        return false;
-    }
-    if PENDING.remove(&pk).is_err() {
-        loss(LOSS_MAP);
-        return false;
-    }
-    if !source_state::release_pending() {
-        loss(LOSS_MAP);
-    }
-    thread.depth -= 1;
-    if THREADS.insert(key, thread, 0).is_err() {
-        loss(LOSS_MAP);
-        return false;
-    }
-    *out_key = key;
-    *out_pending = p;
-    // The live row's seed (immutable since creation — `enter`/
-    // depth bookkeeping never touches it). On a recreated row this
-    // is the FRESH seed (orphaned-return rule above).
-    *out_seed = thread.seed;
-    p.suppressed == 0
+    loss(LOSS_PAIR);
+    false
 }
 #[uretprobe]
 pub fn observation_return(ctx: RetProbeContext) -> u32 {

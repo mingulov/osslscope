@@ -179,6 +179,20 @@ pub struct Thread {
     /// only on the shared trace machine's closed-window entries).
     pub blind: u32,
 }
+/// fix8 (R8-2): `PendingKey.reserved` slot kind. Frames keep 0
+/// (every pre-fix key); overflow/blind markers take 1/2. Lateral
+/// same-level O+T markers never collide (kind-selected pops); a
+/// second same-kind marker at one level falls back to the fungible
+/// counter (NOEXIST refusal — the old behavior, still correct for
+/// counter-owned returns). Key layout UNCHANGED (24 B).
+pub const PENDING_FRAME: u32 = 0;
+pub const PENDING_OVERFLOW_MARKER: u32 = 1;
+pub const PENDING_BLIND_MARKER: u32 = 2;
+/// fix8 (R8-2): `Pending.suppressed` marker value. Frames use
+/// 0/1 (emit/suppress); markers always suppress AND are keyed by
+/// kind, so the pop path branches on the key, never this value.
+/// Value layout UNCHANGED (56 B).
+pub const MARKER_SUPPRESSED: u32 = 2;
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct PendingKey {
@@ -198,6 +212,22 @@ pub struct Pending {
     pub api: u32,
     pub name: u32,
     pub suppressed: u32,
+}
+impl Pending {
+    /// fix8 (R8-2): a positional suppress-marker for an entry that
+    /// owns no frame (overflow) or no observation (closed window).
+    /// Carries the OWNER cookie (the pop path matches returns to
+    /// their own slot by it) and consumes no invocation. Popping a
+    /// marker suppresses exactly one return and realigns the stack —
+    /// a longjmp'd marker is discarded by the next outer return
+    /// (availability), never shifting frames (no cascade).
+    pub fn marker(cookie: u64) -> Self {
+        Self {
+            cookie,
+            suppressed: MARKER_SUPPRESSED,
+            ..Self::default()
+        }
+    }
 }
 /// Positive future public operation IDs are preserved, independently of registry.
 pub const fn known_operation(op: u32) -> u32 {
@@ -223,18 +253,32 @@ pub fn suppress_wrapper(parent: &Pending, child: &Pending) -> bool {
         && parent.arg0 == child.arg0
 }
 impl Thread {
-    pub fn enter(&mut self) -> Option<u64> {
+    /// fix8 (R8-2): pure frame attempt for the trace machine —
+    /// wounds depth and mints an invocation, or refuses WITHOUT
+    /// arming any counter (the caller slots an overflow marker or
+    /// falls back to the fungible counter). Refusal conditions are
+    /// exactly `enter`'s (depth cap, sticky overflow, exhausted
+    /// invocations); only the counter side effect moves to the
+    /// caller. BPF-safe (no allocation).
+    pub fn enter_frame(&mut self) -> Option<u64> {
         if self.depth >= MAX_DEPTH || self.overflow != 0 {
-            self.overflow = self.overflow.saturating_add(1);
             return None;
         }
         if self.next == u64::MAX {
-            self.overflow = self.overflow.saturating_add(1);
             return None;
         }
         self.next += 1;
         self.depth += 1;
         Some(self.next)
+    }
+    pub fn enter(&mut self) -> Option<u64> {
+        match self.enter_frame() {
+            Some(invocation) => Some(invocation),
+            None => {
+                self.overflow = self.overflow.saturating_add(1);
+                None
+            }
+        }
     }
     pub fn failed_entry(&mut self) {
         self.depth = self.depth.saturating_sub(1);
@@ -256,9 +300,11 @@ impl Thread {
     /// accepted return — which consumed it WITHOUT popping its
     /// own frame, so the FOLLOWING same-cookie return popped the
     /// wrong frame (frame-shift + cascade, up to 7 mislabeled
-    /// RESULTs). Rejected returns now consume T-first-then-O via
-    /// `blind_return` (marker only, never a pop); accepted
-    /// behavior here is unchanged.
+    /// RESULTs). fix8 (R8-2): slotted returns pop their own slot
+    /// (positional, skip-safe) and reach here only when they own
+    /// no slot (marker refusal fell back to the fungible
+    /// counter); the aggregate machine still pairs purely through
+    /// here. Accepted behavior is unchanged.
     pub fn skip_return(&mut self) -> bool {
         if self.overflow != 0 {
             self.overflow -= 1;
@@ -279,11 +325,10 @@ impl Thread {
     }
     /// Consume one unit for a WINDOW-REJECTED return (resolved
     /// identity, closed window): its own blind tombstone first,
-    /// else one overflow marker (under the never-reopen window,
-    /// T==0 at a rejected return proves marker ownership — see
-    /// `blind`). Marker only — NEVER a pop (a rejected return has
-    /// no addressable frame; popping would steal same-cookie
-    /// frames). Returns whether a unit was consumed. Rejections
+    /// else one overflow marker. fix8 (R8-2): slotted returns pop
+    /// their own slot instead and reach here only when they own
+    /// no slot (marker refusal fell back to the fungible
+    /// counter). Returns whether a unit was consumed. Rejections
     /// that cannot attribute (tgid/generation/CONFIG mismatch —
     /// a different row) must NOT call this.
     pub fn blind_return(&mut self) -> bool {
@@ -885,6 +930,668 @@ mod tests {
         t.blind = u32::MAX;
         t.blind_entry();
         assert_eq!(t.blind, u32::MAX, "tombstones saturate, never wrap");
+    }
+    /// fix8 F2: host model of the BPF return-path bookkeeping WITH
+    /// skipped returns (the fix7 model's gap — "all returns execute"
+    /// is exactly what longjmp violates) and positional marker
+    /// slots (`find_mine` + `discard_deeper` + pop, mirrored block
+    /// for block — see the BPF≡model correspondence in the fix8
+    /// report). Every entry arms exactly one unit (frame slot,
+    /// marker slot, or fungible counter); every executed return
+    /// pops its own slot (fast path: own frame; slow path: deepest
+    /// mine after discarding deeper stale slots) or consumes its
+    /// counter unit. `skip()` documents a longjmp'd return (kernel
+    /// discards the uretprobe instance — the return NEVER runs,
+    /// consuming nothing).
+    struct Fix8Model {
+        thread: Thread,
+        frames: [Option<(u64, u64)>; 9],
+        omarks: [Option<u64>; 9],
+        tmarks: [Option<u64>; 9],
+        emitted: [(u64, u64); MAX_DEPTH as usize],
+        emitted_len: usize,
+        suppressed: u32,
+        discarded: u32,
+        quota_fail: bool,
+        force_counter: bool,
+    }
+    impl Fix8Model {
+        fn new() -> Self {
+            Self {
+                thread: Thread::default(),
+                frames: [None; 9],
+                omarks: [None; 9],
+                tmarks: [None; 9],
+                emitted: [(0, 0); MAX_DEPTH as usize],
+                emitted_len: 0,
+                suppressed: 0,
+                discarded: 0,
+                quota_fail: false,
+                force_counter: false,
+            }
+        }
+        /// Framed entry: production `enter_frame` + frame slot.
+        fn frame(&mut self, cookie: u64) -> u64 {
+            let slot = self.thread.depth as usize;
+            let inv = self.thread.enter_frame().expect("framed entry");
+            assert!(self.frames[slot].is_none(), "frame slot collision");
+            self.frames[slot] = Some((cookie, inv));
+            inv
+        }
+        /// Overflow entry: refused frame, then an O-marker slot at
+        /// the current depth — or the fungible counter on marker
+        /// refusal (collision/quota/neuter), mirroring the BPF
+        /// None arm exactly.
+        fn overflow(&mut self, cookie: u64) {
+            assert_eq!(self.thread.enter_frame(), None, "must refuse a frame");
+            let slot = self.thread.depth as usize;
+            if !self.force_counter && !self.quota_fail && self.omarks[slot].is_none() {
+                self.omarks[slot] = Some(cookie);
+            } else {
+                self.thread.overflow = self.thread.overflow.saturating_add(1);
+            }
+        }
+        /// Closed-window entry: a T-marker slot at the current
+        /// depth — or the fungible tombstone on marker refusal,
+        /// mirroring `blind_arm_entry` exactly.
+        fn blind_enter(&mut self, cookie: u64) {
+            let slot = self.thread.depth as usize;
+            if !self.force_counter && !self.quota_fail && self.tmarks[slot].is_none() {
+                self.tmarks[slot] = Some(cookie);
+            } else {
+                self.thread.blind_entry();
+            }
+        }
+        /// A longjmp'd return: never executes, consumes nothing.
+        fn skip(&mut self) {}
+        /// Deepest slot owned by `cookie` (level, kind 0/1/2):
+        /// levels deep→shallow; within a level frame, then T
+        /// (rejected only), then O — mirroring `find_mine`.
+        fn find_mine(&self, cookie: u64, include_t: bool) -> Option<(usize, u32)> {
+            let top = (self.thread.depth as usize).min(MAX_DEPTH as usize);
+            for level in (0..=top).rev() {
+                if let Some((owner, _)) = self.frames[level] {
+                    if owner == cookie {
+                        return Some((level, PENDING_FRAME));
+                    }
+                }
+                if include_t && self.tmarks[level] == Some(cookie) {
+                    return Some((level, PENDING_BLIND_MARKER));
+                }
+                if self.omarks[level] == Some(cookie) {
+                    return Some((level, PENDING_OVERFLOW_MARKER));
+                }
+            }
+            None
+        }
+        /// Discard slots strictly deeper than `mine` (all kinds —
+        /// mirroring `discard_deeper` with include_t=1).
+        fn discard_deeper(&mut self, mine: usize) {
+            let top = (self.thread.depth as usize).min(MAX_DEPTH as usize);
+            for level in (mine + 1..=top).rev() {
+                if self.frames[level].take().is_some() {
+                    self.thread.depth = self.thread.depth.saturating_sub(1);
+                    self.discarded += 1;
+                }
+                if self.tmarks[level].take().is_some() {
+                    self.discarded += 1;
+                }
+                if self.omarks[level].take().is_some() {
+                    self.discarded += 1;
+                }
+            }
+        }
+        /// Accepted return of `cookie` (rv observed on emit):
+        /// fast-path own frame, else slow search (T excluded),
+        /// else the overflow counter — mirroring `pop_return`'s
+        /// accepted arm exactly.
+        fn marker_at(&self, level: usize) -> bool {
+            self.omarks[level].is_some() || self.tmarks[level].is_some()
+        }
+        fn return_accept(&mut self, cookie: u64, rv: u64) {
+            if self.thread.depth > 0 {
+                let slot = self.thread.depth as usize - 1;
+                if let Some((owner, inv)) = self.frames[slot] {
+                    if owner == cookie && !self.marker_at(self.thread.depth as usize) {
+                        self.frames[slot] = None;
+                        self.thread.depth -= 1;
+                        self.emitted[self.emitted_len] = (inv, rv);
+                        self.emitted_len += 1;
+                        return;
+                    }
+                }
+            }
+            if let Some((mine, kind)) = self.find_mine(cookie, false) {
+                self.discard_deeper(mine);
+                if kind == PENDING_FRAME {
+                    let (_, inv) = self.frames[mine].take().unwrap();
+                    self.thread.depth = self.thread.depth.saturating_sub(1);
+                    self.emitted[self.emitted_len] = (inv, rv);
+                    self.emitted_len += 1;
+                } else {
+                    assert_eq!(kind, PENDING_OVERFLOW_MARKER);
+                    self.omarks[mine] = None;
+                    self.suppressed += 1;
+                }
+                return;
+            }
+            assert!(self.thread.skip_return(), "counter-owned accepted return");
+        }
+        /// Window-rejected return of `cookie`: fast-path own frame
+        /// (popped, suppressed), else slow search (all kinds),
+        /// else the T-first counter — mirroring `pop_return`'s
+        /// rejected arm exactly. Never emits.
+        fn return_reject(&mut self, cookie: u64) -> bool {
+            if self.thread.depth > 0 {
+                let slot = self.thread.depth as usize - 1;
+                if let Some((owner, _)) = self.frames[slot] {
+                    if owner == cookie && !self.marker_at(self.thread.depth as usize) {
+                        self.frames[slot] = None;
+                        self.thread.depth -= 1;
+                        return true;
+                    }
+                }
+            }
+            if let Some((mine, kind)) = self.find_mine(cookie, true) {
+                self.discard_deeper(mine);
+                if kind == PENDING_FRAME {
+                    self.frames[mine] = None;
+                    self.thread.depth = self.thread.depth.saturating_sub(1);
+                } else if kind == PENDING_BLIND_MARKER {
+                    self.tmarks[mine] = None;
+                    self.suppressed += 1;
+                } else {
+                    self.omarks[mine] = None;
+                    self.suppressed += 1;
+                }
+                return true;
+            }
+            // No slot of mine: the T-first counter (fix7 residual);
+            // a unit-less return consumes nothing (BPF: silent).
+            self.thread.blind_return()
+        }
+        /// Every emission paired its own frame with its own rv.
+        fn assert_aligned(&self) {
+            for (i, &(frame, rv)) in self.emitted[..self.emitted_len].iter().enumerate() {
+                assert_eq!(frame, rv, "emission {i} mislabeled");
+            }
+        }
+        fn assert_quiescent(&self) {
+            assert_eq!(
+                (self.thread.depth, self.thread.overflow, self.thread.blind),
+                (0, 0, 0)
+            );
+            assert!(self.frames.iter().all(|slot| slot.is_none()));
+            assert!(self.omarks.iter().all(|slot| slot.is_none()));
+            assert!(self.tmarks.iter().all(|slot| slot.is_none()));
+        }
+    }
+    #[test]
+    fn fix8_longjmp_skip_stays_aligned() {
+        // fix8 F2 GREEN (R8-2 — the realizable mixed-cookie shape:
+        // non-operational A-frames, operational overflow B +
+        // blind C): C longjmps; B's rejected return discards C's
+        // stale T-marker and pops its own O-marker; every A pops
+        // its own frame. (RED pre-fix: this schedule asserted the
+        // exact [(8,7)..(2,1)] cascade — quoted in the fix8 report.)
+        const A: u64 = 0xA11CE;
+        const B: u64 = 0xB00B;
+        const C: u64 = 0xC10C;
+        let mut m = Fix8Model::new();
+        let mut invs = [0u64; 8];
+        for slot in invs.iter_mut() {
+            *slot = m.frame(A);
+        }
+        assert_eq!(invs, [1, 2, 3, 4, 5, 6, 7, 8]);
+        m.overflow(B);
+        m.blind_enter(C);
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (8, 0, 0),
+            "both markers slotted, counters untouched"
+        );
+        m.skip();
+        m.return_reject(B);
+        // B pops its own lateral O; C's stale lateral T waits (a
+        // lateral slot is never discarded — it may be outer-live).
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+        m.return_accept(A, 8);
+        // A8's return reaps the now-deeper stale T, then pops own.
+        assert_eq!((m.suppressed, m.discarded), (1, 1));
+        for rv in invs[..7].iter().rev() {
+            m.return_accept(A, *rv);
+        }
+        assert_eq!(
+            m.emitted,
+            [
+                (8, 8),
+                (7, 7),
+                (6, 6),
+                (5, 5),
+                (4, 4),
+                (3, 3),
+                (2, 2),
+                (1, 1)
+            ]
+        );
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_r73_marker_owner_reject_resyncs() {
+        // fix8 F2 (R7-3 via markers): the overflow owner's rejected
+        // return pops its own O-marker; frames pop own. No skip,
+        // no tombstone, full-cascade resync preserved.
+        const A: u64 = 0xA11CE;
+        const B: u64 = 0xB00B;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.overflow(B);
+        m.return_reject(B);
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_mirror_blind_nested_in_overflow() {
+        // fix8 F2 (mirror via lateral markers): X's O-marker and
+        // E's T-marker share level 8; E's rejected return pops its
+        // own T (the lateral O survives); X's accepted return pops
+        // its own O; frames pop own.
+        const A: u64 = 0xA11CE;
+        const X: u64 = 0xB00B;
+        const E: u64 = 0xC10C;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.overflow(X);
+        m.blind_enter(E);
+        m.return_reject(E);
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+        m.return_accept(X, 0);
+        assert_eq!((m.suppressed, m.discarded), (2, 0));
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_mirror_flip_overflow_nested_in_blind() {
+        // fix8 F2 (lateral tie, both orders): E's T-marker outer,
+        // X's O-marker inner at one level. X returns first (LIFO
+        // execution) — accepted AND rejected variants — and must
+        // pop its own O without touching E's lateral T; E then pops
+        // its own T.
+        const A: u64 = 0xA11CE;
+        const X: u64 = 0xB00B;
+        const E: u64 = 0xC10C;
+        for rejected in [false, true] {
+            let mut m = Fix8Model::new();
+            for _ in 0..8 {
+                m.frame(A);
+            }
+            m.blind_enter(E);
+            m.overflow(X);
+            if rejected {
+                m.return_reject(X);
+            } else {
+                m.return_accept(X, 0);
+            }
+            assert!(m.tmarks[8].is_some(), "rejected={rejected}: E's T survives");
+            m.return_reject(E);
+            for rv in (1..=8u64).rev() {
+                m.return_accept(A, rv);
+            }
+            m.assert_aligned();
+            m.assert_quiescent();
+        }
+    }
+    #[test]
+    fn fix8_same_cookie_skip_still_cascades_impossibility() {
+        // fix8 F2 impossibility pin (R8-2): the SAME schedule with
+        // ONE cookie still cascades [(8,7)..(2,1)] — PROVABLY
+        // unfixable (same-cookie return events are ambiguous: B's
+        // return and C's return are the identical observation, so
+        // no deterministic rule pops correctly in both the skip and
+        // no-skip worlds). Unrealizable for the R8-2 mixed
+        // reject/accept shape (never-reopen forbids it); pinned so
+        // the boundary stays documented, not so it stays broken by
+        // accident. The mechanism degrades exactly to the old
+        // cascade here — no worse.
+        const S: u64 = 0x5A4E;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S);
+        m.blind_enter(S);
+        m.skip();
+        m.return_reject(S);
+        // Eight returns: the first pops B's orphaned O (suppressing
+        // A8's RESULT), then every pop shifts by one.
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [(8, 7), (7, 6), (6, 5), (5, 4), (4, 3), (3, 2), (2, 1)]
+        );
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (1, 0, 0)
+        );
+    }
+    #[test]
+    fn fix8_same_cookie_r73_and_mirror_unchanged() {
+        // fix8 F2 no-skip pins (TRULY single-cookie R7-3 + mirror,
+        // the fix7 model shapes ported to markers): both align —
+        // LIFO order carries them (the marker owner returns first
+        // and the fast path stands down while markers sit deep).
+        const S: u64 = 0x5A4E;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S);
+        m.return_reject(S);
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S);
+        m.blind_enter(S);
+        m.return_reject(S);
+        m.return_accept(S, 0);
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_normal_overflow_and_nesting_unchanged() {
+        // fix8 F2 no-change pins (R7-3): plain overflow with NO
+        // rejection pops its O-marker (replacing the accepted
+        // skip — same observable); 8-deep nesting pops LIFO;
+        // `blind` never armed in either.
+        const A: u64 = 0xA11CE;
+        const X: u64 = 0xB00B;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.overflow(X);
+        assert_eq!(m.thread.blind, 0);
+        m.return_accept(X, 0);
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+        assert_eq!(m.thread.blind, 0);
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        assert_eq!(m.thread.blind, 0);
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_counter_fallback_collision_stays_aligned() {
+        // fix8 F2 (same-kind same-level collision → fungible
+        // counter): Y's O collides with X's slotted O (Y owns a
+        // counter unit); Y's accepted return consumes it; X pops
+        // its slot; frames pop own. T-collision mirrors it.
+        const A: u64 = 0xA11CE;
+        const X: u64 = 0xB00B;
+        const Y: u64 = 0xC10C;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.overflow(X);
+        m.overflow(Y);
+        assert_eq!((m.thread.overflow, m.thread.blind), (1, 0));
+        m.return_accept(Y, 0);
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 0));
+        m.return_accept(X, 0);
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+        const E: u64 = 0xE11E;
+        const F: u64 = 0xF11F;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.blind_enter(E);
+        m.blind_enter(F);
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 1));
+        assert!(m.return_reject(F));
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 0));
+        assert!(m.return_reject(E));
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_counter_skip_heals_without_cascade() {
+        // fix8 F2 (S2 shape): R1 owns a refused counter unit with
+        // a slotted blind C nested inside; C skips; R1's rejected
+        // return consumes its unit (C's stale slot waits); the next
+        // outer return discards C and pops own. Counter-skips heal
+        // (slotted pops bypass counters entirely) — strictly better
+        // than the old fungible eating, which cascaded here.
+        const A: u64 = 0xA11CE;
+        const R1: u64 = 0xB00B;
+        const C: u64 = 0xC10C;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.quota_fail = true;
+        m.overflow(R1);
+        m.quota_fail = false;
+        assert_eq!(m.thread.overflow, 1);
+        m.blind_enter(C);
+        m.skip();
+        assert!(m.return_reject(R1));
+        assert_eq!(m.thread.overflow, 0);
+        assert!(m.tmarks[8].is_some(), "C's stale slot waits");
+        m.return_accept(A, 8);
+        assert_eq!(m.discarded, 1);
+        for rv in (1..=7u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_quota_refusal_falls_back_to_counters() {
+        // fix8 F2 (quota exhaustion → fungible counters): refused
+        // markers arm exactly the old units; owned returns consume
+        // them; frames pop own. Graceful degradation, still
+        // aligned.
+        const A: u64 = 0xA11CE;
+        const B: u64 = 0xB00B;
+        const C: u64 = 0xC10C;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.quota_fail = true;
+        m.overflow(B);
+        m.blind_enter(C);
+        m.quota_fail = false;
+        assert_eq!((m.thread.overflow, m.thread.blind), (1, 1));
+        assert!(m.return_reject(C));
+        assert_eq!((m.thread.overflow, m.thread.blind), (1, 0));
+        assert!(m.return_reject(B));
+        assert_eq!((m.thread.overflow, m.thread.blind), (0, 0));
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_rejected_frame_pops_suppressed() {
+        // fix8 F2 (straddling close): a framed call whose return is
+        // window-rejected pops its frame WITHOUT emitting (slot
+        // hygiene — pre-fix the frame leaked). A foreign-cookie
+        // reject consumes nothing and disturbs nothing. The outer
+        // frames pop own.
+        const A: u64 = 0xA11CE;
+        const B: u64 = 0xB00B;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        assert!(m.return_reject(A));
+        assert_eq!(m.emitted_len, 0, "rejected pops never emit");
+        assert_eq!(m.thread.depth, 7);
+        assert!(!m.return_reject(B), "foreign reject consumes nothing");
+        assert_eq!(m.thread.depth, 7);
+        for rv in (1..=7u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+    }
+    #[test]
+    fn fix8_neuter_counter_only_cascades_same_cookie() {
+        // fix8 F2 neuter (N2-analog): with markers disabled, the
+        // SAME-cookie overflow shape cascades — the fast path pops
+        // the outer frame for the marker-owner's return and every
+        // later pop shifts. The positional mechanism (not the
+        // tests) carries the fix.
+        const S: u64 = 0x5A4E;
+        let mut m = Fix8Model::new();
+        m.force_counter = true;
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S);
+        assert_eq!((m.thread.overflow, m.thread.blind), (1, 0));
+        m.return_accept(S, 100);
+        for rv in (3..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [(8, 100), (7, 8), (6, 7), (5, 6), (4, 5), (3, 4), (2, 3)]
+        );
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (1, 1, 0),
+            "A1's frame leaks and X's unit orphans"
+        );
+    }
+    #[test]
+    fn fix8_neuter_skip_first_order_misattributes_mixed_slots() {
+        // fix8 F2 design neuter (order): the OLD skip-first
+        // accepted order eats a counter unit even when the
+        // returning call owns a slot — here F2's return consumes
+        // R1's unit and orphans its own O-slot. The positional
+        // bypass (slots before counters) exists for exactly this
+        // mix; with it, both consume own (pinned above).
+        const A: u64 = 0xA11CE;
+        const R1: u64 = 0xB00B;
+        const F2: u64 = 0xF222;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.quota_fail = true;
+        m.overflow(R1);
+        m.quota_fail = false;
+        m.overflow(F2);
+        assert_eq!(m.thread.overflow, 1);
+        assert!(m.thread.skip_return(), "skip-first eats R1's unit");
+        assert!(m.omarks[8].is_some(), "F2's own slot orphans");
+        assert_eq!(m.thread.overflow, 0);
+    }
+    #[test]
+    fn fix8_enter_frame_refuses_cleanly_and_enter_matches() {
+        // fix8 F2 units (R8-2): `enter_frame` wounds+mints on
+        // success and touches NOTHING on refusal (depth cap,
+        // sticky overflow, exhausted invocations); `enter` is
+        // exactly `enter_frame` + bump-on-None (aggregate-machine
+        // behavior unchanged — differential over a state grid).
+        let mut t = Thread::default();
+        assert_eq!(t.enter_frame(), Some(1));
+        assert_eq!((t.next, t.depth, t.overflow), (1, 1, 0));
+        for grid in 0..9u32 {
+            for overflow in [0u32, 1, u32::MAX] {
+                for next in [0u64, 41, u64::MAX - 1, u64::MAX] {
+                    let mut a = Thread {
+                        next,
+                        depth: grid,
+                        overflow,
+                        seed: 3,
+                        blind: 0,
+                    };
+                    let mut b = a;
+                    let frame = a.enter_frame();
+                    let classic = b.enter();
+                    assert_eq!(frame, classic, "grid={grid} o={overflow} next={next}");
+                    assert_eq!((a.next, a.depth), (b.next, b.depth));
+                    match frame {
+                        Some(_) => {
+                            assert_eq!(a.overflow, overflow, "success bumps nothing");
+                            assert_eq!(b.overflow, overflow);
+                        }
+                        None => {
+                            assert_eq!(a.overflow, overflow, "refusal arms nothing");
+                            assert_eq!(b.overflow, overflow.saturating_add(1));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn fix8_marker_slots_reuse_layouts() {
+        // fix8 F2 units (R8-2): marker kinds reuse the frozen
+        // layouts — frames keep key 0, markers take 1/2; marker
+        // values suppress and carry the owner cookie with no
+        // invocation. NO map-layout change (specs untouched).
+        assert_eq!(
+            (PENDING_FRAME, PENDING_OVERFLOW_MARKER, PENDING_BLIND_MARKER),
+            (0, 1, 2)
+        );
+        assert_eq!(MARKER_SUPPRESSED, 2);
+        let marker = Pending::marker(0xC00E);
+        assert_eq!(marker.cookie, 0xC00E);
+        assert_eq!(marker.suppressed, MARKER_SUPPRESSED);
+        assert_eq!(marker.invocation, 0);
+        assert_eq!(core::mem::size_of::<Pending>(), 56);
+        assert_eq!(core::mem::size_of::<PendingKey>(), 24);
+        assert_eq!(core::mem::offset_of!(PendingKey, reserved), 20);
+        assert_eq!(core::mem::size_of::<Thread>(), 32);
     }
     #[test]
     fn thread_value_is_32_with_blind_at_24() {
