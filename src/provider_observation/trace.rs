@@ -462,6 +462,13 @@ struct PendingEdge {
 /// shared a namespace to begin with). Wire keys are UNCHANGED
 /// (outputs still bind the bare `PairKey` — `HashedKey::of`,
 /// exemplars, `key_hash16`).
+///
+/// fix5 (R5-3 dissolution) joint invariant: a mispair needs the
+/// FULL key equal (epoch + stamp + key + invocation); safety =
+/// stamps-differ OR invocations-differ. Fix5-F1 gives
+/// non-reusing invocations (sufficient alone); fix4 gives
+/// separating stamps when clocks resolve (sufficient alone) —
+/// defense in depth, each sufficient.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct EpochKey {
     /// The tid's retire epoch at feed time (`epoch_of`).
@@ -1675,6 +1682,64 @@ mod tests {
         assert_eq!(
             (t.paired, t.unpaired_entries, t.unpaired_results),
             (2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn same_stamp_different_invocations_never_pair() {
+        // fix5 (R5-3 dissolution proof): same stamp + DIFFERENT
+        // invocations (+ same epoch/key) NEVER pair, both feed
+        // orders. A same-stamp mispair WITHOUT invocation reuse
+        // would force the clocksource-restriction path — this
+        // proves the pairing key separates on invocation alone
+        // (the joint invariant's second sufficient strand).
+        for swap in [false, true] {
+            let mut p = edge_bearing();
+            let ka = key(10, 11, 1, 100, 7);
+            let kb = key(10, 11, 1, 100, 8);
+            if swap {
+                p.result(result_stamped(kb, 20, 1500, 1, STAMP));
+                p.attempt(attempt_stamped(ka, 20, 1000, STAMP));
+            } else {
+                p.attempt(attempt_stamped(ka, 20, 1000, STAMP));
+                p.result(result_stamped(kb, 20, 1500, 1, STAMP));
+            }
+            p.finalize(3000);
+            let t = p.totals();
+            assert_eq!(
+                (t.paired, t.unpaired_entries, t.unpaired_results),
+                (0, 1, 1),
+                "swap={swap}"
+            );
+        }
+    }
+
+    #[test]
+    fn high_seeded_continuation_pairs_across_retire() {
+        // fix5 availability: invocations CONTINUING across retire
+        // pair normally — recycled high-seeded edges form pairs
+        // (global-seq seeding must not break pairing).
+        let mut p = edge_bearing();
+        // Old incarnation pairs at a high invocation (as fix5 seeds).
+        let k1 = key(10, 11, 1, 100, 5000);
+        p.attempt(attempt_stamped(k1, 20, 1000, STAMP));
+        p.result(result_stamped(k1, 20, 1500, 1, STAMP));
+        assert_eq!(p.totals().paired, 1, "old high pair forms");
+        // Retire (bump), then recycled HIGH-continuation edges
+        // (new stamp, higher invocation — the fix5 BPF shape) pair.
+        p.retire_scope(10, 11);
+        let k2 = key(10, 11, 1, 100, 5001);
+        p.attempt(attempt_stamped(k2, 20, 2000, STAMP_NEW));
+        p.result(result_stamped(k2, 20, 2500, 1, STAMP_NEW));
+        // Same-incarnation continuation also pairs (no HW block).
+        let k3 = key(10, 11, 1, 100, 5002);
+        p.attempt(attempt_stamped(k3, 20, 2600, STAMP_NEW));
+        p.result(result_stamped(k3, 20, 2700, 1, STAMP_NEW));
+        p.finalize(3000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (3, 0, 0)
         );
     }
 
