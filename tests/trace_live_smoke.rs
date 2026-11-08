@@ -350,3 +350,147 @@ fn off_mode_matches_base(mode: u32) {
         assert_eq!(row.row.gaps.unpaired, 0);
     }
 }
+
+/// fix5 F3d (R5-1 shape): LOSS delta + attribution records queued for
+/// DRAIN (not in carry) → reconcile (empty carry) → drain consumes.
+/// The DRAIN batch must be downgraded + carry the lane gap; the
+/// reconcile batch must carry no stolen signal. REAL throughout:
+/// live attach, live flood overrun (no drain until after reconcile —
+/// overrun by capacity arithmetic, not timing), real decode /
+/// consume / drain path. Ring-mmap forging was refuted first: the
+/// kernel refuses PROT_WRITE on ringbuf producer pages even as root
+/// (EPERM), so only live BPF producers can queue drain content.
+const FLOOD_BATCHES: usize = 40;
+
+fn attributed_downgraded(batch: &po::ObservationBatch) -> (usize, usize) {
+    let mut attributed = 0usize;
+    let mut downgraded = 0usize;
+    for fact in &batch.facts {
+        let (algorithm, quality) = match &fact.payload {
+            po::ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            }
+            | po::ObservationPayload::Implementation {
+                algorithm,
+                alias_quality,
+                ..
+            } => (algorithm, alias_quality),
+            _ => continue,
+        };
+        attributed += 1;
+        if algorithm.label() == "other" && quality.status == po::AliasStatus::Unavailable {
+            downgraded += 1;
+        }
+    }
+    (attributed, downgraded)
+}
+
+#[test]
+#[ignore = "live lane only (TRACE_LIVE_SMOKE=1 + root + fresh object)"]
+fn fix5_f3d_queued_drain_loss_downgrades_drain_batch() {
+    let object = match gated() {
+        Some(object) => object,
+        None => return,
+    };
+    let scratch = ScratchDir(
+        std::env::temp_dir().join(format!("osslscope-trace-f3d-{}", std::process::id())),
+    );
+    let _ = fs::remove_dir_all(&scratch.0);
+    fs::create_dir(&scratch.0).unwrap();
+    let app = build_workload(&scratch.0);
+    let (mut child, rx) = spawn(&app);
+    let mut scanner = ScopedScanner::new(
+        Selection {
+            pids: vec![child.0.id()],
+            ..Default::default()
+        },
+        inventory::Limits::default(),
+    )
+    .unwrap();
+    let mut session = po::ProviderSession::open(po::ObservationLimits::default(), &object).unwrap();
+    session.set_trace_mode(trace::TRACE_MODE_LATENCY).unwrap();
+    let setup = session.reconcile(&scanner.snapshot());
+    assert!(
+        !setup.gaps.iter().any(|g| matches!(
+            g,
+            po::ObservationGap::AttachFailed
+                | po::ObservationGap::BpfUnavailable
+                | po::ObservationGap::SymbolUnavailable
+        )),
+        "setup: {:?}",
+        setup.gaps
+    );
+    // Flood WITHOUT draining: 40 x 60 fetch+digest ops (~16 ring
+    // records each, 104 B each) into the 1 MiB ring (~10k records).
+    // ~38k records against ~10k slots overruns LOSS_RING by
+    // capacity arithmetic; the ring retains the oldest ~10k
+    // records (a queue, not an overwrite ring) with complete
+    // head sequences. No session.drain until after reconcile.
+    let stdin = child.0.stdin.as_mut().unwrap();
+    for _ in 0..FLOOD_BATCHES {
+        stdin.write_all(b"G").unwrap();
+    }
+    stdin.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(300);
+    for n in 0..FLOOD_BATCHES {
+        let line = loop {
+            if Instant::now() >= deadline {
+                panic!("VOID: flood batch {n} did not finish within 300s");
+            }
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(line) if line.starts_with("done ") => break line,
+                Ok(_) => continue,
+                Err(_) => continue,
+            }
+        };
+        assert_eq!(
+            line,
+            format!("done ok={OPS} fetched={OPS}"),
+            "flood batch {n}"
+        );
+    }
+    // Reconcile with an empty carry (no retire ran — the child is
+    // alive): the queued records stay queued for drain.
+    let reconciled = session.reconcile(&scanner.snapshot());
+    assert!(
+        reconciled.facts.is_empty(),
+        "premise: empty carry emits no facts: {:?}",
+        reconciled.facts.iter().map(|f| &f.api).collect::<Vec<_>>()
+    );
+    assert!(
+        !reconciled.gaps.contains(&po::ObservationGap::QueueLoss),
+        "reconcile must not steal the drain's loss signal: {:?}",
+        reconciled.gaps
+    );
+    // Drain consumes the queued survivors: the batch overlaps the
+    // overrun, so every attribution in it downgrades + the lane
+    // gap rides WITH the affected content.
+    let drained = session.drain(Instant::now() + Duration::from_secs(30));
+    eprintln!(
+        "f3d: reconcile_gaps={:?} drain_facts={} drain_gaps={:?}",
+        reconciled.gaps,
+        drained.facts.len(),
+        drained.gaps
+    );
+    assert!(
+        drained.gaps.contains(&po::ObservationGap::QueueLoss),
+        "drain batch must carry the overlapping lane gap: {:?}",
+        drained.gaps
+    );
+    let (attributed, downgraded) = attributed_downgraded(&drained);
+    assert!(
+        attributed >= 1,
+        "premise: queued survivors must attribute: facts={}",
+        drained.facts.len()
+    );
+    assert_eq!(
+        downgraded, attributed,
+        "every queued attribution overlapping loss downgrades"
+    );
+    child.0.stdin.as_mut().unwrap().write_all(b"X").unwrap();
+    drop(child.0.stdin.take());
+    assert!(child.0.wait().unwrap().success());
+    let _ = session.close();
+}

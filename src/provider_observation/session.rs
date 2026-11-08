@@ -3049,8 +3049,9 @@ impl ProviderSession {
         if self.closed || self.final_drain || !self.gate.admitting() {
             b.gap(ObservationGap::Invalidated);
             // fix4: this exit also emits the taken carry — validate
-            // it exactly like the tail exit (see below).
-            self.poll_loss_lanes(&mut b);
+            // it exactly like the tail exit (see below). fix5: peek,
+            // never consume (R5-1).
+            self.peek_loss_lanes(&mut b);
             return b;
         }
         // R5-3: pending retries drain FIRST — before the release
@@ -3286,7 +3287,10 @@ impl ProviderSession {
         // before emitting, exactly like `drain` does. Poll LAST:
         // retire-drains fire mid-reconcile, and only a
         // post-consumption poll catches overlapping loss.
-        self.poll_loss_lanes(&mut b);
+        // fix5 (R5-1): PEEK, never consume — a delta here may
+        // belong to records still queued for drain; the next
+        // drain accounts it (single accounting site).
+        self.peek_loss_lanes(&mut b);
         b
     }
     fn add_target(
@@ -3561,48 +3565,98 @@ impl ProviderSession {
         b.gap(ObservationGap::SamplingPartial);
         Ok(())
     }
-    /// fix4 (R4-2): the single LOSS-validation site. Polls all
-    /// eight loss lanes AFTER the caller consumed ring content and
-    /// downgrades the WHOLE batch (carry included) on any delta
-    /// or read failure. Called by `drain` (after its ring loop)
-    /// AND by `reconcile_records` (at the end, both exits — the
-    /// carry it flushes was consumed by retire-drains and must
-    /// validate exactly like drain-emitted content). One function,
-    /// two call sites — the two emission points cannot drift.
+    /// fix4 (R4-2) + fix5 (R5-1): the single CONSUMING
+    /// LOSS-validation site. Polls all eight loss lanes AFTER the
+    /// caller consumed ring content and downgrades the WHOLE batch
+    /// (carry included) on any delta or read failure. Called ONLY
+    /// by `drain` (after its ring loop) — it is the single
+    /// accounting site (`last_loss`/`loss_totals` advance here and
+    /// nowhere else). `reconcile_records` (both exits) uses the
+    /// peek below instead: a reconcile-time consume would steal a
+    /// delta belonging to records still queued for drain (R5-1).
     fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
                 Ok(values) => {
-                    self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
-                    // N4: stamp the read's containing tick (0
-                    // without a clock — fail-closed: an unstamped
-                    // read cannot advance the baseline).
-                    self.loss_read_tick[index] = self
-                        .loss_tick_clock
-                        .map(|(origin, tick_ns)| {
-                            loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns)
-                        })
-                        .unwrap_or(0);
+                    self.stamp_loss_read(index);
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
                         self.loss_totals[index] =
                             self.loss_totals[index].saturating_add(total - self.last_loss[index]);
                         self.aliases.clear();
                         invalidate_algorithms(b);
-                        b.gap(match index {
-                            0 => ObservationGap::QueueLoss,
-                            1 => ObservationGap::PendingLimit,
-                            2 => ObservationGap::DepthLimit,
-                            3 => ObservationGap::UnpairedReturn,
-                            4 => ObservationGap::TargetReadFailed,
-                            5 => ObservationGap::RelocationRefused,
-                            6 => ObservationGap::DispatchPartial,
-                            _ => ObservationGap::NamespaceChanged,
-                        });
+                        b.gap(loss_lane_gap(index));
                         self.last_loss[index] = total;
                     }
                 }
                 Err(_) => {
+                    self.aliases.clear();
+                    invalidate_algorithms(b);
+                    b.gap(ObservationGap::BpfUnavailable);
+                }
+            }
+        }
+    }
+    /// N4: one bump+stamp per successful LOSS map read. Shared by
+    /// the consuming poll and the peek — a peek IS a successful
+    /// read, so receipts (and the coordinator's read-tick
+    /// advancement) keep their cadence on both paths.
+    fn stamp_loss_read(&mut self, index: usize) {
+        self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
+        // N4: stamp the read's containing tick (0 without a clock
+        // — fail-closed: an unstamped read cannot advance the
+        // baseline).
+        self.loss_read_tick[index] = self
+            .loss_tick_clock
+            .map(|(origin, tick_ns)| loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns))
+            .unwrap_or(0);
+    }
+    /// fix5 (R5-1): peek-style LOSS validation for the reconcile
+    /// path — signal without stealing. Reads every lane
+    /// (bump+stamp receipts, exactly like the consuming poll) and
+    /// downgrades + gaps the batch on any delta, but NEVER
+    /// advances `last_loss`/`loss_totals`: the next `drain` still
+    /// sees the full delta and accounts it once. The downgrade +
+    /// lane gap fire iff the batch carries attribution-bearing
+    /// content (facts or learned sites — exactly what
+    /// `invalidate_algorithms` mutates), so the signal rides with
+    /// affected content and an empty reconcile batch emits no
+    /// stolen-signal noise.
+    ///
+    /// No-under-downgrade: every emitted batch is validated AFTER
+    /// its content was consumed (drain batches by the consuming
+    /// poll, reconcile batches by this peek; retire-drain content
+    /// lands in the carry and is validated by whichever emits it
+    /// next). A delta overlapping both a reconcile batch and
+    /// queued drain records downgrades BOTH (the peek sees
+    /// total > last_loss; the drain later sees total' >= total >
+    /// last_loss and accounts totals += total' - last_loss once).
+    /// `last_loss` advances only at drain, so any delta since the
+    /// last drain is caught by the next drain no matter how many
+    /// peeks observed it — nothing is consumed without
+    /// accounting. The drain-side downgrade is cumulative and may
+    /// cover records that arrived before the loss instant
+    /// (over-conservative, sound: downgrade ⊇ affected).
+    fn peek_loss_lanes(&mut self, b: &mut ObservationBatch) {
+        let content = !b.facts.is_empty() || !b.learned_sites.is_empty();
+        for index in 0..8 {
+            match self.loss.get(&(index as u32), 0) {
+                Ok(values) => {
+                    self.stamp_loss_read(index);
+                    if !content {
+                        continue;
+                    }
+                    let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
+                    if total > self.last_loss[index] {
+                        self.aliases.clear();
+                        invalidate_algorithms(b);
+                        b.gap(loss_lane_gap(index));
+                    }
+                }
+                Err(_) => {
+                    if !content {
+                        continue;
+                    }
                     self.aliases.clear();
                     invalidate_algorithms(b);
                     b.gap(ObservationGap::BpfUnavailable);
@@ -5568,6 +5622,20 @@ pub(crate) fn assemble_payload(
     })
 }
 
+/// fix5: lane index → batch gap, shared by the consuming poll
+/// and the peek (was inline in `poll_loss_lanes`).
+fn loss_lane_gap(index: usize) -> ObservationGap {
+    match index {
+        0 => ObservationGap::QueueLoss,
+        1 => ObservationGap::PendingLimit,
+        2 => ObservationGap::DepthLimit,
+        3 => ObservationGap::UnpairedReturn,
+        4 => ObservationGap::TargetReadFailed,
+        5 => ObservationGap::RelocationRefused,
+        6 => ObservationGap::DispatchPartial,
+        _ => ObservationGap::NamespaceChanged,
+    }
+}
 fn invalidate_algorithms(batch: &mut ObservationBatch) {
     for fact in &mut batch.facts {
         match &mut fact.payload {

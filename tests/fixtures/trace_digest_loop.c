@@ -12,27 +12,31 @@ int main(void) {
     }
     setvbuf(stdout, NULL, _IONBF, 0);
     puts("ready");
-    if (getchar() != 'G') {
-        return 2;
-    }
-    int ok = 0;
-    int fetched = 0;
-    for (int i = 0; i < 60; i++) {
-        EVP_MD *md = EVP_MD_fetch(NULL, "SHA2-256", NULL);
-        if (md == NULL) {
-            continue;
+    /* fix5 F3d: loop single G batches until X (G..done..G..done..X).
+     * One-shot G..done..X still works exactly as before. */
+    for (;;) {
+        int c = getchar();
+        if (c == 'X') {
+            return 0;
         }
-        fetched++;
-        size_t outlen = 0;
-        if (EVP_Q_digest(NULL, "SHA2-256", NULL, input, sizeof input, out, &outlen) == 1
-            && outlen == 32) {
-            ok++;
+        if (c != 'G') {
+            return 2;
         }
-        EVP_MD_free(md);
+        int ok = 0;
+        int fetched = 0;
+        for (int i = 0; i < 60; i++) {
+            EVP_MD *md = EVP_MD_fetch(NULL, "SHA2-256", NULL);
+            if (md == NULL) {
+                continue;
+            }
+            fetched++;
+            size_t outlen = 0;
+            if (EVP_Q_digest(NULL, "SHA2-256", NULL, input, sizeof input, out, &outlen) == 1
+                && outlen == 32) {
+                ok++;
+            }
+            EVP_MD_free(md);
+        }
+        printf("done ok=%d fetched=%d\n", ok, fetched);
     }
-    printf("done ok=%d fetched=%d\n", ok, fetched);
-    if (getchar() != 'X') {
-        return 3;
-    }
-    return 0;
 }
