@@ -423,11 +423,11 @@ fn fix5_f3d_queued_drain_loss_downgrades_drain_batch() {
         setup.gaps
     );
     // Flood WITHOUT draining: 40 x 60 fetch+digest ops (~16 ring
-    // records each, 104 B each) into the 1 MiB ring (~10k records).
-    // ~38k records against ~10k slots overruns LOSS_RING by
-    // capacity arithmetic; the ring retains the oldest ~10k
-    // records (a queue, not an overwrite ring) with complete
-    // head sequences. No session.drain until after reconcile.
+    // records each, 112 B each — fix6) into the 1 MiB ring (~9.3k
+    // records). ~38k records against ~9.3k slots overruns
+    // LOSS_RING by capacity arithmetic; the ring retains the
+    // oldest ~9.3k records (a queue, not an overwrite ring) with
+    // complete head sequences. No session.drain until after reconcile.
     let stdin = child.0.stdin.as_mut().unwrap();
     for _ in 0..FLOOD_BATCHES {
         stdin.write_all(b"G").unwrap();

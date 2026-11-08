@@ -136,6 +136,10 @@ pub struct AttemptEdge {
     /// BPF-stamped task incarnation (`Record.start_time_ns`,
     /// decode-gated nonzero). Part of the pairing identity.
     pub start_time_ns: u64,
+    /// BPF-stamped creation seed (`Record.seed`, bytes 104..112 —
+    /// NOT decode-gated: 0 is the legitimate first creation).
+    /// Part of the pairing identity.
+    pub seed: u64,
 }
 
 /// Decoded RESULT edge (producer input).
@@ -152,6 +156,10 @@ pub struct ResultEdge {
     /// BPF-stamped task incarnation (`Record.start_time_ns`,
     /// decode-gated nonzero). Part of the pairing identity.
     pub start_time_ns: u64,
+    /// BPF-stamped creation seed (`Record.seed`, bytes 104..112 —
+    /// NOT decode-gated: 0 is the legitimate first creation).
+    /// Part of the pairing identity.
+    pub seed: u64,
 }
 
 /// Frozen §6D-3 finite histogram edges (ns, ascending, verbatim).
@@ -454,27 +462,35 @@ struct PendingEdge {
     seq: u64,
 }
 
-/// Epoch-tagged pairing key (fix3 + fix4 incarnation): the
-/// retire epoch AND the BPF-stamped task incarnation are part of
-/// the pairing identity, so cross-incarnation edges never pair in
-/// EITHER recycle order (after-retire late edges land in their
-/// own incarnation namespace; before-retire recycled edges never
-/// shared a namespace to begin with). Wire keys are UNCHANGED
-/// (outputs still bind the bare `PairKey` — `HashedKey::of`,
-/// exemplars, `key_hash16`).
+/// Epoch-tagged pairing key (fix3 + fix4 incarnation + fix6
+/// seed): the retire epoch AND the BPF-stamped task incarnation
+/// AND the BPF-stamped creation seed are part of the pairing
+/// identity, so cross-incarnation edges never pair in EITHER
+/// recycle order (after-retire late edges land in their own
+/// incarnation namespace; before-retire recycled edges never
+/// shared a namespace to begin with), and cross-creation edges
+/// never pair even when invocations overlap (R6-1: rows restart
+/// at 1 BY DESIGN — the seed scopes them). Wire keys are
+/// UNCHANGED (outputs still bind the bare `PairKey` —
+/// `HashedKey::of`, exemplars, `key_hash16`).
 ///
-/// fix5 (R5-3 dissolution) joint invariant: a mispair needs the
-/// FULL key equal (epoch + stamp + key + invocation); safety =
-/// stamps-differ OR invocations-differ. Fix5-F1 gives
-/// non-reusing invocations (sufficient alone); fix4 gives
-/// separating stamps when clocks resolve (sufficient alone) —
-/// defense in depth, each sufficient.
+/// fix6 (R6-1) joint invariant: a mispair needs the FULL key
+/// equal (epoch + stamp + seed + key + invocation); safety =
+/// stamps-differ OR seeds-differ OR invocations-differ — three
+/// strands, each sufficient with its precondition (stamps
+/// immutable-ish, seeds CAS-unique, invocations
+/// per-row-monotonic). (The fix5 two-strand invariant claimed
+/// non-reusing invocations — R6-1 refuted it: unique seeds with
+/// overlapping ranges mispair. The answer is identity — the seed
+/// IN the key — not more arithmetic.)
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct EpochKey {
     /// The tid's retire epoch at feed time (`epoch_of`).
     epoch: u64,
     /// BPF-stamped task incarnation at feed time.
     start_time_ns: u64,
+    /// BPF-stamped creation seed at feed time.
+    seed: u64,
     /// Full wire pairing key.
     key: PairKey,
 }
@@ -482,11 +498,12 @@ struct EpochKey {
 /// Pairing scope: the THREADS-row scope (contract `ThreadKey` —
 /// `pid`, `tid`, `generation` — the key `invocation` counts
 /// under), qualified by the retire epoch (HW is per-epoch,
-/// dropped at bump — fix3) AND the task incarnation (HW is
+/// dropped at bump — fix3), the task incarnation (HW is
 /// per-incarnation — fix4: a recycled tid's invocation counter
-/// never aliases the old one; fix5: BPF row creation seeds from
-/// a global fetch-add, so counters never restart at all and
-/// per-incarnation HW stands as defense in depth).
+/// never aliases the old one) AND the creation seed (HW is
+/// per-seed — fix6: invocations restart at 1 per row BY DESIGN,
+/// so an unscoped HW would false-dup across seeds — the same
+/// reasoning as per-incarnation).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ScopeKey {
     /// Executing pid.
@@ -499,6 +516,8 @@ struct ScopeKey {
     epoch: u64,
     /// Task incarnation (high-water namespace).
     start_time_ns: u64,
+    /// Creation seed (high-water namespace).
+    seed: u64,
 }
 
 impl ScopeKey {
@@ -510,6 +529,7 @@ impl ScopeKey {
             generation: key.key.generation,
             epoch: key.epoch,
             start_time_ns: key.start_time_ns,
+            seed: key.seed,
         }
     }
 }
@@ -629,14 +649,18 @@ impl TraceProducer {
         // fix3: tag with the tid's current retire epoch — the epoch
         // is part of the pairing identity, so a pre-bump hold never
         // pairs with a post-bump edge (no window-counted rejection:
-        // the new incarnation pairs immediately from its high-seeded
-        // invocations — fix5: BPF seeds HIGH, never 1).
+        // the new incarnation pairs immediately — its restarted
+        // invocations are scoped by the new seed).
         // fix4: tag with the BPF-stamped incarnation too — soundness
         // against recycled tids (both orders) comes from the stamp,
         // not from the drain barrier (which is best-effort ordering).
+        // fix6: tag with the BPF-stamped creation seed too —
+        // soundness against delete/recreate invocation overlap
+        // (R6-1) comes from the seed: rows restart at 1 BY DESIGN.
         let ekey = EpochKey {
             epoch: self.epoch_of(edge.key.pid, edge.key.tid),
             start_time_ns: edge.start_time_ns,
+            seed: edge.seed,
             key: edge.key,
         };
         // F4: a held RESULT pairs only in its arrival window
@@ -729,9 +753,11 @@ impl TraceProducer {
         });
         // fix3: epoch tag (see `attempt` — same boundary).
         // fix4: incarnation tag (see `attempt` — same boundary).
+        // fix6: seed tag (see `attempt` — same boundary).
         let ekey = EpochKey {
             epoch: self.epoch_of(edge.key.pid, edge.key.tid),
             start_time_ns: edge.start_time_ns,
+            seed: edge.seed,
             key: edge.key,
         };
         if let Some(held) = self.pending_attempt_remove(&ekey) {
@@ -925,8 +951,9 @@ impl TraceProducer {
     /// the next edge-bearing feed). The HW scopes are dropped (HW
     /// is per-epoch) and the epoch bumps: pre-bump holds (old
     /// epoch) never pair with post-bump edges (new epoch), and
-    /// the new incarnation pairs immediately from its high-seeded
-    /// invocations (fix5: BPF seeds HIGH, never 1).
+    /// the new incarnation pairs immediately — fix6: its restarted
+    /// invocations (rows restart at 1 BY DESIGN) are scoped by the
+    /// new row's seed, so they never alias the old holds.
     /// Epoch storage is FIXED-CAPPED (FIFO, same
     /// kernel-mirrored bound); evicting an epoch expires the
     /// victim's pending WITH it (coupled expiry — protection
@@ -988,9 +1015,9 @@ impl TraceProducer {
     /// precedence), and the HW shield extends past the expired
     /// holds (current epoch only — stale-epoch HW is dead), so
     /// late old edges (invocations at or below the old HW) land
-    /// visible dup-unpaired — fix5: recycled tids seed HIGH from
-    /// the BPF global counter, so their new edges land in a fresh
-    /// incarnation scope above the shield and pair normally.
+    /// visible dup-unpaired — fix6: recycled tids mint a fresh
+    /// seed, so their restarted edges land in a fresh seed scope
+    /// beside the shield and pair normally.
     /// Conservation exact; the session records the visible skip
     /// signal (`DrainOverrun`).
     pub(crate) fn retire_scope_skipped(&mut self, pid: u32, tid: u32) {
@@ -1390,6 +1417,12 @@ mod tests {
     const STAMP: u64 = 0x5A44;
     /// A second test incarnation (recycled tid).
     const STAMP_NEW: u64 = 0x5A45;
+    /// Default test seed (0 — the legitimate first creation; every
+    /// default-helper test below pins the decoder's NO-nonzero-gate
+    /// rule implicitly).
+    const SEED: u64 = 0;
+    /// A second test seed (recreated row).
+    const SEED_NEW: u64 = 1;
 
     fn attempt(key: PairKey, api: u32, ns: u64) -> AttemptEdge {
         AttemptEdge {
@@ -1397,6 +1430,7 @@ mod tests {
             api,
             monotonic_ns: ns,
             start_time_ns: STAMP,
+            seed: SEED,
         }
     }
 
@@ -1407,6 +1441,7 @@ mod tests {
             monotonic_ns: ns,
             outcome,
             start_time_ns: STAMP,
+            seed: SEED,
         }
     }
 
@@ -1416,6 +1451,7 @@ mod tests {
             api,
             monotonic_ns: ns,
             start_time_ns: stamp,
+            seed: SEED,
         }
     }
 
@@ -1426,6 +1462,28 @@ mod tests {
             monotonic_ns: ns,
             outcome,
             start_time_ns: stamp,
+            seed: SEED,
+        }
+    }
+
+    fn attempt_seeded(key: PairKey, api: u32, ns: u64, seed: u64) -> AttemptEdge {
+        AttemptEdge {
+            key,
+            api,
+            monotonic_ns: ns,
+            start_time_ns: STAMP,
+            seed,
+        }
+    }
+
+    fn result_seeded(key: PairKey, api: u32, ns: u64, outcome: u32, seed: u64) -> ResultEdge {
+        ResultEdge {
+            key,
+            api,
+            monotonic_ns: ns,
+            outcome,
+            start_time_ns: STAMP,
+            seed,
         }
     }
 
@@ -1665,10 +1723,10 @@ mod tests {
         // fix4: same-stamp edges pair (legitimate — it really
         // happened), and the high-water is per-incarnation: a
         // consumed invocation in the old incarnation never
-        // suppresses the recycled same-invocation call (fix5:
-        // BPF never re-emits invocation 7 — the forged reuse
-        // below pins the stamp-namespace isolation as defense
-        // in depth, not a reachable BPF shape).
+        // suppresses the recycled same-invocation call (fix6:
+        // BPF rows restart invocations at 1 BY DESIGN, scoped by
+        // the seed — the forged reuse below pins the
+        // stamp-namespace isolation as one sufficient strand).
         let mut p = edge_bearing();
         let k = key(10, 11, 1, 100, 7);
         p.attempt(attempt_stamped(k, 20, 1000, STAMP));
@@ -1717,26 +1775,122 @@ mod tests {
     }
 
     #[test]
-    fn high_seeded_continuation_pairs_across_retire() {
-        // fix5 availability: invocations CONTINUING across retire
-        // pair normally — recycled high-seeded edges form pairs
-        // (global-seq seeding must not break pairing).
+    fn seed_scoped_cross_creation_reuse_never_pairs() {
+        // fix6 F1/F3e GREEN (RED was the R6-1 mispair on seedless
+        // code — same schedule paired (1,0,0)): row A (seed 0)
+        // emits invocation 2, is deleted by numeric cleanup; row B
+        // (seed 1) restarts and re-emits invocation 2 BY DESIGN.
+        // Late RESULT(A) + ATTEMPT(B) share stamp+epoch+key+
+        // invocation (same task — a live-row delete never
+        // re-stamps) but carry DIFFERENT seeds: no pair, both
+        // orders. Conservation exact.
+        for swap in [false, true] {
+            let mut p = edge_bearing();
+            let k = key(10, 11, 1, 100, 2);
+            if swap {
+                p.result(result_seeded(k, 20, 1500, 1, SEED));
+                p.attempt(attempt_seeded(k, 20, 1000, SEED_NEW));
+            } else {
+                p.attempt(attempt_seeded(k, 20, 1000, SEED_NEW));
+                p.result(result_seeded(k, 20, 1500, 1, SEED));
+            }
+            p.finalize(2000);
+            let t = p.totals();
+            assert_eq!(
+                (t.paired, t.unpaired_entries, t.unpaired_results),
+                (0, 1, 1),
+                "swap={swap}: cross-seed reuse must not pair"
+            );
+            let ra: u64 = t.received.attempts.iter().sum();
+            let rr: u64 = t.received.results.iter().sum();
+            assert_eq!(ra, t.paired + t.unpaired_entries, "swap={swap}");
+            assert_eq!(rr, t.paired + t.unpaired_results, "swap={swap}");
+        }
+    }
+
+    #[test]
+    fn seed_scoped_same_seed_restart_pairs_and_hw_is_per_seed() {
+        // fix6 F1 availability + HW-per-seed: same-seed edges pair
+        // (legitimate — it really happened), and the high-water is
+        // per-seed: a consumed invocation under the old seed never
+        // suppresses the recreated same-invocation call (rows
+        // restart at 1 BY DESIGN — an unscoped HW would false-dup
+        // every recreated row's first calls).
         let mut p = edge_bearing();
-        // Old incarnation pairs at a high invocation (as fix5 seeds).
-        let k1 = key(10, 11, 1, 100, 5000);
-        p.attempt(attempt_stamped(k1, 20, 1000, STAMP));
-        p.result(result_stamped(k1, 20, 1500, 1, STAMP));
-        assert_eq!(p.totals().paired, 1, "old high pair forms");
-        // Retire (bump), then recycled HIGH-continuation edges
-        // (new stamp, higher invocation — the fix5 BPF shape) pair.
+        let k = key(10, 11, 1, 100, 1);
+        p.attempt(attempt_seeded(k, 20, 1000, SEED));
+        p.result(result_seeded(k, 20, 1500, 1, SEED));
+        assert_eq!(p.totals().paired, 1, "same-seed pair forms");
+        // Recreated row restarts invocation 1 under a new seed:
+        // not an HW dup (the old scope's HW is namespaced away).
+        p.attempt(attempt_seeded(k, 20, 2000, SEED_NEW));
+        p.result(result_seeded(k, 20, 2500, 1, SEED_NEW));
+        p.finalize(3000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (2, 0, 0)
+        );
+        // ... while a same-seed replay stays HW-blocked.
+        p.attempt(attempt_seeded(k, 20, 4000, SEED_NEW));
+        p.result(result_seeded(k, 20, 4500, 1, SEED_NEW));
+        p.finalize(5000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (2, 1, 1),
+            "same-seed replay stays dup-unpaired"
+        );
+    }
+
+    #[test]
+    fn same_stamp_different_seeds_never_pair() {
+        // fix6 F1: same stamp + SAME invocation + different seeds
+        // NEVER pair, both feed orders — extends the R5-3 proof to
+        // the three-strand invariant (the seed strand separates on
+        // its own, like the stamp and invocation strands).
+        for swap in [false, true] {
+            let mut p = edge_bearing();
+            let k = key(10, 11, 1, 100, 7);
+            if swap {
+                p.result(result_seeded(k, 20, 1500, 1, SEED_NEW));
+                p.attempt(attempt_seeded(k, 20, 1000, SEED));
+            } else {
+                p.attempt(attempt_seeded(k, 20, 1000, SEED));
+                p.result(result_seeded(k, 20, 1500, 1, SEED_NEW));
+            }
+            p.finalize(3000);
+            let t = p.totals();
+            assert_eq!(
+                (t.paired, t.unpaired_entries, t.unpaired_results),
+                (0, 1, 1),
+                "swap={swap}"
+            );
+        }
+    }
+
+    #[test]
+    fn seed_scoped_restart_pairs_across_retire() {
+        // fix6 availability (replaces the fix5 high-seed pin — the
+        // old `b > a`-on-`next` assert is VOID: it measured the
+        // wrong thing): rows restart invocations at 1 BY DESIGN,
+        // scoped by the seed. Old incarnation pairs (seed 0), retire
+        // (bump), then the recycled row RESTARTS at invocation 1
+        // under a new seed (same stamp — a delete/recreate without
+        // tid death never re-stamps; the seed separates alone) and
+        // pairs; same-seed continuation also pairs (no HW block).
+        let mut p = edge_bearing();
+        let k1 = key(10, 11, 1, 100, 5);
+        p.attempt(attempt_seeded(k1, 20, 1000, SEED));
+        p.result(result_seeded(k1, 20, 1500, 1, SEED));
+        assert_eq!(p.totals().paired, 1, "old pair forms");
         p.retire_scope(10, 11);
-        let k2 = key(10, 11, 1, 100, 5001);
-        p.attempt(attempt_stamped(k2, 20, 2000, STAMP_NEW));
-        p.result(result_stamped(k2, 20, 2500, 1, STAMP_NEW));
-        // Same-incarnation continuation also pairs (no HW block).
-        let k3 = key(10, 11, 1, 100, 5002);
-        p.attempt(attempt_stamped(k3, 20, 2600, STAMP_NEW));
-        p.result(result_stamped(k3, 20, 2700, 1, STAMP_NEW));
+        let k2 = key(10, 11, 1, 100, 1);
+        p.attempt(attempt_seeded(k2, 20, 2000, SEED_NEW));
+        p.result(result_seeded(k2, 20, 2500, 1, SEED_NEW));
+        let k3 = key(10, 11, 1, 100, 2);
+        p.attempt(attempt_seeded(k3, 20, 2600, SEED_NEW));
+        p.result(result_seeded(k3, 20, 2700, 1, SEED_NEW));
         p.finalize(3000);
         let t = p.totals();
         assert_eq!(
@@ -2625,8 +2779,9 @@ mod tests {
         // fix3: epochs replace window-counted markers — old-old pairs preserved iff
         // drained pre-bump; the new incarnation pairs clean IMMEDIATELY
         // (no 2-window rejection); cross-bump same-key halves never
-        // pair. (fix5: the forged post-bump invocations 1..=10 below
-        // exercise the epoch namespace — real recycled tids seed HIGH.)
+        // pair. (fix6: the forged post-bump invocations 1..=10 below
+        // exercise the epoch namespace — and real recycled tids DO
+        // restart at 1 now, scoped by their fresh seed.)
         let mut p = edge_bearing();
         // Old incarnation: complete pairs (both gens) + one dangling hold.
         for generation in [1u64, 2] {

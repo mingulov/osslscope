@@ -371,9 +371,9 @@ pub(crate) const TYPED_COOKIE_FIRST: u64 = 1 << 31;
 /// One past the last typed cookie (u32 range end, exclusive).
 pub(crate) const TYPED_COOKIE_END: u64 = 1 << 32;
 /// fix3: retire-drain event budget. The EVENTS ring holds 1 MiB
-/// (`provider_observation.rs:33`) of exact-104 B records
-/// (contract `EVENT_SIZE`), so ≤ 10,082 records fit resident;
-/// 65,536 ≈ 6.5× that absorbs a full ring plus in-flight commits
+/// (`provider_observation.rs:33`) of exact-112 B records
+/// (contract `EVENT_SIZE` — fix6), so ≤ 9,362 records fit resident;
+/// 65,536 ≈ 7× that absorbs a full ring plus in-flight commits
 /// plus concurrent producer arrivals during the drain. Past it
 /// the bump is skipped (stay unretired + visible `DrainOverrun`)
 /// — an unprovable-empty ring must never bump. Worst-case work is
@@ -2023,11 +2023,13 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
         ("MEMBERS", 1, 4, 24, 64),
         ("NAMESPACE", 2, 4, 16, 1),
         ("RANGES", 1, 8, 16, 8192),
-        ("THREADS", 1, 16, 16, 4096),
+        // fix6 (R6-1): THREADS/API_THREADS values 16→24 B (the
+        // row remembers its creation seed — contract `Thread`).
+        ("THREADS", 1, 16, 24, 4096),
         ("PENDING", 1, 24, 56, 4096),
         ("LOSS", 6, 4, 8, 8),
         ("API_TOTALS", 5, 8, 72, 1024),
-        ("API_THREADS", 1, 24, 16, 4096),
+        ("API_THREADS", 1, 24, 24, 4096),
         ("API_WINDOW", 2, 4, 16, 1),
         ("TRACE_MODE", 2, 4, 4, 1),
         ("ALG_CLASS", 1, 8, 42, 1024),
@@ -2718,10 +2720,13 @@ impl ProviderSession {
     /// contract: absence-confirming Exit (fresh triple + task-dir
     /// absence + window coverage) — removal itself is best-effort
     /// per key (a row re-created after our removal belongs to a
-    /// live recycled tid and self-heals on its next hit; fix5:
-    /// the re-created row seeds HIGH from the BPF global INV_SEQ
-    /// counter, so it can never re-emit an invocation inside its
-    /// own stamp — R5-2 closed; orphaned PENDING frames stay
+    /// live recycled tid and self-heals on its next hit; fix6:
+    /// the re-created row mints a FRESH seed from the BPF global
+    /// INV_SEQ counter and restarts invocations at 1 BY DESIGN,
+    /// scoped by that seed — R6-1 closed (the fix5 "seeds HIGH,
+    /// never re-emits" claim INVERTS: unique seeds with
+    /// overlapping ranges mispair; the seed joins the pairing key
+    /// as identity); orphaned PENDING frames stay
     /// BPF-bounded and fail visible on cookie mismatch, never
     /// silently). Returns the cleanup-failure
     /// count (enumeration + deletion); the caller records a
@@ -3940,6 +3945,7 @@ impl ProviderSession {
                     api: r.api,
                     monotonic_ns: r.monotonic_ns,
                     start_time_ns: r.start_time_ns,
+                    seed: r.seed,
                 });
             } else {
                 self.trace.result(super::trace::ResultEdge {
@@ -3948,6 +3954,7 @@ impl ProviderSession {
                     monotonic_ns: r.monotonic_ns,
                     outcome: r.outcome,
                     start_time_ns: r.start_time_ns,
+                    seed: r.seed,
                 });
             }
         }
@@ -7566,8 +7573,9 @@ mod tests {
         // on sixteen possible CPUs, excluding the separately owned ADMIT gate
         // (T8.2a: TRACE_MODE adds (4 + 8 + 128) * 1 + 65536 = 65676;
         // fix4: CONFIG value 24 -> 32 adds (8 + 32 + 128 - 160) * 1024 = 8192;
-        // fix5: INV_SEQ adds (4 + 8 + 128) * 1 + 65536 = 65676).
-        let required = 7_305_904;
+        // fix5: INV_SEQ adds (4 + 8 + 128) * 1 + 65536 = 65676;
+        // fix6: THREADS + API_THREADS values 16 -> 24 add 8 * 4096 * 2 = 65536).
+        let required = 7_371_440;
         let budget = ObservationBudget::new(ObservationLimits {
             max_state_bytes: required - 1,
             ..Default::default()
@@ -17320,11 +17328,12 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
 /// `#[ignore]`d with graceful skip-with-message when map creation
 /// fails (no caps — the INCONCLUSIVE pattern); run under sudo in M4.
 ///
-/// fix5: the forged cross-incarnation invocation reuse below (inv 1
+/// fix6: the forged cross-incarnation invocation reuse below (inv 1
 /// under both OLD and NEW stamps) exercises the stamp-namespace
-/// isolation as defense in depth — real BPF row creation seeds
-/// from the global INV_SEQ counter and never re-emits an
-/// invocation within a tid.
+/// isolation as one sufficient strand — real BPF rows restart
+/// invocations at 1 BY DESIGN, scoped by their fresh creation
+/// seed (the fix5 "never re-emits" claim INVERTS — R6-1). F3e
+/// forges the seed strand itself (same stamp, different seeds).
 #[cfg(test)]
 mod fix4_retire {
     use super::*;
@@ -17335,6 +17344,12 @@ mod fix4_retire {
     /// tid incarnation vs its recycled replacement.
     const OLD_START: u64 = 111_000_000_001;
     const NEW_START: u64 = 222_000_000_002;
+    /// Forged creation seeds (fix6): the first creation (0 —
+    /// legitimate, like the wire's no-gate rule) vs the recreated
+    /// row's fresh seed. F3a/b share one seed (their stamps alone
+    /// must separate); F3e forges both.
+    const SEED: u64 = 0;
+    const SEED_NEW: u64 = 1;
     /// Operational API: `consume` feeds the trace producer then
     /// early-returns (trace plane only — no cold facts).
     const EDGE_API: u32 = 20;
@@ -17554,7 +17569,8 @@ mod fix4_retire {
 
     /// Forge an edge-record image (ATTEMPT/RESULT shape: zero
     /// operation/algorithm/function/cacheability/code) with a
-    /// forged incarnation stamp at offset 96.
+    /// forged incarnation stamp at offset 96 and a forged creation
+    /// seed at offset 104 (fix6).
     fn edge_bytes(
         kind: u32,
         pid: u32,
@@ -17563,6 +17579,7 @@ mod fix4_retire {
         mono_ns: u64,
         outcome: u32,
         start: u64,
+        seed: u64,
     ) -> Vec<u8> {
         let mut b = vec![0u8; c::EVENT_SIZE];
         for (at, v) in [
@@ -17585,6 +17602,7 @@ mod fix4_retire {
         }
         b[56..60].copy_from_slice(&outcome.to_le_bytes());
         b[96..104].copy_from_slice(&start.to_le_bytes());
+        b[104..112].copy_from_slice(&seed.to_le_bytes());
         b
     }
 
@@ -17625,20 +17643,20 @@ mod fix4_retire {
         // must not pair.
         feed(
             &mut s,
-            &edge_bytes(c::RESULT, pid, tid, 1, 100, 1, OLD_START),
+            &edge_bytes(c::RESULT, pid, tid, 1, 100, 1, OLD_START, SEED),
         );
         feed(
             &mut s,
-            &edge_bytes(c::ATTEMPT, pid, tid, 1, 200, 0, NEW_START),
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 200, 0, NEW_START, SEED),
         );
         // Same-incarnation old+old pair (inv 9, OLD): legitimate, pairs.
         feed(
             &mut s,
-            &edge_bytes(c::ATTEMPT, pid, tid, 9, 50, 0, OLD_START),
+            &edge_bytes(c::ATTEMPT, pid, tid, 9, 50, 0, OLD_START, SEED),
         );
         feed(
             &mut s,
-            &edge_bytes(c::RESULT, pid, tid, 9, 150, 1, OLD_START),
+            &edge_bytes(c::RESULT, pid, tid, 9, 150, 1, OLD_START, SEED),
         );
         s.trace.finalize(1_000);
         let t = s.trace.totals();
@@ -17672,20 +17690,20 @@ mod fix4_retire {
         // incarnations.
         feed(
             &mut s,
-            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START),
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED),
         );
         feed(
             &mut s,
-            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, NEW_START),
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, NEW_START, SEED),
         );
         // Same-incarnation new+new pair (inv 2, NEW): legitimate, pairs.
         feed(
             &mut s,
-            &edge_bytes(c::ATTEMPT, pid, tid, 2, 110, 0, NEW_START),
+            &edge_bytes(c::ATTEMPT, pid, tid, 2, 110, 0, NEW_START, SEED),
         );
         feed(
             &mut s,
-            &edge_bytes(c::RESULT, pid, tid, 2, 210, 1, NEW_START),
+            &edge_bytes(c::RESULT, pid, tid, 2, 210, 1, NEW_START, SEED),
         );
         // Now retire (covers the dual order: retire after the fact).
         let failures = s.remove_thread_rows(pid, tid);
@@ -17703,13 +17721,79 @@ mod fix4_retire {
         assert_eq!(rr, t.paired + t.unpaired_results, "result conservation");
     }
 
+    /// F3e (R6-1 shape, session level): delete/recreate with
+    /// FORGED seeds. Retire via the REAL `remove_thread_rows`
+    /// (models the numeric-cleanup delete), then feed a late old
+    /// RESULT (pre-delete emission, fed post-bump — same epoch as
+    /// the recreated row's edges, same stamp: a live-row delete
+    /// never re-stamps) plus the recreated row's restarted
+    /// same-invocation ATTEMPT (new seed): the seed ALONE
+    /// separates them — no pair, both arrival orders — while a
+    /// same-seed continuation pairs (availability). On seedless
+    /// code this schedule is the R6-1 mispair (demonstrated RED at
+    /// unit level before the fix).
+    #[test]
+    #[ignore = "fix6 F3e: requires BPF map privileges (sudo M4 run)"]
+    fn fix6_cross_seed_reuse_never_pairs_same_seed_pairs() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP fix6 F3e: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // The delete (empty maps → drain-then-bump).
+        let failures = s.remove_thread_rows(pid, tid);
+        assert_eq!(failures, 0, "empty-map cleanup must succeed");
+        // Order 1 (inv 2): recreated ATTEMPT first, late old
+        // RESULT second — same stamp, same epoch, different seeds.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 2, 100, 0, OLD_START, SEED_NEW),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 2, 150, 1, OLD_START, SEED),
+        );
+        // Order 2 (inv 3): late old RESULT first — the same-window
+        // inversion must not pair across seeds either.
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 3, 200, 1, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 3, 110, 0, OLD_START, SEED_NEW),
+        );
+        // Same-seed continuation (inv 4, new seed): legitimate, pairs.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 4, 120, 0, OLD_START, SEED_NEW),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 4, 210, 1, OLD_START, SEED_NEW),
+        );
+        s.trace.finalize(1_000);
+        let t = s.trace.totals();
+        assert_eq!(t.paired, 1, "only the same-seed continuation pairs");
+        assert_eq!(t.unpaired_entries, 2, "both cross-seed ATTEMPTs unpaired");
+        assert_eq!(t.unpaired_results, 2, "both cross-seed RESULTs unpaired");
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!((ra, rr), (3, 3), "received must count every fed edge");
+        assert_eq!(ra, t.paired + t.unpaired_entries, "attempt conservation");
+        assert_eq!(rr, t.paired + t.unpaired_results, "result conservation");
+    }
+
     /// Alias-plane payload words (operation/algorithm/function/
     /// outcome/status/cacheability), bundled past the clippy arity lint.
     struct AliasWords(u32, u32, u32, u32, u32, u32);
 
     /// Forge an alias-plane record image (ALGORITHM_BEGIN / ALIAS /
     /// ALIAS_END) with a forged incarnation stamp (one
-    /// incarnation — the sequence genuinely belongs together).
+    /// incarnation — the sequence genuinely belongs together) and
+    /// a forged creation seed at offset 104 (fix6).
     fn alias_bytes(
         kind: u32,
         pid: u32,
@@ -17717,6 +17801,7 @@ mod fix4_retire {
         invocation: u64,
         mono_ns: u64,
         words: AliasWords,
+        seed: u64,
     ) -> Vec<u8> {
         let mut b = vec![0u8; c::EVENT_SIZE];
         for (at, v) in [
@@ -17745,6 +17830,7 @@ mod fix4_retire {
         b[72..76].copy_from_slice(&cacheability.to_le_bytes());
         b[76..80].copy_from_slice(&status.to_le_bytes());
         b[96..104].copy_from_slice(&OLD_START.to_le_bytes());
+        b[104..112].copy_from_slice(&seed.to_le_bytes());
         b
     }
 
@@ -17790,6 +17876,7 @@ mod fix4_retire {
                 7,
                 100,
                 AliasWords(1, 0, 0, 1, 0, 1),
+                SEED,
             ),
         );
         feed_carry(
@@ -17801,6 +17888,7 @@ mod fix4_retire {
                 7,
                 110,
                 AliasWords(1, 0, u32::from(canon), weak, 0, 1),
+                SEED,
             ),
         );
         feed_carry(
@@ -17812,6 +17900,7 @@ mod fix4_retire {
                 7,
                 120,
                 AliasWords(1, c::OTHER, 1, 0, 0, 1),
+                SEED,
             ),
         );
         // Premise: the carry holds one attributed Algorithm fact.
@@ -17869,16 +17958,21 @@ mod fix4_retire {
     }
 }
 
-/// Fix5 F4: BPF global-seq seeding behavioral test (R5-2).
+/// Fix6: seed-in-record seeding behavioral test (R6-1).
 ///
 /// Privileged live-attach test: real object, real workload, real
 /// BPF entry path. Deletes a live THREADS row via the REAL session
 /// cleanup on a live session (R5-2's exact hazard: numeric cleanup
-/// racing a live row) + re-emits → the re-created row seeds HIGH
-/// (never restarts at 1). `#[ignore]`d with graceful skip when
+/// racing a live row) + re-emits → the re-created row mints a
+/// FRESH strictly-greater seed AND restarts invocations at 1 BY
+/// DESIGN (scoped by the seed — the fix5 "never restarts" assert
+/// INVERTS). Same-seed edges still pair end-to-end through the
+/// real 112 B decode (availability); cross-seed no-pair is pinned
+/// at session level (F3e) and unit level, composed with the live
+/// seed advance proven here. `#[ignore]`d with graceful skip when
 /// caps/object are absent; run under sudo in M4.
 #[cfg(test)]
-mod fix5_seeding {
+mod fix6_seeding {
     use super::*;
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Child, Command, Stdio};
@@ -17952,13 +18046,13 @@ mod fix5_seeding {
     }
 
     #[test]
-    #[ignore = "fix5 seeding: requires root + OSSL_PROVIDER_OBSERVATION_TEST_BPF (sudo M4 run)"]
-    fn fix5_deleted_live_row_never_restarts() {
+    #[ignore = "fix6 seeding: requires root + OSSL_PROVIDER_OBSERVATION_TEST_BPF (sudo M4 run)"]
+    fn fix6_recreated_row_advances_seed_restarts_invocations() {
         let Some(object) = gated() else {
-            eprintln!("SKIP fix5 seeding: need root + object");
+            eprintln!("SKIP fix6 seeding: need root + object");
             return;
         };
-        let dir = std::env::temp_dir().join(format!("osslscope-seed5-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("osslscope-seed6-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir(&dir).unwrap();
         let app = build_workload(&dir);
@@ -18009,17 +18103,17 @@ mod fix5_seeding {
             setup.gaps
         );
         // Warmup batch: absorbs first-batch-cold effects (provider
-        // init/fetch caching changes the BPF enter count by a couple
-        // — observed 482 vs 481 without warmup), so the two measured
-        // batches below execute identical enter counts.
+        // init/fetch caching changes the BPF enter count), so the
+        // two measured batches below execute identical enter counts.
         run_batch(child.0.stdin.as_mut().unwrap(), &rx, 0);
         let _ = s.drain(Instant::now() + Duration::from_secs(30));
         // Symmetric double-delete: two fresh rows under identical
-        // warm batches. Row A seeds s, row B seeds s+1 (consecutive
-        // global-seq creations), so B.next - A.next = 1 exactly —
-        // the strict inequality below measures the seed advance
-        // directly. R5-2's exact hazard drives each deletion:
-        // numeric cleanup deleting a LIVE row.
+        // warm batches. Row A mints seed s, row B mints a strictly
+        // greater seed (consecutive global-seq creations), while
+        // BOTH rows count invocations from 0 (restart at 1 BY
+        // DESIGN) — so the `next` values come out EQUAL. R5-2's
+        // exact hazard drives each deletion: numeric cleanup
+        // deleting a LIVE row.
         let mut created = Vec::new();
         for n in 1..=2 {
             let failures = s.remove_thread_rows(pid, pid);
@@ -18028,14 +18122,29 @@ mod fix5_seeding {
             let _ = s.drain(Instant::now() + Duration::from_secs(30));
             let rows = thread_rows(&s, pid, pid);
             assert_eq!(rows.len(), 1, "re-created row {n} present");
-            created.push(rows[0].1.next);
+            created.push((rows[0].1.seed, rows[0].1.next));
         }
-        let (a, b) = (created[0], created[1]);
-        eprintln!("seed5: fresh-row next a={a} b={b}");
-        assert!(a >= 2, "fresh row never restarts at 1: a={a}");
+        let ((sa, na), (sb, nb)) = (created[0], created[1]);
+        eprintln!("seed6: fresh rows a=(seed={sa}, next={na}) b=(seed={sb}, next={nb})");
         assert!(
-            b > a,
-            "consecutive creations seed strictly higher (global seq): a={a} b={b}"
+            sb > sa,
+            "consecutive creations mint strictly greater seeds: sa={sa} sb={sb}"
+        );
+        assert_eq!(
+            na, nb,
+            "identical warm batches count identically from the restart: na={na} nb={nb}"
+        );
+        assert!(
+            na >= 2,
+            "rows count entries from the restart (premise): na={na}"
+        );
+        // Availability end-to-end: same-seed edges paired through
+        // the real BPF → 112 B wire → decode → trace path.
+        s.trace.finalize(1_000_000);
+        assert!(
+            s.trace.totals().paired >= 1,
+            "live same-seed pairs must form: {:?}",
+            s.trace.totals()
         );
         child.0.stdin.as_mut().unwrap().write_all(b"X").unwrap();
         drop(child.0.stdin.take());

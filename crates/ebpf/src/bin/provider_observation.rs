@@ -57,28 +57,30 @@ static TRACE_MODE: Array<u32> = Array::with_max_entries(1, 0);
 static API_TOTALS: PerCpuHashMap<u64, ApiAggregate> = PerCpuHashMap::with_max_entries(1024, 0);
 #[map]
 static API_THREADS: HashMap<ApiThreadKey, Thread> = HashMap::with_max_entries(4096, 0);
-// fix5 (R5-2): process-global invocation seed. THREADS-miss seeds `next`
-// from a fetch-add here (stride 1) instead of 0, so a recycled tid never
-// restarts at 1 inside its own stamp. BPF-internal; the host never reads
-// or writes this map (it appears in the loader spec only so the object
-// shape stays exact).
+// fix6 (R6-1): process-global creation-seed counter. THREADS-miss
+// mints the row's identity here — the seed is STORED on the row
+// (`Thread.seed`) and STAMPED on every record, joining the pairing
+// key. (The fix5 design seeded `next` from this counter and claimed
+// "never restarts" — R6-1 refuted it: unique seeds with OVERLAPPING
+// ranges still mispair. Invocations restart at 1 per row BY DESIGN
+// now, scoped by the seed: identity, not arithmetic.) BPF-internal;
+// the host never reads or writes this map (it appears in the loader
+// spec only so the object shape stays exact).
 #[map]
 static INV_SEQ: Array<u64> = Array::with_max_entries(1, 0);
-// fix5 (R5-2): fetch the next global seed. Returns the PRE-add value;
-// `Thread::enter` adds 1, so the first-ever creation still yields
-// invocation 1 and every later creation is strictly greater (monotonic
-// within a tid: no reuse, all recycle orders safe, no userspace
-// coordination). Implemented as a bounded CAS loop (the same
-// `atomic_cxchg` pattern `source_state::claim_pending` already ships):
-// a single-instruction fetch-add (`atomic_xadd` → XADD-with-fetch) is
+// fix6 (R6-1): mint the next creation seed. Returns the PRE-add
+// value (0 for the first-ever creation — legitimate, never gated).
+// Implemented as a bounded CAS loop (the same `atomic_cxchg`
+// pattern `source_state::claim_pending` already ships): a
+// single-instruction fetch-add (`atomic_xadd` → XADD-with-fetch) is
 // not expressible at the pinned `--cpu generic` (LLVM rejects use of
 // the XADD return value), while cmpxchg on a 1-elem array value is
 // already proven in this object. Each successful CAS hands out a
 // unique seed, so issuance is strictly monotonic. Exhaustion (8
 // consecutive races) or a saturated counter returns u64::MAX, which
-// `enter` refuses (LOSS_DEPTH) — fail-closed, never a reused
-// invocation. Wraparound past MAX is impossible: the CAS never
-// advances a saturated counter.
+// the entry path refuses WITHOUT creating a row (LOSS_DEPTH) —
+// fail-closed, never a reused or sentinel seed. Wraparound past MAX
+// is impossible: the CAS never advances a saturated counter.
 #[inline(always)]
 fn seed_next() -> u64 {
     use core::intrinsics::{atomic_cxchg, AtomicOrdering::SeqCst};
@@ -264,6 +266,12 @@ pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record, stamp: u64)
         ..Record::default()
     };
     out.start_time_ns = stamp;
+    // fix6 (R6-1): the seed is NOT set here — BPF subprograms take
+    // at most 5 arguments, so every `base` call site assigns
+    // `r.seed` itself (entry: its row's seed; returns:
+    // `pop_return`'s live row seed, threaded like the stamp).
+    // Derived emissions (INIT/QUERY/IMPLEMENTATION/ALIAS walks)
+    // inherit it from the `base`-built record they reuse.
 }
 #[inline(always)]
 fn incarnation_stamp(cookie: u64) -> u64 {
@@ -373,17 +381,32 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         }
         // Edge-bearing: fall through to the shared Pending/emit path (D0-2/D0-3).
     }
-    // fix5 (R5-2): seed ONLY `next` on creation. `depth`/`overflow`
-    // keep resetting: the old incarnation's nesting died with its row,
-    // and depth overflow reports LOSS_DEPTH at enter time (the None arm
-    // below) rather than inheriting a stale counter.
+    // fix6 (R6-1 + R6-4 primary): the row remembers its creation
+    // seed. `seed_next()` mints a fresh identity; MAX (CAS
+    // exhaustion or a saturated counter) REFUSES without creating
+    // any row (LOSS_DEPTH) — no row, no record, never a sentinel
+    // seed. Otherwise the row is born `{ seed: s, next: 0, ... }`:
+    // invocations restart at 1 per row BY DESIGN (scoped by the
+    // seed — the fix5 "never restarts" claim INVERTS). `depth`/
+    // `overflow` keep resetting: the old incarnation's nesting died
+    // with its row, and depth overflow reports LOSS_DEPTH at enter
+    // time (the None arm below) rather than inheriting a stale
+    // counter.
     let mut thread = match unsafe { THREADS.get(&key).copied() } {
         Some(thread) => thread,
-        None => Thread {
-            next: seed_next(),
-            depth: 0,
-            overflow: 0,
-        },
+        None => {
+            let s = seed_next();
+            if s == u64::MAX {
+                loss(LOSS_DEPTH);
+                return 0;
+            }
+            Thread {
+                seed: s,
+                next: 0,
+                depth: 0,
+                overflow: 0,
+            }
+        }
     };
     let old_depth = thread.depth;
     let Some(invocation) = thread.enter() else {
@@ -470,31 +493,40 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     {
         let mut r = Record::default();
         base(&p, &key, ATTEMPT, &mut r, stamp);
+        r.seed = thread.seed;
         r.status = p.name;
         emit(&r)
     }
     if matches!(p.api, PUBLIC_UNQUERY | TEARDOWN | UNQUERY_CALLBACK) {
-        invalidate(&p, &key, if p.api == TEARDOWN { 3 } else { 2 }, stamp);
+        invalidate(
+            &p,
+            &key,
+            if p.api == TEARDOWN { 3 } else { 2 },
+            stamp,
+            thread.seed,
+        );
     }
     0
 }
 #[inline(never)]
 #[no_mangle]
-pub fn invalidate(p: &Pending, key: &ThreadKey, status: u32, stamp: u64) {
+pub fn invalidate(p: &Pending, key: &ThreadKey, status: u32, stamp: u64, seed: u64) {
     // Invalidate advertisement leases, independently of retained code lifetimes.
     if let Some(member) = MEMBERS.get_ptr_mut(&key.pid) {
         unsafe { (*member).epoch = 0 }
     }
     let mut r = Record::default();
     base(p, key, INVALIDATION, &mut r, stamp);
+    r.seed = seed;
     r.status = status;
     emit(&r);
 }
 #[inline(never)]
 #[no_mangle]
-pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64) {
+pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64, seed: u64) {
     let mut r = Record::default();
     base(p, key, INIT, &mut r, stamp);
+    r.seed = seed;
     r.outcome = int_outcome(rv);
     emit(&r);
     if r.outcome != 1 {
@@ -511,9 +543,10 @@ pub fn init_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64) {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn getter_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) {
+pub fn getter_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64, seed: u64) {
     let mut r = Record::default();
     base(p, key, INIT, &mut r, stamp);
+    r.seed = seed;
     r.outcome = if table == 0 { 2 } else { 1 };
     emit(&r);
     if table != 0 {
@@ -771,8 +804,8 @@ pub extern "C" fn dispatch_slot(index: u64, context: u64) -> u64 {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn query_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) {
-    let cacheability = query_result(p, key, table, stamp);
+pub fn query_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64, seed: u64) {
+    let cacheability = query_result(p, key, table, stamp, seed);
     if table == 0 {
         return;
     }
@@ -783,6 +816,7 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) {
         cacheability,
         stopped: 0,
         stamp,
+        seed,
     };
     let result = unsafe {
         helpers::bpf_loop(
@@ -800,9 +834,10 @@ pub fn query_return(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) {
 }
 #[inline(never)]
 #[no_mangle]
-pub fn query_result(p: &Pending, key: &ThreadKey, table: u64, stamp: u64) -> u32 {
+pub fn query_result(p: &Pending, key: &ThreadKey, table: u64, stamp: u64, seed: u64) -> u32 {
     let mut r = Record::default();
     base(p, key, QUERY, &mut r, stamp);
+    r.seed = seed;
     r.operation = p.operation;
     r.outcome = if table == 0 { 2 } else { 1 };
     r.cacheability = match unsafe { helpers::bpf_probe_read_user(p.arg2 as *const u32) } {
@@ -831,6 +866,7 @@ struct AlgorithmScan {
     cacheability: u32,
     stopped: u32,
     stamp: u64,
+    seed: u64,
 }
 #[inline(never)]
 #[no_mangle]
@@ -873,6 +909,7 @@ pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
         &mut record,
         scan.stamp,
     );
+    record.seed = scan.seed;
     record.operation = p.operation;
     record.cacheability = scan.cacheability;
     let r = &mut record;
@@ -893,9 +930,26 @@ pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
     0
 }
 // Keep pairing temporaries out of the frame that classifies a query return.
+//
+// fix6 (R6-1) orphaned-return seed rule: the RESULT carries the LIVE
+// row's seed (`*out_seed`, set only on success). A row recreated
+// mid-call (numeric cleanup deleted the pre-delete row — legal)
+// hands the return its FRESH seed, so the RESULT can never pair with
+// the pre-delete ATTEMPT (conservative no-pair, both visible
+// unpaired — never a shared sentinel two orphans could pair
+// through). A pure THREADS-miss (row deleted, not recreated) emits
+// NOTHING (LOSS_PAIR + false; every caller returns without
+// emitting), so no seed choice arises there — the pre-delete ATTEMPT
+// expires unpaired-visible. `*out_seed` is untouched on every
+// failure path (callers only read it after `true`).
 #[inline(never)]
 #[no_mangle]
-pub fn pop_return(cookie: u64, out_key: &mut ThreadKey, out_pending: &mut Pending) -> bool {
+pub fn pop_return(
+    cookie: u64,
+    out_key: &mut ThreadKey,
+    out_pending: &mut Pending,
+    out_seed: &mut u64,
+) -> bool {
     let Some((_, key)) = identity(cookie) else {
         return false;
     };
@@ -940,6 +994,10 @@ pub fn pop_return(cookie: u64, out_key: &mut ThreadKey, out_pending: &mut Pendin
     }
     *out_key = key;
     *out_pending = p;
+    // The live row's seed (immutable since creation — `enter`/
+    // depth bookkeeping never touches it). On a recreated row this
+    // is the FRESH seed (orphaned-return rule above).
+    *out_seed = thread.seed;
     p.suppressed == 0
 }
 #[uretprobe]
@@ -957,9 +1015,11 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
             if trace_operational() {
                 let mut tkey = ThreadKey::default();
                 let mut pend = Pending::default();
-                if pop_return(cookie, &mut tkey, &mut pend) {
+                let mut seed = 0;
+                if pop_return(cookie, &mut tkey, &mut pend, &mut seed) {
                     let mut r = Record::default();
                     base(&pend, &tkey, RESULT, &mut r, stamp);
+                    r.seed = seed;
                     r.status = 0;
                     r.outcome = operational_outcome(pend.api, rv);
                     emit(&r);
@@ -970,26 +1030,28 @@ pub fn observation_return(ctx: RetProbeContext) -> u32 {
     }
     let mut key = ThreadKey::default();
     let mut p = Pending::default();
-    if !pop_return(cookie, &mut key, &mut p) {
+    let mut seed = 0;
+    if !pop_return(cookie, &mut key, &mut p, &mut seed) {
         return 0;
     }
     let rv: u64 = ctx.ret();
     if p.api == PROVIDER_INIT {
-        init_return(&p, &key, rv, stamp)
+        init_return(&p, &key, rv, stamp, seed)
     } else if p.api == GET_DISPATCH {
-        getter_return(&p, &key, rv, stamp)
+        getter_return(&p, &key, rv, stamp, seed)
     } else if query_api(p.api) {
-        query_return(&p, &key, rv, stamp)
+        query_return(&p, &key, rv, stamp, seed)
     } else if !matches!(p.api, PUBLIC_UNQUERY | TEARDOWN | UNQUERY_CALLBACK) {
-        api_return(&p, &key, rv, stamp);
+        api_return(&p, &key, rv, stamp, seed);
     }
     0
 }
 #[inline(never)]
 #[no_mangle]
-pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64) {
+pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64, seed: u64) {
     let mut r = Record::default();
     base(p, key, RESULT, &mut r, stamp);
+    r.seed = seed;
     r.status = p.name;
     r.outcome = if matches!(p.api, UNLOAD | ADD_BUILTIN) {
         int_outcome(rv)
@@ -1000,7 +1062,7 @@ pub fn api_return(p: &Pending, key: &ThreadKey, rv: u64, stamp: u64) {
     };
     emit(&r);
     if p.api == UNLOAD && r.outcome == 1 {
-        invalidate(p, key, 1, stamp)
+        invalidate(p, key, 1, stamp, seed)
     }
     if p.api == ADD_BUILTIN && r.outcome == 1 {
         if code_ok(key.pid, p.arg2) {

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 type Thread = (u32, u32, u64);
 struct Sequence {
-    identity: [u64; 6],
+    identity: [u64; 7],
     evidence: c::FiniteEvidence,
     next: u32,
     valid: bool,
@@ -17,7 +17,7 @@ pub(crate) struct Sequences(BTreeMap<Thread, Sequence>);
 fn thread(r: &c::Record) -> Thread {
     (r.pid, r.tid, r.generation)
 }
-fn identity(r: &c::Record) -> [u64; 6] {
+fn identity(r: &c::Record) -> [u64; 7] {
     [
         r.cookie,
         r.invocation,
@@ -25,6 +25,11 @@ fn identity(r: &c::Record) -> [u64; 6] {
         r.operation as u64,
         r.cacheability as u64,
         r.algorithm_index as u64,
+        // fix6 (R6-1 shape): invocations restart at 1 per row BY
+        // DESIGN, so the alias-sequence join scopes by the creation
+        // seed too — a recreated row's restarted invocations must
+        // neither join nor collide with the old row's sequences.
+        r.seed,
     ]
 }
 pub(crate) fn other() -> AlgorithmId {
@@ -194,6 +199,33 @@ mod tests {
             "previous algorithm cannot label the next one"
         );
     }
+    #[test]
+    fn cross_seed_restarted_invocations_never_join_sequences() {
+        // fix6 (R6-1 shape, alias plane): a recreated row restarts
+        // invocations at 1 BY DESIGN — its restarted sequence must
+        // neither join the old row's open sequence nor be rejected
+        // as a re-begin: the seed scopes the join, so the new row's
+        // complete sequence labels its own implementation while the
+        // old row's evidence stays unreachable from it.
+        let q = query();
+        let mut s = Sequences::default();
+        let b = ObservationBudget::default();
+        s.begin(&q, &b).unwrap();
+        s.alias(&known(q, 0)).unwrap();
+        // Same thread, same invocation, same words — new seed: a
+        // FRESH sequence (the old un-ended one is replaced with the
+        // standard IntervalUnknown, never joined).
+        let mut re = q;
+        re.seed = 1;
+        assert_eq!(s.begin(&re, &b), Err(ObservationGap::IntervalUnknown));
+        s.alias(&known(re, 0)).unwrap();
+        s.end(&end(re, 1, 0)).unwrap();
+        assert_eq!(u16::from(s.implementation(&re).unwrap().0), 0);
+        // The old row's records no longer address anything.
+        assert!(s.alias(&known(q, 1)).is_err());
+        assert!(s.implementation(&q).is_err());
+    }
+
     #[test]
     fn complete_sequence_labels_only_matching_implementation() {
         let q = query();

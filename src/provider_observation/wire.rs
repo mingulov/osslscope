@@ -99,6 +99,10 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
         // stamp means the BPF offset read failed — fail closed to
         // InvalidWire, never a silent pairing namespace).
         || r.start_time_ns == 0
+        // fix6: the creation seed is DELIBERATELY ungated — seed 0
+        // is the legitimate first creation, not a failure signal
+        // (any nonzero gate here would drop every first-row edge).
+
         || r.algorithm_index >= c::MAX_ALGORITHMS
         || r.algorithm_index != 0
             && !matches!(

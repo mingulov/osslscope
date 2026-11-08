@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Finite observation ABI. No opaque target handle is a transport field.
-pub const VERSION: u32 = 4;
-pub const EVENT_SIZE: usize = 104;
+pub const VERSION: u32 = 5;
+pub const EVENT_SIZE: usize = 112;
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_PENDING: u32 = 4096;
 pub const MAX_RANGES: u32 = 128;
@@ -73,6 +73,12 @@ pub struct Record {
     /// recycle order. Always nonzero on the wire (the decoder
     /// rejects 0 — a zero stamp means the BPF offset read failed).
     pub start_time_ns: u64,
+    /// BPF-stamped creation seed (fix6): the emitting THREADS row's
+    /// `Thread.seed` (bytes 104..112). Host pairing namespaces on
+    /// this, so invocations — which restart at 1 per row BY DESIGN
+    /// — never pair across row creations. Seed 0 is the legitimate
+    /// first creation: the decoder applies NO nonzero gate.
+    pub seed: u64,
 }
 /// BPF-side sanity ceiling for `Config.task_off`: the verifier
 /// needs a bounded scalar for the task-pointer arithmetic, and
@@ -133,6 +139,16 @@ pub struct Thread {
     pub next: u64,
     pub depth: u32,
     pub overflow: u32,
+    /// Creation seed (fix6): the `seed_next()` value this row was
+    /// born with (24 B value). The row's pairing namespace:
+    /// invocations restart at 1 per row BY DESIGN, scoped by this
+    /// seed (the fix5 "never restarts" claim INVERTS — R6-1 proved
+    /// unique seeds with overlapping ranges still mispair, so the
+    /// seed joins the pairing key as identity, not arithmetic).
+    /// Immutable after creation (`enter`/`skip_return`/
+    /// `failed_entry` never touch it). `API_THREADS` rows carry a
+    /// vestigial 0 (their `next` is write-only — never emitted).
+    pub seed: u64,
 }
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
@@ -443,5 +459,32 @@ mod tests {
         for mode in [2, 3, 4] {
             assert!(trace_edge_bearing(mode), "mode {mode}");
         }
+    }
+
+    #[test]
+    fn record_wire_layout_is_112_with_seed_at_104() {
+        // fix6 (R6-1): exact wire bytes for the A2 rev4 delta —
+        // 112 B total, VERSION 5, seed APPENDED at bytes 104..112
+        // (every earlier offset unchanged, so the bump is clean
+        // under the exact-size + version envelope checks).
+        assert_eq!(VERSION, 5);
+        assert_eq!(EVENT_SIZE, 112);
+        assert_eq!(core::mem::size_of::<Record>(), 112);
+        assert_eq!(core::mem::offset_of!(Record, version), 0);
+        assert_eq!(core::mem::offset_of!(Record, invocation), 48);
+        assert_eq!(core::mem::offset_of!(Record, start_time_ns), 96);
+        assert_eq!(core::mem::offset_of!(Record, seed), 104);
+    }
+
+    #[test]
+    fn thread_value_is_24_with_seed_at_16() {
+        // fix6 (R6-1): THREADS/API_THREADS value 16→24 B, seed
+        // APPENDED (existing field offsets unchanged). The loader
+        // `specs()` mirrors these sizes exactly.
+        assert_eq!(core::mem::size_of::<Thread>(), 24);
+        assert_eq!(core::mem::offset_of!(Thread, next), 0);
+        assert_eq!(core::mem::offset_of!(Thread, depth), 8);
+        assert_eq!(core::mem::offset_of!(Thread, overflow), 12);
+        assert_eq!(core::mem::offset_of!(Thread, seed), 16);
     }
 }
