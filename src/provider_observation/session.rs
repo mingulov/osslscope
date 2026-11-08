@@ -2669,6 +2669,13 @@ impl ProviderSession {
     /// nonzero count as uncertainty — an accepted exit must never
     /// leave possible stale rows unrecorded.
     pub(crate) fn remove_thread_rows(&mut self, pid: u32, tid: u32) -> u64 {
+        // G3 (T8.2a-fix2): the incarnation ended — retire the
+        // tid's trace scopes FIRST (every generation), independent
+        // of per-row removal success: stale HW must never judge a
+        // recycled tid number (tombstoned 2 windows, then fresh).
+        // Sole funnel: every cleanup path (focused task-exit +
+        // coordinator revalidation) lands here.
+        self.trace.retire_scope(pid, tid);
         // N10: every cleanup failure counts (enumeration errors +
         // deletion failures) — the caller records nonzero counts
         // as uncertainty. Removal stays best-effort per key; the

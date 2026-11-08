@@ -366,6 +366,11 @@ pub struct TraceProducer {
     inv_hw: HashMap<ScopeKey, ScopeHw>,
     /// FIFO index for scopes (bounded by the cap).
     scope_order: BTreeMap<(u64, u64), ScopeKey>,
+    /// G3 tombstones: (pid,tid) → retire record (≤ cap,
+    /// FIFO-evicted; recorded in off-mode too).
+    retired: BTreeMap<(u32, u32), RetiredScope>,
+    /// FIFO index for tombstones (bounded by the cap).
+    retired_order: BTreeMap<(u64, u64), (u32, u32)>,
     /// Insertion sequence (monotonic; wrapping — 2^64 inserts
     /// unreachable, and every index entry dies with its map).
     order_seq: u64,
@@ -445,6 +450,21 @@ impl ScopeKey {
     }
 }
 
+/// G3 tombstone visibility: a retired scope's edges go
+/// immediate-unpaired for this many producer windows, then the
+/// scope is fresh (HW=None).
+const TRACE_TOMBSTONE_WINDOWS: u64 = 2;
+
+/// G3 tombstone: a retired (pid,tid)'s recorded retire window
+/// (covers EVERY generation for the tid).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct RetiredScope {
+    /// Producer window of the retire.
+    retire_window: u64,
+    /// Insertion sequence (FIFO order key with `retire_window`).
+    seq: u64,
+}
+
 /// Per-scope invocation high-water (F3).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ScopeHw {
@@ -478,6 +498,8 @@ impl TraceProducer {
             pending_result_order: BTreeMap::new(),
             inv_hw: HashMap::new(),
             scope_order: BTreeMap::new(),
+            retired: BTreeMap::new(),
+            retired_order: BTreeMap::new(),
             order_seq: 0,
             window: 0,
             last_loss: [0; 8],
@@ -535,7 +557,15 @@ impl TraceProducer {
             monotonic_ns: edge.monotonic_ns,
             outcome: 0,
         });
-        self.touch_scope(&edge.key);
+        // G3: tombstoned scope — immediate unpaired (visible +
+        // exemplar, NEVER paired, NEVER silent), never a touch
+        // (immediate-unpaired must not refresh the scope clock).
+        if self.tombstoned(edge.key.pid, edge.key.tid) {
+            self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+            self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+            self.push_live_exemplar(ExemplarDir::Entry, edge.key, edge.api);
+            return;
+        }
         // F4: a held RESULT pairs only in its arrival window
         // (frozen §6D-6 is forward-only: the RESULT lands in the
         // ATTEMPT's SAME or NEXT window — same-window inversion
@@ -624,7 +654,14 @@ impl TraceProducer {
             monotonic_ns: edge.monotonic_ns,
             outcome: edge.outcome,
         });
-        self.touch_scope(&edge.key);
+        // G3: tombstoned scope — immediate unpaired (visible +
+        // exemplar, NEVER paired, NEVER silent), never a touch.
+        if self.tombstoned(edge.key.pid, edge.key.tid) {
+            self.unpaired_results = self.unpaired_results.saturating_add(1);
+            self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+            self.push_live_exemplar(ExemplarDir::Result, edge.key, edge.api);
+            return;
+        }
         if let Some(held) = self.pending_attempt_remove(&edge.key) {
             self.pair(
                 edge.key,
@@ -675,7 +712,17 @@ impl TraceProducer {
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
                 self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
-                self.advance_hw(&key);
+                // G3: a tombstoned scope's history is void —
+                // expiry under the tombstone never advances the
+                // HW. Pre-retire holds always expire under it
+                // (holds live ≤1 window, the tombstone lasts 2),
+                // so the scope is fresh (HW=None) afterward.
+                // `pair()` needs no guard: a fed edge in a
+                // tombstoned scope returns before pairing, and
+                // both key halves share the scope.
+                if !self.tombstone_active(key.pid, key.tid) {
+                    self.advance_hw(&key);
+                }
             }
         }
         let stale_results: Vec<PairKey> = self
@@ -689,7 +736,10 @@ impl TraceProducer {
                 self.unpaired_results = self.unpaired_results.saturating_add(1);
                 self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
                 self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
-                self.advance_hw(&key);
+                // G3: tombstoned history is void (see above).
+                if !self.tombstone_active(key.pid, key.tid) {
+                    self.advance_hw(&key);
+                }
             }
         }
         // F3: scopes idle >1 window drop their high-water at roll.
@@ -708,6 +758,21 @@ impl TraceProducer {
         for scope in idle_scopes {
             if let Some(hw) = self.inv_hw.remove(&scope) {
                 self.scope_order.remove(&(hw.insert_window, hw.seq));
+            }
+        }
+        // G3: expired tombstones drop at roll (the scope is
+        // already fresh — see `tombstoned`).
+        let current = self.window;
+        let expired: Vec<(u32, u32)> = self
+            .retired
+            .iter()
+            .filter(|(_, r)| current.saturating_sub(r.retire_window) >= TRACE_TOMBSTONE_WINDOWS)
+            .map(|(who, _)| *who)
+            .collect();
+        // Bounded by the pairing cap (one entry per tombstone).
+        for who in expired {
+            if let Some(r) = self.retired.remove(&who) {
+                self.retired_order.remove(&(r.retire_window, r.seq));
             }
         }
         let mut ring_loss = [0u64; 8];
@@ -758,14 +823,19 @@ impl TraceProducer {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
             self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
-            self.advance_hw(&key);
+            // G3: tombstoned history is void (see close-time expiry).
+            if !self.tombstone_active(key.pid, key.tid) {
+                self.advance_hw(&key);
+            }
         }
         self.pending_attempt_order.clear();
         for (key, held) in std::mem::take(&mut self.pending_results) {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
             self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
-            self.advance_hw(&key);
+            if !self.tombstone_active(key.pid, key.tid) {
+                self.advance_hw(&key);
+            }
         }
         self.pending_result_order.clear();
     }
@@ -773,6 +843,78 @@ impl TraceProducer {
     /// Cumulative totals.
     pub fn totals(&self) -> TraceTotals {
         self.totals
+    }
+
+    /// G3: retire a CONFIRMED-DEAD tid's pairing scopes. Called
+    /// from `remove_thread_rows` (the sole cleanup funnel),
+    /// covering EVERY generation for the tid; fires in off-mode
+    /// too (no edges flow, but the tombstone is recorded for
+    /// the next edge-bearing feed). The scope HWs are dropped
+    /// and a (pid,tid) tombstone is recorded: fed edges go
+    /// immediate-unpaired (visible + exemplar, NEVER paired,
+    /// NEVER silent) for 2 windows, then the scope is fresh
+    /// (HW=None) and pairs again. Tombstone storage is
+    /// FIXED-CAPPED (FIFO, same kernel-mirrored bound).
+    pub(crate) fn retire_scope(&mut self, pid: u32, tid: u32) {
+        let dead: Vec<ScopeKey> = self
+            .inv_hw
+            .keys()
+            .filter(|scope| scope.pid == pid && scope.tid == tid)
+            .copied()
+            .collect();
+        // Bounded by the scope cap (one entry per scope).
+        for scope in dead {
+            if let Some(hw) = self.inv_hw.remove(&scope) {
+                self.scope_order.remove(&(hw.insert_window, hw.seq));
+            }
+        }
+        let who = (pid, tid);
+        if let Some(old) = self.retired.get(&who) {
+            let order = (old.retire_window, old.seq);
+            self.retired_order.remove(&order);
+        }
+        if self.retired.len() >= TRACE_PAIRING_CAP {
+            if let Some((&order, &victim)) = self.retired_order.iter().next() {
+                self.retired_order.remove(&order);
+                self.retired.remove(&victim);
+            }
+        }
+        let window = self.window;
+        let seq = self.next_seq();
+        self.retired_order.insert((window, seq), who);
+        self.retired.insert(
+            who,
+            RetiredScope {
+                retire_window: window,
+                seq,
+            },
+        );
+    }
+
+    /// Feed-path tombstone probe: true while the (pid,tid)
+    /// tombstone is live (2 windows); an expired tombstone is
+    /// dropped here (the scope is already fresh — its HW was
+    /// removed at retire and nothing advanced it under the
+    /// tombstone) and reports false.
+    fn tombstoned(&mut self, pid: u32, tid: u32) -> bool {
+        let who = (pid, tid);
+        let Some(r) = self.retired.get(&who) else {
+            return false;
+        };
+        if self.window.saturating_sub(r.retire_window) < TRACE_TOMBSTONE_WINDOWS {
+            return true;
+        }
+        let r = self.retired.remove(&who).expect("tombstone just observed");
+        self.retired_order.remove(&(r.retire_window, r.seq));
+        false
+    }
+
+    /// Pure tombstone probe for expiry paths (no lazy drop —
+    /// the close sweep owns removal).
+    fn tombstone_active(&self, pid: u32, tid: u32) -> bool {
+        self.retired
+            .get(&(pid, tid))
+            .is_some_and(|r| self.window.saturating_sub(r.retire_window) < TRACE_TOMBSTONE_WINDOWS)
     }
 
     /// Next FIFO insertion sequence.
@@ -806,6 +948,8 @@ impl TraceProducer {
                 seq,
             },
         );
+        // G3: accept-path stamp (the hold accepts the newcomer).
+        self.touch_scope(&key);
     }
 
     /// Index-maintaining removal of a held ATTEMPT.
@@ -837,6 +981,8 @@ impl TraceProducer {
                 seq,
             },
         );
+        // G3: accept-path stamp (the hold accepts the newcomer).
+        self.touch_scope(&key);
     }
 
     /// Index-maintaining removal of a held RESULT.
@@ -912,8 +1058,11 @@ impl TraceProducer {
         self.inv_hw.get_mut(&scope).expect("scope just inserted")
     }
 
-    /// Mark scope activity: every post-gate edge arrival stamps the
-    /// scope's window (idle-drop keys on arrivals only).
+    /// Mark scope activity on ACCEPT paths only (pending-insert
+    /// + pair — G3): an immediate-unpaired edge must NEVER stamp
+    /// the scope clock, or rejections self-perpetuate stale HW
+    /// (the recycled-tid feedback loop). Idle-drop keys on
+    /// accepted arrivals only.
     fn touch_scope(&mut self, key: &PairKey) {
         let window = self.window;
         self.scope_or_insert(ScopeKey::of(key)).last_window = window;
@@ -939,6 +1088,8 @@ impl TraceProducer {
     }
 
     fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, outcome: u32) {
+        // G3: accept-path stamp (the pair accepts the newcomer).
+        self.touch_scope(&key);
         self.advance_hw(&key);
         let class = pair_class(api, outcome);
         // §6D-3: zero/negative deltas are unusable durations but real pairs.
@@ -1033,6 +1184,11 @@ impl TraceProducer {
             "result index"
         );
         assert_eq!(self.inv_hw.len(), self.scope_order.len(), "scope index");
+        assert_eq!(
+            self.retired.len(),
+            self.retired_order.len(),
+            "tombstone index"
+        );
         for ((window, seq), key) in &self.pending_attempt_order {
             let held = self
                 .pending_attempts
@@ -1050,6 +1206,10 @@ impl TraceProducer {
         for ((window, seq), scope) in &self.scope_order {
             let hw = self.inv_hw.get(scope).expect("scope order resolves");
             assert_eq!((hw.insert_window, hw.seq), (*window, *seq));
+        }
+        for ((window, seq), who) in &self.retired_order {
+            let r = self.retired.get(who).expect("tombstone order resolves");
+            assert_eq!((r.retire_window, r.seq), (*window, *seq));
         }
     }
 }
@@ -1260,6 +1420,169 @@ mod tests {
         let rr: u64 = t.received.results.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
         assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn reject_storm_does_not_refresh_scope() {
+        // G3 (codex R2-3): immediate-unpaired rejections must NOT
+        // refresh the scope clock — a reject storm still expires
+        // (breaks the reject-refresh feedback loop that kept a
+        // recycled tid's stale HW alive forever).
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 50);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        p.close_window(0, 2000, [0; 8]);
+        for w in 0..2u64 {
+            for inv in 1..=50u64 {
+                let d = key(10, 11, 1, 200 + inv, inv);
+                p.attempt(attempt(d, 20, 3000 + w * 1000 + inv));
+                p.result(result(d, 20, 3050 + w * 1000 + inv, 1));
+            }
+            p.close_window(1 + w, 4000 + w * 1000, [0; 8]);
+        }
+        // Scope expired despite the storm → the ancient key
+        // re-pairs (disclosed F3 residual: replay after expiry
+        // pairs; BPF never emits dups).
+        p.attempt(attempt(k, 20, 9000));
+        p.result(result(k, 20, 9500, 1));
+        p.finalize(9999);
+        let t = p.totals();
+        assert_eq!(t.paired, 2);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (100, 100));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn retire_scope_recycle_matrix() {
+        // G3 (codex R2-3): death + recycle + low invocations. A
+        // retired scope's edges go immediate-unpaired (visible +
+        // exemplar, NEVER paired, NEVER silent) for 2 windows,
+        // then the scope is fresh (HW=None) and pairs again. No
+        // cross-incarnation mispair; conservation exact; retire
+        // covers EVERY generation for the tid.
+        let mut p = edge_bearing();
+        for generation in [1u64, 2] {
+            for inv in 1..=50u64 {
+                let k = key(10, 11, generation, 100 + inv, inv);
+                p.attempt(attempt(k, 20, 1000 + inv));
+                p.result(result(k, 20, 2000 + inv, 1));
+            }
+        }
+        assert_eq!(p.totals().paired, 100);
+        p.retire_scope(10, 11);
+        // Retire window (0): recycled low invocations are
+        // visible-unpaired in BOTH generations, never paired.
+        let r0 = key(10, 11, 1, 500, 1);
+        p.attempt(attempt(r0, 20, 3000));
+        p.result(result(r0, 20, 3100, 1));
+        let r0b = key(10, 11, 2, 501, 2);
+        p.attempt(attempt(r0b, 20, 3200));
+        p.result(result(r0b, 20, 3300, 1));
+        // An untouched scope still pairs mid-tombstone (isolation).
+        let other = key(10, 12, 1, 600, 1);
+        p.attempt(attempt(other, 20, 3400));
+        p.result(result(other, 20, 3500, 1));
+        assert_eq!(p.totals().paired, 101);
+        assert_eq!(
+            (p.totals().unpaired_entries, p.totals().unpaired_results),
+            (2, 2)
+        );
+        let w0 = p.close_window(0, 4000, [0; 8]);
+        let entries = w0
+            .exemplars
+            .iter()
+            .filter(|e| e.dir == ExemplarDir::Entry)
+            .count();
+        let results = w0
+            .exemplars
+            .iter()
+            .filter(|e| e.dir == ExemplarDir::Result)
+            .count();
+        assert_eq!((entries, results), (2, 2));
+        // Window 1: still tombstoned.
+        let r1 = key(10, 11, 1, 502, 3);
+        p.attempt(attempt(r1, 20, 5000));
+        p.result(result(r1, 20, 5100, 1));
+        assert_eq!(p.totals().paired, 101);
+        p.close_window(1, 6000, [0; 8]);
+        // Window 2: scope fresh — recycled low invocations (≤
+        // the old HW of 50 — rejected pre-fix) pair again.
+        for generation in [1u64, 2] {
+            let f = key(10, 11, generation, 600 + generation, generation + 10);
+            p.attempt(attempt(f, 20, 7000 + generation));
+            p.result(result(f, 20, 7100 + generation, 1));
+        }
+        p.finalize(8000);
+        let t = p.totals();
+        assert_eq!(t.paired, 103);
+        assert_eq!((t.unpaired_entries, t.unpaired_results), (3, 3));
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn retire_scope_queued_old_record_never_pairs() {
+        // G3: an old-incarnation ATTEMPT held at retire time must
+        // never pair with a late (queued) same-key RESULT — the
+        // late edge goes immediate-unpaired (+ exemplar), the hold
+        // expires unpaired. No cross-incarnation mispair;
+        // conservation exact.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.retire_scope(10, 11);
+        p.result(result(k, 20, 1500, 1));
+        assert_eq!(p.totals().paired, 0);
+        assert_eq!(p.totals().unpaired_results, 1);
+        let w0 = p.close_window(0, 2000, [0; 8]);
+        assert_eq!(p.totals().unpaired_entries, 0);
+        assert_eq!(w0.exemplars.len(), 1);
+        assert_eq!(w0.exemplars[0].dir, ExemplarDir::Result);
+        let w1 = p.close_window(1, 3000, [0; 8]);
+        assert_eq!(w1.exemplars.len(), 1);
+        assert_eq!(w1.exemplars[0].dir, ExemplarDir::Entry);
+        p.finalize(4000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (0, 1, 1)
+        );
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn retire_scope_bounded_and_off_mode() {
+        // G3: tombstone storage is FIXED-CAPPED (FIFO), and the
+        // hook fires in off-mode too (no edges, no panic — the
+        // tombstone is recorded for the next edge-bearing feed).
+        let mut p = TraceProducer::new();
+        p.retire_scope(10, 11);
+        assert_eq!(p.retired.len(), 1);
+        for i in 0..5000u32 {
+            p.retire_scope(100 + (i % 7), 2000 + i);
+        }
+        assert!(p.retired.len() <= TRACE_PAIRING_CAP);
+        p.check_indexes();
+        p.retire_scope(7, 7);
+        p.set_mode(TRACE_MODE_LATENCY);
+        let k = key(7, 7, 1, 100, 1);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        p.finalize(2000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (0, 1, 1)
+        );
     }
 
     #[test]
