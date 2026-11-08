@@ -836,6 +836,55 @@ impl FocusedSession {
             _reservation: pool.reserve(1024).expect("hollow lease"),
         }
     }
+    /// fix6 F2: hollow shell around a REAL provider session for
+    /// the coordinator receipt-discipline schedule test (R6-2):
+    /// receipts/totals come from the real session maps and logic,
+    /// everything else stays hollow. Test-only.
+    #[cfg(test)]
+    pub(crate) fn with_session_for_coordinator_tests(
+        pid: u32,
+        starttime: u64,
+        namespaces: crate::inventory::NamespaceIds,
+        pool: &crate::observation_memory::MemoryPool,
+        session: crate::provider_observation::session::ProviderSession,
+    ) -> Self {
+        let mut hollow = Self::hollow_for_coordinator_tests(pid, starttime, namespaces, pool);
+        hollow.session = Some(session);
+        hollow
+    }
+    /// fix6 F2 test seam: drain the inner real session (clean,
+    /// empty ring — consumes and accounts).
+    #[cfg(test)]
+    pub(crate) fn drain_for_test(&mut self) {
+        if let Some(s) = self.session.as_mut() {
+            let _ = s.drain(std::time::Instant::now() + std::time::Duration::from_secs(10));
+        }
+    }
+    /// fix6 F2 test seam: peek the inner real session (the real
+    /// reconcile-path peek over an empty batch).
+    #[cfg(test)]
+    pub(crate) fn peek_for_test(&mut self) -> crate::provider_observation::ObservationBatch {
+        self.session
+            .as_mut()
+            .map(|s| s.peek_loss_lanes_for_test())
+            .unwrap_or_default()
+    }
+    /// fix6 F2 test seam: inject a LOSS lane delta into the inner
+    /// real session's loss map.
+    #[cfg(test)]
+    pub(crate) fn set_loss_lane_for_test(&mut self, lane: u32, value: u64) {
+        if let Some(s) = self.session.as_mut() {
+            s.set_loss_lane_for_test(lane, value);
+        }
+    }
+    /// fix6 F2 test seam: anchor the inner real session's receipt
+    /// tick clock at nominal `tick`.
+    #[cfg(test)]
+    pub(crate) fn set_loss_tick_for_test(&mut self, tick: u64, tick_ns: u64) {
+        if let Some(s) = self.session.as_mut() {
+            s.set_loss_tick_for_test(tick, tick_ns);
+        }
+    }
     /// Persistent host ceilings plus bounded scanner/pins/argv, source bytes,
     /// and map payload/entry overhead. Temporary ELF bytes and parser metadata
     /// are leased separately on the same pool before allocation.
@@ -2042,11 +2091,15 @@ impl FocusedSession {
         self.session.as_ref().map(|s| s.link_count()).unwrap_or(0)
     }
     /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
-    /// (LOSS read sequence, containing tick), `None` when no
+    /// (LOSS read sequence, certified tick), `None` when no
     /// provider session contributes (nothing to prove). The
     /// coordinator advances a lane's baseline tick only to the
-    /// oldest read tick across live sessions, retaining the last
-    /// successful baseline through failures.
+    /// oldest certified tick across live sessions, retaining the
+    /// last successful baseline through failures. fix6 (R6-2):
+    /// the certified tick is the last ACCOUNTED read's tick
+    /// (peeks certify accounted coverage, never their own read
+    /// tick — receipts advance cadence without certifying
+    /// unaccounted reads).
     pub(crate) fn session_loss_read_receipts(&self) -> Option<[(u64, u64); 8]> {
         self.session.as_ref().map(|s| s.loss_read_receipts())
     }

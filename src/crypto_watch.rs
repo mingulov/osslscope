@@ -1364,11 +1364,13 @@ fn tick_of(ns: u64, origin: u64, tick_ns: u64) -> u64 {
 /// N4 pure receipt advance (§4.1 `[S,T+1)` rule): `None` when any
 /// live session's lane sequence is unmoved (a stalled session
 /// blocks the advance); otherwise the tick the baseline may
-/// advance to — the OLDEST successful read's containing tick
-/// across receipts (never the evaluation tick: loss after the
-/// read but still in its tick stays covered). Vacuous (no live
-/// sessions, or none contributing) advances to the evaluation
-/// tick, preserving quiet-tick progress.
+/// advance to — the OLDEST certified (accounted) read tick across
+/// receipts (never the evaluation tick: loss after the read but
+/// still in its tick stays covered; fix6/R6-2: peeks certify the
+/// last ACCOUNTED tick, so unaccounted reads never advance the
+/// baseline past the totals). Vacuous (no live sessions, or none
+/// contributing) advances to the evaluation tick, preserving
+/// quiet-tick progress.
 fn lane_advance(
     eval_tick: u64,
     lane: usize,
@@ -2222,11 +2224,13 @@ impl RunState {
     }
     /// 6A per-tick ring evaluation (§4.1): per-reason deltas over
     /// the high-water propagate baseline-to-detection windows
-    /// `[S, T+1)` (`S` = tick of the last successful read, widening
+    /// `[S, T+1)` (`S` = tick of the last accounted read, widening
     /// across skipped ticks); drain residue marks the current tick
     /// while backpressured. Baseline ticks advance ONLY to the
-    /// oldest successful read's containing tick across live
-    /// sessions (per-session/lane receipts): failed reads retain
+    /// oldest ACCOUNTED read's containing tick across live
+    /// sessions (per-session/lane receipts; fix6/R6-2: peeks
+    /// certify the last accounted tick, never their own read tick
+    /// — receipts certify accounted coverage): failed reads retain
     /// the last successful baseline so the next detection starts
     /// at the frozen `[S, T+1)`, never after the failure — and a
     /// read evaluated a tick late never skips its own tick.
@@ -2236,9 +2240,9 @@ impl RunState {
         let tick = self.current_tick;
         let first = self.prev_tick.is_none();
         let ring = self.live_ring();
-        // N4: receipts carry (sequence, containing tick); the
-        // baseline advances to the oldest READ tick, never to the
-        // evaluation tick.
+        // N4: receipts carry (sequence, certified tick); the
+        // baseline advances to the oldest CERTIFIED (accounted)
+        // tick, never to the evaluation tick (fix6/R6-2).
         let seen: Vec<[u64; 8]> = self.active.iter().map(|a| a.loss_seen).collect();
         let receipts: Vec<Option<[(u64, u64); 8]>> = self
             .active
@@ -3003,7 +3007,8 @@ impl RunState {
                 )?;
                 admitted.push(spec.identity.pid);
                 // N4: stamp receipts with this run's tick clock so
-                // baselines advance to read ticks, not eval ticks.
+                // baselines advance to certified (accounted) read
+                // ticks, not eval ticks (fix6/R6-2).
                 session.set_loss_tick_clock(self.origin_ns, self.tick_ns);
                 let loss_seen = session
                     .session_loss_read_receipts()
@@ -6246,6 +6251,102 @@ mod tests {
         assert_eq!(super::lane_advance(5, 0, &seen, &receipts), Some(2));
         let stalled = [Some([(1u64, 4u64); 8]), Some([(0u64, 2u64); 8])];
         assert_eq!(super::lane_advance(5, 0, &seen, &stalled), None);
+    }
+    #[test]
+    #[ignore = "fix6 R6-2 schedule: requires BPF map privileges (sudo M4 run)"]
+    fn peek_receipts_must_not_certify_unaccounted_coverage() {
+        // fix6 (R6-2) coordinator-schedule test — nothing mocked
+        // about the property: a REAL session (real peek/drain,
+        // real receipts, real totals over real maps) inside a REAL
+        // coordinator (real `lane_advance`, real baselines, real
+        // propagation). The R6-2 schedule: loss late tick 2 →
+        // reconcile peeks tick 3 → drain skipped through next eval
+        // → eval tick 4 → drain accounts → eval tick 5. The
+        // propagated window must COVER tick 2, and `lane_advance`
+        // must not stall for the peek-only phase.
+        let Some(session) =
+            crate::provider_observation::session::ProviderSession::minimal_for_coordinator_tests()
+        else {
+            eprintln!("SKIP R6-2 schedule: BPF map creation failed (no caps)");
+            return;
+        };
+        const TICK_NS: u64 = 1_000_000_000;
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let namespaces = crate::inventory::NamespaceIds {
+            pid: None,
+            mount: None,
+        };
+        let mut run = RunState::new(BTreeSet::new(), 0, 1);
+        run.prev_tick = Some(1);
+        run.active.push(Active {
+            identity: Incarnation {
+                pid: 4242,
+                starttime: 1,
+                namespaces: namespaces.clone(),
+            },
+            segment: 1,
+            image_epoch: 0,
+            session: FocusedSession::with_session_for_coordinator_tests(
+                4242, 1, namespaces, &pool, session,
+            ),
+            ledger: MemberLedger::empty(),
+            admit_ns: 0,
+            suspended: false,
+            cgroup: None,
+            grace_noted: None,
+            loss_seen: [0; 8],
+        });
+        // Phase 1: clean drain in tick 2 (sees zero, accounts
+        // nothing) + eval tick 2 (baseline advances to 2).
+        run.active[0].session.set_loss_tick_for_test(2, TICK_NS);
+        run.active[0].session.drain_for_test();
+        run.current_tick = 2;
+        run.update_loss_baselines(0);
+        assert_eq!(
+            run.consumed_tick, [2; 8],
+            "premise: tick-2 baseline, got {:?}",
+            run.consumed_tick
+        );
+        // Loss LATE tick 2 (after the drain's read) + reconcile
+        // peeks tick 3 (receipt moves, totals stay 0) + drain
+        // skipped through the next eval (the `pending.is_some()`
+        // early return — modeled by simply not draining).
+        run.active[0].session.set_loss_lane_for_test(0, 5);
+        run.active[0].session.set_loss_tick_for_test(3, TICK_NS);
+        let peeked = run.active[0].session.peek_for_test();
+        assert!(
+            peeked.gaps.is_empty(),
+            "premise: empty peek emits no signal: {:?}",
+            peeked.gaps
+        );
+        run.current_tick = 4;
+        run.update_loss_baselines(0);
+        // No-stall: the peek-only receipts moved the lane (seq 2
+        // observed — `lane_advance` returned `Some`).
+        assert_eq!(
+            run.active[0].loss_seen[0], 2,
+            "lane_advance must not stall on peek-only receipts"
+        );
+        // ... but the peek must NOT certify its own tick ahead of
+        // the accounted totals: the baseline stays at the last
+        // ACCOUNTED tick (2), never the peek tick (3).
+        assert_eq!(
+            run.consumed_tick[0], 2,
+            "peek must not advance past accounted coverage, got {:?}",
+            run.consumed_tick
+        );
+        // Drain accounts the delta (read tick 3) + eval tick 5:
+        // the propagated window must COVER the tick-2 loss.
+        run.active[0].session.set_loss_tick_for_test(3, TICK_NS);
+        run.active[0].session.drain_for_test();
+        run.current_tick = 5;
+        run.update_loss_baselines(0);
+        let wire = run.carrier.wire();
+        assert!(
+            wire.iter()
+                .any(|w| w.cause == "ring_loss" && w.start_tick <= 2 && w.end_tick > 2),
+            "propagated window must cover tick 2, got {wire:?}"
+        );
     }
     #[test]
     fn deferred_exec_checks_entry_lifetime_lower_bound() {

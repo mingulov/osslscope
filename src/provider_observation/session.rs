@@ -559,6 +559,15 @@ pub struct ProviderSession {
     /// coordinator advances baselines to read ticks, never to the
     /// evaluation tick. Zero until the first stamped read.
     loss_read_tick: [u64; 8],
+    /// fix6 (R6-2): the containing tick of each lane's last
+    /// CONSUMING read (the drain's `poll_loss_lanes` — the only
+    /// site that advances `last_loss`/`loss_totals`). Peeks stamp
+    /// THIS tick (not their own read tick): receipts certify
+    /// accounted coverage, never unaccounted reads. Zero until
+    /// the first consuming read (certifying genesis — sound
+    /// over-coverage: the baseline cannot advance past what a
+    /// drain actually accounted).
+    last_accounted_tick: [u64; 8],
     /// N4: the coordinator's tick clock (`run_origin_ns`,
     /// `tick_ns`) for receipt stamping, set at admission. Reads
     /// without a clock stamp tick 0 (fail-closed: the baseline
@@ -2355,6 +2364,7 @@ impl ProviderSession {
             loss_totals: [0; 8],
             loss_read_seq: [0; 8],
             loss_read_tick: [0; 8],
+            last_accounted_tick: [0; 8],
             loss_tick_clock: None,
             last_drain: Instant::now(),
             closed: false,
@@ -3584,7 +3594,11 @@ impl ProviderSession {
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
                 Ok(values) => {
-                    self.stamp_loss_read(index);
+                    // fix6 (R6-2): a consuming read certifies its
+                    // own tick — the totals now account every delta
+                    // through it, so peeks may certify it too.
+                    let tick = self.stamp_loss_read(index);
+                    self.last_accounted_tick[index] = tick;
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
                         self.loss_totals[index] =
@@ -3603,23 +3617,24 @@ impl ProviderSession {
             }
         }
     }
-    /// N4: one bump+stamp per successful LOSS map read. Shared by
-    /// the consuming poll and the peek — a peek IS a successful
-    /// read, so receipts (and the coordinator's read-tick
-    /// advancement) keep their cadence on both paths.
-    fn stamp_loss_read(&mut self, index: usize) {
+    /// N4: one bump+stamp per successful CONSUMING LOSS map read
+    /// (the drain's poll — the peek below bumps the sequence but
+    /// stamps the last accounted tick instead). Returns the
+    /// stamped tick so the poll can record its certification.
+    fn stamp_loss_read(&mut self, index: usize) -> u64 {
         self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
         // N4: stamp the read's containing tick (0 without a clock
         // — fail-closed: an unstamped read cannot advance the
         // baseline).
-        self.loss_read_tick[index] = self
+        let tick = self
             .loss_tick_clock
             .map(|(origin, tick_ns)| loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns))
             .unwrap_or(0);
+        self.loss_read_tick[index] = tick;
+        tick
     }
     /// fix5 (R5-1): peek-style LOSS validation for the reconcile
-    /// path — signal without stealing. Reads every lane
-    /// (bump+stamp receipts, exactly like the consuming poll) and
+    /// path — signal without stealing. Reads every lane and
     /// downgrades + gaps the batch on any delta, but NEVER
     /// advances `last_loss`/`loss_totals`: the next `drain` still
     /// sees the full delta and accounts it once. The downgrade +
@@ -3628,6 +3643,15 @@ impl ProviderSession {
     /// `invalidate_algorithms` mutates), so the signal rides with
     /// affected content and an empty reconcile batch emits no
     /// stolen-signal noise.
+    ///
+    /// fix6 (R6-2): the peek bumps the receipt sequence (keeping
+    /// `lane_advance` cadence — a reconcile-only session never
+    /// stalls the coordinator) but stamps the last ACCOUNTED tick,
+    /// not its own read tick: receipts certify accounted coverage
+    /// (R6-2 proved stamping the read tick certifies unaccounted
+    /// coverage — a peek in tick 3 past a tick-2 loss advanced the
+    /// baseline to 3 while the totals stayed 0, and the later
+    /// detection propagated `[3,6)`, omitting tick 2).
     ///
     /// No-under-downgrade: every emitted batch is validated AFTER
     /// its content was consumed (drain batches by the consuming
@@ -3648,7 +3672,12 @@ impl ProviderSession {
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
                 Ok(values) => {
-                    self.stamp_loss_read(index);
+                    // fix6 (R6-2): bump for cadence, stamp the
+                    // last accounted tick (never this read's tick
+                    // — the totals did not move, so this read
+                    // certifies nothing new).
+                    self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
+                    self.loss_read_tick[index] = self.last_accounted_tick[index];
                     if !content {
                         continue;
                     }
@@ -17338,6 +17367,131 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     }
 }
 
+/// Fix6 F2: minimal live session + seams for the coordinator
+/// receipt-discipline schedule test (R6-2). Real BPF maps (no
+/// programs, no attach, no targets — custody-free), real
+/// peek/drain/receipt/totals logic. `None` (→ skip with message)
+/// when BPF map creation fails (no caps). Test-only.
+#[cfg(test)]
+impl ProviderSession {
+    pub(crate) fn minimal_for_coordinator_tests() -> Option<Self> {
+        // Map type numbers mirror `specs()` (1 hash, 2 array,
+        // 5 percpu hash, 6 percpu array, 27 ringbuf).
+        let events = {
+            let obj = aya_obj::Map::new_from_params(27, 0, 0, 1 << 20, 0);
+            let data = MapData::create(obj, "fix6_sched_events", None).ok()?;
+            RingBuf::try_from(Map::from_map_data(data).ok()?).ok()?
+        };
+        let config: BpfMap<MapData, u64, c::Config> = BpfMap::create(1024, 0).ok()?;
+        let members: BpfMap<MapData, u32, c::Member> = BpfMap::create(64, 0).ok()?;
+        let threads: BpfMap<MapData, c::ThreadKey, c::Thread> = BpfMap::create(4096, 0).ok()?;
+        let api_threads: BpfMap<MapData, c::ApiThreadKey, c::Thread> =
+            BpfMap::create(4096, 0).ok()?;
+        let ranges: BpfMap<MapData, c::RangeKey, c::Range> = BpfMap::create(8192, 0).ok()?;
+        let loss: PerCpuArray<MapData, u64> = PerCpuArray::create(8, 0).ok()?;
+        let api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate> =
+            PerCpuHashMap::create(1024, 0).ok()?;
+        let api_window: Array<MapData, c::Range> = Array::create(1, 0).ok()?;
+        let trace_mode: Array<MapData, u32> = Array::create(1, 0).ok()?;
+
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).ok()?;
+        assert!(gate.admitting(), "fake gate must admit (premise)");
+
+        Some(ProviderSession {
+            gate,
+            final_drain: false,
+            final_refusals: BTreeMap::new(),
+            final_terminal: BTreeSet::new(),
+            loaded: loader::GatedLoaded::empty_for_tests(),
+            _source_kernel: Err(ObservationGap::BpfUnavailable),
+            source_prepared: loader::Prepared {
+                progs: Vec::new(),
+                maps: Vec::new(),
+            },
+            source_owner: None,
+            typed_startup: Vec::new(),
+            events,
+            config,
+            members,
+            threads,
+            api_threads,
+            ranges,
+            loss,
+            api_totals,
+            api_window,
+            trace_mode,
+            task_start_off: 0,
+            trace: trace::TraceProducer::new(),
+            api_owners: BTreeMap::new(),
+            startup: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            refreshing: BTreeMap::new(),
+            pending_retire: BTreeMap::new(),
+            pending_startup: BTreeSet::new(),
+            exec_sealed: BTreeSet::new(),
+            fenced: BTreeMap::new(),
+            fence_withheld: 0,
+            unfence_after_drain: BTreeSet::new(),
+            retire_carry: ObservationBatch::default(),
+            roles: Roles(BTreeMap::new()),
+            aliases: assembly::Sequences::default(),
+            budget: ObservationBudget::default(),
+            setup_state_spent: 0,
+            setup_reads_spent: 0,
+            release_gate: ReleaseGate::new(),
+            next_cookie: 1,
+            next_typed_cookie: TYPED_COOKIE_FIRST,
+            next_site_id: 1,
+            next_object_id: 1,
+            typed_sites: BTreeMap::new(),
+            typed_pins: BTreeMap::new(),
+            object_ids: BTreeMap::new(),
+            next_generation: 1,
+            emitted: 0,
+            learned: BTreeSet::new(),
+            last_loss: [0; 8],
+            loss_totals: [0; 8],
+            loss_read_seq: [0; 8],
+            loss_read_tick: [0; 8],
+            last_accounted_tick: [0; 8],
+            loss_tick_clock: None,
+            last_drain: Instant::now(),
+            closed: false,
+        })
+    }
+
+    /// Test seam: run the reconcile-path peek over an empty batch
+    /// (the real `peek_loss_lanes` — receipts + content gate).
+    pub(crate) fn peek_loss_lanes_for_test(&mut self) -> ObservationBatch {
+        let mut b = ObservationBatch::default();
+        self.peek_loss_lanes(&mut b);
+        b
+    }
+
+    /// Test seam: inject a LOSS lane delta (cpu0 = `value`, other
+    /// CPUs zero) into the real loss map.
+    pub(crate) fn set_loss_lane_for_test(&mut self, lane: u32, value: u64) {
+        let cpus = aya::util::nr_cpus().map_err(|(_, e)| e).expect("nr_cpus");
+        let mut values = vec![0u64; cpus];
+        values[0] = value;
+        let percpu = aya::maps::PerCpuValues::try_from(values).expect("percpu values");
+        self.loss
+            .set(lane, percpu, 0)
+            .expect("loss injection must succeed");
+    }
+
+    /// Test seam: anchor the receipt tick clock so the calling
+    /// phase reads as nominal `tick` (models time passing between
+    /// coordinator ticks without sleeping; receipts still come
+    /// from the real stamp logic).
+    pub(crate) fn set_loss_tick_for_test(&mut self, tick: u64, tick_ns: u64) {
+        let now = LiveClock.monotonic_ns();
+        let origin = now.saturating_sub(tick.saturating_mul(tick_ns));
+        self.set_loss_tick_clock(origin, tick_ns);
+    }
+}
+
 /// Fix4 F3: session-level retire tests (R4-1 + recycle-before-retire
 /// dual + R4-2 carry integrity).
 ///
@@ -17580,6 +17734,7 @@ mod fix4_retire {
             loss_totals: [0; 8],
             loss_read_seq: [0; 8],
             loss_read_tick: [0; 8],
+            last_accounted_tick: [0; 8],
             loss_tick_clock: None,
             last_drain: Instant::now(),
             closed: false,
