@@ -3589,7 +3589,8 @@ impl ProviderSession {
     /// nowhere else). `reconcile_records` (both exits) uses the
     /// peek below instead: a reconcile-time consume would steal a
     /// delta belonging to records still queued for drain (R5-1);
-    /// fix6 (R6-3): dirty drains peek too (clean-gated drain).
+    /// fix6 (R6-3): live dirty drains peek too (clean-gated drain;
+    /// §6 fixup: terminal dirty drains consume — see the gate).
     fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
         for index in 0..8 {
             match self.loss.get(&(index as u32), 0) {
@@ -3913,14 +3914,22 @@ impl ProviderSession {
         // clean drain — honest (the backlog is genuinely suspect),
         // availability-only.
         //
-        // Close/final caveat: the final drain funnels through here
-        // too — a dirty final drain peeks (signals) rather than
-        // consumes, and the dirt is never silent (a dirty break
-        // always rides `DrainOverrun`/`FactLimit` on this batch,
-        // and `finalize_until` appends `IntervalUnknown`).
-        // Terminal accounting is account-or-signal: clean drains
-        // consume, dirty drains signal.
-        if drained_clean {
+        // Fixup (§6): terminal drains CONSUME — the final drain
+        // funnels through here too, and a dirty final drain must
+        // poll, not peek: no future drain exists to account the
+        // delta later (R6-3's steal argument is void at final —
+        // nothing is left to steal from), and the remainder is
+        // dropped either way. A peek here would leave real observed
+        // loss permanently unaccounted (`loss_totals` undercounts;
+        // sealed coordinator totals inherit it). Live dirty drains
+        // still peek (the baseline stays for the drain that
+        // consumes the survivors). Repeated-finalize safe: the poll
+        // accounts only `total > last_loss`, so a second final sees
+        // no new delta and cannot double-count. The dirt is never
+        // silent either way (a dirty break always rides
+        // `DrainOverrun`/`FactLimit` on this batch, and
+        // `finalize_until` appends `IntervalUnknown`).
+        if drained_clean || self.final_drain {
             self.poll_loss_lanes(&mut b);
         } else {
             self.peek_loss_lanes(&mut b);
@@ -18134,6 +18143,140 @@ mod fix4_retire {
             batch.gaps.contains(&ObservationGap::QueueLoss),
             "loss gap present: {:?}",
             batch.gaps
+        );
+    }
+
+    /// Fixup (§6 dirty-final accounting): a dirty FINAL drain must
+    /// CONSUME, not peek. `finalize_until` with an EXPIRED deadline
+    /// (zero-consumed + `DrainOverrun`) over an injected LOSS delta:
+    /// the delta is accounted (`loss_totals` advances — no future
+    /// drain exists to steal from; the remainder is dropped either
+    /// way), the dirt gaps ride the batch, and carried partial
+    /// content is downgraded. RED before the fixup (totals frozen),
+    /// GREEN after.
+    #[test]
+    #[ignore = "fixup §6 dirty-final: requires BPF map privileges (sudo M4 run)"]
+    fn fixup_dirty_final_drain_consumes_loss_delta() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP fixup §6 dirty-final: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        // A closable gate: the fixture's fake gate never opens, and
+        // `finalize_until` early-returns (before the drain) unless
+        // the cut succeeds — so mint a real gate (same caps the maps
+        // already needed) and open it.
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = match crate::writer_gate::WriterGate::create(&pool) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP fixup §6 dirty-final: real gate creation failed: {e}");
+                return;
+            }
+        };
+        if gate.open().is_err() {
+            eprintln!("SKIP fixup §6 dirty-final: real gate open failed (no caps)");
+            return;
+        }
+        s.gate = gate;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // Partial content: one attributed Algorithm fact in the
+        // carry (F3c pattern — the final drain funnels the carry
+        // through, so close emits it too).
+        let label = crate::kinds::alg_class_label(0).expect("registry class 0");
+        let canon = crate::kinds::algorithm_semantic_id(label).expect("class 0 canon");
+        let weak = u32::from(crate::kinds::is_weak_alg(label));
+        feed_carry(
+            &mut s,
+            &alias_bytes(
+                c::ALGORITHM_BEGIN,
+                pid,
+                tid,
+                7,
+                100,
+                AliasWords(1, 0, 0, 1, 0, 1),
+                SEED,
+            ),
+        );
+        feed_carry(
+            &mut s,
+            &alias_bytes(
+                c::ALIAS,
+                pid,
+                tid,
+                7,
+                110,
+                AliasWords(1, 0, u32::from(canon), weak, 0, 1),
+                SEED,
+            ),
+        );
+        feed_carry(
+            &mut s,
+            &alias_bytes(
+                c::ALIAS_END,
+                pid,
+                tid,
+                7,
+                120,
+                AliasWords(1, c::OTHER, 1, 0, 0, 1),
+                SEED,
+            ),
+        );
+        assert_eq!(s.retire_carry.facts.len(), 1, "carry premise: one fact");
+        // Overlapping LOSS delta (lane 0 = 5) before finalize.
+        s.set_loss_lane_for_test(0, 5);
+        // EXPIRED deadline: the final drain breaks dirty with zero
+        // consumed (`DrainOverrun`).
+        let deadline = Instant::now();
+        let batch = s.finalize_until(deadline);
+        // The fix property: the delta is ACCOUNTED (no future drain
+        // exists to do it later).
+        assert_eq!(
+            s.loss_totals(),
+            [5, 0, 0, 0, 0, 0, 0, 0],
+            "dirty final must account the overlapping delta"
+        );
+        // The dirt is never silent.
+        assert!(
+            batch.gaps.contains(&ObservationGap::DrainOverrun),
+            "dirty-final gaps must carry DrainOverrun: {:?}",
+            batch.gaps
+        );
+        assert!(
+            batch.gaps.contains(&ObservationGap::IntervalUnknown),
+            "final batch must carry IntervalUnknown: {:?}",
+            batch.gaps
+        );
+        // Consumed partial content is downgraded, never intact.
+        assert_eq!(batch.facts.len(), 1, "downgraded, never dropped");
+        match &batch.facts[0].payload {
+            ObservationPayload::Algorithm {
+                algorithm,
+                alias_quality,
+                ..
+            } => {
+                assert_eq!(
+                    *algorithm,
+                    assembly::other(),
+                    "LOSS overlap downgrades the algorithm"
+                );
+                assert_eq!(
+                    alias_quality.status,
+                    crate::provider_observation::AliasStatus::Unavailable,
+                    "LOSS overlap withholds the quality"
+                );
+            }
+            other => panic!("expected Algorithm payload, got {other:?}"),
+        }
+        // Repeated-finalize safe: no new delta → no double-count
+        // (`total > last_loss` gates the poll).
+        let totals = s.loss_totals();
+        let _ = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert_eq!(
+            s.loss_totals(),
+            totals,
+            "repeated finalize must not double-count"
         );
     }
 }
