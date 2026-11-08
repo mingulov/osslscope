@@ -286,6 +286,15 @@ pub struct ClosedTraceWindow {
     pub unpaired_entries: u64,
     /// Window unpaired RESULTs.
     pub unpaired_results: u64,
+    /// Window cap-sacrificed ATTEMPTs (fix3: the documented
+    /// visible exception to the detail-caps guarantee — a subset
+    /// of `unpaired_entries`, counted at every cap-driven
+    /// sacrifice: FIFO pending eviction + coupled
+    /// incarnation-evict expiry).
+    pub pending_evicted_entries: u64,
+    /// Window cap-sacrificed RESULTs (subset of
+    /// `unpaired_results`, same increment sites).
+    pub pending_evicted_results: u64,
     /// Window received edges by family.
     pub received: ReceivedCounts,
     /// `LOSS_DEPTH` lane delta (IS the lane, §6D-4).
@@ -331,6 +340,12 @@ pub struct TraceTotals {
     pub unpaired_entries: u64,
     /// Cumulative unpaired RESULTs.
     pub unpaired_results: u64,
+    /// Cumulative cap-sacrificed ATTEMPTs (fix3: subset of
+    /// `unpaired_entries` — see the window field).
+    pub pending_evicted_entries: u64,
+    /// Cumulative cap-sacrificed RESULTs (subset of
+    /// `unpaired_results`, same increment sites).
+    pub pending_evicted_results: u64,
     /// Cumulative received edges by family.
     pub received: ReceivedCounts,
     /// Cumulative dropped detail rows.
@@ -406,6 +421,10 @@ pub struct TraceProducer {
     unpaired_entries: u64,
     /// Window unpaired RESULTs.
     unpaired_results: u64,
+    /// Window cap-sacrificed ATTEMPTs (fix3).
+    pending_evicted_entries: u64,
+    /// Window cap-sacrificed RESULTs (fix3).
+    pending_evicted_results: u64,
     /// Window received.
     received: ReceivedCounts,
     /// Window nonmonotonic pairs.
@@ -536,6 +555,8 @@ impl TraceProducer {
             paired: 0,
             unpaired_entries: 0,
             unpaired_results: 0,
+            pending_evicted_entries: 0,
+            pending_evicted_results: 0,
             received: ReceivedCounts::default(),
             nonmonotonic_pairs: 0,
             rejected_unknown_api: 0,
@@ -786,6 +807,8 @@ impl TraceProducer {
             paired: self.paired,
             unpaired_entries: self.unpaired_entries,
             unpaired_results: self.unpaired_results,
+            pending_evicted_entries: self.pending_evicted_entries,
+            pending_evicted_results: self.pending_evicted_results,
             received: self.received,
             depth_exceeded: ring_loss[2],
             dropped: self.dropped,
@@ -810,6 +833,8 @@ impl TraceProducer {
         self.paired = 0;
         self.unpaired_entries = 0;
         self.unpaired_results = 0;
+        self.pending_evicted_entries = 0;
+        self.pending_evicted_results = 0;
         self.received = ReceivedCounts::default();
         self.nonmonotonic_pairs = 0;
         self.rejected_unknown_api = 0;
@@ -879,11 +904,26 @@ impl TraceProducer {
         } else if self.epochs.len() >= TRACE_PAIRING_CAP {
             // New entry past the cap: evict the oldest epoch with
             // COUPLED EXPIRY (finding-3 analog — never silent,
-            // never mispairing).
+            // never mispairing). Cap-driven like the FIFO pending
+            // evictions, so the victims count evicted too.
             if let Some((&order, &victim)) = self.epoch_order.iter().next() {
                 self.epoch_order.remove(&order);
                 self.epochs.remove(&victim);
-                let _ = self.expire_tid_pending(victim.0, victim.1);
+                let (attempts, results) = self.expire_tid_pending(victim.0, victim.1);
+                self.pending_evicted_entries = self
+                    .pending_evicted_entries
+                    .saturating_add(attempts.len() as u64);
+                self.totals.pending_evicted_entries = self
+                    .totals
+                    .pending_evicted_entries
+                    .saturating_add(attempts.len() as u64);
+                self.pending_evicted_results = self
+                    .pending_evicted_results
+                    .saturating_add(results.len() as u64);
+                self.totals.pending_evicted_results = self
+                    .totals
+                    .pending_evicted_results
+                    .saturating_add(results.len() as u64);
                 self.drop_tid_scopes(victim.0, victim.1);
             }
         }
@@ -1050,9 +1090,9 @@ impl TraceProducer {
     }
 
     /// Evict the oldest pending ATTEMPT (FIFO cap enforcement):
-    /// visible unpaired count + exemplar, NEVER an HW advance
-    /// (eviction ≠ consumption — the counterpart may still
-    /// arrive; terminal buckets stay correct).
+    /// visible unpaired count + exemplar + evicted count, NEVER
+    /// an HW advance (eviction ≠ consumption — the counterpart
+    /// may still arrive; terminal buckets stay correct).
     fn evict_oldest_attempt(&mut self) {
         let Some((&order, &key)) = self.pending_attempt_order.iter().next() else {
             return;
@@ -1061,12 +1101,16 @@ impl TraceProducer {
         if let Some(held) = self.pending_attempts.remove(&key) {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+            self.pending_evicted_entries = self.pending_evicted_entries.saturating_add(1);
+            self.totals.pending_evicted_entries =
+                self.totals.pending_evicted_entries.saturating_add(1);
             self.push_live_exemplar(ExemplarDir::Entry, key.key, held.api);
         }
     }
 
     /// Evict the oldest pending RESULT (FIFO cap enforcement):
-    /// visible unpaired count + exemplar, never an HW advance.
+    /// visible unpaired count + exemplar + evicted count, never
+    /// an HW advance.
     fn evict_oldest_result(&mut self) {
         let Some((&order, &key)) = self.pending_result_order.iter().next() else {
             return;
@@ -1075,6 +1119,9 @@ impl TraceProducer {
         if let Some(held) = self.pending_results.remove(&key) {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+            self.pending_evicted_results = self.pending_evicted_results.saturating_add(1);
+            self.totals.pending_evicted_results =
+                self.totals.pending_evicted_results.saturating_add(1);
             self.push_live_exemplar(ExemplarDir::Result, key.key, held.api);
         }
     }
@@ -1661,6 +1708,12 @@ mod tests {
         assert_eq!(t.paired, 1);
         assert_eq!(t.unpaired_entries, 1);
         assert_eq!(t.unpaired_results, 2);
+        // fix3: the G2 stale-orphan eviction is correctness-driven
+        // (F4 forward-only), not cap-driven — no evicted counts.
+        assert_eq!(
+            (t.pending_evicted_entries, t.pending_evicted_results),
+            (0, 0)
+        );
         let ra: u64 = t.received.attempts.iter().sum();
         let rr: u64 = t.received.results.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
@@ -2196,6 +2249,11 @@ mod tests {
         assert_eq!(t.paired, legit);
         assert_eq!(t.unpaired_entries, 3 * cap as u64);
         assert_eq!(t.unpaired_results, 3 * cap as u64);
+        // fix3: every FIFO sacrifice is counted (2×cap evicted per
+        // direction; the cap still held at `finalize` expires
+        // uncounted — evicted ⊆ unpaired).
+        assert_eq!(t.pending_evicted_entries, 2 * cap as u64);
+        assert_eq!(t.pending_evicted_results, 2 * cap as u64);
         let ra: u64 = t.received.attempts.iter().sum();
         let rr: u64 = t.received.results.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
@@ -2241,6 +2299,12 @@ mod tests {
         let t = p.totals();
         assert_eq!(t.paired, 5002);
         assert_eq!((t.unpaired_entries, t.unpaired_results), (1, 1));
+        // fix3: scope eviction drops HW only (pending self-sufficient)
+        // — no pending sacrificed, no evicted counts.
+        assert_eq!(
+            (t.pending_evicted_entries, t.pending_evicted_results),
+            (0, 0)
+        );
         let ra: u64 = t.received.attempts.iter().sum();
         let rr: u64 = t.received.results.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
@@ -2347,13 +2411,23 @@ mod tests {
         }
         p.result(result(k, 20, 1500, 1));
         assert_eq!(p.totals().paired, 0, "evicted hold must never pair");
-        p.close_window(0, 2000, [0; 8]);
+        // Coupled incarnation-evict expiry: the hold's sacrifice is counted.
+        assert_eq!(p.totals().pending_evicted_entries, 1);
+        assert_eq!(p.totals().pending_evicted_results, 0);
+        let w0 = p.close_window(0, 2000, [0; 8]);
+        assert_eq!(w0.pending_evicted_entries, 1, "window carries the count");
+        assert_eq!(w0.pending_evicted_results, 0);
         p.close_window(1, 3000, [0; 8]);
         p.finalize(4000);
         let t = p.totals();
         assert_eq!(
             (t.paired, t.unpaired_entries, t.unpaired_results),
             (0, 1, 1)
+        );
+        assert_eq!(
+            (t.pending_evicted_entries, t.pending_evicted_results),
+            (1, 0),
+            "evicted counts are cumulative"
         );
         let ra: u64 = t.received.attempts.iter().sum();
         let rr: u64 = t.received.results.iter().sum();
@@ -2409,6 +2483,45 @@ mod tests {
     }
 
     #[test]
+    fn counterpart_after_evict_reports_evicted_counts() {
+        // fix3 (codex R3-1 counters): hold A(k), flood 4096 other-tid
+        // ATTEMPTs (FIFO evicts A(k) — the documented visible exception),
+        // then R(k) arrives within horizon. The sacrifice is counted
+        // (window + cumulative), the counterpart never pairs with the
+        // sacrificed hold (unpaired), conservation stays exact.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        for i in 0..4096u64 {
+            let f = key(20, 3000 + i as u32, 1, 5000 + i, 1);
+            p.attempt(attempt(f, 20, 2000 + i));
+        }
+        // A(k) was the oldest: exactly one FIFO sacrifice so far.
+        assert_eq!(p.totals().pending_evicted_entries, 1);
+        assert_eq!(p.totals().unpaired_entries, 1);
+        p.result(result(k, 20, 9000, 1));
+        assert_eq!(p.totals().paired, 0, "sacrificed hold never pairs");
+        let w0 = p.close_window(0, 9500, [0; 8]);
+        assert_eq!(w0.pending_evicted_entries, 1);
+        assert_eq!(w0.pending_evicted_results, 0);
+        p.close_window(1, 9999, [0; 8]);
+        p.finalize(10_000);
+        let t = p.totals();
+        assert_eq!(t.paired, 0);
+        assert_eq!(t.unpaired_entries, 4097);
+        assert_eq!(t.unpaired_results, 1);
+        assert_eq!(
+            (t.pending_evicted_entries, t.pending_evicted_results),
+            (1, 0),
+            "one sacrifice, cumulative"
+        );
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
     fn retire_skip_expires_pending_and_shields() {
         // fix3: the retire-drain budget-exceeded path (the session skips
         // the bump — stays unretired). The tid's pending expires
@@ -2447,6 +2560,14 @@ mod tests {
         let r3 = key(10, 11, 1, 602, 12);
         p.result(result(r3, 20, 3300, 1));
         assert_eq!(p.totals().paired, 10);
+        // Skip-expiry is budget-driven, NOT cap-driven: no evicted counts.
+        assert_eq!(
+            (
+                p.totals().pending_evicted_entries,
+                p.totals().pending_evicted_results
+            ),
+            (0, 0)
+        );
         let w0 = p.close_window(0, 4000, [0; 8]);
         assert!(
             w0.exemplars.iter().any(|e| e.dir == ExemplarDir::Entry),
