@@ -295,6 +295,8 @@ pub struct TraceProducer {
     pending_attempts: HashMap<PairKey, PendingEdge>,
     /// Pending RESULTs by key.
     pending_results: HashMap<PairKey, PendingEdge>,
+    /// Per-scope invocation high-water (F3: consumed keys never re-pair).
+    inv_hw: HashMap<ScopeKey, ScopeHw>,
     /// Current window sequence.
     window: u64,
     /// Last-seen cumulative lanes.
@@ -340,6 +342,39 @@ struct PendingEdge {
     outcome: u32,
 }
 
+/// Pairing scope: the THREADS-row scope (contract `ThreadKey` —
+/// `pid`, `tid`, `generation` — the key `invocation` counts under).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+struct ScopeKey {
+    /// Executing pid.
+    pid: u32,
+    /// Executing tid.
+    tid: u32,
+    /// Scope/authority generation.
+    generation: u64,
+}
+
+impl ScopeKey {
+    /// Project a full pairing key to its scope.
+    fn of(key: &PairKey) -> Self {
+        Self {
+            pid: key.pid,
+            tid: key.tid,
+            generation: key.generation,
+        }
+    }
+}
+
+/// Per-scope invocation high-water (F3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct ScopeHw {
+    /// Highest consumed invocation, once any pair/expiry/finalize
+    /// ran in this scope (`None` = nothing consumed yet).
+    hw: Option<u64>,
+    /// Internal window of the last observed edge in this scope.
+    last_window: u64,
+}
+
 impl TraceProducer {
     /// Frozen defaults: mode off, §6D-5 caps.
     pub fn new() -> Self {
@@ -354,6 +389,7 @@ impl TraceProducer {
             max_bytes,
             pending_attempts: HashMap::new(),
             pending_results: HashMap::new(),
+            inv_hw: HashMap::new(),
             window: 0,
             last_loss: [0; 8],
             totals: TraceTotals::default(),
@@ -400,6 +436,7 @@ impl TraceProducer {
             monotonic_ns: edge.monotonic_ns,
             outcome: 0,
         });
+        self.touch_scope(&edge.key);
         if let Some(held) = self.pending_results.remove(&edge.key) {
             self.pair(
                 edge.key,
@@ -412,6 +449,11 @@ impl TraceProducer {
             // Duplicate ATTEMPT on a live key (BPF never emits this):
             // the newcomer is the anomaly — conserve it as unpaired
             // immediately and keep the pairable original pending.
+            self.unpaired_entries = self.unpaired_entries.saturating_add(1);
+            self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
+        } else if self.is_hw_dup(&edge.key) {
+            // F3: consumed-or-older invocation with no live state —
+            // a replay, never a re-pair (frozen §6D-6).
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
         } else {
@@ -445,6 +487,7 @@ impl TraceProducer {
             monotonic_ns: edge.monotonic_ns,
             outcome: edge.outcome,
         });
+        self.touch_scope(&edge.key);
         if let Some(held) = self.pending_attempts.remove(&edge.key) {
             self.pair(
                 edge.key,
@@ -456,6 +499,11 @@ impl TraceProducer {
         } else if self.pending_results.contains_key(&edge.key) {
             // Duplicate RESULT on a live key: conserve the newcomer
             // as unpaired immediately, keep the original pending.
+            self.unpaired_results = self.unpaired_results.saturating_add(1);
+            self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
+        } else if self.is_hw_dup(&edge.key) {
+            // F3: consumed-or-older invocation with no live state —
+            // a replay, never a re-pair (frozen §6D-6).
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
         } else {
@@ -496,6 +544,7 @@ impl TraceProducer {
                 self.unpaired_entries = self.unpaired_entries.saturating_add(1);
                 self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
                 self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
+                self.advance_hw(&key);
             }
         }
         let stale_results: Vec<PairKey> = self
@@ -509,8 +558,17 @@ impl TraceProducer {
                 self.unpaired_results = self.unpaired_results.saturating_add(1);
                 self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
                 self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
+                self.advance_hw(&key);
             }
         }
+        // F3: scopes idle >1 window drop their high-water at roll.
+        // Residual (disclosed): an ancient replay after expiry can
+        // re-pair. BPF never emits dups — a replay implies
+        // host-side duplication, and live pending always keeps its
+        // scope (pending arrives recently by construction).
+        let current = self.window;
+        self.inv_hw
+            .retain(|_, scope| current.saturating_sub(scope.last_window) <= 1);
         let mut ring_loss = [0u64; 8];
         for index in 0..8 {
             ring_loss[index] = loss_abs[index].saturating_sub(self.last_loss[index]);
@@ -556,11 +614,13 @@ impl TraceProducer {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
             self.push_exemplar(ExemplarDir::Entry, key, held, now_ns);
+            self.advance_hw(&key);
         }
         for (key, held) in std::mem::take(&mut self.pending_results) {
             self.unpaired_results = self.unpaired_results.saturating_add(1);
             self.totals.unpaired_results = self.totals.unpaired_results.saturating_add(1);
             self.push_exemplar(ExemplarDir::Result, key, held, now_ns);
+            self.advance_hw(&key);
         }
     }
 
@@ -569,7 +629,52 @@ impl TraceProducer {
         self.totals
     }
 
+    /// Mark scope activity: every post-gate edge arrival stamps the
+    /// scope's window (idle-drop keys on arrivals only).
+    fn touch_scope(&mut self, key: &PairKey) {
+        let window = self.window;
+        self.inv_hw
+            .entry(ScopeKey::of(key))
+            .or_insert(ScopeHw {
+                hw: None,
+                last_window: window,
+            })
+            .last_window = window;
+    }
+
+    /// F3 replay check: a consumed-or-older invocation with NO live
+    /// state is a dup. Call only when no pending entry holds `key`
+    /// in either direction — live state means unconsumed (nested
+    /// per-thread invocations interleave, so a live counterpart
+    /// always pairs and the high-water never overrides it).
+    fn is_hw_dup(&self, key: &PairKey) -> bool {
+        self.inv_hw
+            .get(&ScopeKey::of(key))
+            .is_some_and(|scope| scope.hw.is_some_and(|hw| key.invocation <= hw))
+    }
+
+    /// Advance the scope high-water past a consumed invocation
+    /// (pair/expiry/finalize). Deliberately not activity: the
+    /// idle-drop clock runs on arrivals, not bookkeeping.
+    fn advance_hw(&mut self, key: &PairKey) {
+        let scope = ScopeKey::of(key);
+        let window = self.window;
+        let entry = self
+            .inv_hw
+            .entry(scope)
+            .or_insert(ScopeHw {
+                hw: None,
+                last_window: window,
+            });
+        entry.hw = Some(
+            entry
+                .hw
+                .map_or(key.invocation, |hw| hw.max(key.invocation)),
+        );
+    }
+
     fn pair(&mut self, key: PairKey, api: u32, attempt_ns: u64, result_ns: u64, class: u32) {
+        self.advance_hw(&key);
         // §6D-3: zero/negative deltas are unusable durations but real pairs.
         let nonmonotonic = result_ns <= attempt_ns;
         let duration_ns = if nonmonotonic {
@@ -766,6 +871,90 @@ mod tests {
         assert_eq!(t.unpaired_entries, 0);
         assert_eq!(t.received.attempts, [0, 0, 1]);
         assert_eq!(t.received.results, [0, 0, 2]);
+    }
+
+    #[test]
+    fn invocation_high_water_blocks_repair() {
+        // F3 (codex R1-3): A R R A on one key → 1 pair +
+        // 1 unpaired-R + 1 unpaired-A (frozen §6D-6: a second
+        // RESULT on a consumed key is unpaired, never a re-pair).
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        p.result(result(k, 20, 1600, 1));
+        p.attempt(attempt(k, 20, 1700));
+        p.finalize(2000);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!(t.unpaired_results, 1);
+        assert_eq!(t.unpaired_entries, 1);
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn high_water_keeps_nested_pairs() {
+        // F3 refinement pin: per-thread invocations interleave
+        // under nesting (outer A5, inner A6/R6, outer R5); a live
+        // counterpart always pairs — the high-water never
+        // overrides live pending state.
+        let mut p = edge_bearing();
+        let outer = key(10, 11, 1, 100, 5);
+        let inner = key(10, 11, 1, 200, 6);
+        p.attempt(attempt(outer, 20, 1000));
+        p.attempt(attempt(inner, 22, 1100));
+        p.result(result(inner, 22, 1500, 1));
+        p.result(result(outer, 20, 1600, 1));
+        p.finalize(2000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (2, 0, 0)
+        );
+    }
+
+    #[test]
+    fn high_water_blocks_cross_window_dups() {
+        // F3: a consumed key replayed in the next window yields
+        // dups, never a re-pair; conservation stays exact.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        p.close_window(0, 2000, [0; 8]);
+        p.attempt(attempt(k, 20, 2500));
+        p.result(result(k, 20, 2600, 1));
+        p.finalize(3000);
+        let t = p.totals();
+        assert_eq!(t.paired, 1);
+        assert_eq!(t.unpaired_entries, 1);
+        assert_eq!(t.unpaired_results, 1);
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!(ra, t.paired + t.unpaired_entries);
+        assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn scope_expiry_drops_idle_high_water() {
+        // F3 disclosed residual: scopes idle >1 window drop
+        // their high-water at roll, so an ancient replay after
+        // expiry re-pairs (BPF never emits dups — replays only
+        // arise from host-side duplication).
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        p.close_window(0, 2000, [0; 8]);
+        p.close_window(1, 3000, [0; 8]);
+        p.close_window(2, 4000, [0; 8]);
+        p.attempt(attempt(k, 20, 5000));
+        p.result(result(k, 20, 5500, 1));
+        p.finalize(6000);
+        assert_eq!(p.totals().paired, 2);
     }
 
     #[test]
