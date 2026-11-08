@@ -2,7 +2,7 @@
 //! Shared live pending capacity in the actual provider entry/return handlers.
 pub use crate::shared_maps::{ATTR_STATE, SOURCE_CONFIG};
 use core::intrinsics::{atomic_cxchg, AtomicOrdering::SeqCst};
-use osslscope_bpf_contract::source::{pending_claim_value, pending_release_value};
+use osslscope_bpf_contract::source::{pending_claim_value, pending_release_n_value, pending_release_value};
 
 // A single atomic compare/exchange with equal replacement is a real ordered
 // read. Do not substitute volatile loads or LLVM fences that BPF may discard.
@@ -72,6 +72,41 @@ pub fn release_pending() -> bool {
     }
     // A missed release keeps its reservation until final cut. It cannot create
     // headroom, underflow or refund another live frame. Caller records loss.
+    false
+}
+/// Batched release of `n` removed frames (Task 0 verifier fix): ONE
+/// CAS loop for the whole discard batch instead of one single-release
+/// CAS loop per removed slot. Same CAS discipline + retry bound as
+/// `release_pending`; all-or-nothing per `pending_release_n_value`
+/// (a refused batch keeps every reservation — the same fail-safe
+/// direction — and the caller records loss once).
+#[inline(never)]
+#[no_mangle]
+pub fn release_pending_n(n: u32) -> bool {
+    let Some(state) = ATTR_STATE.get_ptr_mut(0) else {
+        return false;
+    };
+    let mode = unsafe { (*state).source_mode };
+    if mode == 0 {
+        return true;
+    }
+    if mode != 1 {
+        return false;
+    }
+    let pending = unsafe { core::ptr::addr_of_mut!((*state).pending_claims) };
+    let mut current = unsafe { ordered_read(pending) };
+    for _ in 0..8 {
+        let Some(next) = pending_release_n_value(current, n) else {
+            return false;
+        };
+        let (observed, released) =
+            unsafe { atomic_cxchg::<u64, { SeqCst }, { SeqCst }>(pending, current, next) };
+        if released {
+            return true;
+        }
+        current = observed;
+    }
+    // As above: missed batches keep their reservations; caller records loss.
     false
 }
 

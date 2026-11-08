@@ -1035,12 +1035,17 @@ mod tests {
             None
         }
         /// Discard slots strictly deeper than `mine` (all kinds —
-        /// mirroring `discard_deeper` with include_t=1).
+        /// mirroring `discard_deeper` with include_t=1: single pass,
+        /// levels top→0, counting discards; the BPF drives the pass
+        /// via `bpf_loop` and hoists the depth unwinding after (ONE
+        /// saturating subtract — net-identical to per-delete
+        /// decrements).
         fn discard_deeper(&mut self, mine: usize) {
             let top = (self.thread.depth as usize).min(MAX_DEPTH as usize);
+            let mut unwound: u32 = 0;
             for level in (mine + 1..=top).rev() {
                 if self.frames[level].take().is_some() {
-                    self.thread.depth = self.thread.depth.saturating_sub(1);
+                    unwound += 1;
                     self.discarded += 1;
                 }
                 if self.tmarks[level].take().is_some() {
@@ -1050,6 +1055,7 @@ mod tests {
                     self.discarded += 1;
                 }
             }
+            self.thread.depth = self.thread.depth.saturating_sub(unwound);
         }
         /// Accepted return of `cookie` (rv observed on emit):
         /// fast-path own frame, else slow search (T excluded),

@@ -1066,8 +1066,70 @@ pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
 /// kinds (a deeper T slot is stale-proven the same way; only the
 /// ownership SEARCH excludes T for accepted returns — an
 /// accepted return provably owns no blind marker, but still reaps
-/// deeper blind garbage). Absent slots skip silent; a failed
-/// quota release fires LOSS_MAP (as on the pop path).
+/// deeper blind garbage). Absent slots skip silent; a refused
+/// batched quota release fires LOSS_MAP once (as on the pop path).
+/// Task 0 verifier fix: the discard scan runs as a `bpf_loop`
+/// callback (one level per invocation) instead of an inline Rust
+/// loop. Bisected: an inline loop with one loop-carried counter
+/// verifies, but adding the second counter (`unwound` beside
+/// `freed`) blows the jump budget — the verifier stops merging
+/// loop states (21K states, sequence trip) — and the post-loop
+/// quota-release call multiplies the unmerged caller states past
+/// the budget. The `bpf_loop` callback is verified ONCE (index as
+/// a range, not per-iteration states), so the single-pass body
+/// with both counters fits comfortably; the batched release and
+/// the depth unwinding stay hoisted after (net-identical).
+/// Deletes/visits unchanged (levels top→0, all kinds).
+struct DiscardCtx {
+    key: ThreadKey,
+    top: u32,
+    mine_level: u32,
+    include_t: u32,
+    unwound: u32,
+    markers_freed: u32,
+}
+/// One discard level (see `discard_deeper`): returns 0 to continue
+/// the scan, 1 to break (mine reached or index beyond `top`).
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn discard_level_cb(index: u64, context: u64) -> u64 {
+    // SAFETY: synchronous bpf_loop receives this initialized own-stack context.
+    let ctx = unsafe { &mut *(context as *mut DiscardCtx) };
+    if index > ctx.top as u64 {
+        return 1;
+    }
+    let level = ctx.top - index as u32;
+    if level <= ctx.mine_level {
+        return 1;
+    }
+    let frame_key = PendingKey {
+        thread: ctx.key,
+        depth: level,
+        reserved: PENDING_FRAME,
+    };
+    if PENDING.remove(&frame_key).is_ok() {
+        ctx.unwound += 1;
+    }
+    if ctx.include_t != 0 {
+        let t_key = PendingKey {
+            thread: ctx.key,
+            depth: level,
+            reserved: PENDING_BLIND_MARKER,
+        };
+        if PENDING.remove(&t_key).is_ok() {
+            ctx.markers_freed += 1;
+        }
+    }
+    let o_key = PendingKey {
+        thread: ctx.key,
+        depth: level,
+        reserved: PENDING_OVERFLOW_MARKER,
+    };
+    if PENDING.remove(&o_key).is_ok() {
+        ctx.markers_freed += 1;
+    }
+    0
+}
 #[inline(never)]
 #[no_mangle]
 pub fn discard_deeper(
@@ -1078,43 +1140,35 @@ pub fn discard_deeper(
     thread: &mut Thread,
 ) {
     let top = if depth > MAX_DEPTH { MAX_DEPTH } else { depth };
-    for step in 0..9u32 {
-        if step > top {
-            break;
-        }
-        let level = top - step;
-        if level <= mine_level {
-            break;
-        }
-        let frame_key = PendingKey {
-            thread: *key,
-            depth: level,
-            reserved: PENDING_FRAME,
-        };
-        if PENDING.remove(&frame_key).is_ok() {
-            if !source_state::release_pending() {
-                loss(LOSS_MAP);
-            }
-            thread.depth = thread.depth.saturating_sub(1);
-        }
-        if include_t != 0 {
-            let t_key = PendingKey {
-                thread: *key,
-                depth: level,
-                reserved: PENDING_BLIND_MARKER,
-            };
-            if PENDING.remove(&t_key).is_ok() && !source_state::release_pending() {
-                loss(LOSS_MAP);
-            }
-        }
-        let o_key = PendingKey {
-            thread: *key,
-            depth: level,
-            reserved: PENDING_OVERFLOW_MARKER,
-        };
-        if PENDING.remove(&o_key).is_ok() && !source_state::release_pending() {
-            loss(LOSS_MAP);
-        }
+    let mut ctx = DiscardCtx {
+        key: *key,
+        top,
+        mine_level,
+        include_t,
+        unwound: 0,
+        markers_freed: 0,
+    };
+    // Callback only touches captured scratch (levels top→0) and
+    // PENDING deletes; counts stay exact even on early break.
+    let result = unsafe {
+        helpers::bpf_loop(
+            9,
+            discard_level_cb as *mut core::ffi::c_void,
+            (&mut ctx as *mut DiscardCtx).cast(),
+            0,
+        )
+    };
+    if result < 0 {
+        // Unreachable (nr=9 + flags=0 + verified callback cannot
+        // fail); signal LOUD and proceed with the actual counts
+        // (sound: the release/depth below consume exactly what the
+        // callback deleted, partial or full).
+        loss(LOSS_MAP);
+    }
+    thread.depth = thread.depth.saturating_sub(ctx.unwound);
+    let freed = ctx.unwound + ctx.markers_freed;
+    if freed != 0 && !source_state::release_pending_n(freed) {
+        loss(LOSS_MAP);
     }
 }
 /// fix8 (R8-2): fast-path guard — whether any marker (either
@@ -1156,11 +1210,11 @@ pub fn find_mine(
     out: &mut u64,
 ) -> bool {
     let top = if depth > MAX_DEPTH { MAX_DEPTH } else { depth };
-    for step in 0..9u32 {
-        if step > top {
-            break;
-        }
-        let level = top - step;
+    // Task 0 verifier fix: count DOWN from `top` (no `top - step`
+    // subtraction — the up-counting range confused the verifier's
+    // bound tracking). Visit order unchanged (levels top→0).
+    let mut level = top;
+    for _ in 0..9u32 {
         let frame_key = PendingKey {
             thread: *key,
             depth: level,
@@ -1196,6 +1250,10 @@ pub fn find_mine(
                 return true;
             }
         }
+        if level == 0 {
+            break;
+        }
+        level -= 1;
     }
     false
 }
@@ -1246,6 +1304,16 @@ pub fn pop_return(
                 if find_mine(&key, thread.depth, cookie, 1, &mut found) {
                     let mine_level = (found >> 32) as u32;
                     let mine_kind = (found & 0xffff_ffff) as u32;
+                    // Task 0 verifier fix: bound `mine_level` for the
+                    // discard loop (`find_mine` only ever writes
+                    // 0..=top, but the verifier joins its exit states
+                    // imprecisely — an unbounded level blows the jump
+                    // budget). Out-of-range is unreachable; fail LOUD
+                    // (never pop a wild slot) if hit.
+                    if mine_level > MAX_DEPTH {
+                        loss(LOSS_PAIR);
+                        return false;
+                    }
                     discard_deeper(&key, thread.depth, mine_level, 1, &mut thread);
                     let mk = PendingKey {
                         thread: key,
@@ -1323,6 +1391,13 @@ pub fn pop_return(
     if find_mine(&key, thread.depth, cookie, 0, &mut found) {
         let mine_level = (found >> 32) as u32;
         let mine_kind = (found & 0xffff_ffff) as u32;
+        // Task 0 verifier fix: bound `mine_level` for the discard
+        // loop (see the rejected arm above — same join imprecision).
+        // Out-of-range is unreachable; fail LOUD if hit.
+        if mine_level > MAX_DEPTH {
+            loss(LOSS_PAIR);
+            return false;
+        }
         discard_deeper(&key, thread.depth, mine_level, 1, &mut thread);
         let mk = PendingKey {
             thread: key,

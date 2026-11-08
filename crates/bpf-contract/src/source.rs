@@ -245,6 +245,25 @@ pub const fn pending_release_value(current: u64) -> Option<u64> {
         Some(current - 1)
     }
 }
+/// Batched release of `n` removed frames (Task 0 verifier fix): one
+/// atomic CAS instead of `n` sequential single-release CAS loops, so
+/// the BPF discard path makes ONE quota call per return instead of up
+/// to 27 (the 27-in-loop calls blew the verifier's jump budget —
+/// `observation_return` failed to load with E2BIG). All-or-nothing:
+/// `Some(current - n)` iff the batch keeps the counter above the two
+/// fixed reservations and within the cap; else `None` (the caller
+/// records loss and the claims stay held — the same fail-safe
+/// direction as a failed single release). `n == 0` and `n > 27` refuse
+/// (the discard path frees at most 8 bodies × 3 kinds = 24 — level 0
+/// never takes a body — so 27 is a defensive never-hit ceiling).
+#[inline(always)]
+pub const fn pending_release_n_value(current: u64, n: u32) -> Option<u64> {
+    if n == 0 || n > 27 || current <= 2 || current > 4096 || current - 2 < n as u64 {
+        None
+    } else {
+        Some(current - n as u64)
+    }
+}
 
 const _: () = {
     assert!(core::mem::size_of::<SourceRequest>() == 112);
@@ -404,6 +423,36 @@ mod tests {
         }
         for limit in [0, 1, 4097, u32::MAX] {
             assert_eq!(pending_claim_value(2, limit), None);
+        }
+    }
+    #[test]
+    fn batched_pending_release_keeps_reserved_pair_and_caps_the_batch() {
+        // Task 0 verifier fix: n=1 matches the single release exactly.
+        for current in [3u64, 4, 100, 4096] {
+            assert_eq!(
+                pending_release_n_value(current, 1),
+                pending_release_value(current),
+                "current={current}"
+            );
+        }
+        // Exact batches across the counter range.
+        assert_eq!(pending_release_n_value(29, 27), Some(2));
+        assert_eq!(pending_release_n_value(30, 27), Some(3));
+        assert_eq!(pending_release_n_value(4096, 27), Some(4069));
+        assert_eq!(pending_release_n_value(5, 3), Some(2));
+        assert_eq!(pending_release_n_value(12, 10), Some(2));
+        // The reserved pair is never refunded (all-or-nothing).
+        for (current, n) in [(2, 1), (3, 2), (28, 27), (4, 3), (10, 9)] {
+            assert_eq!(pending_release_n_value(current, n), None, "{current}-{n}");
+        }
+        // Degenerate batches refuse.
+        for n in [0, 28, u32::MAX] {
+            assert_eq!(pending_release_n_value(4096, n), None, "n={n}");
+        }
+        // Out-of-range counters refuse (mirrors the single release).
+        for current in [0, 1, 2, 4097, u64::MAX] {
+            assert_eq!(pending_release_n_value(current, 1), None, "{current}");
+            assert_eq!(pending_release_n_value(current, 27), None, "{current}");
         }
     }
     #[test]
