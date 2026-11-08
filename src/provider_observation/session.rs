@@ -2666,19 +2666,21 @@ impl ProviderSession {
     pub(crate) fn loss_totals(&self) -> [u64; 8] {
         self.loss_totals
     }
-    /// N4: install the coordinator's tick clock for receipt
-    /// stamping (called once at admission). Each successful LOSS
-    /// read then stamps its own containing tick, so a read
-    /// evaluated a tick late still anchors the baseline to its
-    /// own tick.
+    /// N4 + fix7 (R7-2): install the coordinator's tick clock
+    /// for receipt stamping (called once at admission). Each
+    /// consuming LOSS poll samples its receipt tick BEFORE the map
+    /// read and commits it only on success, so a read evaluated
+    /// a tick late still anchors the baseline to its receipt tick
+    /// — never to a completion tick the snapshot doesn't cover.
     pub(crate) fn set_loss_tick_clock(&mut self, origin_ns: u64, tick_ns: u64) {
         self.loss_tick_clock = Some((origin_ns, tick_ns.max(1)));
     }
     /// 6A successful-read receipts (§4.1 `[S,T+1)` rule): per-lane
-    /// (read sequence, containing tick), one bump+stamp per
-    /// successful LOSS map read. The coordinator advances a lane's
-    /// baseline tick only to the oldest read tick across live
-    /// sessions.
+    /// (read sequence, receipt tick), one bump+stamp per
+    /// successful LOSS map read (fix7/R7-2: the consuming poll
+    /// samples BEFORE the read — receipts certify accounted
+    /// coverage). The coordinator advances a lane's baseline tick
+    /// only to the oldest receipt tick across live sessions.
     pub(crate) fn loss_read_receipts(&self) -> [(u64, u64); 8] {
         std::array::from_fn(|i| (self.loss_read_seq[i], self.loss_read_tick[i]))
     }
@@ -3907,6 +3909,15 @@ impl ProviderSession {
                     }
                     event
                 }
+                // fix7 (R7-1 verdict (i)): a `None` break keeps
+                // `drained_clean` even though `None` ≠ empty (a
+                // busy head hides queued records; producers may
+                // queue-and-lose while descheduled). The next
+                // drain's complete survivors publish INTACT — which
+                // is CORRECT (gap-safe assembly — the delta hit
+                // other records), not a steal: the poll below stays
+                // as conservative defense-in-depth plus exact
+                // coordinator accounting.
                 None => break,
             };
             match event {

@@ -466,13 +466,13 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
         // fix6 (R6-4 backstop): a None with `next == MAX` DELETES
         // the row instead of inserting it — persisting a MAX row
         // would wedge every later entry (returns clear only
-        // `overflow`), turning transient CAS exhaustion into
-        // permanent per-thread blindness. Depth-overflow Nones
-        // still insert (their overflow arms `skip_return`
-        // pairing). Creation-time refusal (above) makes fresh MAX
-        // rows unreachable; a pre-existing MAX row needs 2^64
-        // emits (unreachable) — the delete is pure defense in
-        // depth, distinguished by `next`, not freshness.
+        // `overflow`/`blind`, never `next`), turning transient CAS
+        // exhaustion into permanent per-thread blindness.
+        // Depth-overflow Nones still insert (their overflow arms
+        // `skip_return` pairing). Creation-time refusal (above)
+        // makes fresh MAX rows unreachable; a pre-existing MAX row
+        // needs 2^64 emits (unreachable) — the delete is pure
+        // defense in depth, distinguished by `next`, not freshness.
         match enter_none_disposition(thread.next) {
             EnterNoneDisposition::Delete => {
                 if THREADS.remove(&key).is_err() {
