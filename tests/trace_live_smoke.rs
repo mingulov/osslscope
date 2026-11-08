@@ -106,6 +106,7 @@ fn drive(
     let scratch = ScratchDir(
         std::env::temp_dir().join(format!("osslscope-trace-smoke-{}", std::process::id())),
     );
+    let _ = fs::remove_dir_all(&scratch.0);
     fs::create_dir(&scratch.0).unwrap();
     let app = build_workload(&scratch.0);
     let (mut child, rx) = spawn(&app);
