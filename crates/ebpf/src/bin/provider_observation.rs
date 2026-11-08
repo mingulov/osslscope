@@ -480,6 +480,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
                 depth: 0,
                 overflow: 0,
                 blind: 0,
+                overflow_inner: 0,
             }
         }
     };
@@ -525,6 +526,18 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
                 loss(LOSS_MAP);
             }
             thread.overflow = thread.overflow.saturating_add(1);
+            // R9-P2-1: record fallback POSITION with the unit. An
+            // occupied same-level O-marker means this unit is
+            // INNER (entered after the slot owner — it returns
+            // first and its accepted return must consume before
+            // any same-cookie slot pops); an empty level means
+            // OUTER (quota/map refusal — a later slot pops
+            // first). Covers collision, quota, and map refusal
+            // uniformly: the probe reads occupancy, not the
+            // refusal cause.
+            if o_marker_at(&key, old_depth) {
+                thread.overflow_inner = thread.overflow_inner.saturating_add(1);
+            }
             if THREADS.insert(key, thread, 0).is_err() {
                 loss(LOSS_MAP)
             }
@@ -570,6 +583,12 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     };
     if !source_state::claim_pending() {
         thread.failed_entry();
+        // R9-P2-1: the failed call's counter unit records
+        // position like any fallback (probed at the unwound
+        // level — `failed_entry` restored `old_depth`).
+        if o_marker_at(&key, old_depth) {
+            thread.overflow_inner = thread.overflow_inner.saturating_add(1);
+        }
         if THREADS.insert(key, thread, 0).is_err() {
             loss(LOSS_MAP)
         }
@@ -582,6 +601,12 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
             loss(LOSS_MAP);
         }
         thread.failed_entry();
+        // R9-P2-1: same position recording as the claim-failure
+        // arm above (an occupied O at the unwound level means
+        // this unit returns before the slot owner).
+        if o_marker_at(&key, old_depth) {
+            thread.overflow_inner = thread.overflow_inner.saturating_add(1);
+        }
         if THREADS.insert(key, thread, 0).is_err() {
             loss(LOSS_MAP)
         }
@@ -1192,6 +1217,19 @@ fn marker_at(key: &ThreadKey, level: u32) -> bool {
     };
     unsafe { PENDING.get(&t_key) }.is_some()
 }
+/// R9-P2-1: fallback-position probe — whether an O-marker (any
+/// cookie) occupies `level`. O-only (a T-marker says nothing
+/// about overflow ordering — T-first belongs to the rejected
+/// path, which is unchanged).
+#[inline(always)]
+fn o_marker_at(key: &ThreadKey, level: u32) -> bool {
+    let o_key = PendingKey {
+        thread: *key,
+        depth: level,
+        reserved: PENDING_OVERFLOW_MARKER,
+    };
+    unsafe { PENDING.get(&o_key) }.is_some()
+}
 /// fix8 (R8-2): slow pop search — the deepest slot owned by
 /// `cookie` (fetch-only; `*out` packs level << 32 | kind). Frames
 /// sort before their lateral markers (a frame is always inner to
@@ -1358,8 +1396,11 @@ pub fn pop_return(
     // directly (the common case) — but ONLY when no marker sits at
     // the current depth (a same-cookie marker-owner's return must
     // NOT hijack the outer frame; a deeper marker of any cookie is
-    // a skipped inner the slow path discards). Anything else falls
-    // to the slow positional search.
+    // a skipped inner the slow path discards). R9-P2-1: and ONLY
+    // with no overflow outstanding (a cookie match is not
+    // ownership — with a counter unit outstanding the returning
+    // call may own the counter, and the slow path consumes it).
+    // Anything else falls to the slow positional search.
     if thread.depth > 0 {
         let pk = PendingKey {
             thread: key,
@@ -1367,7 +1408,7 @@ pub fn pop_return(
             reserved: PENDING_FRAME,
         };
         if let Some(p) = unsafe { PENDING.get(&pk).copied() } {
-            if p.cookie == cookie && !marker_at(&key, thread.depth) {
+            if p.cookie == cookie && !marker_at(&key, thread.depth) && thread.overflow == 0 {
                 if PENDING.remove(&pk).is_err() {
                     loss(LOSS_MAP);
                     return false;
@@ -1396,6 +1437,26 @@ pub fn pop_return(
         // Out-of-range is unreachable; fail LOUD if hit.
         if mine_level > MAX_DEPTH {
             loss(LOSS_PAIR);
+            return false;
+        }
+        // R9-P2-1: a cookie match is not ownership — an ambiguous
+        // match consumes instead of popping. An O-slot pops only
+        // with no inner unit outstanding (else the inner counter
+        // owner is returning — the collision shape); a frame pops
+        // only with no overflow outstanding (else a counter owner
+        // is returning — quota/map/failed shapes). A consume pops
+        // and discards nothing (a deeper marker may be outer-live,
+        // not skipped). The guards guarantee a unit (`skip_return`
+        // cannot fail here); the rejected arm is unchanged.
+        let consume_counter = (mine_kind == PENDING_OVERFLOW_MARKER
+            && thread.overflow_inner > 0
+            && thread.overflow > 0)
+            || (mine_kind == PENDING_FRAME && thread.overflow > 0);
+        if consume_counter {
+            thread.skip_return();
+            if THREADS.insert(key, thread, 0).is_err() {
+                loss(LOSS_MAP);
+            }
             return false;
         }
         discard_deeper(&key, thread.depth, mine_level, 1, &mut thread);
