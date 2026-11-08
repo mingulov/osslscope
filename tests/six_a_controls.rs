@@ -2501,7 +2501,9 @@ fn inject_thread_row(map_id: &str, pid: u32, tid: u32) -> bool {
     key.extend_from_slice(&pid.to_le_bytes());
     key.extend_from_slice(&tid.to_le_bytes());
     key.extend_from_slice(&0u64.to_le_bytes());
-    let value = [0u8; 16];
+    // fix6: THREADS values are 24 B (the row remembers its creation
+    // seed — all-zero row = {next 0, depth 0, overflow 0, seed 0}).
+    let value = [0u8; 24];
     let hex: Vec<String> = key
         .iter()
         .chain(value.iter())

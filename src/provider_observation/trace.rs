@@ -2892,8 +2892,9 @@ mod tests {
             (1, 1)
         );
         // Forged low invocation (≤ old HW): visible dup-unpaired,
-        // never pairs (fix5: real recycled tids seed above the HW
-        // and pair — this forging exercises the shield mechanism).
+        // never pairs (fix6: real recycled tids mint a fresh seed
+        // and pair in the new scope — this same-seed forging
+        // exercises the shield mechanism).
         let r1 = key(10, 11, 1, 600, 1);
         p.attempt(attempt(r1, 20, 3000));
         p.result(result(r1, 20, 3100, 1));
