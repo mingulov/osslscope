@@ -44,16 +44,19 @@ wrapper=os.environ.get('RUSTC_WRAPPER') or config.get('build',{}).get('rustc-wra
 host_enabled=nightly and config.get('unstable',{}).get('host-config',False)
 if 'CARGO_UNSTABLE_HOST_CONFIG' in os.environ: host_enabled=nightly and os.environ['CARGO_UNSTABLE_HOST_CONFIG']=='true'
 if 'unstable.host-config=false' in args: host_enabled=False
+_tvar='CARGO_TARGET_'+('BPFEL_UNKNOWN_NONE' if nightly else 'X86_64_UNKNOWN_LINUX_GNU')+'_RUSTFLAGS'
+_ttriple='bpfel-unknown-none' if nightly else 'x86_64-unknown-linux-gnu'
 if host_enabled:
  host=config.get('host',{});flags=host.get('x86_64-unknown-linux-gnu',host).get('rustflags',[])
-elif nightly and '--target' in args: flags=[]
 elif 'CARGO_ENCODED_RUSTFLAGS' in os.environ: flags=os.environ['CARGO_ENCODED_RUSTFLAGS'].split('\x1f') if os.environ['CARGO_ENCODED_RUSTFLAGS'] else []
 elif 'RUSTFLAGS' in os.environ: flags=os.environ['RUSTFLAGS'].split()
 elif 'CARGO_BUILD_RUSTFLAGS' in os.environ: flags=os.environ['CARGO_BUILD_RUSTFLAGS'].split()
-else: flags=config.get('target',{}).get('x86_64-unknown-linux-gnu',{}).get('rustflags',config.get('build',{}).get('rustflags',[]))
+elif _tvar in os.environ: flags=os.environ[_tvar].split()
+else: flags=config.get('target',{}).get(_ttriple,{}).get('rustflags',config.get('build',{}).get('rustflags',[]))
 command=([wrapper] if wrapper else [])+[compiler,*flags,'--print','sysroot']
 sysroot=subprocess.check_output(command,text=True).strip()
 with (root/'cargo-compilers.jsonl').open('a') as out: out.write(json.dumps({'nightly':nightly,'compiler':compiler,'sysroot':sysroot,'metadata':'metadata' in args})+'\n')
+with (root/'cargo-linkers.jsonl').open('a') as out: out.write(json.dumps({'nightly':nightly,'metadata':'metadata' in args,'env_linker':os.environ.get('CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER'),'flags':flags})+'\n')
 if 'metadata' in args: print(json.dumps({'target_directory':str(root/'outputs')}));sys.exit()
 if 'build' not in args: raise SystemExit('unexpected fixture command')
 names=['osslscope-'+name for name in ('harvest','count','members','provider-observation','focused-count')] if nightly else ['osslscope']
@@ -73,6 +76,15 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def flags_carry_linker(flags):
+    for i, flag in enumerate(flags):
+        if flag == '-C' and i + 1 < len(flags) and flags[i + 1].startswith('linker'):
+            return True
+        if flag.startswith('-Clinker'):
+            return True
+    return False
+
+
 class BuildSourceBinding(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
@@ -88,7 +100,7 @@ class BuildSourceBinding(unittest.TestCase):
         for name in ('cargo','rustc','rustup','bpf-linker','pinned-host-rustc','pinned-nightly-rustc','alternate-rustc','cache-wrapper'):
             path=self.bin/name;path.write_text(SHIM);path.chmod(0o755)
         self.env=dict(os.environ,PATH=str(self.bin)+os.pathsep+os.environ['PATH'],SOURCE_BINDING_FIXTURE=str(self.root))
-        for selector in ('RUSTC','CARGO_BUILD_RUSTC','RUSTC_WRAPPER','CARGO_BUILD_RUSTC_WRAPPER','RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','CARGO_UNSTABLE_HOST_CONFIG','CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST'):
+        for selector in ('RUSTC','CARGO_BUILD_RUSTC','RUSTC_WRAPPER','CARGO_BUILD_RUSTC_WRAPPER','RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER','CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS','CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS','CARGO_UNSTABLE_HOST_CONFIG','CARGO_UNSTABLE_TARGET_APPLIES_TO_HOST'):
             self.env.pop(selector,None)
         self.manifest=self.root/'build.json'
 
@@ -153,12 +165,12 @@ class BuildSourceBinding(unittest.TestCase):
     def test_environment_build_and_target_flags_cannot_redirect_source(self):
         alternate=str(self.root/'alternate-sysroot')
         config=self.product/'.cargo/config.toml';config.parent.mkdir(exist_ok=True)
-        for selector in ('RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','build.rustflags','target.rustflags'):
+        for selector in ('RUSTFLAGS','CARGO_ENCODED_RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS','build.rustflags','target.rustflags'):
             with self.subTest(selector=selector):
                 config.write_text('')
                 environment={}
                 if selector=='CARGO_ENCODED_RUSTFLAGS': environment[selector]='--sysroot\x1f'+alternate
-                elif selector in ('RUSTFLAGS','CARGO_BUILD_RUSTFLAGS'): environment[selector]='--sysroot '+alternate
+                elif selector in ('RUSTFLAGS','CARGO_BUILD_RUSTFLAGS','CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS'): environment[selector]='--sysroot '+alternate
                 else: config.write_text(('['+('build' if selector=='build.rustflags' else 'target.x86_64-unknown-linux-gnu')+']\nrustflags = ["--sysroot='+alternate+'"]\n'))
                 log=self.root/'cargo-compilers.jsonl';log.unlink(missing_ok=True)
                 run=self.build(('--host-only','--check-only'),**environment);self.assertEqual(run.returncode,0,run.stdout+run.stderr)
@@ -204,10 +216,29 @@ class BuildSourceBinding(unittest.TestCase):
                 run=self.build(options);self.assertEqual(run.returncode,0,run.stdout+run.stderr)
                 self.assertIsNone(json.loads(self.manifest.read_bytes()).get('bpf_runtime_source'))
 
+    # System tools the entrypoint may exec, beyond the fixture's own
+    # cargo/rustc/rustup shims (bpf-linker is deliberately absent).
+    LINKERLESS_TOOLS = ('sh','python3','git','cat','cp','grep','dirname',
+                        'sed','rm','mkdir','date','sha256sum','basename',
+                        'file','readelf','pwd')
+
     def linkerless_path(self):
-        # Fixture tools first, then a linker-free system tail: no
-        # bpf-linker may leak in from the ambient PATH.
-        return str(self.bin)+os.pathsep+'/usr/bin'+os.pathsep+'/bin'
+        # Hermetic absence: fixture tools first, then a private dir of
+        # symlinks to exactly the system tools the script needs. No
+        # system directory is retained, so an installed bpf-linker
+        # cannot leak in from the ambient PATH on any machine; the
+        # trailing assertion guards the construction loudly.
+        tools = self.root/'linkerless-tools'
+        if not tools.exists():
+            tools.mkdir()
+            for name in self.LINKERLESS_TOOLS:
+                target = shutil.which(name)
+                self.assertIsNotNone(target,'system tool missing: '+name)
+                (tools/name).symlink_to(target)
+        path = str(self.bin)+os.pathsep+str(tools)
+        self.assertIsNone(shutil.which('bpf-linker',path=path),
+                          'bpf-linker leaked into the linkerless PATH')
+        return path
 
     def test_linker_missing_refuses_check_only(self):
         (self.bin/'bpf-linker').unlink()
@@ -241,6 +272,60 @@ class BuildSourceBinding(unittest.TestCase):
         (self.bin/'bpf-linker').unlink()
         run=self.build(('--host-only','--check-only'),PATH=self.linkerless_path())
         self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+
+    def linker_calls(self):
+        log=self.root/'cargo-linkers.jsonl'
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines()]
+
+    def assert_bpf_linker_bound(self):
+        # Every BPF compilation must receive the CHECKED absolute
+        # linker through cargo's own selection variable, and no
+        # `-C linker` may arrive through rustflags (which would
+        # last-win over the binding under real cargo).
+        checked=str(self.bin/'bpf-linker')
+        calls=[call for call in self.linker_calls() if call['nightly'] and not call['metadata']]
+        self.assertTrue(calls,'no BPF compilation cargo calls logged')
+        for call in calls:
+            self.assertEqual(call['env_linker'],checked,'BPF cargo call did not receive the checked linker binding')
+            self.assertFalse(flags_carry_linker(call['flags']),'rustflags-carried -C linker reached BPF compilation: %r' % (call['flags'],))
+
+    def test_bpf_linker_override_env_cannot_divert_selection(self):
+        log=self.root/'cargo-linkers.jsonl';log.unlink(missing_ok=True)
+        run=self.build(('--bpf-only',),CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER='/usr/bin/false')
+        self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+        self.assert_bpf_linker_bound()
+
+    def test_bpf_linker_config_file_cannot_divert_selection(self):
+        config=self.product/'.cargo/config.toml';config.parent.mkdir(exist_ok=True)
+        bodies={'triple': '[target.bpfel-unknown-none]\nlinker = "/usr/bin/false"\n',
+                'cfg': '[target."cfg(unix)"]\nlinker = "/usr/bin/false"\n'}
+        for name, body in bodies.items():
+            with self.subTest(table=name):
+                config.write_text(body)
+                log=self.root/'cargo-linkers.jsonl';log.unlink(missing_ok=True)
+                run=self.build(('--bpf-only',))
+                self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+                self.assert_bpf_linker_bound()
+
+    def test_rustflags_linker_smuggling_stays_suppressed(self):
+        config=self.product/'.cargo/config.toml';config.parent.mkdir(exist_ok=True)
+        hostile='-C linker=/usr/bin/false'
+        for selector in ('CARGO_BUILD_RUSTFLAGS','CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS','build.rustflags','target.rustflags'):
+            with self.subTest(selector=selector):
+                config.write_text('')
+                environment={'CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER': '/usr/bin/false'}
+                if selector in ('CARGO_BUILD_RUSTFLAGS','CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS'):
+                    environment[selector]=hostile
+                elif selector == 'build.rustflags':
+                    config.write_text('[build]\nrustflags = ["-Clinker=/usr/bin/false"]\n')
+                else:
+                    config.write_text('[target.bpfel-unknown-none]\nrustflags = ["-Clinker=/usr/bin/false"]\n')
+                log=self.root/'cargo-linkers.jsonl';log.unlink(missing_ok=True)
+                run=self.build(('--bpf-only',),**environment)
+                self.assertEqual(run.returncode,0,run.stdout+run.stderr)
+                self.assert_bpf_linker_bound()
 
 
 if __name__=='__main__':

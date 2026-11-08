@@ -37,7 +37,10 @@ only) on a cache miss. `CARGO_BUILD_JOBS` defaults to 2.
   share the prerequisite gate: a missing linker or any other
   version fails hard with exit 3 and an install hint — there is
   no silent fallback, because the wrong linker miscompiles the
-  BPF objects.
+  BPF objects. The checked absolute path is bound into
+  compilation (`CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER`), so
+  environment or config-file linker selectors cannot substitute
+  another binary behind the gate.
 - `python3` (3.11 or newer), `sha256sum`, `file`, `readelf`.
 
 Check what the script sees:
@@ -69,35 +72,55 @@ runs every cargo call with network allowed; the default (neither flag)
 tries `--offline` first and retries once online on a cache miss only.
 The manifest records the selected mode and which path was used.
 
-Identity-v2 dev admission (full default mode only):
+Identity-v2 dev admission (full default mode only) is a
+preparatory path, not a working recipe yet:
 
 ```sh
 ./scripts/build-dev.sh --identity-v2-inputs FILE --identity-v2-dir DIR
 ```
 
-Both flags are required together and are refused with `--host-only`
-or `--bpf-only`. `FILE` must name an existing inputs file; `DIR` is
-created when missing but must be fresh — the script refuses a
-directory that already holds `dev-admission.json`. The run freezes
-custody plus the four identity BPF roles, builds the observer-only
-host binary against them, and writes the dev admission
-(`dev-admission.json`) under `DIR`; `OSSL_PACKAGE_RECORD_DIR` points
-at `DIR` only for that host build.
+What exists today: the flags parse, the pairing/file/freshness
+sentinel checks run (both flags required together, refused with
+`--host-only`/`--bpf-only`; `FILE` must name an existing inputs
+file; `DIR` is created when missing but refused when it already
+holds `dev-admission.json`), and the script then deliberately
+refuses — the custody producer `osslscope-identity-custodian` has
+no bin target in this checkout, and neither does the BPF role
+`osslscope-identity`. An operator running the recipe today sees
+cargo's ``error: no bin target named
+`osslscope-identity-custodian` in default-run packages`` followed
+by the script's `error: identity v2 requires the actual custody
+producer` (exit 1); nothing is written to `DIR`. Once the two
+producers land, the run will freeze custody plus the four identity
+BPF roles, build the observer-only host binary against them, and
+write the dev admission (`dev-admission.json`) under `DIR`;
+`OSSL_PACKAGE_RECORD_DIR` will point at `DIR` only for that host
+build.
 
 `CARGO_TARGET_DIR` (or `build.target-dir`) is honored: cargo writes
 where it points, and the script resolves both real target directories
 through `cargo metadata` — `--check-only` prints them and the manifest
 records them (`host_target_dir`, `bpf_target_dir`,
-`cargo_target_dir_env`). Only the per-invocation cargo log capture
-stays fixed under `<repo>/target/.cargo-log-*/`.
+`cargo_target_dir_env`). Three paths stay fixed regardless: the
+per-invocation cargo log capture under
+`<repo>/target/.cargo-log-*/`, the default manifest at
+`<repo>/target/dev-build-manifest.json` (only `--manifest`
+redirects it), and the identity helper's private compilation
+directory under the capture dir (`admission-target`; currently
+unreached — the identity path refuses before it, see above).
 
 Ambient Rust flags are normalized, not honored: every cargo invocation
 runs with `RUSTFLAGS`/`CARGO_ENCODED_RUSTFLAGS` blanked and unstable
 host-config selection disabled, so ambient flags cannot redirect the
-pinned sysroot or leak host options into the BPF link. The blanking is
-load-bearing — `-C target-cpu=native` breaks the bpfel link and
-`--sysroot ALT` would silently redirect compilation while the manifest
-still binds the pinned source identity — so custom Rust flags are
+pinned sysroot, leak host options into the BPF link, or smuggle a
+`-C linker` past the bound linker. The blanked empty set overrides
+`RUSTFLAGS`, `CARGO_BUILD_RUSTFLAGS`, per-target rustflags variables,
+and config-file rustflags tables alike. The blanking is load-bearing:
+`-C target-cpu=native` breaks the bpfel link (observed as a real
+artifact-level failure) and `--sysroot ALT` would silently redirect
+compilation while the manifest still binds the pinned source identity
+(mechanism sound per cargo flag precedence; the committed
+demonstration is fixture-level, host-only) — so custom Rust flags are
 outside this pinned recipe. Proof:
 `scripts/tests/test-runtime-source-binding.py`
 (`test_environment_build_and_target_flags_cannot_redirect_source`).

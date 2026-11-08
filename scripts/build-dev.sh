@@ -123,10 +123,12 @@ run_pinned_cargo() {
     # scalar config overrides disable separate host-table flag selection.
     # The blanking is load-bearing, not hygiene: ambient RUSTFLAGS leak
     # into every cargo invocation, so `-C target-cpu=native` breaks the
-    # bpfel link (host CPU features reach bpf-linker) and `--sysroot ALT`
-    # silently redirects compilation while the manifest still binds the
-    # pinned source identity. Custom Rust flags are outside this pinned
-    # recipe; see docs/build.md. Proof:
+    # bpfel link (host CPU features reach bpf-linker — observed as a
+    # real artifact-level failure) and `--sysroot ALT` would silently
+    # redirect compilation while the manifest still binds the pinned
+    # source identity (mechanism sound per cargo flag precedence; the
+    # committed demonstration is fixture-level, host-only). Custom Rust
+    # flags are outside this pinned recipe; see docs/build.md. Proof:
     # scripts/tests/test-runtime-source-binding.py
     # (test_environment_build_and_target_flags_cannot_redirect_source).
     RUSTC="$_cargo_rustc" CARGO_BUILD_RUSTC="$_cargo_rustc" \
@@ -157,6 +159,7 @@ esac
 BPF_CARGO_VER=""
 BPF_RUSTC_VER=""
 BPF_LINKER_VER=""
+BPF_LINKER_PATH=""
 BPF_RUSTC_PATH=""
 if [ "$MODE" != "host" ]; then
     BPF_RUSTC_PATH="$(resolve_pinned_rustc "$BPF_TOOLCHAIN")" \
@@ -176,6 +179,28 @@ if [ "$MODE" != "host" ]; then
     # silent fallback. Host-only builds need no linker and skip this.
     [ "$BPF_LINKER_VER" = "bpf-linker $BPF_LINKER_PIN" ] \
         || fail_prereq "bpf-linker is '$BPF_LINKER_VER', need exactly 'bpf-linker $BPF_LINKER_PIN'" "install bpf-linker $BPF_LINKER_PIN manually (e.g. cargo install --locked bpf-linker --version $BPF_LINKER_PIN)"
+    # Bind the CHECKED executable to compilation: cargo's linker
+    # selection (env CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER, config
+    # target.bpfel-unknown-none.linker and target.'cfg(..)'.linker)
+    # otherwise survives the gate above — blanking RUSTFLAGS does not
+    # remove it — so the manifest would record 0.10.4 while cargo
+    # links with another binary. Binding (not rejecting) keeps
+    # legitimate ambient settings working, and the env form wins over
+    # every config-file form. A `-C linker` smuggled through any
+    # rustflags channel would still last-win over this binding, so the
+    # binding is airtight only together with the RUSTFLAGS blanking in
+    # run_pinned_cargo, which suppresses every rustflags channel.
+    # Proof: scripts/tests/test-runtime-source-binding.py
+    # (test_bpf_linker_override_env_cannot_divert_selection and the
+    # config/smuggling cases next to it).
+    BPF_LINKER_PATH="$(command -v bpf-linker)"
+    case "$BPF_LINKER_PATH" in
+        /*) ;;
+        *) BPF_LINKER_PATH="$PWD/$BPF_LINKER_PATH" ;;
+    esac
+    [ -f "$BPF_LINKER_PATH" ] && [ -x "$BPF_LINKER_PATH" ] \
+        || fail_prereq "checked bpf-linker path is not an executable file: $BPF_LINKER_PATH" "install bpf-linker $BPF_LINKER_PIN manually (e.g. cargo install --locked bpf-linker --version $BPF_LINKER_PIN)"
+    export CARGO_TARGET_BPFEL_UNKNOWN_NONE_LINKER="$BPF_LINKER_PATH"
 fi
 
 # Cargo build-std reads the separately installed source tree, not compiler
@@ -487,7 +512,7 @@ export REPO MANIFEST PRODUCT_REF PRODUCT_TREE PRODUCT_REF_SHORT PRODUCT_DIRTY BU
     HOST_CARGO_VER HOST_RUSTC_VER BPF_CARGO_VER BPF_RUSTC_VER BPF_LINKER_VER \
     HOST_TOOLCHAIN BPF_TOOLCHAIN BPF_TARGET BPF_BINS JOBS NET OFFLINE_USED \
     MODE PROFILE HOST_CMD BPF_CMD DIAGNOSTICS HOST_BIN BPF_BIN_PATHS \
-    HOST_TD BPF_TD CHECK_ONLY CARGO_TARGET_DIR CARGO_LOG SCRATCH BPF_LIBRARY_IDENTITY HOST_RUSTC_PATH BPF_RUSTC_PATH
+    HOST_TD BPF_TD CHECK_ONLY CARGO_TARGET_DIR CARGO_LOG SCRATCH BPF_LIBRARY_IDENTITY HOST_RUSTC_PATH BPF_RUSTC_PATH BPF_LINKER_PATH
 python3 - <<'EOF'
 import hashlib, json, os, subprocess
 
@@ -568,6 +593,7 @@ manifest = {
     "bpf_rustc": e.get("BPF_RUSTC_VER") or None,
     "bpf_rustc_path": e.get("BPF_RUSTC_PATH") or None,
     "bpf_linker": e.get("BPF_LINKER_VER") or None,
+    "bpf_linker_path": e.get("BPF_LINKER_PATH") or None,
     "bpf_runtime_source": runtime_source,
     "bpf_target": e.get("BPF_TARGET"),
     "jobs": int(e.get("JOBS", "2")),
