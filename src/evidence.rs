@@ -2253,6 +2253,105 @@ mod bounded_projection_tests {
         assert_eq!(offsets, vec![21, 19, 20]);
     }
 
+    /// fix8 F1 (R8-1): forged learned-identity record through the
+    /// REAL `DynamicAlgorithmId::observed` (no mocked IDs — the
+    /// conflation property under test lives in `observed`'s hash
+    /// inputs). All invocation-identity fields shared; only the
+    /// creation namespace (seed, thread stamp) varies per observation.
+    fn learned_id(seed: u64, stamp: u64) -> DynamicAlgorithmId {
+        let object = ObjectHash::try_from("d".repeat(64)).unwrap();
+        let record = Record {
+            pid: 100,
+            tid: 200,
+            cookie: 7,
+            generation: 3,
+            invocation: 1,
+            operation: 2,
+            algorithm_index: 0,
+            seed,
+            start_time_ns: stamp,
+            ..Default::default()
+        };
+        DynamicAlgorithmId::observed(&object, 4242, &record)
+    }
+
+    fn resolve<'a>(projection: &'a MetadataProjection, id: &str) -> Option<Option<u16>> {
+        projection
+            .algorithm_identities
+            .iter()
+            .find(|identity| identity.id == id)
+            .map(|identity| identity.known_algorithm)
+    }
+
+    #[test]
+    fn fix8_f1_recycled_thread_projects_distinct_identity() {
+        // fix8 F1 (R8-1) shape (a): complete F1(A) + recycled
+        // same-fields F2(B) (invocations restart at 1 per row BY
+        // DESIGN, so a recycled thread reuses every invocation
+        // field). Thread recycle differs in stamp; row
+        // delete/recreate differs in seed — each dimension alone
+        // must namespace. RED pre-fix: one shared public ID, F2
+        // projects A's label.
+        let f1 = learned_id(5, 100);
+        let f2_stamp = learned_id(5, 200);
+        let f2_seed = learned_id(6, 100);
+        assert_ne!(f1, f2_stamp, "stamp must namespace recycled threads");
+        assert_ne!(f1, f2_seed, "seed must namespace recreated rows");
+        let sites = vec![exec_site(4, 31), exec_site(4, 32), exec_site(4, 33)];
+        let rows = vec![
+            row(31, vec![assoc(Some(f1), Some(3))]),
+            row(32, vec![assoc(Some(f2_stamp), Some(9))]),
+            row(33, vec![assoc(Some(f2_seed), Some(11))]),
+        ];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, METADATA_PROJECTION_BUDGET_BYTES);
+        assert_eq!(projection.reason, MetadataProjectionReason::Complete);
+        assert_eq!(projection.algorithm_identities.len(), 3);
+        for (row, want) in [(31u64, Some(3)), (32, Some(9)), (33, Some(11))] {
+            let provenance = projection
+                .site_provenance
+                .iter()
+                .find(|provenance| provenance.site.offset == row)
+                .unwrap();
+            let id = provenance.associations[0].algorithm_id.as_ref().unwrap();
+            assert_eq!(resolve(&projection, id), Some(want), "row {row}");
+        }
+    }
+
+    #[test]
+    fn fix8_f1_incomplete_recycled_projects_unknown() {
+        // fix8 F1 (R8-1) shape (b): complete F1(A) + missing-END
+        // recycled F2 (assembly `other()` = u16::MAX, filtered to
+        // unknown at interning) with a consumed delta. The batch
+        // carries IntervalUnknown but projection gating
+        // (`batch_invalidates_advertisements`) does not reject on
+        // it — so namespacing (not gating) must keep F2 off A's
+        // label. RED pre-fix: F2 shares F1's ID, projects A.
+        let f1 = learned_id(5, 100);
+        let f2 = learned_id(6, 200);
+        assert_ne!(f1, f2);
+        let sites = vec![exec_site(4, 34), exec_site(4, 35)];
+        let rows = vec![
+            row(34, vec![assoc(Some(f1), Some(3))]),
+            row(35, vec![assoc(Some(f2), Some(u16::MAX))]),
+        ];
+        let doc = doc_with(sites, rows);
+        let projection = project_metadata_bounded(&doc, METADATA_PROJECTION_BUDGET_BYTES);
+        assert_eq!(projection.reason, MetadataProjectionReason::Complete);
+        assert_eq!(projection.algorithm_identities.len(), 2);
+        let f2_provenance = projection
+            .site_provenance
+            .iter()
+            .find(|provenance| provenance.site.offset == 35)
+            .unwrap();
+        let f2_id = f2_provenance.associations[0].algorithm_id.as_ref().unwrap();
+        assert_eq!(
+            resolve(&projection, f2_id),
+            Some(None),
+            "incomplete F2 must project unknown, never A's label"
+        );
+    }
+
     #[test]
     fn huge_unknown_sets_stay_bounded_and_counted() {
         let mut sites = Vec::new();

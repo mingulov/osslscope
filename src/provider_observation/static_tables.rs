@@ -56,6 +56,15 @@ impl DynamicAlgorithmId {
     /// observer identities, object fingerprint and bounded ordinal enter this digest.
     /// Invocation numbers are local to (pid, tid, generation); retain that full
     /// scope while excluding per-function addresses, IDs and emission times.
+    /// fix8 (R8-1): the creation namespace (thread stamp, row seed)
+    /// joins the digest. Invocations restart at 1 per row BY DESIGN,
+    /// so a recycled thread reuses every invocation field — without
+    /// the creation pair, distinct observations share one public ID
+    /// and first-known-wins interning mislabels the later one. The
+    /// advertisement-lease epoch stays OUT: the same physical site
+    /// across a lease flip is one observation (the learned table is
+    /// keyed without epoch and bounded at 4,096 sites — epoch would
+    /// only split identities and pressure the bound).
     pub(crate) fn observed(
         object: &super::ObjectHash,
         starttime: u64,
@@ -70,9 +79,15 @@ impl DynamicAlgorithmId {
             record.invocation,
             record.operation as u64,
             record.algorithm_index as u64,
+            // fix8 (R8-1): creation namespace (see above).
+            record.start_time_ns,
+            record.seed,
         ];
         let mut hash = Sha256::new();
-        hash.update(b"osslscope-public-algorithm-v1");
+        // fix8 (R8-1): v1→v2 — the input set changed and projected
+        // IDs persist in report JSON (`algorithm_identities`), so
+        // old/new IDs must never be confused across versions.
+        hash.update(b"osslscope-public-algorithm-v2");
         hash.update(String::from(object.clone()).as_bytes());
         for value in identity {
             hash.update(value.to_le_bytes());
