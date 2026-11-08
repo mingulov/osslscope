@@ -77,6 +77,18 @@ fn decoder_still_accepts_fetch_lifecycle_edges() {
 }
 
 #[test]
+fn rejected_unknown_api_probe() {
+    assert!(wire::rejected_unknown_api(&edge(1, 0, 0)));
+    assert!(wire::rejected_unknown_api(&edge(2, 73, 1)));
+    assert!(wire::rejected_unknown_api(&edge(1, 1000, 0)));
+    for api in [1, 6, 7, 9, 10, 15, 16, 19, 20, 72] {
+        assert!(!wire::rejected_unknown_api(&edge(1, api, 0)), "api {api}");
+    }
+    assert!(!wire::rejected_unknown_api(&edge(1, 0, 0)[..95]));
+    assert!(!wire::rejected_unknown_api(&[]));
+}
+
+#[test]
 fn trace_mode_words_are_frozen() {
     assert_eq!(
         (

@@ -49,7 +49,8 @@ fn outcome(v: u32) -> Result<ApiOutcome, ObservationGap> {
     Ok(match v {
         0 => ApiOutcome::Unknown,
         1 => ApiOutcome::Success,
-        2 => ApiOutcome::Failure,
+        // §6D-0 D0-4: the frozen `Failure <- {failure, empty, retry}` fold.
+        2 | 3 | 4 => ApiOutcome::Failure,
         _ => return Err(ObservationGap::InvalidWire),
     })
 }
@@ -82,6 +83,12 @@ fn read_record(bytes: &[u8]) -> Result<c::Record, ObservationGap> {
 }
 pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
     decode_record(read_record(bytes)?)
+}
+/// Decode-domain unknown-ID probe (§6D-1): true iff the envelope carries
+/// an ID in {0} ∪ {73+}. Counts `trace_rejected_unknown_api` on decode
+/// failure; decode itself is unchanged.
+pub fn rejected_unknown_api(bytes: &[u8]) -> bool {
+    matches!(read_record(bytes), Ok(r) if r.api == 0 || r.api >= 73)
 }
 fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
     let bad = ObservationGap::InvalidWire;
@@ -117,7 +124,7 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
         return Err(bad);
     }
     let compatible = match r.kind {
-        c::ATTEMPT | c::RESULT => matches!(r.api,1..=6|10..=15),
+        c::ATTEMPT | c::RESULT => matches!(r.api, 1..=6|10..=15|20..=72),
         c::INIT => {
             matches!(r.api, c::PROVIDER_INIT | c::GET_DISPATCH) && r.function != 1
                 || r.api == c::ADD_BUILTIN && r.function == 1
