@@ -67,7 +67,7 @@ failure and exits 4. The checks, in the order to fix them:
 | `arch` | Non-x86-64 target (including 32-bit). | Current observation is x86-64-only; observe an admitted x86-64 build. |
 | `flavor` | Not OpenSSL 3.x/4.x (BoringSSL/AWS-LC lookalike, unrecognized bytes, or path confusion such as pointing `--libcrypto` at a static server binary). | Point at a real OpenSSL libcrypto, or use `--builtin` provider mode with an enrolled build. |
 | `build-id` / `dispatch-anchor` | An unknown id alone is informational when a supported symtab route resolves. The current table has eleven exact builds; unknown stripped builds lack that route. Rebuilds can change ids/offsets. | Read the anchor/admission verdict. Recheck exact bytes after rebuild; explicitly enroll unknown stripped builds per [the built-in runbook](builtin-runbook.md), using the same table on doctor and capture. |
-| `btf` | Informational only: the probe path has zero BTF dependence. | Nothing required. |
+| `btf` | Kernel BTF absent: provider observation cannot resolve the incarnation-stamp offset and refuses to load (`BpfUnavailable`). | Install kernel BTF (`apt install linux-headers-$(uname -r)` on Debian/Ubuntu, `dnf install kernel-devel` on RHEL) or move to a kernel that ships `/sys/kernel/btf/vmlinux`. |
 | `token-support` / `perf` rows | Informational only. | Nothing required. |
 
 <!-- source: check names + verdicts: src/doctor.rs; build-id

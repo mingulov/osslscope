@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 //! Finite observation ABI. No opaque target handle is a transport field.
-pub const VERSION: u32 = 3;
-pub const EVENT_SIZE: usize = 96;
+pub const VERSION: u32 = 4;
+pub const EVENT_SIZE: usize = 104;
 pub const MAX_DEPTH: u32 = 8;
 pub const MAX_PENDING: u32 = 4096;
 pub const MAX_RANGES: u32 = 128;
@@ -66,7 +66,19 @@ pub struct Record {
     pub code: u64,
     pub algorithm_index: u32,
     pub reserved: u32,
+    /// BPF-stamped task incarnation (fix4): the emitting thread's
+    /// `task_struct.start_time` (CLOCK_MONOTONIC ns, kernel-assigned,
+    /// immutable per task). Host pairing namespaces on this, so
+    /// recycled-tid edges never pair across incarnations in EITHER
+    /// recycle order. Always nonzero on the wire (the decoder
+    /// rejects 0 — a zero stamp means the BPF offset read failed).
+    pub start_time_ns: u64,
 }
+/// BPF-side sanity ceiling for `Config.task_off`: the verifier
+/// needs a bounded scalar for the task-pointer arithmetic, and
+/// any offset at/above this is not a `start_time` field (the
+/// loader refuses it before any program runs; BPF stamps 0).
+pub const TASK_OFF_MAX: u64 = 65536;
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
 pub struct Config {
@@ -74,6 +86,13 @@ pub struct Config {
     pub object: u64,
     pub pid: u32,
     pub api: u32,
+    /// Load-time-resolved `task_struct.start_time` byte offset
+    /// (fix4): userspace parses it from kernel BTF once and
+    /// programs it into every row; BPF stamps
+    /// `probe_read(task + task_off)` into `Record.start_time_ns`.
+    /// 0 = unprogrammed (BPF stamps 0 → host rejects; the loader
+    /// refuses to run any program with an unprogrammed offset).
+    pub task_off: u64,
 }
 #[derive(Clone, Copy, Default)]
 #[repr(C)]

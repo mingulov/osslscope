@@ -371,12 +371,12 @@ pub(crate) const TYPED_COOKIE_FIRST: u64 = 1 << 31;
 /// One past the last typed cookie (u32 range end, exclusive).
 pub(crate) const TYPED_COOKIE_END: u64 = 1 << 32;
 /// fix3: retire-drain event budget. The EVENTS ring holds 1 MiB
-/// (`provider_observation.rs:33`) of exact-96 B records (contract
-/// `EVENT_SIZE`), so ≤ 10,922 records fit resident; 65,536 ≈ 6×
-/// that absorbs a full ring plus in-flight commits plus
-/// concurrent producer arrivals during the drain. Past it the
-/// bump is skipped (stay unretired + visible `DrainOverrun`) —
-/// an unprovable-empty ring must never bump. Worst-case work is
+/// (`provider_observation.rs:33`) of exact-104 B records
+/// (contract `EVENT_SIZE`), so ≤ 10,082 records fit resident;
+/// 65,536 ≈ 6.5× that absorbs a full ring plus in-flight commits
+/// plus concurrent producer arrivals during the drain. Past it
+/// the bump is skipped (stay unretired + visible `DrainOverrun`)
+/// — an unprovable-empty ring must never bump. Worst-case work is
 /// bounded (65,536 `consume` calls) on a rare path
 /// (confirmed-thread-death cleanup); output stays budget-guarded
 /// inside `consume`.
@@ -448,6 +448,12 @@ pub struct ProviderSession {
     api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate>,
     api_window: Array<MapData, c::Range>,
     trace_mode: Array<MapData, u32>,
+    /// fix4: load-time-resolved `task_struct.start_time` byte
+    /// offset, programmed into every CONFIG row. Resolved once in
+    /// `open_gated` (fail-closed: the session refuses to open
+    /// without it); BPF stamps `probe_read(task + task_off)`
+    /// into every record for incarnation namespacing.
+    task_start_off: u64,
     trace: super::trace::TraceProducer,
     api_owners: BTreeMap<u64, (u32, u64, u32)>,
     startup: BTreeMap<u32, Vec<Attachment>>,
@@ -2013,7 +2019,7 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
     let shapes = [
         ("ADMIT", 12, 4, 4, 1),
         ("EVENTS", 27, 0, 0, 1 << 20),
-        ("CONFIG", 1, 8, 24, 1024),
+        ("CONFIG", 1, 8, 32, 1024),
         ("MEMBERS", 1, 4, 24, 64),
         ("NAMESPACE", 2, 4, 16, 1),
         ("RANGES", 1, 8, 16, 8192),
@@ -2235,6 +2241,11 @@ impl ProviderSession {
             Ok(kernel)
         });
         budget.checkpoint()?;
+        // fix4: resolve the incarnation-stamp offset BEFORE loading
+        // any program — without kernel BTF (or with an unparseable
+        // `task_struct`) the session refuses to open (fail-closed:
+        // unstamped records could mispair across recycled tids).
+        let task_start_off = u64::from(loader::task_start_time_offset(&budget)?);
         let loaded =
             loader::load_gated(&prepared, &gate).map_err(|_| ObservationGap::BpfUnavailable)?;
         super::source_owner::initialize_controls(&loaded, &gate, limits.max_pending_calls)?;
@@ -2286,6 +2297,7 @@ impl ProviderSession {
                 .map_err(|_| ObservationGap::InvalidObject)?,
             api_window,
             trace_mode,
+            task_start_off,
             trace: super::trace::TraceProducer::new(),
             api_owners: BTreeMap::new(),
             startup: BTreeMap::new(),
@@ -2748,16 +2760,23 @@ impl ProviderSession {
     /// old-incarnation edge feeds the pairing producer under the
     /// OLD epoch before the bump. Consumed content lands in the
     /// retire carry (emitted first by the next drain — conserved,
-    /// never dropped). Returns true on a PROVEN-empty ring (two
-    /// consecutive empty polls — the second closes the
-    /// reserve/commit race where a record commits between our last
-    /// consume and the emptiness check). Returns false past
-    /// `RETIRE_DRAIN_BUDGET` (the caller skips the bump; a
-    /// `DrainOverrun` gap rides the carry as the visible skip
-    /// signal). No deadline and no `emitted` check: the count
-    /// budget bounds CPU, while `consume` itself bounds OUTPUT
-    /// (over-limit facts fold to `FactLimit`/`StateLimit` gaps
-    /// per fact — no silent drops, no unbounded facts).
+    /// never dropped). Returns true after two consecutive empty
+    /// polls. fix4 correction: two empty polls are best-effort
+    /// ORDERING, never a PROVEN-empty barrier — Aya's
+    /// `RingBuf::next` returns `None` for a busy uncommitted head
+    /// too, so a stalled head can hide committed records across
+    /// BOTH polls (the second poll only closes the
+    /// reserve/commit race where a record commits between our
+    /// last consume and the check). Cross-incarnation soundness
+    /// comes from the BPF-stamped incarnation in the pairing key
+    /// (a late old edge lands in its own namespace and can never
+    /// pair with the recycled tid's edges), not from this drain.
+    /// Returns false past `RETIRE_DRAIN_BUDGET` (the caller skips
+    /// the bump; a `DrainOverrun` gap rides the carry as the
+    /// visible skip signal). No deadline and no `emitted` check:
+    /// the count budget bounds CPU, while `consume` itself bounds
+    /// OUTPUT (over-limit facts fold to `FactLimit`/`StateLimit`
+    /// gaps per fact — no silent drops, no unbounded facts).
     fn retire_drain(&mut self) -> bool {
         let mut scratch = ObservationBatch::default();
         let mut consumed = 0usize;
@@ -3386,9 +3405,17 @@ impl ProviderSession {
                         .position(|a| a.api == id && same_site(&a.site, &resolved.site))
                 }) {
                     let mut a = self.startup.get_mut(&pid).unwrap().swap_remove(index);
+                    let task_off = self.task_start_off;
                     let adopt = (|| {
                         a.adopt_site(resolved.site)?;
-                        arm_attachment(&mut self.config, &target.process, &a, pid, generation)
+                        arm_attachment(
+                            &mut self.config,
+                            &target.process,
+                            &a,
+                            pid,
+                            generation,
+                            task_off,
+                        )
                     })();
                     target.attachments.push(a);
                     if let Err(gap) = adopt {
@@ -3414,7 +3441,15 @@ impl ProviderSession {
                     true,
                 ) {
                     Ok(a) => {
-                        arm_attachment(&mut self.config, &target.process, &a, pid, generation)?;
+                        let task_off = self.task_start_off;
+                        arm_attachment(
+                            &mut self.config,
+                            &target.process,
+                            &a,
+                            pid,
+                            generation,
+                            task_off,
+                        )?;
                         target.attachments.push(a)
                     }
                     Err(g) => cold_attach_error(g, b)?,
@@ -3818,6 +3853,7 @@ impl ProviderSession {
                     key,
                     api: r.api,
                     monotonic_ns: r.monotonic_ns,
+                    start_time_ns: r.start_time_ns,
                 });
             } else {
                 self.trace.result(super::trace::ResultEdge {
@@ -3825,6 +3861,7 @@ impl ProviderSession {
                     api: r.api,
                     monotonic_ns: r.monotonic_ns,
                     outcome: r.outcome,
+                    start_time_ns: r.start_time_ns,
                 });
             }
         }
@@ -4110,6 +4147,7 @@ impl ProviderSession {
                                 object: object_id,
                                 pid,
                                 api,
+                                task_off: self.task_start_off,
                             },
                             0,
                         )
@@ -4322,12 +4360,14 @@ impl ProviderSession {
             Ok(a) => {
                 // Pair exists but CONFIG is absent: full process/maps/object
                 // validation precedes the only arm operation, and runs again after it.
+                let task_off = self.task_start_off;
                 let result = arm_attachment(
                     &mut self.config,
                     &self.targets[&pid].process,
                     &a,
                     pid,
                     generation,
+                    task_off,
                 );
                 if let Err(g) = result {
                     b.gap(g);
@@ -5254,6 +5294,7 @@ impl ProviderSession {
                                     object: a.object,
                                     pid,
                                     api,
+                                    task_off: self.task_start_off,
                                 },
                                 0,
                             )
@@ -5567,6 +5608,7 @@ fn arm_attachment(
     a: &Attachment,
     pid: u32,
     generation: u64,
+    task_off: u64,
 ) -> Result<(), ObservationGap> {
     let result = validate_then_arm(
         || {
@@ -5585,6 +5627,7 @@ fn arm_attachment(
                         object: a.object,
                         pid,
                         api: a.api,
+                        task_off,
                     },
                     0,
                 )
@@ -7421,8 +7464,9 @@ mod tests {
             .collect();
         // Independent fixed total for the actual seventeen ordinary provider maps
         // on sixteen possible CPUs, excluding the separately owned ADMIT gate
-        // (T8.2a: TRACE_MODE adds (4 + 8 + 128) * 1 + 65536 = 65676).
-        let required = 7_232_036;
+        // (T8.2a: TRACE_MODE adds (4 + 8 + 128) * 1 + 65536 = 65676;
+        // fix4: CONFIG value 24 -> 32 adds (8 + 32 + 128 - 160) * 1024 = 8192).
+        let required = 7_240_228;
         let budget = ObservationBudget::new(ObservationLimits {
             max_state_bytes: required - 1,
             ..Default::default()
@@ -17156,6 +17200,399 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
     }
 }
 
+/// Fix4 F3: session-level retire tests (R4-1 + recycle-before-retire
+/// dual + R4-2 carry integrity).
+///
+/// Map-only privileged tests: real BPF maps (created via aya — no
+/// programs loaded, nothing attached, no live targets) + a real
+/// fixture child for process custody + forged record bytes decoded
+/// through the real `wire::decode_transport` and fed to the real
+/// `consume`. Each test drives the REAL `remove_thread_rows` +
+/// `reconcile_records` (+ `drain` where the shape needs it).
+/// Incarnations are forged host-side via constructed Transports —
+/// no BPF programs needed.
+///
+/// `#[ignore]`d with graceful skip-with-message when map creation
+/// fails (no caps — the INCONCLUSIVE pattern); run under sudo in M4.
+#[cfg(test)]
+mod fix4_retire {
+    use super::*;
+
+    const EDGE_COOKIE: u64 = 0xC0041E;
+    const ALIAS_COOKIE: u64 = 0xA11A5;
+    /// Forged incarnations (nonzero, like the wire gate): the old
+    /// tid incarnation vs its recycled replacement.
+    const OLD_START: u64 = 111_000_000_001;
+    const NEW_START: u64 = 222_000_000_002;
+    /// Operational API: `consume` feeds the trace producer then
+    /// early-returns (trace plane only — no cold facts).
+    const EDGE_API: u32 = 20;
+    /// Query API for the alias envelope (`decode_transport`
+    /// requires `query_api`).
+    const ALIAS_API: u32 = c::PUBLIC_QUERY;
+    const GENERATION: u64 = 19;
+
+    struct Fix4 {
+        session: ProviderSession,
+        /// Held for the test (drop reaps the child).
+        _child: crate::target::OwnedTarget,
+        record: inventory::ProcessRecord,
+        /// Inherited executable mapping (see below); held for the test.
+        _mapping: Fix4Mapping,
+    }
+
+    struct Fix4Mapping(*mut libc::c_void, usize);
+    // SAFETY: solely owned by the holding test; unmapped on drop.
+    unsafe impl Send for Fix4Mapping {}
+    impl Drop for Fix4Mapping {
+        fn drop(&mut self) {
+            unsafe {
+                libc::munmap(self.0, self.1);
+            }
+        }
+    }
+
+    /// Assemble a live session over fresh real maps with one
+    /// admitted target (real child custody, forged sites, empty
+    /// links — no attach). `None` (→ skip with message) when BPF
+    /// map creation fails — the caps signal. Anything past map
+    /// creation failing is a loud panic (sudo-run premise).
+    fn fix4_session() -> Option<Fix4> {
+        // Map type numbers mirror `specs()` (1 hash, 2 array,
+        // 5 percpu hash, 6 percpu array, 27 ringbuf).
+        let events = {
+            let obj = aya_obj::Map::new_from_params(27, 0, 0, 1 << 20, 0);
+            let data = MapData::create(obj, "fix4_events", None).ok()?;
+            RingBuf::try_from(Map::from_map_data(data).ok()?).ok()?
+        };
+        let config: BpfMap<MapData, u64, c::Config> = BpfMap::create(1024, 0).ok()?;
+        let members: BpfMap<MapData, u32, c::Member> = BpfMap::create(64, 0).ok()?;
+        let threads: BpfMap<MapData, c::ThreadKey, c::Thread> = BpfMap::create(4096, 0).ok()?;
+        let api_threads: BpfMap<MapData, c::ApiThreadKey, c::Thread> =
+            BpfMap::create(4096, 0).ok()?;
+        let ranges: BpfMap<MapData, c::RangeKey, c::Range> = BpfMap::create(8192, 0).ok()?;
+        let loss: PerCpuArray<MapData, u64> = PerCpuArray::create(8, 0).ok()?;
+        let api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate> =
+            PerCpuHashMap::create(1024, 0).ok()?;
+        let api_window: Array<MapData, c::Range> = Array::create(1, 0).ok()?;
+        let trace_mode: Array<MapData, u32> = Array::create(1, 0).ok()?;
+
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = crate::writer_gate::fake_for_shape_tests(&pool).ok()?;
+        assert!(gate.admitting(), "fake gate must admit (premise)");
+
+        let budget = ObservationBudget::default();
+        // The stopped child is held PRE-EXEC (its exe is the test
+        // binary itself — see `reconcile_fixture`): map a small
+        // real ELF PROT_EXEC into self FIRST so the child
+        // inherits an executable mapping the fixture process can
+        // bind (same pattern, system file instead of a forwarder
+        // object — never unlinked, so no fixture mutex needed).
+        let elf = File::open("/usr/bin/gnutrue").ok()?;
+        let elf_len = elf.metadata().ok()?.len() as usize;
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                elf_len,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                elf.as_raw_fd(),
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return None;
+        }
+        let mapping = Fix4Mapping(address, elf_len);
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .ok()?;
+        let mut processes = inventory::snapshot(&inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes;
+        let record = processes.pop()?;
+        let exe = File::open("/usr/bin/gnutrue").ok()?;
+        let process = objects::fixture_support::mapped_process(&record, exe, &budget);
+        let site_file = File::open("/usr/bin/gnutrue").ok()?;
+
+        // Two forged sites (edge + alias APIs) against the real custody.
+        let edge_site =
+            objects::fixture_support::forge_site(&process, site_file, 0x1000, GENERATION);
+        let alias_file = File::open("/usr/bin/gnutrue").ok()?;
+        let alias_site =
+            objects::fixture_support::forge_site(&process, alias_file, 0x2000, GENERATION);
+        let edge_object = object_id(&edge_site);
+        let alias_object = object_id(&alias_site);
+        let pid = child.pid();
+        let starttime = record.starttime;
+        let attachments = vec![
+            Attachment {
+                links: Vec::new(),
+                site: edge_site,
+                cookie: EDGE_COOKIE,
+                api: EDGE_API,
+                advertisers: Vec::new(),
+                generation: GENERATION,
+                object: edge_object,
+                original: None,
+                historical: false,
+            },
+            Attachment {
+                links: Vec::new(),
+                site: alias_site,
+                cookie: ALIAS_COOKIE,
+                api: ALIAS_API,
+                advertisers: Vec::new(),
+                generation: GENERATION,
+                object: alias_object,
+                original: None,
+                historical: false,
+            },
+        ];
+        let mut roles = Roles(BTreeMap::new());
+        for a in &attachments {
+            assert!(
+                roles
+                    .observe(role_site(pid, starttime, &a.site), a.api, &budget)
+                    .unwrap(),
+                "role observe must accept (premise)"
+            );
+        }
+        let target = Target {
+            process,
+            starttime,
+            generation: GENERATION,
+            attachments,
+            ranges: 0,
+            ready: true,
+        };
+        let mut trace = trace::TraceProducer::new();
+        trace.set_mode(trace::TRACE_MODE_ALL);
+        let session = ProviderSession {
+            gate,
+            final_drain: false,
+            final_refusals: BTreeMap::new(),
+            final_terminal: BTreeSet::new(),
+            loaded: loader::GatedLoaded::empty_for_tests(),
+            _source_kernel: Err(ObservationGap::BpfUnavailable),
+            source_prepared: loader::Prepared {
+                progs: Vec::new(),
+                maps: Vec::new(),
+            },
+            source_owner: None,
+            typed_startup: Vec::new(),
+            events,
+            config,
+            members,
+            threads,
+            api_threads,
+            ranges,
+            loss,
+            api_totals,
+            api_window,
+            trace_mode,
+            // F3 never arms (no CONFIG rows): honest unprogrammed.
+            task_start_off: 0,
+            trace,
+            api_owners: BTreeMap::new(),
+            startup: BTreeMap::new(),
+            targets: BTreeMap::from([(pid, target)]),
+            refreshing: BTreeMap::new(),
+            pending_retire: BTreeMap::new(),
+            pending_startup: BTreeSet::new(),
+            exec_sealed: BTreeSet::new(),
+            fenced: BTreeMap::new(),
+            fence_withheld: 0,
+            unfence_after_drain: BTreeSet::new(),
+            retire_carry: ObservationBatch::default(),
+            roles,
+            aliases: assembly::Sequences::default(),
+            budget,
+            setup_state_spent: 0,
+            setup_reads_spent: 0,
+            release_gate: ReleaseGate::new(),
+            next_cookie: 1,
+            next_typed_cookie: TYPED_COOKIE_FIRST,
+            next_site_id: 1,
+            next_object_id: 1,
+            typed_sites: BTreeMap::new(),
+            typed_pins: BTreeMap::new(),
+            object_ids: BTreeMap::new(),
+            next_generation: 1,
+            emitted: 0,
+            learned: BTreeSet::new(),
+            last_loss: [0; 8],
+            loss_totals: [0; 8],
+            loss_read_seq: [0; 8],
+            loss_read_tick: [0; 8],
+            loss_tick_clock: None,
+            last_drain: Instant::now(),
+            closed: false,
+        };
+        Some(Fix4 {
+            session,
+            _child: child,
+            record,
+            _mapping: mapping,
+        })
+    }
+
+    /// Forge an edge-record image (ATTEMPT/RESULT shape: zero
+    /// operation/algorithm/function/cacheability/code) with a
+    /// forged incarnation stamp at offset 96.
+    fn edge_bytes(
+        kind: u32,
+        pid: u32,
+        tid: u32,
+        invocation: u64,
+        mono_ns: u64,
+        outcome: u32,
+        start: u64,
+    ) -> Vec<u8> {
+        let mut b = vec![0u8; c::EVENT_SIZE];
+        for (at, v) in [
+            (0, c::VERSION),
+            (4, kind),
+            (8, c::EVENT_SIZE as u32),
+            (12, EDGE_API),
+            (16, pid),
+            (20, tid),
+        ] {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [
+            (24, EDGE_COOKIE),
+            (32, GENERATION),
+            (40, mono_ns),
+            (48, invocation),
+        ] {
+            b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b[56..60].copy_from_slice(&outcome.to_le_bytes());
+        b[96..104].copy_from_slice(&start.to_le_bytes());
+        b
+    }
+
+    /// Feed forged bytes through the real decode + consume into a
+    /// throwaway batch (operational edges: trace feed only — the
+    /// batch must stay empty, which also validates the harness).
+    fn feed(session: &mut ProviderSession, bytes: &[u8]) {
+        let event = wire::decode_transport(bytes).expect("forged bytes must decode");
+        let mut b = ObservationBatch::default();
+        session.consume(event, &mut b);
+        assert!(
+            b.facts.is_empty() && b.gaps.is_empty(),
+            "operational feed must be fact/gap-free: facts={} gaps={:?}",
+            b.facts.len(),
+            b.gaps
+        );
+    }
+
+    /// F3a (R4-1 shape): recycle-after-retire + late old edge.
+    /// Retire (bump), then feed a late old-incarnation RESULT plus
+    /// recycled same-key edges: NO cross-incarnation pair, while a
+    /// same-incarnation old+old pair still forms (legitimate).
+    #[test]
+    #[ignore = "fix4 F3a: requires BPF map privileges (sudo M4 run)"]
+    fn fix4_recycle_after_retire_late_old_never_pairs() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP fix4 F3a: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // Retire the old incarnation (empty ring → drain-then-bump).
+        let failures = s.remove_thread_rows(pid, tid);
+        assert_eq!(failures, 0, "empty-map cleanup must succeed");
+        // Late old-incarnation RESULT (inv 1, OLD) + recycled
+        // same-key ATTEMPT (inv 1, NEW): different incarnations,
+        // must not pair.
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 100, 1, OLD_START),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 200, 0, NEW_START),
+        );
+        // Same-incarnation old+old pair (inv 9, OLD): legitimate, pairs.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 9, 50, 0, OLD_START),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 9, 150, 1, OLD_START),
+        );
+        s.trace.finalize(1_000);
+        let t = s.trace.totals();
+        assert_eq!(t.paired, 1, "only the legitimate old+old pair forms");
+        assert_eq!(t.unpaired_entries, 1, "recycled ATTEMPT expires unpaired");
+        assert_eq!(t.unpaired_results, 1, "late old RESULT expires unpaired");
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!((ra, rr), (2, 2), "received must count every fed edge");
+        // Per-family conservation (each pair holds one attempt + one result).
+        assert_eq!(ra, t.paired + t.unpaired_entries, "attempt conservation");
+        assert_eq!(rr, t.paired + t.unpaired_results, "result conservation");
+    }
+
+    /// F3b (controller dual shape): recycle-BEFORE-retire. Feed old
+    /// holds, then new-incarnation same-key edges WITHOUT retiring:
+    /// old and new namespaces must never mix (pairs only within an
+    /// incarnation). Retire after; conservation exact.
+    #[test]
+    #[ignore = "fix4 F3b: requires BPF map privileges (sudo M4 run)"]
+    fn fix4_recycle_before_retire_namespaces_never_mix() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP fix4 F3b: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // Old hold (inv 1, OLD), then recycled same-key RESULT
+        // (inv 1, NEW) BEFORE any retire: must not pair across
+        // incarnations.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, NEW_START),
+        );
+        // Same-incarnation new+new pair (inv 2, NEW): legitimate, pairs.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 2, 110, 0, NEW_START),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 2, 210, 1, NEW_START),
+        );
+        // Now retire (covers the dual order: retire after the fact).
+        let failures = s.remove_thread_rows(pid, tid);
+        assert_eq!(failures, 0, "empty-map cleanup must succeed");
+        s.trace.finalize(1_000);
+        let t = s.trace.totals();
+        assert_eq!(t.paired, 1, "only the legitimate new+new pair forms");
+        assert_eq!(t.unpaired_entries, 1, "old ATTEMPT expires unpaired");
+        assert_eq!(t.unpaired_results, 1, "new RESULT expires unpaired");
+        let ra: u64 = t.received.attempts.iter().sum();
+        let rr: u64 = t.received.results.iter().sum();
+        assert_eq!((ra, rr), (2, 2), "received must count every fed edge");
+        // Per-family conservation (each pair holds one attempt + one result).
+        assert_eq!(ra, t.paired + t.unpaired_entries, "attempt conservation");
+        assert_eq!(rr, t.paired + t.unpaired_results, "result conservation");
+    }
+}
+
 #[cfg(all(test, target_arch = "x86_64"))]
 #[path = "../../tests/support/provider_forwarder.rs"]
 mod startup_fixture;
@@ -19113,7 +19550,7 @@ mod startup_api_controls {
             }
             let mut r = c::Record {
                 version: c::VERSION,
-                size: 96,
+                size: c::EVENT_SIZE as u32,
                 kind: c::ALGORITHM_BEGIN,
                 pid,
                 tid: pid,
@@ -19124,11 +19561,12 @@ mod startup_api_controls {
                 operation: 1,
                 outcome: 1,
                 cacheability: 1,
+                start_time_ns: 0x5A44,
                 ..Default::default()
             };
             let decode = |r: &c::Record| {
                 wire::decode_transport(unsafe {
-                    std::slice::from_raw_parts((r as *const c::Record).cast(), 96)
+                    std::slice::from_raw_parts((r as *const c::Record).cast(), c::EVENT_SIZE)
                 })
                 .unwrap()
             };
@@ -21846,7 +22284,7 @@ mod startup_api_controls {
         let mut startup = BTreeMap::from([(child.pid(), vec![a])]);
         let mut r = c::Record {
             version: c::VERSION,
-            size: 96,
+            size: c::EVENT_SIZE as u32,
             kind: c::ALGORITHM_BEGIN,
             pid: child.pid(),
             tid: child.pid(),
@@ -21857,11 +22295,12 @@ mod startup_api_controls {
             operation: 1,
             outcome: 1,
             cacheability: 1,
+            start_time_ns: 0x5A44,
             ..Default::default()
         };
         let decode = |r: &c::Record| {
             wire::decode_transport(unsafe {
-                std::slice::from_raw_parts((r as *const c::Record).cast(), 96)
+                std::slice::from_raw_parts((r as *const c::Record).cast(), c::EVENT_SIZE)
             })
             .unwrap()
         };

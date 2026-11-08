@@ -3382,6 +3382,41 @@ pub(super) mod fixture_support {
         verified.revalidate().unwrap();
         verified
     }
+    /// Fix4 F3 test staging: mint an attachment site against an
+    /// already-acquired process with caller-chosen file identity.
+    /// Custody is the process's own (real pidfd/starttime); the
+    /// object is the given file with its live stamp. Production
+    /// acquisition never takes this path (sites resolve from
+    /// verified API tables, never from caller parameters).
+    pub fn forge_site(
+        process: &VerifiedProcess,
+        file: File,
+        offset: u64,
+        generation: u64,
+    ) -> VerifiedSite {
+        let stamp = Stamp::of(&file.metadata().unwrap());
+        let object = Rc::new(Object {
+            file,
+            stamp,
+            page: None,
+            expected: None,
+            parsed: OnceCell::new(),
+            tables: OnceCell::new(),
+            parse_deferred: Cell::new(false),
+            anchor: OnceCell::new(),
+        });
+        VerifiedSite {
+            custody: SiteCustody::Mapped {
+                process: process.process.clone(),
+                maps: process.maps.clone(),
+            },
+            object,
+            offset,
+            generation,
+            hash: crate::provider_observation::schema::ObjectHash::try_from("f".repeat(64))
+                .unwrap(),
+        }
+    }
 }
 
 #[cfg(test)]

@@ -133,6 +133,9 @@ pub struct AttemptEdge {
     pub api: u32,
     /// Producer CLOCK_MONOTONIC timestamp.
     pub monotonic_ns: u64,
+    /// BPF-stamped task incarnation (`Record.start_time_ns`,
+    /// decode-gated nonzero). Part of the pairing identity.
+    pub start_time_ns: u64,
 }
 
 /// Decoded RESULT edge (producer input).
@@ -146,6 +149,9 @@ pub struct ResultEdge {
     pub monotonic_ns: u64,
     /// RAW `record.outcome` (0..4), never the folded payload.
     pub outcome: u32,
+    /// BPF-stamped task incarnation (`Record.start_time_ns`,
+    /// decode-gated nonzero). Part of the pairing identity.
+    pub start_time_ns: u64,
 }
 
 /// Frozen §6D-3 finite histogram edges (ns, ascending, verbatim).
@@ -448,14 +454,20 @@ struct PendingEdge {
     seq: u64,
 }
 
-/// Epoch-tagged pairing key (fix3): the retire epoch is part of
-/// the pairing identity, so cross-incarnation edges never pair.
-/// Wire keys are UNCHANGED (outputs still bind the bare
-/// `PairKey` — `HashedKey::of`, exemplars, `key_hash16`).
+/// Epoch-tagged pairing key (fix3 + fix4 incarnation): the
+/// retire epoch AND the BPF-stamped task incarnation are part of
+/// the pairing identity, so cross-incarnation edges never pair in
+/// EITHER recycle order (after-retire late edges land in their
+/// own incarnation namespace; before-retire recycled edges never
+/// shared a namespace to begin with). Wire keys are UNCHANGED
+/// (outputs still bind the bare `PairKey` — `HashedKey::of`,
+/// exemplars, `key_hash16`).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct EpochKey {
     /// The tid's retire epoch at feed time (`epoch_of`).
     epoch: u64,
+    /// BPF-stamped task incarnation at feed time.
+    start_time_ns: u64,
     /// Full wire pairing key.
     key: PairKey,
 }
@@ -463,7 +475,9 @@ struct EpochKey {
 /// Pairing scope: the THREADS-row scope (contract `ThreadKey` —
 /// `pid`, `tid`, `generation` — the key `invocation` counts
 /// under), qualified by the retire epoch (HW is per-epoch,
-/// dropped at bump — fix3).
+/// dropped at bump — fix3) AND the task incarnation (HW is
+/// per-incarnation — fix4: a recycled tid's continuing or
+/// restarting invocation counter never aliases the old one).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct ScopeKey {
     /// Executing pid.
@@ -474,6 +488,8 @@ struct ScopeKey {
     generation: u64,
     /// Retire epoch (high-water namespace).
     epoch: u64,
+    /// Task incarnation (high-water namespace).
+    start_time_ns: u64,
 }
 
 impl ScopeKey {
@@ -484,6 +500,7 @@ impl ScopeKey {
             tid: key.key.tid,
             generation: key.key.generation,
             epoch: key.epoch,
+            start_time_ns: key.start_time_ns,
         }
     }
 }
@@ -492,8 +509,10 @@ impl ScopeKey {
 /// retired (pid,tid)'s incarnation counter (covers EVERY
 /// generation for the tid). The boundary is PERMANENT — no
 /// window-counted expiry can be outrun by a late edge (codex
-/// R3-2); the session bumps only after a full retire-drain
-/// proves no old-incarnation edge remains queued.
+/// R3-2). fix4: the epoch is best-effort cleanup + ordering —
+/// cross-incarnation soundness comes from the BPF-stamped
+/// incarnation in `EpochKey`, not from the drain-then-bump (the
+/// drain cannot prove the ring empty).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct RetireEpoch {
     /// Current retire epoch (1 after the first bump; absent ⟺ 0).
@@ -602,8 +621,12 @@ impl TraceProducer {
         // is part of the pairing identity, so a pre-bump hold never
         // pairs with a post-bump edge (no window-counted rejection:
         // the new incarnation pairs from invocation 1 immediately).
+        // fix4: tag with the BPF-stamped incarnation too — soundness
+        // against recycled tids (both orders) comes from the stamp,
+        // not from the drain barrier (which is best-effort ordering).
         let ekey = EpochKey {
             epoch: self.epoch_of(edge.key.pid, edge.key.tid),
+            start_time_ns: edge.start_time_ns,
             key: edge.key,
         };
         // F4: a held RESULT pairs only in its arrival window
@@ -695,8 +718,10 @@ impl TraceProducer {
             outcome: edge.outcome,
         });
         // fix3: epoch tag (see `attempt` — same boundary).
+        // fix4: incarnation tag (see `attempt` — same boundary).
         let ekey = EpochKey {
             epoch: self.epoch_of(edge.key.pid, edge.key.tid),
+            start_time_ns: edge.start_time_ns,
             key: edge.key,
         };
         if let Some(held) = self.pending_attempt_remove(&ekey) {
@@ -880,14 +905,18 @@ impl TraceProducer {
 
     /// fix3: retire a CONFIRMED-DEAD tid's pairing scopes. Called
     /// from `remove_thread_rows` (the sole cleanup funnel) AFTER
-    /// a full retire-drain proves no old-incarnation edge remains
-    /// queued (drain-then-bump); covering EVERY generation for
-    /// the tid; fires in off-mode too (no edges flow, but the
-    /// bump is recorded for the next edge-bearing feed). The HW
-    /// scopes are dropped (HW is per-epoch) and the epoch bumps:
-    /// pre-bump holds (old epoch) never pair with post-bump edges
-    /// (new epoch), and the new incarnation pairs from invocation
-    /// 1 immediately. Epoch storage is FIXED-CAPPED (FIFO, same
+    /// a best-effort retire-drain (drain-then-bump — fix4: the
+    /// drain is best-effort ORDERING, never a proven barrier; a
+    /// busy ring head reads empty while committed records wait
+    /// behind it, so cross-incarnation soundness comes from the
+    /// BPF-stamped incarnation in the pairing key, not from this
+    /// bump); covering EVERY generation for the tid; fires in
+    /// off-mode too (no edges flow, but the bump is recorded for
+    /// the next edge-bearing feed). The HW scopes are dropped (HW
+    /// is per-epoch) and the epoch bumps: pre-bump holds (old
+    /// epoch) never pair with post-bump edges (new epoch), and
+    /// the new incarnation pairs from invocation 1 immediately.
+    /// Epoch storage is FIXED-CAPPED (FIFO, same
     /// kernel-mirrored bound); evicting an epoch expires the
     /// victim's pending WITH it (coupled expiry — protection
     /// loss retires the protected state, codex R3-3).
@@ -1343,11 +1372,17 @@ mod tests {
         }
     }
 
+    /// Default test incarnation (nonzero, like the wire gate).
+    const STAMP: u64 = 0x5A44;
+    /// A second test incarnation (recycled tid).
+    const STAMP_NEW: u64 = 0x5A45;
+
     fn attempt(key: PairKey, api: u32, ns: u64) -> AttemptEdge {
         AttemptEdge {
             key,
             api,
             monotonic_ns: ns,
+            start_time_ns: STAMP,
         }
     }
 
@@ -1357,6 +1392,26 @@ mod tests {
             api,
             monotonic_ns: ns,
             outcome,
+            start_time_ns: STAMP,
+        }
+    }
+
+    fn attempt_stamped(key: PairKey, api: u32, ns: u64, stamp: u64) -> AttemptEdge {
+        AttemptEdge {
+            key,
+            api,
+            monotonic_ns: ns,
+            start_time_ns: stamp,
+        }
+    }
+
+    fn result_stamped(key: PairKey, api: u32, ns: u64, outcome: u32, stamp: u64) -> ResultEdge {
+        ResultEdge {
+            key,
+            api,
+            monotonic_ns: ns,
+            outcome,
+            start_time_ns: stamp,
         }
     }
 
@@ -1558,6 +1613,60 @@ mod tests {
         let rr: u64 = t.received.results.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
         assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn incarnation_same_epoch_never_pairs_either_order() {
+        // fix4: same-key edges with different BPF stamps never pair
+        // even in the SAME epoch (recycle-before-retire: the epoch
+        // cannot separate them — only the stamp can). Both arrival
+        // orders; conservation exact.
+        for swap in [false, true] {
+            let mut p = edge_bearing();
+            let k = key(10, 11, 1, 100, 7);
+            if swap {
+                p.result(result_stamped(k, 20, 1500, 1, STAMP_NEW));
+                p.attempt(attempt_stamped(k, 20, 1000, STAMP));
+            } else {
+                p.attempt(attempt_stamped(k, 20, 1000, STAMP));
+                p.result(result_stamped(k, 20, 1500, 1, STAMP_NEW));
+            }
+            p.finalize(2000);
+            let t = p.totals();
+            assert_eq!(t.paired, 0, "swap={swap}: no cross-incarnation pair");
+            assert_eq!(
+                (t.unpaired_entries, t.unpaired_results),
+                (1, 1),
+                "swap={swap}"
+            );
+            let ra: u64 = t.received.attempts.iter().sum();
+            let rr: u64 = t.received.results.iter().sum();
+            assert_eq!(ra, t.paired + t.unpaired_entries, "swap={swap}");
+            assert_eq!(rr, t.paired + t.unpaired_results, "swap={swap}");
+        }
+    }
+
+    #[test]
+    fn incarnation_same_stamp_pairs_and_hw_is_per_incarnation() {
+        // fix4: same-stamp edges pair (legitimate — it really
+        // happened), and the high-water is per-incarnation: a
+        // consumed invocation in the old incarnation never
+        // suppresses the recycled same-invocation call.
+        let mut p = edge_bearing();
+        let k = key(10, 11, 1, 100, 7);
+        p.attempt(attempt_stamped(k, 20, 1000, STAMP));
+        p.result(result_stamped(k, 20, 1500, 1, STAMP));
+        assert_eq!(p.totals().paired, 1, "same-stamp pair forms");
+        // Recycled tid reuses invocation 7 under a new stamp: not
+        // an HW dup (the old scope's HW is namespaced away).
+        p.attempt(attempt_stamped(k, 20, 2000, STAMP_NEW));
+        p.result(result_stamped(k, 20, 2500, 1, STAMP_NEW));
+        p.finalize(3000);
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (2, 0, 0)
+        );
     }
 
     #[test]

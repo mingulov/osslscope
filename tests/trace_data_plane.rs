@@ -5,18 +5,18 @@
 use osslscope::provider_observation::{self as po, trace, wire};
 
 fn edge(kind: u32, api: u32, outcome: u32) -> Vec<u8> {
-    let mut b = vec![0; 96];
+    let mut b = vec![0; wire::contract::EVENT_SIZE];
     for (at, v) in [
         (0, wire::contract::VERSION),
         (4, kind),
-        (8, 96),
+        (8, wire::contract::EVENT_SIZE as u32),
         (12, api),
         (16, 42),
         (20, 43),
     ] {
         b[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
-    for at in [24, 32, 40, 48] {
+    for at in [24, 32, 40, 48, 96] {
         b[at..at + 8].copy_from_slice(&1u64.to_le_bytes());
     }
     b[56..60].copy_from_slice(&outcome.to_le_bytes());

@@ -140,7 +140,7 @@ mod tests {
     fn query() -> c::Record {
         c::Record {
             version: c::VERSION,
-            size: 96,
+            size: c::EVENT_SIZE as u32,
             kind: c::QUERY,
             api: c::QUERY_CALLBACK,
             pid: 1,
@@ -151,6 +151,7 @@ mod tests {
             outcome: 1,
             operation: 1,
             cacheability: 1,
+            start_time_ns: 0x5A44,
             ..c::Record::default()
         }
     }
@@ -172,7 +173,8 @@ mod tests {
         r
     }
     fn decode(r: c::Record) -> Result<wire::Transport, ObservationGap> {
-        let bytes = unsafe { std::slice::from_raw_parts((&r as *const c::Record).cast(), 96) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts((&r as *const c::Record).cast(), c::EVENT_SIZE) };
         wire::decode_transport(bytes)
     }
     #[test]
@@ -305,7 +307,8 @@ mod tests {
         let q = query();
         assert!(decode(known(q, 0)).is_ok());
         let r = known(q, 0);
-        let bytes = unsafe { std::slice::from_raw_parts((&r as *const c::Record).cast(), 96) };
+        let bytes =
+            unsafe { std::slice::from_raw_parts((&r as *const c::Record).cast(), c::EVENT_SIZE) };
         assert!(
             wire::decode(bytes).is_err(),
             "internal aliases are not public facts"
@@ -314,7 +317,7 @@ mod tests {
         old.version = 1;
         assert!(decode(old).is_err());
         assert!(decode(end(q, 1, 0)).is_ok());
-        for field in [0, 1, 2, 3, 4, 5, 6] {
+        for field in [0, 1, 2, 3, 4, 5, 6, 7] {
             let mut r = known(q, 0);
             match field {
                 0 => r.algorithm = 65534,
@@ -323,7 +326,9 @@ mod tests {
                 3 => r.status = 8,
                 4 => r.code = 4096,
                 5 => r.reserved = 1,
-                _ => r.api = c::LOAD,
+                6 => r.api = c::LOAD,
+                // fix4: a zero incarnation stamp fails closed.
+                _ => r.start_time_ns = 0,
             }
             assert!(decode(r).is_err(), "field {field}");
         }

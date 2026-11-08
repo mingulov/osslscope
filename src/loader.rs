@@ -161,6 +161,20 @@ fn read_kernel_btf_bytes(
     bytes.truncate(length);
     Ok((bytes, retained, scratch))
 }
+/// fix4: resolve the `task_struct.start_time` byte offset for BPF
+/// incarnation stamping. Budgeted kernel-BTF acquisition (shared
+/// with the layout readers, same bounds) + offset admission. Any
+/// failure — BTF absent/unparseable, member missing, wrong type,
+/// out of range — refuses the load (fail-closed: callers map the
+/// error to their load refusal, never a guessed offset).
+pub(crate) fn task_start_time_offset(
+    budget: &crate::provider_observation::ObservationBudget,
+) -> Result<u32, crate::provider_observation::ObservationGap> {
+    use crate::provider_observation::ObservationGap as Gap;
+    let (bytes, _retained, _scratch) = read_kernel_btf_bytes(budget)?;
+    budget.checkpoint()?;
+    source_btf::task_start_time_offset(&bytes).map_err(|_| Gap::BpfUnavailable)
+}
 /// Marker immediates owned by the VMA-join helper (kfunc call identities
 /// plus field-offset identities). Shared by the patcher and the
 /// presence scan so the two can never disagree on what a marker is.
@@ -1611,6 +1625,21 @@ impl std::ops::Deref for GatedLoaded {
     type Target = Loaded;
     fn deref(&self) -> &Loaded {
         &self.loaded
+    }
+}
+impl GatedLoaded {
+    /// Empty gated owner for map-only session tests (fix4 F3): no
+    /// programs, no pinned maps, no lifecycle writers. The
+    /// retire/reconcile/drain paths under test never touch it.
+    #[cfg(test)]
+    pub(crate) fn empty_for_tests() -> Self {
+        Self {
+            lifecycle: Vec::new(),
+            loaded: Loaded {
+                progs: HashMap::new(),
+                maps: HashMap::new(),
+            },
+        }
     }
 }
 

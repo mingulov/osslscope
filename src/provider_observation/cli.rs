@@ -795,7 +795,7 @@ mod tests {
             let mut batch = ObservationBatch::default();
             let q = c::Record {
                 version: c::VERSION,
-                size: 96,
+                size: c::EVENT_SIZE as u32,
                 kind: c::QUERY,
                 api: c::QUERY_CALLBACK,
                 pid: 1,
@@ -806,11 +806,13 @@ mod tests {
                 outcome: 1,
                 operation: 1,
                 cacheability: 1,
+                start_time_ns: 0x5A44,
                 ..Default::default()
             };
             let mut assemble = |r: c::Record| {
-                let bytes =
-                    unsafe { std::slice::from_raw_parts((&r as *const c::Record).cast(), 96) };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts((&r as *const c::Record).cast(), c::EVENT_SIZE)
+                };
                 assemble_payload(
                     wire::decode_transport(bytes).unwrap(),
                     &mut sequences,

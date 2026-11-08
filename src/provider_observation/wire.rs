@@ -95,6 +95,10 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
     if r.version != c::VERSION
         || r.size != c::EVENT_SIZE as u32
         || r.reserved != 0
+        // fix4: the BPF incarnation stamp is REQUIRED (a zero
+        // stamp means the BPF offset read failed — fail closed to
+        // InvalidWire, never a silent pairing namespace).
+        || r.start_time_ns == 0
         || r.algorithm_index >= c::MAX_ALGORITHMS
         || r.algorithm_index != 0
             && !matches!(

@@ -2,18 +2,18 @@
 use osslscope::provider_observation::{self as po, wire};
 
 fn record(kind: u32) -> Vec<u8> {
-    let mut b = vec![0; 96];
+    let mut b = vec![0; wire::contract::EVENT_SIZE];
     for (at, v) in [
         (0, wire::contract::VERSION),
         (4, kind),
-        (8, 96),
+        (8, wire::contract::EVENT_SIZE as u32),
         (12, 1),
         (16, 42),
         (20, 43),
     ] {
         b[at..at + 4].copy_from_slice(&v.to_le_bytes());
     }
-    for at in [24, 32, 40, 48] {
+    for at in [24, 32, 40, 48, 96] {
         b[at..at + 8].copy_from_slice(&1u64.to_le_bytes());
     }
     b
@@ -46,6 +46,10 @@ fn private_handles_never_enter_host_transport() {
         b[at] = 255;
         assert!(wire::decode(&b).is_err());
     }
+    // fix4: a zero incarnation stamp fails closed.
+    let mut b = record(1);
+    b[96..104].copy_from_slice(&0u64.to_le_bytes());
+    assert!(wire::decode(&b).is_err());
     assert!(wire::decode(&record(1)[..95]).is_err());
 }
 #[test]

@@ -1331,14 +1331,15 @@ fn check_caps(env: &Env) -> Check {
 
 fn check_btf() -> Check {
     if std::path::Path::new("/sys/kernel/btf/vmlinux").exists() {
-        Check::info(
+        Check::pass(
             "btf",
-            "BTF present (optional — probe path has zero BTF dependence)".into(),
+            "BTF present (required: provider observation resolves the incarnation-stamp offset from kernel BTF at load)".into(),
         )
     } else {
-        Check::info(
+        Check::fail(
             "btf",
-            "BTF absent — OK (probe path has zero BTF dependence); if you want it: ls /sys/kernel/btf/vmlinux; install: apt install linux-headers-$(uname -r) (Debian/Ubuntu) / dnf install kernel-devel (RHEL)".into(),
+            "BTF absent — provider observation refuses to load without the incarnation-stamp offset".into(),
+            "ls /sys/kernel/btf/vmlinux; install: apt install linux-headers-$(uname -r) (Debian/Ubuntu) / dnf install kernel-devel (RHEL)".into(),
         )
     }
 }

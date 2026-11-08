@@ -218,6 +218,16 @@ upgrade toolchains for it.
 Install the built tree into a local prefix with
 `scripts/install-dev.sh` — see [install](install.md).
 
+## Runtime requirement: kernel BTF
+
+Provider observation resolves the BPF incarnation-stamp offset
+(`task_struct.start_time`) from kernel BTF when a session opens.
+The load refuses (`BpfUnavailable`) without
+`/sys/kernel/btf/vmlinux` — there is no fallback, because
+unstamped records could mispair across recycled tids. `doctor`
+reports the `btf` row as fail with the install remediation when
+BTF is absent; see [attach failures](attach-failures.md).
+
 ## Host regression setup
 
 The retained host suites use owned temporary directories, serial tests and the

@@ -195,6 +195,12 @@ fn identity(cookie: u64) -> Option<(Config, ThreadKey)> {
 }
 // Explicit output avoids aggregate-return ABI and keeps construction spills
 // out of the query frame on kernels with a combined 512-byte stack limit.
+// fix4: stamps the emitting task's incarnation (`task_struct.start_time`
+// at the load-time-resolved `CONFIG.task_off`) into every record. Host
+// pairing namespaces on the stamp, so recycled-tid edges never pair
+// across incarnations in either recycle order. An unprogrammed or
+// out-of-range offset stamps 0, which the host decoder rejects
+// (fail-closed); the loader refuses to run with such an offset.
 #[inline(never)]
 #[no_mangle]
 pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record) {
@@ -211,6 +217,23 @@ pub fn base(p: &Pending, t: &ThreadKey, kind: u32, out: &mut Record) {
         invocation: p.invocation,
         ..Record::default()
     };
+    out.start_time_ns = incarnation_stamp(p.cookie);
+}
+#[inline(always)]
+fn incarnation_stamp(cookie: u64) -> u64 {
+    let off = unsafe { CONFIG.get(&cookie).map(|c| c.task_off).unwrap_or(0) };
+    // The bound is load-bearing for the verifier (an unbounded
+    // scalar added to the task pointer is rejected) as well as
+    // defense in depth (the loader validates first).
+    if off == 0 || off > TASK_OFF_MAX {
+        return 0;
+    }
+    let task = unsafe { helpers::generated::bpf_get_current_task_btf() };
+    if task.is_null() {
+        return 0;
+    }
+    let addr = (task as u64).wrapping_add(off);
+    unsafe { helpers::bpf_probe_read_kernel(addr as *const u64) }.unwrap_or(0)
 }
 #[inline(never)]
 #[no_mangle]

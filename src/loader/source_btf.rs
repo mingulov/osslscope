@@ -197,6 +197,24 @@ impl SourceJoinLayout {
         self.allocation
     }
 }
+/// fix4: resolve `task_struct.start_time`'s byte offset from raw
+/// kernel BTF for BPF incarnation stamping. The member must exist
+/// on STRUCT `task_struct` and resolve to an 8-byte unsigned
+/// integer at a nonzero offset within `TASK_OFF_MAX`. Anything
+/// else fails — the caller refuses the load (fail-closed, never
+/// a guessed offset into the task struct).
+pub(super) fn task_start_time_offset(bytes: &[u8]) -> Result<u32> {
+    let view = View::parse(bytes)?;
+    let task = view.named(4, b"task_struct")?;
+    let (ty, offset) = view.member(task, b"start_time")?;
+    view.integer(ty, 8, false, false)?;
+    ensure!(offset != 0, "task start_time at struct origin");
+    ensure!(
+        u64::from(offset) <= crate::provider_observation::wire::contract::TASK_OFF_MAX,
+        "task start_time beyond the BPF bound"
+    );
+    Ok(offset)
+}
 fn word(bytes: &[u8], offset: usize) -> Result<u32> {
     let bytes = bytes
         .get(
@@ -698,5 +716,53 @@ mod tests {
                 .iter()
                 .all(|offset| *offset + 8 <= layout._configuration[9])
         );
+    }
+    /// Minimal `task_struct.start_time` fixture: one integer type +
+    /// one STRUCT with a single member (caller-chosen bit offset,
+    /// integer shape, and struct size).
+    fn task_fixture(bits: u32, int_data: u32, int_size: u32, struct_size: u32) -> Fixture {
+        let mut f = Fixture::new();
+        let int = f.ty("u64", 1, 0, int_size, &[int_data]); // 1
+        let member = f.member("start_time", int, bits);
+        f.ty("task_struct", 4, 1, struct_size, &member); // 2
+        f
+    }
+    #[test]
+    fn task_start_time_offset_resolves_and_rejects() {
+        // Happy path (mirrors the observed vmlinux shape: u64 at
+        // byte 3144 of a large struct).
+        let good = task_fixture(3144 * 8, 64, 8, 9920).finish();
+        assert_eq!(task_start_time_offset(&good).unwrap(), 3144);
+        // Missing struct.
+        let mut f = Fixture::new();
+        f.ty("u64", 1, 0, 8, &[64]);
+        assert!(task_start_time_offset(&f.finish()).is_err());
+        // Missing member.
+        let mut f = Fixture::new();
+        let int = f.ty("u64", 1, 0, 8, &[64]);
+        let other = f.member("start_boottime", int, 64);
+        f.ty("task_struct", 4, 1, 64, &other);
+        assert!(task_start_time_offset(&f.finish()).is_err());
+        // Wrong width (u32).
+        let bad = task_fixture(64, 32, 4, 64).finish();
+        assert!(task_start_time_offset(&bad).is_err());
+        // Signed 8-byte.
+        let bad = task_fixture(64, 1 << 24 | 64, 8, 64).finish();
+        assert!(task_start_time_offset(&bad).is_err());
+        // Struct origin (BPF reads 0 as unprogrammed).
+        let bad = task_fixture(0, 64, 8, 64).finish();
+        assert!(task_start_time_offset(&bad).is_err());
+        // Beyond the BPF bound.
+        let bad = task_fixture(70000 * 8, 64, 8, 80000).finish();
+        assert!(task_start_time_offset(&bad).is_err());
+    }
+    #[test]
+    #[ignore = "read-only running-kernel BTF capability check"]
+    fn running_kernel_start_time_offset() {
+        let bytes = std::fs::read("/sys/kernel/btf/vmlinux").unwrap();
+        let offset = task_start_time_offset(&bytes).unwrap();
+        assert_ne!(offset, 0);
+        assert_eq!(offset % 8, 0);
+        assert!(u64::from(offset) <= crate::provider_observation::wire::contract::TASK_OFF_MAX);
     }
 }
