@@ -559,12 +559,13 @@ pub struct ProviderSession {
     /// coordinator advances baselines to read ticks, never to the
     /// evaluation tick. Zero until the first stamped read.
     loss_read_tick: [u64; 8],
-    /// fix6 (R6-2): the containing tick of each lane's last
-    /// CONSUMING read (the drain's `poll_loss_lanes` — the only
-    /// site that advances `last_loss`/`loss_totals`). Peeks stamp
-    /// THIS tick (not their own read tick): receipts certify
-    /// accounted coverage, never unaccounted reads. Zero until
-    /// the first consuming read (certifying genesis — sound
+    /// fix6 (R6-2) + fix7 (R7-2): the receipt tick of each
+    /// lane's last CONSUMING read (the drain's `poll_loss_lanes`
+    /// — the only site that advances `last_loss`/`loss_totals`),
+    /// sampled BEFORE the map read and committed only on success.
+    /// Peeks stamp THIS tick (not their own read tick): receipts
+    /// certify accounted coverage, never unaccounted reads. Zero
+    /// until the first consuming read (certifying genesis — sound
     /// over-coverage: the baseline cannot advance past what a
     /// drain actually accounted).
     last_accounted_tick: [u64; 8],
@@ -3601,12 +3602,23 @@ impl ProviderSession {
     /// independently load-bearing for the coordinator ledger.
     fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
         for index in 0..8 {
+            // fix7 (R7-2): sample the receipt tick BEFORE the map
+            // read. A completion-time stamp certifies coverage the
+            // snapshot doesn't establish (copy at tick 2, loss
+            // lands in tick 2, stamp 3 while accounting zero ⟹ the
+            // later detection propagates [3,6), omitting tick 2).
+            // The sampled tick commits ONLY on a successful read
+            // (failed reads leave seq/tick — the coordinator
+            // retains the last successful baseline). Sound:
+            // counters are cumulative, so a delta missed now is
+            // seen next (missed-now ⟹ seen-next); torn per-cpu
+            // sums stay exactly-once (components nondecreasing ⟹
+            // partial sums ordered).
+            let tick = self.sample_loss_tick();
             match self.loss.get(&(index as u32), 0) {
                 Ok(values) => {
-                    // fix6 (R6-2): a consuming read certifies its
-                    // own tick — the totals now account every delta
-                    // through it, so peeks may certify it too.
-                    let tick = self.stamp_loss_read(index);
+                    self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
+                    self.loss_read_tick[index] = tick;
                     self.last_accounted_tick[index] = tick;
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
@@ -3626,21 +3638,19 @@ impl ProviderSession {
             }
         }
     }
-    /// N4: one bump+stamp per successful CONSUMING LOSS map read
-    /// (the drain's poll — the peek below bumps the sequence but
-    /// stamps the last accounted tick instead). Returns the
-    /// stamped tick so the poll can record its certification.
-    fn stamp_loss_read(&mut self, index: usize) -> u64 {
-        self.loss_read_seq[index] = self.loss_read_seq[index].saturating_add(1);
-        // N4: stamp the read's containing tick (0 without a clock
-        // — fail-closed: an unstamped read cannot advance the
+    /// N4 + fix7 (R7-2): sample the receipt tick for a CONSUMING
+    /// LOSS map read. Called BEFORE the map read; the caller
+    /// commits the sample (seq bump + `loss_read_tick` +
+    /// `last_accounted_tick`) ONLY on a successful read. (The
+    /// peek below bumps the sequence but stamps the last accounted
+    /// tick instead — it certifies nothing new.)
+    fn sample_loss_tick(&self) -> u64 {
+        // N4: the read's containing tick (0 without a clock —
+        // fail-closed: an unstamped read cannot advance the
         // baseline).
-        let tick = self
-            .loss_tick_clock
+        self.loss_tick_clock
             .map(|(origin, tick_ns)| loss_tick_of(LiveClock.monotonic_ns(), origin, tick_ns))
-            .unwrap_or(0);
-        self.loss_read_tick[index] = tick;
-        tick
+            .unwrap_or(0)
     }
     /// fix5 (R5-1): peek-style LOSS validation for the reconcile
     /// path — signal without stealing. Reads every lane and
@@ -17615,6 +17625,17 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
 #[cfg(test)]
 impl ProviderSession {
     pub(crate) fn minimal_for_coordinator_tests() -> Option<Self> {
+        let loss: PerCpuArray<MapData, u64> = PerCpuArray::create(8, 0).ok()?;
+        Self::minimal_for_coordinator_tests_with_loss(loss)
+    }
+
+    /// fix7 F2: the same minimal session over a caller-created LOSS
+    /// map, so the soak injector can hold an independent handle to
+    /// the SAME kernel map (via `Map::try_clone` +
+    /// `MapData::from_fd`).
+    pub(crate) fn minimal_for_coordinator_tests_with_loss(
+        loss: PerCpuArray<MapData, u64>,
+    ) -> Option<Self> {
         // Map type numbers mirror `specs()` (1 hash, 2 array,
         // 5 percpu hash, 6 percpu array, 27 ringbuf).
         let events = {
@@ -17628,7 +17649,6 @@ impl ProviderSession {
         let api_threads: BpfMap<MapData, c::ApiThreadKey, c::Thread> =
             BpfMap::create(4096, 0).ok()?;
         let ranges: BpfMap<MapData, c::RangeKey, c::Range> = BpfMap::create(8192, 0).ok()?;
-        let loss: PerCpuArray<MapData, u64> = PerCpuArray::create(8, 0).ok()?;
         let api_totals: PerCpuHashMap<MapData, u64, c::ApiAggregate> =
             PerCpuHashMap::create(1024, 0).ok()?;
         let api_window: Array<MapData, c::Range> = Array::create(1, 0).ok()?;
@@ -17729,6 +17749,142 @@ impl ProviderSession {
         let now = LiveClock.monotonic_ns();
         let origin = now.saturating_sub(tick.saturating_mul(tick_ns));
         self.set_loss_tick_clock(origin, tick_ns);
+    }
+}
+
+/// Fix7 F2: receipt-certification property soak (R7-2).
+///
+/// Privileged map-only test: a real LOSS map (no programs, no
+/// attach) + the REAL consuming poll path (`drain` over an empty
+/// ring runs `poll_loss_lanes`). A CONTINUOUS injector thread
+/// bumps lane 0 (sole writer, cumulative set) and stamps each
+/// bump with the shared receipt clock (write-then-stamp); the main
+/// thread runs 2000 read-stamp-eval rounds asserting EVERY round:
+/// #{bumps with tick STRICTLY below the receipt} ≤ accounted
+/// totals. tick_ns = 1 so interleavings straddle aggressively.
+/// Failures are always true bugs (a set completed before a later
+/// lookup is always observed); passes over 2000 rounds are strong
+/// evidence. RED on the old get-then-stamp order
+/// (copy-2/miss-2/stamp-3), GREEN on tick-before-read.
+///
+/// `#[ignore]`d with graceful skip when map creation fails (no
+/// caps); run under sudo in M4.
+#[cfg(test)]
+mod fix7_receipt_soak {
+    use super::*;
+    use crate::capture::ClockPort as _;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[test]
+    #[ignore = "fix7 F2 soak: requires BPF map privileges (sudo M4 run)"]
+    fn fix7_consuming_receipts_certify_accounted_coverage() {
+        // One kernel map, two independent userspace handles (all
+        // public aya API): the session polls through its handle
+        // while the injector bumps through the dup — a shared
+        // `&mut` would serialize the race away.
+        let obj = aya_obj::Map::new_from_params(6, 4, 8, 8, 0);
+        let data = match MapData::create(obj, "fix7_soak_loss", None) {
+            Ok(d) => d,
+            Err(_) => {
+                eprintln!("SKIP fix7 F2 soak: LOSS map creation failed (no caps)");
+                return;
+            }
+        };
+        use std::os::fd::AsFd as _;
+        let dup = match data.fd().as_fd().try_clone_to_owned() {
+            Ok(fd) => fd,
+            Err(_) => {
+                eprintln!("SKIP fix7 F2 soak: LOSS map dup failed");
+                return;
+            }
+        };
+        let map = match Map::from_map_data(data) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!("SKIP fix7 F2 soak: LOSS map wrap failed");
+                return;
+            }
+        };
+        let session_loss: PerCpuArray<MapData, u64> = match PerCpuArray::try_from(map) {
+            Ok(m) => m,
+            Err(_) => {
+                eprintln!("SKIP fix7 F2 soak: session LOSS handle failed");
+                return;
+            }
+        };
+        let injector_loss: PerCpuArray<MapData, u64> = match MapData::from_fd(dup)
+            .ok()
+            .and_then(|d| Map::from_map_data(d).ok())
+            .and_then(|m| PerCpuArray::try_from(m).ok())
+        {
+            Some(m) => m,
+            None => {
+                eprintln!("SKIP fix7 F2 soak: injector LOSS handle failed");
+                return;
+            }
+        };
+        let Some(mut s) = ProviderSession::minimal_for_coordinator_tests_with_loss(session_loss)
+        else {
+            eprintln!("SKIP fix7 F2 soak: minimal session creation failed (no caps)");
+            return;
+        };
+        let cpus = aya::util::nr_cpus().map_err(|(_, e)| e).expect("nr_cpus");
+        // 1 ns ticks: every get/stamp pair straddles aggressively.
+        let origin = LiveClock.monotonic_ns();
+        s.set_loss_tick_clock(origin, 1);
+        let log: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let worker_log = Arc::clone(&log);
+        let worker_done = Arc::clone(&done);
+        let injector = std::thread::spawn(move || {
+            let mut loss: PerCpuArray<MapData, u64> = injector_loss;
+            let mut count = 0u64;
+            while !worker_done.load(Ordering::Relaxed) {
+                count += 1;
+                let mut values = vec![0u64; cpus];
+                values[0] = count;
+                let percpu = aya::maps::PerCpuValues::try_from(values).expect("percpu values");
+                // Sole writer + lane born 0: cumulative set is
+                // exact (no read-modify-write needed).
+                loss.set(0, percpu, 0).expect("injector set");
+                // Write-then-stamp: the stamp trails the set, so a
+                // bump stamped strictly below a receipt provably
+                // completed before that receipt's read.
+                let tick = loss_tick_of(LiveClock.monotonic_ns(), origin, 1);
+                worker_log.lock().unwrap().push(tick);
+            }
+        });
+        let start = Instant::now();
+        let mut rounds = 0u32;
+        let mut prev_seq = 0u64;
+        while rounds < 2000 && start.elapsed() < Duration::from_secs(60) {
+            let batch = s.drain(Instant::now() + Duration::from_millis(100));
+            assert!(
+                !batch.gaps.contains(&ObservationGap::DrainOverrun)
+                    && !batch.gaps.contains(&ObservationGap::FactLimit),
+                "round {rounds}: the poll premise needs a clean drain: {:?}",
+                batch.gaps
+            );
+            let (seq, receipt) = s.loss_read_receipts()[0];
+            let totals = s.loss_totals()[0];
+            assert!(
+                seq > prev_seq,
+                "round {rounds}: the poll must run (seq {seq} <= {prev_seq})"
+            );
+            prev_seq = seq;
+            let certified = log.lock().unwrap().iter().filter(|t| **t < receipt).count() as u64;
+            assert!(
+                certified <= totals,
+                "round {rounds}: {certified} bumps stamped below receipt {receipt} but totals={totals}"
+            );
+            rounds += 1;
+        }
+        done.store(true, Ordering::Relaxed);
+        injector.join().expect("injector join");
+        assert_eq!(rounds, 2000, "soak must complete all rounds inside 60 s");
     }
 }
 
