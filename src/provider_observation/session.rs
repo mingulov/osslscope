@@ -2037,11 +2037,14 @@ pub(crate) fn specs() -> Vec<loader::MapSpec> {
         // row remembers its creation seed — contract `Thread`).
         // fix7 (R7-3): values 24→32 B (the row counts
         // window-blind tombstones — contract `Thread.blind`).
-        ("THREADS", 1, 16, 32, 4096),
+        // R10 1b: values 32→40 B (the row records the
+        // overflow-counter owner — contract
+        // `Thread.counter_known`/`counter_owner`).
+        ("THREADS", 1, 16, 40, 4096),
         ("PENDING", 1, 24, 56, 4096),
         ("LOSS", 6, 4, 8, 8),
         ("API_TOTALS", 5, 8, 72, 1024),
-        ("API_THREADS", 1, 24, 32, 4096),
+        ("API_THREADS", 1, 24, 40, 4096),
         ("API_WINDOW", 2, 4, 16, 1),
         ("TRACE_MODE", 2, 4, 4, 1),
         ("ALG_CLASS", 1, 8, 42, 1024),
@@ -7892,8 +7895,9 @@ mod tests {
         // fix4: CONFIG value 24 -> 32 adds (8 + 32 + 128 - 160) * 1024 = 8192;
         // fix5: INV_SEQ adds (4 + 8 + 128) * 1 + 65536 = 65676;
         // fix6: THREADS + API_THREADS values 16 -> 24 add 8 * 4096 * 2 = 65536;
-        // fix7: THREADS + API_THREADS values 24 -> 32 add 8 * 4096 * 2 = 65536).
-        let required = 7_436_976;
+        // fix7: THREADS + API_THREADS values 24 -> 32 add 8 * 4096 * 2 = 65536;
+        // R10 1b: THREADS + API_THREADS values 32 -> 40 add 8 * 4096 * 2 = 65536).
+        let required = 7_502_512;
         let budget = ObservationBudget::new(ObservationLimits {
             max_state_bytes: required - 1,
             ..Default::default()
