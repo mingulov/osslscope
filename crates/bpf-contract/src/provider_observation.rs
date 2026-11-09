@@ -1878,6 +1878,78 @@ mod tests {
         );
     }
     #[test]
+    fn n1_quota_skip_cascade_is_documented_limitation() {
+        // Re-review N1 limitation pin (A2 rev8): eight framed S
+        // calls; a ninth S call quota-refused onto the fungible
+        // counter (NO marker) is skipped by longjmp; all
+        // surviving returns accepted. The first surviving
+        // return consumes the orphaned counter unit (R9-mandated
+        // consume-before-pop: the skip is unobservable online —
+        // identical cookie/overflow/inner/frame-match
+        // observations in both worlds), then every pop shifts by
+        // one: [(8,7)..(2,1)], ending (1,0,0) with suppr 0 — the
+        // same cascade as the pinned O-skip limitation (one
+        // RESULT lost, one frame orphaned; survivors SHIFT, not
+        // aligned).
+        const S: u64 = 42;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.quota_fail = true;
+        m.overflow(S);
+        m.quota_fail = false;
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 1));
+        m.skip();
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [(8, 7), (7, 6), (6, 5), (5, 4), (4, 3), (3, 2), (2, 1)]
+        );
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (1, 0, 0)
+        );
+        assert_eq!((m.suppressed, m.discarded), (0, 0));
+    }
+    #[test]
+    fn n1_collision_skip_cascade_is_documented_limitation() {
+        // Re-review N1 limitation pin (A2 rev8): eight framed S
+        // calls; B slots the O-marker; C collides onto the
+        // fungible counter (inner) and is skipped by longjmp;
+        // all nine survivors accepted. The first surviving
+        // return consumes C's orphaned counter unit, the next
+        // pops B's orphaned O-marker (suppr 1), then every pop
+        // shifts by one: [(8,7)..(2,1)], ending (1,0,0) — the
+        // identical cascade to quota-skip plus one suppression.
+        const S: u64 = 42;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S); // B: slotted O at depth 8
+        m.overflow(S); // C: same-kind collision → counter (inner)
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.overflow_inner),
+            (8, 1, 1)
+        );
+        m.skip(); // C's return longjmp'd
+        for rv in (1..=9u64).rev() {
+            m.return_accept(S, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [(8, 7), (7, 6), (6, 5), (5, 4), (4, 3), (3, 2), (2, 1)]
+        );
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (1, 0, 0)
+        );
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+    }
+    #[test]
     fn thread_value_is_32_with_blind_at_24() {
         // fix6 (R6-1): THREADS/API_THREADS value 16→24 B, seed
         // APPENDED (existing field offsets unchanged). fix7 (R7-3):
