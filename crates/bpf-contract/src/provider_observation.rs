@@ -179,62 +179,81 @@ pub struct Thread {
     /// a vestigial 0 (blind is armed only on the shared trace
     /// machine's closed-window entries).
     pub blind: u32,
-    /// Single-owner record for the fungible `overflow` counter
-    /// (R10-P2-1 1b, REMOVING the R9 `overflow_inner` position
-    /// count): ownership subsumes position — a same-cookie slot
-    /// match is ambiguous, but only the recorded owner's return
-    /// may consume before popping; every other return pops its
-    /// own slot first (`d7c431a` order). `counter_known` is 1
-    /// iff every outstanding unit was armed by `counter_owner`
-    /// (no sentinel cookie: the flag — never the owner value —
-    /// gates every read, so `Default`/`API_THREADS` rows with
-    /// owner 0 are unknown, never owned-by-0).
+    /// Bounded owner stack for the fungible `overflow` counter
+    /// (round-6 1a, REPLACING the R10 1b single-owner record —
+    /// R11-P2-1 proved a mixed-cookie arm must not clear
+    /// ownership: after one unit settles, the remainder's owner
+    /// is still known from arm ORDER, and slot-first on unknown
+    /// reopens the balanced hijack with no skip). The stack keeps
+    /// the FIRST (bottom: `counter_owner`/`counter_related`) and
+    /// LATEST (top: `counter_owner2`/`counter_related2`) arming
+    /// owners; `counter_len` is 0/1/2 (no sentinel cookie: the
+    /// length — never an owner value — gates every read, so
+    /// `Default`/`API_THREADS` rows are unknown, never
+    /// owned-by-0). Only the TOP owner's return may consume
+    /// before popping (`counter_owned_by`); every other return
+    /// pops its own slot first (`d7c431a` order) — in balanced
+    /// LIFO the top entry is exactly the innermost outstanding
+    /// unit owner's, so top-match is exact there.
     ///
     /// Recording (entry fallback arms, AFTER the `overflow`
-    /// bump): a 0→1 arm records owner+known (+related, below); a
-    /// same-cookie arm keeps all three words; a mixed-cookie arm
-    /// clears all three (the outstanding units have >1 owner —
-    /// unknowable which a return owns — so later returns fall
-    /// back to slot-first; documented residual). Clearing: a
-    /// consume that drains `overflow` to 0 clears all three
-    /// (clear-at-zero — a later arm re-records), and an
+    /// bump): len 0→1 pushes the bottom; len 1→2 pushes the top
+    /// (same-cookie duplicates kept — order, not identity, is
+    /// the disambiguator); a len-2 arm REPLACES the top, keeps
+    /// the bottom, and bumps `counter_evicted` (middle eviction:
+    /// the saturating arm's owner is the most likely next
+    /// settler under LIFO; the bottom is the most likely
+    /// survivor after settles). A drain to 0 clears all six
+    /// words (clear-at-zero — a later arm re-records). An
     /// O-marker removal (pop or discard, either return arm)
-    /// retires all three ONLY when the record is
-    /// marker-related (below — the round-3 lifetime lesson:
-    /// R10-P2-1 finding 1 is stale evidence applied to a later
-    /// marker; round-5 N2: a marker-UNRELATED arm's knowledge
-    /// outlives every marker). T-marker and frame removals
-    /// never retire (they say nothing about overflow
-    /// ownership). `API_THREADS` rows carry vestigial 0s
-    /// (classic `enter` never records; the aggregate path
-    /// consumes through `skip_return` without consulting the
-    /// record).
-    pub counter_known: u32,
-    /// Owner cookie for the record above (meaningful only when
-    /// `counter_known` is 1; always cleared together with it —
-    /// no stale owner is ever observable).
+    /// drops RELATED entries only, compacting survivors (the
+    /// round-3 lifetime lesson scoped per entry: a related
+    /// entry's evidence died with its marker; round-5 N2: an
+    /// unrelated entry references no marker and survives).
+    /// T-marker and frame removals never retire. `API_THREADS`
+    /// rows carry vestigial 0s (classic `enter` never records;
+    /// the aggregate path consumes through `skip_return`
+    /// without consulting the record).
+    ///
+    /// Saturation (documented residual, PROVEN minimal): an
+    /// evicted middle owner falls back to slot-first and may
+    /// hijack on a same-cookie slot collision — unavoidable for
+    /// ANY finite depth (K+1 arms with a same-cookie top
+    /// collision reach identical Thread+PENDING bytes with
+    /// conflicting consume/pop mandates — the generalized
+    /// round-3 identity proof). Every distinct-cookie world is
+    /// served exactly; every residual hole needs same-cookie
+    /// ambiguity (the R11-accepted b3/b4 class). Eviction is
+    /// detectable (`counter_evicted`, cleared only at drain).
+    pub counter_len: u32,
+    /// Bottom (first-arm) owner cookie (meaningful only when
+    /// `counter_len` ≥ 1; always cleared together with it — no
+    /// stale owner is ever observable).
     pub counter_owner: u64,
-    /// Marker-relatedness for the record above (round-5 N2): 1
-    /// iff the record's 0→1 arm observed a live O-marker at the
-    /// arm level (the arming unit is positioned against that
-    /// marker's lifetime — a quota/map arm with the level free
-    /// records 0). Only a related record retires on O-marker
-    /// removal (`retire_counter_owner`); an unrelated record
-    /// survives every marker removal (its knowledge references
-    /// no marker). Same-cookie arms keep this word (a second
-    /// unit of the same owner adds no new lifetime); a
-    /// mixed-cookie arm clears it with the rest; clear-at-zero
-    /// clears it (a later arm re-probes). There is no
-    /// WHICH-marker ambiguity: while a related record is live,
-    /// sticky `overflow` freezes depth at the arm level, all
-    /// slots sit at levels ≤ depth, and the reference marker
-    /// live implies depth is still the arm level (any shrink
-    /// needs a frame pop with a shallower mine, which discards
-    /// the reference first; fast-path pops are blocked by the
-    /// lateral-marker guard) — so any O-removal is the
-    /// reference marker itself or follows its discard in the
-    /// same op, and retiring is exact.
+    /// Marker-relatedness for the bottom entry (round-5 N2,
+    /// per entry): 1 iff that arm observed a live O-marker at
+    /// the arm level. Only a related entry retires on O-marker
+    /// removal. There is no WHICH-marker ambiguity: all live
+    /// related entries share one reference marker (two would
+    /// need depth at two levels at once — round-5 (iii)), so
+    /// any O-removal is the reference itself or follows its
+    /// discard in the same op, and retiring is exact.
     pub counter_related: u32,
+    /// Top (latest-arm) owner cookie (meaningful only when
+    /// `counter_len` is 2; a saturating arm replaces it and
+    /// bumps `counter_evicted` below).
+    pub counter_owner2: u64,
+    /// Marker-relatedness for the top entry (same rule as the
+    /// bottom entry above, probed at the top entry's own arm).
+    pub counter_related2: u32,
+    /// Middle-eviction count: arm-time replacements of the top
+    /// entry while `counter_len` was 2 (saturating arms). The
+    /// forgotten middles stay outstanding-but-unknown. Cleared
+    /// only by clear-at-zero (never by retire/settle — it is
+    /// history, and retire/settle drops are visible in the
+    /// length transitions). Observability only: no rule reads
+    /// it.
+    pub counter_evicted: u32,
 }
 /// fix8 (R8-2): `PendingKey.reserved` slot kind. Frames keep 0
 /// (every pre-fix key); overflow/blind markers take 1/2. Lateral
@@ -341,53 +360,133 @@ impl Thread {
         self.depth = self.depth.saturating_sub(1);
         self.overflow = self.overflow.saturating_add(1);
     }
-    /// Record one overflow fallback arm by `cookie` (R10 1b):
-    /// call AFTER the `overflow` bump, at every site that arms
-    /// the fungible counter (entry None arm, both `failed_entry`
-    /// arms). A 0→1 arm records owner+known, plus relatedness
-    /// from `marker_live` (round-5 N2: whether a live O-marker
-    /// occupies the arm level — probed by the caller); a
-    /// same-cookie arm keeps all three words; a mixed-cookie arm
-    /// clears all three (the remainder is unknowably mixed —
-    /// later returns fall back to slot-first). BPF-safe (no
+    /// Record one overflow fallback arm by `cookie` (round-6
+    /// 1a): call AFTER the `overflow` bump, at every site that
+    /// arms the fungible counter (entry None arm, both
+    /// `failed_entry` arms). Len 0→1 pushes the bottom entry;
+    /// len 1→2 pushes the top entry (same-cookie duplicates are
+    /// kept — ORDER, not identity, disambiguates); a len-2 arm
+    /// REPLACES the top, keeps the bottom, and bumps
+    /// `counter_evicted` (middle eviction — the saturating
+    /// armer settles next under LIFO; the bottom survives
+    /// settles). Relatedness comes from `marker_live` (round-5
+    /// N2: whether a live O-marker occupies the arm level —
+    /// probed by the caller), per entry. BPF-safe (no
     /// allocation).
     pub fn record_counter_owner(&mut self, cookie: u64, marker_live: bool) {
-        if self.overflow == 1 {
+        if self.counter_len == 0 {
             self.counter_owner = cookie;
-            self.counter_known = 1;
             self.counter_related = u32::from(marker_live);
-        } else if self.counter_known != 0 && self.counter_owner != cookie {
-            // Mixed-cookie arm: the remainder is unknowably mixed
-            // (clear ALL THREE words — no stale owner stays
-            // observable).
-            self.counter_owner = 0;
-            self.counter_known = 0;
-            self.counter_related = 0;
+            self.counter_len = 1;
+        } else if self.counter_len == 1 {
+            self.counter_owner2 = cookie;
+            self.counter_related2 = u32::from(marker_live);
+            self.counter_len = 2;
+        } else {
+            // Saturating arm: the middle is forgotten (its owner
+            // falls back to slot-first — documented residual),
+            // the latest armer takes the top.
+            self.counter_owner2 = cookie;
+            self.counter_related2 = u32::from(marker_live);
+            self.counter_evicted = self.counter_evicted.saturating_add(1);
         }
     }
-    /// Retire the counter-owner record (R10 1b, scoped by
-    /// round-5 N2): call when an O-marker is REMOVED (pop or
-    /// discard, either return arm). A marker-RELATED record's
-    /// reference marker is gone — applying it to a later marker
-    /// is the finding-1 staleness — so clear all three words (no
-    /// stale owner stays observable). A marker-UNRELATED record
-    /// (quota/map arm with the level free) references no marker
-    /// and survives (no-op). BPF-safe.
+    /// Retire counter-owner entries (R10 1b, scoped per entry by
+    /// round-5 N2, extended to the stack by round-6 1a): call
+    /// when an O-marker is REMOVED (pop or discard, either
+    /// return arm). A marker-RELATED entry's reference marker
+    /// is gone — applying it to a later marker is the finding-1
+    /// staleness — so drop every related entry, compacting
+    /// survivors (no stale owner stays observable). A
+    /// marker-UNRELATED entry (quota/map arm with the level
+    /// free) references no marker and survives. BPF-safe.
     pub fn retire_counter_owner(&mut self) {
-        if self.counter_related != 0 {
+        if self.counter_len == 2 {
+            let top_related = self.counter_related2 != 0;
+            let bottom_related = self.counter_related != 0;
+            if top_related && bottom_related {
+                self.counter_owner = 0;
+                self.counter_related = 0;
+                self.counter_owner2 = 0;
+                self.counter_related2 = 0;
+                self.counter_len = 0;
+            } else if top_related {
+                self.counter_owner2 = 0;
+                self.counter_related2 = 0;
+                self.counter_len = 1;
+            } else if bottom_related {
+                self.counter_owner = self.counter_owner2;
+                self.counter_related = self.counter_related2;
+                self.counter_owner2 = 0;
+                self.counter_related2 = 0;
+                self.counter_len = 1;
+            }
+        } else if self.counter_len == 1 && self.counter_related != 0 {
             self.counter_owner = 0;
-            self.counter_known = 0;
             self.counter_related = 0;
+            self.counter_len = 0;
         }
     }
     /// Whether `cookie`'s accepted return may consume a counter
-    /// unit before popping its matched slot (R10 1b): only the
-    /// recorded owner's return, only while a unit is
-    /// outstanding. Kind-independent (O-slot and frame matches
-    /// alike — same-cookie units are fungible suppressions).
-    /// BPF-safe.
+    /// unit before popping its matched slot (round-6 1a): only
+    /// the TOP (latest-arm) owner's return, only while a unit
+    /// is outstanding. Kind-independent (O-slot and frame
+    /// matches alike — same-cookie units are fungible
+    /// suppressions). BPF-safe.
     pub fn counter_owned_by(&self, cookie: u64) -> bool {
-        self.overflow > 0 && self.counter_known != 0 && self.counter_owner == cookie
+        if self.overflow == 0 || self.counter_len == 0 {
+            return false;
+        }
+        let top = if self.counter_len == 2 {
+            self.counter_owner2
+        } else {
+            self.counter_owner
+        };
+        top == cookie
+    }
+    /// Settle one consumed unit for `cookie`'s ACCEPTED return
+    /// (round-6 1a): call after a successful `skip_return` on
+    /// the accepted arm (owner consume + no-match consume —
+    /// NEVER on the rejected arm, whose count-only settle may
+    /// lag the record by design). Removes `cookie`'s topmost
+    /// entry (top-first — the returner is innermost under LIFO,
+    /// so its unit is the latest matching one); a returner
+    /// with no entry (evicted middle, retired record, foreign
+    /// settler) removes nothing and only trims a stale bottom
+    /// while the length exceeds the count (rejected-skew
+    /// self-heal — the top, the newest knowledge, is kept).
+    /// BPF-safe.
+    pub fn settle_counter_owner(&mut self, cookie: u64) {
+        if self.counter_len == 2 && self.counter_owner2 == cookie {
+            self.counter_owner2 = 0;
+            self.counter_related2 = 0;
+            self.counter_len = 1;
+        } else if self.counter_len == 2 && self.counter_owner == cookie {
+            self.counter_owner = self.counter_owner2;
+            self.counter_related = self.counter_related2;
+            self.counter_owner2 = 0;
+            self.counter_related2 = 0;
+            self.counter_len = 1;
+        } else if self.counter_len == 1 && self.counter_owner == cookie {
+            self.counter_owner = 0;
+            self.counter_related = 0;
+            self.counter_len = 0;
+        } else if self.counter_len > self.overflow {
+            // No entry of mine: the consumed unit is unknown
+            // (evicted/retired/foreign) — forget the stalest
+            // (bottom) so the length never exceeds the count.
+            if self.counter_len == 2 {
+                self.counter_owner = self.counter_owner2;
+                self.counter_related = self.counter_related2;
+                self.counter_owner2 = 0;
+                self.counter_related2 = 0;
+                self.counter_len = 1;
+            } else if self.counter_len == 1 {
+                self.counter_owner = 0;
+                self.counter_related = 0;
+                self.counter_len = 0;
+            }
+        }
     }
     /// Cross-edge skip, ACCEPTED returns only: consume one
     /// overflow marker armed by an earlier overflowed (or
@@ -413,15 +512,19 @@ impl Thread {
     pub fn skip_return(&mut self) -> bool {
         if self.overflow != 0 {
             self.overflow -= 1;
-            // R10 1b clear-at-zero: the last unit carried the
-            // record's whole meaning — a drained counter owns
-            // nothing (a later arm re-records). Rows that never
-            // record (`API_THREADS`) hold 0 and behave exactly as
+            // R10 1b clear-at-zero (round-6 1a: all six stack
+            // words): the last unit carried the record's whole
+            // meaning — a drained counter owns nothing (a later
+            // arm re-records). Rows that never record
+            // (`API_THREADS`) hold 0 and behave exactly as
             // before.
             if self.overflow == 0 {
                 self.counter_owner = 0;
-                self.counter_known = 0;
+                self.counter_len = 0;
                 self.counter_related = 0;
+                self.counter_owner2 = 0;
+                self.counter_related2 = 0;
+                self.counter_evicted = 0;
             }
             true
         } else {
@@ -455,13 +558,17 @@ impl Thread {
         } else if self.overflow != 0 {
             self.overflow -= 1;
             // R10 1b: the same clear-at-zero as `skip_return`
-            // (the rejected arm itself is unchanged —
-            // slot-first, T-first — this only drops the record
-            // when the drain takes the last unit).
+            // (round-6 1a: all six stack words; the rejected
+            // arm itself is unchanged — slot-first, T-first —
+            // this only drops the record when the drain takes
+            // the last unit).
             if self.overflow == 0 {
                 self.counter_owner = 0;
-                self.counter_known = 0;
+                self.counter_len = 0;
                 self.counter_related = 0;
+                self.counter_owner2 = 0;
+                self.counter_related2 = 0;
+                self.counter_evicted = 0;
             }
             true
         } else {
@@ -769,9 +876,12 @@ mod tests {
             depth: 0,
             overflow: 0,
             blind: 0,
-            counter_known: 0,
+            counter_len: 0,
             counter_owner: 0,
             counter_related: 0,
+            counter_owner2: 0,
+            counter_related2: 0,
+            counter_evicted: 0,
         };
         assert_eq!(
             enter_none_disposition(fresh_max.next),
@@ -784,9 +894,12 @@ mod tests {
             depth: 2,
             overflow: 0,
             blind: 0,
-            counter_known: 0,
+            counter_len: 0,
             counter_owner: 0,
             counter_related: 0,
+            counter_owner2: 0,
+            counter_related2: 0,
+            counter_evicted: 0,
         };
         assert_eq!(
             enter_none_disposition(old_max.next),
@@ -799,9 +912,12 @@ mod tests {
             depth: MAX_DEPTH,
             overflow: 1,
             blind: 0,
-            counter_known: 0,
+            counter_len: 0,
             counter_owner: 0,
             counter_related: 0,
+            counter_owner2: 0,
+            counter_related2: 0,
+            counter_evicted: 0,
         };
         assert_eq!(
             enter_none_disposition(overflow.next),
@@ -814,9 +930,12 @@ mod tests {
             depth: 1,
             overflow: 0,
             blind: 0,
-            counter_known: 0,
+            counter_len: 0,
             counter_owner: 0,
             counter_related: 0,
+            counter_owner2: 0,
+            counter_related2: 0,
+            counter_evicted: 0,
         };
         assert_eq!(
             enter_none_disposition(normal.next),
@@ -1125,23 +1244,27 @@ mod tests {
                 bare: 0,
             }
         }
-        /// Overflow units with a recorded owner (R10 1b): the
-        /// BPF `thread.overflow` (real BPF records every
+        /// Overflow units with a recorded owner (round-6 1a):
+        /// the BPF `thread.overflow` (real BPF records every
         /// fallback, so all its units are owned — `bare` is
         /// model-only).
         fn owned(&self) -> u32 {
             self.thread.overflow.saturating_sub(self.bare)
         }
-        /// Consume one overflow unit through production
-        /// `skip_return` (which clears the record at zero),
-        /// retiring a bare unit first when the schedule neuters
-        /// the mechanism. Mirrors the BPF consume (whose rows
-        /// hold no bare units).
-        fn consume_counter(&mut self) -> bool {
+        /// Consume one overflow unit for `cookie`'s accepted
+        /// return through production `skip_return` (which clears
+        /// the record at zero) + `settle_counter_owner` (which
+        /// removes the settler's topmost entry), retiring a bare
+        /// unit first when the schedule neuters the mechanism
+        /// (bare rows hold len 0, so the settle is a no-op
+        /// there). Mirrors the BPF consume (whose rows hold no
+        /// bare units).
+        fn consume_counter(&mut self, cookie: u64) -> bool {
             if self.thread.overflow == 0 {
                 return false;
             }
             assert!(self.thread.skip_return());
+            self.thread.settle_counter_owner(cookie);
             if self.bare > 0 {
                 self.bare -= 1;
             }
@@ -1158,13 +1281,13 @@ mod tests {
         /// Overflow entry: refused frame, then an O-marker slot at
         /// the current depth — or the fungible counter on marker
         /// refusal (collision/quota/neuter), mirroring the BPF
-        /// None arm exactly. R10 1b: a recorded fallback records
-        /// its owner (`record_counter_owner` — 0→1 records,
-        /// mixed-cookie clears known); round-5 N2: the 0→1 arm
-        /// also records marker-relatedness (live O at the arm
-        /// level — the BPF `o_marker_at` probe); the
-        /// `force_counter` neuter records nothing (bare old-BPF
-        /// count → unknown).
+        /// None arm exactly. Round-6 1a: a recorded fallback
+        /// pushes its owner (`record_counter_owner` — len 0→1
+        /// bottom, len 1→2 top, len-2 arms replace the top and
+        /// evict the middle); round-5 N2: each arm also records
+        /// marker-relatedness (live O at the arm level — the BPF
+        /// `o_marker_at` probe); the `force_counter` neuter
+        /// records nothing (bare old-BPF count → unknown).
         fn overflow(&mut self, cookie: u64) {
             assert_eq!(self.thread.enter_frame(), None, "must refuse a frame");
             let slot = self.thread.depth as usize;
@@ -1234,10 +1357,9 @@ mod tests {
         /// levels top→0, counting discards; the BPF drives the pass
         /// via `bpf_loop` and hoists the depth unwinding after (ONE
         /// saturating subtract — net-identical to per-delete
-        /// decrements). R10 1b: a discarded O-marker retires a
-        /// marker-RELATED counter-owner record (round-5 N2:
-        /// unrelated records survive); T/frame discards never
-        /// retire.
+        /// decrements). Round-6 1a: a discarded O-marker drops
+        /// RELATED stack entries (round-5 N2: unrelated entries
+        /// survive); T/frame discards never retire.
         fn discard_deeper(&mut self, mine: usize) {
             let top = (self.thread.depth as usize).min(MAX_DEPTH as usize);
             let mut unwound: u32 = 0;
@@ -1259,15 +1381,15 @@ mod tests {
         /// Accepted return of `cookie` (rv observed on emit):
         /// fast-path own frame, else slow search (T excluded),
         /// else the overflow counter — mirroring `pop_return`'s
-        /// accepted arm exactly. R10 1b: a cookie match is not
-        /// ownership, so an ambiguous match consumes instead of
-        /// popping ONLY when the returner is the recorded
-        /// counter owner (`counter_owned_by`, kind-independent —
-        /// O-slot and frame matches alike); every other match
-        /// pops its own slot first (`d7c431a` order) — and a
-        /// consume pops and discards nothing. A popped O-marker
-        /// retires a marker-RELATED record (round-5 N2:
-        /// unrelated records survive).
+        /// accepted arm exactly. Round-6 1a: a cookie match is
+        /// not ownership, so an ambiguous match consumes instead
+        /// of popping ONLY when the returner is the TOP (latest
+        /// arm) counter owner (`counter_owned_by`,
+        /// kind-independent — O-slot and frame matches alike);
+        /// every other match pops its own slot first (`d7c431a`
+        /// order) — and a consume pops and discards nothing. A
+        /// popped O-marker drops RELATED stack entries (round-5
+        /// N2: unrelated entries survive).
         fn marker_at(&self, level: usize) -> bool {
             self.omarks[level].is_some() || self.tmarks[level].is_some()
         }
@@ -1292,7 +1414,10 @@ mod tests {
             }
             if let Some((mine, kind)) = self.find_mine(cookie, false) {
                 if self.owner_consumes(cookie) {
-                    assert!(self.consume_counter(), "owned counter unit must exist");
+                    assert!(
+                        self.consume_counter(cookie),
+                        "owned counter unit must exist"
+                    );
                     return;
                 }
                 self.discard_deeper(mine);
@@ -1309,15 +1434,18 @@ mod tests {
                 }
                 return;
             }
-            assert!(self.consume_counter(), "counter-owned accepted return");
+            assert!(
+                self.consume_counter(cookie),
+                "counter-owned accepted return"
+            );
         }
         /// Window-rejected return of `cookie`: fast-path own frame
         /// (popped, suppressed), else slow search (all kinds),
         /// else the T-first counter — mirroring `pop_return`'s
-        /// rejected arm exactly. Never emits. R10 1b: a popped
-        /// O-marker retires a marker-RELATED counter-owner
-        /// record (round-5 N2 scoping; the only rejected-arm
-        /// change; slot-first + T-first preserved).
+        /// rejected arm exactly. Never emits. Round-6 1a: a
+        /// popped O-marker drops RELATED stack entries (round-5
+        /// N2 scoping; slot-first + T-first preserved; rejected
+        /// settles never settle entries — count-only).
         fn return_reject(&mut self, cookie: u64) -> bool {
             if self.thread.depth > 0 {
                 let slot = self.thread.depth as usize - 1;
@@ -1797,9 +1925,12 @@ mod tests {
                         overflow,
                         seed: 3,
                         blind: 0,
-                        counter_known: 0,
+                        counter_len: 0,
                         counter_owner: 0,
                         counter_related: 0,
+                        counter_owner2: 0,
+                        counter_related2: 0,
+                        counter_evicted: 0,
                     };
                     let mut b = a;
                     let frame = a.enter_frame();
@@ -1826,7 +1957,7 @@ mod tests {
         // layouts — frames keep key 0, markers take 1/2; marker
         // values suppress and carry the owner cookie with no
         // invocation. `Pending`/`PendingKey` shapes frozen
-        // (56/24 B); `Thread` is 48 B per the round-5 N2 layout
+        // (56/24 B); `Thread` is 64 B per the round-6 1a layout
         // pin below (specs mirror it).
         assert_eq!(
             (PENDING_FRAME, PENDING_OVERFLOW_MARKER, PENDING_BLIND_MARKER),
@@ -1840,7 +1971,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<Pending>(), 56);
         assert_eq!(core::mem::size_of::<PendingKey>(), 24);
         assert_eq!(core::mem::offset_of!(PendingKey, reserved), 20);
-        assert_eq!(core::mem::size_of::<Thread>(), 48);
+        assert_eq!(core::mem::size_of::<Thread>(), 64);
     }
     #[test]
     fn r9_same_cookie_complete_chain_must_keep_all_pairs_aligned() {
@@ -2050,7 +2181,7 @@ mod tests {
         m.overflow(S); // C: same-kind collision → counter (owned by S)
         assert_eq!((m.thread.depth, m.thread.overflow), (8, 1));
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, S),
             "C's unit records its owner"
         );
@@ -2099,8 +2230,12 @@ mod tests {
         assert!(m.omarks[8].is_none());
         assert_eq!(m.suppressed, 1, "C's rejected return pops B's O-marker");
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
-            (0, 0),
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (0, 0, 0),
             "C's pop retires the owner record with its marker"
         );
         m.overflow(S); // B calls D: fresh O-marker
@@ -2115,8 +2250,13 @@ mod tests {
         m.assert_aligned();
         m.assert_quiescent();
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
-            (0, 0),
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2,
+                m.thread.counter_evicted
+            ),
+            (0, 0, 0, 0),
             "clear-at-zero leaves no stale record"
         );
     }
@@ -2127,8 +2267,8 @@ mod tests {
         // schedule with D sharing X's cookie. C's rejected
         // return pops B's O-marker and retires the record; D(X)
         // slots a fresh O-marker; D's accepted return must pop
-        // its OWN marker (unknown → slot-first) even though the
-        // orphaned unit's armer was also X — the record died
+        // its OWN marker (empty stack → slot-first) even though
+        // the orphaned unit's armer was also X — the record died
         // with B's marker. B's rejected return settles the
         // counter; all eight S pairs stay aligned and quiescent
         // with nothing discarded. (Without retirement D consumes
@@ -2142,13 +2282,17 @@ mod tests {
         }
         m.overflow(X); // B: slotted O at depth 8
         m.overflow(X); // C: same-kind collision → counter
-        assert_eq!((m.thread.counter_known, m.thread.counter_owner), (1, X));
+        assert_eq!((m.thread.counter_len, m.thread.counter_owner), (1, X));
         assert!(m.return_reject(X)); // C returns after close; B still executing
         assert_eq!(m.thread.overflow, 1);
         assert!(m.omarks[8].is_none());
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
-            (0, 0),
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (0, 0, 0),
             "C's pop retires the owner record with its marker"
         );
         m.overflow(X); // B calls D(X): fresh O-marker, same cookie
@@ -2191,9 +2335,9 @@ mod tests {
         m.quota_fail = false;
         assert_eq!((m.thread.depth, m.thread.overflow), (8, 1));
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, X),
-            "the 0→1 arm records owner+known"
+            "the 0→1 arm records len+bottom"
         );
         m.skip();
         for rv in (1..=8u64).rev() {
@@ -2207,7 +2351,7 @@ mod tests {
         );
         assert_eq!((m.suppressed, m.discarded), (0, 0));
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, X),
             "foreign frame pops never retire the record"
         );
@@ -2240,7 +2384,7 @@ mod tests {
         assert_eq!(m.thread.overflow, 1);
         assert_eq!(m.suppressed, 1, "B's rejected return pops C's T-marker");
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, X),
             "T-marker removal never retires the record"
         );
@@ -2278,7 +2422,7 @@ mod tests {
         m.quota_fail = false;
         m.overflow(D);
         assert_eq!((m.thread.depth, m.thread.overflow), (8, 1));
-        assert_eq!((m.thread.counter_known, m.thread.counter_owner), (1, B));
+        assert_eq!((m.thread.counter_len, m.thread.counter_owner), (1, B));
         m.return_accept(D, 900);
         assert_eq!(m.thread.overflow, 1, "later slot pops before outer counter");
         assert!(m.omarks[8].is_none());
@@ -2290,23 +2434,28 @@ mod tests {
         }
         m.assert_aligned();
         m.assert_quiescent();
-        assert_eq!(core::mem::size_of::<Thread>(), 48);
-        assert_eq!(core::mem::offset_of!(Thread, counter_known), 28);
+        assert_eq!(core::mem::size_of::<Thread>(), 64);
+        assert_eq!(core::mem::offset_of!(Thread, counter_len), 28);
         assert_eq!(core::mem::offset_of!(Thread, counter_owner), 32);
         assert_eq!(core::mem::offset_of!(Thread, counter_related), 40);
+        assert_eq!(core::mem::offset_of!(Thread, counter_owner2), 48);
+        assert_eq!(core::mem::offset_of!(Thread, counter_related2), 56);
+        assert_eq!(core::mem::offset_of!(Thread, counter_evicted), 60);
     }
     #[test]
     fn r10_mixed_cookie_second_arm_falls_back_to_slot_first() {
-        // R10 1b residual pin: >1 outstanding mixed-cookie units
-        // fall back to slot-first. Eight framed A calls; B arms
-        // a quota unit (owner B, known); C arms a second quota
-        // unit (mixed-cookie arm clears the record); F2 slots a
-        // later O-marker. F2's accepted return pops its OWN
-        // marker (unknown → slot-first, never a guess); C's and
-        // B's slotless returns consume their units (no-match
-        // consumes unconditionally — there is no slot to pop);
-        // every frame pops own. Aligned + quiescent throughout
-        // the residual.
+        // R10 1b residual pin, round-6 1a: >1 outstanding
+        // mixed-cookie units KEEP both owners in arm order (the
+        // 1b clearing is GONE — R11-P2-1 proved clearing reopens
+        // the balanced hijack). Eight framed A calls; B arms a
+        // quota unit (bottom B); C arms a second quota unit
+        // (top C — no clearing); F2 slots a later O-marker.
+        // F2's accepted return pops its OWN marker (top C is
+        // foreign to F2 → slot-first, never a guess); C's and
+        // B's slotless returns settle their units top-first
+        // (no-match settles unconditionally — there is no slot
+        // to pop); every frame pops own. Aligned + quiescent
+        // throughout the residual.
         const A: u64 = 0xA11CE;
         const B: u64 = 0xB00B;
         const C: u64 = 0xC10C;
@@ -2321,19 +2470,36 @@ mod tests {
         m.quota_fail = false;
         assert_eq!((m.thread.depth, m.thread.overflow), (8, 2));
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
-            (0, 0),
-            "mixed-cookie arm clears the record"
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (2, B, C),
+            "mixed-cookie arm preserves both owners in order"
         );
         m.overflow(F2); // later O-marker slots (no arm, no record change)
-        assert_eq!((m.thread.counter_known, m.thread.counter_owner), (0, 0));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (2, B, C)
+        );
         m.return_accept(F2, 0);
-        assert_eq!(m.thread.overflow, 2, "unknown → slot-first");
+        assert_eq!(m.thread.overflow, 2, "foreign top → slot-first");
         assert!(m.omarks[8].is_none());
         m.return_accept(C, 0);
         assert_eq!(m.thread.overflow, 1);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_owner),
+            (1, B),
+            "C settles the top, B stays bottom"
+        );
         m.return_accept(B, 0);
         assert_eq!(m.thread.overflow, 0);
+        assert_eq!(m.thread.counter_len, 0);
         for rv in (1..=8u64).rev() {
             m.return_accept(A, rv);
         }
@@ -2373,7 +2539,7 @@ mod tests {
         assert!(m.return_reject(S)); // B pops A8's frame, orphans its unit
         assert_eq!((m.thread.depth, m.thread.overflow), (7, 1));
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, S),
             "frame pops never retire the record"
         );
@@ -2424,9 +2590,9 @@ mod tests {
         m.quota_fail = false;
         assert_eq!((m.thread.depth, m.thread.overflow), (8, 1));
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, X),
-            "the 0→1 arm records owner+known"
+            "the 0→1 arm records len+bottom"
         );
         assert_eq!(
             m.thread.counter_related, 0,
@@ -2437,7 +2603,7 @@ mod tests {
         assert_eq!(m.suppressed, 1, "F pops its own marker");
         assert!(m.omarks[8].is_none());
         assert_eq!(
-            (m.thread.counter_known, m.thread.counter_owner),
+            (m.thread.counter_len, m.thread.counter_owner),
             (1, X),
             "foreign O-pop must not retire a marker-unrelated record"
         );
@@ -2458,7 +2624,7 @@ mod tests {
         m.assert_quiescent();
     }
     #[test]
-    fn thread_value_is_48_with_related_at_40() {
+    fn thread_value_is_64_with_stack_at_28() {
         // fix6 (R6-1): THREADS/API_THREADS value 16→24 B, seed
         // APPENDED (existing field offsets unchanged). fix7 (R7-3):
         // 24→32 B, blind APPENDED after seed (all existing offsets
@@ -2467,16 +2633,328 @@ mod tests {
         // unchanged value), and `counter_owner: u64` is APPENDED
         // at 32 (all existing offsets unchanged). Round-5 N2:
         // 40→48 B — `counter_related: u32` APPENDED at 40 (all
-        // existing offsets unchanged). The loader `specs()`
-        // mirrors these sizes exactly.
-        assert_eq!(core::mem::size_of::<Thread>(), 48);
+        // existing offsets unchanged). Round-6 1a: 48→64 B — the
+        // `counter_known` word becomes `counter_len` (offset 28,
+        // values 0/1/2), and `counter_owner2: u64`,
+        // `counter_related2: u32`, `counter_evicted: u32` are
+        // APPENDED at 48/56/60 (all existing offsets unchanged).
+        // The loader `specs()` mirrors these sizes exactly.
+        assert_eq!(core::mem::size_of::<Thread>(), 64);
         assert_eq!(core::mem::offset_of!(Thread, next), 0);
         assert_eq!(core::mem::offset_of!(Thread, depth), 8);
         assert_eq!(core::mem::offset_of!(Thread, overflow), 12);
         assert_eq!(core::mem::offset_of!(Thread, seed), 16);
         assert_eq!(core::mem::offset_of!(Thread, blind), 24);
-        assert_eq!(core::mem::offset_of!(Thread, counter_known), 28);
+        assert_eq!(core::mem::offset_of!(Thread, counter_len), 28);
         assert_eq!(core::mem::offset_of!(Thread, counter_owner), 32);
         assert_eq!(core::mem::offset_of!(Thread, counter_related), 40);
+        assert_eq!(core::mem::offset_of!(Thread, counter_owner2), 48);
+        assert_eq!(core::mem::offset_of!(Thread, counter_related2), 56);
+        assert_eq!(core::mem::offset_of!(Thread, counter_evicted), 60);
+    }
+    #[test]
+    fn r11_mixed_counter_batch_must_not_reopen_balanced_hijack() {
+        // R11-P2-1 (mixed-owner fallback): eight framed S calls; B(S)
+        // slots the O-marker; C(S) collides onto the counter; D(Y)
+        // collides onto the counter (mixed batch). All accepted,
+        // strict LIFO, no skips. D settles slotless; C must consume
+        // the remaining unit (it is C's — order preserved), NOT take
+        // B's O-marker; B pops its own marker; every frame pops own:
+        // D, C, B suppressed, [(8,8)..(1,1)], quiescent — R11's
+        // Expected exactly. (RED pre-fix: C takes B's marker, B
+        // takes S8's frame — [(8,9)..(1,2)].)
+        const S: u64 = 1;
+        const Y: u64 = 2;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S); // B: O-marker, logical call 9
+        m.overflow(S); // C: counter unit, call 10
+        m.overflow(Y); // D: counter unit, call 11
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 2));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2,
+                m.thread.counter_evicted
+            ),
+            (2, S, Y, 0),
+            "mixed batch keeps both owners in arm order"
+        );
+        assert_eq!(
+            (m.thread.counter_related, m.thread.counter_related2),
+            (1, 1),
+            "both arms saw B's live O-marker"
+        );
+        m.return_accept(Y, 11); // D settles slotless
+        assert_eq!(m.thread.overflow, 1);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_owner),
+            (1, S),
+            "D settles the top; the remainder is C's"
+        );
+        assert_eq!(m.emitted_len, 0);
+        m.return_accept(S, 10); // C: must consume, not take B's O
+        assert_eq!(m.emitted_len, 0, "C owns a counter unit, not B's marker");
+        assert_eq!(m.thread.counter_len, 0);
+        assert!(m.omarks[8].is_some(), "B's marker survives C's return");
+        m.return_accept(S, 9); // B: pops its own O-marker
+        assert_eq!((m.suppressed, m.emitted_len), (1, 0));
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        m.assert_quiescent();
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+    }
+    #[test]
+    fn r11_saturated_batch_preserves_oldest_and_latest_owners() {
+        // Round-6 1a saturation pin: three quota units (X, Y, Z)
+        // over eight framed A calls. The third arm evicts the
+        // MIDDLE (sticky bottom X + latest top Z, `evicted` 1);
+        // all three settlers are slotless, so each settles its
+        // unit exactly (Z pops the top, Y's settle finds no
+        // entry and trims nothing, X pops the bottom); every
+        // frame pops own. Aligned + quiescent, eviction
+        // detectable mid-schedule and cleared at drain.
+        const A: u64 = 0xA11CE;
+        const X: u64 = 1;
+        const Y: u64 = 2;
+        const Z: u64 = 3;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(A);
+        }
+        m.quota_fail = true;
+        m.overflow(X);
+        m.overflow(Y);
+        m.overflow(Z);
+        m.quota_fail = false;
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 3));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2,
+                m.thread.counter_evicted
+            ),
+            (2, X, Z, 1),
+            "saturating arm keeps bottom+latest, evicts the middle"
+        );
+        m.return_accept(Z, 0);
+        assert_eq!(m.thread.overflow, 2);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_owner),
+            (1, X),
+            "Z settles the top"
+        );
+        m.return_accept(Y, 0);
+        assert_eq!(m.thread.overflow, 1);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_owner),
+            (1, X),
+            "evicted Y settles slotless; X untouched, no trim needed"
+        );
+        m.return_accept(X, 0);
+        assert_eq!(m.thread.overflow, 0);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_evicted),
+            (0, 0),
+            "clear-at-zero clears the stack and the eviction count"
+        );
+        for rv in (1..=8u64).rev() {
+            m.return_accept(A, rv);
+        }
+        m.assert_aligned();
+        m.assert_quiescent();
+        assert_eq!((m.suppressed, m.discarded), (0, 0));
+    }
+    #[test]
+    fn r11_evicted_middle_owner_falls_back_to_slot_first() {
+        // Round-6 1a saturation residual (PROVEN unavoidable —
+        // the generalized round-3 identity proof: K+1 arms with
+        // a same-cookie top collision reach identical state
+        // with conflicting mandates): B(S) slots the O-marker;
+        // C(X), D(S), E(Y) collide onto the counter (D evicted);
+        // E settles; D — the forgotten middle — matches B's
+        // marker and falls back to slot-first, popping it; C
+        // settles; B pops S8's frame and the survivors shift
+        // [(8,9)..(1,2)] with S1 settling D's orphan. Every
+        // residual hole needs this same-cookie ambiguity (the
+        // R11-accepted b3/b4 class); distinct-cookie batches
+        // settle exactly (pinned above).
+        const S: u64 = 1;
+        const X: u64 = 2;
+        const Y: u64 = 3;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(S); // B: O-marker
+        m.overflow(X); // C: bottom unit
+        m.overflow(S); // D: middle unit (evicted next)
+        m.overflow(Y); // E: top unit, evicts D
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 3));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2,
+                m.thread.counter_evicted
+            ),
+            (2, X, Y, 1),
+            "D(S) is the forgotten middle"
+        );
+        m.return_accept(Y, 12); // E settles the top
+        assert_eq!(m.thread.overflow, 2);
+        assert_eq!((m.thread.counter_len, m.thread.counter_owner), (1, X));
+        m.return_accept(S, 11); // D: evicted → slot-first, pops B's O
+        assert_eq!(m.suppressed, 1, "D takes B's marker (fallback)");
+        assert_eq!(
+            m.thread.counter_len, 0,
+            "the pop retires X's related entry with the marker"
+        );
+        m.return_accept(X, 10); // C settles slotless, record empty
+        assert_eq!(m.thread.overflow, 1);
+        m.return_accept(S, 9); // B: marker gone → pops S8's frame
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [
+                (8, 9),
+                (7, 8),
+                (6, 7),
+                (5, 6),
+                (4, 5),
+                (3, 4),
+                (2, 3),
+                (1, 2)
+            ]
+        );
+        m.assert_quiescent();
+        assert_eq!((m.suppressed, m.discarded), (1, 0));
+    }
+    #[test]
+    fn r11_cross_cookie_retirement_is_needed_after_skipped_counter() {
+        // R11's valid cross-cookie control (replaces the report's
+        // incorrect G(X) argument): eight framed (non-operational)
+        // S calls; operational B(X) slots an O-marker; an S call
+        // collides onto the counter (marker-related) and is
+        // skipped; B's rejected return pops its own O-marker and
+        // MUST retire S's record despite the cookie mismatch —
+        // else the S survivors orphan-consume and cascade. Eight
+        // aligned pairs with the debt retained (0,1,0).
+        const S: u64 = 1;
+        const X: u64 = 2;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(S);
+        }
+        m.overflow(X); // B: O-marker, operational
+        m.overflow(S); // S descendant: counter unit, related
+        assert_eq!((m.thread.counter_len, m.thread.counter_owner), (1, S));
+        m.skip(); // S descendant longjmps
+        assert!(m.return_reject(X)); // B pops its own O
+        assert_eq!(
+            m.thread.counter_len, 0,
+            "retire despite the cookie mismatch"
+        );
+        for rv in (1..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 1, 0)
+        );
+    }
+    #[test]
+    fn r11_stack_settle_trims_stale_bottom_on_skew() {
+        // Round-6 1a method unit: an accepted no-match settle by
+        // a cookie with no entry removes nothing and trims the
+        // stalest (bottom) entry while the length exceeds the
+        // count (rejected-skew self-heal — the top, the newest
+        // knowledge, is kept). A trim is not an eviction.
+        const X: u64 = 1;
+        const Y: u64 = 2;
+        const Z: u64 = 3;
+        let mut t = Thread {
+            depth: MAX_DEPTH,
+            ..Default::default()
+        };
+        assert_eq!(t.enter(), None);
+        t.record_counter_owner(X, false);
+        assert_eq!(t.enter(), None);
+        t.record_counter_owner(Y, false);
+        assert_eq!((t.overflow, t.counter_len), (2, 2));
+        assert!(t.skip_return());
+        t.settle_counter_owner(Z);
+        assert_eq!(
+            (t.counter_len, t.counter_owner),
+            (1, Y),
+            "trim keeps the newest"
+        );
+        assert_eq!(t.counter_evicted, 0);
+    }
+    #[test]
+    fn r11_stack_retire_drops_only_related_entries() {
+        // Round-6 1a method unit: O-marker removal drops RELATED
+        // stack entries only, compacting survivors in order.
+        const X: u64 = 1;
+        const Y: u64 = 2;
+        let mut both = Thread::default();
+        both.counter_len = 2;
+        both.counter_owner = X;
+        both.counter_related = 1;
+        both.counter_owner2 = Y;
+        both.counter_related2 = 1;
+        both.retire_counter_owner();
+        assert_eq!(both.counter_len, 0);
+        let mut top_only = Thread::default();
+        top_only.counter_len = 2;
+        top_only.counter_owner = X;
+        top_only.counter_related = 0;
+        top_only.counter_owner2 = Y;
+        top_only.counter_related2 = 1;
+        top_only.retire_counter_owner();
+        assert_eq!(
+            (top_only.counter_len, top_only.counter_owner),
+            (1, X),
+            "unrelated bottom survives"
+        );
+        let mut bottom_only = Thread::default();
+        bottom_only.counter_len = 2;
+        bottom_only.counter_owner = X;
+        bottom_only.counter_related = 1;
+        bottom_only.counter_owner2 = Y;
+        bottom_only.counter_related2 = 0;
+        bottom_only.retire_counter_owner();
+        assert_eq!(
+            (
+                bottom_only.counter_len,
+                bottom_only.counter_owner,
+                bottom_only.counter_related
+            ),
+            (1, Y, 0),
+            "surviving top shifts to bottom"
+        );
+        let mut neither = Thread::default();
+        neither.counter_len = 2;
+        neither.counter_owner = X;
+        neither.counter_related = 0;
+        neither.counter_owner2 = Y;
+        neither.counter_related2 = 0;
+        neither.retire_counter_owner();
+        assert_eq!(
+            (neither.counter_len, neither.counter_owner),
+            (2, X),
+            "unrelated stack stands"
+        );
     }
 }

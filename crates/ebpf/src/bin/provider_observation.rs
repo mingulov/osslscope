@@ -480,9 +480,12 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
                 depth: 0,
                 overflow: 0,
                 blind: 0,
-                counter_known: 0,
+                counter_len: 0,
                 counter_owner: 0,
                 counter_related: 0,
+                counter_owner2: 0,
+                counter_related2: 0,
+                counter_evicted: 0,
             }
         }
     };
@@ -528,8 +531,8 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
                 loss(LOSS_MAP);
             }
             thread.overflow = thread.overflow.saturating_add(1);
-            // R10 1b: record fallback OWNERSHIP with the unit
-            // (only the recorded owner's return consumes before
+            // Round-6 1a: record fallback OWNERSHIP with the unit
+            // (only the TOP owner's return consumes before
             // popping; every other return pops its own slot
             // first). Round-5 N2: also record marker-relatedness
             // — a live O at the arm level positions this unit
@@ -585,7 +588,7 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
     };
     if !source_state::claim_pending() {
         thread.failed_entry();
-        // R10 1b: the failed call's counter unit records its
+        // Round-6 1a: the failed call's counter unit records its
         // owner like any fallback (round-5 N2: relatedness
         // probed at the unwound level — `failed_entry`
         // restored `old_depth`).
@@ -602,8 +605,8 @@ pub fn observation_entry(ctx: ProbeContext) -> u32 {
             loss(LOSS_MAP);
         }
         thread.failed_entry();
-        // R10 1b: same owner recording as the claim-failure arm
-        // above (round-5 N2: same relatedness probe at the
+        // Round-6 1a: same owner recording as the claim-failure
+        // arm above (round-5 N2: same relatedness probe at the
         // unwound level).
         thread.record_counter_owner(cookie, o_marker_at(&key, old_depth));
         if THREADS.insert(key, thread, 0).is_err() {
@@ -1104,8 +1107,9 @@ pub extern "C" fn algorithm_slot(index: u64, context: u64) -> u64 {
 /// with both counters fits comfortably; the batched release and
 /// the depth unwinding stay hoisted after (net-identical).
 /// Deletes/visits unchanged (levels top→0, all kinds).
-/// R10 1b: the callback additionally counts discarded O-markers
-/// so the hoisted tail can retire the counter-owner record.
+/// Round-6 1a: the callback additionally counts discarded
+/// O-markers so the hoisted tail can retire counter-owner
+/// entries.
 struct DiscardCtx {
     key: ThreadKey,
     top: u32,
@@ -1199,10 +1203,10 @@ pub fn discard_deeper(
     if freed != 0 && !source_state::release_pending_n(freed) {
         loss(LOSS_MAP);
     }
-    // R10 1b: a discarded O-marker retires a marker-RELATED
-    // counter-owner record (round-5 N2: unrelated records
-    // survive — the finding-1 staleness must not reach a later
-    // marker, but marker-free knowledge outlives every marker).
+    // Round-6 1a: a discarded O-marker drops RELATED stack
+    // entries (round-5 N2: unrelated entries survive — the
+    // finding-1 staleness must not reach a later marker, but
+    // marker-free knowledge outlives every marker).
     if ctx.o_freed != 0 {
         thread.retire_counter_owner();
     }
@@ -1386,10 +1390,10 @@ pub fn pop_return(
                     if mine_kind == PENDING_FRAME {
                         thread.depth = thread.depth.saturating_sub(1);
                     }
-                    // R10 1b: a popped O-marker retires a
-                    // marker-RELATED counter-owner record
-                    // (round-5 N2 scoping; the only rejected-arm
-                    // change; slot-first + T-first preserved).
+                    // Round-6 1a: a popped O-marker drops RELATED
+                    // stack entries (round-5 N2 scoping;
+                    // slot-first + T-first preserved; rejected
+                    // settles never settle entries — count-only).
                     if mine_kind == PENDING_OVERFLOW_MARKER {
                         thread.retire_counter_owner();
                     }
@@ -1417,10 +1421,10 @@ pub fn pop_return(
     // directly (the common case) — but ONLY when no marker sits at
     // the current depth (a same-cookie marker-owner's return must
     // NOT hijack the outer frame; a deeper marker of any cookie is
-    // a skipped inner the slow path discards). R10 1b: and ONLY
-    // when the returning call is NOT the recorded counter owner
-    // (a cookie match is not ownership — the owner's return must
-    // consume its counter unit via the slow path instead).
+    // a skipped inner the slow path discards). Round-6 1a: and
+    // ONLY when the returning call is NOT the TOP counter owner
+    // (a cookie match is not ownership — the top owner's return
+    // must consume its counter unit via the slow path instead).
     // Anything else falls to the slow positional search.
     if thread.depth > 0 {
         let pk = PendingKey {
@@ -1463,18 +1467,20 @@ pub fn pop_return(
             loss(LOSS_PAIR);
             return false;
         }
-        // R10 1b: a cookie match is not ownership — an ambiguous
-        // match consumes instead of popping ONLY when the
-        // returning call is the recorded counter owner
+        // Round-6 1a: a cookie match is not ownership — an
+        // ambiguous match consumes instead of popping ONLY when
+        // the returning call is the TOP counter owner
         // (`counter_owned_by`, kind-independent — O-slot and
         // frame matches alike, since same-cookie units are
         // fungible suppressions); every other match pops its own
         // slot first (`d7c431a` order). A consume pops and
         // discards nothing (a deeper marker may be outer-live,
-        // not skipped). The guard guarantees a unit
-        // (`skip_return` cannot fail here).
+        // not skipped) and settles the owner's topmost entry.
+        // The guard guarantees a unit (`skip_return` cannot fail
+        // here).
         if thread.counter_owned_by(cookie) {
             thread.skip_return();
+            thread.settle_counter_owner(cookie);
             if THREADS.insert(key, thread, 0).is_err() {
                 loss(LOSS_MAP);
             }
@@ -1500,9 +1506,9 @@ pub fn pop_return(
         if mine_kind == PENDING_FRAME {
             thread.depth = thread.depth.saturating_sub(1);
         }
-        // R10 1b: a popped O-marker retires a marker-RELATED
-        // counter-owner record (round-5 N2: unrelated records
-        // survive; T pops and frame pops never retire).
+        // Round-6 1a: a popped O-marker drops RELATED stack
+        // entries (round-5 N2: unrelated entries survive; T pops
+        // and frame pops never retire).
         if mine_kind == PENDING_OVERFLOW_MARKER {
             thread.retire_counter_owner();
         }
@@ -1519,9 +1525,11 @@ pub fn pop_return(
         return p.suppressed == 0;
     }
     // No slot of mine: a counter-owned return consumes its overflow
-    // unit (an accepted return provably owns no blind unit); a
-    // unit-less return is unpaired (fail-closed, as before).
+    // unit and settles its stack entry (an accepted return
+    // provably owns no blind unit); a unit-less return is
+    // unpaired (fail-closed, as before).
     if thread.skip_return() {
+        thread.settle_counter_owner(cookie);
         if THREADS.insert(key, thread, 0).is_err() {
             loss(LOSS_MAP)
         }
