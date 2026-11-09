@@ -444,17 +444,22 @@ impl Thread {
         };
         top == cookie
     }
-    /// Settle one consumed unit for `cookie`'s ACCEPTED return
-    /// (round-6 1a): call after a successful `skip_return` on
-    /// the accepted arm (owner consume + no-match consume —
-    /// NEVER on the rejected arm, whose count-only settle may
-    /// lag the record by design). Removes `cookie`'s topmost
+    /// Settle one consumed unit for `cookie`'s return
+    /// (round-6 1a; round-7 R12-P2-1: the rejected arm settles
+    /// too): call after a successful counter consume on EITHER
+    /// arm — accepted (owner consume + no-match consume, after
+    /// `skip_return`) or rejected (overflow consume, inside
+    /// `blind_return` — the blind-tombstone arm consumes no
+    /// counter unit and never settles). A count-only rejected
+    /// consume leaves a stale top owner standing for the next
+    /// accepted return to trust (the R12 trigger — B pops Y8's
+    /// frame on C's stale top). Removes `cookie`'s topmost
     /// entry (top-first — the returner is innermost under LIFO,
     /// so its unit is the latest matching one); a returner
     /// with no entry (evicted middle, retired record, foreign
     /// settler) removes nothing and only trims a stale bottom
-    /// while the length exceeds the count (rejected-skew
-    /// self-heal — the top, the newest knowledge, is kept).
+    /// while the length exceeds the count (skew self-heal —
+    /// the top, the newest knowledge, is kept).
     /// BPF-safe.
     pub fn settle_counter_owner(&mut self, cookie: u64) {
         if self.counter_len == 2 && self.counter_owner2 == cookie {
@@ -543,15 +548,20 @@ impl Thread {
     pub fn blind_entry(&mut self) {
         self.blind = self.blind.saturating_add(1);
     }
-    /// Consume one unit for a WINDOW-REJECTED return (resolved
-    /// identity, closed window): its own blind tombstone first,
-    /// else one overflow marker. fix8 (R8-2): slotted returns pop
-    /// their own slot instead and reach here only when they own
-    /// no slot (marker refusal fell back to the fungible
-    /// counter). Returns whether a unit was consumed. Rejections
-    /// that cannot attribute (tgid/generation/CONFIG mismatch —
-    /// a different row) must NOT call this.
-    pub fn blind_return(&mut self) -> bool {
+    /// Consume one unit for a WINDOW-REJECTED return of
+    /// `cookie` (resolved identity, closed window): its own
+    /// blind tombstone first, else one overflow marker. fix8
+    /// (R8-2): slotted returns pop their own slot instead and
+    /// reach here only when they own no slot (marker refusal
+    /// fell back to the fungible counter). Returns whether a
+    /// unit was consumed. Rejections that cannot attribute
+    /// (tgid/generation/CONFIG mismatch — a different row) must
+    /// NOT call this. Round-7 R12-P2-1: the overflow arm settles
+    /// the returner's stack entry (a partial drain must not
+    /// leave a stale top for the next accepted return); the
+    /// blind-tombstone arm consumes no counter unit, so it
+    /// never settles (the stack describes overflow units only).
+    pub fn blind_return(&mut self, cookie: u64) -> bool {
         if self.blind != 0 {
             self.blind -= 1;
             true
@@ -570,6 +580,7 @@ impl Thread {
                 self.counter_related2 = 0;
                 self.counter_evicted = 0;
             }
+            self.settle_counter_owner(cookie);
             true
         } else {
             false
@@ -991,9 +1002,13 @@ mod tests {
         }
         /// Window-rejected return (production `blind_return` —
         /// marker only, never a pop, never an emission).
-        /// Returns whether a unit was consumed.
+        /// Returns whether a unit was consumed. This model arms
+        /// only through `enter`/`blind_entry` (never recording),
+        /// so the stack is always empty and the round-7 settle
+        /// inside `blind_return` is a no-op — the cookie value
+        /// is irrelevant here.
         fn reject(&mut self) -> bool {
-            self.thread.blind_return()
+            self.thread.blind_return(0)
         }
         /// Accepted return that MUST skip (overflow owner): pins
         /// skip-true + depth unchanged + no emission.
@@ -1175,7 +1190,7 @@ mod tests {
         // fix7 F3 unit pins (R7-3): empty reject consumes nothing;
         // skip ignores blind; tombstones nest; saturation holds.
         let mut t = Thread::default();
-        assert!(!t.blind_return());
+        assert!(!t.blind_return(0));
         assert_eq!((t.overflow, t.blind), (0, 0));
         t.blind_entry();
         t.blind_entry();
@@ -1186,11 +1201,11 @@ mod tests {
         assert_eq!((t.overflow, t.blind), (1, 2));
         assert!(t.skip_return(), "accepted skip reads overflow only");
         assert_eq!((t.overflow, t.blind), (0, 2));
-        assert!(t.blind_return());
+        assert!(t.blind_return(0));
         assert_eq!((t.overflow, t.blind), (0, 1));
-        assert!(t.blind_return());
+        assert!(t.blind_return(0));
         assert_eq!((t.overflow, t.blind), (0, 0));
-        assert!(!t.blind_return());
+        assert!(!t.blind_return(0));
         t.blind = u32::MAX;
         t.blind_entry();
         assert_eq!(t.blind, u32::MAX, "tombstones saturate, never wrap");
@@ -1444,8 +1459,12 @@ mod tests {
         /// else the T-first counter — mirroring `pop_return`'s
         /// rejected arm exactly. Never emits. Round-6 1a: a
         /// popped O-marker drops RELATED stack entries (round-5
-        /// N2 scoping; slot-first + T-first preserved; rejected
-        /// settles never settle entries — count-only).
+        /// N2 scoping; slot-first + T-first preserved).
+        /// Round-7 R12-P2-1: a rejected overflow consume settles
+        /// the returner's stack entry (inside `blind_return` —
+        /// a partial drain must not leave a stale top); slot
+        /// pops consume no counter unit (frame/T pops settle
+        /// nothing) and blind-tombstone consumes never settle.
         fn return_reject(&mut self, cookie: u64) -> bool {
             if self.thread.depth > 0 {
                 let slot = self.thread.depth as usize - 1;
@@ -1472,9 +1491,11 @@ mod tests {
                 }
                 return true;
             }
-            // No slot of mine: the T-first counter (fix7 residual);
-            // a unit-less return consumes nothing (BPF: silent).
-            self.thread.blind_return()
+            // No slot of mine: the T-first counter (fix7 residual;
+            // round-7: the overflow arm settles the returner's
+            // entry inside `blind_return`); a unit-less return
+            // consumes nothing (BPF: silent).
+            self.thread.blind_return(cookie)
         }
         /// Every emission paired its own frame with its own rv.
         fn assert_aligned(&self) {
@@ -2956,5 +2977,121 @@ mod tests {
             (2, X),
             "unrelated stack stands"
         );
+    }
+    #[test]
+    fn r12_rejected_counter_consume_settles_owner_record() {
+        // R12-P2-1: eight framed non-operational Y calls; B(Y)
+        // and nested operational C(X) enter while open, both
+        // marker insertions quota-refused onto the counter
+        // ([Y,X], overflow 2, strict LIFO, no skips, no
+        // eviction). The window closes; C's rejected return
+        // consumes its unit AND settles its top entry (len 2 →
+        // 1 [Y], overflow 1); B's accepted return then consumes
+        // its own unit (top-Y match) instead of popping Y8's
+        // frame; all eight Y pairs align and the machine ends
+        // quiescent with nothing evicted. (RED pre-fix: the
+        // consume is count-only — the stale top X stands, so B
+        // pops Y8's frame → [(8,900),(7,8)..(1,2)].)
+        const Y: u64 = 1;
+        const X: u64 = 2;
+        let mut m = Fix8Model::new();
+        for _ in 0..8 {
+            m.frame(Y);
+        }
+        m.quota_fail = true;
+        m.overflow(Y); // B: accepted non-operational counter unit
+        m.overflow(X); // C: operational counter unit, accepted entry
+        m.quota_fail = false;
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 2));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (2, Y, X)
+        );
+        assert!(m.return_reject(X)); // C returns after close
+        assert_eq!(m.thread.overflow, 1);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_owner),
+            (1, Y),
+            "C's rejected consume settles C's top entry"
+        );
+        m.return_accept(Y, 900); // B returns; must consume, not emit A8
+        assert_eq!(
+            m.emitted_len, 0,
+            "live B owns a counter unit; C's stale top is not evidence B owns A8"
+        );
+        assert_eq!(m.thread.depth, 8);
+        for rv in (1..=8u64).rev() {
+            m.return_accept(Y, rv);
+        }
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        m.assert_quiescent();
+        assert_eq!(m.thread.counter_evicted, 0);
+        assert_eq!((m.suppressed, m.discarded), (0, 0));
+    }
+    #[test]
+    fn r12_mixed_skip_analog_mislabels_once_then_discards() {
+        // R12 world-(b) behavioral pin (re-scope ACCEPTED —
+        // CURRENT behavior pinned, not fixed): 6 A frames +
+        // Y3@6 + Y2@7 (inv 7, 8); X + Y quota counter units;
+        // the innermost unit owner Y is skipped by longjmp.
+        // X settles slotless; Y2's return consumes the
+        // skip-orphaned Y unit (forced: the twin — a slotless
+        // unit-owner Y return — reaches byte-identical decision
+        // state and mandates consume per R9, so no deterministic
+        // rule pops correctly in both worlds); Y3's return then
+        // pops Y2's frame → the single false pair (8,7); the A
+        // returns align; Y3's frame is discarded. Final
+        // [(8,7),(6,6)..(1,1)] to (0,0,0) with suppr 0, disc 1
+        // (partial radius — one mislabel, not the b3 full
+        // cascade; the no-skip class is pure improvement).
+        const A: u64 = 0xA11CE;
+        const X: u64 = 0xB00B;
+        const Y: u64 = 0xC10C;
+        let mut m = Fix8Model::new();
+        for _ in 0..6 {
+            m.frame(A);
+        }
+        m.frame(Y); // Y3 @6, inv 7
+        m.frame(Y); // Y2 @7, inv 8
+        m.quota_fail = true;
+        m.overflow(X);
+        m.overflow(Y);
+        m.quota_fail = false;
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 2));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (2, X, Y)
+        );
+        m.skip(); // Y (innermost unit owner) never returns
+        m.return_accept(X, 100); // X settles slotless
+        assert_eq!(m.thread.overflow, 1);
+        assert_eq!((m.thread.counter_len, m.thread.counter_owner), (1, Y));
+        m.return_accept(Y, 200); // Y2's return consumes the orphan
+        assert_eq!(m.emitted_len, 0);
+        assert_eq!(m.thread.overflow, 0);
+        assert_eq!(m.thread.counter_len, 0);
+        m.return_accept(Y, 7); // Y3's return pops Y2's frame
+        assert_eq!(m.emitted[..m.emitted_len], [(8, 7)]);
+        for rv in (1..=6u64).rev() {
+            m.return_accept(A, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [(8, 7), (6, 6), (5, 5), (4, 4), (3, 3), (2, 2), (1, 1)]
+        );
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (0, 0, 0)
+        );
+        assert_eq!((m.suppressed, m.discarded), (0, 1));
     }
 }

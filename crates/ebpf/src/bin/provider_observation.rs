@@ -1392,15 +1392,19 @@ pub fn pop_return(
                     }
                     // Round-6 1a: a popped O-marker drops RELATED
                     // stack entries (round-5 N2 scoping;
-                    // slot-first + T-first preserved; rejected
-                    // settles never settle entries — count-only).
+                    // slot-first + T-first preserved). Round-7
+                    // R12-P2-1: a rejected overflow consume
+                    // settles the returner's stack entry (inside
+                    // `blind_return` — a partial drain must not
+                    // leave a stale top); slot pops and
+                    // blind-tombstone consumes settle nothing.
                     if mine_kind == PENDING_OVERFLOW_MARKER {
                         thread.retire_counter_owner();
                     }
                     if THREADS.insert(key, thread, 0).is_err() {
                         loss(LOSS_MAP);
                     }
-                } else if thread.blind_return() {
+                } else if thread.blind_return(cookie) {
                     if THREADS.insert(key, thread, 0).is_err() {
                         loss(LOSS_MAP);
                     }
