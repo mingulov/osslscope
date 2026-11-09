@@ -191,26 +191,50 @@ pub struct Thread {
     /// owner 0 are unknown, never owned-by-0).
     ///
     /// Recording (entry fallback arms, AFTER the `overflow`
-    /// bump): a 0→1 arm records owner+known; a same-cookie arm
-    /// keeps them; a mixed-cookie arm clears both words (the
-    /// outstanding units have >1 owner — unknowable which a
-    /// return owns — so later returns fall back to slot-first;
-    /// documented residual). Clearing: a consume that drains
-    /// `overflow` to 0 clears both (clear-at-zero — a later arm
-    /// re-records), and ANY O-marker removal (pop or discard,
-    /// either return arm) retires both (the record's reference
-    /// marker is gone — the round-3 lifetime lesson: R10-P2-1
-    /// finding 1 is stale evidence applied to a later marker).
-    /// T-marker and frame removals never retire (they say
-    /// nothing about overflow ownership). `API_THREADS` rows
-    /// carry vestigial 0s (classic `enter` never records; the
-    /// aggregate path consumes through `skip_return` without
-    /// consulting the record).
+    /// bump): a 0→1 arm records owner+known (+related, below); a
+    /// same-cookie arm keeps all three words; a mixed-cookie arm
+    /// clears all three (the outstanding units have >1 owner —
+    /// unknowable which a return owns — so later returns fall
+    /// back to slot-first; documented residual). Clearing: a
+    /// consume that drains `overflow` to 0 clears all three
+    /// (clear-at-zero — a later arm re-records), and an
+    /// O-marker removal (pop or discard, either return arm)
+    /// retires all three ONLY when the record is
+    /// marker-related (below — the round-3 lifetime lesson:
+    /// R10-P2-1 finding 1 is stale evidence applied to a later
+    /// marker; round-5 N2: a marker-UNRELATED arm's knowledge
+    /// outlives every marker). T-marker and frame removals
+    /// never retire (they say nothing about overflow
+    /// ownership). `API_THREADS` rows carry vestigial 0s
+    /// (classic `enter` never records; the aggregate path
+    /// consumes through `skip_return` without consulting the
+    /// record).
     pub counter_known: u32,
     /// Owner cookie for the record above (meaningful only when
     /// `counter_known` is 1; always cleared together with it —
     /// no stale owner is ever observable).
     pub counter_owner: u64,
+    /// Marker-relatedness for the record above (round-5 N2): 1
+    /// iff the record's 0→1 arm observed a live O-marker at the
+    /// arm level (the arming unit is positioned against that
+    /// marker's lifetime — a quota/map arm with the level free
+    /// records 0). Only a related record retires on O-marker
+    /// removal (`retire_counter_owner`); an unrelated record
+    /// survives every marker removal (its knowledge references
+    /// no marker). Same-cookie arms keep this word (a second
+    /// unit of the same owner adds no new lifetime); a
+    /// mixed-cookie arm clears it with the rest; clear-at-zero
+    /// clears it (a later arm re-probes). There is no
+    /// WHICH-marker ambiguity: while a related record is live,
+    /// sticky `overflow` freezes depth at the arm level, all
+    /// slots sit at levels ≤ depth, and the reference marker
+    /// live implies depth is still the arm level (any shrink
+    /// needs a frame pop with a shallower mine, which discards
+    /// the reference first; fast-path pops are blocked by the
+    /// lateral-marker guard) — so any O-removal is the
+    /// reference marker itself or follows its discard in the
+    /// same op, and retiring is exact.
+    pub counter_related: u32,
 }
 /// fix8 (R8-2): `PendingKey.reserved` slot kind. Frames keep 0
 /// (every pre-fix key); overflow/blind markers take 1/2. Lateral
@@ -320,29 +344,41 @@ impl Thread {
     /// Record one overflow fallback arm by `cookie` (R10 1b):
     /// call AFTER the `overflow` bump, at every site that arms
     /// the fungible counter (entry None arm, both `failed_entry`
-    /// arms). A 0→1 arm records owner+known; a same-cookie arm
-    /// keeps them; a mixed-cookie arm clears both words (the
-    /// remainder is unknowably mixed — later returns fall back
-    /// to slot-first). BPF-safe (no allocation).
-    pub fn record_counter_owner(&mut self, cookie: u64) {
+    /// arms). A 0→1 arm records owner+known, plus relatedness
+    /// from `marker_live` (round-5 N2: whether a live O-marker
+    /// occupies the arm level — probed by the caller); a
+    /// same-cookie arm keeps all three words; a mixed-cookie arm
+    /// clears all three (the remainder is unknowably mixed —
+    /// later returns fall back to slot-first). BPF-safe (no
+    /// allocation).
+    pub fn record_counter_owner(&mut self, cookie: u64, marker_live: bool) {
         if self.overflow == 1 {
             self.counter_owner = cookie;
             self.counter_known = 1;
+            self.counter_related = u32::from(marker_live);
         } else if self.counter_known != 0 && self.counter_owner != cookie {
             // Mixed-cookie arm: the remainder is unknowably mixed
-            // (clear BOTH words — no stale owner stays observable).
+            // (clear ALL THREE words — no stale owner stays
+            // observable).
             self.counter_owner = 0;
             self.counter_known = 0;
+            self.counter_related = 0;
         }
     }
-    /// Retire the counter-owner record (R10 1b): call when an
-    /// O-marker is REMOVED (pop or discard, either return arm).
-    /// The record's reference marker is gone — applying it to a
-    /// later marker is the finding-1 staleness. Clears both
-    /// words (no stale owner stays observable). BPF-safe.
+    /// Retire the counter-owner record (R10 1b, scoped by
+    /// round-5 N2): call when an O-marker is REMOVED (pop or
+    /// discard, either return arm). A marker-RELATED record's
+    /// reference marker is gone — applying it to a later marker
+    /// is the finding-1 staleness — so clear all three words (no
+    /// stale owner stays observable). A marker-UNRELATED record
+    /// (quota/map arm with the level free) references no marker
+    /// and survives (no-op). BPF-safe.
     pub fn retire_counter_owner(&mut self) {
-        self.counter_owner = 0;
-        self.counter_known = 0;
+        if self.counter_related != 0 {
+            self.counter_owner = 0;
+            self.counter_known = 0;
+            self.counter_related = 0;
+        }
     }
     /// Whether `cookie`'s accepted return may consume a counter
     /// unit before popping its matched slot (R10 1b): only the
@@ -385,6 +421,7 @@ impl Thread {
             if self.overflow == 0 {
                 self.counter_owner = 0;
                 self.counter_known = 0;
+                self.counter_related = 0;
             }
             true
         } else {
@@ -424,6 +461,7 @@ impl Thread {
             if self.overflow == 0 {
                 self.counter_owner = 0;
                 self.counter_known = 0;
+                self.counter_related = 0;
             }
             true
         } else {
@@ -733,6 +771,7 @@ mod tests {
             blind: 0,
             counter_known: 0,
             counter_owner: 0,
+            counter_related: 0,
         };
         assert_eq!(
             enter_none_disposition(fresh_max.next),
@@ -747,6 +786,7 @@ mod tests {
             blind: 0,
             counter_known: 0,
             counter_owner: 0,
+            counter_related: 0,
         };
         assert_eq!(
             enter_none_disposition(old_max.next),
@@ -761,6 +801,7 @@ mod tests {
             blind: 0,
             counter_known: 0,
             counter_owner: 0,
+            counter_related: 0,
         };
         assert_eq!(
             enter_none_disposition(overflow.next),
@@ -775,6 +816,7 @@ mod tests {
             blind: 0,
             counter_known: 0,
             counter_owner: 0,
+            counter_related: 0,
         };
         assert_eq!(
             enter_none_disposition(normal.next),
@@ -1118,9 +1160,11 @@ mod tests {
         /// refusal (collision/quota/neuter), mirroring the BPF
         /// None arm exactly. R10 1b: a recorded fallback records
         /// its owner (`record_counter_owner` — 0→1 records,
-        /// mixed-cookie clears known); the `force_counter`
-        /// neuter records nothing (bare old-BPF count →
-        /// unknown).
+        /// mixed-cookie clears known); round-5 N2: the 0→1 arm
+        /// also records marker-relatedness (live O at the arm
+        /// level — the BPF `o_marker_at` probe); the
+        /// `force_counter` neuter records nothing (bare old-BPF
+        /// count → unknown).
         fn overflow(&mut self, cookie: u64) {
             assert_eq!(self.thread.enter_frame(), None, "must refuse a frame");
             let slot = self.thread.depth as usize;
@@ -1131,7 +1175,8 @@ mod tests {
                 if self.force_counter {
                     self.bare = self.bare.saturating_add(1);
                 } else {
-                    self.thread.record_counter_owner(cookie);
+                    let marker_live = self.omarks[slot].is_some();
+                    self.thread.record_counter_owner(cookie, marker_live);
                 }
             }
         }
@@ -1151,13 +1196,16 @@ mod tests {
         /// production `failed_entry` unwinds depth and arms the
         /// fungible counter — mirroring the BPF frame-insert
         /// failure arms exactly (R10 1b: including the owner
-        /// recording). No slot is placed.
+        /// recording; round-5 N2: relatedness probed at the
+        /// unwound level). No slot is placed.
         fn failed_frame(&mut self, cookie: u64) {
             self.thread
                 .enter_frame()
                 .expect("failed entry wounds first");
             self.thread.failed_entry();
-            self.thread.record_counter_owner(cookie);
+            let slot = self.thread.depth as usize;
+            let marker_live = self.omarks[slot].is_some();
+            self.thread.record_counter_owner(cookie, marker_live);
         }
         /// A longjmp'd return: never executes, consumes nothing.
         fn skip(&mut self) {}
@@ -1186,8 +1234,10 @@ mod tests {
         /// levels top→0, counting discards; the BPF drives the pass
         /// via `bpf_loop` and hoists the depth unwinding after (ONE
         /// saturating subtract — net-identical to per-delete
-        /// decrements). R10 1b: a discarded O-marker retires the
-        /// counter-owner record (T/frame discards never retire).
+        /// decrements). R10 1b: a discarded O-marker retires a
+        /// marker-RELATED counter-owner record (round-5 N2:
+        /// unrelated records survive); T/frame discards never
+        /// retire.
         fn discard_deeper(&mut self, mine: usize) {
             let top = (self.thread.depth as usize).min(MAX_DEPTH as usize);
             let mut unwound: u32 = 0;
@@ -1216,7 +1266,8 @@ mod tests {
         /// O-slot and frame matches alike); every other match
         /// pops its own slot first (`d7c431a` order) — and a
         /// consume pops and discards nothing. A popped O-marker
-        /// retires the record.
+        /// retires a marker-RELATED record (round-5 N2:
+        /// unrelated records survive).
         fn marker_at(&self, level: usize) -> bool {
             self.omarks[level].is_some() || self.tmarks[level].is_some()
         }
@@ -1264,8 +1315,9 @@ mod tests {
         /// (popped, suppressed), else slow search (all kinds),
         /// else the T-first counter — mirroring `pop_return`'s
         /// rejected arm exactly. Never emits. R10 1b: a popped
-        /// O-marker retires the counter-owner record (the only
-        /// rejected-arm change; slot-first + T-first preserved).
+        /// O-marker retires a marker-RELATED counter-owner
+        /// record (round-5 N2 scoping; the only rejected-arm
+        /// change; slot-first + T-first preserved).
         fn return_reject(&mut self, cookie: u64) -> bool {
             if self.thread.depth > 0 {
                 let slot = self.thread.depth as usize - 1;
@@ -1747,6 +1799,7 @@ mod tests {
                         blind: 0,
                         counter_known: 0,
                         counter_owner: 0,
+                        counter_related: 0,
                     };
                     let mut b = a;
                     let frame = a.enter_frame();
@@ -1773,8 +1826,8 @@ mod tests {
         // layouts — frames keep key 0, markers take 1/2; marker
         // values suppress and carry the owner cookie with no
         // invocation. `Pending`/`PendingKey` shapes frozen
-        // (56/24 B); `Thread` is 40 B per the R10 1b layout pin
-        // below (specs mirror it).
+        // (56/24 B); `Thread` is 48 B per the round-5 N2 layout
+        // pin below (specs mirror it).
         assert_eq!(
             (PENDING_FRAME, PENDING_OVERFLOW_MARKER, PENDING_BLIND_MARKER),
             (0, 1, 2)
@@ -1787,7 +1840,7 @@ mod tests {
         assert_eq!(core::mem::size_of::<Pending>(), 56);
         assert_eq!(core::mem::size_of::<PendingKey>(), 24);
         assert_eq!(core::mem::offset_of!(PendingKey, reserved), 20);
-        assert_eq!(core::mem::size_of::<Thread>(), 40);
+        assert_eq!(core::mem::size_of::<Thread>(), 48);
     }
     #[test]
     fn r9_same_cookie_complete_chain_must_keep_all_pairs_aligned() {
@@ -2237,9 +2290,10 @@ mod tests {
         }
         m.assert_aligned();
         m.assert_quiescent();
-        assert_eq!(core::mem::size_of::<Thread>(), 40);
+        assert_eq!(core::mem::size_of::<Thread>(), 48);
         assert_eq!(core::mem::offset_of!(Thread, counter_known), 28);
         assert_eq!(core::mem::offset_of!(Thread, counter_owner), 32);
+        assert_eq!(core::mem::offset_of!(Thread, counter_related), 40);
     }
     #[test]
     fn r10_mixed_cookie_second_arm_falls_back_to_slot_first() {
@@ -2303,9 +2357,11 @@ mod tests {
         // as the N1 pins (at A7's return the BPF state is
         // field-identical to the R9-pinned live-owner shape —
         // only the R9-mandated consume fits both). Restoring
-        // `d7c431a` here needs rejected-path owner-return
-        // retirement — out of the 1b spec, named as the
-        // follow-up, not smuggled in.
+        // `d7c431a` here needs rejected-path owner-CONSUME
+        // (settle) — out of the 1b spec, named as the
+        // follow-up, not smuggled in. Bare retirement is
+        // hazardous: S1's steal-return would destroy the valid
+        // record of an S2-live same-cookie unit.
         const S: u64 = 42;
         let mut m = Fix8Model::new();
         for _ in 0..8 {
@@ -2338,16 +2394,82 @@ mod tests {
         assert_eq!((m.suppressed, m.discarded), (0, 0));
     }
     #[test]
-    fn thread_value_is_40_with_owner_at_32() {
+    fn n2_unrelated_quota_arm_survives_foreign_o_pop() {
+        // Round-5 N2 regression (1b blanket retirement): X1 framed
+        // @0 (cookie X) + 7 S frames (depth 8 = MAX) + X2(X)
+        // quota-refused onto the counter (NO marker live at arm —
+        // the arm is marker-UNRELATED) + F slots and pops its own
+        // O @8, all accepted, strict LIFO, no skips. F's foreign
+        // O-pop must NOT retire X2's live owner record: X2
+        // consumes its own unit; X1's frame + 7 S frames stay
+        // intact; all eight pairs align and the machine ends
+        // quiescent (the `f341f8d` end-state — R9's occupancy
+        // rule kept this green; 1b's blanket retirement broke
+        // it). (RED pre-fix: X2 pops X1's frame and discards the
+        // 7 S frames — the R9-P2-1-class hijack in plain LIFO.)
+        const S: u64 = 1;
+        const X: u64 = 2;
+        const F: u64 = 3;
+        let mut m = Fix8Model::new();
+        assert_eq!(m.frame(X), 1, "X1 framed @0");
+        for _ in 0..7 {
+            m.frame(S);
+        }
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (8, 0, 0)
+        );
+        m.quota_fail = true;
+        m.overflow(X); // X2: counter unit, no marker live at arm
+        m.quota_fail = false;
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 1));
+        assert_eq!(
+            (m.thread.counter_known, m.thread.counter_owner),
+            (1, X),
+            "the 0→1 arm records owner+known"
+        );
+        assert_eq!(
+            m.thread.counter_related, 0,
+            "quota arm with the level free records unrelated"
+        );
+        m.overflow(F); // F slots its own O @8 (level free)
+        m.return_accept(F, 0); // F pops its own O
+        assert_eq!(m.suppressed, 1, "F pops its own marker");
+        assert!(m.omarks[8].is_none());
+        assert_eq!(
+            (m.thread.counter_known, m.thread.counter_owner),
+            (1, X),
+            "foreign O-pop must not retire a marker-unrelated record"
+        );
+        assert_eq!(
+            m.thread.counter_related, 0,
+            "the unrelated record stands through the foreign O-pop"
+        );
+        m.return_accept(X, 900); // X2: must consume its own unit
+        assert_eq!(m.emitted_len, 0, "X2 owns a counter unit, not X1's frame");
+        assert_eq!(m.thread.depth, 8);
+        assert_eq!(m.discarded, 0);
+        for rv in (2..=8u64).rev() {
+            m.return_accept(S, rv);
+        }
+        m.return_accept(X, 1); // X1 pops its own frame, last
+        m.assert_aligned();
+        assert_eq!(m.emitted_len, 8);
+        m.assert_quiescent();
+    }
+    #[test]
+    fn thread_value_is_48_with_related_at_40() {
         // fix6 (R6-1): THREADS/API_THREADS value 16→24 B, seed
         // APPENDED (existing field offsets unchanged). fix7 (R7-3):
         // 24→32 B, blind APPENDED after seed (all existing offsets
         // unchanged). R10 1b: 32→40 B — the R9 `overflow_inner`
         // padding word becomes `counter_known` (offset 28,
         // unchanged value), and `counter_owner: u64` is APPENDED
-        // at 32 (all existing offsets unchanged). The loader
-        // `specs()` mirrors these sizes exactly.
-        assert_eq!(core::mem::size_of::<Thread>(), 40);
+        // at 32 (all existing offsets unchanged). Round-5 N2:
+        // 40→48 B — `counter_related: u32` APPENDED at 40 (all
+        // existing offsets unchanged). The loader `specs()`
+        // mirrors these sizes exactly.
+        assert_eq!(core::mem::size_of::<Thread>(), 48);
         assert_eq!(core::mem::offset_of!(Thread, next), 0);
         assert_eq!(core::mem::offset_of!(Thread, depth), 8);
         assert_eq!(core::mem::offset_of!(Thread, overflow), 12);
@@ -2355,5 +2477,6 @@ mod tests {
         assert_eq!(core::mem::offset_of!(Thread, blind), 24);
         assert_eq!(core::mem::offset_of!(Thread, counter_known), 28);
         assert_eq!(core::mem::offset_of!(Thread, counter_owner), 32);
+        assert_eq!(core::mem::offset_of!(Thread, counter_related), 40);
     }
 }
