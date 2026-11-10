@@ -1,15 +1,19 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # docs
 
-Current v0.4.0 candidate workflows include passive discovery/watch, PID/cgroup/module
+Current v0.5.0 workflows include passive discovery/watch, PID/cgroup/module
 inventory, public provider observation and focused PID/owned-run callback
-counting. Start with [usage](usage.md), [build](build.md), [install](install.md),
-[meaning and limits](what-it-proves.md), [candidate release notes](release-v0.4.0.md) and
+counting. Start with [quickstart](quickstart.md), [usage](usage.md),
+[build](build.md), [install](install.md),
+[meaning and limits](what-it-proves.md) and
 the [roadmap](../ROADMAP.md). The
 [published release record](https://github.com/mingulov/osslscope/releases/tag/v0.3.0)
-records historical v0.3 installed checks; it does not qualify this candidate or remove
-attribution, startup or completeness gaps.
+records historical v0.3 installed checks; the [v0.4.0 alpha
+notes](release-v0.4.0.md) record the latest qualification. Neither qualifies
+this tree or removes attribution, startup or completeness gaps.
 
+- `quickstart.md` - one-page first run: binary install to uninstall
+- `container.md` - limited-capability image: owned and host-observer modes
 - `build.md` - reproducible source build (host + BPF), manifests, lockfiles
 - `licensing.md` - component terms and the BPF object/load license boundary
 - `install.md` - local prefix and package install, doctor-first verify, uninstall

@@ -29,6 +29,21 @@
   code=0, attribution Unknown, named gaps, workload canary absent.
   Container 3.5.7 scan from host userns: exit 4 with named
   namespace/process gaps, no silent empty capture.
+- Limited-capability container image (source-built, never
+  `--privileged`; owned mode as non-root with `BPF`+`PERFMON`, host
+  observer as root-in-container with the 5-cap set) plus a shipped
+  seccomp profile and drill transcripts (`docs/container.md`).
+- Plain Kubernetes manifests (`deploy/kubernetes/`: one-shot Job
+  supported, DaemonSet service experimental, stock config refuses exit
+  2, exec doctor probes) with a kind drill transcript.
+- One-page [quickstart](docs/quickstart.md) drilled from a clean
+  clone (binary install → doctor → scan → PARTIAL `report run` →
+  containers → uninstall), a README support matrix, and an uninstall
+  path for every install kind.
+- Measured overhead for this tree: 5.425× median baseline/observed
+  ratio on the stock SHA-256 hot loop, superseding the 4.66× v0.4.0
+  figure (reproduced as the 4.661 control in the same campaign); see
+  `docs/overhead-matrix.md`.
 - Root package version 0.5.0; helper crates retain their versions.
 
 ## 0.4.0 current-state alpha (automatic observation)

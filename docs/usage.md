@@ -1,10 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Usage
 
-The v0.4.0 automatic observation candidate starts with passive discovery, optionally observes
+The v0.5.0 observer starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
-one selected process. Installed/platform qualification is separate from source
-behavior; see [release scope](release-v0.4.0.md).
+one selected process. The supported lane (x86-64, 6.9+ feature-probed
+kernel, BTF, cgroup v2, stock OpenSSL 3.5.x) is in the
+[README support matrix](../README.md#support-matrix-050-lane); start with the
+[quickstart](quickstart.md). Installed/platform qualification is separate
+from source behavior; the latest qualification record is
+[v0.4.0](release-v0.4.0.md) (no v0.5.0 record exists yet).
 
 ## Automatic crypto watch
 
@@ -566,7 +570,7 @@ release can strand a stopped child and requires external cleanup.
 
 | Code | Meaning |
 | --- | --- |
-| 0 | Help or successful doctor controls; no complete execution claim. |
+| 0 | COMPLETE report window, or satisfied definite policy on one (schema case; normal runs are PARTIAL, exit 3). |
 | 1 | Child failure, artifact delivery failure or runtime failure (with or without usable observation). |
 | 2 | Invalid arguments/policy or invalid explicit companion. |
 | 3 | PARTIAL report or doctor unavailable/denied capability. |
@@ -577,6 +581,33 @@ release can strand a stopped child and requires external cleanup.
 Artifact/runtime/child failure takes precedence over partial or inconclusive
 status, while a definite violation retains exit 10. Retain artifacts and gaps
 when interpreting failure; successful stimulus alone proves no observation.
+
+### Accepted-but-undocumented surface (documented limits)
+
+Stated here instead of left silent. `report`/`check` accept
+manual/legacy flags not shown in their usage lines: `--object`,
+`--members-object`, `--dev-bundle`, `--provider`, `--builtin`,
+`--settle`, `--image-digest` and `--force-offset`. `--table` and
+`--provider-table` parse and then refuse (`table enrollment is deferred
+beyond v0.2`). The normal workflow needs none of these; explicit object
+overrides stay operator-trusted as described above.
+
+`doctor --pid PID` and `doctor --exe PATH` select a sectioned
+foreign-backing/target preflight. That route is named in the top-level
+help but not in `doctor --help`, and it needs install-package metadata:
+where the install carries none (containers) it refuses with exit 4, so
+container probes use bare `doctor --format json` (exit 0/3) instead —
+see [container](container.md) and
+[deploy/kubernetes/README.md](../deploy/kubernetes/README.md).
+
+`service-witness` and `service-attempt-trace` are harness-only
+signal-observation commands (absent from the top-level help; each
+prints its own `--help`). They observe a test harness's signal traffic
+for verdict adjudication and are not operator tools.
+
+Name collision: `osslscope inspect` (this page's process/module
+inventory) is unrelated to `docker inspect` (container config; the
+container page uses it to verify `Privileged=false` and the cap set).
 
 ## Legacy foreground diagnostic
 

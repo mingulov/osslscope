@@ -95,6 +95,99 @@ Report remains PARTIAL (3); Unknown-only algorithm evidence is inconclusive
 (11). Workload success alone does not prove observation. See [usage](usage.md)
 for limits, failure precedence, output delivery and cleanup.
 
+## Install a release package
+
+From the 0.5.0 release artifacts (revision 1):
+
+```sh
+sudo dpkg -i osslscope_0.5.0-1_amd64.deb      # Debian/Ubuntu
+osslscope --version
+osslscope doctor --format json
+```
+
+```sh
+sudo rpm -i osslscope-0.5.0-1.x86_64.rpm      # Fedora/RHEL
+osslscope --version
+osslscope doctor --format json
+```
+
+```sh
+sudo tar -xzf osslscope-0.5.0-prefix.tar.gz -C /usr   # any lane host
+sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope
+osslscope --version
+osslscope doctor --format json
+```
+
+The DEB `Depends: libcap2-bin` and the RPM `Requires: libcap` pull in
+`setcap`. The DEB grants the two file capabilities in postinst and
+reloads systemd; it never enables the service — see [Installed
+service](#installed-service-deb). The RPM carries the caps as a file
+attribute and ships no unit. The tarball's receipt binds `/usr`:
+extract into that exact protected prefix, never over an existing
+install. Then verify a selected process as below.
+
+## Uninstall
+
+Stop and disable the service first if it was ever enabled, then remove
+by install kind:
+
+```sh
+sudo systemctl disable --now osslscope-service 2>/dev/null || true
+```
+
+```sh
+sudo dpkg -r osslscope        # DEB: stops the unit, clears file caps
+sudo rm -rf /var/lib/osslscope
+```
+
+```sh
+sudo rpm -e osslscope         # RPM: clears file caps
+sudo rm -rf /var/lib/osslscope
+```
+
+```sh
+sudo setcap -r /usr/bin/osslscope 2>/dev/null || true            # tarball (prefix /usr)
+sudo rm -rf /usr/bin/osslscope /usr/lib/osslscope /usr/share/osslscope /usr/share/doc/osslscope
+```
+
+```sh
+sudo setcap -r /usr/local/bin/osslscope 2>/dev/null || true      # source install (prefix /usr/local)
+sudo rm -rf /usr/local/bin/osslscope /usr/local/lib/osslscope /usr/local/share/osslscope /usr/local/share/doc/osslscope
+```
+
+```sh
+rm -rf "$HOME/.local/bin/osslscope" "$HOME/.local/lib/osslscope" \
+  "$HOME/.local/share/osslscope"               # passive-only prefix, if used
+```
+
+DEB removal keeps the `/etc/osslscope/service.toml` conffile and
+the `/var/lib/osslscope` out-DIR (windows, `sequence.json`,
+`run-summary.json`, reports) — delete them yourself if no reinstall
+follows. The RPM ships no unit or conffile. Also delete any
+`--out`/`--cbom` artifacts you wrote elsewhere. Containers and
+Kubernetes:
+
+```sh
+docker rmi osslscope:0.5.0
+kubectl delete -f deploy/kubernetes/daemonset.yaml \
+  -f deploy/kubernetes/job-report.yaml \
+  -f deploy/kubernetes/configmap.yaml \
+  -f deploy/kubernetes/namespace.yaml
+sudo rm /var/lib/kubelet/seccomp/osslscope.json   # every node
+```
+
+Verify the clean state. osslscope never pins programs or maps under
+`/sys/fs/bpf`, so unrelated entries such as snapd's `snap` may list —
+the grep must find no `ossl`. All four echoes firing is the proof nothing
+remains:
+
+```sh
+hash -r; command -v osslscope || echo "binary gone"
+getcap /usr/bin/osslscope /usr/local/bin/osslscope 2>/dev/null | grep . || echo "caps gone"
+systemctl is-active osslscope-service 2>/dev/null || echo "service gone"
+ls /sys/fs/bpf | grep -i ossl || echo "no osslscope pins"
+```
+
 ## Matched development packages
 
 From a clean reviewed product checkout:

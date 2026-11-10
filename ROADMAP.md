@@ -13,6 +13,17 @@ The milestones below are planned capabilities, not claims about the current app.
 
 ## v0.5.0: useful execution answers and practical installation
 
+**0.5.0 status (RnD slice shipped).** 0.5.0 ships honest PARTIAL-only
+observation on one lane (x86-64, 6.9+ feature-probed kernel, BTF,
+cgroup v2, stock OpenSSL 3.5.x), a limited-capability container image,
+plain Kubernetes manifests (Job supported, DaemonSet service
+experimental), matched prefix/DEB/RPM packages, and the
+[quickstart](docs/quickstart.md). Deferred out of 0.5.0 from the plan
+below: positive algorithm/provider attribution, overlay-active tracing
+as complete (locator + explicit gap only), `service` as supported,
+Prometheus/OpenTelemetry export, before/after migration comparison,
+and the 3.0.x/4.x qualification matrix.
+
 The intended workflow is: install a complete package, discover a real process
 or container, select its scope, and obtain an understandable execution report
 that can support a useful policy decision or CBOM.
