@@ -1,0 +1,81 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# osslscope one-shot report: the SUPPORTED in-cluster path.
+#
+# Runs one owned-workload trace (`report ... run -- openssl dgst ...`)
+# with the minimal 2-cap tier (BPF + PERFMON), as the image's non-root
+# `osslscope` user, with the shipped seccomp profile, no host mounts,
+# no hostPID, no hostNetwork. This mirrors the documented
+# `docker run` owned recipe (see docs/container.md).
+#
+# No `runAsNonRoot: true` here: kubelet cannot verify a name-based
+# image USER (`container has runAsNonRoot and image has non-numeric
+# user (osslscope), cannot verify user is non-root` — the pod never
+# starts). The image already runs as the non-root `osslscope` user by
+# default; pinning a numeric `runAsUser` would couple this manifest to
+# the image's uid allocation, so the image default stands alone.
+#
+# Exit semantics are honest, not green: a useful-but-gapped run exits
+# 3 with a PARTIAL report (the normal outcome — see the README
+# excerpt), so the Job object reads `Failed` with exit code 3. That
+# `Failed` + PARTIAL log IS the success signal. `backoffLimit: 0`
+# keeps a PARTIAL from retrying into a second identical PARTIAL.
+# A setup/environment refusal exits 4 with no verdict (fail LOUD).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: osslscope-report
+  namespace: osslscope
+  labels:
+    app.kubernetes.io/name: osslscope
+    app.kubernetes.io/component: report
+    app.kubernetes.io/version: "0.5.0"
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  activeDeadlineSeconds: 300
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: osslscope
+        app.kubernetes.io/component: report
+        app.kubernetes.io/version: "0.5.0"
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: osslscope-report
+          image: ghcr.io/mingulov/osslscope:0.5.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - report
+            - --duration
+            - "5"
+            - --format
+            - json
+            - run
+            - --
+            - openssl
+            - dgst
+            - -sha256
+            - /dev/null
+          # Measured, not guessed: the owned report peaks at ~1.31 GiB
+          # (polled memory.current max; guest dmesg forensics:
+          # CONSTRAINT_MEMCG on memcg-charged kernel BPF memory). A 1 Gi
+          # limit OOMs with exit 137 (proven in docker AND kind); 2 Gi
+          # holds the measured peak with headroom.
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON"]
+            seccompProfile:
+              type: Localhost
+              localhostProfile: osslscope.json

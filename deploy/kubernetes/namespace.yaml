@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# osslscope namespace.
+#
+# Pod Security `enforce: privileged` is REQUIRED, not laziness: osslscope
+# tracing needs hostPID, BPF/PERFMON-class Linux capabilities, and
+# read-only host mounts (BTF/cgroup/security) on every node it observes.
+# A `restricted`-enforcing namespace rejects these pods outright, so
+# restricted clusters are UNSUPPORTED in 0.x — there is no supported
+# unprivileged in-cluster mode in this release. If your cluster enforces
+# `restricted` cluster-wide, use `kubectl debug` (see README.md) instead.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: osslscope
+  labels:
+    app.kubernetes.io/name: osslscope
+    app.kubernetes.io/version: "0.5.0"
+    pod-security.kubernetes.io/enforce: privileged

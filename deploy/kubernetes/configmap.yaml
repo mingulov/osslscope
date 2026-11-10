@@ -1,0 +1,54 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# osslscope service configuration for the DaemonSet.
+#
+# Shape mirrors packaging/deb/service.toml (scalar keys are the CLI flag
+# spellings kebab-cased; explicit CLI flags override these values;
+# unknown keys refuse with exit 2).
+#
+# OPERATOR ACTION REQUIRED: the stock selection below refuses LOUDLY
+# (exit 2 `service requires at least one of --pid/--cgroup`) — it never
+# runs an observe-nothing service. Pick ONE target shape (uncomment and
+# fill in `pid` or `cgroup`), then `kubectl rollout restart` the
+# DaemonSet. PIDs are node-local (hostPID): prefer `cgroup` for durable
+# selections covering every process in one cgroup.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: osslscope-service
+  namespace: osslscope
+  labels:
+    app.kubernetes.io/name: osslscope
+    app.kubernetes.io/component: service
+    app.kubernetes.io/version: "0.5.0"
+data:
+  service.toml: |
+    # osslscope service configuration (D-record §§1.3–1.4).
+    # Stock config selects NO targets and refuses with exit 2 — pick ONE
+    # target shape below before the DaemonSet can run.
+    version = 1
+    window = 30
+    interval = 1
+    timeout = 60
+    grace = 5
+    format = "json"
+    queue-bytes = 1048576
+    queue-events = 1024
+    rotate-bytes = 67108864
+    rotate-interval = 3600
+    retain-windows = 2880
+    retain-bytes = 1073741824
+    # The out-DIR is a pod emptyDir (see daemonset.yaml); the service
+    # runs as root in-container with the 5-cap bounding set, so this
+    # default stays root-writable. Keep it unless the replacement is
+    # writable by the service.
+    out = "/var/lib/osslscope/windows"
+    # Target selection (exactly one shape — pick ONE):
+    # Observe explicit PIDs (repeatable across restarts only while the
+    # PIDs live; prefer `cgroup` for durable selections):
+    # pid = [1234, 5678]
+    # Observe every process in one cgroup (durable across exec/fork):
+    # cgroup = "/sys/fs/cgroup/my-workload"
+    # Optional policy + stream tap (paths must be readable/writable by
+    # the service as above):
+    # policy = "/etc/osslscope/policy.toml"
+    # stream = "/var/lib/osslscope/stream.jsonl"

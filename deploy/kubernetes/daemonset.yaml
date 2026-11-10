@@ -1,0 +1,135 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# osslscope continuous observer, one pod per amd64 node.
+#
+# EXPERIMENTAL: the in-Kubernetes service is experimental in 0.5.0 (see
+# README.md). The SUPPORTED in-cluster path is the one-shot Job
+# (job-report.yaml).
+#
+# Privilege posture (never `--privileged`, never hostNetwork):
+# - hostPID: true — the observer reads host PIDs (same as the
+#   documented `docker run --pid=host` observer recipe).
+# - capabilities: drop ALL, add exactly the 5 named caps the systemd
+#   unit carries (BPF, PERFMON, SYS_PTRACE, CHECKPOINT_RESTORE,
+#   DAC_READ_SEARCH). No CAP_SYS_ADMIN. YAML spells caps WITHOUT the
+#   `CAP_` prefix.
+# - seccomp: the shipped deploy/seccomp-osslscope.json profile, which
+#   the operator installs on every node as the kubelet localhost
+#   profile `osslscope.json` (see README.md). There is no
+#   `seccomp=unconfined` recipe.
+# - AppArmor `Unconfined`: the container default profile denies the
+#   ptrace reads host-observer mode needs (proven: 5 caps alone fail
+#   with EACCES on /proc/PID/exe+maps; see docs/container.md), so the
+#   DaemonSet opts out of AppArmor confinement explicitly. Needs
+#   kubelet >= 1.30 for the `appArmorProfile` field.
+# - runAsUser 0: host-observer mode needs root in-container (non-root
+#   foreign-uid observation fails closed; see docs/container.md).
+# - host mounts are read-only (BTF, cgroup v2, kernel security).
+#
+# Liveness/readiness: exec `osslscope doctor --format json`. osslscope
+# exposes NO HTTP endpoint, so there is no httpGet probe to write.
+# doctor exits 0 on a qualifying node and 4 (fail-closed, LOUD) on an
+# unqualifying one — DaemonSet Ready therefore tracks per-node
+# qualification, and unqualifying nodes fail loud instead of green.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: osslscope
+  namespace: osslscope
+  labels:
+    app.kubernetes.io/name: osslscope
+    app.kubernetes.io/component: service
+    app.kubernetes.io/version: "0.5.0"
+    osslscope.io/experimental-service: "true"
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: osslscope
+      app.kubernetes.io/component: service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: osslscope
+        app.kubernetes.io/component: service
+        app.kubernetes.io/version: "0.5.0"
+        osslscope.io/experimental-service: "true"
+    spec:
+      hostPID: true
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      containers:
+        - name: osslscope
+          image: ghcr.io/mingulov/osslscope:0.5.0
+          imagePullPolicy: IfNotPresent
+          args: ["service", "--config", "/etc/osslscope/service.toml"]
+          # Measured, not guessed: the tracing engine peaks at ~1.31 GiB
+          # (guest dmesg forensics: memcg-charged KERNEL BPF memory, victim
+          # RSS only ~19 MB — userspace stays small). A 1 Gi limit OOMs
+          # with exit 137 (proven 3x in the kind drill); 2 Gi holds the
+          # measured peak with headroom. Proven over drill windows only —
+          # longer service soaks are unproven in 0.x (see README.md).
+          resources:
+            requests:
+              cpu: 250m
+              memory: 1Gi
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          securityContext:
+            privileged: false
+            runAsUser: 0
+            runAsNonRoot: false
+            capabilities:
+              drop: ["ALL"]
+              add: ["BPF", "PERFMON", "SYS_PTRACE", "CHECKPOINT_RESTORE", "DAC_READ_SEARCH"]
+            seccompProfile:
+              type: Localhost
+              localhostProfile: osslscope.json
+            appArmorProfile:
+              type: Unconfined
+          volumeMounts:
+            - name: config
+              mountPath: /etc/osslscope
+              readOnly: true
+            - name: out
+              mountPath: /var/lib/osslscope/windows
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
+            - name: cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
+            - name: security
+              mountPath: /sys/kernel/security
+              readOnly: true
+          readinessProbe:
+            exec:
+              command: ["osslscope", "doctor", "--format", "json"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 30
+            failureThreshold: 1
+          livenessProbe:
+            exec:
+              command: ["osslscope", "doctor", "--format", "json"]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 30
+            failureThreshold: 3
+      volumes:
+        - name: config
+          configMap:
+            name: osslscope-service
+        - name: out
+          emptyDir: {}
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: security
+          hostPath:
+            path: /sys/kernel/security
+            type: Directory
