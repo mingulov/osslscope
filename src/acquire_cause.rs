@@ -197,7 +197,9 @@ impl From<&crate::provider_observation::schema::ObservationGap> for AcquisitionC
             | InvalidWire
             | RelocationRefused => AcquisitionCause::BpfLoad,
             AttachFailed | ClassifierFailed | RegistrationRace | MembershipUnknown
-            | UnpairedReturn | DispatchPartial | SamplingPartial => AcquisitionCause::Attach,
+            | UnpairedReturn | DispatchPartial | SamplingPartial | QuarantinedApi => {
+                AcquisitionCause::Attach
+            }
             SnapshotLag | Invalidated => AcquisitionCause::DeadlineCancel,
             ProcessLimit | ObjectLimit | LinkLimit | PendingLimit | DepthLimit | SiteLimit
             | FactLimit | StateLimit | ReadLimit | QueueLoss | DrainOverrun => {
@@ -278,6 +280,7 @@ mod tests {
             (UnpairedReturn, Attach),
             (DispatchPartial, Attach),
             (SamplingPartial, Attach),
+            (QuarantinedApi, Attach),
             (SnapshotLag, DeadlineCancel),
             (Invalidated, DeadlineCancel),
             (ProcessLimit, Limit),

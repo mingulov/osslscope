@@ -2439,12 +2439,9 @@ impl ProviderSession {
         // entry stub; 30 quarantine pairs are oops-free vs ~1/6
         // baseline. Keyed by stable API id (not file offset) so it
         // holds across libcrypto builds. See
-        // .superpowers/sdd/handoff/crash-fix-report.md.
-        if quarantined_api(api) {
-            return Err(ObservationGap::SymbolUnavailable);
-        }
-        if self.final_drain || !self.gate.admitting() {
-            return Err(ObservationGap::Invalidated);
+        // docs/kernel-quarantine-note.md.
+        if let Some(gap) = attach_refusal(api, self.final_drain, self.gate.admitting()) {
+            return Err(gap);
         }
         if self
             .link_pressure()
@@ -5444,6 +5441,13 @@ impl ProviderSession {
         // leaves a partial prearm on refusal (ER-S2-I1).
         let mut to_add = Vec::with_capacity(resolved.len());
         for (api, site) in resolved {
+            // M2: quarantined apis never enter the prearm order — a
+            // policy refusal must not abort the whole batch (fail-open).
+            // The gap stays visible: cold reconcile retries the api and
+            // records the quarantine refusal on the setup batch.
+            if quarantined_api(api) {
+                continue;
+            }
             let pid = site.pid();
             if self
                 .startup
@@ -5836,10 +5840,26 @@ fn transient_budget_gap(gap: ObservationGap) -> bool {
 }
 /// Stable API id of `EVP_DigestInit_ex2` (API_NAMES[1]; the id<->name
 /// binding is wire-pinned). Quarantined 2026-11-09: probing this export's
-/// entry stub panics kernels (observation_ent+0x1ee GPF); see attach_pair.
+/// entry stub panics kernels (observation_ent+0x1ee GPF); see attach_pair
+/// and docs/kernel-quarantine-note.md.
+/// Sibling-stub extension order (tracked follow-up; extend here first on
+/// any sibling oops): 20, then 25, 29, 24, 28 — the `_ex` twin first,
+/// then the cipher pairs.
 const QUARANTINED_EVP_DIGEST_INIT_EX2: u32 = 21;
 fn quarantined_api(api: u32) -> bool {
     api == QUARANTINED_EVP_DIGEST_INIT_EX2
+}
+/// Precedence-ordered attach refusal: terminal-drain/closed-gate
+/// (`Invalidated`) outranks the kernel-panic quarantine, preserving
+/// the exact prior error in every session state (M1).
+fn attach_refusal(api: u32, final_drain: bool, gate_admitting: bool) -> Option<ObservationGap> {
+    if final_drain || !gate_admitting {
+        return Some(ObservationGap::Invalidated);
+    }
+    if quarantined_api(api) {
+        return Some(ObservationGap::QuarantinedApi);
+    }
+    None
 }
 fn arm_attachment(
     config: &mut BpfMap<MapData, u64, c::Config>,
@@ -5994,6 +6014,26 @@ mod tests {
         for api in [1, 7, 20, 22, 45, 72] {
             assert!(!super::quarantined_api(api));
         }
+    }
+    #[test]
+    fn attach_refusal_prefers_invalidated_over_quarantine() {
+        use super::ObservationGap;
+        // M1: terminal-drain/closed-gate (Invalidated) outranks the
+        // quarantine refusal, preserving the exact prior error in
+        // every session state.
+        assert_eq!(
+            super::attach_refusal(21, true, true),
+            Some(ObservationGap::Invalidated)
+        );
+        assert_eq!(
+            super::attach_refusal(21, false, false),
+            Some(ObservationGap::Invalidated)
+        );
+        assert_eq!(
+            super::attach_refusal(21, false, true),
+            Some(ObservationGap::QuarantinedApi)
+        );
+        assert_eq!(super::attach_refusal(20, false, true), None);
     }
     /// N10 fake thread-row map: BTreeMap rows plus injectable
     /// enumeration/deletion failures, exercising the shared
@@ -7032,12 +7072,20 @@ mod tests {
     /// observes `Disconnected` with a dead worker and unproven
     /// close.
     fn ack_losing_spawner(taken: std::sync::mpsc::Sender<()>) -> super::DropperSpawn {
+        // Persistent (never one-shot): a worker that exits after one
+        // take leaves its rx alive-but-undrained across the exit
+        // window, so a retry barrier enqueued in that window lands
+        // orphaned (try_send succeeds, nobody recvs) and the test
+        // flakes Timeout under load. The loop mirrors the production
+        // worker (which also drains until disconnect).
         Box::new(move |rx, _shared| {
             let taken = taken.clone();
             std::thread::spawn(move || {
-                if let Ok(msg) = rx.recv() {
+                while let Ok(msg) = rx.recv() {
                     drop(msg);
-                    taken.send(()).ok();
+                    if taken.send(()).is_err() {
+                        break;
+                    }
                 }
             });
             Ok(())

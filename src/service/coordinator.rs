@@ -5584,6 +5584,13 @@ mod tests {
         let out = s4_scratch("final-seals");
         let drain = s4_drain_bytes();
         let (mut run, _guard) = s4_run(&out, 0, drain);
+        // Load-hardened grace: this test pins CANCEL-survival of
+        // close-critical staging (15.8 MB through worker-backed
+        // spill + assembly + seal), not deadline arithmetic — the
+        // 5 s default expires honestly-but-spuriously on loaded
+        // runners (assemble_window Expired → exit 4). Deadline
+        // expiry itself is pinned by dedicated unit tests.
+        run.cfg.grace = Duration::from_secs(60);
         unsafe { libc::raise(libc::SIGTERM) };
         s4_consume_batch(&mut run);
         assert!(
@@ -5660,6 +5667,9 @@ mod tests {
         let out = s4_scratch("terminal-seals");
         let drain = s4_drain_bytes();
         let (mut run, _guard) = s4_run(&out, u64::MAX, drain);
+        // Load-hardened grace (same as the final twin): cancel-
+        // survival, not deadline arithmetic, is what's pinned here.
+        run.cfg.grace = Duration::from_secs(60);
         unsafe { libc::raise(libc::SIGTERM) };
         s4_consume_batch(&mut run);
         let code = match close_mid_window(run) {

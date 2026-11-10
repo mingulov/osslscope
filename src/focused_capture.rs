@@ -196,6 +196,9 @@ fn observation_loss(gap: ObservationGap) -> GapCounter {
             ("focused.tracing_unavailable", CounterSource::Setup)
         }
         AttachFailed => ("focused.observation_attach", CounterSource::Attach),
+        // I-2: the kernel-panic quarantine refusal names itself — a
+        // refused attach is not a drain/read failure (never read_unknown).
+        QuarantinedApi => ("focused.attach_refused_quarantined", CounterSource::Attach),
         _ => ("focused.read_unknown", CounterSource::Drain),
     };
     loss(name, source, 1)
@@ -4184,5 +4187,23 @@ mod r71_tests {
             session.last_clean_drain_ns > 100,
             "clean unheld drain must advance the clean instant"
         );
+    }
+}
+#[cfg(test)]
+mod quarantine_visibility_tests {
+    use super::*;
+    #[test]
+    fn quarantine_gap_names_itself_outside_read_unknown() {
+        // I-2: the kernel-panic quarantine refusal must surface under
+        // its own counter name — never the generic read_unknown
+        // catch-all (a refused attach is not a drain/read failure).
+        let counter = observation_loss(ObservationGap::QuarantinedApi);
+        assert_eq!(counter.name, "focused.attach_refused_quarantined");
+        assert_eq!(counter.source, CounterSource::Attach);
+        assert_eq!(counter.kind, CounterKind::Loss);
+        // The genuine missing-symbol gap keeps its own (non-quarantine)
+        // identity: the two producers must never conflate.
+        let genuine = observation_loss(ObservationGap::SymbolUnavailable);
+        assert_ne!(genuine.name, counter.name);
     }
 }

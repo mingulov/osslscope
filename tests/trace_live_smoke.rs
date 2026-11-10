@@ -137,14 +137,17 @@ fn drive(mode: u32) -> Driven {
     let mut session = po::ProviderSession::open(po::ObservationLimits::default(), &object).unwrap();
     session.set_trace_mode(mode).unwrap();
     let setup = session.reconcile(&scanner.snapshot());
-    // 2026-11-09 kernel-panic quarantine: exactly one SymbolUnavailable is
+    // 2026-11-09 kernel-panic quarantine: exactly one QuarantinedApi is
     // expected (API 21 EVP_DigestInit_ex2, refused at attach; probing its
     // entry stub GPFs kernels). AttachFailed/BpfUnavailable stay denied,
-    // and the paired-480 + family asserts below still guard coverage.
+    // genuine SymbolUnavailable stays zero (the quarantine names itself),
+    // and the MIN_PAIRS + family asserts below still guard coverage.
     assert!(
         !setup.gaps.iter().any(|g| matches!(
             g,
-            po::ObservationGap::AttachFailed | po::ObservationGap::BpfUnavailable
+            po::ObservationGap::AttachFailed
+                | po::ObservationGap::BpfUnavailable
+                | po::ObservationGap::SymbolUnavailable
         )),
         "setup: {:?}",
         setup.gaps
@@ -153,7 +156,7 @@ fn drive(mode: u32) -> Driven {
         setup
             .gaps
             .iter()
-            .filter(|g| matches!(g, po::ObservationGap::SymbolUnavailable))
+            .filter(|g| matches!(g, po::ObservationGap::QuarantinedApi))
             .count(),
         1,
         "setup quarantine gap: {:?}",
@@ -422,12 +425,15 @@ fn flood_queued(tag: &str) -> Option<Flooded> {
     let mut session = po::ProviderSession::open(po::ObservationLimits::default(), &object).unwrap();
     session.set_trace_mode(trace::TRACE_MODE_LATENCY).unwrap();
     let setup = session.reconcile(&scanner.snapshot());
-    // 2026-11-09 kernel-panic quarantine: exactly one SymbolUnavailable is
-    // expected (API 21 EVP_DigestInit_ex2, refused at attach).
+    // 2026-11-09 kernel-panic quarantine: exactly one QuarantinedApi is
+    // expected (API 21 EVP_DigestInit_ex2, refused at attach); genuine
+    // SymbolUnavailable stays zero.
     assert!(
         !setup.gaps.iter().any(|g| matches!(
             g,
-            po::ObservationGap::AttachFailed | po::ObservationGap::BpfUnavailable
+            po::ObservationGap::AttachFailed
+                | po::ObservationGap::BpfUnavailable
+                | po::ObservationGap::SymbolUnavailable
         )),
         "setup: {:?}",
         setup.gaps
@@ -436,7 +442,7 @@ fn flood_queued(tag: &str) -> Option<Flooded> {
         setup
             .gaps
             .iter()
-            .filter(|g| matches!(g, po::ObservationGap::SymbolUnavailable))
+            .filter(|g| matches!(g, po::ObservationGap::QuarantinedApi))
             .count(),
         1,
         "setup quarantine gap: {:?}",

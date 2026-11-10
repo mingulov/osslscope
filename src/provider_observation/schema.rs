@@ -53,6 +53,11 @@ pub enum ObservationGap {
     MembershipUnknown,
     RegistrationRace,
     Invalidated,
+    /// Attach refused by the kernel-panic quarantine policy
+    /// (`quarantined_api`): the export is present but must stay
+    /// unprobed. Distinct from `SymbolUnavailable` (genuinely
+    /// missing/unresolvable symbol) so the user surface can name it.
+    QuarantinedApi,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
