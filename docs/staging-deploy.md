@@ -1,6 +1,11 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Staging deploy
 
+> HISTORICAL / developer runbook — not part of the 0.5.0 supported
+> journey (see `docs/quickstart.md`). Its privileged debug fallback
+> predates the 0.5.0 no-privileged posture and is UNSUPPORTED as a
+> release recipe.
+
 CI gates with `run --`. Staging observes already-running
 services with `report --pid` from an ephemeral privileged
 debug container that shares the target's pid namespace.
