@@ -19,10 +19,14 @@
 - Known limits: typed-program positives stay blocked — R5 refuted
   as-built (`typed_return` exceeds the kernel-7.0 verifier limit;
   revision options scoped, none selected). No 3.0.x or 4.x runtime
-  lane on hand; DEB/RPM install/remove on declared distro cells and
-  native re-measure stay open. Reports remain PARTIAL where
+  lane on hand. DEB/RPM install/remove CLOSED by the rc.1 proof
+  (Debian cell + Fedora 43 cell, G6) and native re-measure CLOSED at
+  5.425× (below) — the "stay open" rows from the 2026-11-02
+  candidate stage are superseded. Reports remain PARTIAL where
   evidence is partial; attribution stays Unknown where unproven.
-- Installed journey (candidate tarball, system prefix): companion-trust
+- Installed journey (HISTORICAL — candidate-tarball observation from
+  the 2026-11-02 stage, preserved verbatim; superseded for release
+  claims by the rc.1 PARTIAL evidence): companion-trust
   matrix closed (mismatch/ownership/ancestry refused, root-owned +
   matching + trusted ancestry available, doctor exit 0). Host 3.5.5
   `report run -- openssl dgst`: 2857 sites, 11,560 calls, exited

@@ -6,8 +6,8 @@
 # read-only host mounts (BTF/cgroup/security) on every node it observes.
 # A `restricted`-enforcing namespace rejects these pods outright, so
 # restricted clusters are UNSUPPORTED in 0.x — there is no supported
-# unprivileged in-cluster mode in this release. If your cluster enforces
-# `restricted` cluster-wide, use `kubectl debug` (see README.md) instead.
+# unprivileged in-cluster mode, and no supported no-install workaround,
+# in this release (see README.md).
 apiVersion: v1
 kind: Namespace
 metadata:

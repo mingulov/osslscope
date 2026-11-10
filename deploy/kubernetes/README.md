@@ -124,36 +124,15 @@ $ kubectl -n osslscope edit configmap osslscope-service
 $ kubectl -n osslscope rollout restart daemonset/osslscope
 ```
 
-## No-install option: kubectl debug
+## No-install option: none supported in 0.5.0
 
-To trace without installing anything, run the published image as an
-ephemeral debug container sharing the target pod's PID namespace
-(drilled in the guest lane; output below verbatim from a
-`dgst-loop` target pod — names differ per run):
-
-```console
-$ kubectl -n <target-ns> debug <target-pod> --share-processes \
-    --profile=sysadmin \
-    --image=ghcr.io/mingulov/osslscope:0.5.0 --target=<target-container> -- \
-    osslscope doctor --format json
-Targeting container "<target-container>". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
-Defaulting debug container name to debugger-7zvk6.
-$ kubectl -n <target-ns> logs <target-pod> -c debugger-7zvk6
-{"capabilities":{"bpf":"available","count_companion":"available","count_load":"available","inventory":"available","observation_companion":"available","observation_load":"available","pid_namespace":"available","ring_buffer":"available","uprobe_multi":"available","user_read":"available"},"execution":"not_observed","historical_activation":"unknown","record":"doctor","schema_version":"osslscope.focused.doctor.v1"}
-$ # debug container exit: exit=0 reason=Completed
-```
-
-Two drilled findings shape this recipe. Spell the binary
-`osslscope doctor`: `kubectl debug` overrides the image entrypoint,
-so a bare `doctor` fails with `executable file not found in $PATH`.
-And pass `--profile=sysadmin`: the default profile's bounding set
-cannot exec the file-caps binary at all (`operation not permitted`,
-exit 255), while sysadmin yields the all-`available` exit 0 above.
-Unlike the manifests, the debug container uses your cluster's
-default seccomp profile, not the shipped one.
-
-`--share-processes` puts the debug container in the target's PID
-namespace, so `report --pid <N>` sees target PIDs.
+There is NO supported no-install recipe in this release. What was
+tried and rejected: `kubectl debug` with the default profile cannot
+exec the file-caps binary at all (`operation not permitted`, exit
+255), and `--profile=sysadmin` would create a PRIVILEGED ephemeral
+container — contradicting the posture above — so it is not offered.
+To trace without installing the DaemonSet, run the one-shot Job (it
+needs no prior install beyond `kubectl apply -f job-report.yaml`).
 
 ## Uninstall
 
@@ -171,9 +150,12 @@ Provenance: single-node kind v0.27.0 (node image
 `kindest/node:v1.32.2`, kubectl + server v1.32.2, control-plane taint
 removed for the drill), image `ghcr.io/mingulov/osslscope:0.5.0` via
 `kind load docker-image` (pre-publish equivalent of the published
-image tag — after publish, `docker rmi` the loaded tag on drill
-nodes before applying release manifests, since `IfNotPresent`
-would otherwise shadow the release image with no warning),
+image tag — for release manifests use a FRESH kind cluster (delete +
+recreate): kind keeps loaded images in node-local containerd, so
+host-side `docker rmi` does NOT evict them and `IfNotPresent` would
+otherwise shadow the release image with no warning; confirm digest
+identity via `kubectl get pod -o jsonpath={..imageID}` before
+trusting a run),
 seccomp profile copied into the node at
 `/var/lib/kubelet/seccomp/osslscope.json`. The cluster ran inside a
 KVM guest (the live-BPF containment lane). kind shares the host

@@ -48,8 +48,10 @@ spec:
         - name: osslscope-report
           # Mutable tag + IfNotPresent: pre-publish `kind load` nodes
           # keep a same-tag test image that shadows the release image
-          # with no warning — `docker rmi` before applying release
-          # manifests, or digest-pin post-publish. (No digest exists
+          # with no warning — use a FRESH kind cluster for release
+          # manifests (delete + recreate; host `docker rmi` does not
+          # evict kind's node-local containerd cache), verify imageID
+          # identity, or digest-pin post-publish. (No digest exists
           # to pin until 0.5.0 is pushed.)
           image: ghcr.io/mingulov/osslscope:0.5.0
           imagePullPolicy: IfNotPresent
