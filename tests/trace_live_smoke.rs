@@ -137,14 +137,26 @@ fn drive(mode: u32) -> Driven {
     let mut session = po::ProviderSession::open(po::ObservationLimits::default(), &object).unwrap();
     session.set_trace_mode(mode).unwrap();
     let setup = session.reconcile(&scanner.snapshot());
+    // 2026-11-09 kernel-panic quarantine: exactly one SymbolUnavailable is
+    // expected (API 21 EVP_DigestInit_ex2, refused at attach; probing its
+    // entry stub GPFs kernels). AttachFailed/BpfUnavailable stay denied,
+    // and the paired-480 + family asserts below still guard coverage.
     assert!(
         !setup.gaps.iter().any(|g| matches!(
             g,
-            po::ObservationGap::AttachFailed
-                | po::ObservationGap::BpfUnavailable
-                | po::ObservationGap::SymbolUnavailable
+            po::ObservationGap::AttachFailed | po::ObservationGap::BpfUnavailable
         )),
         "setup: {:?}",
+        setup.gaps
+    );
+    assert_eq!(
+        setup
+            .gaps
+            .iter()
+            .filter(|g| matches!(g, po::ObservationGap::SymbolUnavailable))
+            .count(),
+        1,
+        "setup quarantine gap: {:?}",
         setup.gaps
     );
     child.0.stdin.as_mut().unwrap().write_all(b"G").unwrap();
@@ -410,14 +422,24 @@ fn flood_queued(tag: &str) -> Option<Flooded> {
     let mut session = po::ProviderSession::open(po::ObservationLimits::default(), &object).unwrap();
     session.set_trace_mode(trace::TRACE_MODE_LATENCY).unwrap();
     let setup = session.reconcile(&scanner.snapshot());
+    // 2026-11-09 kernel-panic quarantine: exactly one SymbolUnavailable is
+    // expected (API 21 EVP_DigestInit_ex2, refused at attach).
     assert!(
         !setup.gaps.iter().any(|g| matches!(
             g,
-            po::ObservationGap::AttachFailed
-                | po::ObservationGap::BpfUnavailable
-                | po::ObservationGap::SymbolUnavailable
+            po::ObservationGap::AttachFailed | po::ObservationGap::BpfUnavailable
         )),
         "setup: {:?}",
+        setup.gaps
+    );
+    assert_eq!(
+        setup
+            .gaps
+            .iter()
+            .filter(|g| matches!(g, po::ObservationGap::SymbolUnavailable))
+            .count(),
+        1,
+        "setup quarantine gap: {:?}",
         setup.gaps
     );
     // Flood WITHOUT draining: 40 x 60 fetch+digest ops (~16 ring

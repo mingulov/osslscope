@@ -2432,6 +2432,17 @@ impl ProviderSession {
         generation: u64,
         create_links: bool,
     ) -> Result<Attachment, ObservationGap> {
+        // 2026-11-09 kernel-panic quarantine: refuse to probe
+        // EVP_DigestInit_ex2 (stable API id 21). Every observed
+        // observation_ent+0x1ee GPF (2 host panics + 7 guest oopses,
+        // same prog/offset/trace) fired at this export's 11-byte
+        // entry stub; 30 quarantine pairs are oops-free vs ~1/6
+        // baseline. Keyed by stable API id (not file offset) so it
+        // holds across libcrypto builds. See
+        // .superpowers/sdd/handoff/crash-fix-report.md.
+        if quarantined_api(api) {
+            return Err(ObservationGap::SymbolUnavailable);
+        }
         if self.final_drain || !self.gate.admitting() {
             return Err(ObservationGap::Invalidated);
         }
@@ -5823,6 +5834,13 @@ fn transient_budget_gap(gap: ObservationGap) -> bool {
         ObservationGap::ReadLimit | ObservationGap::SnapshotLag | ObservationGap::StateLimit
     )
 }
+/// Stable API id of `EVP_DigestInit_ex2` (API_NAMES[1]; the id<->name
+/// binding is wire-pinned). Quarantined 2026-11-09: probing this export's
+/// entry stub panics kernels (observation_ent+0x1ee GPF); see attach_pair.
+const QUARANTINED_EVP_DIGEST_INIT_EX2: u32 = 21;
+fn quarantined_api(api: u32) -> bool {
+    api == QUARANTINED_EVP_DIGEST_INIT_EX2
+}
 fn arm_attachment(
     config: &mut BpfMap<MapData, u64, c::Config>,
     process: &VerifiedProcess,
@@ -5961,6 +5979,21 @@ mod tests {
         assert!(!ProviderSession::trace_plane_only(c::INIT, 20));
         assert!(!ProviderSession::trace_plane_only(c::IMPLEMENTATION, 45));
         assert!(!ProviderSession::trace_plane_only(c::GAP, 20));
+    }
+    #[test]
+    fn kernel_panic_quarantine_holds_evp_digest_init_ex2() {
+        // 2026-11-09 incident: probing API 21 (EVP_DigestInit_ex2 entry
+        // stub) GPFs kernels (observation_ent+0x1ee); attach_pair must
+        // keep refusing it while admitting neighbors. The id<->name
+        // binding is wire-pinned (API_NAMES[1]).
+        assert_eq!(
+            crate::api_activity::API_NAMES[(super::QUARANTINED_EVP_DIGEST_INIT_EX2 - 20) as usize],
+            "EVP_DigestInit_ex2"
+        );
+        assert!(super::quarantined_api(21));
+        for api in [1, 7, 20, 22, 45, 72] {
+            assert!(!super::quarantined_api(api));
+        }
     }
     /// N10 fake thread-row map: BTreeMap rows plus injectable
     /// enumeration/deletion failures, exercising the shared
