@@ -45,6 +45,13 @@
   figure (reproduced as the 4.661 control in the same campaign); see
   `docs/overhead-matrix.md`.
 - Root package version 0.5.0; helper crates retain their versions.
+- Kernel-panic quarantine: `EVP_DigestInit_ex2` (API 21) unprobed —
+  probing its entry stub panics kernels. The refusal is named at the
+  user surface (`quarantined_api` setup gap,
+  `focused.attach_refused_quarantined` loss counter; the API 21 row
+  shows `not_attached`); residual risk, sibling follow-ups, and the
+  deferred kernel-bug status live in
+  `docs/kernel-quarantine-note.md`.
 
 ## 0.4.0 current-state alpha (automatic observation)
 

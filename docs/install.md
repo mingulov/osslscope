@@ -110,6 +110,13 @@ sudo rpm -i osslscope-0.5.0-1.x86_64.rpm      # Fedora/RHEL
 osslscope --version
 osslscope doctor --format json
 ```
+(RPM proven live in the 0.5.0 lane, not just `rpm -qlp`: Fedora
+43 cell, install exit 0 → version 0.5.0 → caps `cap_perfmon,
+cap_bpf=ep` → doctor exit 0 with silent stderr → erase exit 0
+with file-level verify. Container-cell caveats only: install
+with default caps — `rpm -i` under `--cap-drop ALL` fails in
+cpio — and grant `BPF`+`PERFMON` to run, or exec refuses the
+file caps with `Operation not permitted`.)
 
 ```sh
 sudo tar -xzf osslscope-0.5.0-prefix.tar.gz -C /usr   # any lane host

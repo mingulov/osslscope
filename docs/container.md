@@ -22,22 +22,29 @@ to the committed source identity and the resolver refuses dirty builds):
 docker build -t osslscope:0.5.0 .
 ```
 
-The builder stage installs the pinned toolchains (Rust 1.88.0,
-nightly-2026-05-20 with `rust-src`, bpf-linker 0.10.4) and runs
-`./scripts/build-dev.sh --release` plus `./scripts/install-dev.sh
---prefix /usr/local`. The runtime stage is slim Debian with
-`libcap2-bin` (for `setcap` at build time), `openssl` (the demo
-workload), the prefix, `cap_bpf,cap_perfmon=ep` file caps on the
-root-owned binary, and the `osslscope` user. Build from a real
+The builder stage installs the pinned toolchains (rustup 1.29.3
+bootstrap, SHA-256 verified; Rust 1.88.0, nightly-2026-05-20 with
+`rust-src`, bpf-linker 0.10.4) and runs `./scripts/build-dev.sh
+--release` plus `./scripts/install-dev.sh --prefix /usr/local`.
+The runtime stage is slim Debian with `openssl` (the demo workload
+— the Job manifest's default args run `openssl dgst`), the prefix,
+`cap_bpf,cap_perfmon=ep` file caps on the root-owned binary, and
+the `osslscope` user (stable uid 65532). `libcap2-bin` exists only
+for the one `setcap` at build time and is purged after. 0.x images
+ship no signatures, SLSA provenance, or SBOM — verify by digest
+after pinning. Build from a real
 checkout: a linked `git worktree` ships a `.git` pointer file whose
 target lies outside the build context, which yields an
-unknown-source install that tracing refuses; a full clone builds
-clean (`product: e112a5e (dirty=false)`, v2 receipt).
+unknown-source install that tracing refuses (build-identity
+semantics; no worktree build log retained in the lane); a full
+clone builds clean (`product: e112a5e (dirty=false)` at the
+Task-2 base — your build shows its own HEAD — v2 receipt).
 
 Minimum capabilities: the binary carries file caps, so the container
 bounding set must grant at least `BPF`+`PERFMON` even for `--help` —
 with `--cap-drop ALL` alone, `exec` fails with `operation not
-permitted`.
+permitted` (file-caps bounding-set semantics; the drill transcripts
+below all run with the granting tier).
 
 ## Seccomp
 
@@ -84,14 +91,16 @@ totals `entries=2 observed_success=2`):
  "observed_failure": 0,
  "observed_success": 2,
  "unsupported": 0,
- "verification_mismatch": 0
+ "verification_mismatch": 0,
+ "gaps": {…}
 }
 ```
+(`…` marks the trimmed `gaps` object — the row carries seven fields.)
 
 Spike evidence (throwaway image, same prefix): non-root file caps
-attached 2780 sites; a root re-run attached 2780 as well (an earlier
-2855 read was run-to-run variance, not a user gap), with identical
-counts. A `bpf`-denied seccomp variant attached nothing (zeros),
+attached 2780 sites (repeated); a root run attached 2855 with
+identical entries=2 counts — run-to-run site variance, not a user
+gap. A `bpf`-denied seccomp variant attached nothing (zeros),
 proving the filter is load-bearing; a `perf_event_open`-denied
 variant stayed green, so the shipped profile adds no
 `perf_event_open` allowance.
@@ -126,8 +135,11 @@ docker run --rm --user root --pid=host \
   osslscope:0.5.0 doctor --format json
 ```
 
-Expected: exit 0 with silent stderr. Drill output (shipped image,
-shipped seccomp profile):
+Expected: exit 0 with osslscope-silent stderr (the lane's dockerd
+prints one `WARNING: IPv4 forwarding is disabled. Networking will
+not work.` line — the lane runs `--iptables=false --bridge=none`;
+real hosts with networking show fully silent stderr). Drill output
+(shipped image, shipped seccomp profile, dockerd WARNING trimmed):
 
 ```text
 $ docker run --rm --user root --pid=host \
@@ -190,6 +202,8 @@ Privileged=false CapAdd=[CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_
 CapDrop=[ALL] User=root PidMode=host
 SecurityOpt=[apparmor=unconfined seccomp=<shipped deploy/seccomp-osslscope.json, 12 KB>]
 ```
+(`label=disable` lane SELinux artifact trimmed from the pasted
+`SecurityOpt`.)
 
 ## Limits
 
@@ -206,6 +220,8 @@ SecurityOpt=[apparmor=unconfined seccomp=<shipped deploy/seccomp-osslscope.json,
   `docker-default` profile denies ptrace reads) and only there; owned
   mode keeps the default profile. A custom AppArmor profile allowing
   ptrace read is untested and not shipped.
-- `seccomp=unconfined` and any `--privileged` invocation are
-  unsupported; if a supported recipe fails where unconfined works,
-  report it with the denial instead of shipping unconfined.
+- Any `--privileged` invocation is unsupported. `seccomp=unconfined`
+  is a diagnostic fallback only, never a recipe (same posture as
+  above): if a supported recipe fails where unconfined works,
+  report it with the denial instead of shipping unconfined. On
+  Kubernetes there is no `seccomp=unconfined` recipe at all.

@@ -36,6 +36,10 @@ osslscope --version
 sudo rpm -i osslscope-0.5.0-1.x86_64.rpm      # Fedora/RHEL
 osslscope --version
 ```
+(RPM proven live in the 0.5.0 lane: Fedora 43 cell, `rpm -i`
+exit 0 → `--version` 0.5.0 → getcap `cap_perfmon,cap_bpf=ep` →
+`doctor --format json` exit 0 with silent stderr → `rpm -e`
+exit 0 with file-level verify.)
 
 ```sh
 sudo tar -xzf osslscope-0.5.0-prefix.tar.gz -C /usr   # any lane host

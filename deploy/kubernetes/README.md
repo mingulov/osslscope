@@ -37,7 +37,8 @@ $ sudo cp deploy/seccomp-osslscope.json /var/lib/kubelet/seccomp/osslscope.json
 
 Both workloads set `seccompProfile: {type: Localhost,
 localhostProfile: osslscope.json}`. There is no
-`seccomp=unconfined` recipe. The profile is the container-runtime
+`seccomp=unconfined` recipe on Kubernetes (on Docker it is a
+diagnostic fallback only, never a recipe). The profile is the container-runtime
 default plus exactly one appended `bpf` allowance (see
 `../seccomp-osslscope.json` and `docs/container.md`).
 
@@ -126,19 +127,33 @@ $ kubectl -n osslscope rollout restart daemonset/osslscope
 ## No-install option: kubectl debug
 
 To trace without installing anything, run the published image as an
-ephemeral debug container sharing the target pod's PID namespace:
+ephemeral debug container sharing the target pod's PID namespace
+(drilled in the guest lane; output below verbatim from a
+`dgst-loop` target pod — names differ per run):
 
 ```console
 $ kubectl -n <target-ns> debug <target-pod> --share-processes \
+    --profile=sysadmin \
     --image=ghcr.io/mingulov/osslscope:0.5.0 --target=<target-container> -- \
-    doctor --format json
+    osslscope doctor --format json
+Targeting container "<target-container>". If you don't see processes from this container it may be because the container runtime doesn't support this feature.
+Defaulting debug container name to debugger-7zvk6.
+$ kubectl -n <target-ns> logs <target-pod> -c debugger-7zvk6
+{"capabilities":{"bpf":"available","count_companion":"available","count_load":"available","inventory":"available","observation_companion":"available","observation_load":"available","pid_namespace":"available","ring_buffer":"available","uprobe_multi":"available","user_read":"available"},"execution":"not_observed","historical_activation":"unknown","record":"doctor","schema_version":"osslscope.focused.doctor.v1"}
+$ # debug container exit: exit=0 reason=Completed
 ```
 
+Two drilled findings shape this recipe. Spell the binary
+`osslscope doctor`: `kubectl debug` overrides the image entrypoint,
+so a bare `doctor` fails with `executable file not found in $PATH`.
+And pass `--profile=sysadmin`: the default profile's bounding set
+cannot exec the file-caps binary at all (`operation not permitted`,
+exit 255), while sysadmin yields the all-`available` exit 0 above.
+Unlike the manifests, the debug container uses your cluster's
+default seccomp profile, not the shipped one.
+
 `--share-processes` puts the debug container in the target's PID
-namespace, so `report --pid <N>` sees target PIDs. Debug containers
-run with the default seccomp/capability set of your cluster — if
-doctor reports unavailable capabilities, the node (not the manifest)
-needs the caps/seccomp/AppArmor posture above.
+namespace, so `report --pid <N>` sees target PIDs.
 
 ## Uninstall
 
@@ -156,11 +171,16 @@ Provenance: single-node kind v0.27.0 (node image
 `kindest/node:v1.32.2`, kubectl + server v1.32.2, control-plane taint
 removed for the drill), image `ghcr.io/mingulov/osslscope:0.5.0` via
 `kind load docker-image` (pre-publish equivalent of the published
-image tag), seccomp profile copied into the node at
+image tag — after publish, `docker rmi` the loaded tag on drill
+nodes before applying release manifests, since `IfNotPresent`
+would otherwise shadow the release image with no warning),
+seccomp profile copied into the node at
 `/var/lib/kubelet/seccomp/osslscope.json`. The cluster ran inside a
 KVM guest (the live-BPF containment lane). kind shares the host
 kernel, so this drill proves the MANIFESTS (apply → schedule →
-probe → report), not kernel breadth.
+probe → report), not kernel breadth. (`-o wide` tables below
+show the decision columns only — CONTAINERS/IMAGES/SELECTOR and
+IP/NODE columns trimmed for readability; shown values are verbatim.)
 
 > NOTE: kind-in-guest containers sit on overlayfs, and foreign attach
 > to overlay-backed libcrypto observes nothing (a guest-lane artifact,
@@ -196,7 +216,7 @@ $ kubectl apply -f job-report.yaml
 job.batch/osslscope-report created
 $ kubectl -n osslscope get job osslscope-report -o wide
 NAME               STATUS   COMPLETIONS   DURATION   AGE
-osslscope-report   Failed   0/1           11s        11s
+osslscope-report   Failed   0/1           15s        15s
 $ # pod exit: exit=3 reason=Error
 ```
 
@@ -211,10 +231,14 @@ osslscope: focused callbacks attached (pid=12, sites=2780)
 
 Same 2780 sites and entries=2 as the documented Docker owned drill.
 Note: `kubectl logs` returned only a ~250-byte tail of this report
-in the drill lane (mechanism unidentified); the complete report was
-read from the node's `/var/log/pods/...` files. For multi-MB
-reports, raise the kubelet's `containerLogMaxSize`/`containerLogMaxFiles`
-or fetch the full log from the node.
+in the drill lane (mechanism unidentified); the full report was
+read from the node's `/var/log/pods/...` files. Raising the
+kubelet's `containerLogMaxSize`/`containerLogMaxFiles` does NOT
+restore it — tested with `containerLogMaxSize: 50Mi` (rotation
+stopped, single 16.7 MB node file) and `kubectl logs` still
+returned a 253-byte tail. For multi-MB reports, fetch the full
+log from the node's `/var/log/pods/...` files (the drilled
+fallback).
 
 ### 3. Unqualifying node fails loud (BTF masked → exit 3)
 
@@ -223,7 +247,7 @@ seccomp, AppArmor unconfined, cgroup/security mounts) except `/sys/kernel/btf`
 masked by an emptyDir, running `doctor --format json`:
 
 ```console
-$ kubectl -n osslscope logs pod/osslscope-nobtf
+$ kubectl -n osslscope logs pod/doc-nobtf
 osslscope doctor: capability unavailable: count_companion(unavailable), count_load(not_checked), observation_load(unavailable) (see capabilities above)
 {"capabilities":{"bpf":"available","count_companion":"unavailable",...},"record":"doctor","schema_version":"osslscope.focused.doctor.v1"}
 $ # pod exit: exit=3 reason=Error
@@ -249,7 +273,9 @@ osslscope-d5mt6   1/1     Running   0          3m
 ```
 
 Pod events are clean (Scheduled/Pulled/Created/Started, no probe
-failures). The service tiles windows to its out-DIR (emptyDir):
+failures). The service tiles windows to its out-DIR (emptyDir).
+(Pasted from two drill runs: the `get` is drill6, the `exec`
+is drill7 — pod hashes differ across runs.)
 
 ```console
 $ kubectl -n osslscope exec osslscope-cb4wl -- ls /var/lib/osslscope/windows/

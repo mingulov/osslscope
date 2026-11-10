@@ -405,6 +405,14 @@ are incomplete advertisements; warm and built-in activation may stay unknown.
 Unsupported observations retain passive inventory and explicit gaps. Supplied
 module inspection remains passive and rejects provider observation.
 
+Kernel-panic quarantine: `EVP_DigestInit_ex2` (API 21) stays
+unprobed — probing its entry stub panics kernels. Its activity
+row shows `not_attached` with zero entries. Where the attach is
+attempted and refused, it surfaces as the `quarantined_api`
+setup gap plus the `focused.attach_refused_quarantined` loss
+counter (see
+[kernel-quarantine-note](kernel-quarantine-note.md)).
+
 ## Execution report and check
 
 ```sh
