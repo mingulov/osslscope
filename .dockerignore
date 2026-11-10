@@ -1,0 +1,8 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Build context exclusions for the osslscope image. NOTE: .git is
+# deliberately NOT excluded — build-dev.sh binds the install receipt
+# to the committed source identity, and tracing refuses installs
+# built without it.
+target/
+dist/
+*.log

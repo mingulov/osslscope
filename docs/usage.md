@@ -169,6 +169,7 @@ No selector grants additional access or enters a target namespace.
 Run osslscope in the host procfs and cgroup view when selecting host processes.
 Docker, `kubectl` and the shell utilities below help the operator resolve a
 scope; osslscope itself has no Docker socket or Kubernetes-client dependency.
+To run osslscope itself inside a container, see [container](container.md).
 These examples assume a host cgroup-v2 hierarchy mounted at `/sys/fs/cgroup`
 with its hierarchy root exposed. Check your mount layout independently (for
 example, `findmnt -t cgroup2`); do not concatenate a container-relative cgroup
