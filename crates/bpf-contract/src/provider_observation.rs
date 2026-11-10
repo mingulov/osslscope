@@ -215,13 +215,17 @@ pub struct Thread {
     /// the aggregate path consumes through `skip_return`
     /// without consulting the record).
     ///
-    /// Saturation (documented residual, PROVEN minimal): an
-    /// evicted middle owner falls back to slot-first and may
-    /// hijack on a same-cookie slot collision — unavoidable for
-    /// ANY finite depth (K+1 arms with a same-cookie top
-    /// collision reach identical Thread+PENDING bytes with
-    /// conflicting consume/pop mandates — the generalized
-    /// round-3 identity proof). Every distinct-cookie world is
+    /// Saturation (documented residual — a NAMED PINNED
+    /// limitation, an explicit coverage trade, NOT a proven
+    /// necessity or minimality result): an evicted middle owner
+    /// falls back to slot-first and may hijack on a same-cookie
+    /// slot collision (K+1 arms with a same-cookie top collision
+    /// reach identical Thread+PENDING bytes with conflicting
+    /// consume/pop mandates — the generalized round-3 identity
+    /// construction — so exact reconstruction is unachievable
+    /// there; it does NOT prove strict fail-closed saturation
+    /// impossible for finite depth — see the Amendment 6D-A2
+    /// saturation residual). Every distinct-cookie world is
     /// served exactly; every residual hole needs same-cookie
     /// ambiguity (the R11-accepted b3/b4 class). Eviction is
     /// detectable (`counter_evicted`, cleared only at drain).
@@ -1522,7 +1526,7 @@ mod tests {
         // its own frame. (RED pre-fix: this schedule cascaded the
         // exact [(8,7)..(2,1)] through the old cookie-blind counter
         // rule; the cascade shape stays pinned post-fix by
-        // `fix8_same_cookie_skip_still_cascades_impossibility`.)
+        // `fix8_same_cookie_skip_still_cascades_documented_limitation`.)
         const A: u64 = 0xA11CE;
         const B: u64 = 0xB00B;
         const C: u64 = 0xC10C;
@@ -1648,13 +1652,15 @@ mod tests {
         }
     }
     #[test]
-    fn fix8_same_cookie_skip_still_cascades_impossibility() {
-        // fix8 F2 impossibility pin (R8-2): the SAME schedule with
-        // ONE cookie still cascades [(8,7)..(2,1)] — PROVABLY
-        // unfixable (same-cookie return events are ambiguous: B's
-        // return and C's return are the identical observation, so
-        // no deterministic rule pops correctly in both the skip and
-        // no-skip worlds). Unrealizable for the R8-2 mixed
+    fn fix8_same_cookie_skip_still_cascades_documented_limitation() {
+        // fix8 F2 documented limitation (R8-2 — an explicit
+        // coverage trade, NOT a proven necessity result): the SAME
+        // schedule with ONE cookie still cascades [(8,7)..(2,1)] —
+        // exact reconstruction is unachievable there (same-cookie
+        // return events are ambiguous: B's return and C's return
+        // are the identical observation, so no deterministic rule
+        // pops correctly in both the skip and no-skip worlds).
+        // Unrealizable for the R8-2 mixed
         // reject/accept shape (never-reopen forbids it); pinned so
         // the boundary stays documented, not so it stays broken by
         // accident. The mechanism degrades exactly to the old
@@ -2795,10 +2801,13 @@ mod tests {
     }
     #[test]
     fn r11_evicted_middle_owner_falls_back_to_slot_first() {
-        // Round-6 1a saturation residual (PROVEN unavoidable —
-        // the generalized round-3 identity proof: K+1 arms with
-        // a same-cookie top collision reach identical state
-        // with conflicting mandates): B(S) slots the O-marker;
+        // Round-6 1a saturation residual (a NAMED PINNED
+        // limitation — an explicit coverage trade, NOT a proven
+        // necessity result: the generalized round-3 identity
+        // construction — K+1 arms with a same-cookie top
+        // collision reach identical state with conflicting
+        // mandates — shows exact reconstruction unachievable
+        // there): B(S) slots the O-marker;
         // C(X), D(S), E(Y) collide onto the counter (D evicted);
         // E settles; D — the forgotten middle — matches B's
         // marker and falls back to slot-first, popping it; C
@@ -3093,5 +3102,83 @@ mod tests {
             (0, 0, 0)
         );
         assert_eq!((m.suppressed, m.discarded), (0, 1));
+    }
+    #[test]
+    fn r13_mixed_rejected_steal_is_documented_limitation() {
+        // R13 mixed rejected-steal behavioral pin (re-scope
+        // ACCEPTED — CURRENT behavior pinned, not fixed): seven
+        // framed non-operational Y calls + operational X1's frame
+        // (inv 8, depth 8); A(Y) + B(X) quota counter units
+        // ([Y,X], strict LIFO, no skips, no eviction). The window
+        // closes; B's rejected return pops X1's frame (slot-first
+        // rejected arm — its own counter unit survives); the stale
+        // X top then permits A's accepted return to emit (7,900)
+        // against Y7's frame; X1's genuine rejected return
+        // consumes B's orphaned unit ([Y,X]→[Y]); Y's next return
+        // consumes A's unit slotless; the six outer Y returns pop
+        // own frames. Final [(7,900),(6,6)..(1,1)] to (0,0,0)
+        // with suppr 0, disc 0, evicted 0 (one mislabel — the
+        // all-live mixed analog of the R10 same-cookie
+        // rejected-steal; every call returns normally in LIFO
+        // order, no skip or reopening). (RED pre-pin: the rev12
+        // :2897 assurance expected [(7,7)..(1,1)] — the failure's
+        // `left` quoted [(7,900)..(1,1)], refuting it.)
+        const Y: u64 = 1;
+        const X: u64 = 2;
+        let mut m = Fix8Model::new();
+        for _ in 0..7 {
+            m.frame(Y);
+        }
+        m.frame(X); // X1, invocation 8
+        m.quota_fail = true;
+        m.overflow(Y); // A(Y), outer counter unit
+        m.overflow(X); // B(X), inner counter unit, both enter while open
+        m.quota_fail = false;
+        assert_eq!((m.thread.depth, m.thread.overflow), (8, 2));
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (2, Y, X)
+        );
+        assert!(m.return_reject(X)); // B steals X1's frame, keeps its unit
+        assert_eq!(
+            (m.thread.depth, m.thread.overflow, m.thread.blind),
+            (7, 2, 0)
+        );
+        assert_eq!(
+            (
+                m.thread.counter_len,
+                m.thread.counter_owner,
+                m.thread.counter_owner2
+            ),
+            (2, Y, X),
+            "a frame pop settles nothing"
+        );
+        m.return_accept(Y, 900); // A emits against Y7's frame
+        assert_eq!(m.emitted[..m.emitted_len], [(7, 900)]);
+        assert!(m.return_reject(X)); // X1's genuine return eats B's orphan
+        assert_eq!(m.thread.overflow, 1);
+        assert_eq!(
+            (m.thread.counter_len, m.thread.counter_owner),
+            (1, Y),
+            "X1's rejected consume settles X's top entry"
+        );
+        m.return_accept(Y, 7); // Y consumes A's unit slotless
+        assert_eq!(m.emitted_len, 1);
+        assert_eq!(m.thread.overflow, 0);
+        assert_eq!(m.thread.counter_len, 0);
+        for rv in (1..=6u64).rev() {
+            m.return_accept(Y, rv);
+        }
+        assert_eq!(
+            m.emitted[..m.emitted_len],
+            [(7, 900), (6, 6), (5, 5), (4, 4), (3, 3), (2, 2), (1, 1)]
+        );
+        m.assert_quiescent();
+        assert_eq!(m.thread.counter_evicted, 0);
+        assert_eq!((m.suppressed, m.discarded), (0, 0));
     }
 }
