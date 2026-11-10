@@ -7,12 +7,13 @@
 # no hostPID, no hostNetwork. This mirrors the documented
 # `docker run` owned recipe (see docs/container.md).
 #
-# No `runAsNonRoot: true` here: kubelet cannot verify a name-based
-# image USER (`container has runAsNonRoot and image has non-numeric
-# user (osslscope), cannot verify user is non-root` — the pod never
-# starts). The image already runs as the non-root `osslscope` user by
-# default; pinning a numeric `runAsUser` would couple this manifest to
-# the image's uid allocation, so the image default stands alone.
+# User: numeric `runAsUser: 65532` + `runAsNonRoot: true`. Kubelet
+# cannot verify a name-based image USER (`container has runAsNonRoot
+# and image has non-numeric user (osslscope), cannot verify user is
+# non-root` — the pod never starts), so the image pins the
+# `osslscope` user to the stable uid 65532 (see Dockerfile) and this
+# manifest mirrors it numerically. Belt-and-braces over the image
+# default: a mutated image running as root now refuses to start.
 #
 # Exit semantics are honest, not green: a useful-but-gapped run exits
 # 3 with a PARTIAL report (the normal outcome — see the README
@@ -45,6 +46,11 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: osslscope-report
+          # Mutable tag + IfNotPresent: pre-publish `kind load` nodes
+          # keep a same-tag test image that shadows the release image
+          # with no warning — `docker rmi` before applying release
+          # manifests, or digest-pin post-publish. (No digest exists
+          # to pin until 0.5.0 is pushed.)
           image: ghcr.io/mingulov/osslscope:0.5.0
           imagePullPolicy: IfNotPresent
           args:
@@ -64,6 +70,8 @@ spec:
           # CONSTRAINT_MEMCG on memcg-charged kernel BPF memory). A 1 Gi
           # limit OOMs with exit 137 (proven in docker AND kind); 2 Gi
           # holds the measured peak with headroom.
+          # CPU 250m/1 are sane defaults, NOT measured — memory is the
+          # drilled dimension.
           resources:
             requests:
               cpu: 250m
@@ -73,6 +81,8 @@ spec:
               memory: 2Gi
           securityContext:
             privileged: false
+            runAsUser: 65532
+            runAsNonRoot: true
             capabilities:
               drop: ["ALL"]
               add: ["BPF", "PERFMON"]

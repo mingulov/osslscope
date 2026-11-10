@@ -27,9 +27,11 @@
 #
 # Liveness/readiness: exec `osslscope doctor --format json`. osslscope
 # exposes NO HTTP endpoint, so there is no httpGet probe to write.
-# doctor exits 0 on a qualifying node and 4 (fail-closed, LOUD) on an
-# unqualifying one — DaemonSet Ready therefore tracks per-node
-# qualification, and unqualifying nodes fail loud instead of green.
+# doctor exits 0 on a qualifying node and 3 with a loud stderr reason
+# when a capability is unavailable — DaemonSet Ready therefore tracks
+# per-node qualification, and unqualifying nodes fail loud instead of
+# green. (Exit 4 is the sectioned preflight route, which containers
+# refuse for missing package metadata — never the probe signal here.)
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -58,6 +60,11 @@ spec:
         kubernetes.io/arch: amd64
       containers:
         - name: osslscope
+          # Mutable tag + IfNotPresent: pre-publish `kind load` nodes
+          # keep a same-tag test image that shadows the release image
+          # with no warning — `docker rmi` before applying release
+          # manifests, or digest-pin post-publish. (No digest exists
+          # to pin until 0.5.0 is pushed.)
           image: ghcr.io/mingulov/osslscope:0.5.0
           imagePullPolicy: IfNotPresent
           args: ["service", "--config", "/etc/osslscope/service.toml"]
@@ -67,6 +74,8 @@ spec:
           # with exit 137 (proven 3x in the kind drill); 2 Gi holds the
           # measured peak with headroom. Proven over drill windows only —
           # longer service soaks are unproven in 0.x (see README.md).
+          # CPU 250m/1 are sane defaults, NOT measured — memory is the
+          # drilled dimension.
           resources:
             requests:
               cpu: 250m
@@ -120,7 +129,10 @@ spec:
           configMap:
             name: osslscope-service
         - name: out
-          emptyDir: {}
+          # Bounded past the app's 1 GiB retain-bytes so a config or
+          # rotation bug pressures the pod (eviction), never the node.
+          emptyDir:
+            sizeLimit: 2Gi
         - name: btf
           hostPath:
             path: /sys/kernel/btf
