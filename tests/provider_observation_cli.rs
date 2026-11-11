@@ -758,6 +758,39 @@ fn human_verbosity_adds_detail_only() {
     redacted(&v2);
 }
 
+#[test]
+fn human_watch_repeated_snapshot_batches_heartbeat() {
+    // W1 mirror: batch 1 renders full; a later identical batch
+    // (no facts, same gaps, same snapshot state) heartbeats, and
+    // the end record names the cumulative history.
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        "2147483647",
+        "--observe-providers",
+        "--watch",
+        "--interval",
+        "0.05",
+        "--duration",
+        "0.4",
+    ]);
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        text.contains("snapshot 1:"),
+        "first batch full, got: {text}"
+    );
+    assert!(
+        text.contains("tick ") && text.contains("no changes"),
+        "no heartbeat, got: {text}"
+    );
+    assert!(
+        text.contains("cumulative="),
+        "no cumulative word, got: {text}"
+    );
+    redacted(&output);
+}
+
 fn has_64_hex(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() >= 64

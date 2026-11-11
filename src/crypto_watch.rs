@@ -619,6 +619,71 @@ struct DeferredRemoved {
 /// Buffered human gap entry: the grouping key (reason/device/pid)
 /// plus the selected `errno` for `-vv` per-object records.
 type PendingGap = (GapReason, Option<u64>, Option<u32>, Option<i32>);
+
+/// A completed sample awaiting its quiet verdict (W1 lazy
+/// heartbeat): reported only if `end_seq` still matches the
+/// output sequence when the next sample (or close) flushes —
+/// any records printed after the sample veto the heartbeat.
+struct QuietTick {
+    tick: u64,
+    end_seq: u64,
+    status: &'static str,
+    procs: usize,
+    verified: usize,
+    total: usize,
+}
+
+/// Take the pending quiet tick iff nothing printed since the
+/// sample completed. Always consumes the pending slot: a
+/// vetoed tick reports nothing, never late.
+fn take_quiet_heartbeat(pending: &mut Option<QuietTick>, seq_now: u64) -> Option<QuietTick> {
+    let tick = pending.take()?;
+    if tick.end_seq == seq_now {
+        Some(tick)
+    } else {
+        None
+    }
+}
+
+/// Human-only Discovery delta (W1): refresh per-process
+/// digests, evict departed pids (bounded across pid reuse),
+/// and return the (pid, starttime) keys that are new or
+/// changed — the only ones the human path renders. The machine
+/// path ignores the return and emits every record.
+fn refresh_discovery_digests(
+    prev: &mut BTreeMap<(u32, u64), inventory::WatchedProcessDigest>,
+    processes: &[inventory::ProcessRecord],
+) -> BTreeSet<(u32, u64)> {
+    let mut changed = BTreeSet::new();
+    for process in processes {
+        let key = (process.pid, process.starttime);
+        let digest = inventory::watched_process_digest(process);
+        if prev.get(&key).is_none_or(|old| *old != digest) {
+            changed.insert(key);
+        }
+        prev.insert(key, digest);
+    }
+    prev.retain(|key, _| processes.iter().any(|p| (p.pid, p.starttime) == *key));
+    changed
+}
+
+/// Human-only gap-batch delta (W1): true when this sample's gap
+/// multiset differs from the last rendered one (order never
+/// counts, membership does); refreshes `prev` either way. The
+/// compared tuples match exactly what the grouped block
+/// renders (reason/device/pid plus `-vv` errno).
+fn refresh_gap_batch(prev: &mut Vec<PendingGap>, gaps: &[inventory::Gap]) -> bool {
+    let mut current: Vec<PendingGap> = gaps
+        .iter()
+        .map(|gap| (gap.reason, gap.device, gap.pid, gap.errno))
+        .collect();
+    current.sort();
+    if *prev == current {
+        return false;
+    }
+    *prev = current;
+    true
+}
 struct Output<'a, W> {
     writer: &'a mut W,
     sequence: u64,
@@ -799,6 +864,36 @@ impl<W: Write> Output<'_, W> {
             write!(self.writer, " roots omitted={}", ignored.len() - cap)?;
         }
         writeln!(self.writer)?;
+        self.sequence += 1;
+        self.writer.flush()?;
+        Ok(())
+    }
+    /// Human-only quiet-tick line (W1): the shared heartbeat
+    /// shape (`tick N: no changes (status .., processes ..,
+    /// modules v/t verified)`). Silent in JSON mode — and the
+    /// machine sequence never shifts.
+    fn emit_heartbeat(&mut self, tick: &QuietTick) -> io::Result<()> {
+        if self.json {
+            return Ok(());
+        }
+        writeln!(
+            self.writer,
+            "tick {}: no changes (status {}, processes {}, modules {}/{} verified)",
+            tick.tick, tick.status, tick.procs, tick.verified, tick.total
+        )?;
+        self.sequence += 1;
+        self.writer.flush()?;
+        Ok(())
+    }
+    /// Human-only run-history suffix (F8/H2): the shared
+    /// `cumulative:` word plus the first-uncertain notes. Silent
+    /// in JSON mode — the machine end shape is unchanged.
+    fn emit_cumulative(&mut self, seen: &inventory::watch::Cumulative) -> io::Result<()> {
+        if self.json {
+            return Ok(());
+        }
+        writeln!(self.writer, "cumulative: {}", seen.word())?;
+        self.writer.write_all(seen.notes().as_bytes())?;
         self.sequence += 1;
         self.writer.flush()?;
         Ok(())
@@ -2171,6 +2266,27 @@ struct RunState {
     /// uncertainty edges).
     origin_ns: u64,
     tick_ns: u64,
+    /// Human-only Discovery delta (W1): last rendered digest per
+    /// (pid, starttime). Unchanged per-process Discovery blocks
+    /// stay silent; the machine path still emits every record.
+    /// Evicted to the current sample each tick (bounded).
+    discovery_prev: BTreeMap<(u32, u64), inventory::WatchedProcessDigest>,
+    /// Human-only gap-batch delta (W1): last rendered sample gap
+    /// multiset, sorted. Identical repeats stay silent.
+    gaps_prev: Vec<PendingGap>,
+    /// Run-level sample-history uncertainty (F8/H2), shared with
+    /// the inventory and provider routes.
+    cumulative: inventory::watch::Cumulative,
+    /// Lazy human heartbeat (W1): the last completed sample,
+    /// reported quiet at the next sample (or close) only if
+    /// nothing printed after it — later session records veto.
+    /// Staged only for samples that were silent throughout
+    /// (see `sample_start_seq`).
+    quiet_pending: Option<QuietTick>,
+    /// Output sequence at the current sample's start (W1): the
+    /// sample stages a quiet verdict only if the sequence is
+    /// unchanged at its end — its own records veto staging.
+    sample_start_seq: u64,
 }
 impl RunState {
     fn new(user_pids: BTreeSet<u32>, origin_ns: u64, tick_ns: u64) -> Self {
@@ -2237,6 +2353,11 @@ impl RunState {
             last_probe_ns: origin_ns,
             origin_ns,
             tick_ns: tick_ns.max(1),
+            discovery_prev: BTreeMap::new(),
+            gaps_prev: Vec::new(),
+            cumulative: inventory::watch::Cumulative::default(),
+            quiet_pending: None,
+            sample_start_seq: 0,
         }
     }
     /// 6A tick↔ns mapping (§7 `Start` rule): nominal tick T starts at
@@ -4168,6 +4289,9 @@ impl ServiceEngine {
                         coalesced: 0,
                     },
                 })?;
+                // Zero-sample end (F8/H2): history is clean by
+                // construction — human only, JSON stays silent.
+                out.emit_cumulative(&inventory::watch::Cumulative::default())?;
                 crate::report::err_line(&format!(
                     "osslscope crypto watch: scope unavailable ({}; see records above)",
                     reason.word()
@@ -4363,6 +4487,14 @@ impl ServiceEngine {
         // and active sessions retain metadata between samples.
         let sampled = if now >= next_scan {
             sample_fired = true;
+            // W1 lazy heartbeat (human only; the slot stays empty
+            // in JSON mode so this is a no-op there): the previous
+            // sample reports quiet only if nothing printed after
+            // it completed — later session records veto.
+            if let Some(quiet) = take_quiet_heartbeat(&mut run.quiet_pending, out.sequence) {
+                out.emit_heartbeat(&quiet)?;
+            }
+            run.sample_start_seq = out.sequence;
             let sample_open_ns = LiveClock.monotonic_ns();
             let snapshot = scanner
                 .observation_snapshot_for(interval.min(deadline.saturating_duration_since(now)));
@@ -4380,18 +4512,37 @@ impl ServiceEngine {
                 _ => {}
             }
             run.current_tick = tick;
-            for gap in &snapshot.snapshot.gaps {
-                out.emit(Record::Gap { gap })?;
+            // F8/H2: run-level sample history (both modes; the
+            // human close suffix reads it, JSON ignores it).
+            run.cumulative.observe(tick, snapshot.snapshot.exit_code());
+            // W1 (human only): identical repeat gap batches stay
+            // silent; the first batch still flushes live (no
+            // end-of-run accumulation). JSON emits every gap.
+            let gaps_moved = refresh_gap_batch(&mut run.gaps_prev, &snapshot.snapshot.gaps);
+            if gaps_moved || out.json {
+                for gap in &snapshot.snapshot.gaps {
+                    out.emit(Record::Gap { gap })?;
+                }
+                // Flush each sample's gap batch immediately (human-only;
+                // JSON never buffers): without this, gap-only samples
+                // accumulate silently until the end record. The buffer
+                // holds one sample's (limits-bounded) gap triples at most.
+                out.flush_gaps()?;
             }
-            // Flush each sample's gap batch immediately (human-only;
-            // JSON never buffers): without this, gap-only samples
-            // accumulate silently until the end record. The buffer
-            // holds one sample's (limits-bounded) gap triples at most.
-            out.flush_gaps()?;
             // 6A per-member pass: flags seal first (re-probed),
             // then sample-driven stay/resume/retire/suspend.
             run.sample_members(&mut out, &snapshot.snapshot, &ctx, admitted)?;
+            // W1 (human only): unchanged per-process Discovery
+            // blocks stay silent (first sighting always prints).
+            // JSON emits every record. The break below only fires
+            // when the run is ending (cancel/deadline), so no
+            // later sample can suppress an unrendered block.
+            let changed =
+                refresh_discovery_digests(&mut run.discovery_prev, &snapshot.snapshot.processes);
             for p in &snapshot.snapshot.processes {
+                if !out.json && !changed.contains(&(p.pid, p.starttime)) {
+                    continue;
+                }
                 out.emit(Record::Discovery {
                     process: p,
                     sidecar: Some(&snapshot.snapshot.resolve),
@@ -4452,6 +4603,21 @@ impl ServiceEngine {
             sync_selection(scanner, run);
             sync_roots(port, run);
             run.prev_tick = Some(tick);
+            // W1: stage this sample's quiet verdict (human only),
+            // but only if the sample printed nothing at all — its
+            // own records veto staging, and anything printed
+            // later vetoes the report (see the flush above).
+            if !out.json && out.sequence == run.sample_start_seq {
+                let (verified, locator) = snapshot.snapshot.identity_counts();
+                run.quiet_pending = Some(QuietTick {
+                    tick,
+                    end_seq: out.sequence,
+                    status: snapshot.snapshot.capabilities.inventory.word(),
+                    procs: snapshot.snapshot.processes.len(),
+                    verified,
+                    total: verified + locator,
+                });
+            }
             Some(snapshot)
         } else {
             None
@@ -4752,6 +4918,12 @@ impl ServiceEngine {
             lost_intervals: run.carrier.wire(),
             coalesced: run.carrier.coalesced,
         };
+        // W1: flush the last sample's quiet verdict (if any)
+        // before the end record — close seals printed above veto
+        // it exactly like any later record.
+        if let Some(quiet) = take_quiet_heartbeat(&mut run.quiet_pending, out.sequence) {
+            out.emit_heartbeat(&quiet)?;
+        }
         out.emit(Record::End {
             reason,
             segments: run.segments,
@@ -4762,6 +4934,9 @@ impl ServiceEngine {
             deferred_removed: std::mem::take(&mut run.removed),
             session_loss,
         })?;
+        // F8/H2: run-level sample history (human only; the
+        // machine end shape is unchanged).
+        out.emit_cumulative(&run.cumulative)?;
         crate::report::err_line(&crypto_end_reason(run.segments, reason));
         let code = if run.segments == 0 { 4 } else { 3 };
         self.sequence = out.sequence;
@@ -9090,5 +9265,176 @@ mod tests {
             super::pool_exhausted_reason().contains("pool exhausted"),
             "pool reason pinned"
         );
+    }
+
+    fn watch_process(pid: u32, starttime: u64, comm: &str) -> crate::inventory::ProcessRecord {
+        use crate::inventory as inv;
+        inv::ProcessRecord {
+            interval: inv::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            },
+            namespaces: inv::NamespaceIds::default(),
+            pid,
+            starttime,
+            comm: Some(comm.to_string()),
+            comm_status: inv::IdentityAvailability::Available,
+            exe: None,
+            exe_status: inv::IdentityAvailability::Unreadable,
+            modules: Vec::new(),
+            provider_activation: inv::ObservationState::Unknown,
+            provider_interfaces: inv::ObservationState::Unknown,
+            execution: inv::ObservationState::NotObserved,
+        }
+    }
+
+    // W1 mirror (human only): unchanged per-process Discovery
+    // blocks stay silent; new/changed processes still print.
+    // Departed pids evict so long watches stay bounded.
+    #[test]
+    fn refresh_discovery_digests_reports_new_changed_and_evicts_departed() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut prev: BTreeMap<(u32, u64), crate::inventory::WatchedProcessDigest> =
+            BTreeMap::new();
+        let seen = watch_process(11, 100, "child");
+        assert_eq!(
+            super::refresh_discovery_digests(&mut prev, std::slice::from_ref(&seen)),
+            BTreeSet::from([(11, 100)])
+        );
+        assert!(
+            super::refresh_discovery_digests(&mut prev, std::slice::from_ref(&seen)).is_empty()
+        );
+        let renamed = watch_process(11, 100, "renamed");
+        assert_eq!(
+            super::refresh_discovery_digests(&mut prev, std::slice::from_ref(&renamed)),
+            BTreeSet::from([(11, 100)])
+        );
+        assert!(super::refresh_discovery_digests(&mut prev, &[]).is_empty());
+        assert!(prev.is_empty(), "departed pids must evict");
+        assert_eq!(
+            super::refresh_discovery_digests(&mut prev, std::slice::from_ref(&seen)),
+            BTreeSet::from([(11, 100)])
+        );
+    }
+
+    // Same for per-sample gap batches: identical repeats stay
+    // silent (multiset comparison — order never counts, counts do).
+    #[test]
+    fn refresh_gap_batch_suppresses_identical_repeats() {
+        use crate::inventory as inv;
+        let gap = || inv::Gap {
+            pid: Some(7),
+            device: Some(1),
+            inode: Some(10),
+            reason: inv::GapReason::TooLarge,
+            errno: Some(1),
+            actor_euid: Some(1001),
+        };
+        let mut prev = Vec::new();
+        assert!(super::refresh_gap_batch(
+            &mut prev,
+            std::slice::from_ref(&gap())
+        ));
+        assert!(!super::refresh_gap_batch(
+            &mut prev,
+            std::slice::from_ref(&gap())
+        ));
+        assert!(super::refresh_gap_batch(&mut prev, &[gap(), gap()]));
+        assert!(!super::refresh_gap_batch(&mut prev, &[gap(), gap()]));
+        assert!(super::refresh_gap_batch(&mut prev, &[]));
+        assert!(!super::refresh_gap_batch(&mut prev, &[]));
+    }
+
+    // The lazy heartbeat: a completed sample reports quiet only
+    // when nothing printed after it (later session records veto).
+    #[test]
+    fn quiet_tick_flushes_only_when_silent() {
+        let mut pending = Some(super::QuietTick {
+            tick: 4,
+            end_seq: 10,
+            status: "complete",
+            procs: 1,
+            verified: 1,
+            total: 1,
+        });
+        assert!(super::take_quiet_heartbeat(&mut pending, 12).is_none());
+        assert!(pending.is_none());
+        let mut pending = Some(super::QuietTick {
+            tick: 5,
+            end_seq: 12,
+            status: "partial",
+            procs: 1,
+            verified: 0,
+            total: 1,
+        });
+        let flushed = super::take_quiet_heartbeat(&mut pending, 12).unwrap();
+        assert_eq!((flushed.tick, flushed.status), (5, "partial"));
+        assert!(pending.is_none());
+        assert!(super::take_quiet_heartbeat(&mut pending, 12).is_none());
+    }
+
+    #[test]
+    fn heartbeat_and_cumulative_lines_share_watch_shapes() {
+        let mut bytes = Vec::new();
+        {
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: false,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+                verbosity: 0,
+            };
+            out.emit_heartbeat(&super::QuietTick {
+                tick: 2,
+                end_seq: 9,
+                status: "partial",
+                procs: 1,
+                verified: 0,
+                total: 1,
+            })
+            .unwrap();
+            let mut seen = crate::inventory::watch::Cumulative::default();
+            seen.observe(1, 3);
+            out.emit_cumulative(&seen).unwrap();
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("tick 2: no changes (status partial, processes 1, modules 0/1 verified)"),
+            "got: {text}"
+        );
+        assert!(text.contains("cumulative: partial-seen"), "got: {text}");
+        assert!(
+            text.contains("note: sample 1 was partial; history remains uncertain"),
+            "got: {text}"
+        );
+        // JSON mode: both silent (machine records carry the evidence).
+        let mut bytes = Vec::new();
+        {
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: true,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+                verbosity: 0,
+            };
+            out.emit_heartbeat(&super::QuietTick {
+                tick: 2,
+                end_seq: 9,
+                status: "partial",
+                procs: 1,
+                verified: 0,
+                total: 1,
+            })
+            .unwrap();
+            out.emit_cumulative(&crate::inventory::watch::Cumulative::default())
+                .unwrap();
+            assert_eq!(out.sequence, 0, "machine sequence must not shift");
+        }
+        assert!(bytes.is_empty());
     }
 }

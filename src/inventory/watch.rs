@@ -106,6 +106,65 @@ pub(super) fn exit_reason(outcome: &WatchOutcome) -> Option<String> {
         EndReason::Output => None,
     }
 }
+
+/// Run-level sample-history uncertainty (F8/H2), shared by the
+/// inventory, provider, and crypto-watch routes: a later
+/// complete sample never erases earlier uncertainty. `usable`
+/// tracks whether ANY sample was usable (exit != 4);
+/// `partial`/`unavailable` book the first uncertain sample per
+/// track. An exit-4 sample books the unavailable track only —
+/// one note per track, never a double note for one sample.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Cumulative {
+    pub(crate) usable: bool,
+    pub(crate) partial: bool,
+    pub(crate) unavailable: bool,
+    pub(crate) first_partial: Option<u64>,
+    pub(crate) first_unavailable: Option<u64>,
+}
+impl Cumulative {
+    pub(crate) fn observe(&mut self, sample: u64, exit: u8) {
+        self.usable |= exit != 4;
+        match exit {
+            4 => {
+                self.unavailable = true;
+                self.first_unavailable.get_or_insert(sample);
+            }
+            0 => {}
+            // Unknown exits fail closed into partial history:
+            // unrecognized status is uncertainty, never clean.
+            _ => {
+                self.partial = true;
+                self.first_partial.get_or_insert(sample);
+            }
+        }
+    }
+    /// A degraded observation without an unavailable inventory
+    /// sample still books partial history (provider route).
+    pub(crate) fn note_partial(&mut self, sample: u64) {
+        self.partial = true;
+        self.first_partial.get_or_insert(sample);
+    }
+    /// End status for a Duration end: 4 iff zero usable samples
+    /// (all unavailable, or none at all — same rule as the
+    /// provider end record), else 3 iff any uncertainty was
+    /// seen, else 0.
+    pub(crate) fn end_status(&self) -> u8 {
+        if !self.usable {
+            4
+        } else if self.partial || self.unavailable {
+            3
+        } else {
+            0
+        }
+    }
+    pub(crate) fn word(&self) -> &'static str {
+        super::cumulative_word(self.partial, self.unavailable)
+    }
+    pub(crate) fn notes(&self) -> String {
+        super::cumulative_notes(self.first_partial, self.first_unavailable)
+    }
+}
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangeKind {
@@ -114,6 +173,30 @@ enum ChangeKind {
     ProcessNotSeen,
     ModuleNotSeen,
     VisibilityLost,
+}
+impl ChangeKind {
+    /// Human word for change event lines. Mirrors the serde
+    /// snake_case label (and the discovery-v1 schema enum)
+    /// exactly — see `tests::watch_words_match_json`.
+    fn word(&self) -> &'static str {
+        match self {
+            ChangeKind::ProcessSeen => "process_seen",
+            ChangeKind::ModuleSeen => "module_seen",
+            ChangeKind::ProcessNotSeen => "process_not_seen",
+            ChangeKind::ModuleNotSeen => "module_not_seen",
+            ChangeKind::VisibilityLost => "visibility_lost",
+        }
+    }
+}
+/// Human word for the end reason. Mirrors the serde snake_case
+/// label exactly — see `tests::watch_words_match_json`.
+fn reason_word(reason: EndReason) -> &'static str {
+    match reason {
+        EndReason::Duration => "duration",
+        EndReason::Interrupted => "interrupted",
+        EndReason::ScopeUnavailable => "scope_unavailable",
+        EndReason::Output => "output",
+    }
 }
 #[derive(Serialize)]
 struct Change {
@@ -135,7 +218,27 @@ struct Record<'a> {
     sampled_history: &'static str,
 }
 fn same_module(a: &ModuleRecord, b: &ModuleRecord) -> bool {
-    (a.info.device, a.info.inode, &a.info.sha256) == (b.info.device, b.info.inode, &b.info.sha256)
+    // Identity, evidence, and version sameness on top of file
+    // identity: a status flip or a changed locator/version hint
+    // is a meaningful watch change (W1). `capture_unix_ms` is
+    // re-stamped every sample and excluded — comparing it would
+    // flap every tick and kill the heartbeat.
+    a.info == b.info
+        && a.identity_status == b.identity_status
+        && same_verified_path(a.verified_path.as_ref(), b.verified_path.as_ref())
+        && a.verified_path_unavailable == b.verified_path_unavailable
+        && a.maps_spelling == b.maps_spelling
+}
+fn same_verified_path(a: Option<&super::VerifiedPath>, b: Option<&super::VerifiedPath>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x.path == y.path
+                && x.path_encoding == y.path_encoding
+                && x.locator_kind == y.locator_kind
+        }
+        _ => false,
+    }
 }
 fn visible(snapshot: &Snapshot, pid: u32) -> bool {
     snapshot.gaps.iter().all(|gap| {
@@ -194,7 +297,18 @@ fn changes(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
                 p.pid == old.pid && p.starttime == old.starttime && p.namespaces == old.namespaces
             });
             if !visible(current, old.pid) {
-                add(ChangeKind::VisibilityLost, old.pid, old.starttime, None);
+                // Visibility loss fires on transitions (was usable,
+                // now not) and for pids gone from an unusable sample
+                // (exit unprovable — never process_not_seen). A pid
+                // that stays present across persistently unusable
+                // samples is NOT news every tick: steady
+                // uncertainty heartbeats (W1); gap churn still
+                // breaks the human heartbeat via `gaps_changed`.
+                let was_visible = visible(previous, old.pid);
+                let gone = !current.processes.iter().any(|p| p.pid == old.pid);
+                if was_visible || gone {
+                    add(ChangeKind::VisibilityLost, old.pid, old.starttime, None);
+                }
             } else if let Some(now) = now {
                 for module in &old.modules {
                     if !now.modules.iter().any(|m| same_module(m, module)) {
@@ -217,104 +331,189 @@ fn changes(previous: Option<&Snapshot>, current: &Snapshot) -> Vec<Change> {
     }
     result
 }
-fn emit(
-    value: &impl Serialize,
+
+/// (pid, starttime) processes re-observed with different names
+/// (comm/exe): the same incarnation, so `changes()` — whose
+/// vocabulary is schema-pinned — stays silent, but the human
+/// tick must not heartbeat over a rename (W1 names).
+fn names_changed(previous: &Snapshot, current: &Snapshot) -> Vec<(u32, u64)> {
+    let mut renamed = Vec::new();
+    for process in &current.processes {
+        let old = previous.processes.iter().find(|p| {
+            p.pid == process.pid
+                && p.starttime == process.starttime
+                && p.namespaces == process.namespaces
+        });
+        let names = (
+            process.comm.as_deref(),
+            process.comm_status,
+            process.exe.as_deref(),
+            process.exe_status,
+        );
+        if old.is_some_and(|old| {
+            (
+                old.comm.as_deref(),
+                old.comm_status,
+                old.exe.as_deref(),
+                old.exe_status,
+            ) != names
+        }) {
+            renamed.push((process.pid, process.starttime));
+        }
+    }
+    renamed
+}
+
+/// True when the gap multiset changed between samples (W1
+/// gaps): gap-only churn still breaks the human heartbeat —
+/// uncertainty deltas are meaningful changes. Sorted before
+/// comparing: sample order never counts, membership does.
+fn gaps_changed(previous: &Snapshot, current: &Snapshot) -> bool {
+    let mut old = previous.gaps.clone();
+    old.sort();
+    let mut new = current.gaps.clone();
+    new.sort();
+    old != new
+}
+fn emit(value: &impl Serialize, writer: &mut impl Write) -> io::Result<()> {
+    serde_json::to_writer(&mut *writer, value).map_err(io::Error::other)?;
+    writer.write_all(b"\n")?;
+    writer.flush()
+}
+/// Human change event line (typed; the `path=` fragment still
+/// reads through the JSON-shaped module because
+/// `TerminalPathWriter::change_fragment` takes a `Value`).
+/// Full sha256 today — Task 4 truncates these lines (W2).
+fn human_change_line(
     writer: &mut impl Write,
-    human: bool,
-    paths: Option<&super::resolve::TerminalPathWriter>,
+    change: &Change,
+    paths: &super::resolve::TerminalPathWriter,
 ) -> io::Result<()> {
-    if human {
-        // Finite enums and safe numeric/hash identities only. This is one
-        // transient bounded record, never a retained history array.
-        let value = serde_json::to_value(value).map_err(io::Error::other)?;
-        if value["record"] == "end" {
-            writeln!(
-                writer,
-                "Watch ended: {} (status {}, snapshots {}). Sampled history remains incomplete.",
-                value["reason"], value["status"], value["sequence"]
-            )?;
-            writeln!(
-                writer,
-                "  elapsed={}s+{}ns; limits: pids={} objects={} charged_bytes={} timeout={}s+{}ns",
-                value["elapsed"]["secs"],
-                value["elapsed"]["nanos"],
-                value["limits"]["max_pids"],
-                value["limits"]["max_objects"],
-                value["limits"]["max_read_bytes"],
-                value["limits"]["timeout"]["secs"],
-                value["limits"]["timeout"]["nanos"]
-            )?;
-            if !value["gap"].is_null() {
-                writeln!(writer, "  scope gap={}", value["gap"])?;
-            }
+    write!(
+        writer,
+        "  {} pid={} starttime={}",
+        change.kind.word(),
+        change.pid,
+        change.starttime
+    )?;
+    if let Some(module) = &change.module {
+        write!(writer, " sha256={}", module.info.sha256)?;
+        // T5 `--resolve-paths`: TTY-only fragment from the
+        // dedicated writer (omitted unless flag on; never in the
+        // machine record).
+        let value = serde_json::to_value(module).map_err(io::Error::other)?;
+        if let Some(fragment) = paths.change_fragment(&value) {
+            write!(writer, " path={fragment}")?;
+        }
+    }
+    writeln!(writer)
+}
+/// Human per-sample render (W1): every tick opens with its
+/// `tick N:` status line — the per-sample heartbeat with
+/// status/counts — and the state beneath depends on what
+/// moved. Tick 1 and `-v` ticks render full state; change ticks
+/// render event lines plus changed-process blocks; gap-only or
+/// name-only churn renders full state or the renamed blocks
+/// (gap diffs can be unnamed, so only the names case stays
+/// targeted); quiet ticks print the line alone. `previous` is
+/// `None` only for tick 1.
+fn human_tick(
+    writer: &mut impl Write,
+    sequence: u64,
+    snapshot: &Snapshot,
+    deltas: &[Change],
+    previous: Option<&Snapshot>,
+    paths: &super::resolve::TerminalPathWriter,
+    verbosity: u8,
+) -> io::Result<()> {
+    let (verified, locator) = snapshot.identity_counts();
+    let total = verified + locator;
+    let status = snapshot.capabilities.inventory.word();
+    let procs = snapshot.processes.len();
+    let renamed = previous.map_or_else(Vec::new, |old| names_changed(old, snapshot));
+    let gaps_moved = previous.is_some_and(|old| gaps_changed(old, snapshot));
+    let verbose = verbosity >= 1;
+    if previous.is_none() {
+        writeln!(
+            writer,
+            "tick {sequence}: initial state (status {status}, processes {procs}, modules {verified}/{total} verified)"
+        )?;
+        // First-sighting event lines (starttimes ride here at
+        // level 0 — the verdict lines below carry no starttime).
+        for delta in deltas {
+            human_change_line(writer, delta, paths)?;
+        }
+        super::cli::human_snapshot_body(writer, snapshot, paths, verbosity, None)?;
+    } else if !deltas.is_empty() {
+        writeln!(
+            writer,
+            "tick {sequence}: {} sampled changes (status {status}, processes {procs}, modules {verified}/{total} verified)",
+            deltas.len()
+        )?;
+        for delta in deltas {
+            human_change_line(writer, delta, paths)?;
+        }
+        if verbose || gaps_moved {
+            super::cli::human_snapshot_body(writer, snapshot, paths, verbosity, None)?;
         } else {
-            writeln!(
-                writer,
-                "Snapshot {}: inventory {}; sampled changes {}",
-                value["sequence"],
-                value["snapshot"]["capabilities"]["inventory"],
-                value["changes"].as_array().map_or(0, Vec::len)
-            )?;
-            // Identity totals mirror the typed Snapshot::identity_counts
-            // over the serialized modules. Unrecognized words are ignored
-            // (never misclassified): the schema is versioned and new
-            // variants must not corrupt old totals.
-            let mut verified = 0usize;
-            let mut locator = 0usize;
-            for module in value["snapshot"]["processes"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .flat_map(|p| p["modules"].as_array().into_iter().flatten())
-            {
-                match module["identity_status"].as_str() {
-                    Some("verified") => verified += 1,
-                    Some("locator_candidate") => locator += 1,
-                    _ => {}
-                }
-            }
-            write!(
-                writer,
-                "  {}",
-                super::identity_totals_line(verified, locator)
-            )?;
-            // Per-snapshot groups (buffered for this flush only): typed
-            // gaps deserialize from the same Value the rows below read,
-            // so the block repeats the record exactly. On schema drift
-            // the old per-gap lines keep rendering (never fail loud).
-            match serde_json::from_value::<Vec<super::Gap>>(value["snapshot"]["gaps"].clone()) {
-                Ok(gaps) => {
-                    let triples = gaps.iter().map(|g| (g.reason.word(), g.device, g.pid));
-                    writer.write_all(super::gap_groups_block(triples, "  ").as_bytes())?;
-                }
-                Err(_) => {
-                    for gap in value["snapshot"]["gaps"].as_array().into_iter().flatten() {
-                        writeln!(writer, "  gap={} pid={}", gap["reason"], gap["pid"])?;
-                    }
-                }
-            }
-            for change in value["changes"].as_array().into_iter().flatten() {
-                write!(
-                    writer,
-                    "  {} pid={} starttime={}",
-                    change["kind"], change["pid"], change["starttime"]
-                )?;
-                if !change["module"].is_null() {
-                    write!(writer, " sha256={}", change["module"]["info"]["sha256"])?;
-                    // T5 `--resolve-paths`: TTY-only fragment from the
-                    // dedicated writer (omitted unless flag on; never
-                    // in the machine record above).
-                    if let Some(fragment) = paths.and_then(|w| w.change_fragment(&change["module"]))
-                    {
-                        write!(writer, " path={fragment}")?;
-                    }
-                }
-                writeln!(writer)?;
-            }
+            let only: std::collections::BTreeSet<(u32, u64)> = deltas
+                .iter()
+                .map(|delta| (delta.pid, delta.starttime))
+                .chain(renamed)
+                .collect();
+            super::cli::human_snapshot_body(writer, snapshot, paths, verbosity, Some(&only))?;
+        }
+    } else if !renamed.is_empty() || gaps_moved {
+        writeln!(
+            writer,
+            "tick {sequence}: state changed (status {status}, processes {procs}, modules {verified}/{total} verified)"
+        )?;
+        if !verbose && !gaps_moved {
+            let only: std::collections::BTreeSet<(u32, u64)> = renamed.into_iter().collect();
+            super::cli::human_snapshot_body(writer, snapshot, paths, verbosity, Some(&only))?;
+        } else {
+            super::cli::human_snapshot_body(writer, snapshot, paths, verbosity, None)?;
         }
     } else {
-        serde_json::to_writer(&mut *writer, value).map_err(io::Error::other)?;
-        writer.write_all(b"\n")?;
+        // Quiet tick: the line always reports reality; `-v`
+        // additionally dumps full state beneath it.
+        writeln!(
+            writer,
+            "tick {sequence}: no changes (status {status}, processes {procs}, modules {verified}/{total} verified)"
+        )?;
+        if verbose {
+            super::cli::human_snapshot_body(writer, snapshot, paths, verbosity, None)?;
+        }
+    }
+    writer.flush()
+}
+/// Human end render (typed): the `Watch ended:` verdict with
+/// run-level cumulative history (F8/H2) plus the
+/// first-uncertain notes — a later complete sample never
+/// erases earlier uncertainty.
+fn human_end(writer: &mut impl Write, outcome: &WatchOutcome, seen: &Cumulative) -> io::Result<()> {
+    writeln!(
+        writer,
+        "Watch ended: {} (status {}, snapshots {}, cumulative: {}). Sampled history remains incomplete.",
+        reason_word(outcome.reason),
+        outcome.status,
+        outcome.sequence,
+        seen.word()
+    )?;
+    writer.write_all(seen.notes().as_bytes())?;
+    writeln!(
+        writer,
+        "  elapsed={}s+{}ns; limits: pids={} objects={} charged_bytes={} timeout={}s+{}ns",
+        outcome.elapsed.as_secs(),
+        outcome.elapsed.subsec_nanos(),
+        outcome.limits.max_pids,
+        outcome.limits.max_objects,
+        outcome.limits.max_read_bytes,
+        outcome.limits.timeout.as_secs(),
+        outcome.limits.timeout.subsec_nanos()
+    )?;
+    if let Some(gap) = outcome.gap {
+        writeln!(writer, "  scope gap={}", gap.word())?;
     }
     writer.flush()
 }
@@ -325,16 +524,15 @@ pub fn run(
     writer: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<WatchOutcome, io::Error> {
-    // Machine-only entry: force both intents off. Intentional-for-now
-    // D1 carve-out per R6: v0.6.0 D1 rejected the never-in-JSON gate
-    // for CLI output, but this internal `run()` keeps acquisition off
-    // until human-surface Task 3 flips it (and re-pins the
-    // `sampled_arrival_removal_visibility_and_direct_cancellation`
-    // canary in tests/inventory_watch.rs) — NOT live F2 doctrine.
+    // Machine-only entry (v0.6.0 D1, F7): machine records
+    // always acquire path evidence — proven `verified_path` or
+    // null plus a finite `verified_path_unavailable` reason —
+    // exactly like the CLI `--json` path (`acquire_paths`). Only
+    // the human TTY `path=` render fragment stays off here.
     let mut machine = options.clone();
-    machine.selection.resolve_paths = false;
+    machine.selection.resolve_paths = true;
     machine.resolve_paths = false;
-    run_formatted(&machine, writer, cancel, false, false)
+    run_formatted(&machine, writer, cancel, false, false, 0)
 }
 pub(super) fn run_formatted(
     options: &WatchOptions,
@@ -342,6 +540,7 @@ pub(super) fn run_formatted(
     cancel: &AtomicBool,
     human: bool,
     terminal: bool,
+    verbosity: u8,
 ) -> io::Result<WatchOutcome> {
     options.validate()?;
     let started = Instant::now();
@@ -349,16 +548,18 @@ pub(super) fn run_formatted(
         writer.write_all(b"Passive sampled inventory: mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n")?;
     }
     let mut sequence = 0;
-    let mut status = 4;
     let mut previous = None;
     let mut blindness_printed = false;
+    // F8/H2: run-level sample history — the Duration end status
+    // derives from this, never from the last sample alone.
+    let mut seen = Cumulative::default();
     let mut end = WatchOutcome {
         schema_version: "osslscope.discovery.v1",
         mode: "watch",
         record: "end",
         sequence: 0,
         reason: EndReason::Duration,
-        status,
+        status: 4,
         elapsed: Duration::ZERO,
         limits: options.limits.clone(),
         gap: None,
@@ -368,7 +569,11 @@ pub(super) fn run_formatted(
         end.reason = EndReason::Interrupted;
         end.status = 3;
         end.elapsed = started.elapsed();
-        emit(&end, writer, human, None)?;
+        if human {
+            human_end(writer, &end, &seen)?;
+        } else {
+            emit(&end, writer)?;
+        }
         return Ok(end);
     }
     let mut scanner = match ScopedScanner::new(options.selection.clone(), options.limits.clone()) {
@@ -382,14 +587,17 @@ pub(super) fn run_formatted(
             }
             end.gap = Some(gap);
             end.elapsed = started.elapsed();
-            emit(&end, writer, human, None)?;
+            if human {
+                human_end(writer, &end, &seen)?;
+            } else {
+                emit(&end, writer)?;
+            }
             return Ok(end);
         }
     };
     loop {
         if cancel.load(Ordering::Relaxed) {
             end.reason = EndReason::Interrupted;
-            status = 3;
             break;
         }
         if options.duration.is_some_and(|d| started.elapsed() >= d) {
@@ -408,18 +616,8 @@ pub(super) fn run_formatted(
             blindness_printed = true;
         }
         sequence += 1;
-        status = snapshot.exit_code();
-        let record = Record {
-            schema_version: "osslscope.discovery.v1",
-            mode: "watch",
-            record: "snapshot",
-            sequence,
-            interval: &snapshot.interval,
-            poll_interval: options.interval,
-            changes: changes(previous.as_ref(), &snapshot),
-            snapshot: &snapshot,
-            sampled_history: "incomplete",
-        };
+        seen.observe(sequence, snapshot.exit_code());
+        let deltas = changes(previous.as_ref(), &snapshot);
         // T5 `--resolve-paths`: per-snapshot writer over this
         // snapshot's sidecar (render intent + TTY from the caller;
         // acquisition was gated separately by the effective
@@ -429,14 +627,44 @@ pub(super) fn run_formatted(
             terminal,
             &snapshot.resolve,
         );
-        if let Err(error) = emit(&record, writer, human, Some(&paths)) {
+        let rendered = if human {
+            human_tick(
+                writer,
+                sequence,
+                &snapshot,
+                &deltas,
+                previous.as_ref(),
+                &paths,
+                verbosity,
+            )
+        } else {
+            emit(
+                &Record {
+                    schema_version: "osslscope.discovery.v1",
+                    mode: "watch",
+                    record: "snapshot",
+                    sequence,
+                    interval: &snapshot.interval,
+                    poll_interval: options.interval,
+                    changes: deltas,
+                    snapshot: &snapshot,
+                    sampled_history: "incomplete",
+                },
+                writer,
+            )
+        };
+        if let Err(error) = rendered {
             end.reason = EndReason::Output;
             end.status = 1;
             end.sequence = sequence;
             end.elapsed = started.elapsed();
             // A broken sink often cannot accept its end record. Attempt once;
             // preserve the original error and never continue acquiring data.
-            let _ = emit(&end, writer, human, None);
+            if human {
+                let _ = human_end(writer, &end, &seen);
+            } else {
+                let _ = emit(&end, writer);
+            }
             return Err(error);
         }
         previous = Some(snapshot);
@@ -458,9 +686,18 @@ pub(super) fn run_formatted(
         }
     }
     end.sequence = sequence;
-    end.status = status;
+    // ScopeUnavailable and Output return early above; only
+    // Duration (cumulative history, F8) and Interrupted reach here.
+    end.status = match end.reason {
+        EndReason::Interrupted => 3,
+        _ => seen.end_status(),
+    };
     end.elapsed = started.elapsed();
-    emit(&end, writer, human, None)?;
+    if human {
+        human_end(writer, &end, &seen)?;
+    } else {
+        emit(&end, writer)?;
+    }
     Ok(end)
 }
 
@@ -593,61 +830,175 @@ mod tests {
         );
     }
 
-    #[test]
-    fn watch_snapshot_prints_identity_totals() {
-        // The human emitter reads a serialized record: one verified and
-        // one locator module must total exactly.
-        let record = serde_json::json!({
-            "record": "snapshot",
-            "sequence": 1,
-            "snapshot": {
-                "capabilities": {"inventory": "complete"},
-                "processes": [
-                    {"modules": [
-                        {"identity_status": "verified"},
-                        {"identity_status": "locator_candidate"}
-                    ]}
-                ],
-                "gaps": []
+    fn tick_process(pid: u32, comm: &str) -> crate::inventory::ProcessRecord {
+        crate::inventory::ProcessRecord {
+            interval: crate::inventory::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
             },
-            "changes": []
-        });
+            namespaces: crate::inventory::NamespaceIds::default(),
+            pid,
+            starttime: 7,
+            comm: Some(comm.to_string()),
+            comm_status: crate::inventory::IdentityAvailability::Available,
+            exe: None,
+            exe_status: crate::inventory::IdentityAvailability::Unreadable,
+            modules: vec![module_record(crate::inventory::IdentityStatus::Verified)],
+            provider_activation: crate::inventory::ObservationState::Unknown,
+            provider_interfaces: crate::inventory::ObservationState::Unknown,
+            execution: crate::inventory::ObservationState::NotObserved,
+        }
+    }
+
+    fn tick_snapshot(
+        processes: Vec<crate::inventory::ProcessRecord>,
+        gaps: Vec<crate::inventory::Gap>,
+        state: crate::inventory::InventoryState,
+    ) -> crate::inventory::Snapshot {
+        crate::inventory::Snapshot {
+            interval: crate::inventory::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            },
+            scope_record: crate::inventory::ScopeRecord::default(),
+            schema_version: "osslscope.discovery.v1".into(),
+            mode: crate::inventory::SnapshotMode::Snapshot,
+            scope: crate::inventory::Scope::Pids,
+            selected_pids: vec![11],
+            processes,
+            gaps,
+            totals: crate::inventory::WorkTotals::default(),
+            limits: Limits::default(),
+            capabilities: crate::inventory::Capabilities {
+                inventory: state,
+                provider_activation: crate::inventory::ObservationState::Unknown,
+                provider_interfaces: crate::inventory::ObservationState::Unknown,
+                execution: crate::inventory::ObservationState::NotObserved,
+            },
+            resolve: crate::inventory::resolve::ResolveSidecar::default(),
+            cgroup_identity: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn render_tick(
+        sequence: u64,
+        snapshot: &Snapshot,
+        previous: Option<&Snapshot>,
+        verbosity: u8,
+    ) -> String {
+        let deltas = super::changes(previous, snapshot);
         let mut buf = Vec::new();
-        super::emit(&record, &mut buf, true, None).unwrap();
-        let out = String::from_utf8(buf).unwrap();
+        let paths =
+            crate::inventory::resolve::TerminalPathWriter::new(false, false, &snapshot.resolve);
+        super::human_tick(
+            &mut buf, sequence, snapshot, &deltas, previous, &paths, verbosity,
+        )
+        .unwrap();
+        String::from_utf8(buf).unwrap()
+    }
+
+    #[test]
+    fn human_tick_renders_initial_heartbeat_and_state_changed() {
+        // Tick 1 renders full state with identity totals; an
+        // identical tick 2 heartbeats; a tick-3 rename renders
+        // the renamed block instead of a heartbeat.
+        let gap = || crate::inventory::Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: Some(9),
+            reason: crate::inventory::GapReason::IdentityUnverified,
+            errno: None,
+            actor_euid: None,
+        };
+        let snap1 = tick_snapshot(
+            vec![tick_process(11, "child")],
+            vec![gap()],
+            crate::inventory::InventoryState::Partial,
+        );
+        let tick1 = render_tick(1, &snap1, None, 0);
         assert!(
-            out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)"),
-            "got: {out}"
+            tick1.contains(
+                "tick 1: initial state (status partial, processes 1, modules 1/1 verified)"
+            ),
+            "got: {tick1}"
+        );
+        assert!(
+            tick1.contains("pid=11 comm=child exe=- modules=1 status=partial"),
+            "verdict, got: {tick1}"
+        );
+        assert!(
+            tick1
+                .contains("identity: 1 verified, 0 locator-candidate of 1 modules (100% verified)"),
+            "totals, got: {tick1}"
+        );
+        assert!(
+            tick1.contains("gaps: 1 (identity_unverified=1;"),
+            "counts, got: {tick1}"
+        );
+        let snap2 = snap1.clone();
+        let tick2 = render_tick(2, &snap2, Some(&snap1), 0);
+        assert!(
+            tick2
+                .contains("tick 2: no changes (status partial, processes 1, modules 1/1 verified)"),
+            "got: {tick2}"
+        );
+        assert!(!tick2.contains("pid=11"), "heartbeat re-dumped: {tick2}");
+        // Verbose quiet tick: the line still reports reality; the
+        // full state dumps beneath it.
+        let tick2v = render_tick(2, &snap2, Some(&snap1), 1);
+        assert!(
+            tick2v
+                .contains("tick 2: no changes (status partial, processes 1, modules 1/1 verified)"),
+            "got: {tick2v}"
+        );
+        assert!(
+            tick2v.contains("pid=11 comm=child"),
+            "verbose dumps state, got: {tick2v}"
+        );
+        let snap3 = tick_snapshot(
+            vec![tick_process(11, "renamed")],
+            vec![gap()],
+            crate::inventory::InventoryState::Partial,
+        );
+        let tick3 = render_tick(3, &snap3, Some(&snap2), 0);
+        assert!(
+            tick3.contains(
+                "tick 3: state changed (status partial, processes 1, modules 1/1 verified)"
+            ),
+            "got: {tick3}"
+        );
+        assert!(
+            tick3.contains("pid=11 comm=renamed"),
+            "renamed block, got: {tick3}"
         );
     }
 
     #[test]
-    fn watch_human_coalesces_repeated_gaps() {
-        // Three identical gaps + one different gap: one group line with
-        // `: 3`, one with `: 1`, plus the header with exact totals.
-        let gap = |reason: &str, pid: u32| {
-            serde_json::json!({
-                "pid": pid, "device": 7, "inode": 9, "reason": reason,
-            })
+    fn human_tick_verbose_coalesces_repeated_gaps() {
+        // Three identical gaps + one different gap at -v: one
+        // group line with `: 3`, one with `: 1`, plus the header
+        // with exact totals; level 0 keeps the counts line.
+        let gap = |reason: crate::inventory::GapReason, pid: u32| crate::inventory::Gap {
+            pid: Some(pid),
+            device: Some(7),
+            inode: Some(9),
+            reason,
+            errno: None,
+            actor_euid: None,
         };
-        let record = serde_json::json!({
-            "record": "snapshot",
-            "sequence": 1,
-            "snapshot": {
-                "capabilities": {"inventory": "partial"},
-                "processes": [],
-                "gaps": [
-                    gap("identity_unverified", 11),
-                    gap("identity_unverified", 11),
-                    gap("identity_unverified", 11),
-                    gap("deadline", 12),
-                ]
-            },
-            "changes": []
-        });
-        let mut buf = Vec::new();
-        super::emit(&record, &mut buf, true, None).unwrap();
-        let out = String::from_utf8(buf).unwrap();
+        let snap = tick_snapshot(
+            vec![tick_process(11, "child")],
+            vec![
+                gap(crate::inventory::GapReason::IdentityUnverified, 11),
+                gap(crate::inventory::GapReason::IdentityUnverified, 11),
+                gap(crate::inventory::GapReason::IdentityUnverified, 11),
+                gap(crate::inventory::GapReason::Deadline, 12),
+            ],
+            crate::inventory::InventoryState::Partial,
+        );
+        let out = render_tick(1, &snap, None, 1);
         assert!(
             out.contains("gaps (4 total in 2 groups):"),
             "coalesced header, got: {out}"
@@ -660,9 +1011,159 @@ mod tests {
             out.contains("deadline device=7 pid=12: 1"),
             "singleton group keeps its ids, got: {out}"
         );
+        let quiet = render_tick(1, &snap, None, 0);
         assert!(
-            !out.contains("gap=\"identity_unverified\""),
-            "no per-gap lines remain, got: {out}"
+            quiet.contains("gaps: 4 (deadline=1 identity_unverified=3;"),
+            "counts line, got: {quiet}"
         );
+        assert!(
+            !quiet.contains("total in"),
+            "no groups at level 0, got: {quiet}"
+        );
+    }
+
+    #[test]
+    fn watch_words_match_json() {
+        for (kind, word) in [
+            (super::ChangeKind::ProcessSeen, "process_seen"),
+            (super::ChangeKind::ModuleSeen, "module_seen"),
+            (super::ChangeKind::ProcessNotSeen, "process_not_seen"),
+            (super::ChangeKind::ModuleNotSeen, "module_not_seen"),
+            (super::ChangeKind::VisibilityLost, "visibility_lost"),
+        ] {
+            assert_eq!(kind.word(), word);
+            assert_eq!(
+                serde_json::to_value(kind).unwrap(),
+                serde_json::Value::String(word.into())
+            );
+        }
+        for (reason, word) in [
+            (super::EndReason::Duration, "duration"),
+            (super::EndReason::Interrupted, "interrupted"),
+            (super::EndReason::ScopeUnavailable, "scope_unavailable"),
+            (super::EndReason::Output, "output"),
+        ] {
+            assert_eq!(super::reason_word(reason), word);
+            assert_eq!(
+                serde_json::to_value(reason).unwrap(),
+                serde_json::Value::String(word.into())
+            );
+        }
+    }
+
+    // F8/H2: the run end status is cumulative, never the last
+    // sample's status — a later complete sample never erases
+    // earlier uncertainty. 4 means zero usable samples (all
+    // unavailable, or none at all); 3 means usable data with an
+    // uncertain history (same rule as the provider end record).
+    #[test]
+    fn cumulative_end_status_keeps_partial_and_unavailable_history() {
+        let run = |exits: &[u8]| {
+            let mut seen = super::Cumulative::default();
+            for (i, &exit) in exits.iter().enumerate() {
+                seen.observe(i as u64 + 1, exit);
+            }
+            seen.end_status()
+        };
+        assert_eq!(run(&[]), 4);
+        assert_eq!(run(&[0]), 0);
+        assert_eq!(run(&[0, 0]), 0);
+        assert_eq!(run(&[3]), 3);
+        assert_eq!(run(&[3, 0]), 3);
+        assert_eq!(run(&[0, 3, 0]), 3);
+        assert_eq!(run(&[4]), 4);
+        assert_eq!(run(&[4, 4]), 4);
+        assert_eq!(run(&[4, 0]), 3);
+        assert_eq!(run(&[0, 4]), 3);
+        assert_eq!(run(&[3, 4]), 3);
+        assert_eq!(run(&[4, 3]), 3);
+    }
+
+    #[test]
+    fn cumulative_firsts_name_earliest_uncertain_samples() {
+        let mut seen = super::Cumulative::default();
+        seen.observe(1, 0);
+        seen.observe(2, 3);
+        seen.observe(3, 0);
+        seen.observe(4, 4);
+        assert_eq!(seen.first_partial, Some(2));
+        assert_eq!(seen.first_unavailable, Some(4));
+        // An unavailable sample books the unavailable track only:
+        // one note per track, never a double note for one sample.
+        let mut seen = super::Cumulative::default();
+        seen.observe(1, 4);
+        assert_eq!(seen.first_partial, None);
+        assert_eq!(seen.first_unavailable, Some(1));
+    }
+
+    fn module_record(status: crate::inventory::IdentityStatus) -> crate::inventory::ModuleRecord {
+        crate::inventory::ModuleRecord {
+            info: crate::inventory::ModuleInfo {
+                sha256: "a".repeat(64),
+                device: 7,
+                inode: 9,
+                size_bytes: 100,
+                architecture: crate::inventory::Architecture::X86_64,
+                kind: crate::inventory::ObjectKind::Other,
+                exports: Vec::new(),
+                depends_on_libcrypto: false,
+                depends_on_libssl: false,
+                file_soname: None,
+                file_openssl_version: None,
+                file_version_status: crate::inventory::FileVersionStatus::Absent,
+            },
+            identity_status: status,
+            verified_path: None,
+            verified_path_unavailable: None,
+            maps_spelling: None,
+        }
+    }
+
+    // W1: watch comparison must not ignore identity-status
+    // changes (codex quiet-contract ruling), nor path, version,
+    // or evidence changes on the same file.
+    #[test]
+    fn same_module_flags_identity_and_evidence_changes() {
+        use crate::inventory::IdentityStatus;
+        let base = module_record(IdentityStatus::Verified);
+        assert!(super::same_module(&base, &base));
+        assert!(!super::same_module(
+            &base,
+            &module_record(IdentityStatus::LocatorCandidate)
+        ));
+        let mut versioned = base.clone();
+        versioned.info.file_openssl_version = Some("OpenSSL 3.0.0".to_string());
+        assert!(!super::same_module(&base, &versioned));
+        let mut pathed = base.clone();
+        pathed.maps_spelling = Some(crate::inventory::MapsSpelling {
+            spelling: "/lib/x.so".to_string(),
+            source: crate::inventory::MapsSource::ProcMaps,
+            verification: crate::inventory::MapsVerification::Unverified,
+        });
+        assert!(!super::same_module(&base, &pathed));
+        let mut reasoned = base.clone();
+        reasoned.verified_path_unavailable =
+            Some(crate::inventory::PathUnavailableReason::UnverifiedIdentity);
+        assert!(!super::same_module(&base, &reasoned));
+    }
+
+    #[test]
+    fn same_module_ignores_per_sample_capture_time() {
+        // `capture_unix_ms` is re-stamped every sample: comparing
+        // it would flap every tick and kill the heartbeat. Only
+        // the stable locator triple (path, encoding, kind) counts.
+        let mut a = module_record(crate::inventory::IdentityStatus::Verified);
+        let mut b = a.clone();
+        for (slot, stamp) in [(&mut a, Some(100)), (&mut b, Some(200))] {
+            slot.verified_path = Some(crate::inventory::VerifiedPath {
+                path: "/lib/x.so".to_string(),
+                path_encoding: crate::inventory::PathEncoding::Utf8,
+                locator_kind: crate::inventory::LocatorKind::HostDirect,
+                capture_unix_ms: stamp,
+            });
+        }
+        assert!(super::same_module(&a, &b));
+        b.verified_path.as_mut().unwrap().path = "/lib/y.so".to_string();
+        assert!(!super::same_module(&a, &b));
     }
 }

@@ -74,6 +74,8 @@ int main(int argc, char **argv) {
             if(p==MAP_FAILED) return 3;
         } else if(c=='u') { if(munmap(p,len)) return 4; p=0; }
         else if(c=='d') { if(prctl(PR_SET_DUMPABLE,0)) return 5; }
+        else if(c=='e') { if(prctl(PR_SET_DUMPABLE,1)) return 7; }
+        else if(c=='n') { if(prctl(PR_SET_NAME,"renamed",0,0,0)) return 8; }
         else return 6;
         puts("ready"); fflush(stdout);
     }
@@ -120,6 +122,15 @@ impl Drop for Owned {
     fn drop(&mut self) {
         drop(self.child.stdin.take());
         assert!(self.child.wait().unwrap().success());
+    }
+}
+/// Observer child that is always reaped, even when an assertion
+/// fails mid-stream (keeps the child-reaper lint quiet).
+struct ReapedObserver(Child);
+impl Drop for ReapedObserver {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 fn options(pid: u32) -> WatchOptions {
@@ -202,11 +213,15 @@ fn sampled_arrival_removal_visibility_and_direct_cancellation() {
     assert!(!changes(&writer.values[3], "module_not_seen"));
     assert_eq!(writer.values[4]["reason"], "interrupted");
     let text = serde_json::to_string(&writer.values).unwrap();
-    assert!(!text.contains("PRIVATE_CANARY"));
-    // v0.6.0 D2: the fixture dir LEGITIMATELY appears in the
-    // allowlisted per-process `exe` identity value (watch records
-    // embed the full snapshot; the fixture child binary lives
-    // under the canary dir), and nowhere else.
+    // v0.6.0 F7 (R6 carry): `watch::run` now acquires path
+    // evidence like the CLI `--json` path, so the fixture module
+    // filename LEGITIMATELY appears in machine records — but ONLY
+    // under the D1 path-evidence keys (`verified_path.path` and
+    // `maps_spelling.spelling`). Anywhere else is a leak.
+    // Deferral pointer: the never-acquire carve-out lived in
+    // `watch::run` from machine T2 until human-surface Task 3
+    // flipped it; the acquisition rules themselves are D1's (see
+    // `procfs.rs` D1 publish block + `resolve.rs` custody).
     let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
     fn walk(value: &serde_json::Value, parent: &str, dir: &str) {
         match value {
@@ -221,6 +236,17 @@ fn sampled_arrival_removal_visibility_and_direct_cancellation() {
                 }
             }
             serde_json::Value::String(text) => {
+                if text.contains("PRIVATE_CANARY") {
+                    assert!(
+                        parent == "path" || parent == "spelling",
+                        "canary filename outside D1 path-evidence keys (key {parent:?}): {text}"
+                    );
+                }
+                // v0.6.0 D2: the fixture dir LEGITIMATELY appears
+                // in the allowlisted per-process `exe` identity
+                // value (watch records embed the full snapshot;
+                // the fixture child binary lives under the canary
+                // dir), and — since F7 — under the D1 keys above.
                 if text.contains(dir) {
                     assert!(
                         parent == "path" || parent == "spelling" || parent == "exe",
@@ -232,6 +258,33 @@ fn sampled_arrival_removal_visibility_and_direct_cancellation() {
         }
     }
     walk(&doc, "", f.0.to_str().unwrap());
+    // F7 fix evidence: with acquisition on, every module record
+    // carries either proven path evidence or null plus a finite
+    // D1 reason — never the bare null pair of the off shape —
+    // and at least one row carries D1 evidence (the flip proof).
+    let mut modules = 0;
+    let mut evidenced = 0;
+    for record in &writer.values {
+        let processes = record["snapshot"]["processes"].as_array();
+        for module in processes
+            .into_iter()
+            .flatten()
+            .flat_map(|p| p["modules"].as_array().into_iter().flatten())
+        {
+            modules += 1;
+            assert!(
+                module["verified_path"].is_null() != module["verified_path_unavailable"].is_null(),
+                "bare null pair without a D1 reason: {module}"
+            );
+            if !module["maps_spelling"].is_null() {
+                evidenced += 1;
+            }
+        }
+    }
+    assert!(
+        modules > 0 && evidenced > 0,
+        "acquisition off: no D1 evidence in {modules} module records"
+    );
     assert!(child.child.try_wait().unwrap().is_none());
 }
 // Catches rehashing stable files, stale fingerprint reuse, and unbounded retained descriptors.
@@ -704,7 +757,7 @@ fn human_watch_snapshot_prints_identity_totals() {
         .unwrap();
     assert!(matches!(output.status.code(), Some(0 | 3 | 4)));
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Snapshot 1:"), "sampled, got: {text}");
+    assert!(text.contains("tick 1:"), "sampled, got: {text}");
     assert!(
         text.contains("identity: ")
             && (text.contains("verified") || text.contains("no modules inventoried")),
@@ -739,7 +792,7 @@ fn human_watch_with_gaps_never_claims_blindness() {
         .unwrap();
     child.kill().unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Snapshot 2:"), "sampled twice, got: {text}");
+    assert!(text.contains("tick 2:"), "sampled twice, got: {text}");
     assert!(
         !text.contains("blindness:"),
         "no absence claim under gaps, got: {text}"
@@ -772,7 +825,7 @@ fn human_watch_states_blindness_exactly_once_when_verified() {
         .unwrap();
     child.kill().unwrap();
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(text.contains("Snapshot 2:"), "sampled twice, got: {text}");
+    assert!(text.contains("tick 2:"), "sampled twice, got: {text}");
     assert_eq!(
         text.matches("blindness: no-mapped-openssl").count(),
         1,
@@ -781,28 +834,343 @@ fn human_watch_states_blindness_exactly_once_when_verified() {
 }
 
 #[test]
-fn human_watch_coalesces_snapshot_gaps() {
-    // Dead pid (deterministic in any privilege lane): per-snapshot
-    // gaps render as a grouped block with exact totals, not one line
-    // per gap.
+fn v060_watch_delta_heartbeat_and_cumulative_uncertainty() {
+    use std::io::Read;
+    let me = std::process::id().to_string();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--pid",
+            &me,
+            "--watch",
+            "--interval",
+            "1",
+            "--duration",
+            "3",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut out = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success() || status.code() == Some(3));
+    let ticks = out.matches("tick ").count();
+    assert!(ticks >= 2, "no heartbeats: {out}");
+    let full_lists = out.matches("modules=").count();
+    assert!(full_lists <= 2, "full state re-dumped every tick: {out}");
+    assert!(out.contains("Watch ended:"), "no end record");
+}
+
+// F8/H2: partial-then-complete must end non-complete — a later
+// complete sample never erases earlier uncertainty. The
+// dumpable dance below needs an environment that yields
+// complete samples; elsewhere it SKIPs (the
+// `cumulative_end_status_*` unit tests pin the rule itself).
+#[test]
+fn watch_end_status_preserves_partial_history() {
+    let f = Fixture::new();
+    let module = f.module();
+    let mut child = f.child(&module);
+    child.command(b'm');
+    let pid = child.pid();
+    let mut opts = options(pid);
+    opts.interval = Duration::from_millis(50);
+    opts.duration = Some(Duration::from_millis(400));
+    let mut count = 0;
+    let mut writer = Records {
+        pending: vec![],
+        values: vec![],
+        after: |record: &Value| {
+            if record["record"] != "snapshot" {
+                return;
+            }
+            count += 1;
+            match count {
+                1 => child.command(b'd'),
+                2 => child.command(b'e'),
+                _ => {}
+            }
+        },
+    };
+    let outcome = watch::run(&opts, &mut writer, &AtomicBool::new(false)).unwrap();
+    let snapshots: Vec<&Value> = writer
+        .values
+        .iter()
+        .filter(|v| v["record"] == "snapshot")
+        .collect();
+    assert!(snapshots.len() >= 3, "too few samples");
+    let exit = |v: &Value| match v["snapshot"]["capabilities"]["inventory"].as_str() {
+        Some("complete") => 0,
+        Some("partial") => 3,
+        Some("unavailable") => 4,
+        other => panic!("unknown inventory state: {other:?}"),
+    };
+    if exit(snapshots[0]) != 0 {
+        eprintln!("SKIP: environment yields no complete baseline");
+        return;
+    }
+    if exit(snapshots[1]) == 0 {
+        eprintln!("SKIP: dumpable dance inert here (e.g. root)");
+        return;
+    }
+    if snapshots[2..].iter().any(|s| exit(s) != 0) {
+        eprintln!("SKIP: re-enable did not restore complete samples");
+        return;
+    }
+    assert_eq!(writer.values.last().unwrap()["reason"], "duration");
+    assert_eq!(
+        outcome.exit_code(),
+        3,
+        "later complete erased partial history: {:?}",
+        snapshots.iter().map(|s| exit(s)).collect::<Vec<_>>()
+    );
+    assert_eq!(writer.values.last().unwrap()["status"], 3);
+}
+
+// F8/H2 dual (runs everywhere): usable-then-unavailable must
+// end partial (3), not unavailable (4) — exit 4 means zero
+// usable samples, and the first sample here was usable. A
+// last-sample-only end status would report 4.
+#[test]
+fn watch_end_status_preserves_usable_history() {
+    let mut workload = ReapedObserver(Command::new("sleep").arg("30").spawn().unwrap());
+    std::thread::sleep(Duration::from_millis(200));
+    let pid = workload.0.id();
+    let mut opts = options(pid);
+    opts.interval = Duration::from_millis(50);
+    opts.duration = Some(Duration::from_millis(400));
+    let mut count = 0;
+    let mut writer = Records {
+        pending: vec![],
+        values: vec![],
+        after: |record: &Value| {
+            if record["record"] != "snapshot" {
+                return;
+            }
+            count += 1;
+            if count == 1 {
+                // Reaped before the next sample: later samples
+                // observe a dead pid (unavailable).
+                workload.0.kill().unwrap();
+                workload.0.wait().unwrap();
+            }
+        },
+    };
+    let outcome = watch::run(&opts, &mut writer, &AtomicBool::new(false)).unwrap();
+    let snapshots: Vec<&Value> = writer
+        .values
+        .iter()
+        .filter(|v| v["record"] == "snapshot")
+        .collect();
+    assert!(snapshots.len() >= 2, "too few samples");
+    let exit = |v: &Value| match v["snapshot"]["capabilities"]["inventory"].as_str() {
+        Some("complete") => 0,
+        Some("partial") => 3,
+        Some("unavailable") => 4,
+        other => panic!("unknown inventory state: {other:?}"),
+    };
+    if exit(snapshots[0]) == 4 {
+        eprintln!("SKIP: live baseline unusable here");
+        return;
+    }
+    if exit(snapshots[snapshots.len() - 1]) != 4 {
+        eprintln!("SKIP: pid reused or still observable after kill");
+        return;
+    }
+    assert_eq!(writer.values.last().unwrap()["reason"], "duration");
+    assert_eq!(
+        outcome.exit_code(),
+        3,
+        "later unavailable erased usable history: {:?}",
+        snapshots.iter().map(|s| exit(s)).collect::<Vec<_>>()
+    );
+    assert_eq!(writer.values.last().unwrap()["status"], 3);
+}
+
+// W1 names: a mid-watch rename (same pid+starttime, same
+// modules) is a meaningful human change — full state, not a
+// heartbeat — while machine changes[] stays empty (the Change
+// vocabulary is schema-pinned; machines diff full records).
+#[test]
+fn watch_human_reports_rename_without_machine_changes() {
+    // Machine leg (library): rename between samples, changes empty.
+    {
+        let f = Fixture::new();
+        let module = f.module();
+        let mut child = f.child(&module);
+        child.command(b'm');
+        let pid = child.pid();
+        let cancel = AtomicBool::new(false);
+        let mut count = 0;
+        let mut writer = Records {
+            pending: vec![],
+            values: vec![],
+            after: |record: &Value| {
+                if record["record"] != "snapshot" {
+                    return;
+                }
+                count += 1;
+                match count {
+                    1 => child.command(b'n'),
+                    2 => cancel.store(true, Ordering::Relaxed),
+                    _ => panic!("unexpected poll"),
+                }
+            },
+        };
+        watch::run(&options(pid), &mut writer, &cancel).unwrap();
+        assert_eq!(writer.values.len(), 3);
+        assert!(
+            writer.values[1]["changes"].as_array().unwrap().is_empty(),
+            "machine vocabulary grew: {}",
+            writer.values[1]["changes"]
+        );
+        assert_ne!(
+            writer.values[0]["snapshot"]["processes"][0]["comm"],
+            writer.values[1]["snapshot"]["processes"][0]["comm"],
+            "rename did not land"
+        );
+    }
+    // Human leg (CLI): tick 2 (still idle) heartbeats — the
+    // control — then the rename breaks the heartbeat at tick 3.
+    let f = Fixture::new();
+    let module = f.module();
+    let mut child = f.child(&module);
+    child.command(b'm');
+    let mut observer = ReapedObserver(
+        Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args([
+                "scan",
+                "--watch",
+                "--pid",
+                &child.pid().to_string(),
+                "--interval",
+                "0.2",
+                "--duration",
+                "5",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut reader = BufReader::new(observer.0.stdout.take().unwrap());
+    let mut line = String::new();
+    // EOF (duration end without the wanted line) returns empty so
+    // the assertions below fail instead of blocking forever.
+    let tick_line =
+        |reader: &mut BufReader<std::process::ChildStdout>, line: &mut String, want: &str| {
+            loop {
+                line.clear();
+                if reader.read_line(line).unwrap() == 0 {
+                    return String::new();
+                }
+                if line.starts_with(want) {
+                    return line.clone();
+                }
+            }
+        };
+    tick_line(&mut reader, &mut line, "tick 1:");
+    let tick2 = tick_line(&mut reader, &mut line, "tick 2:");
+    child.command(b'n');
+    let tick3 = tick_line(&mut reader, &mut line, "tick 3:");
+    // Only signal the observer process created by this test.
+    assert_eq!(
+        unsafe { libc::kill(observer.0.id() as i32, libc::SIGINT) },
+        0
+    );
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).unwrap();
+    let code = observer.0.wait().unwrap().code();
+    // Assertions after the reaped wait (also keeps the
+    // child-reaper lint quiet on every path).
+    assert!(
+        tick2.contains("no changes"),
+        "control failed: idle tick not quiet: {tick2}"
+    );
+    assert!(
+        !tick3.contains("no changes"),
+        "rename swallowed by heartbeat: {tick3}"
+    );
+    assert!(
+        tick3.contains("state changed"),
+        "rename tick mislabeled: {tick3}"
+    );
+    assert_eq!(code, Some(3));
+    assert!(rest.contains("Watch ended:"), "no end record: {rest}");
+    assert!(child.child.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn human_watch_end_reports_cumulative_uncertainty() {
+    // Dead pid: every sample uncertain — the end record names
+    // the cumulative history and the first uncertain sample.
     let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
         .args([
             "scan",
             "--watch",
             "--pid",
             "2147483647",
+            "--interval",
+            "0.05",
             "--duration",
             "0.3",
         ])
         .output()
         .unwrap();
-    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(matches!(output.status.code(), Some(3 | 4)));
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("Watch ended:"), "no end record: {text}");
     assert!(
-        text.contains("gaps (") && text.contains("total in"),
-        "coalesced gap block, got: {text}"
+        text.contains("cumulative: partial-seen") || text.contains("cumulative: unavailable-seen"),
+        "no cumulative word: {text}"
     );
     assert!(
-        !text.contains("  gap=\""),
-        "no per-gap lines remain, got: {text}"
+        text.contains("note: sample 1 was ") && text.contains("history remains uncertain"),
+        "no uncertainty note: {text}"
     );
+}
+
+#[test]
+fn human_watch_coalesces_snapshot_gaps() {
+    // Dead pid (deterministic in any privilege lane): level 0
+    // shows the exact per-reason counts line, -v the coalesced
+    // grouped block — never one line per gap.
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "scan",
+            "--watch",
+            "--pid",
+            "2147483647",
+            "--duration",
+            "0.3",
+        ];
+        args.extend(extra.iter().copied());
+        Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args(&args)
+            .output()
+            .unwrap()
+    };
+    let quiet = String::from_utf8_lossy(&run(&[]).stdout).into_owned();
+    assert!(
+        quiet.contains("gaps: ") && !quiet.contains("total in"),
+        "counts line at level 0, got: {quiet}"
+    );
+    let verbose = String::from_utf8_lossy(&run(&["-v"]).stdout).into_owned();
+    assert!(
+        verbose.contains("gaps (") && verbose.contains("total in"),
+        "coalesced gap block at -v, got: {verbose}"
+    );
+    for (level, text) in [("0", &quiet), ("1", &verbose)] {
+        assert!(
+            !text.contains("  gap=\""),
+            "no per-gap lines remain at level {level}, got: {text}"
+        );
+    }
 }

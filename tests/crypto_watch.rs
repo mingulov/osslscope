@@ -1339,9 +1339,10 @@ fn human_watch_coalesces_discovery_gaps() {
 }
 
 #[test]
-fn human_gap_only_samples_flush_live_blocks() {
-    // Dead pid over several samples: each sample's gaps flush their
-    // own block (no end-of-run accumulation).
+fn human_gap_only_samples_flush_once_then_heartbeat() {
+    // Dead pid over several samples (W1): the first sample's
+    // gaps flush their block live (no end-of-run accumulation);
+    // identical repeats heartbeat instead of re-dumping.
     let output = command(&[
         "scan",
         "--watch",
@@ -1355,8 +1356,84 @@ fn human_gap_only_samples_flush_live_blocks() {
     ]);
     assert_eq!(output.status.code(), Some(4));
     let text = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        text.matches("gaps (").count(),
+        1,
+        "first block live, repeats silent, got: {text}"
+    );
     assert!(
-        text.matches("gaps (").count() >= 2,
-        "one block per sample, got: {text}"
+        text.contains("tick ") && text.contains("no changes"),
+        "no heartbeat, got: {text}"
+    );
+}
+
+#[test]
+fn human_watch_idle_samples_heartbeat_and_discovery_prints_once() {
+    // W1 mirror (human only): a dead pid heartbeats once its
+    // samples go quiet, and an idle live target prints each
+    // Discovery block once (per-sample stay Memberships are
+    // out of scope — they remain the member heartbeat).
+    // Hermetic (R2 concern f): isolated exe-dir, so stray
+    // `target/debug/` companions never flip the absence outcome.
+    let dir =
+        std::env::temp_dir().join(format!("osslscope-watch-heartbeat-{}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    let binary = dir.join("osslscope");
+    std::fs::copy(env!("CARGO_BIN_EXE_osslscope"), &binary).unwrap();
+    let output = Command::new(&binary)
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            "2147483647",
+            "--interval",
+            "0.2",
+            "--duration",
+            "1",
+        ])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        text.contains("tick ") && text.contains("no changes"),
+        "no heartbeat, got: {text}"
+    );
+    assert!(
+        text.contains("cumulative: "),
+        "no cumulative word, got: {text}"
+    );
+    assert!(
+        text.contains("Crypto watch end:"),
+        "no end record, got: {text}"
+    );
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    // Live leg needs the default 1s sample budget: a 0.2s budget
+    // deadlines the observation scan in this container (base
+    // behavior — verified via stash — yielding zero processes).
+    let output = Command::new(&binary)
+        .args([
+            "scan",
+            "--watch",
+            "--observe-crypto",
+            "--pid",
+            &child.id().to_string(),
+            "--interval",
+            "1",
+            "--duration",
+            "2.5",
+        ])
+        .output()
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+    let text = String::from_utf8(output.stdout).unwrap();
+    let marker = format!("Process {} start=", child.id());
+    assert_eq!(
+        text.matches(&marker).count(),
+        1,
+        "Discovery re-dumped every sample, got: {text}"
     );
 }

@@ -5,7 +5,7 @@ use super::{
     ObservationState, ProcessRecord, Snapshot, SnapshotOptions, WorkTotals, elf, snapshot,
 };
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, IsTerminal as _, Write};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -537,11 +537,37 @@ pub(crate) fn human_snapshot(
     paths: &super::resolve::TerminalPathWriter,
     verbosity: u8,
 ) -> io::Result<()> {
+    writer.write_all(MEANING.as_bytes())?;
+    human_snapshot_body(writer, snapshot, paths, verbosity, None)?;
+    if super::snapshot_conclusively_without_openssl(snapshot) {
+        writer.write_all(super::blindness_line().as_bytes())?;
+    }
+    writer.flush()
+}
+
+/// The state block of [`human_snapshot`] without MEANING or the
+/// blindness line (both stay caller-owned: streaming callers
+/// print them once per run, never per sample — H1). `only`
+/// restricts the verdict+row section to changed (pid,
+/// starttime) processes; totals, counts, groups, records, and
+/// counters always cover the whole snapshot (H2: counts are
+/// never filtered by a delta). Bytes for `only = None` are
+/// exactly [`human_snapshot`] minus its preamble, blindness
+/// line, and flush.
+pub(crate) fn human_snapshot_body(
+    writer: &mut impl Write,
+    snapshot: &Snapshot,
+    paths: &super::resolve::TerminalPathWriter,
+    verbosity: u8,
+    only: Option<&BTreeSet<(u32, u64)>>,
+) -> io::Result<()> {
     // Clamped here so a future caller can never observe an
     // unclamped level.
     let level = verbosity.min(2);
-    writer.write_all(MEANING.as_bytes())?;
     for process in &snapshot.processes {
+        if only.is_some_and(|set| !set.contains(&(process.pid, process.starttime))) {
+            continue;
+        }
         writeln!(writer, "{}", verdict_line(process, &snapshot.gaps, level))?;
         let rows = paths.object_rows(std::slice::from_ref(process));
         // `object_rows` builds exactly one row per module in order;
@@ -592,10 +618,7 @@ pub(crate) fn human_snapshot(
             snapshot.totals.read_bytes, snapshot.totals.objects_inspected
         )?;
     }
-    if super::snapshot_conclusively_without_openssl(snapshot) {
-        writer.write_all(super::blindness_line().as_bytes())?;
-    }
-    writer.flush()
+    Ok(())
 }
 
 /// Human render for operator-supplied module lists
@@ -659,8 +682,6 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
         // Read before the Selection moves below consume the vectors.
         let verbosity = options.verbosity;
         if options.watch {
-            // Task 3 (watch delta) owns watch human verbosity; until
-            // then `-v` parses but the watch arm renders level 0.
             let _signals = match WatchSignals::install() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -685,6 +706,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 &WATCH_INTERRUPTED,
                 !options.json,
                 terminal,
+                verbosity,
             )
             .map(|outcome| {
                 if let Some(line) = super::watch::exit_reason(&outcome) {

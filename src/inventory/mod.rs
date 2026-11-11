@@ -502,6 +502,19 @@ pub enum InventoryState {
     Partial,
     Unavailable,
 }
+impl InventoryState {
+    /// Display word for human per-sample status lines (watch
+    /// heartbeats on every route). Mirrors the serde snake_case
+    /// label exactly (see
+    /// `tests::inventory_state_words_match_json`).
+    pub fn word(&self) -> &'static str {
+        match self {
+            InventoryState::Complete => "complete",
+            InventoryState::Partial => "partial",
+            InventoryState::Unavailable => "unavailable",
+        }
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Capabilities {
@@ -728,6 +741,111 @@ pub fn human_exports(exports: &[Api]) -> String {
         })
         .collect();
     format!("exports=[{}]", words.join(", "))
+}
+
+/// Run-level cumulative-uncertainty word for human end
+/// records (one shape for the inventory, provider, and
+/// crypto-watch routes): `clean` when every sample was
+/// complete, otherwise the worst history seen. A later
+/// complete sample never clears the word (H2).
+pub fn cumulative_word(saw_partial: bool, saw_unavailable: bool) -> &'static str {
+    if saw_unavailable {
+        "unavailable-seen"
+    } else if saw_partial {
+        "partial-seen"
+    } else {
+        "clean"
+    }
+}
+
+/// Human uncertainty notes for a run's first uncertain samples
+/// (one shape for every route): one `note:` line per track
+/// seen, chronological across tracks, empty when the history is
+/// clean. The sample numbers are the route's own 1-based sample
+/// (inventory/provider) or nominal tick (crypto-watch) ids.
+pub fn cumulative_notes(first_partial: Option<u64>, first_unavailable: Option<u64>) -> String {
+    let mut notes: Vec<(u64, &str)> = Vec::new();
+    if let Some(seq) = first_partial {
+        notes.push((seq, "partial"));
+    }
+    if let Some(seq) = first_unavailable {
+        notes.push((seq, "unavailable"));
+    }
+    notes.sort();
+    let mut out = String::new();
+    for (seq, word) in notes {
+        out.push_str(&format!(
+            "note: sample {seq} was {word}; history remains uncertain\n"
+        ));
+    }
+    out
+}
+
+/// Stable per-module watch digest: the fields a human row shows
+/// (identity, evidence, versions), minus per-sample volatility.
+/// `VerifiedPath::capture_unix_ms` is re-stamped every sample
+/// and deliberately excluded — only the stable locator triple
+/// (path, encoding, kind) counts, exactly like `same_module` in
+/// the inventory watch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WatchedModuleDigest {
+    info: ModuleInfo,
+    identity: IdentityStatus,
+    path: Option<(String, PathEncoding, LocatorKind)>,
+    unavailable: Option<PathUnavailableReason>,
+    maps: Option<MapsSpelling>,
+}
+
+/// Stable per-process watch digest for borrowed snapshots (the
+/// provider and crypto-watch routes cannot retain full previous
+/// snapshots): names, namespaces, states, and module digests.
+/// The inventory watch compares retained typed snapshots
+/// directly instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WatchedProcessDigest {
+    pid: u32,
+    starttime: u64,
+    namespaces: NamespaceIds,
+    comm: Option<String>,
+    comm_status: IdentityAvailability,
+    exe: Option<String>,
+    exe_status: IdentityAvailability,
+    activation: ObservationState,
+    interfaces: ObservationState,
+    execution: ObservationState,
+    modules: Vec<WatchedModuleDigest>,
+}
+
+pub(crate) fn watched_process_digest(process: &ProcessRecord) -> WatchedProcessDigest {
+    WatchedProcessDigest {
+        pid: process.pid,
+        starttime: process.starttime,
+        namespaces: process.namespaces.clone(),
+        comm: process.comm.clone(),
+        comm_status: process.comm_status,
+        exe: process.exe.clone(),
+        exe_status: process.exe_status,
+        activation: process.provider_activation,
+        interfaces: process.provider_interfaces,
+        execution: process.execution,
+        modules: process
+            .modules
+            .iter()
+            .map(|module| WatchedModuleDigest {
+                info: module.info.clone(),
+                identity: module.identity_status,
+                path: module.verified_path.as_ref().map(|proven| {
+                    (
+                        proven.path.clone(),
+                        proven.path_encoding,
+                        proven.locator_kind,
+                    )
+                }),
+                unavailable: module.verified_path_unavailable,
+                maps: module.maps_spelling.clone(),
+            })
+            .collect(),
+    }
 }
 
 /// Group gaps by (reason, device, pid) with exact counters
@@ -960,5 +1078,133 @@ mod tests {
         assert!(bare_value.get("verified_path_unavailable").is_some());
         assert!(bare_value.get("maps_spelling").is_some());
         assert!(bare_value["verified_path"].is_null());
+    }
+
+    #[test]
+    fn inventory_state_words_match_json() {
+        for state in [
+            super::InventoryState::Complete,
+            super::InventoryState::Partial,
+            super::InventoryState::Unavailable,
+        ] {
+            let json = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                json,
+                serde_json::Value::String(state.word().into()),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cumulative_word_ranks_history() {
+        assert_eq!(super::cumulative_word(false, false), "clean");
+        assert_eq!(super::cumulative_word(true, false), "partial-seen");
+        assert_eq!(super::cumulative_word(false, true), "unavailable-seen");
+        assert_eq!(super::cumulative_word(true, true), "unavailable-seen");
+    }
+
+    #[test]
+    fn cumulative_notes_name_first_uncertain_samples_chronologically() {
+        assert_eq!(super::cumulative_notes(None, None), "");
+        assert_eq!(
+            super::cumulative_notes(Some(2), None),
+            "note: sample 2 was partial; history remains uncertain\n"
+        );
+        assert_eq!(
+            super::cumulative_notes(None, Some(1)),
+            "note: sample 1 was unavailable; history remains uncertain\n"
+        );
+        // Chronological across tracks: the earlier sample first.
+        assert_eq!(
+            super::cumulative_notes(Some(4), Some(2)),
+            "note: sample 2 was unavailable; history remains uncertain\n\
+             note: sample 4 was partial; history remains uncertain\n"
+        );
+        assert_eq!(
+            super::cumulative_notes(Some(2), Some(4)),
+            "note: sample 2 was partial; history remains uncertain\n\
+             note: sample 4 was unavailable; history remains uncertain\n"
+        );
+    }
+
+    fn digest_process(pid: u32) -> super::ProcessRecord {
+        super::ProcessRecord {
+            interval: super::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            },
+            namespaces: super::NamespaceIds::default(),
+            pid,
+            starttime: 7,
+            comm: Some("child".to_string()),
+            comm_status: super::IdentityAvailability::Available,
+            exe: None,
+            exe_status: super::IdentityAvailability::Unreadable,
+            modules: vec![super::ModuleRecord {
+                info: super::ModuleInfo {
+                    sha256: "a".repeat(64),
+                    device: 7,
+                    inode: 9,
+                    size_bytes: 100,
+                    architecture: super::Architecture::X86_64,
+                    kind: super::ObjectKind::Other,
+                    exports: Vec::new(),
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                    file_soname: None,
+                    file_openssl_version: None,
+                    file_version_status: super::FileVersionStatus::Absent,
+                },
+                identity_status: super::IdentityStatus::Verified,
+                verified_path: None,
+                verified_path_unavailable: None,
+                maps_spelling: None,
+            }],
+            provider_activation: super::ObservationState::Unknown,
+            provider_interfaces: super::ObservationState::Unknown,
+            execution: super::ObservationState::NotObserved,
+        }
+    }
+
+    #[test]
+    fn watched_process_digest_tracks_names_and_evidence_not_capture_time() {
+        let base = digest_process(11);
+        let same = digest_process(11);
+        assert_eq!(
+            super::watched_process_digest(&base),
+            super::watched_process_digest(&same)
+        );
+        // Same pid+starttime, renamed comm: a meaningful change.
+        let mut renamed = digest_process(11);
+        renamed.comm = Some("renamed".to_string());
+        assert_ne!(
+            super::watched_process_digest(&base),
+            super::watched_process_digest(&renamed)
+        );
+        // Same file, flipped identity: a meaningful change.
+        let mut flipped = digest_process(11);
+        flipped.modules[0].identity_status = super::IdentityStatus::LocatorCandidate;
+        assert_ne!(
+            super::watched_process_digest(&base),
+            super::watched_process_digest(&flipped)
+        );
+        // Re-stamped capture time only: NOT a change (per-sample
+        // volatility, like `same_module` in the inventory watch).
+        let mut a = digest_process(11);
+        let mut b = digest_process(11);
+        for (slot, stamp) in [(&mut a, Some(100)), (&mut b, Some(200))] {
+            slot.modules[0].verified_path = Some(super::VerifiedPath {
+                path: "/lib/x.so".to_string(),
+                path_encoding: super::PathEncoding::Utf8,
+                locator_kind: super::LocatorKind::HostDirect,
+                capture_unix_ms: stamp,
+            });
+        }
+        assert_eq!(
+            super::watched_process_digest(&a),
+            super::watched_process_digest(&b)
+        );
     }
 }

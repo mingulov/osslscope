@@ -207,6 +207,11 @@ struct End<'a> {
     capabilities: &'a Capabilities,
     gap: Option<inventory::GapReason>,
     sampled_history: &'static str,
+    /// Run-level sample history for the human end record only
+    /// (F8/H2): skipped by serde, so the machine end shape is
+    /// byte-identical.
+    #[serde(skip)]
+    cumulative: inventory::watch::Cumulative,
 }
 fn nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
@@ -360,16 +365,19 @@ impl Render for Record<'_> {
 }
 impl Render for End<'_> {
     // The end record is status-critical and already minimal: byte-
-    // identical at every verbosity level.
+    // identical at every verbosity level. The cumulative word and
+    // notes are history, never detail volume (H2: never gated).
     fn human(&self, writer: &mut impl Write, _verbosity: u8) -> io::Result<()> {
         writeln!(
             writer,
-            "end {}: reason={} status={} elapsed_ns={}",
+            "end {}: reason={} status={} elapsed_ns={} cumulative={}",
             self.sequence,
             finite(&self.reason)?,
             self.status,
-            nanos(self.elapsed)
+            nanos(self.elapsed),
+            self.cumulative.word()
         )?;
+        writer.write_all(self.cumulative.notes().as_bytes())?;
         human_capabilities(self.capabilities, writer)?;
         if let Some(gap) = self.gap {
             writeln!(writer, "  inventory_gap={}", finite(&gap)?)?;
@@ -407,20 +415,63 @@ struct Stream<'a, W> {
     capabilities: Capabilities,
     started: Instant,
     sequence: u64,
-    usable: bool,
-    partial: bool,
+    /// Previous snapshot batch digest (W1 heartbeat): `None`
+    /// until the first snapshot batch renders full. Snapshots
+    /// arrive borrowed, so the stream retains this owned digest
+    /// instead of a full previous snapshot.
+    prev: Option<ProviderDigest>,
+    cumulative: inventory::watch::Cumulative,
+}
+
+/// Stable per-batch digest: sample exit, per-process digests,
+/// and both gap multisets sorted (sample order never counts).
+/// Observation gaps join the digest (not an emptiness check),
+/// so a persistent identical gap set heartbeats while any gap
+/// churn renders full.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderDigest {
+    exit: u8,
+    processes: Vec<inventory::WatchedProcessDigest>,
+    gaps: Vec<inventory::Gap>,
+    obs_gaps: Vec<String>,
+}
+
+fn digest_batch(
+    snapshot: &inventory::Snapshot,
+    gaps: &[ObservationGap],
+) -> io::Result<ProviderDigest> {
+    let mut snap_gaps = snapshot.gaps.clone();
+    snap_gaps.sort();
+    let mut obs: Vec<String> = Vec::with_capacity(gaps.len());
+    for gap in gaps {
+        obs.push(finite(gap)?);
+    }
+    obs.sort();
+    Ok(ProviderDigest {
+        exit: snapshot.exit_code(),
+        processes: snapshot
+            .processes
+            .iter()
+            .map(inventory::watched_process_digest)
+            .collect(),
+        gaps: snap_gaps,
+        obs_gaps: obs,
+    })
 }
 
 /// Stderr reason for provider exits 3/4, derived from the same
-/// (usable, partial, reason) triple `end` maps to the exit code.
+/// (cumulative, reason) pair `end` maps to the exit code.
 /// `None` exactly when the status would be 0.
 fn end_reason_text(
-    usable: bool,
-    partial: bool,
+    seen: &inventory::watch::Cumulative,
     reason: inventory::watch::EndReason,
     gap: Option<inventory::GapReason>,
 ) -> Option<String> {
-    if usable && !partial && reason != inventory::watch::EndReason::Interrupted {
+    if seen.usable
+        && !seen.partial
+        && !seen.unavailable
+        && reason != inventory::watch::EndReason::Interrupted
+    {
         return None;
     }
     if reason == inventory::watch::EndReason::ScopeUnavailable {
@@ -429,7 +480,7 @@ fn end_reason_text(
             "osslscope provider discovery: scope unavailable{gap} (see end record above)"
         ));
     }
-    if !usable {
+    if !seen.usable {
         return Some(
             "osslscope provider discovery: providers unavailable (no usable snapshot; see records above)"
                 .into(),
@@ -500,14 +551,61 @@ impl<W: Write> Stream<'_, W> {
                 inventory::InventoryState::Partial => "partial",
                 inventory::InventoryState::Unavailable => "unavailable",
             };
-            self.usable |= snapshot.exit_code() != 4;
-            self.partial |= snapshot.exit_code() != 0;
         }
         if lag > Duration::from_millis(200) && !gaps.contains(&ObservationGap::SnapshotLag) {
             gaps.push(ObservationGap::SnapshotLag);
         }
-        self.partial |= degraded(&gaps);
+        let bad = degraded(&gaps);
         self.sequence += 1;
+        // F8/H2: run-level history — a later clean batch never
+        // erases earlier uncertainty. Exit-4 samples book the
+        // unavailable track only (never a double note); degraded
+        // batches without one book partial.
+        if let Some(snapshot) = snapshot {
+            self.cumulative.observe(self.sequence, snapshot.exit_code());
+        }
+        if bad && snapshot.is_none_or(|s| s.exit_code() != 4) {
+            self.cumulative.note_partial(self.sequence);
+        }
+        // W1: an identical repeat batch (no facts, same gaps,
+        // same snapshot state) heartbeats in human mode; machine
+        // mode always renders the full record. Observation-only
+        // batches (drain/close) always carry facts or gaps, so
+        // they render full and leave the digest chain untouched.
+        let digest = match snapshot {
+            Some(snapshot) => Some(digest_batch(snapshot, &gaps)?),
+            None => None,
+        };
+        let quiet = !self.options.json
+            && facts.is_empty()
+            && digest
+                .as_ref()
+                .is_some_and(|digest| self.prev.as_ref() == Some(digest));
+        if let Some(digest) = digest {
+            self.prev = Some(digest);
+        }
+        if quiet {
+            // Proven by `quiet`: the digest exists only when the
+            // snapshot does.
+            let snapshot = snapshot.expect("quiet batch carries a snapshot");
+            let (verified, locator) = snapshot.identity_counts();
+            let status = if snapshot.exit_code() == 4 {
+                "unavailable"
+            } else if snapshot.exit_code() == 3 || bad {
+                "partial"
+            } else {
+                "complete"
+            };
+            writeln!(
+                self.writer,
+                "tick {}: no changes (status {status}, processes {}, modules {verified}/{} verified)",
+                self.sequence,
+                snapshot.processes.len(),
+                verified + locator
+            )?;
+            self.writer.flush()?;
+            return Ok(());
+        }
         emit(
             &Record {
                 schema_version: SCHEMA,
@@ -540,9 +638,12 @@ impl<W: Write> Stream<'_, W> {
         reason: inventory::watch::EndReason,
         gap: Option<inventory::GapReason>,
     ) -> io::Result<u8> {
-        let status = if !self.usable {
+        let status = if !self.cumulative.usable {
             4
-        } else if self.partial || reason == inventory::watch::EndReason::Interrupted {
+        } else if self.cumulative.partial
+            || self.cumulative.unavailable
+            || reason == inventory::watch::EndReason::Interrupted
+        {
             3
         } else {
             0
@@ -560,12 +661,13 @@ impl<W: Write> Stream<'_, W> {
                 capabilities: &self.capabilities,
                 gap,
                 sampled_history: "incomplete",
+                cumulative: self.cumulative.clone(),
             },
             self.writer,
             !self.options.json,
             self.options.verbosity,
         )?;
-        if let Some(line) = end_reason_text(self.usable, self.partial, reason, gap) {
+        if let Some(line) = end_reason_text(&self.cumulative, reason, gap) {
             crate::report::err_line(&line);
         }
         Ok(status)
@@ -584,8 +686,8 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
         capabilities: Capabilities::new(false),
         started,
         sequence: 0,
-        usable: false,
-        partial: false,
+        prev: None,
+        cumulative: inventory::watch::Cumulative::default(),
     };
     let mut scanner =
         match ScopedScanner::new(options.selection.clone(), inventory::Limits::default()) {
@@ -767,8 +869,14 @@ mod tests {
             capabilities: Capabilities::new(false),
             started: Instant::now(),
             sequence: 0,
-            usable: true,
-            partial: false,
+            prev: None,
+            cumulative: crate::inventory::watch::Cumulative {
+                usable: true,
+                partial: false,
+                unavailable: false,
+                first_partial: None,
+                first_unavailable: None,
+            },
         };
         stream
             .batch(
@@ -778,7 +886,7 @@ mod tests {
                 Duration::from_millis(201),
             )
             .unwrap();
-        assert!(stream.partial);
+        assert!(stream.cumulative.partial);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["interval"]["drain_lag_ns"], 201000000);
         assert_eq!(value["gaps"], serde_json::json!(["snapshot_lag"]));
@@ -1023,14 +1131,20 @@ mod tests {
 
     #[test]
     fn end_reason_names_unusable_partial_and_scope() {
-        use inventory::watch::EndReason;
+        use inventory::watch::{Cumulative, EndReason};
+        let seen = |usable: bool, partial: bool| Cumulative {
+            usable,
+            partial,
+            unavailable: false,
+            first_partial: partial.then_some(1),
+            first_unavailable: None,
+        };
         assert_eq!(
-            super::end_reason_text(true, false, EndReason::Duration, None),
+            super::end_reason_text(&seen(true, false), EndReason::Duration, None),
             None
         );
         let scope = super::end_reason_text(
-            false,
-            false,
+            &seen(false, false),
             EndReason::ScopeUnavailable,
             Some(inventory::GapReason::ProcessUnavailable),
         )
@@ -1039,12 +1153,13 @@ mod tests {
             scope.contains("scope unavailable") && scope.contains("process_unavailable"),
             "got: {scope}"
         );
-        let unusable = super::end_reason_text(false, true, EndReason::Duration, None).unwrap();
+        let unusable =
+            super::end_reason_text(&seen(false, true), EndReason::Duration, None).unwrap();
         assert!(unusable.contains("unavailable"), "got: {unusable}");
-        let partial = super::end_reason_text(true, true, EndReason::Duration, None).unwrap();
+        let partial = super::end_reason_text(&seen(true, true), EndReason::Duration, None).unwrap();
         assert!(partial.contains("partial"), "got: {partial}");
         let interrupted =
-            super::end_reason_text(true, false, EndReason::Interrupted, None).unwrap();
+            super::end_reason_text(&seen(true, false), EndReason::Interrupted, None).unwrap();
         assert!(interrupted.contains("interrupted"), "got: {interrupted}");
     }
 
@@ -1307,5 +1422,252 @@ mod tests {
         let mut j2 = Vec::new();
         emit(&record, &mut j2, false, 2).unwrap();
         assert_eq!(j0, j2);
+    }
+
+    fn heartbeat_snapshot(state: crate::inventory::InventoryState) -> crate::inventory::Snapshot {
+        use crate::inventory as inv;
+        let interval = inv::CaptureInterval {
+            started_unix_ms: None,
+            finished_unix_ms: None,
+            elapsed_ns: 0,
+        };
+        inv::Snapshot {
+            interval: interval.clone(),
+            scope_record: inv::ScopeRecord::default(),
+            schema_version: "osslscope.discovery.v1".into(),
+            mode: inv::SnapshotMode::Snapshot,
+            scope: inv::Scope::Pids,
+            selected_pids: vec![1],
+            processes: vec![inv::ProcessRecord {
+                interval: interval.clone(),
+                namespaces: inv::NamespaceIds::default(),
+                pid: 1,
+                starttime: 0,
+                comm: None,
+                comm_status: inv::IdentityAvailability::Unreadable,
+                exe: None,
+                exe_status: inv::IdentityAvailability::Unreadable,
+                modules: vec![inv::ModuleRecord {
+                    info: inv::ModuleInfo {
+                        sha256: "a".repeat(64),
+                        device: 0,
+                        inode: 0,
+                        size_bytes: 0,
+                        architecture: inv::Architecture::X86_64,
+                        kind: inv::ObjectKind::Other,
+                        exports: Vec::new(),
+                        depends_on_libcrypto: false,
+                        depends_on_libssl: false,
+                        file_soname: None,
+                        file_openssl_version: None,
+                        file_version_status: inv::FileVersionStatus::Absent,
+                    },
+                    identity_status: inv::IdentityStatus::Verified,
+                    verified_path: None,
+                    verified_path_unavailable: None,
+                    maps_spelling: None,
+                }],
+                provider_activation: inv::ObservationState::Unknown,
+                provider_interfaces: inv::ObservationState::Unknown,
+                execution: inv::ObservationState::NotObserved,
+            }],
+            gaps: Vec::new(),
+            totals: inv::WorkTotals::default(),
+            limits: inv::Limits::default(),
+            capabilities: inv::Capabilities {
+                inventory: state,
+                provider_activation: inv::ObservationState::Unknown,
+                provider_interfaces: inv::ObservationState::Unknown,
+                execution: inv::ObservationState::NotObserved,
+            },
+            resolve: inv::resolve::ResolveSidecar::default(),
+            cgroup_identity: std::collections::BTreeMap::new(),
+        }
+    }
+
+    fn heartbeat_options(json: bool) -> Options {
+        Options {
+            selection: Selection::default(),
+            json,
+            watch: true,
+            interval: Duration::from_secs(1),
+            duration: Duration::from_secs(30),
+            verbosity: 0,
+        }
+    }
+
+    // W1 mirror: the first batch renders full; an identical
+    // second batch (no facts, same gaps, same snapshot state)
+    // prints the shared heartbeat line instead of a full block.
+    #[test]
+    fn stream_second_identical_snapshot_batch_is_a_heartbeat() {
+        let options = heartbeat_options(false);
+        let snapshot = heartbeat_snapshot(crate::inventory::InventoryState::Complete);
+        let mut bytes = Vec::new();
+        {
+            let mut stream = Stream {
+                writer: &mut bytes,
+                options: &options,
+                capabilities: Capabilities::new(true),
+                started: Instant::now(),
+                sequence: 0,
+                prev: None,
+                cumulative: crate::inventory::watch::Cumulative::default(),
+            };
+            stream
+                .batch(
+                    ObservationBatch::default(),
+                    Some(&snapshot),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            stream
+                .batch(
+                    ObservationBatch::default(),
+                    Some(&snapshot),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("snapshot 1:"),
+            "first batch full, got: {text}"
+        );
+        assert!(
+            text.contains(
+                "tick 2: no changes (status complete, processes 1, modules 1/1 verified)"
+            ),
+            "no heartbeat, got: {text}"
+        );
+        assert!(!text.contains("snapshot 2:"), "re-dumped, got: {text}");
+    }
+
+    #[test]
+    fn stream_heartbeat_never_filters_machine_records() {
+        // Machine mode: full records every batch, no tick line.
+        let options = heartbeat_options(true);
+        let snapshot = heartbeat_snapshot(crate::inventory::InventoryState::Complete);
+        let mut bytes = Vec::new();
+        {
+            let mut stream = Stream {
+                writer: &mut bytes,
+                options: &options,
+                capabilities: Capabilities::new(true),
+                started: Instant::now(),
+                sequence: 0,
+                prev: None,
+                cumulative: crate::inventory::watch::Cumulative::default(),
+            };
+            for _ in 0..2 {
+                stream
+                    .batch(
+                        ObservationBatch::default(),
+                        Some(&snapshot),
+                        Duration::ZERO,
+                        Duration::ZERO,
+                    )
+                    .unwrap();
+            }
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(!text.contains("tick "), "heartbeat in NDJSON: {text}");
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().all(|r| r["record"] == "snapshot"));
+    }
+
+    // F8 mirror: run-level partial history survives a later
+    // complete batch — end status stays non-complete and the
+    // human end record names the cumulative history. Machine
+    // end shape gains no keys.
+    #[test]
+    fn stream_end_keeps_partial_history_across_batches() {
+        let options = heartbeat_options(false);
+        let partial = heartbeat_snapshot(crate::inventory::InventoryState::Partial);
+        let complete = heartbeat_snapshot(crate::inventory::InventoryState::Complete);
+        let mut bytes = Vec::new();
+        let status;
+        {
+            let mut stream = Stream {
+                writer: &mut bytes,
+                options: &options,
+                capabilities: Capabilities::new(true),
+                started: Instant::now(),
+                sequence: 0,
+                prev: None,
+                cumulative: crate::inventory::watch::Cumulative::default(),
+            };
+            stream
+                .batch(
+                    ObservationBatch::default(),
+                    Some(&partial),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            stream
+                .batch(
+                    ObservationBatch::default(),
+                    Some(&complete),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            status = stream
+                .end(crate::inventory::watch::EndReason::Duration, None)
+                .unwrap();
+        }
+        assert_eq!(status, 3);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("cumulative=partial-seen"),
+            "no cumulative word, got: {text}"
+        );
+        assert!(
+            text.contains("note: sample 1 was partial; history remains uncertain"),
+            "no uncertainty note, got: {text}"
+        );
+        // Machine end record: same keys (cumulative stays human-only).
+        let options = heartbeat_options(true);
+        let mut bytes = Vec::new();
+        {
+            let mut stream = Stream {
+                writer: &mut bytes,
+                options: &options,
+                capabilities: Capabilities::new(true),
+                started: Instant::now(),
+                sequence: 0,
+                prev: None,
+                cumulative: crate::inventory::watch::Cumulative::default(),
+            };
+            stream
+                .batch(
+                    ObservationBatch::default(),
+                    Some(&partial),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .unwrap();
+            let status = stream
+                .end(crate::inventory::watch::EndReason::Duration, None)
+                .unwrap();
+            assert_eq!(status, 3);
+        }
+        let text = String::from_utf8(bytes).unwrap();
+        let end: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(end["record"], "end");
+        assert_eq!(end["status"], 3);
+        assert!(
+            end.get("cumulative").is_none()
+                && end.get("cumulative_partial").is_none()
+                && end.get("cumulative_unavailable").is_none(),
+            "machine end shape changed: {end}"
+        );
     }
 }
