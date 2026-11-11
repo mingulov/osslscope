@@ -40,6 +40,7 @@ pub mod report;
 pub mod scan;
 pub mod schema;
 pub mod service;
+pub mod shutdown;
 pub mod target;
 
 pub mod focused_count;
