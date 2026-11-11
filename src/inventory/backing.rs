@@ -41,7 +41,9 @@ use std::ffi::CString;
 use std::fs::{File, Metadata};
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
+use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::MetadataExt as _;
+use std::path::PathBuf;
 
 /// Internal-only virtual-memory range under verification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1148,6 +1150,14 @@ pub(crate) fn direct_layer_candidates(
     direct_layer_candidates_charged(process_dir, maps_path, max, &mut UnboundedBudget)
 }
 
+/// Joined layer entries: the NUL-terminated host-absolute spelling plus
+/// the admitted descriptor (`None` when the join is unopenable or not a
+/// regular file — symlinked layer members stay skipped). Shared core of
+/// the descriptor and pathname projections below: admission, slot
+/// counting, bounds, and budget charging are identical for both. The
+/// pathname projection is a CANDIDATE source only (v0.6.0 D3 container
+/// arm) — every spelling still requires constrained reopen + identity +
+/// layer-membership revalidation by the caller; nothing here is proof.
 /// Budget-charged layer discovery (ER-5E-I2 remainder): the mountinfo buffer
 /// reservation is held for the whole extraction (released only with the
 /// buffer), parser/path/candidate scratch is reserved BEFORE any of it is
@@ -1156,12 +1166,12 @@ pub(crate) fn direct_layer_candidates(
 /// opened (or dropped) before the next is built. A budget refusal yields no
 /// candidates and the caller re-derives the precise gap downstream, exactly
 /// as a mountinfo read refusal does.
-pub(crate) fn direct_layer_candidates_charged<B: BackingBudget>(
+fn direct_layer_entries_charged<B: BackingBudget>(
     process_dir: &File,
     maps_path: &[u8],
     max: usize,
     budget: &mut B,
-) -> Vec<File> {
+) -> Vec<(Vec<u8>, Option<File>)> {
     let limit = max.min(MAX_LAYER_CANDIDATES);
     let mut candidates = Vec::new();
     if maps_path.is_empty() || !maps_path.starts_with(b"/") || maps_path.ends_with(b" (deleted)") {
@@ -1220,11 +1230,50 @@ pub(crate) fn direct_layer_candidates_charged<B: BackingBudget>(
             continue;
         };
         joined += 1;
-        if let Some(file) = open_layer_candidate(&path) {
-            candidates.push(file);
-        }
+        let file = open_layer_candidate(&path);
+        candidates.push((path, file));
     }
     candidates
+}
+
+/// Descriptor projection of [`direct_layer_entries_charged`]: admitted
+/// candidates only (same set as before this split — successfully opened
+/// regular files). See the shared core for charging and bounds.
+pub(crate) fn direct_layer_candidates_charged<B: BackingBudget>(
+    process_dir: &File,
+    maps_path: &[u8],
+    max: usize,
+    budget: &mut B,
+) -> Vec<File> {
+    direct_layer_entries_charged(process_dir, maps_path, max, budget)
+        .into_iter()
+        .filter_map(|(_, file)| file)
+        .collect()
+}
+
+/// Pathname projection of [`direct_layer_entries_charged`] (v0.6.0 D3):
+/// host-absolute spellings for the ADMITTED candidates only (same
+/// admission set as the descriptor variant). CANDIDATE source only:
+/// the container arm still constrained-reopens each spelling and
+/// revalidates identity + layer membership — an entry here proves
+/// nothing by itself. Retained spelling bytes are transient (the caller
+/// drops them after establishment) and bounded by the candidate limit.
+pub(crate) fn direct_layer_candidate_paths_charged<B: BackingBudget>(
+    process_dir: &File,
+    maps_path: &[u8],
+    max: usize,
+    budget: &mut B,
+) -> Vec<PathBuf> {
+    direct_layer_entries_charged(process_dir, maps_path, max, budget)
+        .into_iter()
+        .filter_map(|(mut path, file)| {
+            file?;
+            // The joiner appends exactly one NUL terminator.
+            debug_assert_eq!(path.last(), Some(&0));
+            path.pop();
+            Some(PathBuf::from(std::ffi::OsStr::from_bytes(&path)))
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -321,6 +321,15 @@ pub enum LocatorKind {
     ProcRootAnchored,
 }
 
+/// Proven object path (v0.6.0 D1/D3): `path` names the module's
+/// retained identity (re-proven at capture time), `locator_kind`
+/// records HOW it was proven (host direct, container layer, or
+/// target-root anchored), and `capture_unix_ms` stamps WHEN.
+/// Incarnation binding: the enclosing `ProcessRecord`'s `(pid,
+/// starttime, namespaces)` triple is the identity the path is proven
+/// against — consumers must NEVER join paths across processes by
+/// `(device, inode)` alone (numbers recycle across namespaces and
+/// mounts; the incarnation triple does not).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VerifiedPath {

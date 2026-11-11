@@ -28,7 +28,7 @@
 //!   diagnostics). [`ResolveSidecar`] debug output redacts.
 //! - `/proc/self/fd` is never probed.
 
-use super::{IdentityStatus, ModuleInfo, ProcessRecord};
+use super::{IdentityStatus, ModuleInfo, ProcessRecord, backing};
 use std::fs::File;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
@@ -96,7 +96,8 @@ impl ResolveError {
 }
 
 // Per-thread resolver invocation count: incremented on every
-// resolve_for_display and establish_locator entry. Hostile cells
+// resolve_for_display, establish_locator, establish_container_locator,
+// and publish_root_anchored entry. Hostile cells
 // assert zero deltas (rules 1/4/5: the resolver never runs for
 // candidates, without the flag, or off-terminal). Thread-local,
 // so parallel suites stay isolated; production overhead is one
@@ -533,6 +534,330 @@ pub(crate) fn establish_locator(candidate: &Path, verified: (u64, u64)) -> Optio
         return None;
     }
     Some(absolute)
+}
+
+/// Transient establishment budget (v0.6.0 D3): `establish_container_locator`
+/// carries no caller `Work` (fixed signature), so layer discovery charges
+/// here instead: reads capped across a single derivation, state
+/// reservations capped, no deadline (one acquisition op — the caller
+/// enforces its own deadline at the next `Work` checkpoint). Any refusal
+/// fails the arm closed.
+struct EstablishmentBudget {
+    read_left: usize,
+    state_left: usize,
+}
+
+impl EstablishmentBudget {
+    /// One derivation: a mountinfo-sized read allowance plus a scratch
+    /// allowance covering the extraction formula (both transient —
+    /// dropped with the candidates after establishment).
+    fn one_derivation() -> Self {
+        Self {
+            read_left: 2 << 20,
+            state_left: 8 << 20,
+        }
+    }
+}
+
+impl backing::BackingBudget for EstablishmentBudget {
+    fn checkpoint(&mut self) -> Result<(), backing::BackingError> {
+        Ok(())
+    }
+    fn allow_read(&mut self, want: usize) -> Result<usize, backing::BackingError> {
+        if self.read_left == 0 {
+            return Err(backing::BackingError::Unavailable);
+        }
+        Ok(want.max(1).min(self.read_left))
+    }
+    fn commit_read(&mut self, bytes: u64) -> Result<(), backing::BackingError> {
+        self.read_left = self
+            .read_left
+            .saturating_sub(usize::try_from(bytes).unwrap_or(usize::MAX));
+        Ok(())
+    }
+    fn reserve_state(
+        &mut self,
+        bytes: usize,
+    ) -> Result<backing::BackingLease, backing::BackingError> {
+        if bytes > self.state_left {
+            return Err(backing::BackingError::Unavailable);
+        }
+        self.state_left -= bytes;
+        Ok(backing::BackingLease::Uncharged)
+    }
+}
+
+/// Layer-candidate bound for the container arm: mirrors the backing
+/// call site (`procfs::backing` passes the same value).
+const CONTAINER_LAYER_MAX: usize = 16;
+
+/// Establish a container locator at acquisition (v0.6.0 D3): runs ONLY
+/// after the host arm (`establish_locator`) returns `None` for a
+/// verified module. Two sub-arms, first full pass wins:
+///
+/// - Layer arm: each `direct_layer_candidate_paths_charged` spelling is
+///   a CANDIDATE only — constrained-reopened, identity-matched against
+///   the retained verified identity, layer-membership re-proven by a
+///   fresh derivation from the retained proc dir, and chase-verified.
+/// - Root-fd arm: the maps-relative spelling is resolved inside a root
+///   fd acquired from the RETAINED proc dir, with magic-link/escape
+///   protection, then revalidated (process, root, namespace, backing,
+///   pathname — see `verify_root_anchored`).
+///
+/// Returns the proven locator plus its kind; `None` fails closed (the
+/// caller keeps the host-arm reason and publishes `null`).
+pub(crate) fn establish_container_locator(
+    process_dir: &File,
+    candidate: &Path,
+    verified: (u64, u64),
+) -> Option<(PathBuf, super::LocatorKind)> {
+    count_invocation();
+    if !enforcement_supported() {
+        return None;
+    }
+    if let Some(hit) = establish_layer_locator(process_dir, candidate, verified) {
+        return Some(hit);
+    }
+    let anchored = verify_root_anchored(process_dir, candidate, verified)?;
+    Some((anchored, super::LocatorKind::ProcRootAnchored))
+}
+
+/// Layer sub-arm: host-absolute overlay spellings from the TARGET's
+/// mount table. Proof per candidate is a constrained open, exact
+/// identity, still-a-member re-derivation, and a verified chase.
+/// First full pass wins; anything short fails through to the
+/// root-fd arm.
+fn establish_layer_locator(
+    process_dir: &File,
+    candidate: &Path,
+    verified: (u64, u64),
+) -> Option<(PathBuf, super::LocatorKind)> {
+    let maps_bytes = candidate.as_os_str().as_bytes();
+    let entries = backing::direct_layer_candidate_paths_charged(
+        process_dir,
+        maps_bytes,
+        CONTAINER_LAYER_MAX,
+        &mut EstablishmentBudget::one_derivation(),
+    );
+    for spelling in entries {
+        if !spelling.is_absolute() {
+            continue;
+        }
+        let Ok(opened) = open_constrained(&spelling) else {
+            continue;
+        };
+        if !identity_matches(&opened, verified) {
+            continue;
+        }
+        // Membership re-proof: the layer must STILL be listed in the
+        // target's mount table now (a stale derivation from a
+        // since-unmounted layer never publishes).
+        let fresh = backing::direct_layer_candidate_paths_charged(
+            process_dir,
+            maps_bytes,
+            CONTAINER_LAYER_MAX,
+            &mut EstablishmentBudget::one_derivation(),
+        );
+        if !fresh.contains(&spelling) {
+            continue;
+        }
+        let Ok(canonical) = chase_canonical(&spelling, verified) else {
+            continue;
+        };
+        return Some((canonical, super::LocatorKind::ContainerLayer));
+    }
+    None
+}
+
+/// Root-fd walk: resolve `absolute` (target-namespace spelling, leading
+/// `/`) inside `root`, returning the canonical spelling plus the pinned
+/// final descriptor. Every descent is a single-component constrained
+/// `openat2` against a component PROVEN a non-symlink by `fstatat`
+/// NOFOLLOW; symlinks chase TEXTUALLY (readlink + splice, absolute
+/// targets restart at the root fd) so the kernel never interprets a
+/// link — magic links can only contribute text, never traversal, and
+/// absolute restarts land on the target root, never the host root.
+/// `..` pops lexically over the proven link-free prefix (after any
+/// expansion, or above the root fd, it fails closed). Bounded by
+/// `MAX_CHASE_STEPS`/`MAX_SYMLINK_EXPANSIONS`; anything else fails
+/// closed to `None`.
+fn walk_rooted(root: &File, absolute: &[u8]) -> Option<(Vec<u8>, File)> {
+    use std::os::unix::io::AsRawFd as _;
+    if absolute.is_empty() || !absolute.starts_with(b"/") {
+        return None;
+    }
+    let Ok(root_anchor) = root.try_clone() else {
+        return None;
+    };
+    let mut dir = root.try_clone().ok()?;
+    let mut pending: Vec<Vec<u8>> = absolute
+        .split(|b| *b == b'/')
+        .filter(|c| !c.is_empty() && *c != b".")
+        .map(|c| c.to_vec())
+        .collect();
+    pending.reverse();
+    let mut built: Vec<Vec<u8>> = Vec::new();
+    let mut expanded_symlink = false;
+    let mut expansions = 0usize;
+    let mut step = 0usize;
+    while let Some(component) = pending.pop() {
+        if step >= MAX_CHASE_STEPS {
+            return None;
+        }
+        step += 1;
+        if component == b".." {
+            // Lexical pop is exact only over a proven non-link
+            // prefix; above the root fd it is an escape attempt.
+            if expanded_symlink || built.pop().is_none() {
+                return None;
+            }
+            // Re-anchor by restarting the walk over the popped
+            // prefix plus the untouched remainder (re-classifies
+            // every component; steps stay bounded above).
+            let Ok(fresh) = root_anchor.try_clone() else {
+                return None;
+            };
+            dir = fresh;
+            let mut rest: Vec<Vec<u8>> = pending.drain(..).rev().collect();
+            let mut combined = built.clone();
+            combined.append(&mut rest);
+            combined.reverse();
+            pending = combined;
+            built = Vec::new();
+            continue;
+        }
+        let name = std::ffi::CString::new(component.as_slice()).ok()?;
+        // SAFETY: dirfd borrowed; stat valid for the call.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                &mut stat,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if ok != 0 {
+            return None;
+        }
+        if (stat.st_mode & libc::S_IFMT) == libc::S_IFLNK {
+            expansions += 1;
+            if expansions > MAX_SYMLINK_EXPANSIONS {
+                return None;
+            }
+            let mut target = vec![0u8; libc::PATH_MAX as usize];
+            // SAFETY: dirfd + name borrowed; target outlives the call.
+            let len = unsafe {
+                libc::readlinkat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    target.as_mut_ptr().cast(),
+                    target.len(),
+                )
+            };
+            if len <= 0 {
+                return None;
+            }
+            target.truncate(len as usize);
+            expanded_symlink = true;
+            if target.starts_with(b"/") {
+                let Ok(fresh) = root_anchor.try_clone() else {
+                    return None;
+                };
+                dir = fresh;
+                built.clear();
+            }
+            let mut parts: Vec<Vec<u8>> = target
+                .split(|b| *b == b'/')
+                .filter(|c| !c.is_empty() && *c != b".")
+                .map(|c| c.to_vec())
+                .collect();
+            parts.reverse();
+            pending.extend(parts);
+            continue;
+        }
+        let child = openat2_no_magic(dir.as_raw_fd(), &name).ok()?;
+        dir = child;
+        built.push(component);
+    }
+    let mut canonical = vec![b'/'];
+    canonical.extend(built.join(&b'/'));
+    Some((canonical, dir))
+}
+
+/// Root-fd sub-arm, shared by establishment and publish: prove the
+/// maps-relative spelling inside a root fd acquired from the RETAINED
+/// proc dir (the single audited magic-link traversal on this path —
+/// `open_at` follows `root` deliberately to enter the target mount
+/// namespace; every later step is magic-free by construction, see
+/// `walk_rooted`), then revalidate process + root + namespace +
+/// backing + pathname:
+///
+/// - process/root/namespace: the incarnation bracket
+///   (`incarnation_direct` before vs after — starttime plus mount-ns
+///   identity must be stable, and both reads must succeed, so a raced
+///   exit/reuse fails closed);
+/// - backing: the pinned final descriptor must fstat-match the retained
+///   verified identity EXACTLY (same-domain comparison — no btrfs
+///   carve-out, mirroring `identity_matches`);
+/// - pathname: the canonical string must re-walk from a FRESH root fd
+///   to the same identity (walk races fail closed here, never to a
+///   mislabeled spelling).
+fn verify_root_anchored(
+    process_dir: &File,
+    candidate: &Path,
+    verified: (u64, u64),
+) -> Option<PathBuf> {
+    let bytes = candidate.as_os_str().as_bytes();
+    let before = super::procfs::incarnation_direct(process_dir)?;
+    let root = super::procfs::open_at(process_dir, b"root").ok()?;
+    let (canonical, pinned) = walk_rooted(&root, bytes)?;
+    if !identity_matches(&pinned, verified) {
+        return None;
+    }
+    drop(pinned);
+    let after = super::procfs::incarnation_direct(process_dir)?;
+    if before != after {
+        return None;
+    }
+    // Pathname re-proof from a fresh root fd (also re-proves target
+    // liveness: a raced exit fails the fresh `root` open).
+    let fresh = super::procfs::open_at(process_dir, b"root").ok()?;
+    let (rebuilt, confirm) = walk_rooted(&fresh, &canonical)?;
+    if rebuilt != canonical || !identity_matches(&confirm, verified) {
+        return None;
+    }
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&canonical)))
+}
+
+/// Machine publish for one root-anchored row (D3): re-prove the
+/// retained target-relative spelling through a FRESH root fd (same
+/// core as establishment — process/root/namespace/backing/pathname),
+/// then encode losslessly with `LocatorKind::ProcRootAnchored`.
+/// Anything short publishes `null` + `ResolveFailed` (never a weaker
+/// reason — only a positive revalidation closes).
+pub(crate) fn publish_root_anchored(
+    process_dir: &File,
+    locator: &Path,
+    identity: (u64, u64),
+) -> (
+    Option<super::VerifiedPath>,
+    Option<super::PathUnavailableReason>,
+) {
+    count_invocation();
+    let Some(canonical) = verify_root_anchored(process_dir, locator, identity) else {
+        return (None, Some(super::PathUnavailableReason::ResolveFailed));
+    };
+    let (path, path_encoding) = encode_machine_path(canonical.as_os_str().as_bytes());
+    (
+        Some(super::VerifiedPath {
+            path,
+            path_encoding,
+            locator_kind: super::LocatorKind::ProcRootAnchored,
+            capture_unix_ms: crate::inventory::wall_ms_pub(),
+        }),
+        None,
+    )
 }
 
 /// Render-time resolution for one capability (rules 5–6): atomic
@@ -1682,5 +2007,57 @@ mod tests {
         let (path, reason) = publish_verified_path(&magic);
         assert_eq!(path, None);
         assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
+    }
+
+    #[test]
+    fn v060_container_locator_rejects_escape_and_recycle() {
+        let dir = std::fs::File::open("/proc/self").unwrap();
+        // `..` escaping above the target root fd must fail closed.
+        let escape = std::path::Path::new("/../../../../etc/hostname");
+        assert!(super::establish_container_locator(&dir, escape, (0, 0)).is_none());
+        // Wrong retained identity (stand-in for PID-reuse/starttime
+        // mismatch) must fail closed, never publish the candidate.
+        let real = std::path::Path::new("/usr/lib/x86_64-linux-gnu/libcrypto.so.3");
+        assert!(super::establish_container_locator(&dir, real, (1, 1)).is_none());
+    }
+
+    // v0.6.0 D3 agent-runnable positive: `/proc/self` is its own
+    // target, so the root-fd arm proves a real file with no backing
+    // verification. Kind-agnostic at this level — on overlay hosts
+    // the layer arm legitimately wins first; the KIND→publish
+    // mapping is pinned by the procfs publish test and the bwrap
+    // integration instead.
+    #[test]
+    fn v060_container_locator_proves_self_rooted_file() {
+        use crate::inventory::LocatorKind;
+        let lib = [
+            "/usr/lib64/libcrypto.so.3",
+            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+            "/lib64/libcrypto.so.3",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+        let Some(lib) = lib else {
+            eprintln!("SKIP: no system libcrypto for the container-locator positive test");
+            return;
+        };
+        let dir = std::fs::File::open("/proc/self").unwrap();
+        let identity = identity_of(Path::new(lib));
+        // Root-arm core directly: canonical spelling, pinned identity.
+        let anchored = super::verify_root_anchored(&dir, Path::new(lib), identity)
+            .expect("self-rooted walk proves the file");
+        let expected = std::fs::canonicalize(lib).unwrap();
+        assert_eq!(anchored, expected);
+        // Full establish: a proven kind naming the same file.
+        let (path, kind) = super::establish_container_locator(&dir, Path::new(lib), identity)
+            .expect("container arm proves the self-rooted file");
+        assert!(
+            kind == LocatorKind::ProcRootAnchored || kind == LocatorKind::ContainerLayer,
+            "{kind:?}"
+        );
+        assert_eq!(identity_of(&path), identity);
+        if kind == LocatorKind::ProcRootAnchored {
+            assert_eq!(path, expected);
+        }
     }
 }

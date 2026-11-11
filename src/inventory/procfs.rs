@@ -3,10 +3,11 @@
 //! as execution evidence. No producer bootstrap or target-memory dependency.
 
 use super::{
-    Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, MapsSource,
-    MapsSpelling, MapsVerification, ModuleInfo, ModuleRecord, NamespaceId, NamespaceIds,
-    ObjectKind, ObservationState, PathUnavailableReason, ProcessRecord, Scope, ScopeRecord,
-    Snapshot, SnapshotMode, SnapshotOptions, VerifiedPath, WorkTotals, backing, elf, resolve,
+    Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, LocatorKind,
+    MapsSource, MapsSpelling, MapsVerification, ModuleInfo, ModuleRecord, NamespaceId,
+    NamespaceIds, ObjectKind, ObservationState, PathUnavailableReason, ProcessRecord, Scope,
+    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, VerifiedPath, WorkTotals, backing, elf,
+    resolve,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,6 +182,37 @@ fn starttime(directory: &File, work: &mut Work<'_>) -> Result<u64, GapReason> {
     Ok(start)
 }
 
+/// Establishment-time incarnation bracket (v0.6.0 D3): a direct
+/// starttime and mount-namespace read WITHOUT a `Work` budget — the
+/// container arm has a fixed signature with no caller budget to
+/// charge. Bounded single reads (same 64 KiB `stat` cap as
+/// `Work::read`); `None` fails the arm closed. Parsing mirrors
+/// `starttime` (comm may contain spaces and `)` — only the last `)`
+/// delimits it).
+pub(super) fn incarnation_direct(directory: &File) -> Option<(u64, NamespaceId)> {
+    let file = open_at(directory, b"stat").ok()?;
+    let mut bytes = Vec::new();
+    (&file).take(65_537).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 65_536 {
+        return None;
+    }
+    let end = bytes.iter().rposition(|b| *b == b')')?;
+    let starttime = bytes[end + 1..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|b| !b.is_empty())
+        .nth(19)
+        .and_then(|value| number(value, 10))?;
+    let namespace = open_at(directory, b"ns/mnt").ok()?;
+    let metadata = namespace.metadata().ok()?;
+    Some((
+        starttime,
+        NamespaceId {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    ))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Fingerprint {
     dev: u64,
@@ -220,6 +252,10 @@ struct Cached {
     /// retained with the verifying FD. `None` unless the flag was
     /// on at acquisition AND a permissible pathname was proven.
     locator: Option<PathBuf>,
+    /// Provenance of `locator` (v0.6.0 D3): `HostDirect` unless the
+    /// container arm proved a layer or root-anchored spelling.
+    /// Meaningful only when `locator.is_some()`.
+    locator_kind: LocatorKind,
 }
 
 /// Cache identity: native fingerprint plus the association's witnessed page
@@ -556,6 +592,7 @@ impl Work<'_> {
                 // Proven later by the verify caller (which holds
                 // the mapping); cache hits reuse the retained one.
                 locator: None,
+                locator_kind: LocatorKind::HostDirect,
             },
         );
         result
@@ -778,20 +815,38 @@ fn maps_spelling_for(path: &[u8]) -> MapsSpelling {
 /// or an unduppable verifying FD degrades to `ResolveFailed` (the
 /// row stays Verified; only the path evidence is unavailable).
 /// The transient dup is dropped before return (F3: no retained FD
-/// mid-acquisition).
+/// mid-acquisition). v0.6.0 D3: root-anchored rows re-prove through
+/// a FRESH target root fd (host-side re-resolution cannot open
+/// target spellings); layer rows re-resolve through the same host
+/// machinery (their spellings are host-meaningful) with the
+/// recorded kind stamped on success — the kind is the locator's
+/// establishment provenance, while the path↔inode binding is what
+/// the re-resolution re-proves.
 fn publish_for_key(
     cache: &BTreeMap<CacheKey, Cached>,
     key: &CacheKey,
     identity: (u64, u64),
+    process_dir: &File,
 ) -> (Option<VerifiedPath>, Option<PathUnavailableReason>) {
     let Some(cached) = cache.get(key) else {
         return (None, Some(PathUnavailableReason::ResolveFailed));
     };
+    if cached.locator_kind == LocatorKind::ProcRootAnchored
+        && let Some(locator) = cached.locator.as_ref()
+    {
+        return resolve::publish_root_anchored(process_dir, locator, identity);
+    }
     let Ok(file) = cached.file.try_clone() else {
         return (None, Some(PathUnavailableReason::ResolveFailed));
     };
     let capability = resolve::RowCapability::new(identity, file, cached.locator.clone());
-    resolve::publish_verified_path(&capability)
+    let (mut verified_path, reason) = resolve::publish_verified_path(&capability);
+    if cached.locator_kind == LocatorKind::ContainerLayer
+        && let Some(path) = verified_path.as_mut()
+    {
+        path.locator_kind = LocatorKind::ContainerLayer;
+    }
+    (verified_path, reason)
 }
 
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
@@ -926,11 +981,25 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                         let identity = (metadata.dev(), metadata.ino());
                         let candidate =
                             std::path::Path::new(std::ffi::OsStr::from_bytes(mapping.path));
-                        if let Some(locator) = resolve::establish_locator(candidate, identity)
+                        // Host arm first; the D3 container arm runs
+                        // ONLY when the host arm proves nothing
+                        // (target-namespaced spellings fail the
+                        // host-side constrained open by design).
+                        let proven = resolve::establish_locator(candidate, identity)
+                            .map(|locator| (locator, LocatorKind::HostDirect))
+                            .or_else(|| {
+                                resolve::establish_container_locator(
+                                    &process.directory,
+                                    candidate,
+                                    identity,
+                                )
+                            });
+                        if let Some((locator, kind)) = proven
                             && work.charge_resolve(locator.as_os_str().len() + 512)
                             && let Some(cached) = work.cache.get_mut(&key)
                         {
                             cached.locator = Some(locator);
+                            cached.locator_kind = kind;
                         }
                     }
                     // v0.6.0 D1: the sample's OWN maps pathname for
@@ -1034,8 +1103,12 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                 module.verified_path_unavailable = Some(PathUnavailableReason::UnverifiedIdentity);
                 continue;
             }
-            let (verified_path, verified_path_unavailable) =
-                publish_for_key(&work.cache, key, (module.info.device, module.info.inode));
+            let (verified_path, verified_path_unavailable) = publish_for_key(
+                &work.cache,
+                key,
+                (module.info.device, module.info.inode),
+                &process.directory,
+            );
             module.verified_path = verified_path;
             module.verified_path_unavailable = verified_path_unavailable;
             work.resolve_staged
@@ -1436,9 +1509,11 @@ mod tests {
                 info: Err(GapReason::NotElf),
                 seen: true,
                 locator: Some(real.clone()),
+                locator_kind: LocatorKind::HostDirect,
             },
         );
-        let (path, reason) = publish_for_key(&cache, &key, identity);
+        let process_dir = File::open("/proc/self").unwrap();
+        let (path, reason) = publish_for_key(&cache, &key, identity, &process_dir);
         let path = path.expect("proven locator publishes");
         assert_eq!(path.path, real.to_string_lossy());
         assert_eq!(path.path_encoding, super::super::PathEncoding::Utf8);
@@ -1448,7 +1523,7 @@ mod tests {
         // No locator: finite reason, never a path.
         cache.get_mut(&key).unwrap().locator = None;
         assert_eq!(
-            publish_for_key(&cache, &key, identity),
+            publish_for_key(&cache, &key, identity, &process_dir),
             (None, Some(PathUnavailableReason::NoLocator))
         );
         // Unknown key: finite reason, never a path.
@@ -1456,7 +1531,58 @@ mod tests {
         std::fs::write(&probe, b"y").unwrap();
         let missing = (Fingerprint::from(&std::fs::metadata(&probe).unwrap()), None);
         assert_eq!(
-            publish_for_key(&cache, &missing, identity),
+            publish_for_key(&cache, &missing, identity, &process_dir),
+            (None, Some(PathUnavailableReason::ResolveFailed))
+        );
+    }
+
+    // v0.6.0 D3: a stored root-anchored locator re-proves through the
+    // held proc dir and publishes its kind (no backing verification
+    // needed — `/proc/self` is its own target, so this runs
+    // unprivileged); a mismatched identity fails closed to
+    // `ResolveFailed`, never the spelling.
+    #[test]
+    fn v060_publish_root_anchored_reproves_kind_or_fails_closed() {
+        let lib = [
+            "/usr/lib64/libcrypto.so.3",
+            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+            "/lib64/libcrypto.so.3",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists());
+        let Some(lib) = lib else {
+            eprintln!("SKIP: no system libcrypto for the root-anchored publish test");
+            return;
+        };
+        let metadata = std::fs::metadata(lib).unwrap();
+        let key = (Fingerprint::from(&metadata), None);
+        let identity = (metadata.dev(), metadata.ino());
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            key.clone(),
+            Cached {
+                _memory: None,
+                file: File::open(lib).unwrap(),
+                info: Err(GapReason::NotElf),
+                seen: true,
+                locator: Some(PathBuf::from(lib)),
+                locator_kind: LocatorKind::ProcRootAnchored,
+            },
+        );
+        let process_dir = File::open("/proc/self").unwrap();
+        let (path, reason) = publish_for_key(&cache, &key, identity, &process_dir);
+        let path = path.expect("root-anchored locator re-proves");
+        // Canonical spelling (test-only oracle: `canonicalize` is
+        // forbidden in production, fine as an expected value).
+        let expected = std::fs::canonicalize(lib).unwrap();
+        assert_eq!(path.path, expected.to_string_lossy());
+        assert_eq!(path.locator_kind, LocatorKind::ProcRootAnchored);
+        assert!(path.capture_unix_ms.is_some());
+        assert_eq!(reason, None);
+        // Wrong identity (stand-in for a recycled target): the
+        // re-proof fails closed, never the retained spelling.
+        assert_eq!(
+            publish_for_key(&cache, &key, (1, 1), &process_dir),
             (None, Some(PathUnavailableReason::ResolveFailed))
         );
     }
