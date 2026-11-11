@@ -431,6 +431,58 @@ fn module_or_filters_and_explicit_elf_without_openssl_exports_work() {
         osslscope::inventory::ObjectKind::Other
     );
 }
+#[test]
+fn v060_module_selected_other_is_listed_not_counted() {
+    let f = Fixture::new();
+    let ordinary = f.build(
+        "PRIVATE_CANARY_ordinary",
+        "int ordinary(void) { return 31; }",
+        true,
+    );
+    let child = f.child(&[ordinary.clone()]);
+    // Default route control: the mapped Other-kind objects are
+    // counted, not listed — the same population the module leg
+    // below must not also count.
+    let plain = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--pid", &child.pid().to_string(), "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        matches!(plain.status.code(), Some(0 | 3)),
+        "{:?}",
+        plain.status
+    );
+    let doc: serde_json::Value = serde_json::from_slice(&plain.stdout).unwrap();
+    let proc = &doc["processes"][0];
+    let counted = proc["other_objects"]["verified"].as_u64().unwrap()
+        + proc["other_objects"]["candidate"].as_u64().unwrap();
+    assert!(counted >= 1, "expected counted Others, got: {proc}");
+    // Module route (R11): the selected Other is listed and must
+    // not also be counted — no object is both listed and counted.
+    let output = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--pid",
+            &child.pid().to_string(),
+            "--module",
+            ordinary.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 3)),
+        "{:?}",
+        output.status
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let proc = &value["processes"][0];
+    let modules = proc["modules"].as_array().unwrap();
+    assert_eq!(modules.len(), 1);
+    assert_eq!(modules[0]["info"]["kind"], "other");
+    assert_eq!(proc["other_objects"]["verified"], 0);
+    assert_eq!(proc["other_objects"]["candidate"], 0);
+}
 
 // 5E RED: a genuine container process maps lower-only overlay image layers;
 // the snapshot must verify them (not merely list them as candidates) while

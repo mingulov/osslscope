@@ -1007,6 +1007,10 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     let mut modules = Vec::new();
     // P0-5 counted-not-listed `Other` objects for this process (see
     // `OtherCounts`): incremented exactly where filtering happens below.
+    // R11: `verified`/`candidate` accrue only while `include_other` is
+    // false — under `scan --module` selected Others are listed, so
+    // counting them too would represent one object twice. `failed`
+    // accrues in every route: failures are never listed anywhere.
     let mut other_objects = OtherCounts::default();
     let mut verified = BTreeSet::new();
     let mut attempts = 0;
@@ -1076,8 +1080,10 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                 // binds it (the `IdentityUnverified` gap above names the
                 // same mapping). This mirrors the listing the filter below
                 // suppresses: verified repeats dedup above, while uncertain
-                // locators stay separate records.
-                if info.kind == ObjectKind::Other {
+                // locators stay separate records. R11: no bucket when the
+                // filter below keeps the row (`scan --module` lists
+                // selected Others — listed and counted would be twice).
+                if info.kind == ObjectKind::Other && !work.include_other {
                     match status {
                         IdentityStatus::Verified => other_objects.verified += 1,
                         IdentityStatus::LocatorCandidate => other_objects.candidate += 1,

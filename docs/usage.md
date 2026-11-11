@@ -329,7 +329,9 @@ an undefined reference to a recognized API symbol), or `other` (none of the
 above — an ELF object with no recognized OpenSSL interface evidence, such as
 NSS `libssl3.so`); they do not authenticate a vendor. Human output and
 `scan --help` carry a one-line `kinds:` legend decoding every word. `other`
-objects are counted per process, never listed: `other_objects` reports
+objects are counted per process, never listed — except under `scan --module`,
+where a selector-matched `other` is listed as a module row and not counted:
+`other_objects` reports
 `verified` (backing proof closed) vs `candidate` (unverified locator only —
 an `identity_unverified` gap names the same mapping) vs `failed` (the mapping
 errored before any classification — every one also carries a gap).

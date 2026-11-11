@@ -176,7 +176,9 @@ pub enum Architecture {
 ///   undefined reference to a recognized API symbol.
 /// - `Other`: none of the above — an ELF object with no recognized
 ///   OpenSSL interface evidence. Others are counted per process
-///   ([`ProcessRecord::other_objects`]), never listed.
+///   ([`ProcessRecord::other_objects`]), never listed — except under
+///   an explicit `--module` selector, where a selected `Other` is
+///   listed as a module row and lands in no count bucket (R11).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
@@ -464,19 +466,24 @@ pub enum IdentityAvailability {
 }
 
 /// Per-process counts of `ObjectKind::Other` file-backed
-/// executable objects (v0.6.0 P0-5): Others are counted, never
-/// listed, so `0 modules` stays distinguishable from `nothing
-/// mapped`. `verified` counts Others whose backing proof closed;
-/// `candidate` counts Others bound only to an unverified locator
-/// (an `IdentityUnverified` gap names the same mapping);
-/// `failed` counts executable file-backed mappings that errored
-/// before any classification (backing or parse failure — every
-/// one also carries a gap). Non-executable mappings, skipped
-/// non-regular files, and files determined to be non-ELF are
-/// outside the counted population and never increment any
-/// bucket. Counts are classification-time outcomes: a later
-/// `Changed` gap downgrades `verified` to `candidate` (like the
-/// published rows) and always vetoes the
+/// executable objects (v0.6.0 P0-5): outside an explicit
+/// `--module` selector scope, Others are counted, never listed,
+/// so `0 modules` stays distinguishable from `nothing mapped`.
+/// Under `scan --module` a selected `Other` is listed as a
+/// module row instead and lands in no count bucket (R11: no
+/// object is ever both listed and counted). `verified` counts
+/// Others whose backing proof closed; `candidate` counts Others
+/// bound only to an unverified locator (an `IdentityUnverified`
+/// gap names the same mapping); `failed` counts executable
+/// file-backed mappings that errored before any classification
+/// (backing or parse failure — every one also carries a gap —
+/// in every route, since failures are never listed anywhere).
+/// Non-executable mappings, skipped non-regular files, and files
+/// determined to be non-ELF are outside the counted population
+/// and never increment any bucket. Counts are
+/// classification-time outcomes: a later `Changed` gap
+/// downgrades `verified` to `candidate` (like the published
+/// rows) and always vetoes the
 /// [`snapshot_conclusively_without_openssl`] predicate, but
 /// never rewrites history beyond that.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
