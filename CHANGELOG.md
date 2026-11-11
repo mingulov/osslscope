@@ -14,6 +14,12 @@
   watch `changes[]` no longer repeats steady-state
   `visibility_lost` entries every tick — they fire on transition,
   with steady uncertainty heartbeats instead of per-tick repeats.
+- `inspect --module` human output now carries `path=` on every
+  row by default (the operator-supplied spelling, labeled —
+  previously omitted without `--resolve-paths`), the `kinds:`
+  legend, and `-v`/`-vv` detail (grouped errors, per-module
+  exports, per-error records, safe counters). Exits, stderr,
+  counts, and `--json` bytes are unchanged.
 
 ## Unreleased (v0.6.0 machine surface)
 

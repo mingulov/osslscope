@@ -1042,6 +1042,22 @@ pub(crate) fn display_path(canonical: &Path) -> String {
     )
 }
 
+/// Flag-absent `--module` `path=` value (codex F1): the
+/// operator's own argv spelling — the file this route actually
+/// opened — sanitized + bounded like every emitted path and
+/// labeled so it never reads as a verified re-resolution.
+/// Never echoes on error rows (failures carry no row) and never
+/// enters JSON or diagnostics.
+pub(crate) fn operator_path_value(spelling: &str) -> String {
+    const LABEL: &str = "(operator-supplied: ";
+    let safe = crate::report::safe_display(spelling);
+    if LABEL.chars().count() + safe.chars().count() < DISPLAY_BOUND {
+        return format!("{LABEL}{safe})");
+    }
+    let budget = DISPLAY_BOUND - LABEL.chars().count() - 2; // `…` + `)`
+    format!("{LABEL}{}…)", safe.chars().take(budget).collect::<String>())
+}
+
 /// Render one row's `path=` value: placeholder or resolved display
 /// string. Infallible by design (exits/diagnostics unaffected).
 pub(crate) fn path_value(capability: Option<&RowCapability>) -> String {
@@ -1196,25 +1212,42 @@ impl<'a> TerminalPathWriter<'a> {
         rows
     }
 
-    /// `--module`-route human rows (v0.6.0 P0-3). Operator-observed
-    /// rows carry no identity word (eligibility was established at
-    /// the acquisition site) and no machine path evidence exists on
-    /// this route, so `path=` renders only under the flag
-    /// ([`TerminalPathWriter::fragment_module`] rules, including the
-    /// piped `(not-a-terminal)` placeholder) and is omitted without
-    /// it — flag-absent output carries no `path=` anywhere.
-    pub(crate) fn module_rows(&self, modules: &[ModuleInfo]) -> Vec<String> {
+    /// `--module`-route human rows (v0.6.0 P0-3, codex F1).
+    /// Operator-observed rows carry no identity word (eligibility
+    /// was established at the acquisition site). `path=` ALWAYS
+    /// renders: TTY + flag rows re-resolve through
+    /// [`TerminalPathWriter::fragment_module`] (`(unavailable)` on
+    /// join misses); piped + flag rows keep `(not-a-terminal)`;
+    /// without the flag each row shows its operator-supplied
+    /// spelling ([`operator_path_value`] — the file this route
+    /// actually opened, labeled, never a verified-path claim) or
+    /// `(unavailable)` when the source is missing. `sources` runs
+    /// aligned with `modules` (first spelling wins on dedup);
+    /// misalignment fails closed to the placeholder.
+    pub(crate) fn module_rows(&self, modules: &[ModuleInfo], sources: &[String]) -> Vec<String> {
         modules
             .iter()
-            .map(|module| {
+            .enumerate()
+            .map(|(index, module)| {
                 let mut row = format!(
                     "  {} sha256={} size={}",
                     module.kind.word(),
                     Self::short_sha(&module.sha256),
                     module.size_bytes,
                 );
+                // Flag-on rows re-resolve (TTY) or placeholder
+                // (piped) via fragment_module; flag-absent rows
+                // show the operator's own spelling, labeled.
                 if let Some(path) = self.fragment_module((module.device, module.inode)) {
                     row.push_str(&format!(" path={path}"));
+                } else if !self.flag {
+                    let path = sources
+                        .get(index)
+                        .map(|spelling| operator_path_value(spelling))
+                        .unwrap_or_else(|| UNAVAILABLE.to_string());
+                    row.push_str(&format!(" path={path}"));
+                } else {
+                    row.push_str(&format!(" path={UNAVAILABLE}"));
                 }
                 row.push_str(&format!(" version={}", Self::human_version(module)));
                 row
@@ -1821,7 +1854,7 @@ mod tests {
         );
         assert_eq!(writer.fragment_module(identity), None);
         assert!(writer.object_rows(&[]).is_empty());
-        assert!(writer.module_rows(&[]).is_empty());
+        assert!(writer.module_rows(&[], &[]).is_empty());
         assert_eq!(resolve_invocations() - before, 0);
         // Flag on, off-terminal: placeholder, no I/O.
         let writer = TerminalPathWriter::new(true, false, &sidecar);
@@ -2120,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn writer_module_rows_omit_path_without_flag() {
+    fn writer_module_rows_carry_operator_spelling_without_flag() {
         use crate::inventory::{Architecture, FileVersionStatus, ModuleInfo, ObjectKind};
         let sidecar = ResolveSidecar::default();
         let module = ModuleInfo {
@@ -2137,21 +2170,62 @@ mod tests {
             file_openssl_version: None,
             file_version_status: FileVersionStatus::Absent,
         };
-        // Flag-absent: rows render with no path= anywhere (cell 5).
+        let sources = vec!["/op/libfoo.so.1".to_string()];
+        // Flag-absent (codex F1): rows carry the labeled
+        // operator-supplied spelling — no resolver I/O.
         let writer = TerminalPathWriter::new(false, true, &sidecar);
+        let before = resolve_invocations();
         assert_eq!(
-            writer.module_rows(std::slice::from_ref(&module)),
-            vec!["  other sha256=0123456789ab size=4096 version=libfoo.so.1".to_string()]
+            writer.module_rows(std::slice::from_ref(&module), &sources),
+            vec![
+                "  other sha256=0123456789ab size=4096 path=(operator-supplied: /op/libfoo.so.1) version=libfoo.so.1"
+                    .to_string()
+            ]
         );
-        // Piped with the flag: the module route has no machine path
-        // evidence, so the historical placeholder stands.
+        assert_eq!(resolve_invocations() - before, 0);
+        // Missing source fails closed to the placeholder.
+        assert_eq!(
+            writer.module_rows(std::slice::from_ref(&module), &[]),
+            vec![
+                "  other sha256=0123456789ab size=4096 path=(unavailable) version=libfoo.so.1"
+                    .to_string()
+            ]
+        );
+        // Piped with the flag: the historical placeholder stands
+        // (live re-resolution needs a TTY).
         let writer = TerminalPathWriter::new(true, false, &sidecar);
         assert_eq!(
-            writer.module_rows(std::slice::from_ref(&module)),
+            writer.module_rows(std::slice::from_ref(&module), &sources),
             vec![
                 "  other sha256=0123456789ab size=4096 path=(not-a-terminal) version=libfoo.so.1"
                     .to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn operator_path_value_sanitizes_bounds_and_labels() {
+        // Labeled, never a bare path.
+        assert_eq!(
+            operator_path_value("/op/mod.so"),
+            "(operator-supplied: /op/mod.so)"
+        );
+        // Hostile bytes sanitize like every emitted path.
+        assert_eq!(
+            operator_path_value("x-\u{1b}]0;owned\u{07}-\u{202e}rtl.so"),
+            "(operator-supplied: x-?]0;owned?-?rtl.so)"
+        );
+        // Overlong spellings bound at 200 chars with `…`.
+        let long = format!("/{}", "a".repeat(500));
+        let value = operator_path_value(&long);
+        assert_eq!(value.chars().count(), 200, "{value}");
+        assert!(value.ends_with("…)"), "{value}");
+        assert!(value.starts_with("(operator-supplied: /aaa"), "{value}");
+        // Exact-fit spellings pass through unmarked.
+        let fit = format!("/{}", "b".repeat(178));
+        assert_eq!(
+            operator_path_value(&fit),
+            format!("(operator-supplied: {fit})")
         );
     }
 

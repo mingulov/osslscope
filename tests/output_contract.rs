@@ -6897,18 +6897,36 @@ fn v060_privilege_hint_fires_only_on_errno_proven_denial() {
         .output()
         .unwrap();
     let derr = String::from_utf8_lossy(&denied.stderr);
-    let doc: Result<serde_json::Value, _> = serde_json::from_slice(&denied.stdout);
-    if let Ok(doc) = doc {
-        let has_perm_gap = doc["gaps"].as_array().unwrap().iter().any(|g| {
-            g.get("errno").and_then(|e| e.as_i64()) == Some(libc_errno::EPERM)
-                || g.get("errno").and_then(|e| e.as_i64()) == Some(libc_errno::EACCES)
-        });
+    // Codex F4: this leg must FAIL on non-JSON stdout, never skip
+    // its assertions — require the document, the exit the gap
+    // population implies, and the hint/errno correspondence.
+    let doc: serde_json::Value = serde_json::from_slice(&denied.stdout)
+        .expect("denied-PID leg must emit valid JSON discovery output");
+    let gaps = doc["gaps"]
+        .as_array()
+        .expect("denied-PID leg must carry a gaps array");
+    if gaps.is_empty() {
         assert_eq!(
-            derr.contains("re-run as root"),
-            has_perm_gap,
-            "hint/errno mismatch: {derr}"
+            denied.status.code(),
+            Some(0),
+            "gap-free scan must exit 0: {derr}"
+        );
+    } else {
+        assert!(
+            matches!(denied.status.code(), Some(3) | Some(4)),
+            "scan with gaps must exit 3/4, got {:?}: {derr}",
+            denied.status.code()
         );
     }
+    let has_perm_gap = gaps.iter().any(|g| {
+        g.get("errno").and_then(|e| e.as_i64()) == Some(libc_errno::EPERM)
+            || g.get("errno").and_then(|e| e.as_i64()) == Some(libc_errno::EACCES)
+    });
+    assert_eq!(
+        derr.contains("re-run as root"),
+        has_perm_gap,
+        "hint/errno mismatch: {derr}"
+    );
     // Own PID with no permission gaps: hint must not fire.
     let me = std::process::id().to_string();
     let clean = std::process::Command::new(bin)
@@ -6973,4 +6991,158 @@ fn v060_stream_discipline_s1_s14() {
     assert_eq!(help.status.code(), Some(0));
     assert!(help.stderr.is_empty());
     assert!(String::from_utf8_lossy(&help.stdout).contains("-v"));
+}
+
+/// Minimal shared object for the codex-fix `--module` human pins.
+fn v060_build_so(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base: PathBuf = std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = base.join(format!(
+        "osslscope-v060hum-{}-{}-{}",
+        std::process::id(),
+        tag,
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("m.c");
+    let so = dir.join("mod.so");
+    std::fs::write(&src, "int marker(void) { return 1; }\n").unwrap();
+    let cc = std::process::Command::new("cc")
+        .args(["-shared", "-fPIC", "-o"])
+        .arg(&so)
+        .arg(&src)
+        .output()
+        .unwrap();
+    assert!(
+        cc.status.success(),
+        "cc failed: {}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+    so
+}
+
+#[test]
+fn v060_inspect_module_human_default_carries_operator_path_and_legend() {
+    // Codex F1+F3: default `inspect --module` rows carry `path=`
+    // (the operator-supplied spelling, labeled — this route's
+    // input IS the path) and the P0-5 kind legend. Unavailable
+    // inputs stay finite: no operand echo anywhere.
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let so = v060_build_so("f1");
+    let spelling = so.to_str().unwrap().to_string();
+    let out = std::process::Command::new(bin)
+        .args(["inspect", "--module", &spelling])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains("sha256=")).collect();
+    assert_eq!(rows.len(), 1, "{text}");
+    assert!(
+        rows[0].contains("path=(operator-supplied:"),
+        "F1: {}",
+        rows[0]
+    );
+    assert!(rows[0].contains("mod.so"), "F1: {}", rows[0]);
+    let legend = text
+        .lines()
+        .find(|l| l.starts_with("kinds:"))
+        .unwrap_or_else(|| panic!("F3: no legend: {text}"));
+    for kind in [
+        "openssl_compatible",
+        "provider_module",
+        "openssl_consumer",
+        "other=",
+    ] {
+        assert!(legend.contains(kind), "F3: {kind} missing: {legend}");
+    }
+    assert!(text.contains("errors: 0"), "{text}");
+    // Unavailable input: counts + meanings, finite diagnostics.
+    let bad = std::process::Command::new(bin)
+        .args(["inspect", "--module", "/PRIVATE_CANARY_v060hum_missing"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(4));
+    let btext = String::from_utf8_lossy(&bad.stdout);
+    assert!(btext.contains("errors: 1 (unavailable=1"), "{btext}");
+    assert!(!btext.contains("PRIVATE_CANARY"), "{btext}");
+    assert!(
+        !String::from_utf8_lossy(&bad.stderr).contains("PRIVATE_CANARY"),
+        "operand echo in stderr"
+    );
+}
+
+#[test]
+fn v060_inspect_module_verbosity_adds_detail_without_moving_machine() {
+    // Codex F2: -v adds grouped errors + per-row exports + full
+    // per-object state (input_index), -vv adds per-error records
+    // + safe counters, clamped at 2; exits/stderr/JSON identical.
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let so = v060_build_so("f2");
+    let spelling = so.to_str().unwrap().to_string();
+    let missing = "/PRIVATE_CANARY_v060hum_missing";
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(["inspect", "--module", &spelling, "--module", missing]);
+        for e in extra {
+            cmd.arg(e);
+        }
+        cmd.output().unwrap()
+    };
+    let h0 = run(&[]);
+    let h1 = run(&["-v"]);
+    let h2 = run(&["-vv"]);
+    let h2b = run(&["-v", "-v"]);
+    assert_eq!(h0.status.code(), Some(3));
+    assert_eq!(h0.status.code(), h1.status.code());
+    assert_eq!(h0.status.code(), h2.status.code());
+    assert_eq!(h0.stderr, h1.stderr);
+    assert_eq!(h0.stderr, h2.stderr);
+    let s0 = String::from_utf8_lossy(&h0.stdout);
+    let s1 = String::from_utf8_lossy(&h1.stdout);
+    let s2 = String::from_utf8_lossy(&h2.stdout);
+    // Level 0 stays quiet.
+    for absent in [
+        "exports=[",
+        "errors (",
+        "error input_index=",
+        "counters:",
+        "input_index=",
+    ] {
+        assert!(!s0.contains(absent), "L0 leak {absent}: {s0}");
+    }
+    // Level 1: grouped errors + exports + full per-object state.
+    assert!(s1.contains("exports=["), "no -v exports: {s1}");
+    assert!(s1.contains("input_index=0"), "no -v input: {s1}");
+    assert!(
+        s1.contains("errors (1 total in 1 group):"),
+        "no -v groups: {s1}"
+    );
+    assert!(!s1.contains("error input_index="), "{s1}");
+    assert!(!s1.contains("counters:"), "{s1}");
+    // Level 2: per-error records + safe counters.
+    assert!(
+        s2.contains("error input_index=1 reason=unavailable errno=2"),
+        "no -vv record: {s2}"
+    );
+    assert!(
+        s2.contains("counters: read_bytes="),
+        "no -vv counters: {s2}"
+    );
+    // Clamp: -v -v renders exactly -vv.
+    assert_eq!(h2.stdout, h2b.stdout);
+    // Machine output ignores verbosity entirely (byte-identical:
+    // the module route carries no timestamps).
+    let j0 = run(&["--json"]);
+    let j2 = run(&["--json", "-vv"]);
+    assert_eq!(j0.status.code(), j2.status.code());
+    assert_eq!(j0.stdout, j2.stdout, "JSON must ignore -vv");
+    assert_eq!(j0.stderr, j2.stderr);
+    assert!(
+        !String::from_utf8_lossy(&j0.stdout).contains(&spelling),
+        "operator spelling leaked into JSON"
+    );
 }

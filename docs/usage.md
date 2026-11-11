@@ -427,11 +427,13 @@ to bottom:
 - the `blindness:` boundary only when complete enumeration found
   no OpenSSL object.
 
-`inspect --module` prints the same meaning boundary (no legend),
-one row per supplied file without the identity word
-(`{kind} sha256={12-hex} size={bytes}[ path={...}]
-version={...}`; `path=` appears only with `--resolve-paths`), and
-an `errors:` counts line with the same per-reason meanings.
+`inspect --module` prints the same meaning boundary plus the
+`kinds:` legend, one row per supplied file without the identity
+word (`{kind} sha256={12-hex} size={bytes} path={...}
+version={...}`; `path=` always renders — the operator-supplied
+spelling labeled `(operator-supplied: ...)`, or the verified
+re-resolution under `--resolve-paths` on a TTY), and an
+`errors:` counts line with the same per-reason meanings.
 `scan --watch` prints the sampled-meaning boundary once, then one
 `tick N:` status line per sample (`initial state`, `N sampled
 changes`, `state changed`, or `no changes`, each with
@@ -445,8 +447,11 @@ erases earlier uncertainty.
 only: `-v` adds grouped gap blocks, per-module `exports=[...]`,
 and full per-process state (`starttime=` `namespaces=`
 `provider_activation=` `provider_interfaces=` `execution=`);
-`-vv` adds per-object `gap pid= device= reason= errno=` records
-and a `counters:` line. Exits, stderr, counts, and hashes are
+on `inspect --module` the same level adds grouped `errors`,
+per-module exports, and `input_index=` per row. `-vv` adds
+per-object `gap pid= device= reason= errno=` records (`error
+input_index= reason= errno=` on `inspect --module`) and a
+`counters:` line. Exits, stderr, counts, and hashes are
 identical at every level; `--json`/NDJSON stays complete and
 unfiltered. There is no `-q`: the default is already quiet. The
 privilege hint (see [Privilege](#privilege)) fires on stderr

@@ -180,32 +180,40 @@ fn cell2_chain_resolves_canonical_machine_bytes_identical() {
     assert!(!String::from_utf8_lossy(&on.stderr).contains("SENTINEL_resolve_only"));
 }
 
-/// Cell 5: flag absent → no `path=` fragment anywhere (human or
-/// JSON). v0.6.0 P0-3 stdout split: the module route's human bytes
-/// carry rows, never the JSON document (the old human-tail-equals-
-/// `--json` comparison is retired with the mixed output); existing
-/// golden suites pin the remaining routes' bytes. No-I/O leg is the
+/// Cell 5 (codex F1): flag absent → JSON carries no `path=`
+/// fragment and no operator spelling anywhere, while human rows
+/// show the operator-supplied spelling labeled (the input IS the
+/// path on this route — no verified-path claim). v0.6.0 P0-3
+/// stdout split: the module route's human bytes carry rows, never
+/// the JSON document (the old human-tail-equals-`--json`
+/// comparison is retired with the mixed output); existing golden
+/// suites pin the remaining routes' bytes. No-I/O leg is the
 /// unit cell `writer_gates_flag_terminal_and_status_without_io`.
 #[test]
-fn cell5_flag_absent_omits_fragments() {
+fn cell5_flag_absent_shows_operator_spelling_not_resolved() {
     let dir = scratch("cell5");
     let real = build_so(&dir, "real.so");
-    for extra in [&["--json"][..], &[][..]] {
-        let mut args = vec!["inspect", "--module", real.to_str().unwrap()];
-        args.extend_from_slice(extra);
-        let out = bin().args(&args).output().unwrap();
-        assert!(out.status.success());
-        assert!(!stdout_text(&out).contains("path="), "{args:?}");
-        assert!(!stdout_text(&out).contains("real.so"), "{args:?}");
-    }
-    // Human bytes: MEANING + module rows + error counts, no JSON.
+    // Machine bytes: no fragment, no operator spelling.
+    let machine = bin()
+        .args(["inspect", "--module", real.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert!(machine.status.success());
+    assert!(!stdout_text(&machine).contains("path="));
+    assert!(!stdout_text(&machine).contains("real.so"));
+    // Human bytes: MEANING + legend + module rows (labeled
+    // operator spelling) + error counts, no JSON.
     let human = bin()
         .args(["inspect", "--module", real.to_str().unwrap()])
         .output()
         .unwrap();
     let human_text = stdout_text(&human);
     assert!(human_text.contains("Passive inventory:"), "{human_text}");
-    assert_eq!(module_rows(&human_text).len(), 1, "{human_text}");
+    assert!(human_text.contains("kinds:"), "{human_text}");
+    let rows = module_rows(&human_text);
+    assert_eq!(rows.len(), 1, "{human_text}");
+    assert!(rows[0].contains("path=(operator-supplied:"), "{}", rows[0]);
+    assert!(rows[0].contains("real.so"), "{}", rows[0]);
     assert!(human_text.contains("errors: 0"), "{human_text}");
     assert!(!human_text.contains("\"schema_version\""), "{human_text}");
 }

@@ -23,7 +23,8 @@ const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove 
 /// import); `other` is counted per process, never listed — except
 /// under `scan --module`, where a selector-matched `other` is
 /// listed as a module row and not counted.
-/// Single source for human snapshots and `--help`.
+/// Single source for human snapshots, the `--module` route,
+/// and `--help`.
 const LEGEND: &str = "kinds: openssl_compatible=<exports-recognized-api> provider_module=<exports-ossl_provider_init> openssl_consumer=<depends-or-imports-openssl> other=<counted-not-listed>\n";
 /// Value-taking options of [`parse`]: the scan router consumes the
 /// token after each of these, so flag-shaped values never misroute.
@@ -218,6 +219,16 @@ struct ModuleInventory {
     mode: &'static str,
     modules: Vec<ModuleInfo>,
     errors: Vec<ModuleError>,
+    /// Operator argv spellings (lossy) aligned with `modules`
+    /// (first wins on dedup): the human `path=` fragment (codex
+    /// F1 — default rows show the given path, labeled). Skipped
+    /// by serde — machine bytes never carry operator spellings.
+    #[serde(skip)]
+    module_sources: Vec<String>,
+    /// Input indices aligned with `modules` (first wins on
+    /// dedup): `-v` full per-object state. Skipped by serde.
+    #[serde(skip)]
+    module_inputs: Vec<usize>,
     /// Render-time row capabilities (T5 `--resolve-paths` rule 3),
     /// skipped by serde — machine bytes flag-independent (cell 2).
     /// Locator provenance here is operator argv (observer-side),
@@ -247,6 +258,8 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits, resolve_paths: bool) -> Mo
         mode: "module",
         modules: Vec::new(),
         errors: Vec::new(),
+        module_sources: Vec::new(),
+        module_inputs: Vec::new(),
         totals: WorkTotals::default(),
         limits,
         resolve: super::resolve::ResolveSidecar::default(),
@@ -341,6 +354,12 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits, resolve_paths: bool) -> Mo
                 if resolve_paths {
                     resolve_staged.push((key, path.clone()));
                 }
+                // Dedup collapses repeats before this push, so the
+                // first spelling/index wins — aligned with modules.
+                result
+                    .module_sources
+                    .push(path.to_string_lossy().into_owned());
+                result.module_inputs.push(input_index);
                 result.modules.push(info);
             }
             Ok(None) => (),
@@ -593,9 +612,8 @@ fn verdict_line(process: &ProcessRecord, gaps: &[Gap], verbosity: u8) -> String 
 
 /// Exact per-reason counts line (`gaps:` for snapshots, `errors:`
 /// for operator-supplied module lists): reasons sorted by word,
-/// counters exact. The `-v` rerun hint rides the snapshot line only
-/// (Task 2 lands per-object gap detail there; the module route has
-/// no such detail planned, so its line stays hint-free and honest).
+/// counters exact. The `-v` rerun hint rides every non-empty line
+/// (per-object detail lives one level up on both routes).
 fn counts_line(label: &str, reasons: impl Iterator<Item = GapReason>, rerun_hint: bool) -> String {
     let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     let mut total = 0usize;
@@ -814,22 +832,100 @@ pub(crate) fn human_snapshot_body(
 }
 
 /// Human render for operator-supplied module lists
-/// (`inspect --module`, v0.6.0 P0-3): MEANING + one row per module
-/// + exact per-reason error counts. Never emits JSON bytes.
+/// (`inspect --module`, v0.6.0 P0-3): MEANING, the kind legend,
+/// one row per module, and exact per-reason error counts.
+/// Never emits JSON bytes.
+/// Verbosity gates detail volume only (0 = counts line; 1 =
+/// grouped errors, per-module `exports=[...]`, and full
+/// per-object state (`input_index=`); 2 = per-error records and
+/// safe counters); exits, stderr, counts, and hashes (short at
+/// every level) are identical throughout.
 fn human_modules(
     writer: &mut impl Write,
     inventory: &ModuleInventory,
     paths: &super::resolve::TerminalPathWriter,
+    verbosity: u8,
 ) -> io::Result<()> {
+    // Clamped here so a future caller can never observe an
+    // unclamped level.
+    let level = verbosity.min(2);
     writer.write_all(MEANING.as_bytes())?;
-    for row in paths.module_rows(&inventory.modules) {
-        writeln!(writer, "{row}")?;
+    writer.write_all(LEGEND.as_bytes())?;
+    let rows = paths.module_rows(&inventory.modules, &inventory.module_sources);
+    // `module_rows` builds exactly one row per module in order;
+    // the zips below append each module's own state.
+    debug_assert_eq!(rows.len(), inventory.modules.len());
+    debug_assert_eq!(rows.len(), inventory.module_inputs.len());
+    if level >= 1 {
+        for ((row, module), input) in rows
+            .iter()
+            .zip(inventory.modules.iter())
+            .zip(inventory.module_inputs.iter())
+        {
+            writeln!(
+                writer,
+                "{row} input_index={input} {}",
+                super::human_exports(&module.exports)
+            )?;
+        }
+    } else {
+        for row in &rows {
+            writeln!(writer, "{row}")?;
+        }
     }
     writer.write_all(
-        counts_line("errors", inventory.errors.iter().map(|e| e.reason), false).as_bytes(),
+        counts_line("errors", inventory.errors.iter().map(|e| e.reason), true).as_bytes(),
     )?;
     writer.write_all(gap_meanings_block(inventory.errors.iter().map(|e| e.reason)).as_bytes())?;
+    if level >= 1 {
+        writer
+            .write_all(error_groups_block(inventory.errors.iter().map(|e| e.reason)).as_bytes())?;
+    }
+    if level >= 2 {
+        for error in &inventory.errors {
+            writeln!(
+                writer,
+                "error input_index={} reason={} errno={}",
+                error.input_index,
+                error.reason.word(),
+                error.errno.map_or("-".to_string(), |e| e.to_string())
+            )?;
+        }
+        writeln!(
+            writer,
+            "counters: read_bytes={} objects_inspected={}",
+            inventory.totals.read_bytes, inventory.totals.objects_inspected
+        )?;
+    }
     writer.flush()
+}
+
+/// Human error-group block for the `--module` route: reason
+/// words with exact counters, deterministic order, empty string
+/// when there is nothing to show. Mirrors
+/// [`super::gap_groups_block`]'s shape with the route's `errors`
+/// noun (module errors carry no device/pid, so groups key on
+/// the reason word alone). `-v` detail only; the `errors:`
+/// counts line stays the verbosity-independent total (H2).
+fn error_groups_block(reasons: impl Iterator<Item = GapReason>) -> String {
+    let mut groups: BTreeMap<&str, usize> = BTreeMap::new();
+    for reason in reasons {
+        *groups.entry(reason.word()).or_insert(0) += 1;
+    }
+    if groups.is_empty() {
+        return String::new();
+    }
+    let total: usize = groups.values().sum();
+    let mut s = format!(
+        "errors ({} total in {} group{}):\n",
+        total,
+        groups.len(),
+        if groups.len() == 1 { "" } else { "s" },
+    );
+    for (word, count) in &groups {
+        s.push_str(&format!("  {word}: {count}\n"));
+    }
+    s
 }
 
 /// Pure machine render: ONLY the JSON document on stdout, no
@@ -1001,12 +1097,10 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 &result.resolve,
             );
             // v0.6.0 P0-3 stdout split: rows by default, JSON opt-in.
-            // The --module route stays flat at every verbosity (Task 1
-            // decision: no per-object detail planned there).
             let rendered = if options.json {
                 render_json(&result, &mut output)
             } else {
-                human_modules(&mut output, &result, &writer)
+                human_modules(&mut output, &result, &writer, verbosity)
             };
             rendered.map(|()| {
                 let reasons: Vec<GapReason> = result.errors.iter().map(|e| e.reason).collect();
@@ -1485,7 +1579,9 @@ mod tests {
     #[test]
     fn human_modules_renders_error_meanings() {
         // v0.6.0 D6: the inspect --module errors line carries the
-        // same one-line meanings as the snapshot gaps line.
+        // same one-line meanings as the snapshot gaps line; codex
+        // F2/F3: the rerun hint (per-object detail exists one
+        // level up) and the kind legend ride this route too.
         let result = super::inspect_modules(
             &[PathBuf::from("/PRIVATE_CANARY_missing")],
             Limits::default(),
@@ -1495,13 +1591,119 @@ mod tests {
         assert_eq!(result.errors[0].reason, GapReason::Unavailable);
         let paths = super::super::resolve::TerminalPathWriter::new(false, false, &result.resolve);
         let mut buf = Vec::new();
-        super::human_modules(&mut buf, &result, &paths).unwrap();
+        super::human_modules(&mut buf, &result, &paths, 0).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("errors: 1 (unavailable=1)\n"), "{out}");
+        assert!(
+            out.contains("errors: 1 (unavailable=1; rerun with -v for per-object detail)\n"),
+            "{out}"
+        );
         assert!(
             out.contains("  unavailable: a file needed for inventory could not be opened or read; what it held is unknown\n"),
             "{out}"
         );
+        assert!(out.contains(super::LEGEND), "{out}");
+        assert!(!out.contains("PRIVATE_CANARY"), "{out}");
+    }
+
+    #[test]
+    fn human_modules_verbosity_levels_add_groups_state_records_counters() {
+        // Codex F1/F2/F3, unit leg: default rows carry the labeled
+        // operator path + legend; -v adds exports/input/groups;
+        // -vv adds per-error records + counters; level 3 clamps
+        // to 2; machine bytes never carry the new render fields.
+        let module = ModuleInfo {
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            device: 8,
+            inode: 100,
+            size_bytes: 4096,
+            architecture: Architecture::X86_64,
+            kind: ObjectKind::ProviderModule,
+            exports: vec![Api::OsslProviderInit],
+            depends_on_libcrypto: false,
+            depends_on_libssl: false,
+            file_soname: None,
+            file_openssl_version: None,
+            file_version_status: FileVersionStatus::Absent,
+        };
+        let inventory = super::ModuleInventory {
+            schema_version: "osslscope.discovery.v1",
+            mode: "module",
+            modules: vec![module],
+            errors: vec![super::ModuleError {
+                input_index: 1,
+                reason: GapReason::Unavailable,
+                errno: Some(2),
+            }],
+            module_sources: vec!["/op/mod.so".to_string()],
+            module_inputs: vec![0],
+            totals: super::WorkTotals {
+                processes_attempted: 0,
+                objects_attempted: 2,
+                objects_inspected: 1,
+                read_bytes: 5000,
+            },
+            limits: super::Limits::default(),
+            resolve: super::super::resolve::ResolveSidecar::default(),
+            capabilities: super::Capabilities {
+                inventory: super::InventoryState::Partial,
+                provider_activation: super::ObservationState::Unknown,
+                provider_interfaces: super::ObservationState::Unknown,
+                execution: super::ObservationState::NotObserved,
+            },
+        };
+        let render = |verbosity: u8| {
+            let paths =
+                super::super::resolve::TerminalPathWriter::new(false, false, &inventory.resolve);
+            let mut buf = Vec::new();
+            super::human_modules(&mut buf, &inventory, &paths, verbosity).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        let l0 = render(0);
+        let l1 = render(1);
+        let l2 = render(2);
+        assert_eq!(render(3), l2, "verbosity clamps at 2");
+        // F1+F3 at every level: labeled operator path + legend.
+        for (n, out) in [("0", &l0), ("1", &l1), ("2", &l2)] {
+            assert!(
+                out.contains("path=(operator-supplied: /op/mod.so)"),
+                "L{n}: {out}"
+            );
+            assert!(out.contains(super::LEGEND), "L{n}: {out}");
+            assert!(
+                out.contains("errors: 1 (unavailable=1; rerun with -v for per-object detail)"),
+                "L{n} counts: {out}"
+            );
+        }
+        for absent in [
+            "exports=[",
+            "errors (",
+            "error input_index=",
+            "counters:",
+            "input_index=",
+        ] {
+            assert!(!l0.contains(absent), "L0 leak {absent}: {l0}");
+        }
+        assert!(
+            l1.contains("input_index=0 exports=[ossl_provider_init]"),
+            "no -v state: {l1}"
+        );
+        assert!(
+            l1.contains("errors (1 total in 1 group):\n  unavailable: 1\n"),
+            "no -v groups: {l1}"
+        );
+        assert!(!l1.contains("error input_index="), "{l1}");
+        assert!(!l1.contains("counters:"), "{l1}");
+        assert!(
+            l2.contains("error input_index=1 reason=unavailable errno=2\n"),
+            "no -vv record: {l2}"
+        );
+        assert!(
+            l2.contains("counters: read_bytes=5000 objects_inspected=1\n"),
+            "no -vv counters: {l2}"
+        );
+        let v = serde_json::to_value(&inventory).unwrap();
+        assert!(v.get("module_sources").is_none(), "{v}");
+        assert!(v.get("module_inputs").is_none(), "{v}");
     }
 
     #[test]
@@ -1960,6 +2162,8 @@ mod tests {
                 mode: "module",
                 modules: Vec::new(),
                 errors,
+                module_sources: Vec::new(),
+                module_inputs: Vec::new(),
                 totals: super::WorkTotals::default(),
                 limits: super::Limits::default(),
                 resolve: super::super::resolve::ResolveSidecar::default(),
