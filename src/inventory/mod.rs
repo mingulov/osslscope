@@ -656,16 +656,6 @@ impl Snapshot {
         }
         (verified, locator)
     }
-
-    /// Human preamble inputs (display-only; JSON is unchanged):
-    /// identity counts plus gaps coalesced by (reason, device, pid).
-    pub fn human_preamble(&self) -> SnapshotPreamble {
-        SnapshotPreamble {
-            identity: self.identity_counts(),
-            gap_groups: coalesce_gaps(&self.gaps),
-            conclusively_without_openssl: snapshot_conclusively_without_openssl(self),
-        }
-    }
 }
 
 /// Shared human identity totals line (one shape for snapshot
@@ -714,21 +704,10 @@ pub fn snapshot_conclusively_without_openssl(snapshot: &Snapshot) -> bool {
     })
 }
 
-/// Human-preamble inputs for a [`Snapshot`] (see
-/// [`Snapshot::human_preamble`]). A group is (reason, device, pid,
-/// exact count), sorted by (reason, device, pid) with absent ids
-/// sorting first.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnapshotPreamble {
-    pub identity: (usize, usize),
-    pub gap_groups: Vec<(GapReason, Option<u64>, Option<u32>, usize)>,
-    pub conclusively_without_openssl: bool,
-}
-
 /// Shared human gap-group block: groups (word, device, pid) triples
 /// with exact counters, deterministic order (BTreeMap iteration),
 /// empty string when there is nothing to show. The one grouping
-/// implementation for snapshot preambles and all streaming paths;
+/// implementation for snapshot gap sections and all streaming paths;
 /// each path adapts its gap type to words (inodes never key a group).
 /// `indent` nests the block under streaming records (`""` top-level).
 pub fn gap_groups_block<'a, I>(gaps: I, indent: &str) -> String

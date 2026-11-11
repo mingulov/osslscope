@@ -228,6 +228,14 @@ fn v060_schema_rejects_malformed_controls() {
     let mut doc = base.clone();
     doc.as_object_mut().unwrap().remove("scope_record");
     control("drop-scope-record", doc);
+    // P0-5: `other_objects` is a required per-process key —
+    // omitting it must fail.
+    let mut doc = base.clone();
+    doc["processes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("other_objects");
+    control("drop-other_objects", doc);
     // The watch-embedded snapshot is the same struct: its
     // `required` must match the top level.
     let out = bin()

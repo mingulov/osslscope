@@ -10,6 +10,10 @@
   `docs/usage.md` ("Human output") for the row shapes, `-v`/`-vv`
   levels, kind legend, privilege hint, and per-reason gap
   meanings.
+- Machine-visible refinement (serialization shape unchanged):
+  watch `changes[]` no longer repeats steady-state
+  `visibility_lost` entries every tick — they fire on transition,
+  with steady uncertainty heartbeats instead of per-tick repeats.
 
 ## Unreleased (v0.6.0 machine surface)
 

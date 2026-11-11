@@ -20,7 +20,9 @@ const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove 
 /// word without source. Glosses mirror `elf.rs` classification
 /// exactly (recognized dynamic code exports; `OSSL_PROVIDER_init`;
 /// known `libcrypto`/`libssl` SONAME need or recognized API
-/// import); `other` is counted per process, never listed.
+/// import); `other` is counted per process, never listed — except
+/// under `scan --module`, where a selector-matched `other` is
+/// listed as a module row and not counted.
 /// Single source for human snapshots and `--help`.
 const LEGEND: &str = "kinds: openssl_compatible=<exports-recognized-api> provider_module=<exports-ossl_provider_init> openssl_consumer=<depends-or-imports-openssl> other=<counted-not-listed>\n";
 /// Value-taking options of [`parse`]: the scan router consumes the

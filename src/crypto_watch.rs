@@ -6505,6 +6505,50 @@ mod tests {
         }
     }
 
+    // T2 minor: crypto NDJSON ignores verbosity — the `json`
+    // branch of `emit` never reads it (`rows_cap`, `flush_gaps`,
+    // and `human` are all `!json`-gated). One assertion pins it.
+    #[test]
+    fn json_ignores_verbosity() {
+        let process: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 0},
+            "namespaces": {"pid": null, "mount": null},
+            "pid": 42, "starttime": 123,
+            "modules": [],
+            "provider_activation": "unknown", "provider_interfaces": "unknown", "execution": "not_observed"
+        }))
+        .unwrap();
+        let gap = inventory::Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: None,
+            reason: inventory::GapReason::Deadline,
+            errno: Some(libc::EPERM),
+            actor_euid: None,
+        };
+        let render = |verbosity: u8| {
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: true,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+                verbosity,
+            };
+            out.emit(Record::Gap { gap: &gap }).unwrap();
+            out.emit(Record::Discovery {
+                process: &process,
+                sidecar: None,
+            })
+            .unwrap();
+            drop(out);
+            bytes
+        };
+        assert_eq!(render(0), render(2));
+    }
+
     // W5: the Discovery object line carries the JSON snake_case
     // kind/identity words, never Rust Debug formatting.
     #[test]
