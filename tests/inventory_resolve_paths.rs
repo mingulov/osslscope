@@ -686,6 +686,7 @@ fn v060_json_paths_come_from_custody_not_maps_text() {
         .output()
         .unwrap();
     let _ = workload.kill();
+    let _ = workload.wait();
     let doc: serde_json::Value = serde_json::from_slice(&snap.stdout).unwrap();
     let modules = doc["processes"][0]["modules"].as_array().unwrap();
     assert!(!modules.is_empty(), "ssl workload has no modules");

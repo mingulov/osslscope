@@ -325,8 +325,12 @@ pub fn run(
     writer: &mut impl Write,
     cancel: &AtomicBool,
 ) -> Result<WatchOutcome, io::Error> {
-    // Machine-only entry: force both intents off (F2 bypass —
-    // callers cannot opt JSON output into resolution).
+    // Machine-only entry: force both intents off. Intentional-for-now
+    // D1 carve-out per R6: v0.6.0 D1 rejected the never-in-JSON gate
+    // for CLI output, but this internal `run()` keeps acquisition off
+    // until human-surface Task 3 flips it (and re-pins the
+    // `sampled_arrival_removal_visibility_and_direct_cancellation`
+    // canary in tests/inventory_watch.rs) — NOT live F2 doctrine.
     let mut machine = options.clone();
     machine.selection.resolve_paths = false;
     machine.resolve_paths = false;
