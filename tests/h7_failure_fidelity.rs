@@ -899,9 +899,19 @@ mod g1_host {
         fn read_file_bound(
             &mut self,
             p: &str,
-            n: usize,
+            _allowance: usize,
         ) -> std::io::Result<(Arc<[u8]>, (u64, u64))> {
-            plan::read_file_bounded(p, n).map(|f| (f.bytes, (f.dev, f.ino)))
+            // Failure-fidelity scenarios are not bound tests: the
+            // fixture object is this suite's own debug binary, which
+            // outgrows any fixed per-object cap. Size the cap to the
+            // file itself (pinned-identity + tear semantics of the
+            // bounded helper are unchanged); bound enforcement stays
+            // covered by the dedicated R14 suites.
+            let bound = std::fs::metadata(p)
+                .ok()
+                .and_then(|m| usize::try_from(m.len()).ok())
+                .unwrap_or(usize::MAX - 1);
+            plan::read_file_bounded(p, bound).map(|f| (f.bytes, (f.dev, f.ino)))
         }
         fn stat_file(&mut self, _p: &str) -> Option<FileStat> {
             None
@@ -925,7 +935,12 @@ mod g1_host {
     pub fn run(scenario: Scenario) -> Run {
         use std::os::unix::fs::MetadataExt as _;
         let path = std::env::current_exe().unwrap();
-        let file = plan::read_file_bounded(path.to_str().unwrap(), 128 * 1024 * 1024).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        // Bound the self-read by the binary's own stat'd size: debug
+        // test binaries outgrow any fixed guess (CI builds top the old
+        // 128 MiB cap); the ELF program-header parse below needs the
+        // whole file but nothing more.
+        let file = plan::read_file_bounded(path.to_str().unwrap(), meta.len() as usize).unwrap();
         let elf = goblin::elf::Elf::parse(&file.bytes).unwrap();
         let off = elf
             .program_headers
@@ -934,7 +949,6 @@ mod g1_host {
             .unwrap()
             .p_offset
             + 16;
-        let meta = std::fs::metadata(&path).unwrap();
         let device = plan::encode_device(libc::major(meta.dev()), libc::minor(meta.dev()));
         let live = vec![Mapping {
             start: 0x70000000,
