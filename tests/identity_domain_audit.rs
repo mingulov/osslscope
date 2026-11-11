@@ -406,14 +406,6 @@ fn h5_t3_every_device_site_names_one_domain() {
             1,
         ),
         ("src/inventory/procfs.rs", "raw", "dev: m.dev(),", 1),
-        // Watch compares native ModuleInfo identities, previously obtained
-        // from fstat; no join to encoded map text or display-domain values.
-        (
-            "src/inventory/watch.rs",
-            "raw",
-            "(a.info.device, a.info.inode, &a.info.sha256) == (b.info.device, b.info.inode, &b.info.sha256)",
-            1,
-        ),
         // T5 `--resolve-paths`: sidecar join keys and render-time
         // identity checks. Every device value is native fstat dev_t
         // (opened FDs) or ModuleInfo preserving it; joins are exact
@@ -468,20 +460,19 @@ fn h5_t3_every_device_site_names_one_domain() {
         (
             "src/inventory/resolve.rs",
             "raw",
-            ".fragment_module((module.device, module.inode))",
+            "if let Some(path) = self.fragment_module((module.device, module.inode)) {",
             1,
         ),
-        // Namespace and cgroup descriptor IDs retain native dev_t; selector
-        // fingerprints compare fstat metadata only, never encoded map IDs.
-        ("src/inventory/procfs.rs", "raw", "device: m.dev(),", 1),
-        // v0.6.0 D3 incarnation bracket: fstat st_dev of the opened
-        // ns/mnt FD into NamespaceId, compared only against a second
-        // same-domain incarnation read (before != after fails closed).
+        // Namespace IDs retain native dev_t from fresh ns-FD fstat:
+        // the ns/mnt incarnation-bracket reader (compared only
+        // against a second same-domain incarnation read — before !=
+        // after fails closed) and the P0-6 `namespace_id` helper
+        // (same fresh-fstat provenance, first refusal preserved).
         (
             "src/inventory/procfs.rs",
             "raw",
             "device: metadata.dev(),",
-            1,
+            2,
         ),
         ("src/inventory/scope.rs", "raw", "device: m.dev(),", 1),
         ("src/inventory/scope.rs", "raw", "m.dev(),", 1),
@@ -1771,25 +1762,54 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".map(|m| (m.dev(), m.ino()))",
             1,
         ),
-        // Gap display triples: run-local grouping keys for the
-        // human gap block (same local precedent as
+        // Gap display tuples: run-local grouping/delta keys for
+        // the human gap blocks (same local precedent as
         // inventory/mod.rs) — rendered, never cross-domain joined.
+        // The crypto pair carries `-vv` errno in the 4-tuple; the
+        // delta multiset compares same-run tuples only.
         (
             "src/crypto_watch.rs",
             "local",
-            "self.pending_gaps.push((gap.reason, gap.device, gap.pid));",
+            ".map(|gap| (gap.reason, gap.device, gap.pid, gap.errno))",
             1,
         ),
         (
-            "src/inventory/watch.rs",
+            "src/crypto_watch.rs",
             "local",
-            "let triples = gaps.iter().map(|g| (g.reason.word(), g.device, g.pid));",
+            ".push((gap.reason, gap.device, gap.pid, gap.errno));",
+            1,
+        ),
+        (
+            "src/inventory/cli.rs",
+            "local",
+            ".map(|g| (g.reason.word(), g.device, g.pid)),",
             1,
         ),
         (
             "src/provider_observation/cli.rs",
             "local",
             "gaps.iter().map(|g| (g.reason.word(), g.device, g.pid)),",
+            1,
+        ),
+        // `-vv` per-object gap records and the `-v` namespace
+        // summary format device numbers for display only; the
+        // values are never compared or joined.
+        (
+            "src/inventory/cli.rs",
+            "display",
+            "gap.device.map_or(\"-\".to_string(), |d| d.to_string()),",
+            1,
+        ),
+        (
+            "src/inventory/mod.rs",
+            "display",
+            "id.map_or(\"-\".to_string(), |n| format!(\"{}:{}\", n.device, n.inode))",
+            1,
+        ),
+        (
+            "src/provider_observation/cli.rs",
+            "display",
+            "gap.device.map_or(\"-\".to_string(), |d| d.to_string()),",
             1,
         ),
         // 6B tap identity proof: fresh native fstat vs fresh
