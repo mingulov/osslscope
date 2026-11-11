@@ -303,11 +303,72 @@ pub enum IdentityStatus {
     LocatorCandidate,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathEncoding {
+    Utf8,
+    Utf8PercentEscaped,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocatorKind {
+    HostDirect,
+    ContainerLayer,
+    ProcRootAnchored,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerifiedPath {
+    pub path: String,
+    pub path_encoding: PathEncoding,
+    pub locator_kind: LocatorKind,
+    pub capture_unix_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapsSource {
+    ProcMaps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MapsVerification {
+    Unverified,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MapsSpelling {
+    pub spelling: String,
+    pub source: MapsSource,
+    pub verification: MapsVerification,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathUnavailableReason {
+    UnverifiedIdentity,
+    NoLocator,
+    ResolveFailed,
+    Changed,
+    Missing,
+    Unavailable,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleRecord {
     pub info: ModuleInfo,
     pub identity_status: IdentityStatus,
+    #[serde(default)]
+    pub verified_path: Option<VerifiedPath>,
+    #[serde(default)]
+    pub verified_path_unavailable: Option<PathUnavailableReason>,
+    #[serde(default)]
+    pub maps_spelling: Option<MapsSpelling>,
 }
 
 /// Unknown historical state is distinct from an execution observation.
@@ -705,5 +766,68 @@ mod tests {
             Api::EvpCipherCtxFree,
         ]);
         assert_eq!(all.len(), Api::COUNT);
+    }
+
+    #[test]
+    fn v060_path_keys_round_trip_and_old_docs_default() {
+        use super::{
+            Architecture, IdentityStatus, LocatorKind, MapsSource, MapsSpelling, MapsVerification,
+            ModuleInfo, ModuleRecord, ObjectKind, PathEncoding, PathUnavailableReason,
+            VerifiedPath,
+        };
+        let record = ModuleRecord {
+            info: ModuleInfo {
+                sha256: "a".repeat(64),
+                device: 7,
+                inode: 9,
+                size_bytes: 100,
+                architecture: Architecture::X86_64,
+                kind: ObjectKind::OpenSslCompatible,
+                exports: vec![],
+                depends_on_libcrypto: false,
+                depends_on_libssl: false,
+            },
+            identity_status: IdentityStatus::Verified,
+            verified_path: Some(VerifiedPath {
+                path: "/usr/lib/x86_64-linux-gnu/libcrypto.so.3".to_string(),
+                path_encoding: PathEncoding::Utf8,
+                locator_kind: LocatorKind::HostDirect,
+                capture_unix_ms: Some(1_700_000_000_000),
+            }),
+            verified_path_unavailable: None,
+            maps_spelling: Some(MapsSpelling {
+                spelling: "/usr/lib/x86_64-linux-gnu/libcrypto.so.3".to_string(),
+                source: MapsSource::ProcMaps,
+                verification: MapsVerification::Unverified,
+            }),
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["verified_path"]["locator_kind"], "host_direct");
+        assert_eq!(value["maps_spelling"]["verification"], "unverified");
+        // v0.5 document (no new keys) still reads; new keys default to None.
+        let old = serde_json::json!({
+            "info": {
+                "sha256": "a".repeat(64), "device": 7, "inode": 9, "size_bytes": 100,
+                "architecture": "x86_64", "kind": "openssl_compatible", "exports": [],
+                "depends_on_libcrypto": false, "depends_on_libssl": false
+            },
+            "identity_status": "verified"
+        });
+        let back: ModuleRecord = serde_json::from_value(old).unwrap();
+        assert_eq!(back.verified_path, None);
+        assert_eq!(back.maps_spelling, None);
+        // New document always carries the keys, even when null.
+        let bare = ModuleRecord {
+            info: record.info.clone(),
+            identity_status: IdentityStatus::LocatorCandidate,
+            verified_path: None,
+            verified_path_unavailable: Some(PathUnavailableReason::UnverifiedIdentity),
+            maps_spelling: None,
+        };
+        let bare_value = serde_json::to_value(&bare).unwrap();
+        assert!(bare_value.get("verified_path").is_some());
+        assert!(bare_value.get("verified_path_unavailable").is_some());
+        assert!(bare_value.get("maps_spelling").is_some());
+        assert!(bare_value["verified_path"].is_null());
     }
 }

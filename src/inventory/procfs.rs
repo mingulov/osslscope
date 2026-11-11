@@ -899,6 +899,9 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                         ModuleRecord {
                             info,
                             identity_status: status,
+                            verified_path: None,
+                            verified_path_unavailable: None,
+                            maps_spelling: None,
                         },
                         key.clone(),
                     ));

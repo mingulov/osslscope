@@ -5563,6 +5563,9 @@ mod tests {
                     depends_on_libssl: false,
                 },
                 identity_status: inventory::IdentityStatus::Verified,
+                verified_path: None,
+                verified_path_unavailable: None,
+                maps_spelling: None,
             };
             let record = inventory::ProcessRecord {
                 interval: inventory::CaptureInterval {
@@ -8042,6 +8045,9 @@ mod tests {
                     depends_on_libssl: false,
                 },
                 identity_status: inventory::IdentityStatus::Verified,
+                verified_path: None,
+                verified_path_unavailable: None,
+                maps_spelling: None,
             };
             let record = inventory::ProcessRecord {
                 interval: inventory::CaptureInterval {

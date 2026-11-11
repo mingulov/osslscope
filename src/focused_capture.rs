@@ -2635,6 +2635,9 @@ mod session_tests {
                 depends_on_libssl: false,
             },
             identity_status: inventory::IdentityStatus::Verified,
+            verified_path: None,
+            verified_path_unavailable: None,
+            maps_spelling: None,
         };
         let admitted = select_engine_libcrypto(&maps, std::slice::from_ref(&module))
             .expect("matching identity admits");

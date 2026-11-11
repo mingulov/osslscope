@@ -1422,6 +1422,9 @@ mod tests {
                 depends_on_libssl: false,
             },
             identity_status: status,
+            verified_path: None,
+            verified_path_unavailable: None,
+            maps_spelling: None,
         }
     }
 

@@ -7402,6 +7402,9 @@ mod tests {
                 depends_on_libssl: false,
             },
             identity_status: inventory::IdentityStatus::Verified,
+            verified_path: None,
+            verified_path_unavailable: None,
+            maps_spelling: None,
         }];
         assert!(matches!(acquire_observable(&record, &mut budget), Ok(None)));
         assert_eq!(budget.elf_read_bytes(), 0);
