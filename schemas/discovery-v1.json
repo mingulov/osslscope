@@ -465,7 +465,7 @@
       }
     },
     "gap": {
-      "description": "Only safe process/file fingerprints accompany finite gap labels. errno/actor_euid are appended last and omitted when no backing operation failed.",
+      "description": "Only safe process/file fingerprints accompany finite gap labels. errno/actor_euid are appended last and omitted when no open failure was preserved.",
       "type": "object",
       "required": ["pid", "device", "inode", "reason"],
       "additionalProperties": false,

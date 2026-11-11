@@ -305,7 +305,7 @@ it before display. Module facts carry the file's OWN `file_soname`
 validated rodata `file_openssl_version` with `file_version_status`
 (`present`, `absent`, `ambiguous`, or `not_fully_scanned` — only
 `present` carries a version string). Gaps may carry `errno`/`actor_euid`
-from the refused backing operation. File evidence is never a runtime
+from a refused open (backing, process, maps, or namespace). File evidence is never a runtime
 claim: SONAME and rodata version strings describe bytes on disk, not
 loaded, activated, or executed code — no version-to-vulnerability claim
 may be derived from them. The machine shape is pinned by
@@ -394,6 +394,31 @@ failure; **3** useful partial inventory; **4** wholly unavailable observation;
 inventory does not imply activation, execution or completeness beyond the
 requested visible scope. An accepted process with no relevant modules remains
 useful inventory. Output failure takes exit 1 even if discovery was partial.
+
+### Privilege
+
+Discovery is passive but not permission-free: unreadable processes and
+mappings become finite gaps, and the inventory states them instead of
+guessing. When a gap carries a refused-open `errno` of `EPERM`/`EACCES`
+— proof the kernel denied this observer — stderr carries one privilege
+hint naming the unverified portion (`{u} of {t} modules unverified`),
+the remedy, and this section. The hint fires only on such errno-proven
+denials: never for `too_large`, `changed`, limits, or dead PIDs, and it
+fires for root too when root is actually denied. It is emitted once per
+invocation on stderr only (a watch run retains one hint for the whole
+run, never one per tick) and is identical at every verbosity level.
+
+The supported path to a complete inventory is re-running as root.
+Capability recipes are best-effort: this project publishes a recipe
+only against the exact matrix it was tested on — kernel, distribution,
+namespace layout, LSM policy, and backing-proof path — and never
+advertises a universal minimal capability set derived from `EPERM`
+alone. Container root is not host visibility: mount/PID namespaces,
+LSM policy, and `hidepid` mounts can deny reads that succeed
+elsewhere, and only the `verified` backing proof promotes a candidate
+— a readable pathname alone never does. When the hint fires, compare
+runs at the same privilege before concluding anything changed in the
+target.
 
 ## Sampled watch
 

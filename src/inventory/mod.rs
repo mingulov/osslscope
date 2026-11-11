@@ -576,7 +576,7 @@ pub struct Gap {
     pub device: Option<u64>,
     pub inode: Option<u64>,
     pub reason: GapReason,
-    /// Selected backing-operation `errno` for this gap, when the
+    /// Selected refused-open `errno` for this gap, when the
     /// acquisition attempted an open or fstat that failed. Usually the
     /// refused range-bound open; may also name a metadata failure, and
     /// may accompany a limit reason when the refusal preceded the limit.

@@ -6887,3 +6887,47 @@ fn v060_human_has_no_long_hashes_no_jargon_honest_interval() {
     }
     assert!(!has_64_hex(&wtext), "64-hex in default watch");
 }
+
+#[test]
+fn v060_privilege_hint_fires_only_on_errno_proven_denial() {
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    // Foreign-root PID is unreadable to an unprivileged observer: hint must fire.
+    let denied = std::process::Command::new(bin)
+        .args(["scan", "--pid", "1", "--json"])
+        .output()
+        .unwrap();
+    let derr = String::from_utf8_lossy(&denied.stderr);
+    let doc: Result<serde_json::Value, _> = serde_json::from_slice(&denied.stdout);
+    if let Ok(doc) = doc {
+        let has_perm_gap = doc["gaps"].as_array().unwrap().iter().any(|g| {
+            g.get("errno").and_then(|e| e.as_i64()) == Some(libc_errno::EPERM)
+                || g.get("errno").and_then(|e| e.as_i64()) == Some(libc_errno::EACCES)
+        });
+        assert_eq!(
+            derr.contains("re-run as root"),
+            has_perm_gap,
+            "hint/errno mismatch: {derr}"
+        );
+    }
+    // Own PID with no permission gaps: hint must not fire.
+    let me = std::process::id().to_string();
+    let clean = std::process::Command::new(bin)
+        .args(["scan", "--pid", &me, "--json"])
+        .output()
+        .unwrap();
+    let clean_doc: serde_json::Value = serde_json::from_slice(&clean.stdout).unwrap();
+    let clean_perm = clean_doc["gaps"].as_array().unwrap().iter().any(|g| {
+        g.get("errno").and_then(|e| e.as_i64()) == Some(1)
+            || g.get("errno").and_then(|e| e.as_i64()) == Some(13)
+    });
+    assert_eq!(
+        String::from_utf8_lossy(&clean.stderr).contains("re-run as root"),
+        clean_perm
+    );
+}
+
+// Minimal libc errno constants without a new dependency.
+mod libc_errno {
+    pub const EPERM: i64 = 1;
+    pub const EACCES: i64 = 13;
+}

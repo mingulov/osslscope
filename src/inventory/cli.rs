@@ -417,6 +417,50 @@ fn inventory_exit_reason(state: InventoryState, reasons: &[GapReason]) -> Option
         "osslscope discovery: inventory {state_word}: {detail} ({count}; see records above)"
     ))
 }
+/// Stderr privilege hint (v0.6.0 P0-6): `Some` iff at least one gap
+/// carries errno EPERM/EACCES from an actually refused open — the
+/// only trigger. Bare gaps (`too_large`, `changed`, limits, dead
+/// pids) and non-permission errnos never fire it, and a root run
+/// gets the hint too when root is actually denied. The counts state
+/// the unverified portion: `u` = locator-candidate modules + gaps
+/// naming a pid, `t` = all modules + all gaps, both from the
+/// finished snapshot with no extra IO (`u <= t` always; firing
+/// implies `u >= 1` since every denial site names its pid). The
+/// word is EACCES when any denial is EACCES, else EPERM. Names
+/// root-as-supported (D5) and points at `usage.md#privilege`;
+/// capability recipes stay best-effort, never a universal set.
+/// Verbosity-independent; the caller emits it once per invocation
+/// on stderr only.
+pub(crate) fn privilege_hint(snapshot: &Snapshot) -> Option<String> {
+    let denied = snapshot.gaps.iter().any(|gap| {
+        gap.errno
+            .is_some_and(|e| e == libc::EPERM || e == libc::EACCES)
+    });
+    if !denied {
+        return None;
+    }
+    let word = if snapshot
+        .gaps
+        .iter()
+        .any(|gap| gap.errno == Some(libc::EACCES))
+    {
+        "EACCES"
+    } else {
+        "EPERM"
+    };
+    let (_, locator) = snapshot.identity_counts();
+    let modules: usize = snapshot
+        .processes
+        .iter()
+        .map(|process| process.modules.len())
+        .sum();
+    let named = snapshot.gaps.iter().filter(|gap| gap.pid.is_some()).count();
+    let unverified = locator + named;
+    let total = modules + snapshot.gaps.len();
+    Some(format!(
+        "osslscope discovery: {unverified} of {total} modules unverified: permission denied ({word}); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
+    ))
+}
 /// Human `comm=` value for one verdict line: the sampled name
 /// sanitized at this human boundary, `-` whenever the sample is
 /// anything but a present `Available` value. Null/missing renders
@@ -731,6 +775,11 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 if let Some(line) = super::watch::exit_reason(&outcome) {
                     crate::report::err_line(&line);
                 }
+                // P0-6: the run-retained hint (if any tick was
+                // denied), once per run — never per tick.
+                if let Some(hint) = outcome.privilege_hint.as_deref() {
+                    crate::report::err_line(hint);
+                }
                 outcome.exit_code()
             })
         } else if command == "scan" {
@@ -781,6 +830,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
                 }
+                if let Some(hint) = privilege_hint(&result) {
+                    crate::report::err_line(&hint);
+                }
                 result.exit_code()
             })
         } else if options.modules.is_empty() {
@@ -804,6 +856,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
+                }
+                if let Some(hint) = privilege_hint(&result) {
+                    crate::report::err_line(&hint);
                 }
                 result.exit_code()
             })
@@ -1629,6 +1684,72 @@ mod tests {
                 && unavailable.contains("process_unavailable")
                 && unavailable.contains("1 gap;"),
             "unavailable reason names state, class, singular count, got: {unavailable}"
+        );
+    }
+
+    #[test]
+    fn privilege_hint_fires_only_on_errno_proven_denial() {
+        // P0-6 trigger: actual EPERM/EACCES only. Clean snapshots,
+        // bare gaps (too_large, changed, process_unavailable,
+        // limits), and non-permission errnos never fire it.
+        let gap = |reason, errno| Gap {
+            pid: Some(7),
+            device: Some(1),
+            inode: Some(10),
+            reason,
+            errno,
+            actor_euid: errno.map(|_| 1001),
+        };
+        let mut snap = snapshot_with(vec![module_with(IdentityStatus::Verified)]);
+        assert_eq!(super::privilege_hint(&snap), None);
+        for (reason, errno) in [
+            (GapReason::TooLarge, None),
+            (GapReason::Changed, None),
+            (GapReason::ProcessUnavailable, None),
+            (GapReason::ReadLimit, None),
+            (GapReason::BackingUnavailable, Some(libc::ENOENT)),
+        ] {
+            snap.gaps = vec![gap(reason, errno)];
+            assert_eq!(
+                super::privilege_hint(&snap),
+                None,
+                "fired for {reason:?}/{errno:?}"
+            );
+        }
+        // Denied: u = locator-candidate modules (1) + pid-naming
+        // gaps (2) = 3; t = modules (2) + gaps (3) = 5. The
+        // pid-less limit gap counts in t but not u; EACCES wins
+        // the word when both denials are present.
+        let mut denied = snapshot_with(vec![
+            module_with(IdentityStatus::Verified),
+            module_with(IdentityStatus::LocatorCandidate),
+        ]);
+        denied.gaps = vec![
+            gap(GapReason::IdentityUnverified, Some(libc::EPERM)),
+            gap(GapReason::ProcessUnavailable, Some(libc::EACCES)),
+            Gap {
+                pid: None,
+                device: None,
+                inode: None,
+                reason: GapReason::ReadLimit,
+                errno: None,
+                actor_euid: None,
+            },
+        ];
+        assert_eq!(
+            super::privilege_hint(&denied).as_deref(),
+            Some(
+                "osslscope discovery: 3 of 5 modules unverified: permission denied (EACCES); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
+            )
+        );
+        // EPERM alone names EPERM: u = 0 + 1 = 1, t = 0 + 1 = 1.
+        let mut eperm = snapshot_with(Vec::new());
+        eperm.gaps = vec![gap(GapReason::BackingUnavailable, Some(libc::EPERM))];
+        assert_eq!(
+            super::privilege_hint(&eperm).as_deref(),
+            Some(
+                "osslscope discovery: 1 of 1 modules unverified: permission denied (EPERM); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
+            )
         );
     }
 

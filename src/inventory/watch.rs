@@ -68,6 +68,13 @@ pub struct WatchOutcome {
     pub limits: Limits,
     pub gap: Option<GapReason>,
     pub sampled_history: &'static str,
+    /// Rendered P0-6 privilege hint for this run (serde-skipped, so
+    /// machine end bytes are identical): the last tick whose
+    /// snapshot carried an errno-proven denial, decided per tick by
+    /// `super::cli::privilege_hint` and retained once per run —
+    /// never per tick. `None` when no tick was denied (or none ran).
+    #[serde(skip)]
+    pub privilege_hint: Option<String>,
 }
 impl WatchOutcome {
     pub fn exit_code(&self) -> u8 {
@@ -520,6 +527,14 @@ fn human_end(writer: &mut impl Write, outcome: &WatchOutcome, seen: &Cumulative)
     if let Some(gap) = outcome.gap {
         writeln!(writer, "  scope gap={}", gap.word())?;
     }
+    // P0-6: when the run retained a privilege hint, the end record
+    // names where it went (stderr) and where the remedy lives.
+    if outcome.privilege_hint.is_some() {
+        writeln!(
+            writer,
+            "  privilege: permission-denied gaps this run; remediation hint on stderr (see usage.md#privilege)"
+        )?;
+    }
     writer.flush()
 }
 /// Stream bounded NDJSON. This never installs signal handlers or signals a
@@ -569,6 +584,7 @@ pub(super) fn run_formatted(
         limits: options.limits.clone(),
         gap: None,
         sampled_history: "incomplete",
+        privilege_hint: None,
     };
     if cancel.load(Ordering::Relaxed) {
         end.reason = EndReason::Interrupted;
@@ -622,6 +638,11 @@ pub(super) fn run_formatted(
         }
         sequence += 1;
         seen.observe(sequence, snapshot.exit_code());
+        // P0-6: retain the latest denied tick's hint on the outcome
+        // (stderr emission happens once, after the run, in `cli`).
+        if let Some(hint) = super::cli::privilege_hint(&snapshot) {
+            end.privilege_hint = Some(hint);
+        }
         let deltas = changes(previous.as_ref(), &snapshot);
         // T5 `--resolve-paths`: per-snapshot writer over this
         // snapshot's sidecar (render intent + TTY from the caller;
@@ -803,6 +824,7 @@ mod tests {
             limits: Limits::default(),
             gap,
             sampled_history: "incomplete",
+            privilege_hint: None,
         }
     }
 
@@ -833,6 +855,89 @@ mod tests {
             empty.contains("before any snapshot"),
             "zero-snapshot end named, got: {empty}"
         );
+    }
+
+    #[test]
+    fn human_end_mentions_privilege_destination_only_when_fired() {
+        // P0-6: a retained hint adds the destination line to the
+        // human end record; a clean run stays silent; the machine
+        // end record never carries the hint (serde-skipped).
+        let mut fired = outcome(EndReason::Duration, 3, None);
+        fired.privilege_hint = Some("osslscope discovery: 1 of 1 modules unverified: permission denied (EACCES); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege".into());
+        let mut buf = Vec::new();
+        super::human_end(&mut buf, &fired, &Cumulative::default()).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(
+            out.contains("privilege: permission-denied gaps this run; remediation hint on stderr (see usage.md#privilege)"),
+            "end must name the hint destination, got: {out}"
+        );
+        // The Task 3 reason line is unchanged by the retention.
+        assert_eq!(
+            super::exit_reason(&fired),
+            super::exit_reason(&outcome(EndReason::Duration, 3, None))
+        );
+        let mut clean = Vec::new();
+        super::human_end(
+            &mut clean,
+            &outcome(EndReason::Duration, 0, None),
+            &Cumulative::default(),
+        )
+        .unwrap();
+        let clean_out = String::from_utf8(clean).unwrap();
+        assert!(
+            !clean_out.contains("privilege:"),
+            "clean end must stay silent, got: {clean_out}"
+        );
+        let value = serde_json::to_value(&fired).unwrap();
+        assert!(
+            value.get("privilege_hint").is_none(),
+            "machine end leaked the hint: {value}"
+        );
+    }
+
+    #[test]
+    fn watch_run_retains_privilege_hint_once_per_run() {
+        // Lane-independent retention proof: a short PID-1 watch
+        // retains a hint iff PID 1 actually denies this observer
+        // right now — root keeps None, denied observers keep one
+        // single-line hint for the whole run, never one per tick.
+        let mut probe = ScopedScanner::new(
+            Selection {
+                pids: vec![1],
+                ..Default::default()
+            },
+            Limits::default(),
+        )
+        .unwrap();
+        let denied_now = probe.snapshot().gaps.iter().any(|gap| {
+            gap.errno
+                .is_some_and(|errno| errno == libc::EPERM || errno == libc::EACCES)
+        });
+        let options = super::WatchOptions {
+            selection: Selection {
+                pids: vec![1],
+                ..Default::default()
+            },
+            limits: Limits::default(),
+            interval: Duration::from_millis(50),
+            duration: Some(Duration::from_millis(200)),
+            resolve_paths: false,
+        };
+        let cancel = AtomicBool::new(false);
+        let mut sink = Vec::new();
+        let outcome = super::run_formatted(&options, &mut sink, &cancel, false, false, 0).unwrap();
+        assert!(outcome.sequence >= 1, "the run must tick");
+        assert_eq!(
+            outcome.privilege_hint.is_some(),
+            denied_now,
+            "retention must match observed denial"
+        );
+        if let Some(hint) = outcome.privilege_hint.as_deref() {
+            assert!(
+                hint.contains("re-run as root") && !hint.contains('\n'),
+                "one single-line hint per run, got: {hint}"
+            );
+        }
     }
 
     fn tick_process(pid: u32, comm: &str) -> crate::inventory::ProcessRecord {

@@ -101,22 +101,34 @@ struct Process {
     pidfd: File,
     starttime: u64,
 }
+/// Preserve only permission-denial provenance (v0.6.0 P0-6): the
+/// privilege hint fires on actual EPERM/EACCES, so only those cross
+/// from a refused open into the gap record. Every other errno
+/// (ENOENT for a dead pid, ESRCH, ...) stays a bare gap —
+/// byte-identical to before, never a synthesized denial.
+fn perm_errno(error: &io::Error) -> Option<i32> {
+    match error.raw_os_error() {
+        Some(errno) if errno == libc::EPERM || errno == libc::EACCES => Some(errno),
+        _ => None,
+    }
+}
 impl Process {
-    fn open(pid: u32, work: &mut Work<'_>) -> Result<Self, GapReason> {
+    fn open(pid: u32, work: &mut Work<'_>) -> Result<Self, (GapReason, Option<i32>)> {
         if pid == 0 || pid > i32::MAX as u32 {
-            return Err(GapReason::ProcessUnavailable);
+            return Err((GapReason::ProcessUnavailable, None));
         }
         let directory = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(format!("/proc/{pid}"))
-            .map_err(|_| GapReason::ProcessUnavailable)?;
+            .map_err(|error| (GapReason::ProcessUnavailable, perm_errno(&error)))?;
         let starttime = starttime(&directory, work)?;
         // SAFETY: pidfd_open receives a positive PID and flags zero. A
         // successful descriptor transfers ownership once to File.
         let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
         if raw < 0 {
-            return Err(GapReason::ProcessUnavailable);
+            let errno = perm_errno(&io::Error::last_os_error());
+            return Err((GapReason::ProcessUnavailable, errno));
         }
         let process = Self {
             directory,
@@ -126,14 +138,14 @@ impl Process {
         process.validate(work)?;
         Ok(process)
     }
-    fn validate(&self, work: &mut Work<'_>) -> Result<(), GapReason> {
-        work.deadline()?;
-        self.live()?;
+    fn validate(&self, work: &mut Work<'_>) -> Result<(), (GapReason, Option<i32>)> {
+        work.deadline().map_err(|reason| (reason, None))?;
+        self.live().map_err(|reason| (reason, None))?;
         if starttime(&self.directory, work)? != self.starttime {
-            return Err(GapReason::Changed);
+            return Err((GapReason::Changed, None));
         }
         // The stat read itself may race exit. Poll the actual held pidfd again.
-        self.live()
+        self.live().map_err(|reason| (reason, None))
     }
     fn live(&self) -> Result<(), GapReason> {
         let mut poll = libc::pollfd {
@@ -165,20 +177,21 @@ pub(super) fn open_at(directory: &File, name: &[u8]) -> io::Result<File> {
     }
     Ok(unsafe { File::from_raw_fd(raw) })
 }
-fn starttime(directory: &File, work: &mut Work<'_>) -> Result<u64, GapReason> {
-    let file = open_at(directory, b"stat").map_err(|_| GapReason::ProcessUnavailable)?;
-    let bytes = work.read(file, 65_536)?;
+fn starttime(directory: &File, work: &mut Work<'_>) -> Result<u64, (GapReason, Option<i32>)> {
+    let file = open_at(directory, b"stat")
+        .map_err(|error| (GapReason::ProcessUnavailable, perm_errno(&error)))?;
+    let bytes = work.read(file, 65_536).map_err(|reason| (reason, None))?;
     // comm can contain spaces and ')': only the last ')' delimits it.
     let end = bytes
         .iter()
         .rposition(|b| *b == b')')
-        .ok_or(GapReason::ProcessUnavailable)?;
+        .ok_or((GapReason::ProcessUnavailable, None))?;
     let start = bytes[end + 1..]
         .split(u8::is_ascii_whitespace)
         .filter(|b| !b.is_empty())
         .nth(19)
         .and_then(|value| number(value, 10))
-        .ok_or(GapReason::ProcessUnavailable)?;
+        .ok_or((GapReason::ProcessUnavailable, None))?;
     Ok(start)
 }
 
@@ -968,36 +981,67 @@ fn publish_for_key(
     (verified_path, reason)
 }
 
-fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
+/// Open one `ns/` entry through the held proc directory,
+/// preserving the first permission refusal (v0.6.0 P0-6) for the
+/// gap record. Any other failure degrades to unknown namespace
+/// metadata exactly as before, with no errno attached.
+fn namespace_id(
+    directory: &File,
+    name: &[u8],
+    errno: &mut Option<i32>,
+) -> Option<(File, NamespaceId)> {
+    let file = match open_at(directory, name) {
+        Ok(file) => file,
+        Err(error) => {
+            if errno.is_none() {
+                *errno = perm_errno(&error);
+            }
+            return None;
+        }
+    };
+    let metadata = match file.metadata() {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            if errno.is_none() {
+                *errno = perm_errno(&error);
+            }
+            return None;
+        }
+    };
+    Some((
+        file,
+        NamespaceId {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+    ))
+}
+
+fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, (GapReason, Option<i32>)> {
     let clock = CaptureClock::start();
-    work.reserve_record(1024)?;
+    work.reserve_record(1024).map_err(|reason| (reason, None))?;
     let process = Process::open(pid, work)?;
     // v0.6.0 D2: sample identity through the held dir once its
     // starttime is known. Every status (including Changed) keeps
     // the modules acquired below — identity never discards
     // inventory.
     let (comm, comm_status, exe, exe_status) = read_comm_exe(&process.directory, process.starttime);
-    let namespace = |name: &[u8]| {
-        open_at(&process.directory, name).ok().and_then(|f| {
-            f.metadata().ok().map(|m| {
-                (
-                    f,
-                    NamespaceId {
-                        device: m.dev(),
-                        inode: m.ino(),
-                    },
-                )
-            })
-        })
-    };
-    let pid_ns = namespace(b"ns/pid");
-    let mount_ns = namespace(b"ns/mnt");
+    let mut namespace_errno = None;
+    let pid_ns = namespace_id(&process.directory, b"ns/pid", &mut namespace_errno);
+    let mount_ns = namespace_id(&process.directory, b"ns/mnt", &mut namespace_errno);
     if pid_ns.is_none() || mount_ns.is_none() {
-        work.gap(Some(pid), None, GapReason::NamespaceUnavailable);
+        work.gap_errno(
+            Some(pid),
+            None,
+            GapReason::NamespaceUnavailable,
+            namespace_errno,
+        );
     }
-    let maps_file =
-        open_at(&process.directory, b"maps").map_err(|_| GapReason::ProcessUnavailable)?;
-    let maps = work.read(maps_file, work.options.limits.max_maps_bytes)?;
+    let maps_file = open_at(&process.directory, b"maps")
+        .map_err(|error| (GapReason::ProcessUnavailable, perm_errno(&error)))?;
+    let maps = work
+        .read(maps_file, work.options.limits.max_maps_bytes)
+        .map_err(|reason| (reason, None))?;
     // One backing view per process; without it every mapping keeps its
     // previous legacy status (never a new failure). A budget refusal here
     // degrades the same approved way an unreadable view does; the charges
@@ -1069,7 +1113,7 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         }
         // Charge metadata, vector growth and temporary fingerprint/set copies
         // before cloning cached or newly inspected module metadata.
-        work.reserve_record(2048)?;
+        work.reserve_record(2048).map_err(|reason| (reason, None))?;
         let mut status = identity_status;
         match work.inspect(file, &metadata, page) {
             Ok(info) => {
@@ -1196,9 +1240,12 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     }
     // Recheck maps, the held proc directory's incarnation, and the actual
     // pidfd before accepting any process. IO churn cannot become completeness.
-    let again = open_at(&process.directory, b"maps")
-        .map_err(|_| GapReason::ProcessUnavailable)
-        .and_then(|file| work.read(file, work.options.limits.max_maps_bytes));
+    let again: Result<ReadBuffer, (GapReason, Option<i32>)> = open_at(&process.directory, b"maps")
+        .map_err(|error| (GapReason::ProcessUnavailable, perm_errno(&error)))
+        .and_then(|file| {
+            work.read(file, work.options.limits.max_maps_bytes)
+                .map_err(|reason| (reason, None))
+        });
     match again {
         Ok(again) if again == maps => {}
         Ok(_) => {
@@ -1210,8 +1257,8 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                 module.identity_status = IdentityStatus::LocatorCandidate;
             }
         }
-        Err(reason) => {
-            work.gap(Some(pid), None, reason);
+        Err((reason, errno)) => {
+            work.gap_errno(Some(pid), None, reason, errno);
             // Dropped Others downgrade exactly like published rows.
             other_objects.candidate += other_objects.verified;
             other_objects.verified = 0;
@@ -1249,9 +1296,18 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         (b"ns/pid".as_slice(), &mut namespaces.pid),
         (b"ns/mnt".as_slice(), &mut namespaces.mount),
     ] {
-        if namespace(name).map(|(_, id)| id) != *identity {
+        // A plain identity change carries no errno (a changed
+        // namespace is not a denial); only a refused re-open does.
+        let mut recheck_errno = None;
+        if namespace_id(&process.directory, name, &mut recheck_errno).map(|(_, id)| id) != *identity
+        {
             *identity = None;
-            work.gap(Some(pid), None, GapReason::NamespaceUnavailable);
+            work.gap_errno(
+                Some(pid),
+                None,
+                GapReason::NamespaceUnavailable,
+                recheck_errno,
+            );
         }
     }
     // T5 `--resolve-paths` rule 3: record staging keys for rows
@@ -1500,7 +1556,7 @@ fn sample_order(order: &[u32], work: &mut Work<'_>, state: &mut ScanState) -> Ve
         work.totals.processes_attempted += 1;
         match process(pid, work) {
             Ok(process) => processes.push(process),
-            Err(reason) => work.gap(Some(pid), None, reason),
+            Err((reason, errno)) => work.gap_errno(Some(pid), None, reason, errno),
         }
         if work.totals.objects_attempted >= work.options.limits.max_objects || work.remaining() == 0
         {
@@ -2303,5 +2359,72 @@ mod tests {
             "counts exceed attempts: {counts:?} vs {:?}",
             result.totals
         );
+    }
+
+    // P0-6 negative leg (deterministic in every lane): a reaped
+    // child is gone, so its /proc open fails ENOENT — which must
+    // NOT cross into the gap. Bare gaps stay byte-identical, never
+    // a synthesized denial.
+    #[test]
+    fn dead_pid_gap_carries_no_errno() {
+        let mut child = ChildGuard(std::process::Command::new("/bin/true").spawn().unwrap());
+        let pid = child.0.id();
+        assert!(child.0.wait().unwrap().success());
+        let result = snapshot(&SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        });
+        assert!(
+            result.processes.is_empty(),
+            "reaped pid must not sample: {result:?}"
+        );
+        assert_eq!(result.gaps.len(), 1, "one gap for the dead pid: {result:?}");
+        let gap = &result.gaps[0];
+        assert_eq!(gap.pid, Some(pid));
+        assert_eq!(gap.reason, GapReason::ProcessUnavailable);
+        assert_eq!(gap.errno, None);
+        assert_eq!(gap.actor_euid, None);
+    }
+
+    // P0-6 positive leg: PID 1's maps must ACTUALLY deny this
+    // observer (EPERM/EACCES) for the lane to prove preservation —
+    // otherwise it skips loudly. Root always skips: it is never
+    // denied here.
+    #[test]
+    fn permission_denied_procfs_open_preserves_errno() {
+        // SAFETY: geteuid takes no arguments and always succeeds.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("SKIP permission leg: running as root");
+            return;
+        }
+        let expected = match std::fs::File::open("/proc/1/maps") {
+            Err(error) => error
+                .raw_os_error()
+                .filter(|errno| *errno == libc::EPERM || *errno == libc::EACCES),
+            Ok(_) => None,
+        };
+        let Some(expected) = expected else {
+            eprintln!("SKIP: PID 1 maps readable or unusually denied here");
+            return;
+        };
+        let result = snapshot(&SnapshotOptions {
+            pids: vec![1],
+            ..Default::default()
+        });
+        assert!(
+            result.gaps.iter().any(|gap| {
+                gap.pid == Some(1)
+                    && gap.reason == GapReason::ProcessUnavailable
+                    && gap.errno == Some(expected)
+            }),
+            "maps denial must preserve errno {expected}: {result:?}"
+        );
+        for gap in result.gaps.iter().filter(|gap| gap.pid == Some(1)) {
+            assert!(
+                gap.errno
+                    .is_none_or(|errno| errno == libc::EPERM || errno == libc::EACCES),
+                "only denials cross from these sites: {gap:?}"
+            );
+        }
     }
 }
