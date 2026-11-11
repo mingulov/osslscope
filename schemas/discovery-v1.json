@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/discovery-v1.json",
   "title": "osslscope discovery v1",
-  "description": "Passive file-backed discovery documents (schema_version osslscope.discovery.v1). The top-level document is the snapshot inventory (scan --json, mode snapshot). definitions.module_inventory covers independent file inspection (inspect --module --json, mode module); definitions.watch_snapshot and definitions.watch_end cover scan --watch NDJSON sample and end records (mode watch). Nested definitions cover the shared records. Every object forbids additional properties. v0.5 readers using deny_unknown_fields reject v0.6 documents (new keys: comm, comm_status, exe, exe_status, file_soname, file_openssl_version, file_version_status, verified_path, verified_path_unavailable, maps_spelling, other_objects, and optional errno/actor_euid on gaps); v0.6 readers accept v0.5 documents (all new keys default). Intentional path/process metadata: other_objects carries per-process counted-not-listed kind=other objects (verified/candidate/failed — never every mapping; a scan --module selected other is listed instead and never counted); verified_path carries proven object paths, maps_spelling carries unverified maps-text spellings, and comm/exe carry sampled process identity — all bounded, all potentially disclosing sensitive filenames. Never emitted anywhere: symbol strings, mapping addresses, argv, cmdline, environment, keys or payloads.",
+  "description": "Passive file-backed discovery documents (schema_version osslscope.discovery.v1). The top-level document is the snapshot inventory (scan --json, mode snapshot). definitions.module_inventory covers independent file inspection (inspect --module --json, mode module); definitions.watch_snapshot and definitions.watch_end cover scan --watch NDJSON sample and end records (mode watch). Nested definitions cover the shared records. Every object forbids additional properties. v0.5 readers using deny_unknown_fields reject v0.6 documents (new keys: comm, comm_status, exe, exe_status, file_soname, file_openssl_version, file_version_status, verified_path, verified_path_unavailable, maps_spelling, other_objects, and optional errno/actor_euid on gaps, errno on module errors); v0.6 readers accept v0.5 documents (all new keys default). Intentional path/process metadata: other_objects carries per-process counted-not-listed kind=other objects (verified/candidate/failed — never every mapping; a scan --module selected other is listed instead and never counted); verified_path carries proven object paths, maps_spelling carries unverified maps-text spellings, and comm/exe carry sampled process identity — all bounded, all potentially disclosing sensitive filenames. Never emitted anywhere: symbol strings, mapping addresses, argv, cmdline, environment, keys or payloads.",
   "type": "object",
   "required": ["schema_version", "mode", "scope", "selected_pids", "processes", "gaps", "totals", "limits", "capabilities", "interval", "scope_record"],
   "additionalProperties": false,
@@ -583,6 +583,7 @@
       }
     },
     "module_error": {
+      "description": "One failed inspect --module input (zero-based input_index) with a finite gap label; errno carries the preserved refused-open integer (open or fstat) or null when no open failure was preserved.",
       "type": "object",
       "required": ["input_index", "reason"],
       "additionalProperties": false,
@@ -592,6 +593,9 @@
         },
         "reason": {
           "$ref": "#/definitions/gap_reason"
+        },
+        "errno": {
+          "type": ["integer", "null"]
         }
       }
     },

@@ -1130,3 +1130,102 @@ fn v060_verbosity_contract() {
     assert_eq!(bad.status.code(), Some(2));
     assert!(bad.stdout.is_empty());
 }
+
+#[test]
+fn v060_inspect_module_denied_file_fires_privilege_hint_with_errno() {
+    // T6b: `inspect --module` on a permission-denied file fires the
+    // P0-6 privilege hint exactly like scan routes, and the
+    // ModuleError record carries the `errno` key (integer
+    // provenance, never IO text). Exits/counts are untouched
+    // (denied module stays exit 4).
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // SAFETY: geteuid takes no arguments and always succeeds.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("SKIP denied-module leg: running as root");
+        return;
+    }
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    struct Lease(std::path::PathBuf);
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let base = std::env::var_os("TMPDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = Lease(base.join(format!(
+        "osslscope-t6b-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    )));
+    std::fs::create_dir(&dir.0).unwrap();
+    std::fs::set_permissions(&dir.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let denied = dir.0.join("denied.so");
+    std::fs::write(&denied, b"not-an-elf").unwrap();
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Precondition: this observer must ACTUALLY be denied here —
+    // otherwise the lane cannot prove the trigger and skips loudly.
+    let expected = match std::fs::File::open(&denied) {
+        Err(error) => error
+            .raw_os_error()
+            .filter(|errno| *errno == libc::EPERM || *errno == libc::EACCES),
+        Ok(_) => None,
+    };
+    let Some(expected) = expected else {
+        eprintln!("SKIP: fixture readable or unusually denied here");
+        return;
+    };
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let out = std::process::Command::new(bin)
+        .args(["inspect", "--module"])
+        .arg(&denied)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4), "denied module stays exit 4");
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["mode"], "module");
+    let errors = doc["errors"].as_array().unwrap();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0]["reason"], "unavailable");
+    // Unit-style shape pin: the ModuleError object carries `errno`.
+    assert!(
+        errors[0].get("errno").is_some(),
+        "ModuleError must carry the errno key: {}",
+        errors[0]
+    );
+    assert_eq!(
+        errors[0]["errno"].as_i64(),
+        Some(expected as i64),
+        "errno is the preserved integer, never IO text"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("inventory unavailable"),
+        "reason line kept: {err}"
+    );
+    assert_eq!(
+        err.matches("re-run as root").count(),
+        1,
+        "hint fires exactly once: {err}"
+    );
+    assert!(
+        err.contains("1 of 1 modules unverified: permission denied"),
+        "hint names the unverified portion: {err}"
+    );
+    // Human route fires identically (stderr-only, format-independent).
+    let human = std::process::Command::new(bin)
+        .args(["inspect", "--module"])
+        .arg(&denied)
+        .output()
+        .unwrap();
+    assert_eq!(human.status.code(), Some(4));
+    let herr = String::from_utf8_lossy(&human.stderr);
+    assert_eq!(
+        herr.matches("re-run as root").count(),
+        1,
+        "human hint fires exactly once: {herr}"
+    );
+}

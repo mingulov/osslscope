@@ -203,6 +203,14 @@ impl Drop for WatchSignals {
 struct ModuleError {
     input_index: usize,
     reason: GapReason,
+    /// Preserved refused-open `errno` for this input (open or
+    /// fstat), `None` for every other failure. Unfiltered
+    /// `raw_os_error` like the backing route (an `ENOENT` miss
+    /// keeps its `2`); only EPERM/EACCES ever fires the P0-6 hint.
+    /// Always serialized (`None` renders `null`); `default` keeps
+    /// forward readers accepting documents without the key.
+    #[serde(default)]
+    errno: Option<i32>,
 }
 #[derive(Serialize)]
 struct ModuleInventory {
@@ -269,17 +277,28 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits, resolve_paths: bool) -> Mo
             result.errors.push(ModuleError {
                 input_index,
                 reason,
+                errno: None,
             });
             break;
         }
         result.totals.objects_attempted += 1;
+        // T6b: the preserved refused-open errno for this input; only
+        // the open/fstat sites below set it, every other failure
+        // leaves it None.
+        let mut errno: Option<i32> = None;
         let inspected = (|| {
             let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
                 .open(path)
-                .map_err(|_| GapReason::Unavailable)?;
-            let metadata = file.metadata().map_err(|_| GapReason::Unavailable)?;
+                .map_err(|error| {
+                    errno = error.raw_os_error();
+                    GapReason::Unavailable
+                })?;
+            let metadata = file.metadata().map_err(|error| {
+                errno = error.raw_os_error();
+                GapReason::Unavailable
+            })?;
             if !metadata.is_file() {
                 return Err(GapReason::NonRegular);
             }
@@ -328,6 +347,7 @@ fn inspect_modules(paths: &[PathBuf], limits: Limits, resolve_paths: bool) -> Mo
             Err(reason) => result.errors.push(ModuleError {
                 input_index,
                 reason,
+                errno,
             }),
         }
     }
@@ -419,37 +439,42 @@ fn inventory_exit_reason(state: InventoryState, reasons: &[GapReason]) -> Option
         "osslscope discovery: inventory {state_word}: {detail} ({count}; see records above)"
     ))
 }
-/// Stderr privilege hint (v0.6.0 P0-6): `Some` iff at least one gap
-/// carries errno EPERM/EACCES from an actually refused open — the
-/// only trigger. Bare gaps (`too_large`, `changed`, limits, dead
-/// pids) and non-permission errnos never fire it, and a root run
-/// gets the hint too when root is actually denied. The counts state
-/// the unverified portion: `u` = locator-candidate modules + gaps
-/// naming a pid, `t` = all modules + all gaps, both from the
-/// finished snapshot with no extra IO (`u <= t` always; firing
-/// implies `u >= 1` since every denial site names its pid). The
-/// word is EACCES when any denial is EACCES, else EPERM. Names
+/// Shared stderr privilege-hint trigger + message (v0.6.0 P0-6,
+/// extended to `inspect --module` by T6b): `Some` iff at least one
+/// preserved errno is EPERM/EACCES from an actually refused open —
+/// the only trigger. Bare records (`too_large`, `changed`, limits,
+/// dead pids) and non-permission errnos never fire it, and a root
+/// run gets the hint too when root is actually denied. The counts
+/// state the unverified portion (`u <= t` always; firing implies
+/// `u >= 1` since every denial is an unverified record). The word
+/// is EACCES when any denial is EACCES, else EPERM. Names
 /// root-as-supported (D5) and points at `usage.md#privilege`;
 /// capability recipes stay best-effort, never a universal set.
 /// Verbosity-independent; the caller emits it once per invocation
 /// on stderr only.
-pub(crate) fn privilege_hint(snapshot: &Snapshot) -> Option<String> {
-    let denied = snapshot.gaps.iter().any(|gap| {
-        gap.errno
-            .is_some_and(|e| e == libc::EPERM || e == libc::EACCES)
-    });
+fn privilege_hint_text(
+    errnos: impl IntoIterator<Item = Option<i32>>,
+    unverified: usize,
+    total: usize,
+) -> Option<String> {
+    let mut denied = false;
+    let mut eacces = false;
+    for errno in errnos {
+        denied |= errno.is_some_and(|e| e == libc::EPERM || e == libc::EACCES);
+        eacces |= errno == Some(libc::EACCES);
+    }
     if !denied {
         return None;
     }
-    let word = if snapshot
-        .gaps
-        .iter()
-        .any(|gap| gap.errno == Some(libc::EACCES))
-    {
-        "EACCES"
-    } else {
-        "EPERM"
-    };
+    let word = if eacces { "EACCES" } else { "EPERM" };
+    Some(format!(
+        "osslscope discovery: {unverified} of {total} modules unverified: permission denied ({word}); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
+    ))
+}
+/// Snapshot-route adapter: `u` = locator-candidate modules + gaps
+/// naming a pid, `t` = all modules + all gaps, both from the
+/// finished snapshot with no extra IO.
+pub(crate) fn privilege_hint(snapshot: &Snapshot) -> Option<String> {
     let (_, locator) = snapshot.identity_counts();
     let modules: usize = snapshot
         .processes
@@ -457,11 +482,21 @@ pub(crate) fn privilege_hint(snapshot: &Snapshot) -> Option<String> {
         .map(|process| process.modules.len())
         .sum();
     let named = snapshot.gaps.iter().filter(|gap| gap.pid.is_some()).count();
-    let unverified = locator + named;
-    let total = modules + snapshot.gaps.len();
-    Some(format!(
-        "osslscope discovery: {unverified} of {total} modules unverified: permission denied ({word}); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
-    ))
+    privilege_hint_text(
+        snapshot.gaps.iter().map(|gap| gap.errno),
+        locator + named,
+        modules + snapshot.gaps.len(),
+    )
+}
+/// Module-route adapter (T6b): `u` = error records, `t` = module +
+/// error records, both from the finished inventory with no extra
+/// IO. Fires on EPERM/EACCES exactly like scan routes.
+fn privilege_hint_for_modules(inventory: &ModuleInventory) -> Option<String> {
+    privilege_hint_text(
+        inventory.errors.iter().map(|error| error.errno),
+        inventory.errors.len(),
+        inventory.modules.len() + inventory.errors.len(),
+    )
 }
 /// Human `comm=` value for one verdict line: the sampled name
 /// sanitized at this human boundary, `-` whenever the sample is
@@ -977,6 +1012,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 let reasons: Vec<GapReason> = result.errors.iter().map(|e| e.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
+                }
+                if let Some(hint) = privilege_hint_for_modules(&result) {
+                    crate::report::err_line(&hint);
                 }
                 inventory_exit(result.capabilities.inventory)
             })
@@ -1904,6 +1942,74 @@ mod tests {
         eperm.gaps = vec![gap(GapReason::BackingUnavailable, Some(libc::EPERM))];
         assert_eq!(
             super::privilege_hint(&eperm).as_deref(),
+            Some(
+                "osslscope discovery: 1 of 1 modules unverified: permission denied (EPERM); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
+            )
+        );
+    }
+
+    #[test]
+    fn privilege_hint_module_arm_fires_only_on_errno_proven_denial() {
+        // T6b: the `inspect --module` arm fires through the same
+        // trigger function — EPERM/EACCES only, EACCES winning the
+        // word when both are present. u = error records, t =
+        // module + error records.
+        fn inventory(errors: Vec<super::ModuleError>) -> super::ModuleInventory {
+            super::ModuleInventory {
+                schema_version: "osslscope.discovery.v1",
+                mode: "module",
+                modules: Vec::new(),
+                errors,
+                totals: super::WorkTotals::default(),
+                limits: super::Limits::default(),
+                resolve: super::super::resolve::ResolveSidecar::default(),
+                capabilities: super::Capabilities {
+                    inventory: super::InventoryState::Unavailable,
+                    provider_activation: super::ObservationState::Unknown,
+                    provider_interfaces: super::ObservationState::Unknown,
+                    execution: super::ObservationState::NotObserved,
+                },
+            }
+        }
+        let error = |input_index, reason, errno| super::ModuleError {
+            input_index,
+            reason,
+            errno,
+        };
+        assert_eq!(
+            super::privilege_hint_for_modules(&inventory(Vec::new())),
+            None
+        );
+        for (reason, errno) in [
+            (super::GapReason::TooLarge, None),
+            (super::GapReason::Changed, None),
+            (super::GapReason::Unavailable, None),
+            (super::GapReason::Unavailable, Some(libc::ENOENT)),
+        ] {
+            let none = inventory(vec![error(0, reason, errno)]);
+            assert_eq!(
+                super::privilege_hint_for_modules(&none),
+                None,
+                "fired for {reason:?}/{errno:?}"
+            );
+        }
+        let denied = inventory(vec![
+            error(0, super::GapReason::Unavailable, Some(libc::EPERM)),
+            error(1, super::GapReason::Unavailable, Some(libc::EACCES)),
+        ]);
+        assert_eq!(
+            super::privilege_hint_for_modules(&denied).as_deref(),
+            Some(
+                "osslscope discovery: 2 of 2 modules unverified: permission denied (EACCES); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
+            )
+        );
+        let eperm = inventory(vec![error(
+            0,
+            super::GapReason::Unavailable,
+            Some(libc::EPERM),
+        )]);
+        assert_eq!(
+            super::privilege_hint_for_modules(&eperm).as_deref(),
             Some(
                 "osslscope discovery: 1 of 1 modules unverified: permission denied (EPERM); re-run as root for a complete inventory (supported path); capability recipes are best-effort, see usage.md#privilege"
             )

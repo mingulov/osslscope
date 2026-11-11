@@ -464,6 +464,7 @@ denials: never for `too_large`, `changed`, limits, or dead PIDs, and it
 fires for root too when root is actually denied. It is emitted once per
 invocation on stderr only (a watch run retains one hint for the whole
 run, never one per tick) and is identical at every verbosity level.
+`inspect --module` errors carry the same refused-open `errno` and fire this hint on `EPERM`/`EACCES`.
 
 The supported path to a complete inventory is re-running as root.
 Capability recipes are best-effort: this project publishes a recipe

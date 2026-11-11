@@ -143,6 +143,46 @@ fn v060_inspect_module_validates() {
     validate_entry(&schema, "module_inventory", &fresh.stdout, true);
     let doc: serde_json::Value = serde_json::from_slice(&fresh.stdout).unwrap();
     assert!(doc["modules"][0].get("file_soname").is_some());
+    // T6b: error records always carry the `errno` key —
+    // integer-or-null per the schema. A missing path preserves its
+    // open errno (never IO text) yet must NOT fire the privilege
+    // hint (non-permission errno); a directory (non-regular, no
+    // open failure) renders null.
+    let missing = bin()
+        .args([
+            "inspect",
+            "--module",
+            "/PRIVATE_CANARY_missing_t6b",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(4));
+    validate_entry(&schema, "module_inventory", &missing.stdout, true);
+    let missing_doc: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
+    let missing_err = &missing_doc["errors"][0];
+    assert_eq!(missing_err["reason"], "unavailable");
+    assert!(
+        missing_err.get("errno").is_some_and(|e| e.is_i64()),
+        "missing path must carry integer errno: {missing_err}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&missing.stderr).contains("re-run as root"),
+        "non-permission errno must not fire the hint"
+    );
+    let dir = bin()
+        .args(["inspect", "--module", env!("CARGO_MANIFEST_DIR"), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(dir.status.code(), Some(4));
+    validate_entry(&schema, "module_inventory", &dir.stdout, true);
+    let dir_doc: serde_json::Value = serde_json::from_slice(&dir.stdout).unwrap();
+    let dir_err = &dir_doc["errors"][0];
+    assert_eq!(dir_err["reason"], "non_regular");
+    assert!(
+        dir_err.get("errno").is_some_and(|e| e.is_null()),
+        "non-open failure must render null errno: {dir_err}"
+    );
 }
 
 #[test]
