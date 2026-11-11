@@ -84,6 +84,10 @@ struct Check {
     status: Status,
     message: String,
     remediation: Option<String>,
+    /// Human-only message override (T4 full-hash sweep): when set,
+    /// human renderers show this while [`Check::json`] keeps the
+    /// full `message`. Machine bytes never see this field.
+    human_message: Option<String>,
 }
 
 impl Check {
@@ -93,6 +97,7 @@ impl Check {
             status: Status::Pass,
             message,
             remediation: None,
+            human_message: None,
         }
     }
     fn fail(id: &'static str, message: String, remediation: String) -> Self {
@@ -101,6 +106,7 @@ impl Check {
             status: Status::Fail,
             message,
             remediation: Some(remediation),
+            human_message: None,
         }
     }
     fn degraded(id: &'static str, message: String, remediation: String) -> Self {
@@ -109,6 +115,7 @@ impl Check {
             status: Status::Degraded,
             message,
             remediation: Some(remediation),
+            human_message: None,
         }
     }
     fn info(id: &'static str, message: String) -> Self {
@@ -117,7 +124,19 @@ impl Check {
             status: Status::Info,
             message,
             remediation: None,
+            human_message: None,
         }
+    }
+    /// Attach a human-only rendering of the message; [`Check::json`]
+    /// keeps the original untouched.
+    fn with_human_message(mut self, message: String) -> Self {
+        self.human_message = Some(message);
+        self
+    }
+    /// The message human renderers print: the override when the
+    /// producing site set one, else the shared message verbatim.
+    fn display_message(&self) -> &str {
+        self.human_message.as_deref().unwrap_or(&self.message)
     }
     fn json(&self) -> serde_json::Value {
         let mut v = serde_json::json!({
@@ -135,6 +154,14 @@ impl Check {
         v["section"] = section.as_str().into();
         v
     }
+}
+
+/// Short hash for human doctor rows: first 12 sha256 hex chars —
+/// the [`crate::inventory::resolve::TerminalPathWriter::short_sha`]
+/// convention shared with discovery rows. Machine [`Check::json`]
+/// keeps the full hash.
+fn short_digest(digest: &crate::package::records::Digest) -> String {
+    crate::inventory::resolve::TerminalPathWriter::short_sha(&digest.to_string()).to_string()
 }
 
 /// Sectioned human rendering: fixed section order, a header per non-empty
@@ -164,7 +191,7 @@ fn render_doctor_human(
                 Status::Degraded => "degraded",
                 Status::Info => "info",
             };
-            s.push_str(&format!("[{tag}] {}: {}\n", c.id, c.message));
+            s.push_str(&format!("[{tag}] {}: {}\n", c.id, c.display_message()));
             if let Some(r) = &c.remediation {
                 s.push_str(&format!("  remediate: {r}\n"));
             }
@@ -3080,10 +3107,17 @@ fn run_admitted_doctor(
         (crate::package::records::Role::Members, "objects-members"),
     ] {
         if let Some(snapshot) = admitted.role(role) {
-            self_checks.push(Check::pass(
-                id,
-                format!("{} sha256={}", snapshot.locator.display(), snapshot.sha256),
-            ));
+            self_checks.push(
+                Check::pass(
+                    id,
+                    format!("{} sha256={}", snapshot.locator.display(), snapshot.sha256),
+                )
+                .with_human_message(format!(
+                    "{} sha256={}",
+                    snapshot.locator.display(),
+                    short_digest(&snapshot.sha256),
+                )),
+            );
         } else {
             self_checks.push(Check::info(id, "not selected: explicit pair only".into()));
         }
@@ -3436,6 +3470,35 @@ mod tests {
         assert_eq!(json[0]["section"], "self_attach");
         assert_eq!(json[0]["id"], "caps");
         assert_eq!(json[1]["section"], "foreign_backing");
+    }
+
+    #[test]
+    fn human_check_messages_carry_short_hashes_while_json_keeps_full() {
+        // T4 sweep: machine needs the full hash, human needs short —
+        // the split keeps `message` (JSON) intact and overrides only
+        // the human rendering.
+        let full = "a".repeat(64);
+        let short = full[..12].to_string();
+        let check = Check::pass(
+            "count-object",
+            format!("Count role/ABI compatible; sha256={full}"),
+        )
+        .with_human_message(format!("Count role/ABI compatible; sha256={short}"));
+        assert_eq!(
+            check.json()["message"],
+            serde_json::Value::String(format!("Count role/ABI compatible; sha256={full}")),
+        );
+        assert_eq!(
+            check.display_message(),
+            format!("Count role/ABI compatible; sha256={short}"),
+        );
+        let sections = [(DoctorSection::SelfAttach, vec![check])];
+        let human = render_doctor_human(&sections, None);
+        assert!(!human.contains(&full), "{human}");
+        assert!(human.contains(&short), "{human}");
+        // Checks without an override render the message verbatim.
+        let plain = Check::pass("x", "no hash here".to_string());
+        assert_eq!(plain.display_message(), "no hash here");
     }
 
     // Scoped substitutes sit before the actual native probe operations. They

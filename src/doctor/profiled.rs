@@ -105,16 +105,20 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
         args.count_object.as_deref(),
     ) {
         Ok(count) => {
-            checks.push(Check::pass(
-                "count-object",
-                format!(
+            let digest = Digest(count.object_sha256);
+            checks.push(
+                Check::pass(
+                    "count-object",
+                    format!("Count role/ABI compatible; sha256={digest}"),
+                )
+                .with_human_message(format!(
                     "Count role/ABI compatible; sha256={}",
-                    Digest(count.object_sha256)
-                ),
-            ));
+                    super::short_digest(&digest),
+                )),
+            );
             Some(PackageRoleProvenance {
                 selection: count.selection,
-                sha256: Digest(count.object_sha256),
+                sha256: digest,
                 bytes: count.object_bytes.len() as u64,
                 build_input_id: None,
             })
@@ -156,7 +160,7 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
                 "[{}] {}: {}",
                 check.status.as_str(),
                 check.id,
-                check.message
+                check.display_message()
             );
             if let Some(remediation) = &check.remediation {
                 println!("  remediate: {remediation}");
