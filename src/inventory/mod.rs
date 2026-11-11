@@ -179,6 +179,20 @@ pub enum ObjectKind {
     Other,
 }
 
+impl ObjectKind {
+    /// Display word for human module rows. Mirrors the serde
+    /// snake_case label exactly (proven by
+    /// `cli::tests::object_kind_words_match_json`).
+    pub fn word(&self) -> &'static str {
+        match self {
+            ObjectKind::OpenSslCompatible => "openssl_compatible",
+            ObjectKind::ProviderModule => "provider_module",
+            ObjectKind::OpenSslConsumer => "openssl_consumer",
+            ObjectKind::Other => "other",
+        }
+    }
+}
+
 /// Finite failure labels: underlying IO/parser messages never escape.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -439,6 +453,12 @@ pub struct ProcessRecord {
     pub comm: Option<String>,
     #[serde(default)]
     pub comm_status: IdentityAvailability,
+    /// Sampled `/proc/PID/exe` spelling. Verbatim-lossy UTF-8 in
+    /// JSON (lossy decode only — unlike `comm`, acquisition applies
+    /// no display sanitization), so every human renderer MUST pass
+    /// BOTH `comm` and `exe` through
+    /// `crate::report::safe_display` at the human boundary (v0.6.0
+    /// machine T4 parked minor); never render raw.
     #[serde(default)]
     pub exe: Option<String>,
     #[serde(default)]

@@ -6708,3 +6708,42 @@ fn r33_strict_v24_reader_rejects_only_new_vocabulary() {
     assert_eq!(error.path, "$.membership");
     assert!(error.message.contains("forbidden"), "{error}");
 }
+
+#[test]
+fn v060_human_default_is_rows_and_json_is_pure() {
+    let me = std::process::id().to_string();
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let human = std::process::Command::new(bin)
+        .args(["scan", "--pid", &me])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&human.stdout);
+    assert!(out.contains("Passive inventory:"), "MEANING missing");
+    assert!(out.contains(&format!("pid={me}")), "no per-process verdict");
+    assert!(
+        !out.contains("\"schema_version\""),
+        "JSON dump in human mode"
+    );
+    assert!(
+        out.lines().count() < 60,
+        "human output too long: {}",
+        out.lines().count()
+    );
+    assert!(!has_64_hex(&out), "full hash in human output");
+    let json = std::process::Command::new(bin)
+        .args(["scan", "--pid", &me, "--json"])
+        .output()
+        .unwrap();
+    let jout = String::from_utf8_lossy(&json.stdout);
+    assert!(
+        !jout.contains("Passive inventory:"),
+        "preamble in --json stdout"
+    );
+    let _: serde_json::Value = serde_json::from_str(&jout).unwrap();
+}
+
+fn has_64_hex(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 64
+        && (0..=bytes.len() - 64).any(|i| bytes[i..i + 64].iter().all(|b| b.is_ascii_hexdigit()))
+}

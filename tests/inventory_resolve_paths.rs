@@ -82,9 +82,16 @@ fn stdout_text(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).replace('\r', "")
 }
 
+/// Human module rows (v0.6.0 P0-3 shape `  {kind} sha256=…`): the
+/// only human lines carrying `sha256=` (verdict/MEANING/totals
+/// lines never do; JSON spells the key `"sha256":`).
+fn module_rows(text: &str) -> Vec<&str> {
+    text.lines().filter(|l| l.contains("sha256=")).collect()
+}
+
 struct Sleeper(Child);
 impl Sleeper {
-    /// Plain sleeper (no OpenSSL mappings — no Object rows).
+    /// Plain sleeper (no OpenSSL mappings — no module rows).
     fn spawn() -> Self {
         Self(
             Command::new("sleep")
@@ -96,7 +103,7 @@ impl Sleeper {
                 .unwrap(),
         )
     }
-    /// Sleeper with libssl/libcrypto mapped (Object rows expected).
+    /// Sleeper with libssl/libcrypto mapped (module rows expected).
     fn spawn_tls() -> Self {
         Self(
             Command::new("python3")
@@ -142,7 +149,7 @@ fn cell2_chain_resolves_canonical_machine_bytes_identical() {
     ]);
     let text = stdout_text(&out);
     assert!(out.status.success(), "{text}");
-    let row: Vec<&str> = text.lines().filter(|l| l.starts_with("Module ")).collect();
+    let row = module_rows(&text);
     assert_eq!(row.len(), 1, "{text}");
     assert!(
         row[0].contains(&format!("path={}", real.display())),
@@ -174,11 +181,11 @@ fn cell2_chain_resolves_canonical_machine_bytes_identical() {
 }
 
 /// Cell 5: flag absent → no `path=` fragment anywhere (human or
-/// JSON); the module route's human JSON tail is byte-identical to
-/// its `--json` bytes (F5c — the route carries no timestamps, so
-/// this is an exact pre-change golden comparison); existing golden
-/// suites pin the remaining routes' bytes. No-I/O leg is the unit
-/// cell `writer_gates_flag_terminal_and_status_without_io`.
+/// JSON). v0.6.0 P0-3 stdout split: the module route's human bytes
+/// carry rows, never the JSON document (the old human-tail-equals-
+/// `--json` comparison is retired with the mixed output); existing
+/// golden suites pin the remaining routes' bytes. No-I/O leg is the
+/// unit cell `writer_gates_flag_terminal_and_status_without_io`.
 #[test]
 fn cell5_flag_absent_omits_fragments() {
     let dir = scratch("cell5");
@@ -191,18 +198,16 @@ fn cell5_flag_absent_omits_fragments() {
         assert!(!stdout_text(&out).contains("path="), "{args:?}");
         assert!(!stdout_text(&out).contains("real.so"), "{args:?}");
     }
-    // Human tail (from the first `{`) equals `--json` bytes exactly.
+    // Human bytes: MEANING + module rows + error counts, no JSON.
     let human = bin()
         .args(["inspect", "--module", real.to_str().unwrap()])
         .output()
         .unwrap();
-    let machine = bin()
-        .args(["inspect", "--module", real.to_str().unwrap(), "--json"])
-        .output()
-        .unwrap();
     let human_text = stdout_text(&human);
-    let tail = &human_text[human_text.find('{').unwrap()..];
-    assert_eq!(tail.as_bytes(), machine.stdout.as_slice());
+    assert!(human_text.contains("Passive inventory:"), "{human_text}");
+    assert_eq!(module_rows(&human_text).len(), 1, "{human_text}");
+    assert!(human_text.contains("errors: 0"), "{human_text}");
+    assert!(!human_text.contains("\"schema_version\""), "{human_text}");
 }
 
 /// Cell 6 as amended by v0.6.0 D1 (never-in-JSON gate rejected):
@@ -371,7 +376,7 @@ fn cell4_proc_magic_suppresses_plain_proc_resolves() {
     ]);
     let text = stdout_text(&out);
     assert!(out.status.success(), "{text}");
-    let row: Vec<&str> = text.lines().filter(|l| l.starts_with("Module ")).collect();
+    let row = module_rows(&text);
     assert_eq!(row.len(), 1, "{text}");
     assert!(row[0].contains("path=(unavailable)"), "{}", row[0]);
     assert!(!text.contains("/proc/"), "{text}");
@@ -389,7 +394,7 @@ fn cell4_proc_magic_suppresses_plain_proc_resolves() {
         "--resolve-paths",
     ]);
     let text = stdout_text(&out);
-    let row: Vec<&str> = text.lines().filter(|l| l.starts_with("Module ")).collect();
+    let row = module_rows(&text);
     assert_eq!(row.len(), 1, "{text}");
     assert!(
         row[0].contains(&format!("path={}", real.display())),
@@ -433,7 +438,7 @@ fn cell8_hostile_filename_sanitized_on_tty() {
     ]);
     let raw = String::from_utf8_lossy(&out.stdout).replace('\r', "");
     assert!(!raw.contains('\u{1b}'), "{raw:?}");
-    let row: Vec<&str> = raw.lines().filter(|l| l.starts_with("Module ")).collect();
+    let row = module_rows(&raw);
     assert_eq!(row.len(), 1, "{raw}");
     assert!(row[0].contains('…'), "{}", row[0]);
     assert!(!row[0].contains('\u{202e}'), "{}", row[0]);
@@ -457,8 +462,7 @@ fn cell9_all_routes_render_tty_fragments() {
     ]);
     let text = stdout_text(&out);
     assert!(
-        text.lines()
-            .any(|l| l.starts_with("Module ") && l.contains("path=")),
+        module_rows(&text).iter().any(|l| l.contains("path=")),
         "{text}"
     );
 
@@ -475,7 +479,7 @@ fn cell9_all_routes_render_tty_fragments() {
         "--resolve-paths",
     ]);
     let text = stdout_text(&out);
-    let objects: Vec<&str> = text.lines().filter(|l| l.starts_with("Object ")).collect();
+    let objects = module_rows(&text);
     assert!(!objects.is_empty(), "{text}");
     assert!(objects.iter().all(|l| l.contains("path=")), "{text}");
 
@@ -488,7 +492,7 @@ fn cell9_all_routes_render_tty_fragments() {
         "--resolve-paths",
     ]);
     let text = stdout_text(&out);
-    let objects: Vec<&str> = text.lines().filter(|l| l.starts_with("Object ")).collect();
+    let objects = module_rows(&text);
     assert!(!objects.is_empty(), "{text}");
     assert!(objects.iter().all(|l| l.contains("path=")), "{text}");
 
@@ -553,9 +557,13 @@ fn cell1_tty_paths_canonical_or_placeholder() {
     ]);
     let text = stdout_text(&out);
     let mut rows = 0;
-    for line in text.lines().filter(|l| l.starts_with("Object ")) {
+    for line in module_rows(&text) {
         rows += 1;
-        let value = line.rsplit("path=").next().unwrap();
+        // Rows end `path={value} version={…}` with version= last,
+        // so the trailing split isolates the path value (these
+        // system-lib paths never embed " version=").
+        let head = line.rsplit_once(" version=").unwrap().0;
+        let value = head.rsplit_once("path=").unwrap().1;
         if value.starts_with('(') {
             assert!(value.ends_with(')'), "{line}");
         } else {
@@ -574,8 +582,8 @@ fn cell1_tty_paths_canonical_or_placeholder() {
 /// External F3: under FD pressure the flag cannot change machine
 /// records or exit status. 40 distinct modules with RLIMIT_NOFILE=64:
 /// the machine loop stages no resolve state at all (deferred
-/// materialization), so the JSON tails and exits are identical with
-/// the flag on vs off — on a TTY (acquisition active) and piped.
+/// materialization), so the `--json` bytes and exits are identical
+/// with the flag on vs off — on a TTY (acquisition active) and piped.
 /// (Pre-fix inline staging retained 40 extra dups mid-loop and
 /// degraded the flagged run under this limit.)
 #[test]
@@ -607,11 +615,14 @@ fn f3_fd_pressure_leaves_machine_records_identical() {
                 .unwrap()
         }
     }
-    fn argv(binary: &str, modules: &[String], flag: bool) -> Vec<String> {
+    fn argv(binary: &str, modules: &[String], flag: bool, json: bool) -> Vec<String> {
         let mut argv = vec![format!("'{binary}'"), "'inspect'".to_string()];
         for module in modules {
             argv.push("'--module'".to_string());
             argv.push(format!("'{module}'"));
+        }
+        if json {
+            argv.push("'--json'".to_string());
         }
         if flag {
             argv.push("'--resolve-paths'".to_string());
@@ -620,23 +631,20 @@ fn f3_fd_pressure_leaves_machine_records_identical() {
     }
     // Shell-quote check: single-quote wrap (no quotes in tmp paths).
     let binary = env!("CARGO_BIN_EXE_osslscope");
-    let off = limited(&argv(binary, &modules, false));
-    let on = limited(&argv(binary, &modules, true));
+    // Machine bytes identical with the flag on vs off (the module
+    // route carries no timestamps, so this is an exact comparison;
+    // v0.6.0 P0-3 split the JSON out of human bytes, hence `--json`).
+    let off = limited(&argv(binary, &modules, false, true));
+    let on = limited(&argv(binary, &modules, true, true));
     assert_eq!(off.status, on.status);
-    // Compare machine tails (pretty JSON from the first `{`).
-    fn tail(text: &str) -> &str {
-        &text[text.find('{').unwrap()..]
-    }
-    let off_text = stdout_text(&off);
-    let on_text = stdout_text(&on);
-    assert_eq!(tail(&off_text), tail(&on_text));
+    assert_eq!(stdout_text(&off), stdout_text(&on));
     // And the flagged run still rendered its rows (placeholders or
     // paths — acquisition ran, machine output didn't move).
+    let human = limited(&argv(binary, &modules, true, false));
+    let human_text = stdout_text(&human);
     assert!(
-        on_text
-            .lines()
-            .any(|l| l.starts_with("Module ") && l.contains("path=")),
-        "{on_text}"
+        module_rows(&human_text).iter().any(|l| l.contains("path=")),
+        "{human_text}"
     );
 }
 

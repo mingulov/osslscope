@@ -70,6 +70,11 @@ const MAX_CHASE_STEPS: usize = 1024;
 /// Display bound (rule 7): at most 200 chars, truncation marks `…`.
 const DISPLAY_BOUND: usize = 200;
 
+/// Human maps-hint bound (v0.6.0 P0-3): the whole
+/// `(unverified maps hint: …)` fragment fits 80 chars, truncation
+/// marks `…`.
+const HUMAN_MAPS_HINT_CHARS: usize = 80;
+
 /// Dedicated resolve-staging byte budget per acquisition
 /// (external F3): retained locator bytes + row overhead charge
 /// here, never the shared record pools — the flag cannot change
@@ -1108,55 +1113,111 @@ impl<'a> TerminalPathWriter<'a> {
         path_value(self.sidecar.lookup(identity))
     }
 
-    /// Short identity key for TTY rows: first 12 sha256 hex chars.
-    fn short_sha(sha256: &str) -> &str {
+    /// Short identity key for human rows: first 12 sha256 hex
+    /// chars. A label, never a map key (full sha256 is
+    /// machine-only).
+    pub(crate) fn short_sha(sha256: &str) -> &str {
         sha256.get(..12).unwrap_or(sha256)
     }
 
-    /// Discovery preamble object rows (one per module, deterministic
-    /// snapshot order). Empty unless the flag is on.
-    pub(crate) fn object_rows(&self, processes: &[ProcessRecord]) -> Vec<String> {
-        if !self.flag {
-            return Vec::new();
+    /// Human `path=` value for one discovery row (v0.6.0 P0-3):
+    /// TTY + flag rows keep the live [`TerminalPathWriter::fragment`]
+    /// rules (constrained re-resolution, `(unverified)` for
+    /// candidates); every other row shows D1 machine evidence —
+    /// `verified_path.path` (sanitized for display), else the
+    /// explicitly-unverified maps hint (80 chars), else
+    /// `(unavailable)`. Piped rows never render `(not-a-terminal)`.
+    fn human_path(&self, module: &super::ModuleRecord) -> String {
+        if self.flag && self.terminal {
+            return self
+                .fragment(
+                    module.identity_status,
+                    (module.info.device, module.info.inode),
+                )
+                .unwrap_or_else(|| UNAVAILABLE.to_string());
         }
+        if let Some(verified) = module.verified_path.as_ref() {
+            return crate::report::safe_display(&verified.path);
+        }
+        if let Some(hint) = module.maps_spelling.as_ref() {
+            let spelling = crate::report::safe_display(&hint.spelling);
+            let full = format!("(unverified maps hint: {spelling})");
+            if full.chars().count() <= HUMAN_MAPS_HINT_CHARS {
+                return full;
+            }
+            let mut cut: String = full.chars().take(HUMAN_MAPS_HINT_CHARS - 1).collect();
+            cut.push('…');
+            return cut;
+        }
+        UNAVAILABLE.to_string()
+    }
+
+    /// Human `version=` value for one row: validated file version
+    /// evidence first, SONAME second, `none` when neither exists.
+    /// Both inputs are ELF-derived bytes, so both sanitize at this
+    /// human boundary. File evidence only, never a runtime claim.
+    fn human_version(info: &ModuleInfo) -> String {
+        info.file_openssl_version
+            .as_deref()
+            .or(info.file_soname.as_deref())
+            .map(crate::report::safe_display)
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    /// Human identity word for one discovery row. Deliberately
+    /// hyphenated (`locator-candidate`); the serde machine spelling
+    /// keeps its underscore (`locator_candidate`).
+    fn human_identity(status: IdentityStatus) -> &'static str {
+        match status {
+            IdentityStatus::Verified => "verified",
+            IdentityStatus::LocatorCandidate => "locator-candidate",
+        }
+    }
+
+    /// Discovery human module rows (v0.6.0 P0-3, one per module,
+    /// deterministic snapshot order). Rows ALWAYS render — the flag
+    /// gates only live TTY re-resolution inside `path=`, never the
+    /// row itself.
+    pub(crate) fn object_rows(&self, processes: &[ProcessRecord]) -> Vec<String> {
         let mut rows = Vec::new();
         for process in processes {
             for module in &process.modules {
-                // Flag is on, so the fragment always renders.
-                let path = self
-                    .fragment(
-                        module.identity_status,
-                        (module.info.device, module.info.inode),
-                    )
-                    .unwrap_or_else(|| UNAVAILABLE.to_string());
                 rows.push(format!(
-                    "Object pid={} sha256={} identity={:?} path={}",
-                    process.pid,
+                    "  {} sha256={} identity={} size={} path={} version={}",
+                    module.info.kind.word(),
                     Self::short_sha(&module.info.sha256),
-                    module.identity_status,
-                    path
+                    Self::human_identity(module.identity_status),
+                    module.info.size_bytes,
+                    self.human_path(module),
+                    Self::human_version(&module.info),
                 ));
             }
         }
         rows
     }
 
-    /// `--module`-route object rows. Empty unless the flag is on.
+    /// `--module`-route human rows (v0.6.0 P0-3). Operator-observed
+    /// rows carry no identity word (eligibility was established at
+    /// the acquisition site) and no machine path evidence exists on
+    /// this route, so `path=` renders only under the flag
+    /// ([`TerminalPathWriter::fragment_module`] rules, including the
+    /// piped `(not-a-terminal)` placeholder) and is omitted without
+    /// it — flag-absent output carries no `path=` anywhere.
     pub(crate) fn module_rows(&self, modules: &[ModuleInfo]) -> Vec<String> {
-        if !self.flag {
-            return Vec::new();
-        }
         modules
             .iter()
             .map(|module| {
-                let path = self
-                    .fragment_module((module.device, module.inode))
-                    .unwrap_or_else(|| UNAVAILABLE.to_string());
-                format!(
-                    "Module sha256={} path={}",
+                let mut row = format!(
+                    "  {} sha256={} size={}",
+                    module.kind.word(),
                     Self::short_sha(&module.sha256),
-                    path
-                )
+                    module.size_bytes,
+                );
+                if let Some(path) = self.fragment_module((module.device, module.inode)) {
+                    row.push_str(&format!(" path={path}"));
+                }
+                row.push_str(&format!(" version={}", Self::human_version(module)));
+                row
             })
             .collect()
     }
@@ -1931,19 +1992,165 @@ mod tests {
         }];
         let rows = writer.object_rows(&processes);
         assert_eq!(rows.len(), 2);
+        // v0.6.0 P0-3 shape: kind word, 12-hex label, hyphenated
+        // identity, size, path, file version evidence.
         assert!(
-            rows[0].starts_with("Object pid=4242 sha256=0123456789ab identity=Verified path="),
+            rows[0].starts_with("  other sha256=0123456789ab identity=verified size=0 path="),
             "{}",
             rows[0]
         );
-        assert!(rows[0].ends_with("real.so"), "{}", rows[0]);
+        assert!(rows[0].contains("real.so"), "{}", rows[0]);
+        assert!(rows[0].ends_with("version=none"), "{}", rows[0]);
         assert_eq!(
             rows[1],
-            "Object pid=4242 sha256=0123456789ab identity=LocatorCandidate path=(unverified)"
+            "  other sha256=0123456789ab identity=locator-candidate size=0 path=(unverified) version=none"
         );
-        // Flag-off: no rows at all (preamble byte-identical).
+        // Flag-off: rows still render (the flag gates only live TTY
+        // re-resolution); with no machine evidence the path is
+        // honestly unavailable.
         let writer = TerminalPathWriter::new(false, true, &sidecar);
-        assert!(writer.object_rows(&processes).is_empty());
+        let rows = writer.object_rows(&processes);
+        assert_eq!(rows.len(), 2);
+        assert!(
+            rows[0].ends_with("path=(unavailable) version=none"),
+            "{}",
+            rows[0]
+        );
+    }
+
+    #[test]
+    fn writer_rows_show_machine_evidence_off_terminal() {
+        use crate::inventory::{
+            IdentityAvailability, IdentityStatus, LocatorKind, MapsSource, MapsSpelling,
+            MapsVerification, PathEncoding, ProcessRecord, VerifiedPath,
+        };
+        let sidecar = ResolveSidecar::default();
+        // Piped even with the flag: machine verified_path wins over
+        // the old (not-a-terminal) placeholder (v0.6.0 D1).
+        let mut verified = writer_module_record(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            (8, 100),
+            IdentityStatus::Verified,
+        );
+        verified.verified_path = Some(VerifiedPath {
+            path: "/usr/lib/libcrypto.so.3".to_string(),
+            path_encoding: PathEncoding::Utf8,
+            locator_kind: LocatorKind::HostDirect,
+            capture_unix_ms: None,
+        });
+        verified.maps_spelling = Some(MapsSpelling {
+            spelling: "/usr/lib/libcrypto.so.3".to_string(),
+            source: MapsSource::ProcMaps,
+            verification: MapsVerification::Unverified,
+        });
+        verified.info.file_openssl_version = Some("OpenSSL 3.5.1".to_string());
+        let mut candidate = writer_module_record("ab", (8, 200), IdentityStatus::LocatorCandidate);
+        candidate.maps_spelling = Some(MapsSpelling {
+            spelling: "/memfd:jit (deleted)".to_string(),
+            source: MapsSource::ProcMaps,
+            verification: MapsVerification::Unverified,
+        });
+        candidate.info.file_soname = Some("libfoo.so.1".to_string());
+        let mut bare = writer_module_record("cd", (8, 300), IdentityStatus::LocatorCandidate);
+        bare.info.file_soname = Some("lib\x07bar.so".to_string());
+        let processes = vec![ProcessRecord {
+            interval: crate::inventory::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            },
+            namespaces: crate::inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+            pid: 4242,
+            starttime: 7,
+            comm: None,
+            comm_status: IdentityAvailability::Unreadable,
+            exe: None,
+            exe_status: IdentityAvailability::Unreadable,
+            modules: vec![verified, candidate, bare],
+            provider_activation: crate::inventory::ObservationState::Unknown,
+            provider_interfaces: crate::inventory::ObservationState::Unknown,
+            execution: crate::inventory::ObservationState::NotObserved,
+        }];
+        for (flag, terminal) in [(true, false), (false, false), (false, true)] {
+            let writer = TerminalPathWriter::new(flag, terminal, &sidecar);
+            let rows = writer.object_rows(&processes);
+            assert_eq!(rows.len(), 3, "flag={flag} terminal={terminal}");
+            assert_eq!(
+                rows[0],
+                "  other sha256=0123456789ab identity=verified size=0 path=/usr/lib/libcrypto.so.3 version=OpenSSL 3.5.1",
+                "flag={flag} terminal={terminal}"
+            );
+            assert_eq!(
+                rows[1],
+                "  other sha256=ab identity=locator-candidate size=0 path=(unverified maps hint: /memfd:jit (deleted)) version=libfoo.so.1",
+                "flag={flag} terminal={terminal}"
+            );
+            // No evidence at all: unavailable path, sanitized SONAME.
+            assert_eq!(
+                rows[2],
+                "  other sha256=cd identity=locator-candidate size=0 path=(unavailable) version=lib?bar.so",
+                "flag={flag} terminal={terminal}"
+            );
+        }
+        // Overlong maps hints truncate to 80 chars, marked.
+        let mut long = writer_module_record("ef", (8, 400), IdentityStatus::LocatorCandidate);
+        long.maps_spelling = Some(MapsSpelling {
+            spelling: format!("/{}", "s".repeat(200)),
+            source: MapsSource::ProcMaps,
+            verification: MapsVerification::Unverified,
+        });
+        let mut one = processes.clone();
+        one[0].modules = vec![long];
+        let writer = TerminalPathWriter::new(false, false, &sidecar);
+        let rows = writer.object_rows(&one);
+        let path = rows[0]
+            .split_once("path=")
+            .unwrap()
+            .1
+            .strip_suffix(" version=none")
+            .unwrap();
+        assert_eq!(path.chars().count(), 80, "{path}");
+        assert!(path.ends_with('…'), "{path}");
+        assert!(path.starts_with("(unverified maps hint: /sss"), "{path}");
+    }
+
+    #[test]
+    fn writer_module_rows_omit_path_without_flag() {
+        use crate::inventory::{Architecture, FileVersionStatus, ModuleInfo, ObjectKind};
+        let sidecar = ResolveSidecar::default();
+        let module = ModuleInfo {
+            sha256: "0123456789abcdef".to_string(),
+            device: 8,
+            inode: 100,
+            size_bytes: 4096,
+            architecture: Architecture::X86_64,
+            kind: ObjectKind::Other,
+            exports: Vec::new(),
+            depends_on_libcrypto: false,
+            depends_on_libssl: false,
+            file_soname: Some("libfoo.so.1".to_string()),
+            file_openssl_version: None,
+            file_version_status: FileVersionStatus::Absent,
+        };
+        // Flag-absent: rows render with no path= anywhere (cell 5).
+        let writer = TerminalPathWriter::new(false, true, &sidecar);
+        assert_eq!(
+            writer.module_rows(std::slice::from_ref(&module)),
+            vec!["  other sha256=0123456789ab size=4096 version=libfoo.so.1".to_string()]
+        );
+        // Piped with the flag: the module route has no machine path
+        // evidence, so the historical placeholder stands.
+        let writer = TerminalPathWriter::new(true, false, &sidecar);
+        assert_eq!(
+            writer.module_rows(std::slice::from_ref(&module)),
+            vec![
+                "  other sha256=0123456789ab size=4096 path=(not-a-terminal) version=libfoo.so.1"
+                    .to_string()
+            ]
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Passive inventory commands. User supplied strings never enter diagnostics.
 use super::{
-    Capabilities, GapReason, InventoryState, Limits, ModuleInfo, ObservationState, SnapshotOptions,
-    SnapshotPreamble, WorkTotals, elf, snapshot,
+    Capabilities, Gap, GapReason, IdentityAvailability, InventoryState, Limits, ModuleInfo,
+    ObservationState, ProcessRecord, Snapshot, SnapshotOptions, WorkTotals, elf, snapshot,
 };
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -394,53 +394,157 @@ fn inventory_exit_reason(state: InventoryState, reasons: &[GapReason]) -> Option
         "osslscope discovery: inventory {state_word}: {detail} ({count}; see records above)"
     ))
 }
-/// Human identity summary: verified-vs-locator module counts plus
-/// the verified share (P1-human-counts). JSON mode never sees it.
-fn identity_line(verified: usize, locator: usize) -> String {
-    super::identity_totals_line(verified, locator)
+/// Human `comm=` value for one verdict line: the sampled name
+/// sanitized at this human boundary, `-` whenever the sample is
+/// anything but a present `Available` value. Null/missing renders
+/// the placeholder, never crashes.
+fn human_comm(process: &ProcessRecord) -> String {
+    if process.comm_status == IdentityAvailability::Available {
+        let shown = process
+            .comm
+            .as_deref()
+            .map(crate::report::safe_display)
+            .unwrap_or_default();
+        if !shown.is_empty() {
+            return shown;
+        }
+    }
+    "-".to_string()
 }
 
-/// Coalesced gap block: one line per (reason, device, pid) group
-/// with exact counters (P1-coalesce, display-only). Empty when the
-/// snapshot carries no gaps.
-fn gap_block(groups: &[(GapReason, Option<u64>, Option<u32>, usize)]) -> String {
-    // Delegates to the shared core: groups arrive pre-counted from
-    // coalesce_gaps, so each triple repeats per its count (counts are
-    // small; clarity over micro-efficiency on the human path).
-    super::gap_groups_block(
-        groups.iter().flat_map(|(reason, device, pid, count)| {
-            std::iter::repeat_n((reason.word(), *device, *pid), *count)
-        }),
-        "",
+/// Human `exe=` value for one verdict line: the last two components
+/// of the sampled spelling, sanitized via
+/// [`crate::report::safe_display`] at this human boundary (`exe` is
+/// verbatim-lossy in JSON — machine T4 parked minor). `-` when the
+/// sample never observed anything (`Unreadable`); `unavailable`
+/// when a sample existed but cannot pin a spelling (`Changed`,
+/// `TooLong` — a truncated tail would mislabel — or a missing value
+/// despite `Available`). Null/missing renders a placeholder, never
+/// crashes.
+fn human_exe(process: &ProcessRecord) -> String {
+    if process.exe_status == IdentityAvailability::Available {
+        if let Some(exe) = process.exe.as_deref() {
+            let safe = crate::report::safe_display(exe);
+            let tail: Vec<&str> = safe
+                .split('/')
+                .filter(|c| !c.is_empty())
+                .rev()
+                .take(2)
+                .collect();
+            let short = tail.into_iter().rev().collect::<Vec<_>>().join("/");
+            if !short.is_empty() {
+                return short;
+            }
+        }
+        return "unavailable".to_string();
+    }
+    match process.exe_status {
+        IdentityAvailability::Unreadable => "-".to_string(),
+        _ => "unavailable".to_string(),
+    }
+}
+
+/// Per-process verdict line: `pid= comm= exe= modules= status=`.
+/// `status` is `complete` iff no gap names this pid (unnamed,
+/// process-wide gaps do not mark any single process partial).
+fn verdict_line(process: &ProcessRecord, gaps: &[Gap]) -> String {
+    let status = if gaps.iter().any(|g| g.pid == Some(process.pid)) {
+        "partial"
+    } else {
+        "complete"
+    };
+    format!(
+        "pid={} comm={} exe={} modules={} status={}",
+        process.pid,
+        human_comm(process),
+        human_exe(process),
+        process.modules.len(),
+        status
     )
 }
 
-fn render(
-    value: &impl Serialize,
-    json: bool,
+/// Exact per-reason counts line (`gaps:` for snapshots, `errors:`
+/// for operator-supplied module lists): reasons sorted by word,
+/// counters exact. The `-v` rerun hint rides the snapshot line only
+/// (Task 2 lands per-object gap detail there; the module route has
+/// no such detail planned, so its line stays hint-free and honest).
+fn counts_line(label: &str, reasons: impl Iterator<Item = GapReason>, rerun_hint: bool) -> String {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut total = 0usize;
+    for reason in reasons {
+        *counts.entry(reason.word()).or_insert(0) += 1;
+        total += 1;
+    }
+    if total == 0 {
+        return format!("{label}: 0\n");
+    }
+    let parts: Vec<String> = counts
+        .iter()
+        .map(|(word, count)| format!("{word}={count}"))
+        .collect();
+    if rerun_hint {
+        format!(
+            "{label}: {total} ({}; rerun with -v for per-object detail)\n",
+            parts.join(" ")
+        )
+    } else {
+        format!("{label}: {total} ({})\n", parts.join(" "))
+    }
+}
+
+/// Human snapshot render (v0.6.0 P0-3): MEANING + per-process
+/// verdict lines with their module rows + identity totals + exact
+/// per-reason gap counts (+ the blindness line when conclusive).
+/// Never emits JSON bytes. `verbosity` arrives in Task 2 (`-v` adds
+/// grouped gaps/exports/full state, `-vv` per-object records/safe
+/// counters); Task 1 renders level 0 for every input.
+pub(crate) fn human_snapshot(
     writer: &mut impl Write,
-    preamble: Option<&SnapshotPreamble>,
-    object_rows: &[String],
+    snapshot: &Snapshot,
+    paths: &super::resolve::TerminalPathWriter,
+    verbosity: u8,
 ) -> io::Result<()> {
-    if !json {
-        writer.write_all(MEANING.as_bytes())?;
-        // Snapshot paths pass their preamble; operator-supplied
-        // module lists (inspect --module) have no process binding
-        // to verify, so they pass None and omit the block.
-        if let Some(pre) = preamble {
-            let (verified, locator) = pre.identity;
-            writer.write_all(identity_line(verified, locator).as_bytes())?;
-            writer.write_all(gap_block(&pre.gap_groups).as_bytes())?;
-            if pre.conclusively_without_openssl {
-                writer.write_all(super::blindness_line().as_bytes())?;
-            }
-        }
-        // T5 `--resolve-paths` object rows (TTY-only writer output;
-        // empty unless the flag is on — preamble byte-identical).
-        for row in object_rows {
+    // Task 2 owns levels 1+: clamped here so a future caller can
+    // never observe an unclamped level.
+    let _level = verbosity.min(2);
+    writer.write_all(MEANING.as_bytes())?;
+    for process in &snapshot.processes {
+        writeln!(writer, "{}", verdict_line(process, &snapshot.gaps))?;
+        for row in paths.object_rows(std::slice::from_ref(process)) {
             writeln!(writer, "{row}")?;
         }
     }
+    let (verified, locator) = snapshot.identity_counts();
+    writer.write_all(super::identity_totals_line(verified, locator).as_bytes())?;
+    writer
+        .write_all(counts_line("gaps", snapshot.gaps.iter().map(|g| g.reason), true).as_bytes())?;
+    if super::snapshot_conclusively_without_openssl(snapshot) {
+        writer.write_all(super::blindness_line().as_bytes())?;
+    }
+    writer.flush()
+}
+
+/// Human render for operator-supplied module lists
+/// (`inspect --module`, v0.6.0 P0-3): MEANING + one row per module
+/// + exact per-reason error counts. Never emits JSON bytes.
+fn human_modules(
+    writer: &mut impl Write,
+    inventory: &ModuleInventory,
+    paths: &super::resolve::TerminalPathWriter,
+) -> io::Result<()> {
+    writer.write_all(MEANING.as_bytes())?;
+    for row in paths.module_rows(&inventory.modules) {
+        writeln!(writer, "{row}")?;
+    }
+    writer.write_all(
+        counts_line("errors", inventory.errors.iter().map(|e| e.reason), false).as_bytes(),
+    )?;
+    writer.flush()
+}
+
+/// Pure machine render: ONLY the JSON document on stdout, no
+/// preamble, no rows (v0.6.0 P0-3 stdout split).
+fn render_json(value: &impl Serialize, writer: &mut impl Write) -> io::Result<()> {
     serde_json::to_writer_pretty(&mut *writer, value).map_err(io::Error::other)?;
     writer.write_all(b"\n")?;
     writer.flush()
@@ -542,14 +646,18 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 }
             };
             let result = scanner.snapshot();
-            let preamble = result.human_preamble();
             let writer = super::resolve::TerminalPathWriter::new(
                 render_paths,
                 output.is_terminal(),
                 &result.resolve,
             );
-            let rows = writer.object_rows(&result.processes);
-            render(&result, options.json, &mut output, Some(&preamble), &rows).map(|()| {
+            // v0.6.0 P0-3 stdout split: rows by default, JSON opt-in.
+            let rendered = if options.json {
+                render_json(&result, &mut output)
+            } else {
+                human_snapshot(&mut output, &result, &writer, 0)
+            };
+            rendered.map(|()| {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
@@ -562,14 +670,18 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 limits: Limits::default(),
                 resolve_paths: acquire,
             });
-            let preamble = result.human_preamble();
             let writer = super::resolve::TerminalPathWriter::new(
                 render_paths,
                 output.is_terminal(),
                 &result.resolve,
             );
-            let rows = writer.object_rows(&result.processes);
-            render(&result, options.json, &mut output, Some(&preamble), &rows).map(|()| {
+            // v0.6.0 P0-3 stdout split: rows by default, JSON opt-in.
+            let rendered = if options.json {
+                render_json(&result, &mut output)
+            } else {
+                human_snapshot(&mut output, &result, &writer, 0)
+            };
+            rendered.map(|()| {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
@@ -583,8 +695,13 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 output.is_terminal(),
                 &result.resolve,
             );
-            let rows = writer.module_rows(&result.modules);
-            render(&result, options.json, &mut output, None, &rows).map(|()| {
+            // v0.6.0 P0-3 stdout split: rows by default, JSON opt-in.
+            let rendered = if options.json {
+                render_json(&result, &mut output)
+            } else {
+                human_modules(&mut output, &result, &writer)
+            };
+            rendered.map(|()| {
                 let reasons: Vec<GapReason> = result.errors.iter().map(|e| e.reason).collect();
                 if let Some(line) = inventory_exit_reason(result.capabilities.inventory, &reasons) {
                     crate::report::err_line(&line);
@@ -696,22 +813,32 @@ mod tests {
             module_with(IdentityStatus::Verified),
             module_with(IdentityStatus::LocatorCandidate),
         ]);
-        let preamble = snap.human_preamble();
+        let paths = super::super::resolve::TerminalPathWriter::new(false, false, &snap.resolve);
         let mut buf = Vec::new();
-        render(&snap, false, &mut buf, Some(&preamble), &[]).unwrap();
+        super::human_snapshot(&mut buf, &snap, &paths, 0).unwrap();
         let out = String::from_utf8(buf).unwrap();
+        // v0.6.0 P0-3 rows-only human bytes: MEANING + verdict +
+        // module rows + identity totals + exact gap counts, no JSON.
+        assert!(out.contains("Passive inventory:"), "{out}");
+        assert!(
+            out.contains("pid=1 comm=- exe=- modules=2 status=complete"),
+            "{out}"
+        );
         assert!(
             out.contains("identity: 1 verified, 1 locator-candidate of 2 modules (50% verified)\n"),
             "{out}"
         );
-        // No gaps: no grouped block.
+        assert!(out.contains("gaps: 0\n"), "{out}");
+        assert!(!out.contains("\"schema_version\""), "{out}");
         assert!(!out.contains("gaps ("), "{out}");
-        // JSON mode carries no preamble at all.
+        // JSON mode carries ONLY the document: no preamble at all.
         let mut buf = Vec::new();
-        render(&snap, true, &mut buf, Some(&preamble), &[]).unwrap();
+        super::render_json(&snap, &mut buf).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(!out.contains("identity: "), "{out}");
         assert!(!out.contains("Passive inventory"), "{out}");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["schema_version"], "osslscope.discovery.v1");
     }
 
     #[test]
@@ -746,6 +873,81 @@ mod tests {
                 "{reason:?}"
             );
         }
+    }
+
+    #[test]
+    fn object_kind_words_match_json() {
+        // Every word mirrors the serde snake_case label exactly.
+        for kind in [
+            ObjectKind::OpenSslCompatible,
+            ObjectKind::ProviderModule,
+            ObjectKind::OpenSslConsumer,
+            ObjectKind::Other,
+        ] {
+            let json = serde_json::to_value(kind).unwrap();
+            assert_eq!(
+                json,
+                serde_json::Value::String(kind.word().into()),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_verdict_pins_identity_placeholders_and_partial() {
+        // exe shortens to its last two components, sanitized; a gap
+        // naming the pid marks it partial.
+        let mut snap = snapshot_with(Vec::new());
+        snap.processes[0].comm = Some("py\x1bthon".to_string());
+        snap.processes[0].comm_status = IdentityAvailability::Available;
+        snap.processes[0].exe = Some("/usr/bin/python3".to_string());
+        snap.processes[0].exe_status = IdentityAvailability::Available;
+        assert_eq!(
+            super::verdict_line(&snap.processes[0], &snap.gaps),
+            "pid=1 comm=py?thon exe=bin/python3 modules=0 status=complete"
+        );
+        snap.gaps.push(Gap {
+            pid: Some(1),
+            device: None,
+            inode: None,
+            reason: GapReason::BackingUnavailable,
+            errno: None,
+            actor_euid: None,
+        });
+        assert!(super::verdict_line(&snap.processes[0], &snap.gaps).ends_with("status=partial"));
+    }
+
+    #[test]
+    fn human_exe_maps_every_status_to_placeholder_or_short() {
+        let mut snap = snapshot_with(Vec::new());
+        let process = &mut snap.processes[0];
+        // Unreadable never observed anything: bare dash.
+        process.exe = None;
+        process.exe_status = IdentityAvailability::Unreadable;
+        assert_eq!(super::human_exe(process), "-");
+        // Changed/TooLong observed something unpinnable: unavailable
+        // (a truncated tail would mislabel, so TooLong never shorts).
+        process.exe_status = IdentityAvailability::Changed;
+        assert_eq!(super::human_exe(process), "unavailable");
+        process.exe = Some("/usr/bin/python3".to_string());
+        process.exe_status = IdentityAvailability::TooLong;
+        assert_eq!(super::human_exe(process), "unavailable");
+        // Available-but-missing is corrupt input: placeholder, no crash.
+        process.exe = None;
+        process.exe_status = IdentityAvailability::Available;
+        assert_eq!(super::human_exe(process), "unavailable");
+        // Available shortens + sanitizes at the human boundary.
+        process.exe = Some("/opt\x07/x/y".to_string());
+        assert_eq!(super::human_exe(process), "x/y");
+        process.exe = Some("/sleep".to_string());
+        assert_eq!(super::human_exe(process), "sleep");
+        // comm: anything but a present Available value is a dash.
+        process.comm = Some("x".to_string());
+        process.comm_status = IdentityAvailability::TooLong;
+        assert_eq!(super::human_comm(process), "-");
+        process.comm = None;
+        process.comm_status = IdentityAvailability::Available;
+        assert_eq!(super::human_comm(process), "-");
     }
 
     #[test]
@@ -850,17 +1052,25 @@ mod tests {
                 actor_euid: None,
             },
         ];
-        let preamble = snap.human_preamble();
+        let paths = super::super::resolve::TerminalPathWriter::new(false, false, &snap.resolve);
         let mut buf = Vec::new();
-        render(&snap, false, &mut buf, Some(&preamble), &[]).unwrap();
+        super::human_snapshot(&mut buf, &snap, &paths, 0).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        assert!(out.contains("gaps (2 total in 1 group):\n"), "{out}");
-        assert!(out.contains("  too_large device=1 pid=7: 2\n"), "{out}");
-        // JSON mode carries the raw array, never the grouped block.
-        let mut buf = Vec::new();
-        render(&snap, true, &mut buf, Some(&preamble), &[]).unwrap();
-        let out = String::from_utf8(buf).unwrap();
+        // v0.6.0 P0-3: exact per-reason counts on one line (groups
+        // deferred to -v); counters exact.
+        assert!(
+            out.contains("gaps: 2 (too_large=2; rerun with -v for per-object detail)\n"),
+            "{out}"
+        );
         assert!(!out.contains("gaps ("), "{out}");
+        // The verdict names only gaps for its own pid: pid 1 stays
+        // complete while pid 7's gaps count above.
+        assert!(out.contains("status=complete"), "{out}");
+        // JSON mode carries the raw array, never the counts line.
+        let mut buf = Vec::new();
+        super::render_json(&snap, &mut buf).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("gaps:"), "{out}");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["gaps"].as_array().unwrap().len(), 2);
     }
@@ -1103,11 +1313,6 @@ mod tests {
             super::super::identity_totals_line(0, 0),
             "identity: no modules inventoried\n"
         );
-        // The snapshot preamble delegates to the shared helper: one shape.
-        assert_eq!(
-            super::identity_line(3, 1),
-            super::super::identity_totals_line(3, 1)
-        );
     }
 
     #[test]
@@ -1186,10 +1391,12 @@ mod tests {
         });
         child.kill().unwrap();
         scanned.gaps.clear();
-        let preamble = scanned.human_preamble();
-        assert!(preamble.conclusively_without_openssl);
+        assert!(super::super::snapshot_conclusively_without_openssl(
+            &scanned
+        ));
+        let paths = super::super::resolve::TerminalPathWriter::new(false, false, &scanned.resolve);
         let mut buf = Vec::new();
-        super::render(&scanned, false, &mut buf, Some(&preamble), &[]).unwrap();
+        super::human_snapshot(&mut buf, &scanned, &paths, 0).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(
             out.contains("blindness: no-mapped-openssl"),
