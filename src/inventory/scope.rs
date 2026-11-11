@@ -215,6 +215,10 @@ impl ScopedScanner {
         snapshot
     }
 
+    // Kept-by-contract shim (Task 2 N-family): the plain name
+    // delegates with a never-cancelled flag; only lib tests still
+    // call it (every production caller passes an explicit flag).
+    #[allow(dead_code)]
     pub(crate) fn observation_snapshot_for(
         &mut self,
         timeout: std::time::Duration,

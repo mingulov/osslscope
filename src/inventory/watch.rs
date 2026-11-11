@@ -562,6 +562,47 @@ pub(super) fn run_formatted(
     terminal: bool,
     verbosity: u8,
 ) -> io::Result<WatchOutcome> {
+    run_inner(options, writer, cancel, None, human, terminal, verbosity)
+}
+/// Shutdown-aware entry for the CLI watch route: the loop checks
+/// `cancelled_and_acked()` instead of the bare flag, so the first
+/// observed cancel writes the ack to stderr promptly (before the end
+/// record), then ends `Interrupted` with the usual cumulative history
+/// (`human_end`/end record below — H2 intact). The `&AtomicBool`
+/// entries stay stderr-silent for library callers.
+pub(super) fn run_shutdown(
+    options: &WatchOptions,
+    writer: &mut impl Write,
+    shutdown: &crate::shutdown::Shutdown,
+    human: bool,
+    terminal: bool,
+    verbosity: u8,
+) -> io::Result<WatchOutcome> {
+    run_inner(
+        options,
+        writer,
+        shutdown.cancel_flag(),
+        Some(shutdown),
+        human,
+        terminal,
+        verbosity,
+    )
+}
+fn run_inner(
+    options: &WatchOptions,
+    writer: &mut impl Write,
+    cancel: &AtomicBool,
+    shutdown: Option<&crate::shutdown::Shutdown>,
+    human: bool,
+    terminal: bool,
+    verbosity: u8,
+) -> io::Result<WatchOutcome> {
+    // First-observation ack rides the Shutdown path only; the
+    // library path checks the same bit with no stderr side effect.
+    let observed = || match shutdown {
+        Some(shutdown) => shutdown.cancelled_and_acked(),
+        None => cancel.load(Ordering::Relaxed),
+    };
     options.validate()?;
     let started = Instant::now();
     if human {
@@ -586,7 +627,7 @@ pub(super) fn run_formatted(
         sampled_history: "incomplete",
         privilege_hint: None,
     };
-    if cancel.load(Ordering::Relaxed) {
+    if observed() {
         end.reason = EndReason::Interrupted;
         end.status = 3;
         end.elapsed = started.elapsed();
@@ -600,7 +641,7 @@ pub(super) fn run_formatted(
     let mut scanner = match ScopedScanner::new(options.selection.clone(), options.limits.clone()) {
         Ok(scanner) => scanner,
         Err(gap) => {
-            if cancel.load(Ordering::Relaxed) {
+            if observed() {
                 end.reason = EndReason::Interrupted;
                 end.status = 3;
             } else {
@@ -617,7 +658,7 @@ pub(super) fn run_formatted(
         }
     };
     loop {
-        if cancel.load(Ordering::Relaxed) {
+        if observed() {
             end.reason = EndReason::Interrupted;
             break;
         }
@@ -701,9 +742,7 @@ pub(super) fn run_formatted(
         previous = Some(snapshot);
         let wait_started = poll_started;
         while wait_started.elapsed() < options.interval {
-            if cancel.load(Ordering::Relaxed)
-                || options.duration.is_some_and(|d| started.elapsed() >= d)
-            {
+            if observed() || options.duration.is_some_and(|d| started.elapsed() >= d) {
                 break;
             }
             let mut wait = options

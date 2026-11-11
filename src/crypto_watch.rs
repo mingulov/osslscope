@@ -13,7 +13,7 @@ use crate::{
         scope::{ScopedScanner, Selection},
     },
     observation_memory::{MemoryLease, MemoryPool},
-    provider_observation::{cli::Signals, objects::read_triple},
+    provider_observation::objects::read_triple,
 };
 use serde::Serialize;
 use std::{
@@ -4512,8 +4512,15 @@ impl ServiceEngine {
             }
             run.sample_start_seq = out.sequence;
             let sample_open_ns = LiveClock.monotonic_ns();
-            let snapshot = scanner
-                .observation_snapshot_for(interval.min(deadline.saturating_duration_since(now)));
+            // Cancel-aware sample (v0.6.0 signals): a set flag ends
+            // acquisition early with the same Deadline gap a timeout
+            // produces — the cancel check after the sample (the
+            // discovery break and the per-member polls below, each
+            // cancel-aware) then winds the tick down promptly.
+            let snapshot = scanner.observation_snapshot_for_with_cancel(
+                interval.min(deadline.saturating_duration_since(now)),
+                cancel,
+            );
             next_scan = Instant::now() + interval;
             // 6A elapsed-derived tick (§7 Start rule) + skipped spans
             // (nominal ticks with no sample render unknown, §4.1).
@@ -4717,6 +4724,36 @@ impl ServiceEngine {
         })
     }
 
+    /// 6A close drain with an external shutdown deadline (S3/WS-A):
+    /// the service passes its minted `--grace` deadline so the
+    /// transport drain honors the shutdown remainder instead of
+    /// only its internal bound; `None` keeps the plain drain (6A).
+    // Test builds serve drains from `FakeCloseEngine`
+    // (`Run.engine` is the fake under `cfg(test)`), so the real
+    // capped drain has no test-build caller.
+    #[cfg_attr(test, allow(dead_code))]
+    pub(crate) fn close_drain_capped(
+        &mut self,
+        cancel: &AtomicBool,
+        deadline: Option<Instant>,
+    ) -> io::Result<CloseOut> {
+        self.close_drain_inner(cancel, deadline, &|| false)
+    }
+
+    /// CLI shutdown-aware close drain (v0.6.0 signals Task 3):
+    /// `close_drain_capped` with `expired()` phase-skips — past the
+    /// 1s post-signal deadline the slow middle phases (seal-all,
+    /// deferred close-out, follow-pending close-out, the
+    /// deferred-close flush) stop promptly, but the End record still
+    /// emits. The service keeps `close_drain_capped` (never skips);
+    /// a prompt drain never observes `expired()` either way.
+    pub(crate) fn close_drain_shutdown(
+        &mut self,
+        shutdown: &crate::shutdown::Shutdown,
+    ) -> io::Result<CloseOut> {
+        self.close_drain_inner(shutdown.cancel_flag(), None, &|| shutdown.expired())
+    }
+
     /// 6A close drain (moved verbatim from `observe()`): the final
     /// poll (lanes fold, events bind), retirement seals without
     /// readmit, deferred close-out, and the terminal `End`. The
@@ -4724,18 +4761,11 @@ impl ServiceEngine {
     /// `duration`); service stops always cancel first (the engine
     /// run IS cancelled — the window-level reason rides the
     /// envelope/summary, never the 6A vocabulary).
-    pub(crate) fn close_drain(&mut self, cancel: &AtomicBool) -> io::Result<CloseOut> {
-        self.close_drain_capped(cancel, None)
-    }
-
-    /// 6A close drain with an external shutdown deadline (S3/WS-A):
-    /// the service passes its minted `--grace` deadline so the
-    /// transport drain honors the shutdown remainder instead of
-    /// only its internal bound; `None` keeps the plain drain (6A).
-    pub(crate) fn close_drain_capped(
+    fn close_drain_inner(
         &mut self,
         cancel: &AtomicBool,
         deadline: Option<Instant>,
+        expired: &dyn Fn() -> bool,
     ) -> io::Result<CloseOut> {
         let mut buf = Vec::new();
         let mut out = Output {
@@ -4856,6 +4886,11 @@ impl ServiceEngine {
         // Seal-all: the run ended (death unproven either way — stopping
         // observation, never inventing exits).
         while let Some(active) = run.active.pop() {
+            // Bounded teardown: past `expired()` the remaining seals
+            // stop here (End still emits below).
+            if expired() {
+                break;
+            }
             let pid = active.identity.pid;
             let outcome = out.finish(active, reason, false)?;
             run.seal_fold(outcome.loss_totals);
@@ -4872,6 +4907,11 @@ impl ServiceEngine {
         };
         let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
         for key in keys {
+            // Bounded teardown: past `expired()` the remaining
+            // close-outs stop here (End still emits below).
+            if expired() {
+                break;
+            }
             if let Some(entry) = run.deferred.remove(&key) {
                 run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
                 run.removed.closed = run.removed.closed.saturating_add(1);
@@ -4881,6 +4921,11 @@ impl ServiceEngine {
         // live-but-never-classified births gap as unknown (no root bill).
         let pids: Vec<u32> = run.follow_pending.keys().copied().collect();
         for pid in pids {
+            // Bounded teardown: past `expired()` the remaining
+            // close-outs stop here (End still emits below).
+            if expired() {
+                break;
+            }
             let Some((_recorded, parent, _)) = run.follow_pending.remove(&pid) else {
                 continue;
             };
@@ -4907,7 +4952,10 @@ impl ServiceEngine {
         run.epoch_tombstones.clear();
         // R6-3: run-end flush of live-path deferred closes (terminal —
         // no more polling, so bounded synchronous close is allowed).
-        crate::provider_observation::session::flush_deferred_offpath_sync();
+        // Bounded teardown: skipped past `expired()` (End still emits).
+        if !expired() {
+            crate::provider_observation::session::flush_deferred_offpath_sync();
+        }
         // 6A seal-fold evaluation (§4.1): final ring reads folded during
         // sealing join the cumulative ring here, so the evaluators run
         // once more — seal-folded loss reaches the session carrier
@@ -5194,24 +5242,29 @@ fn observe(
     pool: &MemoryPool,
     output: &mut impl Write,
     json: bool,
-    cancel: &AtomicBool,
+    shutdown: &crate::shutdown::Shutdown,
     producer: Option<&crate::lifecycle_producer::ProducerHandle>,
 ) -> io::Result<u8> {
+    let cancel = shutdown.cancel_flag();
     let opened = ServiceEngine::open(config, objects, pool, json, producer)?;
     output.write_all(&opened.setup_bytes)?;
     let mut engine = match opened.engine {
         Some(engine) => engine,
         None => return Ok(opened.early_code),
     };
-    while Instant::now() < engine.deadline && !cancel.load(Ordering::Relaxed) {
+    while Instant::now() < engine.deadline && !shutdown.cancelled_and_acked() {
         let it = engine.pump_iteration(cancel)?;
         output.write_all(&it.bytes)?;
         let remaining = engine.deadline.saturating_duration_since(Instant::now());
-        if !cancel.load(Ordering::Relaxed) {
+        if !shutdown.cancelled_and_acked() {
             std::thread::sleep(Duration::from_millis(25).min(remaining));
         }
     }
-    let closed = engine.close_drain(cancel)?;
+    // Teardown bounded by `expired()`: past the deadline the drain
+    // skips its slow phases but still emits End (checked again after
+    // the drain so a signal racing the final emit still acks).
+    let closed = engine.close_drain_shutdown(shutdown)?;
+    shutdown.cancelled_and_acked();
     output.write_all(&closed.bytes)?;
     Ok(closed.code)
 }
@@ -5341,19 +5394,26 @@ pub fn run(args: &[String]) -> ExitCode {
         crate::report::err_line(pool_exhausted_reason());
         return ExitCode::from(4);
     };
-    let _signals = match Signals::install() {
-        Ok(s) => s,
+    let shutdown = match crate::shutdown::Shutdown::install() {
+        Ok(shutdown) => shutdown,
         Err(_) => return ExitCode::from(1),
     };
-    match observe(
+    let result = observe(
         &config,
         objects,
         &pool,
         &mut io::stdout().lock(),
         options.json,
-        _signals.cancel(),
+        &shutdown,
         producer,
-    ) {
+    );
+    // Backstop ack for a signal racing the final end-record emit
+    // (`None` when the in-loop ack already fired or no signal
+    // arrived).
+    if let Some(ack) = shutdown.ack() {
+        crate::shutdown::write_ack(&ack);
+    }
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(_) => {
             crate::report::err_line("osslscope crypto watch: observation/output failed");
@@ -6105,13 +6165,16 @@ mod tests {
             count_sha256: Sha256::digest(&count).into(),
             count: count.into(),
         };
+        // Process-global signal dispositions for the observe driver
+        // (restored on drop; the serial suite owns signal state).
+        let shutdown = crate::shutdown::Shutdown::install().unwrap();
         let result = observe(
             &config,
             objects,
             &pool,
             &mut output,
             true,
-            &AtomicBool::new(false),
+            &shutdown,
             // In-process unit test: no producer installation (the
             // bootstrap history is process-global); polling applies.
             None,

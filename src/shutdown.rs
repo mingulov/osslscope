@@ -83,6 +83,32 @@ impl Shutdown {
                 .unwrap()
                 .is_some_and(|t| t.elapsed() >= SHUTDOWN_DEADLINE)
     }
+
+    /// Cancel check with first-observation ack (v0.6.0 signals Task
+    /// 3): returns `cancelled()`, writing `ack()` to stderr exactly
+    /// once — on the first call that observes cancel. Every
+    /// watch/observation loop calls this at each sample, poll-window,
+    /// and teardown boundary instead of `cancelled()`.
+    pub fn cancelled_and_acked(&self) -> bool {
+        if !self.cancelled() {
+            return false;
+        }
+        if let Some(ack) = self.ack() {
+            write_ack(&ack);
+        }
+        true
+    }
+}
+
+/// Prompt first-signal ack to locked stderr, panic-free like
+/// [`crate::report::err_line`] (a broken stderr degrades to silence,
+/// never to exit 101) but byte-exact: the ack already ends in
+/// newline, so no extra line is added. Verbosity-independent.
+pub(crate) fn write_ack(ack: &str) {
+    use std::io::Write as _;
+    let stderr = io::stderr();
+    let mut locked = stderr.lock();
+    let _ = locked.write_all(ack.as_bytes());
 }
 
 impl Drop for Shutdown {

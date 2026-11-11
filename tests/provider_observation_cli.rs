@@ -837,3 +837,53 @@ fn human_default_has_plain_header_without_jargon() {
     redacted(&base);
     redacted(&v2);
 }
+
+#[test]
+fn v060_provider_watch_sigint_acks_once_with_interrupted_end() {
+    // Live-pid watch like `observer_cancellation_emits_end_and_returns_partial`
+    // (unprivileged host: no BPF session can attach, passive fallback — the
+    // SIGINT leg below exercises the observe loop's cancel path only; live
+    // legs stay guest-side for Task 6).
+    let f = Fixture::new();
+    let mut child = f
+        .command()
+        .args([
+            "scan",
+            "--pid",
+            &std::process::id().to_string(),
+            "--observe-providers",
+            "--watch",
+            "--duration",
+            "60",
+            "--interval",
+            "1",
+            "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // First record proves the observe loop is running (no sleep guess).
+    let mut first = String::new();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    reader.read_line(&mut first).unwrap();
+    assert!(first.contains("\"snapshot\""), "no first record: {first}");
+    assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
+    // Drain stdout to EOF (child exit), then collect stderr + status.
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut reader, &mut rest).unwrap();
+    drop(reader);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        err.matches("shutting down").count(),
+        1,
+        "ack count wrong: {err}"
+    );
+    assert!(
+        rest.contains("\"interrupted\""),
+        "no interrupt end: {first}{rest}"
+    );
+    assert!(rest.contains("\"record\":\"end\""), "no end record: {rest}");
+}

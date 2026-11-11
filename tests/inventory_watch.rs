@@ -1174,3 +1174,86 @@ fn human_watch_coalesces_snapshot_gaps() {
         );
     }
 }
+
+#[test]
+fn v060_watch_sigint_acks_once_and_keeps_history_note() {
+    let me = std::process::id().to_string();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--pid",
+            &me,
+            "--watch",
+            "--interval",
+            "1",
+            "--duration",
+            "60",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(2500));
+    unsafe { assert_eq!(libc::kill(child.id() as i32, libc::SIGINT), 0) };
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        err.matches("shutting down").count(),
+        1,
+        "ack count wrong: {err}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"interrupted\"") || stdout.contains("interrupted"),
+        "no interrupt end: {stdout}"
+    );
+}
+
+#[test]
+fn v060_second_sigint_exits_130_without_end_record() {
+    let me = std::process::id().to_string();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--pid",
+            &me,
+            "--watch",
+            "--interval",
+            "30",
+            "--duration",
+            "300",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let pid = child.id() as i32;
+    unsafe { assert_eq!(libc::kill(pid, libc::SIGINT), 0) };
+    // Sync repair (brief's fixed 200ms gap deterministically overshoots
+    // prompt first-signal shutdown — child already exited with 3, so the
+    // second kill lands on a zombie and the exit stays 3): wait for the
+    // ack instead — first signal observed, child mid-shutdown — then send
+    // the second signal immediately. Name, args, and asserted exit (130)
+    // are verbatim; only the synchronization changed.
+    let mut acked = String::new();
+    let mut errors = BufReader::new(child.stderr.take().unwrap());
+    loop {
+        let mut line = String::new();
+        if errors.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        acked.push_str(&line);
+        if line.contains("shutting down") {
+            break;
+        }
+    }
+    assert!(
+        acked.contains("shutting down"),
+        "no ack before second signal"
+    );
+    unsafe { assert_eq!(libc::kill(pid, libc::SIGINT), 0) };
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(130));
+}

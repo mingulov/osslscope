@@ -5,6 +5,16 @@
 //! the coordinator consumes at the next boundary (admission and
 //! window-open are one critical section); SIGTERM/SIGINT stop after
 //! the current window; a second SIGTERM/SIGINT stops immediately.
+//!
+//! Relationship to the CLI shutdown token (v0.6.0 signals): the
+//! service keeps this signalfd design while the CLI watch and
+//! observation routes (`scan --watch`, `--observe-providers`,
+//! `--observe-crypto`) share `crate::shutdown::Shutdown` — an
+//! async-handler token with a stderr ack and a 1s teardown bound.
+//! One-shot `scan`/`inspect` routes stay deliberately
+//! uninstrumented (no `Shutdown`: SIGINT/SIGTERM kill with
+//! 128+signo as before), since graceful cancel there is unrequested
+//! behavior and would change exit codes.
 
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::time::Duration;

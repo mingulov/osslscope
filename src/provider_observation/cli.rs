@@ -120,6 +120,9 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 extern "C" fn signal(_: libc::c_int) {
     INTERRUPTED.store(true, Ordering::Relaxed);
 }
+/// Legacy per-route token, kept only for `focused_capture::run`
+/// (out of v0.6.0-signals scope): this route's `run()`/`observe()`
+/// use the shared `crate::shutdown::Shutdown` instead.
 pub(crate) struct Signals(Vec<(libc::c_int, libc::sigaction)>);
 impl Signals {
     pub(crate) fn cancel(&self) -> &AtomicBool {
@@ -759,7 +762,12 @@ impl<W: Write> Stream<'_, W> {
         Ok(status)
     }
 }
-fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> io::Result<u8> {
+fn observe(
+    options: &Options,
+    writer: &mut impl Write,
+    shutdown: &crate::shutdown::Shutdown,
+) -> io::Result<u8> {
+    let cancel = shutdown.cancel_flag();
     let started = Instant::now();
     if !options.json {
         writer.write_all(MEANING.as_bytes())?;
@@ -782,8 +790,8 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
                 return stream.end(inventory::watch::EndReason::ScopeUnavailable, Some(gap));
             }
         };
-    let initial = scanner.snapshot();
-    let opened = if cancel.load(Ordering::Relaxed) {
+    let initial = scanner.snapshot_with_cancel(cancel);
+    let opened = if shutdown.cancelled_and_acked() {
         Err(ObservationGap::IntervalUnknown)
     } else {
         artifact::load()
@@ -815,7 +823,7 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
     // The startup blocker prints once, before the first sample record:
     // the initial snapshot is the knowledge event.
     if !options.json
-        && !cancel.load(Ordering::Relaxed)
+        && !shutdown.cancelled_and_acked()
         && inventory::snapshot_conclusively_without_openssl(&initial)
     {
         stream
@@ -832,7 +840,7 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
     let mut next_snapshot = Instant::now() + options.interval;
     let mut last_drain = Instant::now();
     let end_reason = loop {
-        if cancel.load(Ordering::Relaxed) {
+        if shutdown.cancelled_and_acked() {
             break inventory::watch::EndReason::Interrupted;
         }
         if started.elapsed() >= options.duration {
@@ -841,7 +849,7 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
         let now = Instant::now();
         if now >= next_snapshot {
             let begin = started.elapsed();
-            let snapshot = scanner.snapshot();
+            let snapshot = scanner.snapshot_with_cancel(cancel);
             let batch = session
                 .as_mut()
                 .map(|s| s.reconcile(&snapshot))
@@ -905,8 +913,8 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        let _signals = match Signals::install() {
-            Ok(signals) => signals,
+        let shutdown = match crate::shutdown::Shutdown::install() {
+            Ok(shutdown) => shutdown,
             Err(_) => {
                 crate::report::err_line(
                     "osslscope provider discovery: observer signal setup failed",
@@ -914,7 +922,14 @@ pub fn run(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        observe(&options, &mut output, &INTERRUPTED)
+        let code = observe(&options, &mut output, &shutdown);
+        // Backstop ack for a signal racing the final end-record emit
+        // (`None` when the in-loop ack already fired or no signal
+        // arrived).
+        if let Some(ack) = shutdown.ack() {
+            crate::shutdown::write_ack(&ack);
+        }
+        code
     };
     match result {
         Ok(code) => ExitCode::from(code),

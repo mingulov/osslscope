@@ -160,16 +160,6 @@ fn seconds(text: &str, interval: bool) -> Result<Duration, ()> {
     Ok(duration)
 }
 
-/// Prompt first-signal ack to locked stderr, panic-free like
-/// [`crate::report::err_line`] (a broken stderr degrades to
-/// silence, never to exit 101) but byte-exact: the ack already
-/// ends in newline, so no extra line is added. Verbosity-independent.
-fn write_ack(ack: &str) {
-    let stderr = io::stderr();
-    let mut locked = stderr.lock();
-    let _ = locked.write_all(ack.as_bytes());
-}
-
 #[derive(Serialize)]
 struct ModuleError {
     input_index: usize,
@@ -949,7 +939,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            let outcome = super::watch::run_formatted(
+            let outcome = super::watch::run_shutdown(
                 &super::watch::WatchOptions {
                     selection: super::scope::Selection {
                         pids: options.pids,
@@ -963,16 +953,17 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                     resolve_paths: render_paths,
                 },
                 &mut output,
-                shutdown.cancel_flag(),
+                &shutdown,
                 !options.json,
                 terminal,
                 verbosity,
             );
-            // Prompt first-signal ack on stderr (`None` when no
-            // signal arrived — no behavior change then), even when
-            // the stdout sink broke: the ack is stderr's own line.
+            // Backstop ack for a signal racing the final end-record
+            // emit (`None` — no behavior change — when the in-loop
+            // ack already fired or no signal arrived), even when the
+            // stdout sink broke: the ack is stderr's own line.
             if let Some(ack) = shutdown.ack() {
-                write_ack(&ack);
+                crate::shutdown::write_ack(&ack);
             }
             outcome.map(|outcome| {
                 if let Some(line) = super::watch::exit_reason(&outcome) {
