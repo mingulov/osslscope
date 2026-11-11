@@ -850,6 +850,7 @@ mod tests {
             exe: None,
             exe_status: crate::inventory::IdentityAvailability::Unreadable,
             modules: vec![module_record(crate::inventory::IdentityStatus::Verified)],
+            other_objects: crate::inventory::OtherCounts::default(),
             provider_activation: crate::inventory::ObservationState::Unknown,
             provider_interfaces: crate::inventory::ObservationState::Unknown,
             execution: crate::inventory::ObservationState::NotObserved,

@@ -1499,3 +1499,37 @@ fn v060_process_identity_is_bounded_nullable_statused() {
     let procs_old = old["processes"].as_array().unwrap();
     assert!(procs_old[0].get("comm").is_none());
 }
+
+#[test]
+fn v060_other_counts_precise_and_legend_present() {
+    let me = std::process::id().to_string();
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let json = std::process::Command::new(bin)
+        .args(["scan", "--pid", &me, "--json"])
+        .output()
+        .unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let proc = &doc["processes"][0];
+    let other = &proc["other_objects"];
+    assert!(other.get("verified").is_some());
+    assert!(other.get("candidate").is_some());
+    assert!(other.get("failed").is_some());
+    let human = std::process::Command::new(bin)
+        .args(["scan", "--pid", &me])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        text.contains("openssl_compatible"),
+        "no kind legend: {text}"
+    );
+    assert!(
+        text.contains("other objects"),
+        "no Other disclosure: {text}"
+    );
+    let help = std::process::Command::new(bin)
+        .args(["scan", "--help"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("openssl_consumer"));
+}

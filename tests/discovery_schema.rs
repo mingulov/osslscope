@@ -114,6 +114,11 @@ fn v060_snapshot_validates_and_module_path_only() {
     assert!(modules[0].get("verified_path").is_some());
     assert!(modules[0].get("maps_spelling").is_some());
     assert!(modules[0]["info"].get("file_soname").is_some());
+    // P0-5: the fresh snapshot carries per-process Other counts.
+    let other = &doc["processes"][0]["other_objects"];
+    assert!(other.get("verified").is_some());
+    assert!(other.get("candidate").is_some());
+    assert!(other.get("failed").is_some());
     // Bare hash input: exit 4, empty stdout, PATH-form message on stderr.
     let bad = bin()
         .args(["scan", "--module", &"a".repeat(64), "--json"])

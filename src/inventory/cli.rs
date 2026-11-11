@@ -16,6 +16,13 @@ use std::time::{Duration, Instant};
 
 const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths] [-v]\n       osslscope inspect --pid PID [--json] [--resolve-paths] [-v]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths] [-v]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows (default off; --json acquires machine path evidence without the flag; never in diagnostics).\n-v/--verbose (repeatable, -vv = 2) raises human detail only: -v adds grouped gaps, per-module exports, and full per-process state; -vv adds per-object gap records and safe counters. Default human output is quiet; JSON output is complete at every level.\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
+/// One-line kind legend (v0.6.0 P0-5): decodes every `ObjectKind`
+/// word without source. Glosses mirror `elf.rs` classification
+/// exactly (recognized dynamic code exports; `OSSL_PROVIDER_init`;
+/// known `libcrypto`/`libssl` SONAME need or recognized API
+/// import); `other` is counted per process, never listed.
+/// Single source for human snapshots and `--help`.
+const LEGEND: &str = "kinds: openssl_compatible=<exports-recognized-api> provider_module=<exports-ossl_provider_init> openssl_consumer=<depends-or-imports-openssl> other=<counted-not-listed>\n";
 /// Value-taking options of [`parse`]: the scan router consumes the
 /// token after each of these, so flag-shaped values never misroute.
 /// A new value-taking match arm MUST extend this list.
@@ -462,11 +469,14 @@ fn human_exe(process: &ProcessRecord) -> String {
 
 /// Per-process verdict line: `pid= comm= exe= modules= status=`.
 /// `status` is `complete` iff no gap names this pid (unnamed,
-/// process-wide gaps do not mark any single process partial). At
-/// `-v` and above the line extends with full per-process state
-/// (`starttime= namespaces= provider_activation=
-/// provider_interfaces= execution=`); level 0 stays a strict
-/// prefix.
+/// process-wide gaps do not mark any single process partial).
+/// When `modules` is empty the line carries the firefox-style
+/// Other disclosure (`0 OpenSSL modules, N other objects
+/// scanned`, N = successfully classified Others; failures ride
+/// the gaps line). At `-v` and above the line extends with full
+/// per-process state (`starttime= namespaces=
+/// provider_activation= provider_interfaces= execution=`);
+/// level 0 stays a strict prefix.
 fn verdict_line(process: &ProcessRecord, gaps: &[Gap], verbosity: u8) -> String {
     let status = if gaps.iter().any(|g| g.pid == Some(process.pid)) {
         "partial"
@@ -481,6 +491,12 @@ fn verdict_line(process: &ProcessRecord, gaps: &[Gap], verbosity: u8) -> String 
         process.modules.len(),
         status
     );
+    if process.modules.is_empty() {
+        line.push_str(&format!(
+            " (0 OpenSSL modules, {} other objects scanned)",
+            process.other_objects.verified + process.other_objects.candidate
+        ));
+    }
     if verbosity >= 1 {
         line.push_str(&format!(
             " starttime={} namespaces={} provider_activation={} provider_interfaces={} execution={}",
@@ -523,14 +539,15 @@ fn counts_line(label: &str, reasons: impl Iterator<Item = GapReason>, rerun_hint
     }
 }
 
-/// Human snapshot render (v0.6.0 P0-3): MEANING + per-process
-/// verdict lines with their module rows + identity totals + exact
-/// per-reason gap counts (+ the blindness line when conclusive).
-/// Never emits JSON bytes. Verbosity gates detail volume only
-/// (0 = counts line; 1 = + full gap groups + `exports=[...]` per
-/// module row + full per-process state; 2 = + per-object gap
-/// records + safe counters); exits, stderr, counts, and hashes
-/// (short at every level) are identical throughout.
+/// Human snapshot render (v0.6.0 P0-3): MEANING, the kind
+/// legend, per-process verdict lines with their module rows,
+/// identity totals, and exact per-reason gap counts (plus the
+/// blindness line when conclusive). Never emits JSON bytes.
+/// Verbosity gates detail volume only (0 = counts line; 1 = full
+/// gap groups, `exports=[...]` per module row, and full
+/// per-process state; 2 = per-object gap records and safe
+/// counters); exits, stderr, counts, and hashes (short at every
+/// level) are identical throughout.
 pub(crate) fn human_snapshot(
     writer: &mut impl Write,
     snapshot: &Snapshot,
@@ -538,6 +555,7 @@ pub(crate) fn human_snapshot(
     verbosity: u8,
 ) -> io::Result<()> {
     writer.write_all(MEANING.as_bytes())?;
+    writer.write_all(LEGEND.as_bytes())?;
     human_snapshot_body(writer, snapshot, paths, verbosity, None)?;
     if super::snapshot_conclusively_without_openssl(snapshot) {
         writer.write_all(super::blindness_line().as_bytes())?;
@@ -653,6 +671,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
     let outcome = if args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h") {
         output
             .write_all(HELP.as_bytes())
+            .and_then(|()| output.write_all(LEGEND.as_bytes()))
             .and_then(|()| {
                 for line in crate::cli::exit_code_help_observation() {
                     writeln!(output, "{line}")?;
@@ -826,7 +845,8 @@ mod tests {
     use super::super::{
         Api, Architecture, CaptureInterval, FileVersionStatus, Gap, GapReason,
         IdentityAvailability, IdentityStatus, ModuleInfo, ModuleRecord, NamespaceId, NamespaceIds,
-        ObjectKind, ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode, coalesce_gaps,
+        ObjectKind, OtherCounts, ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode,
+        coalesce_gaps,
     };
     use super::*;
 
@@ -880,6 +900,7 @@ mod tests {
                 exe: None,
                 exe_status: IdentityAvailability::Unreadable,
                 modules,
+                other_objects: OtherCounts::default(),
                 provider_activation: ObservationState::Unknown,
                 provider_interfaces: ObservationState::Unknown,
                 execution: ObservationState::NotObserved,
@@ -919,8 +940,9 @@ mod tests {
         let mut buf = Vec::new();
         super::human_snapshot(&mut buf, &snap, &paths, 0).unwrap();
         let out = String::from_utf8(buf).unwrap();
-        // v0.6.0 P0-3 rows-only human bytes: MEANING + verdict +
-        // module rows + identity totals + exact gap counts, no JSON.
+        // v0.6.0 P0-3 rows-only human bytes: MEANING + kind
+        // legend + verdict + module rows + identity totals + exact
+        // gap counts, no JSON.
         assert!(out.contains("Passive inventory:"), "{out}");
         assert!(
             out.contains("pid=1 comm=- exe=- modules=2 status=complete"),
@@ -1006,7 +1028,7 @@ mod tests {
         snap.processes[0].exe_status = IdentityAvailability::Available;
         assert_eq!(
             super::verdict_line(&snap.processes[0], &snap.gaps, 0),
-            "pid=1 comm=py?thon exe=bin/python3 modules=0 status=complete"
+            "pid=1 comm=py?thon exe=bin/python3 modules=0 status=complete (0 OpenSSL modules, 0 other objects scanned)"
         );
         snap.gaps.push(Gap {
             pid: Some(1),
@@ -1016,7 +1038,62 @@ mod tests {
             errno: None,
             actor_euid: None,
         });
-        assert!(super::verdict_line(&snap.processes[0], &snap.gaps, 0).ends_with("status=partial"));
+        assert!(
+            super::verdict_line(&snap.processes[0], &snap.gaps, 0).contains("status=partial"),
+            "gap naming the pid marks it partial"
+        );
+    }
+
+    #[test]
+    fn human_snapshot_carries_kind_legend_and_other_disclosure() {
+        // P0-5: the legend line decodes every kind word; an empty
+        // `modules` verdict discloses classified Others (N =
+        // verified + candidate — `failed` rides the gaps line);
+        // a non-empty verdict carries no disclosure.
+        let mut snap = snapshot_with(Vec::new());
+        snap.processes[0].other_objects = OtherCounts {
+            verified: 4,
+            candidate: 1,
+            failed: 2,
+        };
+        let paths = super::super::resolve::TerminalPathWriter::new(false, false, &snap.resolve);
+        let mut buf = Vec::new();
+        super::human_snapshot(&mut buf, &snap, &paths, 0).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains(super::LEGEND), "{out}");
+        assert!(
+            out.contains("(0 OpenSSL modules, 5 other objects scanned)"),
+            "{out}"
+        );
+        let listed = snapshot_with(vec![module_with(IdentityStatus::Verified)]);
+        let paths = super::super::resolve::TerminalPathWriter::new(false, false, &listed.resolve);
+        let mut buf = Vec::new();
+        super::human_snapshot(&mut buf, &listed, &paths, 0).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains(super::LEGEND), "{out}");
+        assert!(!out.contains("other objects scanned"), "{out}");
+    }
+
+    #[test]
+    fn other_counts_default_and_always_serialized() {
+        // Old documents without the key still parse (zeros); every
+        // serialization carries it; unknown keys still rejected.
+        let legacy: ProcessRecord = serde_json::from_str(
+            r#"{"interval":{"started_unix_ms":null,"finished_unix_ms":null,"elapsed_ns":0},"namespaces":{"pid":null,"mount":null},"pid":1,"starttime":7,"modules":[],"provider_activation":"unknown","provider_interfaces":"unknown","execution":"not_observed"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.other_objects, OtherCounts::default());
+        let value = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(
+            value["other_objects"],
+            serde_json::json!({"verified": 0, "candidate": 0, "failed": 0})
+        );
+        assert!(
+            serde_json::from_str::<OtherCounts>(
+                r#"{"verified":1,"candidate":0,"failed":0,"bogus":1}"#
+            )
+            .is_err()
+        );
     }
 
     #[test]

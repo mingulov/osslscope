@@ -168,6 +168,15 @@ pub enum Architecture {
 }
 
 /// Interface/dependency evidence only, with no vendor or runtime claim.
+/// - `OpenSslCompatible`: the file exports recognized OpenSSL API
+///   symbols (defined dynamic code exports, provider-init excluded).
+/// - `ProviderModule`: the file exports `OSSL_PROVIDER_init`.
+/// - `OpenSslConsumer`: the file needs OpenSSL — a `DT_NEEDED`
+///   `libcrypto`/`libssl` entry in a known SONAME form, or an
+///   undefined reference to a recognized API symbol.
+/// - `Other`: none of the above — an ELF object with no recognized
+///   OpenSSL interface evidence. Others are counted per process
+///   ([`ProcessRecord::other_objects`]), never listed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
@@ -454,6 +463,30 @@ pub enum IdentityAvailability {
     TooLong,
 }
 
+/// Per-process counts of `ObjectKind::Other` file-backed
+/// executable objects (v0.6.0 P0-5): Others are counted, never
+/// listed, so `0 modules` stays distinguishable from `nothing
+/// mapped`. `verified` counts Others whose backing proof closed;
+/// `candidate` counts Others bound only to an unverified locator
+/// (an `IdentityUnverified` gap names the same mapping);
+/// `failed` counts executable file-backed mappings that errored
+/// before any classification (backing or parse failure — every
+/// one also carries a gap). Non-executable mappings, skipped
+/// non-regular files, and files determined to be non-ELF are
+/// outside the counted population and never increment any
+/// bucket. Counts are classification-time outcomes: a later
+/// `Changed` gap downgrades `verified` to `candidate` (like the
+/// published rows) and always vetoes the
+/// [`snapshot_conclusively_without_openssl`] predicate, but
+/// never rewrites history beyond that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtherCounts {
+    pub verified: u32,
+    pub candidate: u32,
+    pub failed: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessRecord {
@@ -476,6 +509,10 @@ pub struct ProcessRecord {
     #[serde(default)]
     pub exe_status: IdentityAvailability,
     pub modules: Vec<ModuleRecord>,
+    /// Counted-not-listed `Other` objects (always serialized;
+    /// old documents default to zeros).
+    #[serde(default)]
+    pub other_objects: OtherCounts,
     pub provider_activation: ObservationState,
     pub provider_interfaces: ObservationState,
     pub execution: ObservationState,
@@ -1162,6 +1199,7 @@ mod tests {
                 verified_path_unavailable: None,
                 maps_spelling: None,
             }],
+            other_objects: super::OtherCounts::default(),
             provider_activation: super::ObservationState::Unknown,
             provider_interfaces: super::ObservationState::Unknown,
             execution: super::ObservationState::NotObserved,

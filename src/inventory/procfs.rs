@@ -5,9 +5,9 @@
 use super::{
     Capabilities, CaptureClock, Gap, GapReason, IdentityAvailability, IdentityStatus,
     InventoryState, LocatorKind, MapsSource, MapsSpelling, MapsVerification, ModuleInfo,
-    ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, PathUnavailableReason,
-    ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, VerifiedPath,
-    WorkTotals, backing, elf, resolve,
+    ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, OtherCounts,
+    PathUnavailableReason, ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode,
+    SnapshotOptions, VerifiedPath, WorkTotals, backing, elf, resolve,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1005,6 +1005,9 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     let view = backing::BackingProcess::capture_charged(&process.directory, work).ok();
     work.backing_limit.take();
     let mut modules = Vec::new();
+    // P0-5 counted-not-listed `Other` objects for this process (see
+    // `OtherCounts`): incremented exactly where filtering happens below.
+    let mut other_objects = OtherCounts::default();
     let mut verified = BTreeSet::new();
     let mut attempts = 0;
     for line in maps.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
@@ -1036,6 +1039,9 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                 Ok(bound) => bound,
                 Err((reason, errno)) => {
                     work.gap_errno(Some(pid), Some(&mapping), reason, errno);
+                    // Backing never acquired: the object errored before
+                    // any classification, and the gap above says so.
+                    other_objects.failed += 1;
                     continue;
                 }
             };
@@ -1054,6 +1060,7 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         // Only verified associations may share a retained cache key.
         // Uncertain locators remain separate records.
         if identity_status == IdentityStatus::Verified && verified.contains(&key) {
+            // Repeat verified sighting of an already-counted object.
             continue;
         }
         // Charge metadata, vector growth and temporary fingerprint/set copies
@@ -1062,6 +1069,20 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         let mut status = identity_status;
         match work.inspect(file, &metadata, page) {
             Ok(info) => {
+                // P0-5 counted-not-listed: an `Other` classification for a
+                // successfully read file-backed executable object lands in
+                // exactly one bucket — `verified` when the backing proof
+                // closed, `candidate` when only an unverified locator
+                // binds it (the `IdentityUnverified` gap above names the
+                // same mapping). This mirrors the listing the filter below
+                // suppresses: verified repeats dedup above, while uncertain
+                // locators stay separate records.
+                if info.kind == ObjectKind::Other {
+                    match status {
+                        IdentityStatus::Verified => other_objects.verified += 1,
+                        IdentityStatus::LocatorCandidate => other_objects.candidate += 1,
+                    }
+                }
                 if work.include_other || info.kind != ObjectKind::Other {
                     // ER-5E-I3: the association is retained through parsing
                     // and re-proven before publication — for fresh parses
@@ -1147,8 +1168,19 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                     ));
                 }
             }
+            // NotElf is a successful determination that the file is not an
+            // executable object at all (like a skipped non-regular): no
+            // object to count and no gap to record.
             Err(GapReason::NotElf) => {}
-            Err(reason) => work.gap(Some(pid), Some(&mapping), reason),
+            Err(reason) => {
+                work.gap(Some(pid), Some(&mapping), reason);
+                // The object errored before any classification — except a
+                // skipped non-regular, which is outside the counted
+                // population like a non-executable mapping.
+                if reason != GapReason::NonRegular {
+                    other_objects.failed += 1;
+                }
+            }
         }
         // The cache holds the descriptor alive; failed admission alone is
         // not retained identity evidence and must not suppress another VMA.
@@ -1165,12 +1197,18 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         Ok(again) if again == maps => {}
         Ok(_) => {
             work.gap(Some(pid), None, GapReason::Changed);
+            // Dropped Others downgrade exactly like published rows.
+            other_objects.candidate += other_objects.verified;
+            other_objects.verified = 0;
             for (module, _) in &mut modules {
                 module.identity_status = IdentityStatus::LocatorCandidate;
             }
         }
         Err(reason) => {
             work.gap(Some(pid), None, reason);
+            // Dropped Others downgrade exactly like published rows.
+            other_objects.candidate += other_objects.verified;
+            other_objects.verified = 0;
             for (module, _) in &mut modules {
                 module.identity_status = IdentityStatus::LocatorCandidate;
             }
@@ -1249,6 +1287,7 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         exe,
         exe_status,
         modules: modules.into_iter().map(|(module, _)| module).collect(),
+        other_objects,
         provider_activation: ObservationState::Unknown,
         provider_interfaces: ObservationState::Unknown,
         execution: ObservationState::NotObserved,
@@ -2232,6 +2271,31 @@ mod tests {
                 .iter()
                 .any(|m| m.info.file_soname.as_deref() == Some("libcrypto.so.3")),
             "post-exec libcrypto must be inventoried: {result:?}"
+        );
+    }
+
+    // P0-5 counted-not-listed: a live self-scan classifies its own
+    // executable mappings (own binary plus libc at minimum), and
+    // the three buckets never exceed the mappings attempted (each
+    // mapping lands in at most one bucket; dedup repeats reuse the
+    // earlier count; non-executable mappings never enter).
+    #[test]
+    fn self_scan_counts_other_objects_within_attempts() {
+        let result = snapshot(&SnapshotOptions {
+            pids: vec![std::process::id()],
+            ..Default::default()
+        });
+        assert_eq!(result.processes.len(), 1);
+        let counts = result.processes[0].other_objects;
+        assert!(
+            counts.verified + counts.candidate > 0,
+            "self-scan must classify Others: {counts:?}"
+        );
+        assert!(
+            (counts.verified + counts.candidate + counts.failed) as usize
+                <= result.totals.objects_attempted,
+            "counts exceed attempts: {counts:?} vs {:?}",
+            result.totals
         );
     }
 }

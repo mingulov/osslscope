@@ -321,11 +321,27 @@ stdout by mode (human rows by default, pure JSON under `--json`).
 
 Module metadata describes a SHA-256, numeric device/inode/size, architecture,
 finite recognized exports and dependency flags. The interface classifications
-are `openssl_compatible`, `provider_module`, `openssl_consumer` or `other`;
-they do not authenticate a vendor. Mapped records distinguish `verified`
-backing association from `locator_candidate` file metadata. A path lookup or
-matching device/inode alone never promotes a candidate to verified backing;
-permissions and filesystem semantics may leave useful candidates and gaps.
+are `openssl_compatible` (the file exports recognized OpenSSL API symbols as
+defined dynamic code exports, provider-init excluded), `provider_module` (the
+file exports `OSSL_PROVIDER_init`), `openssl_consumer` (the file needs
+OpenSSL: a `DT_NEEDED` `libcrypto`/`libssl` entry in a known SONAME form, or
+an undefined reference to a recognized API symbol), or `other` (none of the
+above — an ELF object with no recognized OpenSSL interface evidence, such as
+NSS `libssl3.so`); they do not authenticate a vendor. Human output and
+`scan --help` carry a one-line `kinds:` legend decoding every word. `other`
+objects are counted per process, never listed: `other_objects` reports
+`verified` (backing proof closed) vs `candidate` (unverified locator only —
+an `identity_unverified` gap names the same mapping) vs `failed` (the mapping
+errored before any classification — every one also carries a gap).
+Non-executable mappings, skipped non-regular files, and files determined to
+be non-ELF are outside the counted population, so the counts never claim
+"every mapping is an Other object". A process with `0 modules` still reports
+how many other objects were scanned; any gap — or a module-selector scope —
+keeps the "conclusively without OpenSSL" statement silent. Mapped records
+distinguish `verified` backing association from `locator_candidate` file
+metadata. A path lookup or matching device/inode alone never promotes a
+candidate to verified backing; permissions and filesystem semantics may leave
+useful candidates and gaps.
 
 **ELF exports and mappings do not prove activation or execution.** Provider
 activation and advertised runtime interfaces remain `unknown`; execution is
