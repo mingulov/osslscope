@@ -6742,6 +6742,112 @@ fn v060_human_default_is_rows_and_json_is_pure() {
     let _: serde_json::Value = serde_json::from_str(&jout).unwrap();
 }
 
+#[test]
+fn v060_verbosity_keeps_machine_stderr_and_hashes_stable() {
+    // Task 2 quiet contract across routes: verbosity gates human
+    // detail volume only. JSON/NDJSON bytes, exits, and stderr are
+    // identical at every level; hashes stay short everywhere; -q /
+    // --quiet do not exist (exit 2, empty stdout).
+    let me = std::process::id().to_string();
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let scan = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(["scan", "--pid", &me]);
+        for e in extra {
+            cmd.arg(e);
+        }
+        cmd.output().unwrap()
+    };
+    // Machine output ignores verbosity entirely (compared parsed
+    // minus run-volatile fields: capture intervals and the
+    // read-bytes charge, which tracks live /proc text length).
+    let norm = |out: &std::process::Output| {
+        let mut v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        v.as_object_mut().unwrap().remove("interval");
+        v["totals"].as_object_mut().unwrap().remove("read_bytes");
+        for p in v["processes"].as_array_mut().unwrap() {
+            p.as_object_mut().unwrap().remove("interval");
+        }
+        v
+    };
+    let j0 = scan(&["--json"]);
+    let j1 = scan(&["--json", "-v"]);
+    let j2 = scan(&["-vv", "--json"]);
+    assert_eq!(j0.status.code(), j1.status.code());
+    assert_eq!(j0.status.code(), j2.status.code());
+    assert_eq!(norm(&j0), norm(&j1), "JSON must ignore -v");
+    assert_eq!(norm(&j0), norm(&j2), "JSON must ignore -vv");
+    // Human output: stderr stable, long form equals short form,
+    // -vv adds counters while hashes stay short.
+    let h0 = scan(&[]);
+    let h1 = scan(&["-v"]);
+    let hv = scan(&["--verbose"]);
+    let h2 = scan(&["-vv"]);
+    assert_eq!(h0.status.code(), h1.status.code());
+    assert_eq!(h0.status.code(), h2.status.code());
+    assert_eq!(h0.stderr, h1.stderr);
+    assert_eq!(h0.stderr, h2.stderr);
+    assert_eq!(hv.stdout, h1.stdout, "--verbose must equal -v");
+    let s1 = String::from_utf8_lossy(&h1.stdout);
+    let s2 = String::from_utf8_lossy(&h2.stdout);
+    // (-v exports ride module rows, which need inventoried modules;
+    // container identity verification yields none here, so the lib
+    // tests pin exports while live scans pin full process state.)
+    assert!(
+        s1.contains("namespaces=") && s1.contains("starttime="),
+        "no -v process state, got: {s1}"
+    );
+    assert!(s1.contains("gaps (") || s1.contains("gaps: 0"), "{s1}");
+    assert!(
+        s2.contains("counters: read_bytes="),
+        "no -vv counters, got: {s2}"
+    );
+    assert!(!has_64_hex(&s1), "full hash at -v");
+    assert!(!has_64_hex(&s2), "full hash at -vv");
+    for bad in ["-q", "--quiet"] {
+        let out = scan(&[bad]);
+        assert_eq!(out.status.code(), Some(2), "{bad} must exit 2");
+        assert!(out.stdout.is_empty(), "{bad} must keep stdout empty");
+    }
+    // The inspect route honors the same contract.
+    let run = |args: &[&str]| std::process::Command::new(bin).args(args).output().unwrap();
+    let i0 = run(&["inspect", "--pid", &me]);
+    let i2 = run(&["inspect", "--pid", &me, "-vv"]);
+    assert_eq!(i0.status.code(), i2.status.code());
+    assert_eq!(i0.stderr, i2.stderr);
+    let si2 = String::from_utf8_lossy(&i2.stdout);
+    assert!(
+        si2.contains("counters: read_bytes="),
+        "no inspect -vv counters, got: {si2}"
+    );
+    assert!(!has_64_hex(&si2), "full hash in inspect -vv");
+    let ij0 = run(&["inspect", "--pid", &me, "--json"]);
+    let ij2 = run(&["inspect", "--pid", &me, "--json", "-vv"]);
+    assert_eq!(norm(&ij0), norm(&ij2), "inspect JSON must ignore -vv");
+    // doctor --discovery: levels append detail lines only.
+    let d0 = run(&["doctor", "--discovery"]);
+    let d1 = run(&["doctor", "--discovery", "-v"]);
+    let d2 = run(&["doctor", "--discovery", "-vv"]);
+    assert_eq!(d0.status.code(), d1.status.code());
+    assert_eq!(d0.status.code(), d2.status.code());
+    assert_eq!(d0.stderr, d1.stderr);
+    assert_eq!(d0.stderr, d2.stderr);
+    let t0 = String::from_utf8_lossy(&d0.stdout).into_owned();
+    let t1 = String::from_utf8_lossy(&d1.stdout).into_owned();
+    let t2 = String::from_utf8_lossy(&d2.stdout).into_owned();
+    assert!(t1.starts_with(&t0), "level 0 must prefix -v, got: {t1}");
+    assert!(t2.starts_with(&t1), "-v must prefix -vv, got: {t2}");
+    assert!(t1.contains("detail kernel="), "no -v detail, got: {t1}");
+    assert!(
+        t2.contains("detail caps_effective="),
+        "no -vv detail, got: {t2}"
+    );
+    let dj0 = run(&["doctor", "--discovery", "--json"]);
+    let dj2 = run(&["doctor", "--discovery", "-vv", "--json"]);
+    assert_eq!(dj0.stdout, dj2.stdout, "discovery JSON must ignore -vv");
+}
+
 fn has_64_hex(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() >= 64

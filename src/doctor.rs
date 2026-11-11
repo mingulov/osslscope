@@ -3653,6 +3653,19 @@ mod tests {
     }
 
     #[test]
+    fn discovery_caps_detail_splits_present_vs_missing() {
+        let hex = format!("{:016x}", (1u64 << CAP_SYS_PTRACE) | (1u64 << CAP_BPF));
+        assert_eq!(
+            discovery_caps_detail(&format!("Name:\tdoctor\nCapEff:\t{hex}\n")),
+            "  detail caps_effective=[cap_bpf, cap_sys_ptrace] caps_missing=[cap_perfmon, cap_sys_admin]"
+        );
+        assert_eq!(
+            discovery_caps_detail("no caps here"),
+            "  detail caps_effective=(unavailable)"
+        );
+    }
+
+    #[test]
     fn lockdown_parse() {
         assert_eq!(parse_lockdown("[none] integrity confidentiality"), "none");
         assert_eq!(
@@ -5844,6 +5857,34 @@ fn spawn_coverage_note() -> Check {
 /// values never misroute. A new value-taking match arm MUST extend
 /// this list.
 pub(crate) const DISCOVERY_VALUE_OPTIONS: &[&str] = &["--format"];
+/// `doctor --discovery -vv` caps line over `/proc/self/status`
+/// text: the effective capabilities that matter to this tool,
+/// split into present vs missing. Pure (unit-tested);
+/// unparseable input renders `(unavailable)`, never panics.
+fn discovery_caps_detail(status: &str) -> String {
+    let Some(eff) = parse_capeff(status) else {
+        return "  detail caps_effective=(unavailable)".to_string();
+    };
+    let mut have = Vec::new();
+    let mut missing = Vec::new();
+    for (name, bit) in [
+        ("cap_bpf", CAP_BPF),
+        ("cap_perfmon", CAP_PERFMON),
+        ("cap_sys_admin", CAP_SYS_ADMIN),
+        ("cap_sys_ptrace", CAP_SYS_PTRACE),
+    ] {
+        if has_cap(eff, bit) {
+            have.push(name);
+        } else {
+            missing.push(name);
+        }
+    }
+    format!(
+        "  detail caps_effective=[{}] caps_missing=[{}]",
+        have.join(", "),
+        missing.join(", ")
+    )
+}
 /// Independent discovery capability checks: no target profile or catalogue.
 /// Kernel/verifier diagnostics are reduced to finite states before rendering.
 pub(crate) fn discovery(args: &[String]) -> ExitCode {
@@ -5897,6 +5938,7 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
     let mut json = false;
     let mut discovery = false;
     let mut format = false;
+    let mut verbosity = 0u8;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -5905,6 +5947,11 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
                 json = true;
                 format = true;
             }
+            // Repeatable, clamped at 2 after the loop. `-q`/`--quiet`
+            // stay unknown (exit 2, empty stdout): the default is
+            // already quiet, so no quiet flag exists.
+            "-v" | "--verbose" => verbosity = verbosity.saturating_add(1),
+            "-vv" => verbosity = 2,
             "--format" if !format => {
                 match args.next().map(String::as_str) {
                     Some("json") => json = true,
@@ -5939,6 +5986,12 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
     if !discovery {
         return ExitCode::from(2);
     }
+    // Verbosity gates detail volume only (0 = capability rows; 1 =
+    // + environment detail; 2 = + effective-caps detail);
+    // capability words, stderr, and exits are identical at every
+    // level, and JSON output ignores it entirely. v0.6.0 P0-3:
+    // report/check/service human redesign stays P1.
+    let level = verbosity.min(2);
     let (companion, producer) = match crate::provider_observation::artifact::load() {
         Ok(bytes) => match crate::provider_observation::ProviderSession::open(
             crate::provider_observation::ObservationLimits::default(),
@@ -6029,6 +6082,26 @@ pub(crate) fn discovery(args: &[String]) -> ExitCode {
                 out.write_all(b"\n")?;
             }
             out.write_all(b"  historical_activation=unknown execution=not_observed\n")?;
+            if level >= 1 {
+                let lsm = lsm_list();
+                let lsm = if lsm.is_empty() {
+                    "none".to_string()
+                } else {
+                    lsm.join(",")
+                };
+                writeln!(
+                    out,
+                    "  detail kernel={} lockdown={} lsm={} ima={}",
+                    uname_release(),
+                    lockdown_mode(),
+                    lsm,
+                    ima_state()
+                )?;
+            }
+            if level >= 2 {
+                let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+                writeln!(out, "{}", discovery_caps_detail(&status))?;
+            }
         }
         out.flush()
     })();

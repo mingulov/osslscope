@@ -428,6 +428,18 @@ pub enum ObservationState {
     NotObserved,
 }
 
+impl ObservationState {
+    /// Display word for `-v` full per-process state lines. Mirrors
+    /// the serde snake_case label exactly (see
+    /// `cli::tests::observation_state_words_match_json`).
+    pub fn word(&self) -> &'static str {
+        match self {
+            ObservationState::Unknown => "unknown",
+            ObservationState::NotObserved => "not_observed",
+        }
+    }
+}
+
 /// Finite availability of one sampled process-identity fact
 /// (v0.6.0 D2): `comm` and `exe` are operator-visible `/proc`
 /// readings, never authentication or proof. Old documents default
@@ -685,6 +697,37 @@ where
         s.push_str(&format!("{indent}  {word} device={dev} pid={p}: {count}\n"));
     }
     s
+}
+
+/// Compact human namespace summary for `-v` full per-process
+/// state lines (one shape for the inventory, provider, and
+/// crypto-watch routes): `pid=<dev>:<ino>,mount=<dev>:<ino>`,
+/// with `-` for each absent side. Observer-sampled numbers only.
+pub fn human_namespaces(ids: &NamespaceIds) -> String {
+    let side = |id: Option<&NamespaceId>| {
+        id.map_or("-".to_string(), |n| format!("{}:{}", n.device, n.inode))
+    };
+    format!(
+        "pid={},mount={}",
+        side(ids.pid.as_ref()),
+        side(ids.mount.as_ref())
+    )
+}
+
+/// Human `exports=[...]` fragment for `-v` module rows (one shape
+/// for the inventory, provider, and crypto-watch routes): serde
+/// snake_case words in stored order, `[]` when empty.
+pub fn human_exports(exports: &[Api]) -> String {
+    let words: Vec<String> = exports
+        .iter()
+        .map(|api| {
+            serde_json::to_value(api)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
+        .collect();
+    format!("exports=[{}]", words.join(", "))
 }
 
 /// Group gaps by (reason, device, pid) with exact counters

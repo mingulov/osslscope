@@ -1454,6 +1454,10 @@ fn open_engine(
         interval: cfg.interval,
         resolve_paths: false,
         terminal: false,
+        // Service windows render machine JSON only; human verbosity
+        // stays at the quiet default (report/check/service human
+        // redesign is P1).
+        verbosity: 0,
     };
     // Engine open (coordinator-direct: `ServiceEngine` holds the
     // `!Send` pool — the §7.2 worker list governs the service's

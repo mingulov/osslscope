@@ -27,6 +27,12 @@ struct Options {
     watch: bool,
     interval: Duration,
     duration: Duration,
+    /// Human detail level (`-v`/`--verbose` repeatable, `-vv` = 2,
+    /// clamped at 2; default 0 is quiet). Gates detail volume
+    /// only — exits, stderr, capability words, and JSON bytes are
+    /// identical at every level. v0.6.0 P0-3:
+    /// report/check/service human redesign stays P1.
+    verbosity: u8,
 }
 fn seconds(text: &str, interval: bool) -> Result<Duration, ()> {
     let value: f64 = text.parse().map_err(|_| ())?;
@@ -51,12 +57,18 @@ fn parse(args: &[String]) -> Result<Options, ()> {
     let mut observe = false;
     let mut interval = None;
     let mut duration = None;
+    let mut verbosity = 0u8;
     let mut args = args[1..].iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--observe-providers" if !observe => observe = true,
             "--json" if !json => json = true,
             "--watch" if command == "scan" && !watch => watch = true,
+            // Repeatable, clamped at 2 below. `-q`/`--quiet` stay
+            // unknown (exit 2, empty stdout): the default is
+            // already quiet, so no quiet flag exists.
+            "-v" | "--verbose" => verbosity = verbosity.saturating_add(1),
+            "-vv" => verbosity = 2,
             "--interval" if command == "scan" && interval.is_none() => {
                 interval = Some(seconds(args.next().ok_or(())?, true)?)
             }
@@ -93,6 +105,7 @@ fn parse(args: &[String]) -> Result<Options, ()> {
         watch,
         interval: interval.unwrap_or(Duration::from_secs(1)),
         duration: duration.unwrap_or(Duration::from_secs(30)),
+        verbosity: verbosity.min(2),
     })
 }
 fn path(value: Option<&String>) -> Result<PathBuf, ()> {
@@ -199,7 +212,7 @@ fn nanos(duration: Duration) -> u64 {
     duration.as_nanos().min(u64::MAX as u128) as u64
 }
 trait Render: Serialize {
-    fn human(&self, writer: &mut impl Write) -> io::Result<()>;
+    fn human(&self, writer: &mut impl Write, verbosity: u8) -> io::Result<()>;
 }
 fn finite(value: &impl Serialize) -> io::Result<String> {
     serde_json::to_string(value).map_err(io::Error::other)
@@ -212,7 +225,12 @@ fn human_capabilities(caps: &Capabilities, writer: &mut impl Write) -> io::Resul
     )
 }
 impl Render for Record<'_> {
-    fn human(&self, writer: &mut impl Write) -> io::Result<()> {
+    fn human(&self, writer: &mut impl Write, verbosity: u8) -> io::Result<()> {
+        // Verbosity gates detail volume only (0 = rows + grouped
+        // gaps; 1 = + per-module exports + full per-process state;
+        // 2 = + full fact payloads + per-object gap records + safe
+        // counters); hashes stay short at every level.
+        let level = verbosity.min(2);
         writeln!(
             writer,
             "{} {}: interval_ns={}..{} drain_lag_ns={} facts={}",
@@ -237,22 +255,61 @@ impl Render for Record<'_> {
                 crate::inventory::identity_totals_line(verified, locator)
             )?;
             for process in &snapshot.processes {
-                writeln!(
+                write!(
                     writer,
                     "  process pid={} starttime={}",
                     process.pid, process.starttime
                 )?;
+                if level >= 1 {
+                    write!(
+                        writer,
+                        " modules={} namespaces={} provider_activation={} provider_interfaces={} execution={}",
+                        process.modules.len(),
+                        crate::inventory::human_namespaces(&process.namespaces),
+                        process.provider_activation.word(),
+                        process.provider_interfaces.word(),
+                        process.execution.word()
+                    )?;
+                }
+                writeln!(writer)?;
                 for module in &process.modules {
-                    writeln!(
+                    write!(
                         writer,
                         "    sha256={} kind={} identity={}",
-                        module.info.sha256,
+                        crate::inventory::resolve::TerminalPathWriter::short_sha(
+                            &module.info.sha256
+                        ),
                         finite(&module.info.kind)?,
                         finite(&module.identity_status)?
                     )?;
+                    if level >= 1 {
+                        write!(
+                            writer,
+                            " {}",
+                            crate::inventory::human_exports(&module.info.exports)
+                        )?;
+                    }
+                    writeln!(writer)?;
                 }
             }
             writer.write_all(inventory_gap_block(&snapshot.gaps)?.as_bytes())?;
+            if level >= 2 {
+                for gap in &snapshot.gaps {
+                    writeln!(
+                        writer,
+                        "  gap pid={} device={} reason={} errno={}",
+                        gap.pid.map_or("-".to_string(), |p| p.to_string()),
+                        gap.device.map_or("-".to_string(), |d| d.to_string()),
+                        gap.reason.word(),
+                        gap.errno.map_or("-".to_string(), |e| e.to_string())
+                    )?;
+                }
+                writeln!(
+                    writer,
+                    "  counters: read_bytes={} objects_inspected={}",
+                    snapshot.totals.read_bytes, snapshot.totals.objects_inspected
+                )?;
+            }
         }
         for fact in self.facts {
             let hash: String = fact.object_sha256.clone().into();
@@ -261,7 +318,7 @@ impl Render for Record<'_> {
                 "  fact pid={} starttime={} sha256={} generation={} api={} source={} operation={} class={} monotonic_ns={} context={} confidence={}",
                 fact.pid,
                 fact.starttime,
-                hash,
+                crate::inventory::resolve::TerminalPathWriter::short_sha(&hash),
                 fact.generation,
                 finite(&fact.api)?,
                 finite(&fact.source)?,
@@ -290,14 +347,21 @@ impl Render for Record<'_> {
                     alias_quality.weak
                 )?;
             }
-            writeln!(writer, " payload={}", finite(&fact.payload)?)?;
+            // The full payload is a JSON dump: level 2 only.
+            if level >= 2 {
+                writeln!(writer, " payload={}", finite(&fact.payload)?)?;
+            } else {
+                writeln!(writer)?;
+            }
         }
         writer.write_all(observation_gap_block(self.gaps)?.as_bytes())?;
         Ok(())
     }
 }
 impl Render for End<'_> {
-    fn human(&self, writer: &mut impl Write) -> io::Result<()> {
+    // The end record is status-critical and already minimal: byte-
+    // identical at every verbosity level.
+    fn human(&self, writer: &mut impl Write, _verbosity: u8) -> io::Result<()> {
         writeln!(
             writer,
             "end {}: reason={} status={} elapsed_ns={}",
@@ -313,9 +377,14 @@ impl Render for End<'_> {
         Ok(())
     }
 }
-fn emit(value: &impl Render, writer: &mut impl Write, human: bool) -> io::Result<()> {
+fn emit(
+    value: &impl Render,
+    writer: &mut impl Write,
+    human: bool,
+    verbosity: u8,
+) -> io::Result<()> {
     if human {
-        value.human(writer)?;
+        value.human(writer, verbosity)?;
     } else {
         serde_json::to_writer(&mut *writer, value).map_err(io::Error::other)?;
         writer.write_all(b"\n")?;
@@ -463,6 +532,7 @@ impl<W: Write> Stream<'_, W> {
             },
             self.writer,
             !self.options.json,
+            self.options.verbosity,
         )
     }
     fn end(
@@ -493,6 +563,7 @@ impl<W: Write> Stream<'_, W> {
             },
             self.writer,
             !self.options.json,
+            self.options.verbosity,
         )?;
         if let Some(line) = end_reason_text(self.usable, self.partial, reason, gap) {
             crate::report::err_line(&line);
@@ -741,7 +812,7 @@ mod tests {
             sampled_history: "incomplete",
         };
         let mut human = Vec::new();
-        emit(&record, &mut human, true).unwrap();
+        emit(&record, &mut human, true, 0).unwrap();
         let human = String::from_utf8(human).unwrap();
         let lines: Vec<_> = human
             .lines()
@@ -768,7 +839,7 @@ mod tests {
         }
         assert_ne!(lines[0], lines[1]);
         let mut json = Vec::new();
-        emit(&record, &mut json, false).unwrap();
+        emit(&record, &mut json, false, 0).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
         assert_eq!(json["facts"][0]["operation"], "digest");
         assert_eq!(json["facts"][0]["class"], "digest");
@@ -891,14 +962,14 @@ mod tests {
                 sampled_history: "incomplete",
             };
             let mut json = Vec::new();
-            emit(&record, &mut json, false).unwrap();
+            emit(&record, &mut json, false, 0).unwrap();
             let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
             for fact in value["facts"].as_array().unwrap() {
                 assert_eq!(fact["payload"]["alias_quality"]["status"], expected_status);
                 assert_eq!(fact["payload"]["alias_quality"]["weak"], expected_weak);
             }
             let mut human = Vec::new();
-            emit(&record, &mut human, true).unwrap();
+            emit(&record, &mut human, true, 0).unwrap();
             let human = String::from_utf8(human).unwrap();
             assert_eq!(
                 human
@@ -939,7 +1010,7 @@ mod tests {
             sampled_history: "incomplete",
         };
         let mut bytes = Vec::new();
-        emit(&record, &mut bytes, true).unwrap();
+        emit(&record, &mut bytes, true, 0).unwrap();
         let human = String::from_utf8(bytes).unwrap();
         assert!(human.contains("algorithm=other"), "{human}");
         assert!(human.contains("pid=12"), "{human}");
@@ -1004,7 +1075,7 @@ mod tests {
             sampled_history: "incomplete",
         };
         let mut bytes = Vec::new();
-        emit(&record, &mut bytes, true).unwrap();
+        emit(&record, &mut bytes, true, 0).unwrap();
         let human = String::from_utf8(bytes).unwrap();
         let (verified, locator) = snapshot.identity_counts();
         if verified + locator == 0 {
@@ -1053,5 +1124,106 @@ mod tests {
         );
         assert_eq!(super::inventory_gap_block(&[]).unwrap(), "");
         assert_eq!(super::observation_gap_block(&[]).unwrap(), "");
+    }
+
+    #[test]
+    fn verbosity_parses_repeatable_and_clamps_at_two() {
+        let parse = |flags: &[&str]| {
+            let mut args = vec!["scan".to_string()];
+            args.extend(flags.iter().map(|f| f.to_string()));
+            args.push("--observe-providers".to_string());
+            super::parse(&args)
+        };
+        assert_eq!(parse(&[]).unwrap().verbosity, 0);
+        assert_eq!(parse(&["-v"]).unwrap().verbosity, 1);
+        assert_eq!(parse(&["--verbose"]).unwrap().verbosity, 1);
+        assert_eq!(parse(&["-v", "--verbose"]).unwrap().verbosity, 2);
+        assert_eq!(parse(&["-vv"]).unwrap().verbosity, 2);
+        assert_eq!(parse(&["-vv", "-v"]).unwrap().verbosity, 2);
+        // No quiet flag exists: the default is already quiet.
+        assert!(parse(&["-q"]).is_err());
+        assert!(parse(&["--quiet"]).is_err());
+    }
+
+    #[test]
+    fn human_levels_add_state_exports_payload_records_counters() {
+        let fact: super::super::ObservationFact = serde_json::from_value(serde_json::json!({
+            "pid": 12, "starttime": 100, "object_sha256": "b".repeat(64), "generation": 1,
+            "context": { "state": "unknown" }, "source": "provider_query", "api": "provider_query_callback",
+            "operation": "digest", "class": "digest", "monotonic_ns": 9, "confidence": "unknown",
+            "payload": { "kind": "query_result", "outcome": "success", "cacheability": "cacheable" }
+        }))
+        .unwrap();
+        let snapshot = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![std::process::id()],
+            resolve_paths: false,
+            limits: crate::inventory::Limits::default(),
+        });
+        let capabilities = Capabilities::new(true);
+        let record = Record {
+            schema_version: SCHEMA,
+            mode: "watch",
+            record: "snapshot",
+            sequence: 1,
+            interval: Interval {
+                started_elapsed_ns: 0,
+                finished_elapsed_ns: 10,
+                drain_lag_ns: 10,
+            },
+            poll_interval: Duration::from_secs(1),
+            snapshot: Some(&snapshot),
+            facts: &[fact],
+            gaps: &[],
+            capabilities: &capabilities,
+            sampled_history: "incomplete",
+        };
+        let render = |verbosity: u8| {
+            let mut bytes = Vec::new();
+            emit(&record, &mut bytes, true, verbosity).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let full_hash = "b".repeat(64);
+        let l0 = render(0);
+        // Fact one-liners stay at every level; the payload dump and
+        // -v detail do not appear at level 0.
+        assert!(l0.contains("  fact pid=12 starttime=100"), "{l0}");
+        assert!(!l0.contains("payload="), "{l0}");
+        assert!(!l0.contains("exports="), "{l0}");
+        assert!(!l0.contains("namespaces="), "{l0}");
+        assert!(!l0.contains("gap pid="), "{l0}");
+        assert!(!l0.contains("counters:"), "{l0}");
+        assert!(!l0.contains(&full_hash), "{l0}");
+        let l1 = render(1);
+        assert!(l1.contains("  fact pid=12 starttime=100"), "{l1}");
+        assert!(!l1.contains("payload="), "{l1}");
+        if snapshot.processes.iter().any(|p| !p.modules.is_empty()) {
+            assert!(l1.contains("exports=["), "{l1}");
+        }
+        assert!(l1.contains("namespaces="), "{l1}");
+        assert!(!l1.contains("gap pid="), "{l1}");
+        assert!(!l1.contains("counters:"), "{l1}");
+        assert!(!l1.contains(&full_hash), "{l1}");
+        let l2 = render(2);
+        assert!(l2.contains("payload="), "{l2}");
+        assert!(l2.contains("counters: read_bytes="), "{l2}");
+        if !snapshot.gaps.is_empty() {
+            assert!(l2.contains("gap pid="), "{l2}");
+        }
+        assert!(!l2.contains(&full_hash), "{l2}");
+        assert!(l2.contains("sha256=bbbbbbbbbbbb"), "{l2}");
+        // Level 0 stays a strict prefix of the process line: the -v
+        // extension only appends.
+        for line in l1.lines().filter(|l| l.starts_with("  process ")) {
+            assert!(
+                line.contains("starttime=") && line.contains("modules="),
+                "{line}"
+            );
+        }
+        // JSON ignores verbosity entirely.
+        let mut j0 = Vec::new();
+        emit(&record, &mut j0, false, 0).unwrap();
+        let mut j2 = Vec::new();
+        emit(&record, &mut j2, false, 2).unwrap();
+        assert_eq!(j0, j2);
     }
 }

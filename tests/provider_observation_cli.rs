@@ -709,3 +709,57 @@ fn human_records_coalesce_gaps() {
         "no per-gap lines remain, got: {text}"
     );
 }
+
+#[test]
+fn human_verbosity_adds_detail_only() {
+    // v0.6.0 Task 2: -v/-vv gate human detail volume only — the
+    // exit, stderr, and capability words match level 0 while
+    // exports/counters appear and hashes stay short everywhere.
+    let f = Fixture::new();
+    let pid = std::process::id().to_string();
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "scan",
+            "--pid",
+            pid.as_str(),
+            "--observe-providers",
+            "--watch",
+            "--duration",
+            "0.05",
+        ];
+        args.extend(extra.iter().copied());
+        f.cli(&args)
+    };
+    let base = run(&[]);
+    let v1 = run(&["-v"]);
+    let v2 = run(&["-vv"]);
+    assert_eq!(base.status.code(), v1.status.code());
+    assert_eq!(base.status.code(), v2.status.code());
+    assert_eq!(base.stderr, v1.stderr);
+    assert_eq!(base.stderr, v2.stderr);
+    let t0 = String::from_utf8_lossy(&base.stdout).into_owned();
+    let t1 = String::from_utf8_lossy(&v1.stdout).into_owned();
+    let t2 = String::from_utf8_lossy(&v2.stdout).into_owned();
+    // (-v exports ride module rows, which need inventoried
+    // modules; container identity verification yields none here,
+    // so the lib tests pin exports while live runs pin full
+    // process state.)
+    assert!(
+        t1.contains("namespaces=") && t1.contains("modules="),
+        "no -v process state, got: {t1}"
+    );
+    assert!(
+        t2.contains("counters: read_bytes="),
+        "no -vv counters, got: {t2}"
+    );
+    for (level, text) in [("0", &t0), ("1", &t1), ("2", &t2)] {
+        assert!(!has_64_hex(text), "full hash at level {level}");
+    }
+    redacted(&v2);
+}
+
+fn has_64_hex(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.len() >= 64
+        && (0..=bytes.len() - 64).any(|i| bytes[i..i + 64].iter().all(|b| b.is_ascii_hexdigit()))
+}

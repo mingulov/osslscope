@@ -627,17 +627,24 @@ fn human_scan_with_gaps_never_claims_blindness() {
     }
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
     std::thread::sleep(std::time::Duration::from_millis(500));
-    let output = cli(&["scan", "--pid", &child.id().to_string()]);
+    let pid = child.id().to_string();
+    // The silence property holds at every verbosity level; the
+    // grouped block the old assertion pinned now renders at -v+.
+    for extra in [&[] as &[&str], &["-v"], &["-vv"]] {
+        let mut args = vec!["scan", "--pid", pid.as_str()];
+        args.extend(extra.iter().copied());
+        let output = cli(&args);
+        let text = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            text.contains("gaps: ") && !text.contains("gaps: 0"),
+            "fixture precondition: gaps present, got: {text}"
+        );
+        assert!(
+            !text.contains("blindness:"),
+            "no absence claim under gaps, got: {text}"
+        );
+    }
     child.kill().unwrap();
-    let text = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        text.contains("gaps ("),
-        "fixture precondition: gaps present, got: {text}"
-    );
-    assert!(
-        !text.contains("blindness:"),
-        "no absence claim under gaps, got: {text}"
-    );
 }
 
 #[test]

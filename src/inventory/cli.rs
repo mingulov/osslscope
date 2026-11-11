@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths]\n       osslscope inspect --pid PID [--json] [--resolve-paths]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows (default off; discovery JSON carries machine path evidence; never in diagnostics).\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
+const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths] [-v]\n       osslscope inspect --pid PID [--json] [--resolve-paths] [-v]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths] [-v]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows (default off; --json acquires machine path evidence without the flag; never in diagnostics).\n-v/--verbose (repeatable, -vv = 2) raises human detail only: -v adds grouped gaps, per-module exports, and full per-process state; -vv adds per-object gap records and safe counters. Default human output is quiet; JSON output is complete at every level.\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
 /// Value-taking options of [`parse`]: the scan router consumes the
 /// token after each of these, so flag-shaped values never misroute.
@@ -45,6 +45,13 @@ pub(crate) struct Options {
     /// T5 `--resolve-paths` (rule 1): argv only, default off. No
     /// config-file or env enablement exists anywhere (cell 7).
     pub(crate) resolve_paths: bool,
+    /// Human detail level: `-v`/`--verbose` repeatable, `-vv` = 2,
+    /// clamped at 2 (default 0 is quiet). Gates detail volume
+    /// only — exits, stderr, counts, and JSON bytes are identical
+    /// at every level. v0.6.0 P0-3: report/check/service human
+    /// redesign stays P1; verbosity applies to
+    /// scan/inspect/provider/crypto-watch/doctor routes.
+    pub(crate) verbosity: u8,
 }
 pub(crate) fn parse(command: &str, args: &[String]) -> Result<Options, ()> {
     parse_inner(command, args, false)
@@ -63,12 +70,20 @@ fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Opt
         interval: None,
         duration: None,
         resolve_paths: false,
+        verbosity: 0,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" if !options.json => options.json = true,
             "--resolve-paths" if !options.resolve_paths => options.resolve_paths = true,
+            // Repeatable, clamped at 2 after the loop. `-q`/`--quiet`
+            // stay unknown (exit 2, empty stdout): the default is
+            // already quiet, so no quiet flag exists.
+            "-v" | "--verbose" => {
+                options.verbosity = options.verbosity.saturating_add(1);
+            }
+            "-vv" => options.verbosity = 2,
             "--observe-crypto" if allow_crypto && !crypto => crypto = true,
             "--watch" if command == "scan" && !options.watch => options.watch = true,
             "--interval" if command == "scan" && options.interval.is_none() => {
@@ -120,6 +135,7 @@ fn parse_inner(command: &str, args: &[String], allow_crypto: bool) -> Result<Opt
     if command != "scan" && command != "inspect" {
         return Err(());
     }
+    options.verbosity = options.verbosity.min(2);
     Ok(options)
 }
 
@@ -446,21 +462,36 @@ fn human_exe(process: &ProcessRecord) -> String {
 
 /// Per-process verdict line: `pid= comm= exe= modules= status=`.
 /// `status` is `complete` iff no gap names this pid (unnamed,
-/// process-wide gaps do not mark any single process partial).
-fn verdict_line(process: &ProcessRecord, gaps: &[Gap]) -> String {
+/// process-wide gaps do not mark any single process partial). At
+/// `-v` and above the line extends with full per-process state
+/// (`starttime= namespaces= provider_activation=
+/// provider_interfaces= execution=`); level 0 stays a strict
+/// prefix.
+fn verdict_line(process: &ProcessRecord, gaps: &[Gap], verbosity: u8) -> String {
     let status = if gaps.iter().any(|g| g.pid == Some(process.pid)) {
         "partial"
     } else {
         "complete"
     };
-    format!(
+    let mut line = format!(
         "pid={} comm={} exe={} modules={} status={}",
         process.pid,
         human_comm(process),
         human_exe(process),
         process.modules.len(),
         status
-    )
+    );
+    if verbosity >= 1 {
+        line.push_str(&format!(
+            " starttime={} namespaces={} provider_activation={} provider_interfaces={} execution={}",
+            process.starttime,
+            super::human_namespaces(&process.namespaces),
+            process.provider_activation.word(),
+            process.provider_interfaces.word(),
+            process.execution.word()
+        ));
+    }
+    line
 }
 
 /// Exact per-reason counts line (`gaps:` for snapshots, `errors:`
@@ -495,29 +526,72 @@ fn counts_line(label: &str, reasons: impl Iterator<Item = GapReason>, rerun_hint
 /// Human snapshot render (v0.6.0 P0-3): MEANING + per-process
 /// verdict lines with their module rows + identity totals + exact
 /// per-reason gap counts (+ the blindness line when conclusive).
-/// Never emits JSON bytes. `verbosity` arrives in Task 2 (`-v` adds
-/// grouped gaps/exports/full state, `-vv` per-object records/safe
-/// counters); Task 1 renders level 0 for every input.
+/// Never emits JSON bytes. Verbosity gates detail volume only
+/// (0 = counts line; 1 = + full gap groups + `exports=[...]` per
+/// module row + full per-process state; 2 = + per-object gap
+/// records + safe counters); exits, stderr, counts, and hashes
+/// (short at every level) are identical throughout.
 pub(crate) fn human_snapshot(
     writer: &mut impl Write,
     snapshot: &Snapshot,
     paths: &super::resolve::TerminalPathWriter,
     verbosity: u8,
 ) -> io::Result<()> {
-    // Task 2 owns levels 1+: clamped here so a future caller can
-    // never observe an unclamped level.
-    let _level = verbosity.min(2);
+    // Clamped here so a future caller can never observe an
+    // unclamped level.
+    let level = verbosity.min(2);
     writer.write_all(MEANING.as_bytes())?;
     for process in &snapshot.processes {
-        writeln!(writer, "{}", verdict_line(process, &snapshot.gaps))?;
-        for row in paths.object_rows(std::slice::from_ref(process)) {
-            writeln!(writer, "{row}")?;
+        writeln!(writer, "{}", verdict_line(process, &snapshot.gaps, level))?;
+        let rows = paths.object_rows(std::slice::from_ref(process));
+        // `object_rows` builds exactly one row per module in order;
+        // the zip below appends each module's own exports.
+        debug_assert_eq!(rows.len(), process.modules.len());
+        if level >= 1 {
+            for (row, module) in rows.iter().zip(process.modules.iter()) {
+                writeln!(
+                    writer,
+                    "{row} {}",
+                    super::human_exports(&module.info.exports)
+                )?;
+            }
+        } else {
+            for row in &rows {
+                writeln!(writer, "{row}")?;
+            }
         }
     }
     let (verified, locator) = snapshot.identity_counts();
     writer.write_all(super::identity_totals_line(verified, locator).as_bytes())?;
     writer
         .write_all(counts_line("gaps", snapshot.gaps.iter().map(|g| g.reason), true).as_bytes())?;
+    if level >= 1 {
+        let block = super::gap_groups_block(
+            snapshot
+                .gaps
+                .iter()
+                .map(|g| (g.reason.word(), g.device, g.pid)),
+            "",
+        );
+        writer.write_all(block.as_bytes())?;
+    }
+    if level >= 2 {
+        for gap in &snapshot.gaps {
+            writeln!(
+                writer,
+                "gap pid={} device={} reason={} errno={}",
+                gap.pid.map_or("-".to_string(), |p| p.to_string()),
+                gap.device.map_or("-".to_string(), |d| d.to_string()),
+                gap.reason.word(),
+                gap.errno.map_or("-".to_string(), |e| e.to_string())
+            )?;
+        }
+        writeln!(
+            writer,
+            "counters: read_bytes={} objects_inspected={}",
+            snapshot.totals.read_bytes, snapshot.totals.objects_inspected
+        )?;
+    }
     if super::snapshot_conclusively_without_openssl(snapshot) {
         writer.write_all(super::blindness_line().as_bytes())?;
     }
@@ -582,7 +656,11 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
         let terminal = output.is_terminal();
         let acquire = acquire_paths(options.resolve_paths, options.json, terminal);
         let render_paths = options.resolve_paths && !options.json;
+        // Read before the Selection moves below consume the vectors.
+        let verbosity = options.verbosity;
         if options.watch {
+            // Task 3 (watch delta) owns watch human verbosity; until
+            // then `-v` parses but the watch arm renders level 0.
             let _signals = match WatchSignals::install() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -655,7 +733,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
             let rendered = if options.json {
                 render_json(&result, &mut output)
             } else {
-                human_snapshot(&mut output, &result, &writer, 0)
+                human_snapshot(&mut output, &result, &writer, verbosity)
             };
             rendered.map(|()| {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
@@ -679,7 +757,7 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
             let rendered = if options.json {
                 render_json(&result, &mut output)
             } else {
-                human_snapshot(&mut output, &result, &writer, 0)
+                human_snapshot(&mut output, &result, &writer, verbosity)
             };
             rendered.map(|()| {
                 let reasons: Vec<GapReason> = result.gaps.iter().map(|g| g.reason).collect();
@@ -696,6 +774,8 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 &result.resolve,
             );
             // v0.6.0 P0-3 stdout split: rows by default, JSON opt-in.
+            // The --module route stays flat at every verbosity (Task 1
+            // decision: no per-object detail planned there).
             let rendered = if options.json {
                 render_json(&result, &mut output)
             } else {
@@ -722,9 +802,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Architecture, CaptureInterval, FileVersionStatus, Gap, GapReason, IdentityAvailability,
-        IdentityStatus, ModuleInfo, ModuleRecord, NamespaceIds, ObjectKind, ProcessRecord, Scope,
-        ScopeRecord, Snapshot, SnapshotMode, coalesce_gaps,
+        Api, Architecture, CaptureInterval, FileVersionStatus, Gap, GapReason,
+        IdentityAvailability, IdentityStatus, ModuleInfo, ModuleRecord, NamespaceId, NamespaceIds,
+        ObjectKind, ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode, coalesce_gaps,
     };
     use super::*;
 
@@ -903,7 +983,7 @@ mod tests {
         snap.processes[0].exe = Some("/usr/bin/python3".to_string());
         snap.processes[0].exe_status = IdentityAvailability::Available;
         assert_eq!(
-            super::verdict_line(&snap.processes[0], &snap.gaps),
+            super::verdict_line(&snap.processes[0], &snap.gaps, 0),
             "pid=1 comm=py?thon exe=bin/python3 modules=0 status=complete"
         );
         snap.gaps.push(Gap {
@@ -914,7 +994,7 @@ mod tests {
             errno: None,
             actor_euid: None,
         });
-        assert!(super::verdict_line(&snap.processes[0], &snap.gaps).ends_with("status=partial"));
+        assert!(super::verdict_line(&snap.processes[0], &snap.gaps, 0).ends_with("status=partial"));
     }
 
     #[test]
@@ -1073,6 +1153,156 @@ mod tests {
         assert!(!out.contains("gaps:"), "{out}");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["gaps"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn verbosity_parses_repeatable_and_clamps_at_two() {
+        let parse = |command: &str, flags: &[&str]| {
+            super::parse_inner(
+                command,
+                &flags.iter().map(|f| f.to_string()).collect::<Vec<_>>(),
+                false,
+            )
+        };
+        assert_eq!(parse("scan", &[]).unwrap().verbosity, 0);
+        assert_eq!(parse("scan", &["-v"]).unwrap().verbosity, 1);
+        assert_eq!(parse("scan", &["--verbose"]).unwrap().verbosity, 1);
+        assert_eq!(parse("scan", &["-v", "-v"]).unwrap().verbosity, 2);
+        assert_eq!(parse("scan", &["-vv"]).unwrap().verbosity, 2);
+        assert_eq!(parse("scan", &["-vv", "-v"]).unwrap().verbosity, 2);
+        assert_eq!(parse("scan", &["-v", "-v", "-v"]).unwrap().verbosity, 2);
+        assert_eq!(
+            parse("inspect", &["--pid", "1", "-vv"]).unwrap().verbosity,
+            2
+        );
+        // No quiet flag exists: the default is already quiet.
+        assert!(parse("scan", &["-q"]).is_err());
+        assert!(parse("scan", &["--quiet"]).is_err());
+        assert!(parse("scan", &["-vvv"]).is_err());
+    }
+
+    #[test]
+    fn observation_state_words_match_json() {
+        for state in [
+            super::super::ObservationState::Unknown,
+            super::super::ObservationState::NotObserved,
+        ] {
+            let json = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                json,
+                serde_json::Value::String(state.word().into()),
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn human_namespaces_and_exports_fragments() {
+        assert_eq!(
+            super::super::human_namespaces(&NamespaceIds::default()),
+            "pid=-,mount=-"
+        );
+        assert_eq!(
+            super::super::human_namespaces(&NamespaceIds {
+                pid: Some(NamespaceId {
+                    device: 5,
+                    inode: 123
+                }),
+                mount: None,
+            }),
+            "pid=5:123,mount=-"
+        );
+        assert_eq!(super::super::human_exports(&[]), "exports=[]");
+        assert_eq!(
+            super::super::human_exports(&[Api::OsslProviderInit, Api::EvpDigestUpdate]),
+            "exports=[ossl_provider_init, evp_digest_update]"
+        );
+    }
+
+    #[test]
+    fn human_snapshot_verbosity_levels_add_groups_state_records_counters() {
+        let mut module = module_with(IdentityStatus::Verified);
+        module.info.sha256 = "a".repeat(64);
+        module.info.exports = vec![Api::OsslProviderInit, Api::EvpDigestUpdate];
+        let mut snap = snapshot_with(vec![module]);
+        snap.processes[0].namespaces.pid = Some(NamespaceId {
+            device: 5,
+            inode: 123,
+        });
+        snap.totals.read_bytes = 4096;
+        snap.totals.objects_inspected = 7;
+        snap.gaps = vec![
+            Gap {
+                pid: Some(7),
+                device: Some(1),
+                inode: Some(10),
+                reason: GapReason::TooLarge,
+                errno: Some(libc::EPERM),
+                actor_euid: Some(1001),
+            },
+            Gap {
+                pid: None,
+                device: None,
+                inode: None,
+                reason: GapReason::Deadline,
+                errno: None,
+                actor_euid: None,
+            },
+        ];
+        let render = |verbosity: u8| {
+            let paths = super::super::resolve::TerminalPathWriter::new(false, false, &snap.resolve);
+            let mut buf = Vec::new();
+            super::human_snapshot(&mut buf, &snap, &paths, verbosity).unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        let counts = "gaps: 2 (deadline=1 too_large=1; rerun with -v for per-object detail)\n";
+        let l0 = render(0);
+        assert!(l0.contains(counts), "{l0}");
+        assert!(!l0.contains("exports="), "{l0}");
+        assert!(!l0.contains("gaps ("), "{l0}");
+        assert!(!l0.contains("starttime="), "{l0}");
+        assert!(!l0.contains("gap pid="), "{l0}");
+        assert!(!l0.contains("counters:"), "{l0}");
+        let l1 = render(1);
+        assert!(l1.contains(counts), "{l1}");
+        assert!(
+            l1.contains("exports=[ossl_provider_init, evp_digest_update]"),
+            "{l1}"
+        );
+        assert!(l1.contains("gaps (2 total in 2 groups):"), "{l1}");
+        assert!(
+            l1.contains("starttime=0 namespaces=pid=5:123,mount=-"),
+            "{l1}"
+        );
+        assert!(
+            l1.contains(
+                "provider_activation=unknown provider_interfaces=unknown execution=not_observed"
+            ),
+            "{l1}"
+        );
+        assert!(!l1.contains("gap pid="), "{l1}");
+        assert!(!l1.contains("counters:"), "{l1}");
+        let l2 = render(2);
+        assert!(l2.contains(counts), "{l2}");
+        assert!(
+            l2.contains("gap pid=7 device=1 reason=too_large errno=1"),
+            "{l2}"
+        );
+        assert!(
+            l2.contains("gap pid=- device=- reason=deadline errno=-"),
+            "{l2}"
+        );
+        assert!(
+            l2.contains("counters: read_bytes=4096 objects_inspected=7"),
+            "{l2}"
+        );
+        // Unclamped callers still render level 2; short hashes at
+        // every level (the 64-hex fixture never leaks in full).
+        assert_eq!(render(9), l2);
+        for out in [&l0, &l1, &l2] {
+            assert!(!out.contains(&"a".repeat(64)), "{out}");
+            assert!(out.contains("sha256=aaaaaaaaaaaa"), "{out}");
+        }
     }
 
     #[test]

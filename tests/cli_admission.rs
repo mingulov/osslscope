@@ -1100,3 +1100,33 @@ fn discovery_module_path_only_scope_failure_is_exit4() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(err, "osslscope discovery: requested scope unavailable\n");
 }
+
+#[test]
+fn v060_verbosity_contract() {
+    let me = std::process::id().to_string();
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    let run = |extra: &[&str]| {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(["scan", "--pid", &me]);
+        for e in extra {
+            cmd.arg(e);
+        }
+        cmd.output().unwrap()
+    };
+    let base = run(&[]);
+    let v1 = run(&["-v"]);
+    let v2 = run(&["-vv"]);
+    let v3 = run(&["-vv", "-v"]);
+    assert_eq!(base.status.code(), v1.status.code());
+    assert_eq!(base.status.code(), v2.status.code());
+    assert_eq!(base.stderr, v1.stderr);
+    assert_eq!(v2.stdout, v3.stdout, "verbosity must clamp at 2");
+    let s1 = String::from_utf8_lossy(&v1.stdout);
+    assert!(
+        s1.contains("groups") || s1.contains("exports"),
+        "no -v detail"
+    );
+    let bad = run(&["--no-such-flag"]);
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(bad.stdout.is_empty());
+}

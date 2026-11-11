@@ -111,6 +111,12 @@ pub struct CryptoWatchConfig {
     pub resolve_paths: bool,
     /// Stdout is a terminal (caller-observed). Render-only.
     pub terminal: bool,
+    /// Human detail level (`-v`/`--verbose` repeatable, `-vv` = 2,
+    /// clamped at 2; default 0 is quiet). Gates detail volume
+    /// only — exits, stderr, and NDJSON bytes are identical at
+    /// every level. v0.6.0 P0-3: report/check/service human
+    /// redesign stays P1.
+    pub verbosity: u8,
 }
 impl Default for CryptoWatchConfig {
     fn default() -> Self {
@@ -122,6 +128,7 @@ impl Default for CryptoWatchConfig {
             interval: Duration::from_secs(1),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         }
     }
 }
@@ -609,6 +616,9 @@ struct DeferredRemoved {
     ineligible: u64,
     closed: u64,
 }
+/// Buffered human gap entry: the grouping key (reason/device/pid)
+/// plus the selected `errno` for `-vv` per-object records.
+type PendingGap = (GapReason, Option<u64>, Option<u32>, Option<i32>);
 struct Output<'a, W> {
     writer: &'a mut W,
     sequence: u64,
@@ -616,12 +626,17 @@ struct Output<'a, W> {
     /// Human-only gap buffer: discovery gaps coalesce until the next
     /// record flushes one grouped block. Bounded by one sample's gaps
     /// (flushed by the records that follow); the JSON path never
-    /// buffers, so NDJSON stays one envelope per gap.
-    pending_gaps: Vec<(GapReason, Option<u64>, Option<u32>)>,
+    /// buffers, so NDJSON stays one envelope per gap. Each entry
+    /// carries the selected `errno` so `-vv` can render per-object
+    /// records (grouping still keys on reason/device/pid only).
+    pending_gaps: Vec<PendingGap>,
     /// T5 `--resolve-paths` render flags (external F4): fragments
     /// render iff `resolve_paths && terminal && !json`.
     resolve_paths: bool,
     terminal: bool,
+    /// Human detail level, clamped at 2 (see
+    /// [`CryptoWatchConfig::verbosity`]).
+    verbosity: u8,
 }
 /// 6A one deferral record (owned: scan borrows don't outlive the
 /// tick). Retained-entry records are computed at flush time from
@@ -655,7 +670,8 @@ impl<W: Write> Output<'_, W> {
     fn emit(&mut self, record: Record<'_>) -> io::Result<()> {
         if !self.json {
             if let Record::Gap { gap } = &record {
-                self.pending_gaps.push((gap.reason, gap.device, gap.pid));
+                self.pending_gaps
+                    .push((gap.reason, gap.device, gap.pid, gap.errno));
             } else {
                 self.flush_gaps()?;
                 self.human(&record)?;
@@ -733,15 +749,16 @@ impl<W: Write> Output<'_, W> {
         )
     }
     /// 6A: emit one batch of deferral records — human groups
-    /// past 8 rows, JSON emits one envelope each, in batch order
-    /// (retained entries by key, then oldest-first drop records).
+    /// past 8 rows (level 0; `-v` and above print every row),
+    /// JSON emits one envelope each, in batch order (retained
+    /// entries by key, then oldest-first drop records).
     fn emit_limit_batch(&mut self, recs: Vec<LimitRec>) -> io::Result<()> {
-        const ROWS: usize = 8;
+        let cap = self.rows_cap();
         if recs.is_empty() {
             return Ok(());
         }
-        if !self.json && recs.len() > ROWS {
-            for rec in recs.iter().take(ROWS) {
+        if !self.json && recs.len() > cap {
+            for rec in recs.iter().take(cap) {
                 self.human(&Record::Limit {
                     incarnation: &rec.incarnation,
                     reason: rec.reason,
@@ -750,7 +767,7 @@ impl<W: Write> Output<'_, W> {
                 })?;
                 self.sequence += 1;
             }
-            writeln!(self.writer, "Deferred omitted={}", recs.len() - ROWS)?;
+            writeln!(self.writer, "Deferred omitted={}", recs.len() - cap)?;
             self.sequence += 1;
             self.writer.flush()?;
             return Ok(());
@@ -767,25 +784,37 @@ impl<W: Write> Output<'_, W> {
     }
     /// 6A per-root ignored-descendant volume (§1.7): human-only,
     /// conditional (the coordinator calls it only when nonzero),
-    /// bounded to 8 roots + omitted count.
+    /// bounded to 8 roots + omitted count at level 0 (`-v` and
+    /// above print every root).
     fn emit_ignored_line(&mut self, ignored: &BTreeMap<u32, u64>) -> io::Result<()> {
-        const ROWS: usize = 8;
+        let cap = self.rows_cap();
         if self.json || ignored.is_empty() {
             return Ok(());
         }
         write!(self.writer, "Lifecycle ignored:")?;
-        for (root, count) in ignored.iter().take(ROWS) {
+        for (root, count) in ignored.iter().take(cap) {
             write!(self.writer, " root={root} forks={count}")?;
         }
-        if ignored.len() > ROWS {
-            write!(self.writer, " roots omitted={}", ignored.len() - ROWS)?;
+        if ignored.len() > cap {
+            write!(self.writer, " roots omitted={}", ignored.len() - cap)?;
         }
         writeln!(self.writer)?;
         self.sequence += 1;
         self.writer.flush()?;
         Ok(())
     }
-    /// Flush buffered human gaps as one grouped block (no-op when empty).
+    /// Bounded-list cap for human rows: 8 with explicit omitted
+    /// counts at level 0, unbounded at `-v` and above.
+    fn rows_cap(&self) -> usize {
+        if self.verbosity.min(2) >= 1 {
+            usize::MAX
+        } else {
+            8
+        }
+    }
+    /// Flush buffered human gaps as one grouped block (no-op when
+    /// empty); `-vv` appends one per-object record per gap after
+    /// the block.
     fn flush_gaps(&mut self) -> io::Result<()> {
         if self.pending_gaps.is_empty() {
             return Ok(());
@@ -793,16 +822,34 @@ impl<W: Write> Output<'_, W> {
         let block = inventory::gap_groups_block(
             self.pending_gaps
                 .iter()
-                .map(|(reason, device, pid)| (reason.word(), *device, *pid)),
+                .map(|(reason, device, pid, _)| (reason.word(), *device, *pid)),
             "",
         );
+        self.writer.write_all(block.as_bytes())?;
+        if self.verbosity.min(2) >= 2 {
+            for (reason, device, pid, errno) in self.pending_gaps.iter() {
+                writeln!(
+                    self.writer,
+                    "gap pid={} device={} reason={} errno={}",
+                    pid.map_or("-".to_string(), |p| p.to_string()),
+                    device.map_or("-".to_string(), |d| d.to_string()),
+                    reason.word(),
+                    errno.map_or("-".to_string(), |e| e.to_string())
+                )?;
+            }
+        }
         self.pending_gaps.clear();
-        self.writer.write_all(block.as_bytes())
+        Ok(())
     }
     /// Fixed-size summaries per record. Never dump a document, raw path, symbol
     /// or target string; large object/gap populations get explicit omitted counts.
     fn human(&mut self, record: &Record<'_>) -> io::Result<()> {
-        const ROWS: usize = 8;
+        // Verbosity gates detail volume only (0 = bounded rows +
+        // grouped gaps; 1 = + unbounded lists + per-module exports
+        // + full per-process state; 2 = + per-object gap records);
+        // NDJSON is identical at every level.
+        let level = self.verbosity.min(2);
+        let cap = self.rows_cap();
         let w = &mut self.writer;
         match record {
             Record::Start {
@@ -822,13 +869,24 @@ impl<W: Write> Output<'_, W> {
                 process: p,
                 sidecar,
             } => {
-                writeln!(
+                write!(
                     w,
                     "Process {} start={} objects={} execution=not_observed coverage=unknown (passive inventory)",
                     p.pid,
                     p.starttime,
                     p.modules.len()
                 )?;
+                if level >= 1 {
+                    write!(
+                        w,
+                        " namespaces={} provider_activation={} provider_interfaces={} execution={}",
+                        inventory::human_namespaces(&p.namespaces),
+                        p.provider_activation.word(),
+                        p.provider_interfaces.word(),
+                        p.execution.word()
+                    )?;
+                }
+                writeln!(w)?;
                 let mut verified = 0usize;
                 let mut locator = 0usize;
                 for m in &p.modules {
@@ -853,7 +911,7 @@ impl<W: Write> Output<'_, W> {
                         sidecar,
                     )
                 });
-                for m in p.modules.iter().take(ROWS) {
+                for m in p.modules.iter().take(cap) {
                     write!(
                         w,
                         "  Object sha256={} kind={:?} identity={:?} interfaces={}",
@@ -867,10 +925,13 @@ impl<W: Write> Output<'_, W> {
                     }) {
                         write!(w, " path={fragment}")?;
                     }
+                    if level >= 1 {
+                        write!(w, " {}", inventory::human_exports(&m.info.exports))?;
+                    }
                     writeln!(w)?;
                 }
-                if p.modules.len() > ROWS {
-                    writeln!(w, "  Objects omitted={}", p.modules.len() - ROWS)?;
+                if p.modules.len() > cap {
+                    writeln!(w, "  Objects omitted={}", p.modules.len() - cap)?;
                 }
                 Ok(())
             }
@@ -1025,13 +1086,13 @@ impl<W: Write> Output<'_, W> {
                     .collect();
                 ops.sort_unstable();
                 ops.dedup();
-                for op in ops.iter().take(ROWS) {
+                for op in ops.iter().take(cap) {
                     writeln!(w, "  op={}", crate::report::op_display(*op))?;
                 }
-                if ops.len() > ROWS {
-                    writeln!(w, "  Ops omitted={}", ops.len() - ROWS)?;
+                if ops.len() > cap {
+                    writeln!(w, "  Ops omitted={}", ops.len() - cap)?;
                 }
-                for row in rows("api_activity").iter().take(ROWS) {
+                for row in rows("api_activity").iter().take(cap) {
                     let Some(api) = row["api"]
                         .as_u64()
                         .and_then(|v| u32::try_from(v).ok())
@@ -1055,8 +1116,8 @@ impl<W: Write> Output<'_, W> {
                     };
                     writeln!(w, "  api={} entries={entries}", api.export_name())?;
                 }
-                if rows("api_activity").len() > ROWS {
-                    writeln!(w, "  Apis omitted={}", rows("api_activity").len() - ROWS)?;
+                if rows("api_activity").len() > cap {
+                    writeln!(w, "  Apis omitted={}", rows("api_activity").len() - cap)?;
                 }
                 let counters = d["completeness"]["counters"]
                     .as_array()
@@ -1064,7 +1125,7 @@ impl<W: Write> Output<'_, W> {
                     .unwrap_or(&[]);
                 // Counter names are observer-owned finite vocabulary; limit text
                 // width even if a future producer extends that vocabulary.
-                for c in counters.iter().take(ROWS) {
+                for c in counters.iter().take(cap) {
                     let name = c["name"].as_str().unwrap_or("unknown");
                     let label: String = name
                         .chars()
@@ -1077,24 +1138,25 @@ impl<W: Write> Output<'_, W> {
                         c["value"].as_u64().unwrap_or(0)
                     )?;
                 }
-                if counters.len() > ROWS {
-                    writeln!(w, "  Gaps omitted={}", counters.len() - ROWS)?;
+                if counters.len() > cap {
+                    writeln!(w, "  Gaps omitted={}", counters.len() - cap)?;
                 }
                 // P1c diagnostic channels: the same shaped cause the NDJSON
-                // envelope carries in full, bounded here by the ROWS
-                // discipline with explicit omitted counts.
+                // envelope carries in full, bounded here by the rows
+                // discipline (level 0) with explicit omitted counts;
+                // `-v` and above lift every such bound.
                 for (name, label) in [
                     ("attach_diagnostics", "Attach diagnostic"),
                     ("refusal_diagnostics", "Refusal diagnostic"),
                 ] {
                     let diags = d[name].as_array().map(Vec::as_slice).unwrap_or(&[]);
-                    for diag in diags.iter().take(ROWS) {
+                    for diag in diags.iter().take(cap) {
                         if let Some(text) = diag.as_str() {
                             writeln!(w, "  {label}: {}", crate::report::safe_display(text))?;
                         }
                     }
-                    if diags.len() > ROWS {
-                        writeln!(w, "  {label}s omitted={}", diags.len() - ROWS)?;
+                    if diags.len() > cap {
+                        writeln!(w, "  {label}s omitted={}", diags.len() - cap)?;
                     }
                 }
                 Ok(())
@@ -4007,9 +4069,10 @@ pub(crate) struct ServiceEngine {
     run: RunState,
     sequence: u64,
     json: bool,
-    pending_gaps: Vec<(GapReason, Option<u64>, Option<u32>)>,
+    pending_gaps: Vec<PendingGap>,
     resolve_paths: bool,
     terminal: bool,
+    verbosity: u8,
     tracing: bool,
     reservation: usize,
     trust_reviewed: bool,
@@ -4063,6 +4126,7 @@ impl ServiceEngine {
             pending_gaps: Vec::new(),
             resolve_paths: config.resolve_paths,
             terminal: config.terminal,
+            verbosity: config.verbosity,
         };
         let mut scanner = match ScopedScanner::new_budgeted(
             config.selection.clone(),
@@ -4194,6 +4258,7 @@ impl ServiceEngine {
             pending_gaps,
             resolve_paths: config.resolve_paths,
             terminal: config.terminal,
+            verbosity: config.verbosity,
             tracing,
             reservation,
             trust_reviewed,
@@ -4224,6 +4289,7 @@ impl ServiceEngine {
             pending_gaps: std::mem::take(&mut self.pending_gaps),
             resolve_paths: self.resolve_paths,
             terminal: self.terminal,
+            verbosity: self.verbosity,
         };
         let ctx = AdmitCtx {
             pool: &self.pool,
@@ -4497,6 +4563,7 @@ impl ServiceEngine {
             pending_gaps: std::mem::take(&mut self.pending_gaps),
             resolve_paths: self.resolve_paths,
             terminal: self.terminal,
+            verbosity: self.verbosity,
         };
         let run = &mut self.run;
         let port = &mut self.port;
@@ -5057,6 +5124,7 @@ pub fn run(args: &[String]) -> ExitCode {
         interval: options.interval.unwrap_or(Duration::from_secs(1)),
         resolve_paths: options.resolve_paths,
         terminal,
+        verbosity: options.verbosity,
         ..Default::default()
     };
     // Resolver admits at most two 16MiB objects, with bounded verification/read
@@ -5140,6 +5208,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -5191,6 +5260,7 @@ mod tests {
                 pending_gaps: Vec::new(),
                 resolve_paths: false,
                 terminal: false,
+                verbosity: 0,
             };
             out.emit(Record::ProcessObservation {
                 incarnation: &identity,
@@ -5302,6 +5372,7 @@ mod tests {
                 pending_gaps: Vec::new(),
                 resolve_paths: false,
                 terminal: false,
+                verbosity: 0,
             };
             out.emit(Record::ProcessObservation {
                 incarnation: &identity,
@@ -5369,6 +5440,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -5398,6 +5470,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -5658,6 +5731,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let mut admitted = Vec::new();
         run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
@@ -5890,6 +5964,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         out.emit(Record::Discovery {
             process: &process,
@@ -5929,6 +6004,7 @@ mod tests {
                 pending_gaps: Vec::new(),
                 resolve_paths,
                 terminal,
+                verbosity: 0,
             };
             out.emit(Record::Discovery {
                 process: &process,
@@ -5982,6 +6058,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         out.emit(Record::ProcessObservation {
             incarnation: &identity,
@@ -6033,6 +6110,7 @@ mod tests {
                 pending_gaps: Vec::new(),
                 resolve_paths: false,
                 terminal: false,
+                verbosity: 0,
             };
             out.emit_membership(
                 &identity,
@@ -6085,6 +6163,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         for g in &gaps {
             out.emit(Record::Gap { gap: g }).unwrap();
@@ -6131,6 +6210,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         for _ in 0..2 {
             out.emit(Record::Gap { gap: &gap }).unwrap();
@@ -6144,6 +6224,93 @@ mod tests {
             2,
             "one block per sample batch, got: {text}"
         );
+    }
+
+    #[test]
+    fn human_verbosity_adds_state_exports_rows_and_gap_records() {
+        // Ten modules: level 0 bounds Object rows at 8 with an
+        // omitted count; -v prints every row with exports and full
+        // process state; -vv adds per-object gap records.
+        let modules: Vec<serde_json::Value> = (0..10)
+            .map(|i| {
+                serde_json::json!({
+                    "info": {"sha256": "cc", "device": 1, "inode": 100 + i, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": ["ossl_provider_init"], "depends_on_libcrypto": false, "depends_on_libssl": false},
+                    "identity_status": "verified"
+                })
+            })
+            .collect();
+        let process: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 0},
+            "namespaces": {"pid": {"device": 5, "inode": 6}, "mount": null},
+            "pid": 42, "starttime": 123,
+            "modules": modules,
+            "provider_activation": "unknown", "provider_interfaces": "unknown", "execution": "not_observed"
+        }))
+        .unwrap();
+        let gap = inventory::Gap {
+            pid: Some(11),
+            device: Some(7),
+            inode: None,
+            reason: inventory::GapReason::Deadline,
+            errno: Some(libc::EPERM),
+            actor_euid: None,
+        };
+        let render = |verbosity: u8| {
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: false,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+                verbosity,
+            };
+            out.emit(Record::Gap { gap: &gap }).unwrap();
+            out.emit(Record::Discovery {
+                process: &process,
+                sidecar: None,
+            })
+            .unwrap();
+            drop(out);
+            String::from_utf8(bytes).unwrap()
+        };
+        let objects = |text: &str| text.lines().filter(|l| l.starts_with("  Object ")).count();
+        let l0 = render(0);
+        assert_eq!(objects(&l0), 8, "level 0 bounds rows, got: {l0}");
+        assert!(l0.contains("Objects omitted=2"), "{l0}");
+        assert!(!l0.contains("exports="), "{l0}");
+        assert!(!l0.contains("namespaces="), "{l0}");
+        assert!(!l0.contains("gap pid="), "{l0}");
+        let l1 = render(1);
+        assert_eq!(objects(&l1), 10, "level 1 lifts the bound, got: {l1}");
+        assert!(!l1.contains("omitted="), "{l1}");
+        assert!(l1.contains("exports=[ossl_provider_init]"), "{l1}");
+        assert!(
+            l1.contains("namespaces=pid=5:6,mount=-"),
+            "full process state, got: {l1}"
+        );
+        assert!(
+            l1.contains(
+                "provider_activation=unknown provider_interfaces=unknown execution=not_observed"
+            ),
+            "{l1}"
+        );
+        assert!(!l1.contains("gap pid="), "{l1}");
+        let l2 = render(2);
+        assert_eq!(
+            l2.matches("exports=[ossl_provider_init]").count(),
+            10,
+            "{l2}"
+        );
+        assert!(
+            l2.contains("gap pid=11 device=7 reason=deadline errno=1"),
+            "per-object record, got: {l2}"
+        );
+        // The grouped block stays at every level (established shape).
+        for text in [&l0, &l1, &l2] {
+            assert!(text.contains("gaps (1 total in 1 group):"), "{text}");
+        }
     }
 
     #[test]
@@ -6166,6 +6333,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         out.emit(Record::Gap {
             gap: &gap(inventory::GapReason::Deadline),
@@ -6413,6 +6581,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         super::bind_event(&mut run, &mut sink, &exec(Some(admit - 1)), true).unwrap();
         assert_eq!(
@@ -6433,6 +6602,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         super::bind_event(&mut run, &mut sink, &exec(Some(admit)), true).unwrap();
         assert_eq!(
@@ -6541,6 +6711,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let mut admitted = Vec::new();
         run.sample_members(&mut sink, &snapshot, &ctx, &mut admitted)
@@ -6606,6 +6777,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let fresh = Incarnation {
             pid: 999_999,
@@ -6673,6 +6845,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let event = crate::capture::LifecycleEvent {
             kind: LifecycleKind::Exec,
@@ -6738,6 +6911,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let event = crate::capture::LifecycleEvent {
             kind: LifecycleKind::Exec,
@@ -6852,6 +7026,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let mut admitted = Vec::new();
         let admitted_now = run
@@ -6907,6 +7082,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let event = crate::capture::LifecycleEvent {
             kind: LifecycleKind::Exit,
@@ -6939,6 +7115,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         super::bind_event(&mut run, &mut sink, &event, true).unwrap();
         drop(sink);
@@ -6987,6 +7164,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let fresh = Incarnation {
             pid: 999_999,
@@ -7104,6 +7282,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let fresh = Incarnation {
             pid: 999_999,
@@ -7325,6 +7504,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let mut admitted = Vec::new();
         run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
@@ -7631,6 +7811,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let mut admitted = Vec::new();
         run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
@@ -7991,6 +8172,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let fresh = Incarnation {
             pid: 99_999,
@@ -8156,6 +8338,7 @@ mod tests {
                 pending_gaps: Vec::new(),
                 resolve_paths: false,
                 terminal: false,
+                verbosity: 0,
             };
             let mut admitted = Vec::new();
             run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
@@ -8270,6 +8453,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         run.stash_pending_epoch(
             &mut sink,
@@ -8324,6 +8508,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let event = crate::capture::LifecycleEvent {
             kind: LifecycleKind::Exec,
@@ -8521,6 +8706,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         let mut admitted = Vec::new();
         run.scan_admit(&mut sink, &snapshot, &ctx, &mut admitted)
@@ -8568,6 +8754,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         }
     }
     #[test]
@@ -8708,6 +8895,7 @@ mod tests {
             pending_gaps: Vec::new(),
             resolve_paths: false,
             terminal: false,
+            verbosity: 0,
         };
         run.emit_pending_drops_all(&mut out).unwrap();
         drop(out);
