@@ -3531,14 +3531,22 @@ mod session_tests {
         // instead of re-parsing; assert the contention honestly
         // here (the old `.unwrap()` asserted a fit production
         // never had).
-        assert!(
-            pool.reserve(crate::inventory::elf::parser_scratch_bytes(6_386_528).unwrap())
-                .is_none()
-        );
-        assert!(
-            pool.reserve(crate::inventory::elf::parser_scratch_bytes(128 << 20).unwrap())
-                .is_none()
-        );
+        //
+        // CI-fix: per-CPU map growth leaves that contention only
+        // on many-CPU hosts; 4-CPU CI runners left slack a stock
+        // parse fit (check.yml runs 42861210551 + 42974059023).
+        // The clamp takes the host-dependent slack (leaving one
+        // byte short of a stock scratch); already-contended
+        // hosts take no filler.
+        let stock = crate::inventory::elf::parser_scratch_bytes(6_386_528).unwrap();
+        {
+            let _pressure = pool.clamp_free_to(stock - 1);
+            assert!(pool.reserve(stock).is_none());
+            assert!(
+                pool.reserve(crate::inventory::elf::parser_scratch_bytes(128 << 20).unwrap())
+                    .is_none()
+            );
+        }
         drop(two);
         drop(one);
         let expected = record();

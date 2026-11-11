@@ -5443,12 +5443,22 @@ mod tests {
         // synthetic exhaustion still refuses (the pool
         // arithmetic is unchanged). BPF map right-sizing stays
         // round-2 work.
+        //
+        // CI-fix: the free-space premise above holds only on
+        // many-CPU hosts (per-CPU map growth); 4-CPU CI runners
+        // left slack a stock parse fit (check.yml runs
+        // 42861210551 + 42974059023). The clamp below takes that
+        // host-dependent slack, leaving exactly one small-module
+        // scratch free, so the refuse/fit/recover legs hold on
+        // any CPU count. Already-contended hosts take no filler.
         let pool = MemoryPool::new(GLOBAL_BYTES);
         let _coordinator = pool.reserve(COORDINATOR_BYTES + 32_768).unwrap();
         let _scanner = pool.reserve(4096 * 160 + 100 * 4096).unwrap();
         let cost = FocusedSession::reservation_bytes(&objects()).unwrap() + 29_480;
         let _a = pool.reserve(cost).unwrap();
         let _b = pool.reserve(cost).unwrap();
+        let small = inventory::elf::parser_scratch_bytes(1 << 20).unwrap();
+        let _pressure = pool.clamp_free_to(small);
         // Contended: the stock parse refuses (loud `None` — the
         // scan records a `ReadLimit` gap, never a silent skip).
         assert!(
@@ -5457,10 +5467,10 @@ mod tests {
             "stock libcrypto parse refuses under two max sessions"
         );
         // Partial availability: small modules still parse (a
-        // 1 MiB module needs ~17.9 MiB < ~21.8 MiB free).
+        // 1 MiB module needs ~17.9 MiB, exactly the clamped free).
         {
-            let _small = pool
-                .reserve(inventory::elf::parser_scratch_bytes(1 << 20).unwrap())
+            let _fit = pool
+                .reserve(small)
                 .expect("small-module parse fits under two sessions");
         }
         // Recovery: the stock parse fits again once a session ends.
