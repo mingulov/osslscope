@@ -237,8 +237,25 @@ impl GapReason {
     }
 }
 
+/// Availability of file-backed OpenSSL version evidence (v0.6.0 D4):
+/// file facts only, never a runtime claim. `Present` carries exactly
+/// one distinct recognized version id in `file_openssl_version`; every
+/// other status leaves it `None`. Old documents default to `Absent`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileVersionStatus {
+    Present,
+    #[default]
+    Absent,
+    Ambiguous,
+    NotFullyScanned,
+}
+
 /// File identity plus finite interface evidence; never paths or raw symbols.
 /// `device` is the native Linux `st_dev` value, paired with `st_ino`.
+/// `file_soname` is the object's OWN `DT_SONAME`, never inherited from a
+/// dependency; `file_openssl_version` is the singular validated rodata
+/// version id, or `None` with the reason in `file_version_status`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModuleInfo {
@@ -251,6 +268,12 @@ pub struct ModuleInfo {
     pub exports: Vec<Api>,
     pub depends_on_libcrypto: bool,
     pub depends_on_libssl: bool,
+    #[serde(default)]
+    pub file_soname: Option<String>,
+    #[serde(default)]
+    pub file_openssl_version: Option<String>,
+    #[serde(default)]
+    pub file_version_status: FileVersionStatus,
 }
 
 mod procfs;
@@ -813,9 +836,9 @@ mod tests {
     #[test]
     fn v060_path_keys_round_trip_and_old_docs_default() {
         use super::{
-            Architecture, IdentityStatus, LocatorKind, MapsSource, MapsSpelling, MapsVerification,
-            ModuleInfo, ModuleRecord, ObjectKind, PathEncoding, PathUnavailableReason,
-            VerifiedPath,
+            Architecture, FileVersionStatus, IdentityStatus, LocatorKind, MapsSource, MapsSpelling,
+            MapsVerification, ModuleInfo, ModuleRecord, ObjectKind, PathEncoding,
+            PathUnavailableReason, VerifiedPath,
         };
         let record = ModuleRecord {
             info: ModuleInfo {
@@ -828,6 +851,9 @@ mod tests {
                 exports: vec![],
                 depends_on_libcrypto: false,
                 depends_on_libssl: false,
+                file_soname: None,
+                file_openssl_version: None,
+                file_version_status: FileVersionStatus::Absent,
             },
             identity_status: IdentityStatus::Verified,
             verified_path: Some(VerifiedPath {

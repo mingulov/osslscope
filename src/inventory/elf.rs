@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Data parsing only: no loader calls, symbol execution or target inspection.
 
-use super::{Api, Architecture, GapReason, ModuleInfo, ObjectKind};
+use super::{Api, Architecture, FileVersionStatus, GapReason, ModuleInfo, ObjectKind};
 use goblin::container::{Container, Ctx, Endian};
 use goblin::elf::{Elf, dynamic, header, program_header, section_header, sym};
 use sha2::{Digest as _, Sha256};
@@ -137,6 +137,11 @@ pub(crate) fn inspect_file_budgeted(
     } else {
         ObjectKind::Other
     };
+    // File version evidence (v0.6.0 D4): the object's OWN SONAME plus a
+    // singular validated rodata version id, or null with a finite reason.
+    // Strings never change `kind` and never cross object boundaries.
+    let (file_soname, file_openssl_version, file_version_status) =
+        extract_file_version(&bytes, &elf);
     let result = ModuleInfo {
         sha256: Sha256::digest(&bytes)
             .iter()
@@ -150,6 +155,9 @@ pub(crate) fn inspect_file_budgeted(
         exports: exports.into_iter().collect(),
         depends_on_libcrypto,
         depends_on_libssl,
+        file_soname,
+        file_openssl_version,
+        file_version_status,
     };
     verify_unchanged(file, &before)?;
     Ok(result)
@@ -564,4 +572,234 @@ fn recognized_api(name: &str) -> Option<Api> {
 
         _ => return None,
     })
+}
+
+/// Maximum total `.rodata*` bytes scanned for version evidence in one file.
+/// Past this the version is honestly `NotFullyScanned`, never a partial read.
+const MAX_VERSION_SCAN_BYTES: usize = 4 * 1024 * 1024;
+
+/// The object's OWN `DT_SONAME` plus the singular recognized rodata version
+/// id (optional validated date), or `None` with a finite reason. Each
+/// `SHT_PROGBITS` section named `.rodata*` is scanned independently with
+/// checked extents; sections are never concatenated. Strings found here
+/// never change `kind` and are never attributed to another object.
+pub(crate) fn extract_file_version(
+    bytes: &[u8],
+    elf: &Elf,
+) -> (Option<String>, Option<String>, FileVersionStatus) {
+    let soname = elf.soname.map(str::to_string);
+    let mut candidates = Vec::new();
+    let mut scanned: usize = 0;
+    for section in &elf.section_headers {
+        if section.sh_type != section_header::SHT_PROGBITS {
+            continue;
+        }
+        let is_rodata = elf
+            .shdr_strtab
+            .get_at(section.sh_name)
+            .is_some_and(|name| name.starts_with(".rodata"));
+        if !is_rodata {
+            continue;
+        }
+        let (Some(offset), Some(size)) = (
+            usize::try_from(section.sh_offset).ok(),
+            usize::try_from(section.sh_size).ok(),
+        ) else {
+            return (soname, None, FileVersionStatus::NotFullyScanned);
+        };
+        let Some(end) = offset.checked_add(size) else {
+            return (soname, None, FileVersionStatus::NotFullyScanned);
+        };
+        let Some(region) = bytes.get(offset..end) else {
+            return (soname, None, FileVersionStatus::NotFullyScanned);
+        };
+        let Some(total) = scanned.checked_add(region.len()) else {
+            return (soname, None, FileVersionStatus::NotFullyScanned);
+        };
+        if total > MAX_VERSION_SCAN_BYTES {
+            return (soname, None, FileVersionStatus::NotFullyScanned);
+        }
+        scanned = total;
+        candidates.extend(scan_rodata_region(region));
+    }
+    let (version, status) = select_file_version(&candidates);
+    (soname, version, status)
+}
+
+/// Singular-or-null selection (D4): dedupe; exactly one distinct candidate
+/// yields `Present`, two or more yield `None` + `Ambiguous` (never
+/// first-match-wins), zero yields `None` + `Absent`.
+pub(crate) fn select_file_version(candidates: &[String]) -> (Option<String>, FileVersionStatus) {
+    let distinct: BTreeSet<&str> = candidates.iter().map(String::as_str).collect();
+    if distinct.len() > 1 {
+        return (None, FileVersionStatus::Ambiguous);
+    }
+    match distinct.into_iter().next() {
+        Some(one) => (Some(one.to_string()), FileVersionStatus::Present),
+        None => (None, FileVersionStatus::Absent),
+    }
+}
+
+/// Closed-grammar matches in one region: `OpenSSL <major>.<minor>.<patch>[a-z]?`
+/// with 1-2 digits per component, optionally followed by a validated
+/// `<day> <Mon> <year>` date. Near-misses never match; a match carries the
+/// date only when fully valid, else the bare recognized id.
+pub(crate) fn scan_rodata_region(region: &[u8]) -> Vec<String> {
+    const PREFIX: &[u8] = b"OpenSSL ";
+    let mut found = Vec::new();
+    let mut i = 0;
+    while i + PREFIX.len() <= region.len() {
+        // No match inside a larger token (`FooOpenSSL 1.2.3` is not evidence).
+        let start_boundary = i == 0 || !region[i - 1].is_ascii_alphanumeric();
+        if start_boundary && region[i..].starts_with(PREFIX) {
+            if let Some(matched) = parse_version_at(&region[i..]) {
+                found.push(matched);
+            }
+        }
+        i += 1;
+    }
+    found
+}
+
+/// Recognized id at `input` (which starts with `OpenSSL `), or `None` for a
+/// near-miss. Every consumed byte is validated ASCII, so UTF-8 holds.
+fn parse_version_at(input: &[u8]) -> Option<String> {
+    let mut pos = "OpenSSL ".len();
+    for step in 0..3 {
+        if step > 0 {
+            if input.get(pos) != Some(&b'.') {
+                return None;
+            }
+            pos += 1;
+        }
+        let digits = digit_run(input, pos, 2);
+        if digits.is_empty() {
+            return None;
+        }
+        pos += digits.len();
+    }
+    if input.get(pos).is_some_and(|b| b.is_ascii_lowercase()) {
+        pos += 1;
+    }
+    if input.get(pos) == Some(&b' ') {
+        // Optional validated date; any failure keeps the bare core id.
+        if let Some(date_end) = parse_version_date(input, pos) {
+            pos = date_end;
+        }
+    } else if continues_token(input.get(pos)) {
+        return None;
+    }
+    String::from_utf8(input[..pos].to_vec()).ok()
+}
+
+/// End offset of a fully validated ` <day> <Mon> <year>` date at `pos`
+/// (which holds the separating space): day 1-31, one of the twelve month
+/// words, four-digit year at a token boundary. Else `None`.
+fn parse_version_date(input: &[u8], pos: usize) -> Option<usize> {
+    const MONTHS: [&[u8]; 12] = [
+        b"Jan", b"Feb", b"Mar", b"Apr", b"May", b"Jun", b"Jul", b"Aug", b"Sep", b"Oct", b"Nov",
+        b"Dec",
+    ];
+    let day = digit_run(input, pos + 1, 2);
+    if day.is_empty() {
+        return None;
+    }
+    let day_value = day.iter().fold(0u32, |n, d| n * 10 + u32::from(d - b'0'));
+    if !(1..=31).contains(&day_value) {
+        return None;
+    }
+    let mut p = pos + 1 + day.len();
+    if input.get(p) != Some(&b' ') {
+        return None;
+    }
+    p += 1;
+    let month_end = p.checked_add(3)?;
+    if !MONTHS.contains(&input.get(p..month_end)?) {
+        return None;
+    }
+    p = month_end;
+    if input.get(p) != Some(&b' ') {
+        return None;
+    }
+    p += 1;
+    let year = digit_run(input, p, 4);
+    if year.len() != 4 {
+        return None;
+    }
+    p += year.len();
+    if continues_token(input.get(p)) {
+        return None;
+    }
+    Some(p)
+}
+
+/// Up to `max` ASCII digits at `pos` (possibly empty; callers decide).
+fn digit_run(input: &[u8], pos: usize, max: usize) -> &[u8] {
+    let mut end = pos;
+    while end < input.len() && end - pos < max && input[end].is_ascii_digit() {
+        end += 1;
+    }
+    &input[pos..end]
+}
+
+/// The token continues past the match (`3.0.0.1`, `3.0.0X`, `2021a`): the
+/// full token is outside the closed grammar, so the prefix is not evidence.
+fn continues_token(next: Option<&u8>) -> bool {
+    next.is_some_and(|&b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+' | b'_'))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn v060_version_extraction_is_singular_or_null_with_reason() {
+        let path = std::path::Path::new("/usr/lib/x86_64-linux-gnu/libcrypto.so.3");
+        if !path.exists() {
+            panic!("system libcrypto fixture missing; run on a lane with OpenSSL installed");
+        }
+        let info = super::inspect_module(path, 134_217_728).unwrap();
+        assert_eq!(info.file_soname.as_deref(), Some("libcrypto.so.3"));
+        match info.file_version_status {
+            super::FileVersionStatus::Present => {
+                let v = info.file_openssl_version.as_deref().unwrap();
+                assert!(v.starts_with("OpenSSL 3."), "unexpected {v}");
+            }
+            super::FileVersionStatus::Absent
+            | super::FileVersionStatus::Ambiguous
+            | super::FileVersionStatus::NotFullyScanned => {
+                assert!(info.file_openssl_version.is_none());
+            }
+        }
+        // NSS libssl3.so fixture (or any non-OpenSSL ELF): no OpenSSL version, kind untouched.
+        let nss = std::path::Path::new("/usr/lib/x86_64-linux-gnu/libssl3.so");
+        if nss.exists() {
+            let nss_info = super::inspect_module(nss, 134_217_728).unwrap();
+            assert!(nss_info.file_openssl_version.is_none());
+            assert_ne!(
+                nss_info.file_version_status,
+                super::FileVersionStatus::Present
+            );
+        }
+        // Pure selection rule: dedupe + singular-or-null, no first-match-wins.
+        let two = vec![
+            "OpenSSL 3.0.0 7 Sep 2021".to_string(),
+            "OpenSSL 3.1.0 14 Mar 2023".to_string(),
+        ];
+        let (version, status) = super::select_file_version(&two);
+        assert_eq!(status, super::FileVersionStatus::Ambiguous);
+        assert!(version.is_none());
+        let dup = vec![
+            "OpenSSL 3.0.0 7 Sep 2021".to_string(),
+            "OpenSSL 3.0.0 7 Sep 2021".to_string(),
+        ];
+        let (version, status) = super::select_file_version(&dup);
+        assert_eq!(status, super::FileVersionStatus::Present);
+        assert_eq!(version.as_deref(), Some("OpenSSL 3.0.0 7 Sep 2021"));
+        let (version, status) = super::select_file_version(&[]);
+        assert_eq!(status, super::FileVersionStatus::Absent);
+        assert!(version.is_none());
+        // Region scan: closed grammar only; near-misses never match.
+        let region = b"\0OpenSSL 3.0.0 7 Sep 2021\0OpenSSL X\0 LibreSSL 3.0\0";
+        let found = super::scan_rodata_region(region);
+        assert_eq!(found, vec!["OpenSSL 3.0.0 7 Sep 2021".to_string()]);
+    }
 }

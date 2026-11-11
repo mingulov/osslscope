@@ -590,9 +590,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Architecture, CaptureInterval, Gap, GapReason, IdentityAvailability, IdentityStatus,
-        ModuleInfo, ModuleRecord, NamespaceIds, ObjectKind, ProcessRecord, Scope, ScopeRecord,
-        Snapshot, SnapshotMode, coalesce_gaps,
+        Architecture, CaptureInterval, FileVersionStatus, Gap, GapReason, IdentityAvailability,
+        IdentityStatus, ModuleInfo, ModuleRecord, NamespaceIds, ObjectKind, ProcessRecord, Scope,
+        ScopeRecord, Snapshot, SnapshotMode, coalesce_gaps,
     };
     use super::*;
 
@@ -608,6 +608,9 @@ mod tests {
                 exports: Vec::new(),
                 depends_on_libcrypto: false,
                 depends_on_libssl: false,
+                file_soname: None,
+                file_openssl_version: None,
+                file_version_status: FileVersionStatus::Absent,
             },
             identity_status: status,
             verified_path: None,
