@@ -1,6 +1,28 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## Unreleased (v0.6.0 machine surface)
+
+- Additive discovery machine fields, pinned by
+  `schemas/discovery-v1.json`: `verified_path` /
+  `verified_path_unavailable` / `maps_spelling` on every mapped record
+  (JSON always carries them; `--resolve-paths` now gates only the human
+  TTY `path=` fragment), bounded `comm`/`comm_status` + `exe`/`exe_status`
+  process identity, own-`DT_SONAME` `file_soname` with validated rodata
+  `file_openssl_version` / `file_version_status`, and `errno`/`actor_euid`
+  on gaps. File evidence is never a runtime claim. Reader break: v0.5
+  `deny_unknown_fields` readers reject v0.6 documents; v0.6 readers accept
+  v0.5 documents. Machine consumers must parse `--json`/NDJSON only — the
+  human stdout shape is owned by the human-surface plan, which splits
+  stdout by mode (human rows by default, pure JSON under `--json`).
+- `scan --module` takes a file PATH only (repeatable); bare hashes fail
+  with exit 4 and a message naming the PATH form. Digest selectors
+  (`sha256:...`) are not accepted in v0.6.
+- `--json` snapshot bytes are deterministic across runs modulo wall-clock
+  fields (`interval`, `capture_unix_ms`) and the live-input `read_bytes`
+  accounting total (covered by
+  `v060_json_bytes_deterministic_modulo_wall_clock`).
+
 ## 0.5.0 (candidate — 2026-11-02)
 
 - Honesty + attribution slice over 0.4.0: named acquisition-failure

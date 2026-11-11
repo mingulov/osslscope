@@ -2290,3 +2290,32 @@ fn calls_present_per_op_comes_from_map_join() {
     assert_eq!(snap.queries_observed, 10);
     assert_eq!(snap.queries_by_op, vec![(1, 6), (12, 4)]);
 }
+
+#[test]
+fn v060_json_bytes_deterministic_modulo_wall_clock() {
+    let me = std::process::id().to_string();
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args(["scan", "--pid", &me, "--json"])
+            .output()
+            .unwrap();
+        let mut doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        doc["interval"] = serde_json::Value::Null;
+        // Live-input accounting, not emission: read_bytes charges the
+        // target's /proc stat+maps bytes, which change as the scanned
+        // process itself runs (see inventory_cli.rs "Procfs text can
+        // grow with the new VMA"). Never byte-stable across live runs.
+        doc["totals"]["read_bytes"] = serde_json::Value::Null;
+        for proc in doc["processes"].as_array_mut().unwrap() {
+            proc["interval"] = serde_json::Value::Null;
+            for module in proc["modules"].as_array_mut().unwrap() {
+                if !module["verified_path"].is_null() {
+                    module["verified_path"]["capture_unix_ms"] = serde_json::Value::Null;
+                }
+            }
+        }
+        runs.push(serde_json::to_string(&doc).unwrap());
+    }
+    assert_eq!(runs[0], runs[1]);
+}

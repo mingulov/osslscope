@@ -437,6 +437,16 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".push((key.clone(), (module.info.device, module.info.inode)));",
             1,
         ),
+        // v0.6.0 D1/D3 machine publish: the row's native ModuleInfo
+        // identity is passed as the expected pair and re-proven by
+        // exact fstat equality (`identity_matches`) — same raw
+        // domain, never maps text or an encoded device word.
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "(module.info.device, module.info.inode),",
+            1,
+        ),
         (
             "src/inventory/resolve.rs",
             "raw",
@@ -464,6 +474,15 @@ fn h5_t3_every_device_site_names_one_domain() {
         // Namespace and cgroup descriptor IDs retain native dev_t; selector
         // fingerprints compare fstat metadata only, never encoded map IDs.
         ("src/inventory/procfs.rs", "raw", "device: m.dev(),", 1),
+        // v0.6.0 D3 incarnation bracket: fstat st_dev of the opened
+        // ns/mnt FD into NamespaceId, compared only against a second
+        // same-domain incarnation read (before != after fails closed).
+        (
+            "src/inventory/procfs.rs",
+            "raw",
+            "device: metadata.dev(),",
+            1,
+        ),
         ("src/inventory/scope.rs", "raw", "device: m.dev(),", 1),
         ("src/inventory/scope.rs", "raw", "m.dev(),", 1),
         // Mapping text major/minor is converted with libc::makedev before

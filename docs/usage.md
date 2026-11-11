@@ -111,13 +111,16 @@ signals to targets. It does not inject code or change the target. Procfs
 pseudofiles are unavailable as module inputs; procfs links to ordinary ELF
 backing (such as `/proc/PID/exe` or `/proc/self/fd/N`) remain supported.
 
-`--resolve-paths` (argv only, default off) renders verified host paths on
-human rows, and only there: paths render only on an interactive
-terminal. `--json`/NDJSON, CBOM, policy records, diagnostics, and exit
-codes are byte-identical with the flag on or off; redirected human
-output renders `path=(not-a-terminal)` placeholders instead of paths
-(so redirected human bytes do differ from flag-off by those
-placeholders — never by path text). Only objects whose identity was
+Machine records always carry path evidence: `--json`/NDJSON documents
+include `verified_path`/`verified_path_unavailable`/`maps_spelling` on
+every mapped record whether or not `--resolve-paths` is passed, so
+machine bytes are identical with the flag on or off.
+`--resolve-paths` (argv only, default off) gates only the human `path=`
+fragment, and only on an interactive terminal. CBOM, policy records,
+diagnostics, and exit codes are byte-identical with the flag on or off;
+redirected human output renders `path=(not-a-terminal)` placeholders
+instead of paths (so redirected human bytes do differ from flag-off by
+those placeholders — never by path text). Only objects whose identity was
 verified render a path; locator candidates render `path=(unverified)`
 without any resolution attempt, and failures render `(unavailable)` or
 `(changed)` without ever publishing the attempted spelling. Resolved
@@ -270,16 +273,47 @@ with a gap. `scope_record` contains only the selected cgroup's native device/ino
 identity and computed supplied-module SHA-256 IDs.
 Module output has `mode: "module"`, deduplicated `modules`, finite `errors`
 with zero-based `input_index`, work totals, limits and capability status.
-Module facts carry the file's own `file_soname` plus validated rodata
-`file_openssl_version` with `file_version_status`; process records carry
-`comm`/`comm_status` and `exe`/`exe_status`; mapped records carry
-`verified_path`, `verified_path_unavailable` and `maps_spelling`; gaps may
-carry `errno`/`actor_euid`. The machine shape is pinned by
-`schemas/discovery-v1.json` (snapshot, module, and watch records). Reader
-break: v0.5 `deny_unknown_fields` readers reject v0.6 documents; v0.6 readers
-accept v0.5 documents. No raw target paths, names, symbol strings or mapping
-addresses enter either output or discovery diagnostics. Human output includes
-the interpretation followed by the same readable structured records.
+Mapped records carry path evidence. `verified_path` is set only for
+`verified` rows and holds the proven object path: `path` (the retained
+identity, re-proven at capture time), `path_encoding` (`utf8` verbatim,
+or `utf8_percent_escaped` when the raw bytes were not valid UTF-8 —
+valid runs stay verbatim, each invalid byte becomes uppercase `%XX`;
+over-long spellings truncate with `…`), `locator_kind`
+(`host_direct`, `container_layer`, or `proc_root_anchored` — HOW the
+path was proven), and `capture_unix_ms` (WHEN — an observer wall
+clock). Every other row instead carries the finite
+`verified_path_unavailable` reason (`unverified_identity`, `no_locator`,
+`resolve_failed`, `changed`, `missing`, `unavailable`) — never a path.
+`maps_spelling` is the row's OWN `/proc/PID/maps` pathname for this
+pid+starttime (`spelling`, `source: proc_maps`, `verification:
+unverified`): an unverified hint, never authority, and never joined
+across processes by device/inode. A path lookup or matching
+device/inode alone never promotes a candidate to verified backing.
+Process records carry `comm`/`comm_status` and `exe`/`exe_status`
+sampled from `/proc` (operator-visible readings, never authentication
+or proof): each status is `available`, `unreadable`, `changed` (the
+incarnation recycled mid-sample — both values are dropped), or
+`too_long` (over the 64-byte `comm` / 4096-byte `exe` bound — the
+truncated prefix is still published). `comm` is sanitized for display;
+`exe` is verbatim lossy-decoded bytes, so human renderers must sanitize
+it before display. Module facts carry the file's OWN `file_soname`
+(`DT_SONAME`, never inherited from a dependency) plus the singular
+validated rodata `file_openssl_version` with `file_version_status`
+(`present`, `absent`, `ambiguous`, or `not_fully_scanned` — only
+`present` carries a version string). Gaps may carry `errno`/`actor_euid`
+from the refused backing operation. File evidence is never a runtime
+claim: SONAME and rodata version strings describe bytes on disk, not
+loaded, activated, or executed code — no version-to-vulnerability claim
+may be derived from them. The machine shape is pinned by
+`schemas/discovery-v1.json` (snapshot, module, and watch records).
+Reader break: v0.5 `deny_unknown_fields` readers reject v0.6 documents;
+v0.6 readers accept v0.5 documents. No raw symbol strings or mapping
+addresses enter either output or discovery diagnostics; target path and
+identity strings enter machine JSON as documented above. Machine
+consumers must parse `--json`/NDJSON only: the human stdout shape is
+owned by the human-surface plan
+(`docs/superpowers/plans/2026-11-11-v060-human-surface.md`), which splits
+stdout by mode (human rows by default, pure JSON under `--json`).
 
 Module metadata describes a SHA-256, numeric device/inode/size, architecture,
 finite recognized exports and dependency flags. The interface classifications
@@ -300,7 +334,9 @@ maps read, 4096 processes, 1024 objects per process, 16384 total object attempts
 1 GiB aggregate charged read work and a 30-second cooperative deadline.
 Supplied files use the module, total object, read and deadline limits, with
 repeated unchanged files cached rather than hashed again. Read totals are
-conservative charges including EOF probes, not exact kernel byte counts. The
+conservative charges including EOF probes, not exact kernel byte counts.
+Live `/proc` bytes are charged too, so `read_bytes` varies across runs
+against a running target and must not be compared for equality. The
 deadline is checked between operations; it cannot interrupt a stalled syscall
 or an admitted bounded parse. A budget failure preserves earlier independent
 results and reports a finite gap/error. Discovery snapshots are not atomic;
