@@ -640,7 +640,7 @@ fn human_watch_with_gaps_never_claims_blindness() {
     child.kill().unwrap();
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(
-        text.contains("snapshot 1:"),
+        text.contains("provider sample:"),
         "fixture precondition: sampled, got: {text}"
     );
     assert!(
@@ -677,7 +677,7 @@ fn human_watch_states_blindness_once_before_sampling_when_verified() {
     let pos = text
         .find("blindness: no-mapped-openssl")
         .expect("blocker printed");
-    let first_sample = text.find("snapshot 1:").expect("samples follow");
+    let first_sample = text.find("provider sample:").expect("samples follow");
     assert!(pos < first_sample, "blocker must precede sampling");
     assert_eq!(
         text.matches("blindness: no-mapped-openssl").count(),
@@ -777,7 +777,7 @@ fn human_watch_repeated_snapshot_batches_heartbeat() {
     ]);
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     assert!(
-        text.contains("snapshot 1:"),
+        text.contains("provider sample:"),
         "first batch full, got: {text}"
     );
     assert!(
@@ -795,4 +795,45 @@ fn has_64_hex(text: &str) -> bool {
     let bytes = text.as_bytes();
     bytes.len() >= 64
         && (0..=bytes.len() - 64).any(|i| bytes[i..i + 64].iter().all(|b| b.is_ascii_hexdigit()))
+}
+
+#[test]
+fn human_default_has_plain_header_without_jargon() {
+    // v0.6.0 Task 4 (W2/W5): dead-pid provider watch renders the
+    // plain-words header with none of the four jargon counters at
+    // default; `-vv` restores the full technical detail. (The
+    // honest `interval_unknown` line and per-fact `monotonic_ns`
+    // need a live session, so lib tests pin them synthetically.)
+    let f = Fixture::new();
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "scan",
+            "--pid",
+            "2147483647",
+            "--observe-providers",
+            "--watch",
+            "--duration",
+            "0.05",
+        ];
+        args.extend(extra.iter().copied());
+        f.cli(&args)
+    };
+    let base = run(&[]);
+    let v2 = run(&["-vv"]);
+    assert_eq!(base.status.code(), v2.status.code());
+    let t0 = String::from_utf8_lossy(&base.stdout).into_owned();
+    assert!(
+        t0.contains("provider sample: 0 modules, 0 facts"),
+        "no plain header, got: {t0}"
+    );
+    for word in ["drain_lag_ns", "facts=", "tracing=", "monotonic_ns"] {
+        assert!(!t0.contains(word), "{word} at default, got: {t0}");
+    }
+    assert!(!has_64_hex(&t0), "full hash at default");
+    let t2 = String::from_utf8_lossy(&v2.stdout).into_owned();
+    for word in ["drain_lag_ns=", "facts=", "tracing="] {
+        assert!(t2.contains(word), "{word} missing at -vv, got: {t2}");
+    }
+    redacted(&base);
+    redacted(&v2);
 }

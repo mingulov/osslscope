@@ -461,7 +461,12 @@ fn select_engine_libcrypto(
 /// Map an ENGINE attach failure to its session gap, or None when
 /// the outcome surfaces elsewhere (Deferred retries next
 /// snapshot; Close means shutdown is already closing the gate,
-/// which finish() reports itself).
+/// which finish() reports itself). The `Read` arm is the
+/// `IntervalCause::CountRead` producer (v0.6.0 W3-shard): a
+/// count-read failure, never a join miss — it surfaces through
+/// the focused/report route, while provider-observation records
+/// pin the same rendering contract for join misses.
+/// (`IntervalCause` lives in `provider_observation::schema`.)
 fn map_engine_attach_failure(f: CountFailure) -> Option<ObservationGap> {
     match f {
         CountFailure::Deferred | CountFailure::Close => None,

@@ -6853,3 +6853,37 @@ fn has_64_hex(text: &str) -> bool {
     bytes.len() >= 64
         && (0..=bytes.len() - 64).any(|i| bytes[i..i + 64].iter().all(|b| b.is_ascii_hexdigit()))
 }
+
+#[test]
+fn v060_human_has_no_long_hashes_no_jargon_honest_interval() {
+    let me = std::process::id().to_string();
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    for extra in [&[][..], &["-v"][..], &["-vv"][..]] {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.args(["scan", "--pid", &me]);
+        for e in extra {
+            cmd.arg(e);
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(!has_64_hex(&text), "64-hex at verbosity {extra:?}");
+    }
+    let watch = std::process::Command::new(bin)
+        .args([
+            "scan",
+            "--pid",
+            &me,
+            "--watch",
+            "--interval",
+            "1",
+            "--duration",
+            "2",
+        ])
+        .output()
+        .unwrap();
+    let wtext = String::from_utf8_lossy(&watch.stdout);
+    for word in ["drain_lag_ns", "facts=", "tracing=", "monotonic_ns"] {
+        assert!(!wtext.contains(word), "jargon in default watch: {word}");
+    }
+    assert!(!has_64_hex(&wtext), "64-hex in default watch");
+}

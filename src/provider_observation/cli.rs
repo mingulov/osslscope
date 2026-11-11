@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 //! Cooperative public-ABI observation. No executed assets or target bootstrap.
-use super::{ObservationBatch, ObservationGap, ObservationLimits, ProviderSession, artifact};
+use super::{
+    IntervalCause, ObservationBatch, ObservationGap, ObservationLimits, ProviderSession, artifact,
+};
 use crate::inventory::{
     self,
     scope::{ScopedScanner, Selection},
@@ -191,6 +193,12 @@ struct Record<'a> {
     snapshot: Option<&'a inventory::Snapshot>,
     facts: &'a [super::ObservationFact],
     gaps: &'a [ObservationGap],
+    /// Human-only causes for the interval gaps in [`Self::gaps`],
+    /// aligned in order (see
+    /// [`ObservationBatch::interval_causes`]). Skipped by serde:
+    /// the machine record is byte-identical.
+    #[serde(skip)]
+    interval_causes: &'a [IntervalCause],
     capabilities: &'a Capabilities,
     sampled_history: &'static str,
 }
@@ -234,19 +242,40 @@ impl Render for Record<'_> {
         // Verbosity gates detail volume only (0 = rows + grouped
         // gaps; 1 = + per-module exports + full per-process state;
         // 2 = + full fact payloads + per-object gap records + safe
-        // counters); hashes stay short at every level.
+        // counters + the jargon detail line); hashes stay short at
+        // every level.
         let level = verbosity.min(2);
-        writeln!(
-            writer,
-            "{} {}: interval_ns={}..{} drain_lag_ns={} facts={}",
-            self.record,
-            self.sequence,
-            self.interval.started_elapsed_ns,
-            self.interval.finished_elapsed_ns,
-            self.interval.drain_lag_ns,
-            self.facts.len()
-        )?;
-        human_capabilities(self.capabilities, writer)?;
+        // W5: the default header is plain words.
+        // Observation-only batches (drain/close) carry no snapshot,
+        // so they claim no module count — only batches with
+        // inventory name one.
+        match self.snapshot {
+            Some(snapshot) => {
+                let modules: usize = snapshot.processes.iter().map(|p| p.modules.len()).sum();
+                writeln!(
+                    writer,
+                    "provider sample: {modules} modules, {} facts",
+                    self.facts.len()
+                )?;
+            }
+            None => writeln!(writer, "provider sample: {} facts", self.facts.len())?,
+        }
+        // The technical header moves to `-vv` verbatim (indented):
+        // the interval range, drain lag, and record identity behind
+        // the plain summary above.
+        if level >= 2 {
+            writeln!(
+                writer,
+                "  detail {} {}: interval_ns={}..{} drain_lag_ns={} facts={}",
+                self.record,
+                self.sequence,
+                self.interval.started_elapsed_ns,
+                self.interval.finished_elapsed_ns,
+                self.interval.drain_lag_ns,
+                self.facts.len()
+            )?;
+            human_capabilities(self.capabilities, writer)?;
+        }
         if let Some(snapshot) = self.snapshot {
             writeln!(
                 writer,
@@ -320,7 +349,7 @@ impl Render for Record<'_> {
             let hash: String = fact.object_sha256.clone().into();
             write!(
                 writer,
-                "  fact pid={} starttime={} sha256={} generation={} api={} source={} operation={} class={} monotonic_ns={} context={} confidence={}",
+                "  fact pid={} starttime={} sha256={} generation={} api={} source={} operation={} class={}",
                 fact.pid,
                 fact.starttime,
                 crate::inventory::resolve::TerminalPathWriter::short_sha(&hash),
@@ -329,7 +358,16 @@ impl Render for Record<'_> {
                 finite(&fact.source)?,
                 finite(&fact.operation)?,
                 finite(&fact.class)?,
-                fact.monotonic_ns,
+            )?;
+            // The monotonic timestamp is `-vv` technics (W5); the
+            // default line keeps identity, operation, and
+            // classification.
+            if level >= 2 {
+                write!(writer, " monotonic_ns={}", fact.monotonic_ns)?;
+            }
+            write!(
+                writer,
+                " context={} confidence={}",
                 finite(&fact.context)?,
                 finite(&fact.confidence)?
             )?;
@@ -359,15 +397,16 @@ impl Render for Record<'_> {
                 writeln!(writer)?;
             }
         }
-        writer.write_all(observation_gap_block(self.gaps)?.as_bytes())?;
+        writer.write_all(observation_gap_block(self.gaps, self.interval_causes)?.as_bytes())?;
         Ok(())
     }
 }
 impl Render for End<'_> {
-    // The end record is status-critical and already minimal: byte-
-    // identical at every verbosity level. The cumulative word and
-    // notes are history, never detail volume (H2: never gated).
-    fn human(&self, writer: &mut impl Write, _verbosity: u8) -> io::Result<()> {
+    // The end record is status-critical: the verdict words above
+    // stay byte-identical at every verbosity level (the cumulative
+    // word and notes are history, never detail volume — H2: never
+    // gated). Only the capabilities line is `-vv` technics (W5).
+    fn human(&self, writer: &mut impl Write, verbosity: u8) -> io::Result<()> {
         writeln!(
             writer,
             "end {}: reason={} status={} elapsed_ns={} cumulative={}",
@@ -378,7 +417,9 @@ impl Render for End<'_> {
             self.cumulative.word()
         )?;
         writer.write_all(self.cumulative.notes().as_bytes())?;
-        human_capabilities(self.capabilities, writer)?;
+        if verbosity.min(2) >= 2 {
+            human_capabilities(self.capabilities, writer)?;
+        }
         if let Some(gap) = self.gap {
             writeln!(writer, "  inventory_gap={}", finite(&gap)?)?;
         }
@@ -504,18 +545,61 @@ fn inventory_gap_block(gaps: &[inventory::Gap]) -> io::Result<String> {
     ))
 }
 
-/// Human observation-gap block for one batch: `ObservationGap`
-/// carries no device/pid, so groups key on the finite word only.
-/// Empty when none.
-fn observation_gap_block(gaps: &[ObservationGap]) -> io::Result<String> {
-    let mut words = Vec::with_capacity(gaps.len());
-    for gap in gaps {
-        words.push(finite(gap)?);
+/// Human observation-gap block for one batch: non-interval
+/// gaps group as before (`ObservationGap` carries no device/pid,
+/// so groups key on the finite word only); each
+/// `interval_unknown` renders its honest one-line cause once,
+/// with `(x{n} more)` collapsing for repeats. Empty when none.
+fn observation_gap_block(gaps: &[ObservationGap], causes: &[IntervalCause]) -> io::Result<String> {
+    let mut words = Vec::new();
+    // Pair interval gaps with their aligned causes in order; a
+    // gap past the causes is causeless (explicit fallback, never
+    // a guessed cause); a cause past the gaps is dropped (the
+    // human line must not outclaim the machine record).
+    let mut count_read = 0usize;
+    let mut join_miss = 0usize;
+    let mut causeless = 0usize;
+    {
+        let mut causes = causes.iter().copied();
+        for gap in gaps {
+            if *gap == ObservationGap::IntervalUnknown {
+                match causes.next() {
+                    Some(IntervalCause::CountRead) => count_read += 1,
+                    Some(IntervalCause::JoinMiss) => join_miss += 1,
+                    None => causeless += 1,
+                }
+            } else {
+                words.push(finite(gap)?);
+            }
+        }
     }
-    Ok(crate::inventory::gap_groups_block(
-        words.iter().map(|w| (w.as_str(), None, None)),
-        "  ",
-    ))
+    let mut out =
+        crate::inventory::gap_groups_block(words.iter().map(|w| (w.as_str(), None, None)), "  ");
+    for (cause, count) in [
+        (IntervalCause::CountRead, count_read),
+        (IntervalCause::JoinMiss, join_miss),
+    ] {
+        if count == 0 {
+            continue;
+        }
+        out.push_str("  interval_unknown (timing/count gap: ");
+        out.push_str(cause.text());
+        out.push_str("; counts may be incomplete)");
+        if count > 1 {
+            out.push_str(&format!(" (x{} more)", count - 1));
+        }
+        out.push('\n');
+    }
+    if causeless > 0 {
+        out.push_str(
+            "  interval_unknown (timing/count gap: cause not recorded; counts may be incomplete)",
+        );
+        if causeless > 1 {
+            out.push_str(&format!(" (x{} more)", causeless - 1));
+        }
+        out.push('\n');
+    }
+    Ok(out)
 }
 impl<W: Write> Stream<'_, W> {
     fn mode(&self) -> &'static str {
@@ -536,6 +620,7 @@ impl<W: Write> Stream<'_, W> {
         let ObservationBatch {
             facts,
             mut gaps,
+            interval_causes,
             refusals: _,
             learned_sites: _,
             static_candidates: _,
@@ -625,6 +710,7 @@ impl<W: Write> Stream<'_, W> {
                 snapshot,
                 facts: &facts,
                 gaps: &gaps,
+                interval_causes: &interval_causes,
                 capabilities: &self.capabilities,
                 sampled_history: "incomplete",
             },
@@ -708,6 +794,15 @@ fn observe(options: &Options, writer: &mut impl Write, cancel: &AtomicBool) -> i
         Err(gap) => (
             None,
             ObservationBatch {
+                interval_causes: if gap == ObservationGap::IntervalUnknown {
+                    // Cancel-before-open (the only interval gap
+                    // born here — `open` never returns one): no
+                    // window joined, so the join-miss text holds;
+                    // the interruption itself rides the end record.
+                    vec![IntervalCause::JoinMiss]
+                } else {
+                    Vec::new()
+                },
                 gaps: vec![gap],
                 ..Default::default()
             },
@@ -916,36 +1011,41 @@ mod tests {
             snapshot: None,
             facts: &facts,
             gaps: &[],
+            interval_causes: &[],
             capabilities: &capabilities,
             sampled_history: "incomplete",
         };
-        let mut human = Vec::new();
-        emit(&record, &mut human, true, 0).unwrap();
-        let human = String::from_utf8(human).unwrap();
-        let lines: Vec<_> = human
+        let render = |verbosity: u8| {
+            let mut bytes = Vec::new();
+            emit(&record, &mut bytes, true, verbosity).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        // W5: operation/class stay at default; the monotonic
+        // timestamp is `-vv` technics.
+        let l0 = render(0);
+        let lines: Vec<_> = l0
             .lines()
             .filter(|line| line.starts_with("  fact "))
             .collect();
         assert_eq!(lines.len(), 2);
-        for (line, operation, class, timestamp) in [
-            (
-                lines[0],
-                "operation=\"digest\"",
-                "class=\"digest\"",
-                "monotonic_ns=9",
-            ),
-            (
-                lines[1],
-                "operation=\"cipher\"",
-                "class=\"cipher\"",
-                "monotonic_ns=10",
-            ),
+        for (line, operation, class) in [
+            (lines[0], "operation=\"digest\"", "class=\"digest\""),
+            (lines[1], "operation=\"cipher\"", "class=\"cipher\""),
         ] {
-            for expected in [operation, class, timestamp] {
+            for expected in [operation, class] {
                 assert!(line.contains(expected), "{line}");
             }
+            assert!(!line.contains("monotonic_ns="), "{line}");
         }
         assert_ne!(lines[0], lines[1]);
+        let l2 = render(2);
+        let stamped: Vec<_> = l2
+            .lines()
+            .filter(|line| line.starts_with("  fact "))
+            .collect();
+        assert_eq!(stamped.len(), 2);
+        assert!(stamped[0].contains("monotonic_ns=9"), "{}", stamped[0]);
+        assert!(stamped[1].contains("monotonic_ns=10"), "{}", stamped[1]);
         let mut json = Vec::new();
         emit(&record, &mut json, false, 0).unwrap();
         let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
@@ -1066,6 +1166,7 @@ mod tests {
                 snapshot: None,
                 facts: &facts,
                 gaps: &[],
+                interval_causes: &[],
                 capabilities: &capabilities,
                 sampled_history: "incomplete",
             };
@@ -1114,6 +1215,7 @@ mod tests {
             snapshot: None,
             facts: &[fact],
             gaps: &[],
+            interval_causes: &[],
             capabilities: &capabilities,
             sampled_history: "incomplete",
         };
@@ -1186,6 +1288,7 @@ mod tests {
             snapshot: Some(&snapshot),
             facts: &[],
             gaps: &[],
+            interval_causes: &[],
             capabilities: &capabilities,
             sampled_history: "incomplete",
         };
@@ -1227,18 +1330,170 @@ mod tests {
                 && inventory.contains("backing_unavailable device=7 pid=11: 2"),
             "inventory gaps coalesced, got: {inventory}"
         );
-        let observation = super::observation_gap_block(&[
-            ObservationGap::BpfUnavailable,
-            ObservationGap::BpfUnavailable,
-            ObservationGap::SnapshotLag,
-        ])
+        let observation = super::observation_gap_block(
+            &[
+                ObservationGap::BpfUnavailable,
+                ObservationGap::BpfUnavailable,
+                ObservationGap::SnapshotLag,
+            ],
+            &[],
+        )
         .unwrap();
         assert!(
             observation.contains("gaps (3 total in 2 groups):"),
             "observation gaps coalesced, got: {observation}"
         );
         assert_eq!(super::inventory_gap_block(&[]).unwrap(), "");
-        assert_eq!(super::observation_gap_block(&[]).unwrap(), "");
+        assert_eq!(super::observation_gap_block(&[], &[]).unwrap(), "");
+    }
+
+    // W5: the default record header is plain words; the four
+    // jargon counters (`drain_lag_ns`, `facts=`, `tracing=`,
+    // `monotonic_ns`) plus the interval range render at `-vv`
+    // only. W3-shard: `interval_unknown` carries its honest
+    // one-line cause, never a blanket "benign".
+    #[test]
+    fn human_default_has_plain_header_no_jargon_honest_interval() {
+        let fact: super::super::ObservationFact = serde_json::from_value(serde_json::json!({
+            "pid": 12, "starttime": 100, "object_sha256": "c".repeat(64), "generation": 1,
+            "context": { "state": "unknown" }, "source": "provider_query", "api": "provider_query_callback",
+            "operation": "digest", "class": "digest", "monotonic_ns": 9, "confidence": "unknown",
+            "payload": { "kind": "query_result", "outcome": "success", "cacheability": "cacheable" }
+        }))
+        .unwrap();
+        // Live own-pid snapshot: module counts vary by host, so the
+        // header assertion computes them from the same snapshot.
+        let snapshot = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![std::process::id()],
+            resolve_paths: false,
+            limits: crate::inventory::Limits::default(),
+        });
+        let modules: usize = snapshot.processes.iter().map(|p| p.modules.len()).sum();
+        let capabilities = Capabilities::new(true);
+        let gaps = [ObservationGap::IntervalUnknown];
+        let causes = [IntervalCause::JoinMiss];
+        let record = Record {
+            schema_version: SCHEMA,
+            mode: "watch",
+            record: "snapshot",
+            sequence: 1,
+            interval: Interval {
+                started_elapsed_ns: 0,
+                finished_elapsed_ns: 10,
+                drain_lag_ns: 10,
+            },
+            poll_interval: Duration::from_secs(1),
+            snapshot: Some(&snapshot),
+            facts: &[fact],
+            gaps: &gaps,
+            interval_causes: &causes,
+            capabilities: &capabilities,
+            sampled_history: "incomplete",
+        };
+        let render = |verbosity: u8| {
+            let mut bytes = Vec::new();
+            emit(&record, &mut bytes, true, verbosity).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let l0 = render(0);
+        assert!(
+            l0.contains(&format!("provider sample: {modules} modules, 1 facts")),
+            "{l0}"
+        );
+        for word in [
+            "drain_lag_ns",
+            "facts=",
+            "tracing=",
+            "monotonic_ns",
+            "interval_ns",
+        ] {
+            assert!(!l0.contains(word), "{word} at level 0: {l0}");
+        }
+        assert!(
+            l0.contains("interval_unknown (timing/count gap: observation window did not join; counts may be incomplete)"),
+            "{l0}"
+        );
+        assert!(!l0.contains("benign"), "{l0}");
+        let l1 = render(1);
+        for word in [
+            "drain_lag_ns",
+            "facts=",
+            "tracing=",
+            "monotonic_ns",
+            "interval_ns",
+        ] {
+            assert!(!l1.contains(word), "{word} at level 1: {l1}");
+        }
+        let l2 = render(2);
+        for word in ["drain_lag_ns=", "facts=", "tracing=", "monotonic_ns=9"] {
+            assert!(l2.contains(word), "{word} missing at level 2: {l2}");
+        }
+        // JSON keeps the full hash and every gap instance verbatim.
+        let mut json = Vec::new();
+        emit(&record, &mut json, false, 0).unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(json["facts"][0]["object_sha256"], "c".repeat(64));
+        assert_eq!(json["gaps"], serde_json::json!(["interval_unknown"]));
+    }
+
+    // W3-shard: one honest line per interval cause plus `(x{n}
+    // more)` collapsing; other gaps keep the grouped shape; a gap
+    // without a recorded cause degrades to an explicit fallback,
+    // never a guessed cause or a blanket "benign".
+    #[test]
+    fn observation_gap_block_explains_interval_unknown_with_cause() {
+        let join = super::observation_gap_block(
+            &[ObservationGap::IntervalUnknown],
+            &[IntervalCause::JoinMiss],
+        )
+        .unwrap();
+        assert_eq!(
+            join,
+            "  interval_unknown (timing/count gap: observation window did not join; counts may be incomplete)\n"
+        );
+        let read = super::observation_gap_block(
+            &[ObservationGap::IntervalUnknown],
+            &[IntervalCause::CountRead],
+        )
+        .unwrap();
+        assert_eq!(
+            read,
+            "  interval_unknown (timing/count gap: engine counter read failed; counts may be incomplete)\n"
+        );
+        let repeats = super::observation_gap_block(
+            &[
+                ObservationGap::IntervalUnknown,
+                ObservationGap::IntervalUnknown,
+                ObservationGap::IntervalUnknown,
+            ],
+            &[IntervalCause::JoinMiss, IntervalCause::JoinMiss],
+        )
+        .unwrap();
+        assert!(
+            repeats
+                .contains("observation window did not join; counts may be incomplete) (x1 more)"),
+            "repeat collapsing, got: {repeats}"
+        );
+        assert!(
+            repeats.contains("cause not recorded; counts may be incomplete)"),
+            "causeless remainder stays honest, got: {repeats}"
+        );
+        let mixed = super::observation_gap_block(
+            &[
+                ObservationGap::BpfUnavailable,
+                ObservationGap::IntervalUnknown,
+            ],
+            &[IntervalCause::JoinMiss],
+        )
+        .unwrap();
+        assert!(
+            mixed.contains("gaps (1 total in 1 group):")
+                && mixed.contains("observation window did not join"),
+            "mixed gaps, got: {mixed}"
+        );
+        for text in [&join, &read, &repeats, &mixed] {
+            assert!(!text.contains("benign"), "{text}");
+        }
     }
 
     #[test]
@@ -1366,6 +1621,7 @@ mod tests {
             snapshot: Some(&snapshot),
             facts: &[fact],
             gaps: &[],
+            interval_causes: &[],
             capabilities: &capabilities,
             sampled_history: "incomplete",
         };
@@ -1533,7 +1789,7 @@ mod tests {
         }
         let text = String::from_utf8(bytes).unwrap();
         assert!(
-            text.contains("snapshot 1:"),
+            text.contains("provider sample: 1 modules, 0 facts"),
             "first batch full, got: {text}"
         );
         assert!(

@@ -36,6 +36,13 @@ unsafe impl aya::Pod for c::ApiThreadKey {}
 pub struct ObservationBatch {
     pub facts: Vec<ObservationFact>,
     pub gaps: Vec<ObservationGap>,
+    /// Human-only causes for the [`ObservationGap::IntervalUnknown`]
+    /// instances in [`Self::gaps`] (v0.6.0 W3-shard), aligned in
+    /// order: `interval_causes[i]` explains the i-th interval gap.
+    /// Recorded only through `gap_interval_unknown` (the producing
+    /// site names its cause); never serialized — JSON keeps the
+    /// bare gaps verbatim.
+    pub interval_causes: Vec<IntervalCause>,
     /// Shaped backing-refusal strings drained from the acquisition
     /// budget (R06 vocabulary, caller-rendered). The session merges
     /// these into its attach diagnostics at projection.
@@ -82,6 +89,30 @@ impl ObservationBatch {
             self.gaps.push(g)
         }
     }
+    /// Record an interval gap WITH its producing-site cause (the
+    /// only way an [`ObservationGap::IntervalUnknown`] enters a
+    /// batch): the cause pushes iff the gap is newly pushed, so
+    /// [`Self::interval_causes`] stays aligned with the interval
+    /// gaps in order. Dedup keeps the first cause — the surviving
+    /// gap is one instance in JSON too, so the human line never
+    /// claims more than the machine record.
+    fn gap_interval_unknown(&mut self, cause: IntervalCause) {
+        if !self.gaps.contains(&ObservationGap::IntervalUnknown) {
+            self.gaps.push(ObservationGap::IntervalUnknown);
+            self.interval_causes.push(cause);
+        }
+    }
+    /// Record an assembly error as its gap, attaching the join-miss
+    /// cause when the error is an interval gap (every
+    /// [`super::assembly::Sequences`] interval error is a window
+    /// that failed to join; other gaps carry no cause).
+    fn gap_from_assembly(&mut self, g: ObservationGap) {
+        if g == ObservationGap::IntervalUnknown {
+            self.gap_interval_unknown(IntervalCause::JoinMiss);
+        } else {
+            self.gap(g);
+        }
+    }
     /// Chain an earlier-consumed batch BEHIND this one (the
     /// retire-carry path: this carry is older, the argument was
     /// consumed later). Facts and signal vectors append in
@@ -90,8 +121,20 @@ impl ObservationBatch {
     /// in one batch).
     fn append_batch(&mut self, other: ObservationBatch) {
         self.facts.extend(other.facts);
+        let mut causes = other.interval_causes.into_iter();
         for g in other.gaps {
-            self.gap(g);
+            if g == ObservationGap::IntervalUnknown {
+                // The aligned cause transfers iff the gap is newly
+                // folded; a cause without its gap is dropped (never
+                // rendered — the human line must not outclaim JSON).
+                if let Some(cause) = causes.next() {
+                    self.gap_interval_unknown(cause);
+                } else {
+                    self.gap(g);
+                }
+            } else {
+                self.gap(g);
+            }
         }
         self.refusals.extend(other.refusals);
         self.learned_sites.extend(other.learned_sites);
@@ -1804,7 +1847,7 @@ fn retire_source_owners(
             drop(doomed);
         }
         b.gap(ObservationGap::ProcessUnavailable);
-        b.gap(ObservationGap::IntervalUnknown);
+        b.gap_interval_unknown(IntervalCause::JoinMiss);
         b.gap(ObservationGap::FirstQueryUnknown);
         b.gap(ObservationGap::SamplingPartial);
     } else {
@@ -2970,7 +3013,7 @@ impl ProviderSession {
                         self.exec_sealed.insert(pid);
                         b.exec_witnesses.push(pid);
                         b.gap(pending.gap);
-                        b.gap(ObservationGap::IntervalUnknown);
+                        b.gap_interval_unknown(IntervalCause::JoinMiss);
                         self.refreshing.remove(&pid);
                     }
                 }
@@ -3023,7 +3066,7 @@ impl ProviderSession {
                         self.exec_sealed.insert(pid);
                         b.exec_witnesses.push(pid);
                         b.gap(gap);
-                        b.gap(ObservationGap::IntervalUnknown);
+                        b.gap_interval_unknown(IntervalCause::JoinMiss);
                     }
                     PendingOp::Additive => {
                         if let Some(retained) = refresh_retained {
@@ -3045,7 +3088,7 @@ impl ProviderSession {
                             self.refreshing.insert(pid, retained);
                         }
                         b.gap(gap);
-                        b.gap(ObservationGap::IntervalUnknown);
+                        b.gap_interval_unknown(IntervalCause::JoinMiss);
                     }
                 }
             }
@@ -3205,7 +3248,7 @@ impl ProviderSession {
                         b.exec_witnesses.push(pid);
                     }
                     b.gap(gap);
-                    b.gap(ObservationGap::IntervalUnknown);
+                    b.gap_interval_unknown(IntervalCause::JoinMiss);
                     continue;
                 }
                 let additive = match (record, self.targets.get(&pid)) {
@@ -3249,7 +3292,7 @@ impl ProviderSession {
                 }
             }
             b.gap(gap);
-            b.gap(ObservationGap::IntervalUnknown)
+            b.gap_interval_unknown(IntervalCause::JoinMiss)
         }
         // A locator-only snapshot may have left useful partial custody while
         // excluding a library. Reacquire on stronger inventory authority; do not
@@ -3317,7 +3360,7 @@ impl ProviderSession {
                 }
             }
         }
-        b.gap(ObservationGap::IntervalUnknown);
+        b.gap_interval_unknown(IntervalCause::JoinMiss);
         b.refusals.extend(self.budget.take_refusals());
         // fix4 (R4-2): the carry taken above was consumed by
         // retire-drains — validate the whole batch (carry first)
@@ -3820,7 +3863,7 @@ impl ProviderSession {
                             b.exec_witnesses.push(pid);
                         }
                         b.gap(gap);
-                        b.gap(ObservationGap::IntervalUnknown);
+                        b.gap_interval_unknown(IntervalCause::JoinMiss);
                         continue;
                     }
                     let additive = self
@@ -4001,7 +4044,7 @@ impl ProviderSession {
             }
         }
         if self.aliases.incomplete() {
-            b.gap(ObservationGap::IntervalUnknown);
+            b.gap_interval_unknown(IntervalCause::JoinMiss);
         }
         b
     }
@@ -5556,14 +5599,14 @@ impl ProviderSession {
         if self.gate.close().is_err() {
             let mut b = ObservationBatch::default();
             b.gap(ObservationGap::BpfUnavailable);
-            b.gap(ObservationGap::IntervalUnknown);
+            b.gap_interval_unknown(IntervalCause::JoinMiss);
             return b;
         }
         // Store the receipt in the shared owner before fallible drain/read.
         // Final decoding uses its own bounded budget, not the expired live tick.
         self.budget.set_deadline(deadline);
         let mut b = self.drain(deadline);
-        b.gap(ObservationGap::IntervalUnknown); // in-flight returns are not synthesized
+        b.gap_interval_unknown(IntervalCause::JoinMiss); // in-flight returns are not synthesized
         for (&cookie, &(pid, starttime, api)) in &self.api_owners {
             let values = if Instant::now() >= deadline {
                 Err(ObservationGap::DrainOverrun)
@@ -5708,14 +5751,14 @@ pub(crate) fn assemble_payload(
         wire::Transport::Begin(r) => {
             if let Err(g) = aliases.begin(&r, budget) {
                 invalidate_algorithms(b);
-                b.gap(g);
+                b.gap_from_assembly(g);
             }
             return None;
         }
         wire::Transport::Alias(r) => {
             if let Err(g) = aliases.alias(&r) {
                 invalidate_algorithms(b);
-                b.gap(g);
+                b.gap_from_assembly(g);
             }
             return None;
         }
@@ -5731,7 +5774,7 @@ pub(crate) fn assemble_payload(
                 }
                 Err(g) => {
                     invalidate_algorithms(b);
-                    b.gap(g);
+                    b.gap_from_assembly(g);
                     (super::assembly::other(), AliasQuality::default())
                 }
             };
@@ -5749,7 +5792,7 @@ pub(crate) fn assemble_payload(
             } = &mut payload
             {
                 (*algorithm, *alias_quality) = aliases.implementation(&r).unwrap_or_else(|g| {
-                    b.gap(g);
+                    b.gap_from_assembly(g);
                     (super::assembly::other(), AliasQuality::default())
                 });
             }

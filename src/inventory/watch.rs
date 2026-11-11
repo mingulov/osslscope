@@ -382,8 +382,9 @@ fn emit(value: &impl Serialize, writer: &mut impl Write) -> io::Result<()> {
 }
 /// Human change event line (typed; the `path=` fragment still
 /// reads through the JSON-shaped module because
-/// `TerminalPathWriter::change_fragment` takes a `Value`).
-/// Full sha256 today — Task 4 truncates these lines (W2).
+/// `TerminalPathWriter::change_fragment` takes a `Value`). The
+/// hash is the 12-char short label at every level (W2) — a
+/// label, never a key; the machine record keeps the full sha256.
 fn human_change_line(
     writer: &mut impl Write,
     change: &Change,
@@ -397,7 +398,11 @@ fn human_change_line(
         change.starttime
     )?;
     if let Some(module) = &change.module {
-        write!(writer, " sha256={}", module.info.sha256)?;
+        write!(
+            writer,
+            " sha256={}",
+            super::resolve::TerminalPathWriter::short_sha(&module.info.sha256)
+        )?;
         // T5 `--resolve-paths`: TTY-only fragment from the
         // dedicated writer (omitted unless flag on; never in the
         // machine record).
@@ -1049,6 +1054,47 @@ mod tests {
                 serde_json::Value::String(word.into())
             );
         }
+    }
+
+    // W2: human change lines carry the 12-char short hash at every
+    // level, never the full 64-hex (machine records keep it).
+    #[test]
+    fn human_change_line_prints_short_hash() {
+        use crate::inventory as inv;
+        let sidecar = inv::resolve::ResolveSidecar::default();
+        let paths = inv::resolve::TerminalPathWriter::new(false, false, &sidecar);
+        let full = "ab".repeat(32);
+        let change = super::Change {
+            kind: super::ChangeKind::ModuleSeen,
+            pid: 42,
+            starttime: 7,
+            module: Some(inv::ModuleRecord {
+                info: inv::ModuleInfo {
+                    sha256: full.clone(),
+                    device: 1,
+                    inode: 2,
+                    size_bytes: 3,
+                    architecture: inv::Architecture::X86_64,
+                    kind: inv::ObjectKind::Other,
+                    exports: Vec::new(),
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                    file_soname: None,
+                    file_openssl_version: None,
+                    file_version_status: inv::FileVersionStatus::Absent,
+                },
+                identity_status: inv::IdentityStatus::Verified,
+                verified_path: None,
+                verified_path_unavailable: None,
+                maps_spelling: None,
+            }),
+        };
+        let mut bytes = Vec::new();
+        super::human_change_line(&mut bytes, &change, &paths).unwrap();
+        let line = String::from_utf8(bytes).unwrap();
+        assert!(line.contains("module_seen pid=42 starttime=7"), "{line}");
+        assert!(line.contains("sha256=abababababab"), "{line}");
+        assert!(!line.contains(&full), "full hash on human line: {line}");
     }
 
     // F8/H2: the run end status is cumulative, never the last

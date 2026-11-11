@@ -35,6 +35,12 @@ fn identity(r: &c::Record) -> [u64; 7] {
 pub(crate) fn other() -> AlgorithmId {
     AlgorithmId::try_from(u16::MAX).unwrap()
 }
+// Every `IntervalUnknown` from this impl is a join miss (v0.6.0
+// W3-shard): an un-ended sequence cut by a new begin, a record
+// with no (or a mismatched) sequence, or an implementation read
+// with no joined algorithm. The human cause
+// (`IntervalCause::JoinMiss`) is attached where these errors
+// enter the batch (`session::assemble_payload`), never here.
 impl Sequences {
     pub(crate) fn begin(
         &mut self,

@@ -523,6 +523,12 @@ struct Envelope<T: Serialize> {
     #[serde(flatten)]
     record: T,
 }
+/// JSON encoding of one finite value for human `key=` cells (the
+/// same snake_case words the machine record carries — never Rust
+/// Debug formatting on the human surface).
+fn finite(value: &impl Serialize) -> io::Result<String> {
+    serde_json::to_string(value).map_err(io::Error::other)
+}
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Record<'a> {
@@ -1009,10 +1015,10 @@ impl<W: Write> Output<'_, W> {
                 for m in p.modules.iter().take(cap) {
                     write!(
                         w,
-                        "  Object sha256={} kind={:?} identity={:?} interfaces={}",
+                        "  Object sha256={} kind={} identity={} interfaces={}",
                         m.info.sha256.get(..12).unwrap_or("unknown"),
-                        m.info.kind,
-                        m.identity_status,
+                        finite(&m.info.kind)?,
+                        finite(&m.identity_status)?,
                         m.info.exports.len()
                     )?;
                     if let Some(fragment) = writer.as_ref().and_then(|writer| {
@@ -1270,23 +1276,33 @@ impl<W: Write> Output<'_, W> {
                     .ring
                     .iter()
                     .fold(0, |a, b| a.saturating_add(*b));
+                // W5: the default end line is a plain summary; the
+                // loss/deferred counters ride a `-vv` detail line.
+                // The unknown-coverage suffix stays at every level.
                 writeln!(
                     w,
-                    "Crypto watch end: reason={reason} segments={segments} peak_accounted_bytes={peak_accounted_bytes} peak_deferred_depth={peak_deferred_depth} deferred_drops={deferred_drops} deferred_removed={}/{}/{}/{} signal_dropped={} scan_loss={} prefix_unwitnessed={} drain_pending={} unattributed={} admitted_exit_artifacts={} ring_loss={} lost_intervals={} polling_fallback={} coverage={coverage}; unsampled membership and unobserved activity remain unknown",
-                    deferred_removed.exited,
-                    deferred_removed.reused,
-                    deferred_removed.ineligible,
-                    deferred_removed.closed,
-                    session_loss.signal_dropped,
-                    session_loss.scan_loss,
-                    session_loss.signal_prefix_unwitnessed,
-                    session_loss.drain_pending,
-                    session_loss.unattributed_events,
-                    session_loss.admitted_exit_artifacts,
-                    ring,
-                    session_loss.lost_intervals.len(),
-                    session_loss.polling_fallback
-                )
+                    "Crypto watch end: {reason}, {segments} segments, coverage {coverage}; unsampled membership and unobserved activity remain unknown"
+                )?;
+                if level >= 2 {
+                    writeln!(
+                        w,
+                        "  detail peak_accounted_bytes={peak_accounted_bytes} peak_deferred_depth={peak_deferred_depth} deferred_drops={deferred_drops} deferred_removed={}/{}/{}/{} signal_dropped={} scan_loss={} prefix_unwitnessed={} drain_pending={} unattributed={} admitted_exit_artifacts={} ring_loss={} lost_intervals={} polling_fallback={}",
+                        deferred_removed.exited,
+                        deferred_removed.reused,
+                        deferred_removed.ineligible,
+                        deferred_removed.closed,
+                        session_loss.signal_dropped,
+                        session_loss.scan_loss,
+                        session_loss.signal_prefix_unwitnessed,
+                        session_loss.drain_pending,
+                        session_loss.unattributed_events,
+                        session_loss.admitted_exit_artifacts,
+                        ring,
+                        session_loss.lost_intervals.len(),
+                        session_loss.polling_fallback
+                    )?;
+                }
+                Ok(())
             }
         }
     }
@@ -6485,6 +6501,141 @@ mod tests {
         // The grouped block stays at every level (established shape).
         for text in [&l0, &l1, &l2] {
             assert!(text.contains("gaps (1 total in 1 group):"), "{text}");
+        }
+    }
+
+    // W5: the Discovery object line carries the JSON snake_case
+    // kind/identity words, never Rust Debug formatting.
+    #[test]
+    fn human_discovery_object_line_uses_json_words() {
+        let process: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 0},
+            "namespaces": {"pid": null, "mount": null},
+            "pid": 42, "starttime": 123,
+            "modules": [{
+                "info": {"sha256": "cc", "device": 1, "inode": 100, "size_bytes": 3, "architecture": "x86_64", "kind": "provider_module", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false},
+                "identity_status": "locator_candidate"
+            }],
+            "provider_activation": "unknown", "provider_interfaces": "unknown", "execution": "not_observed"
+        }))
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+            verbosity: 0,
+        };
+        out.emit(Record::Discovery {
+            process: &process,
+            sidecar: None,
+        })
+        .unwrap();
+        drop(out);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains(r#"kind="provider_module" identity="locator_candidate""#),
+            "{text}"
+        );
+        assert!(!text.contains("kind=ProviderModule"), "{text}");
+        assert!(!text.contains("identity=LocatorCandidate"), "{text}");
+    }
+
+    // W5: the default end line is a plain summary; the ~20
+    // loss/deferred counters ride a `-vv` detail line. The
+    // unknown-coverage suffix stays at every level (H2).
+    #[test]
+    fn human_end_collapses_counters_to_vv_detail() {
+        let end = || -> Record<'static> {
+            Record::End {
+                reason: "duration",
+                segments: 3,
+                peak_accounted_bytes: 100,
+                coverage: "partial",
+                peak_deferred_depth: 1,
+                deferred_drops: 2,
+                deferred_removed: DeferredRemoved {
+                    exited: 1,
+                    reused: 2,
+                    ineligible: 3,
+                    closed: 4,
+                },
+                session_loss: SessionLoss {
+                    ring: [0, 1, 0, 0, 0, 0, 0, 0],
+                    connector_drops: 0,
+                    connector_enobufs: 0,
+                    scan_loss: 5,
+                    signal_dropped: 6,
+                    signal_prefix_unwitnessed: 7,
+                    drain_pending: 8,
+                    polling_fallback: true,
+                    unattributed_events: 9,
+                    admitted_exit_artifacts: 10,
+                    lost_intervals: Vec::new(),
+                    coalesced: 0,
+                },
+            }
+        };
+        let render = |verbosity: u8| {
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json: false,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+                verbosity,
+            };
+            out.emit(end()).unwrap();
+            drop(out);
+            String::from_utf8(bytes).unwrap()
+        };
+        for (level, text) in [(0, render(0)), (1, render(1))] {
+            assert!(
+                text.contains("Crypto watch end: duration, 3 segments, coverage partial"),
+                "level {level}, got: {text}"
+            );
+            assert!(
+                text.contains("unsampled membership and unobserved activity remain unknown"),
+                "level {level}, got: {text}"
+            );
+            for word in [
+                "peak_accounted_bytes=",
+                "peak_deferred_depth=",
+                "deferred_drops=",
+                "deferred_removed=",
+                "signal_dropped=",
+                "scan_loss=",
+                "polling_fallback=",
+            ] {
+                assert!(!text.contains(word), "{word} at level {level}, got: {text}");
+            }
+        }
+        let l2 = render(2);
+        assert!(
+            l2.contains("Crypto watch end: duration, 3 segments, coverage partial"),
+            "{l2}"
+        );
+        for word in [
+            "peak_accounted_bytes=100",
+            "peak_deferred_depth=1",
+            "deferred_drops=2",
+            "deferred_removed=1/2/3/4",
+            "signal_dropped=6",
+            "scan_loss=5",
+            "prefix_unwitnessed=7",
+            "drain_pending=8",
+            "unattributed=9",
+            "admitted_exit_artifacts=10",
+            "ring_loss=1",
+            "lost_intervals=0",
+            "polling_fallback=true",
+        ] {
+            assert!(l2.contains(word), "{word} missing at level 2: {l2}");
         }
     }
 

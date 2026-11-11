@@ -60,6 +60,42 @@ pub enum ObservationGap {
     QuarantinedApi,
 }
 
+/// Human-only cause behind one [`ObservationGap::IntervalUnknown`]
+/// instance (v0.6.0 W3-shard): the machine gap stays a bare
+/// `interval_unknown` in JSON (verbatim, every instance), while the
+/// human line names the producing site's cause — a count-read
+/// failure is never a join miss, and neither is blanket-labeled
+/// benign. Carried on [`super::session::ObservationBatch`] aligned
+/// with the interval gaps, in order; never serialized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IntervalCause {
+    /// A count-plane read failed
+    /// (`focused_capture::map_engine_attach_failure` on
+    /// `CountFailure::Read`). That gap surfaces through the
+    /// focused/report route, so provider-observation records never
+    /// carry this cause today — but the rendering contract is
+    /// pinned for whichever route delivers it.
+    CountRead,
+    /// An observation window failed to join: un-ended or
+    /// mismatched assembly sequences (`assembly::Sequences`), a
+    /// lifecycle cut (retire/exec/refresh), an unjoinable close, or
+    /// a start that never opened (cancel) — in every case no
+    /// window joined into a determined interval, while no count
+    /// read itself failed.
+    JoinMiss,
+}
+impl IntervalCause {
+    /// Honest one-line cause text for the human
+    /// `interval_unknown` line (codex binding: cause from the
+    /// producing site, never a blanket label).
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            IntervalCause::CountRead => "engine counter read failed",
+            IntervalCause::JoinMiss => "observation window did not join",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservationLimits {
     pub max_processes: usize,
