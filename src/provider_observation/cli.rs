@@ -1154,11 +1154,88 @@ mod tests {
             "payload": { "kind": "query_result", "outcome": "success", "cacheability": "cacheable" }
         }))
         .unwrap();
-        let snapshot = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
-            pids: vec![std::process::id()],
-            resolve_paths: false,
-            limits: crate::inventory::Limits::default(),
-        });
+        // Synthetic fixture (no live /proc read): one verified
+        // module with exports, full namespaces, one gap, and known
+        // totals — so the L1-exports/L2-records assertions below
+        // always execute, like the inventory and crypto siblings.
+        let snapshot = {
+            use crate::inventory as inv;
+            let module = inv::ModuleRecord {
+                info: inv::ModuleInfo {
+                    sha256: "a".repeat(64),
+                    device: 0,
+                    inode: 0,
+                    size_bytes: 0,
+                    architecture: inv::Architecture::X86_64,
+                    kind: inv::ObjectKind::Other,
+                    exports: vec![inv::Api::OsslProviderInit, inv::Api::EvpDigestUpdate],
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                    file_soname: None,
+                    file_openssl_version: None,
+                    file_version_status: inv::FileVersionStatus::Absent,
+                },
+                identity_status: inv::IdentityStatus::Verified,
+                verified_path: None,
+                verified_path_unavailable: None,
+                maps_spelling: None,
+            };
+            let interval = || inv::CaptureInterval {
+                started_unix_ms: None,
+                finished_unix_ms: None,
+                elapsed_ns: 0,
+            };
+            inv::Snapshot {
+                interval: interval(),
+                scope_record: inv::ScopeRecord::default(),
+                schema_version: "osslscope.discovery.v1".into(),
+                mode: inv::SnapshotMode::Snapshot,
+                scope: inv::Scope::Pids,
+                selected_pids: vec![1],
+                processes: vec![inv::ProcessRecord {
+                    interval: interval(),
+                    namespaces: inv::NamespaceIds {
+                        pid: Some(inv::NamespaceId {
+                            device: 5,
+                            inode: 123,
+                        }),
+                        mount: None,
+                    },
+                    pid: 1,
+                    starttime: 0,
+                    comm: None,
+                    comm_status: inv::IdentityAvailability::Unreadable,
+                    exe: None,
+                    exe_status: inv::IdentityAvailability::Unreadable,
+                    modules: vec![module],
+                    provider_activation: inv::ObservationState::Unknown,
+                    provider_interfaces: inv::ObservationState::Unknown,
+                    execution: inv::ObservationState::NotObserved,
+                }],
+                gaps: vec![inv::Gap {
+                    pid: Some(7),
+                    device: Some(1),
+                    inode: Some(10),
+                    reason: inv::GapReason::TooLarge,
+                    errno: Some(libc::EPERM),
+                    actor_euid: Some(1001),
+                }],
+                totals: inv::WorkTotals {
+                    read_bytes: 4096,
+                    objects_inspected: 7,
+                    ..Default::default()
+                },
+                limits: inv::Limits::default(),
+                capabilities: inv::Capabilities {
+                    inventory: inv::InventoryState::Complete,
+                    provider_activation: inv::ObservationState::Unknown,
+                    provider_interfaces: inv::ObservationState::Unknown,
+                    execution: inv::ObservationState::NotObserved,
+                },
+                resolve: inv::resolve::ResolveSidecar::default(),
+                cgroup_identity: std::collections::BTreeMap::new(),
+            }
+        };
         let capabilities = Capabilities::new(true);
         let record = Record {
             schema_version: SCHEMA,
@@ -1196,19 +1273,24 @@ mod tests {
         let l1 = render(1);
         assert!(l1.contains("  fact pid=12 starttime=100"), "{l1}");
         assert!(!l1.contains("payload="), "{l1}");
-        if snapshot.processes.iter().any(|p| !p.modules.is_empty()) {
-            assert!(l1.contains("exports=["), "{l1}");
-        }
-        assert!(l1.contains("namespaces="), "{l1}");
+        assert!(
+            l1.contains("exports=[ossl_provider_init, evp_digest_update]"),
+            "{l1}"
+        );
+        assert!(l1.contains("namespaces=pid=5:123,mount=-"), "{l1}");
         assert!(!l1.contains("gap pid="), "{l1}");
         assert!(!l1.contains("counters:"), "{l1}");
         assert!(!l1.contains(&full_hash), "{l1}");
         let l2 = render(2);
         assert!(l2.contains("payload="), "{l2}");
-        assert!(l2.contains("counters: read_bytes="), "{l2}");
-        if !snapshot.gaps.is_empty() {
-            assert!(l2.contains("gap pid="), "{l2}");
-        }
+        assert!(
+            l2.contains("counters: read_bytes=4096 objects_inspected=7"),
+            "{l2}"
+        );
+        assert!(
+            l2.contains("gap pid=7 device=1 reason=too_large errno=1"),
+            "{l2}"
+        );
         assert!(!l2.contains(&full_hash), "{l2}");
         assert!(l2.contains("sha256=bbbbbbbbbbbb"), "{l2}");
         // Level 0 stays a strict prefix of the process line: the -v
