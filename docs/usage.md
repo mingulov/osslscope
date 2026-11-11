@@ -395,6 +395,63 @@ inventory does not imply activation, execution or completeness beyond the
 requested visible scope. An accepted process with no relevant modules remains
 useful inventory. Output failure takes exit 1 even if discovery was partial.
 
+### Human output
+
+Without `--json`, `scan` and `inspect --pid` print human rows on
+stdout. v0.6 splits stdout by mode — human rows by default, pure
+JSON under `--json` — so machine consumers must pass `--json`:
+tooling that parsed pre-v0.6 mixed stdout breaks and must switch
+(see the CHANGELOG breaking-change entry). A snapshot reads top
+to bottom:
+
+- the two-line meaning boundary (exports/mappings prove nothing;
+  activation unknown, execution not_observed),
+- the `kinds:` legend decoding the four kind words
+  (`openssl_compatible`, `provider_module`, `openssl_consumer`,
+  `other=<counted-not-listed>`),
+- one `pid= comm= exe= modules= status=` verdict line per process
+  (`comm=`/`exe=` are sanitized display fragments, `-` when never
+  observed; `status=` is `partial` iff a gap names that pid; an
+  empty `modules=` verdict discloses how many other objects were
+  scanned),
+- one indented module row per OpenSSL-kind module:
+  `{kind} sha256={12-hex} identity={verified|locator-candidate}
+  size={bytes} path={...} version={...}` (hashes stay short at
+  every human level; `version=` prefers the validated file
+  version, falls back to the file SONAME, else `none` — file
+  evidence only, never a runtime claim),
+- `identity:` verified-vs-candidate totals,
+- the `gaps:` per-reason counts line with one nested one-line
+  meaning per counted reason, so default output explains the
+  omitted evidence (the full runbook stays future work),
+- the `blindness:` boundary only when complete enumeration found
+  no OpenSSL object.
+
+`inspect --module` prints the same meaning boundary (no legend),
+one row per supplied file without the identity word
+(`{kind} sha256={12-hex} size={bytes}[ path={...}]
+version={...}`; `path=` appears only with `--resolve-paths`), and
+an `errors:` counts line with the same per-reason meanings.
+`scan --watch` prints the sampled-meaning boundary once, then one
+`tick N:` status line per sample (`initial state`, `N sampled
+changes`, `state changed`, or `no changes`, each with
+status/process/verified-module counts), finite `change` event
+lines (`{kind} pid= starttime=[ sha256=][ path=]`), the changed
+(or, at `-v`, full) state beneath, and a `Watch ended:` verdict
+with run-level cumulative history — a later complete sample never
+erases earlier uncertainty.
+
+`-v`/`--verbose` (repeatable, `-vv` = 2) raises human detail
+only: `-v` adds grouped gap blocks, per-module `exports=[...]`,
+and full per-process state (`starttime=` `namespaces=`
+`provider_activation=` `provider_interfaces=` `execution=`);
+`-vv` adds per-object `gap pid= device= reason= errno=` records
+and a `counters:` line. Exits, stderr, counts, and hashes are
+identical at every level; `--json`/NDJSON stays complete and
+unfiltered. There is no `-q`: the default is already quiet. The
+privilege hint (see [Privilege](#privilege)) fires on stderr
+identically at every level.
+
 ### Privilege
 
 Discovery is passive but not permission-free: unreadable processes and

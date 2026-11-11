@@ -583,10 +583,102 @@ fn counts_line(label: &str, reasons: impl Iterator<Item = GapReason>, rerun_hint
     }
 }
 
+/// One-line default meaning per gap reason (v0.6.0 D6: the 128 MiB
+/// cap stays; default output must explain the omitted evidence).
+/// Each line states what was not observed and what stays unknown;
+/// the full runbook stays P1. Rendered by
+/// [`gap_meanings_block`] beside the per-reason counts.
+pub(crate) fn gap_meaning(reason: GapReason) -> &'static str {
+    match reason {
+        GapReason::Unavailable => {
+            "unavailable: a file needed for inventory could not be opened or read; what it held is unknown"
+        }
+        GapReason::NonRegular => {
+            "non_regular: path is not a regular file, so it was never parsed; its interfaces are unknown"
+        }
+        GapReason::TooLarge => {
+            "too_large: file over the 128 MiB read cap was not read; its kind, sha256, and version are unknown"
+        }
+        GapReason::NotElf => {
+            "not_elf: file lacks ELF magic, so it was never classified; its interfaces are unknown"
+        }
+        GapReason::MalformedElf => {
+            "malformed_elf: ELF headers failed to parse; its kind, sha256, and version are unknown"
+        }
+        GapReason::Changed => {
+            "changed: file or process changed mid-sample, so the stale reading was discarded"
+        }
+        GapReason::UnsupportedArchitecture => {
+            "unsupported_architecture: object targets an architecture this observer cannot parse; its interfaces are unknown"
+        }
+        GapReason::ProcessUnavailable => {
+            "process_unavailable: process exited or its /proc entries were unreadable; its inventory is unknown"
+        }
+        GapReason::IdentityUnverified => {
+            "identity_unverified: candidate file metadata is unproven as the mapped backing; the mapping's true kind is unknown"
+        }
+        GapReason::BackingUnavailable => {
+            "backing_unavailable: executable backing could not be opened or its identity mismatched; the mapping's bytes are unknown"
+        }
+        GapReason::ReadLimit => {
+            "read_limit: the 1 GiB shared read budget ran out; uncharged files were never read"
+        }
+        GapReason::ProcessLimit => {
+            "process_limit: the 4096-process cap was reached; further processes were not inventoried"
+        }
+        GapReason::ObjectLimit => {
+            "object_limit: the object admission cap was reached; further objects were not inspected"
+        }
+        GapReason::MalformedMaps => {
+            "malformed_maps: a /proc/PID/maps line failed to parse; that mapping's inventory is unknown"
+        }
+        GapReason::Deadline => {
+            "deadline: the 30-second cooperative deadline expired; remaining work was abandoned"
+        }
+        GapReason::UnsupportedCgroup => {
+            "unsupported_cgroup: cgroup is not a traversable domain cgroup; its subtree was not selected"
+        }
+        GapReason::CgroupUnavailable => {
+            "cgroup_unavailable: cgroup directory could not be opened or pinned; its members are unknown"
+        }
+        GapReason::CgroupLimit => {
+            "cgroup_limit: cgroup traversal hit its directory or membership cap; the uncertain subtree was omitted"
+        }
+        GapReason::MembershipUnknown => {
+            "membership_unknown: cgroup membership could not be sampled; which processes belong is unknown"
+        }
+        GapReason::NamespaceUnavailable => {
+            "namespace_unavailable: namespace identity could not be read; process coordinates are unverified"
+        }
+    }
+}
+
+/// Default-verbosity gap explanations: one [`gap_meaning`] line
+/// per distinct counted reason, nested under the counts line.
+/// Meanings sort by word (each starts with its word), matching
+/// [`counts_line`] order; empty when there is nothing to explain.
+/// Rendered with the counts block at every human level — counts
+/// are verbosity-independent (H2), and their explanation rides
+/// along rather than vanishing under `-v`.
+fn gap_meanings_block(reasons: impl Iterator<Item = GapReason>) -> String {
+    let mut meanings: BTreeSet<&str> = BTreeSet::new();
+    for reason in reasons {
+        meanings.insert(gap_meaning(reason));
+    }
+    let mut out = String::new();
+    for meaning in meanings {
+        out.push_str("  ");
+        out.push_str(meaning);
+        out.push('\n');
+    }
+    out
+}
+
 /// Human snapshot render (v0.6.0 P0-3): MEANING, the kind
 /// legend, per-process verdict lines with their module rows,
-/// identity totals, and exact per-reason gap counts (plus the
-/// blindness line when conclusive). Never emits JSON bytes.
+/// identity totals, exact per-reason gap counts each with its
+/// one-line meaning (plus the blindness line when conclusive).
+/// Never emits JSON bytes.
 /// Verbosity gates detail volume only (0 = counts line; 1 = full
 /// gap groups, `exports=[...]` per module row, and full
 /// per-process state; 2 = per-object gap records and safe
@@ -653,6 +745,7 @@ pub(crate) fn human_snapshot_body(
     writer.write_all(super::identity_totals_line(verified, locator).as_bytes())?;
     writer
         .write_all(counts_line("gaps", snapshot.gaps.iter().map(|g| g.reason), true).as_bytes())?;
+    writer.write_all(gap_meanings_block(snapshot.gaps.iter().map(|g| g.reason)).as_bytes())?;
     if level >= 1 {
         let block = super::gap_groups_block(
             snapshot
@@ -698,6 +791,7 @@ fn human_modules(
     writer.write_all(
         counts_line("errors", inventory.errors.iter().map(|e| e.reason), false).as_bytes(),
     )?;
+    writer.write_all(gap_meanings_block(inventory.errors.iter().map(|e| e.reason)).as_bytes())?;
     writer.flush()
 }
 
@@ -1055,6 +1149,39 @@ mod tests {
     }
 
     #[test]
+    fn v060_default_gap_meanings_explain_omitted_evidence() {
+        assert_eq!(
+            super::gap_meaning(GapReason::TooLarge),
+            "too_large: file over the 128 MiB read cap was not read; its kind, sha256, and version are unknown"
+        );
+        // Every reason has a one-line default meaning (full runbook stays P1).
+        for reason in [
+            GapReason::Unavailable,
+            GapReason::NonRegular,
+            GapReason::TooLarge,
+            GapReason::NotElf,
+            GapReason::MalformedElf,
+            GapReason::Changed,
+            GapReason::UnsupportedArchitecture,
+            GapReason::ProcessUnavailable,
+            GapReason::IdentityUnverified,
+            GapReason::BackingUnavailable,
+            GapReason::ReadLimit,
+            GapReason::ProcessLimit,
+            GapReason::ObjectLimit,
+            GapReason::MalformedMaps,
+            GapReason::Deadline,
+            GapReason::UnsupportedCgroup,
+            GapReason::CgroupUnavailable,
+            GapReason::CgroupLimit,
+            GapReason::MembershipUnknown,
+            GapReason::NamespaceUnavailable,
+        ] {
+            assert!(!super::gap_meaning(reason).is_empty(), "{reason:?}");
+        }
+    }
+
+    #[test]
     fn object_kind_words_match_json() {
         // Every word mirrors the serde snake_case label exactly.
         for kind in [
@@ -1296,6 +1423,12 @@ mod tests {
             out.contains("gaps: 2 (too_large=2; rerun with -v for per-object detail)\n"),
             "{out}"
         );
+        // v0.6.0 D6: each counted reason carries its one-line
+        // meaning beside the counts at default verbosity.
+        assert!(
+            out.contains("  too_large: file over the 128 MiB read cap was not read; its kind, sha256, and version are unknown\n"),
+            "{out}"
+        );
         assert!(!out.contains("gaps ("), "{out}");
         // The verdict names only gaps for its own pid: pid 1 stays
         // complete while pid 7's gaps count above.
@@ -1307,6 +1440,28 @@ mod tests {
         assert!(!out.contains("gaps:"), "{out}");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["gaps"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn human_modules_renders_error_meanings() {
+        // v0.6.0 D6: the inspect --module errors line carries the
+        // same one-line meanings as the snapshot gaps line.
+        let result = super::inspect_modules(
+            &[PathBuf::from("/PRIVATE_CANARY_missing")],
+            Limits::default(),
+            false,
+        );
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(result.errors[0].reason, GapReason::Unavailable);
+        let paths = super::super::resolve::TerminalPathWriter::new(false, false, &result.resolve);
+        let mut buf = Vec::new();
+        super::human_modules(&mut buf, &result, &paths).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("errors: 1 (unavailable=1)\n"), "{out}");
+        assert!(
+            out.contains("  unavailable: a file needed for inventory could not be opened or read; what it held is unknown\n"),
+            "{out}"
+        );
     }
 
     #[test]

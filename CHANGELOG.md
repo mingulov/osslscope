@@ -1,6 +1,16 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## Unreleased (v0.6.0 human surface)
+
+- BREAKING (S1/S3/S5/S6 stdout split): human stdout no longer
+  embeds the JSON document — `scan`/`inspect` print readable rows
+  by default and `--json` stdout is now pure (parses alone).
+  Consumers parsing mixed stdout must pass `--json`. See
+  `docs/usage.md` ("Human output") for the row shapes, `-v`/`-vv`
+  levels, kind legend, privilege hint, and per-reason gap
+  meanings.
+
 ## Unreleased (v0.6.0 machine surface)
 
 - Additive discovery machine fields, pinned by

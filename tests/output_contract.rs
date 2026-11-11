@@ -6931,3 +6931,46 @@ mod libc_errno {
     pub const EPERM: i64 = 1;
     pub const EACCES: i64 = 13;
 }
+
+#[test]
+fn v060_stream_discipline_s1_s14() {
+    let me = std::process::id().to_string();
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    // S12: invalid args -> exit 2, empty stdout.
+    let bad = std::process::Command::new(bin)
+        .args(["scan", "--no-such-flag"])
+        .output()
+        .unwrap();
+    assert_eq!(bad.status.code(), Some(2));
+    assert!(bad.stdout.is_empty());
+    // S2/S4/S7: --json stdout parses alone.
+    for args in [
+        vec!["scan", "--pid", &me, "--json"],
+        vec!["inspect", "--pid", &me, "--json"],
+    ] {
+        let out = std::process::Command::new(bin)
+            .args(&args)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("Passive inventory:"),
+            "{args:?} preamble leak"
+        );
+        let _: serde_json::Value = serde_json::from_str(&text).unwrap();
+    }
+    // S1/S5: human stdout fits one screen for a one-PID case.
+    let human = std::process::Command::new(bin)
+        .args(["scan", "--pid", &me])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&human.stdout).lines().count() < 60);
+    // S11: --help exit 0, empty stderr.
+    let help = std::process::Command::new(bin)
+        .args(["scan", "--help"])
+        .output()
+        .unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stderr.is_empty());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("-v"));
+}
