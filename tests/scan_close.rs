@@ -8,6 +8,7 @@
 use osslscope::scan::governor::{DutyThrottle, StormAction, StormDetector, ThrottleAction};
 use osslscope::scan::oracle::*;
 use osslscope_ebpf_common as wire;
+use serde_json::Value;
 
 const TID: u32 = 4242;
 const ARR: u64 = 0x7000;
@@ -351,6 +352,14 @@ fn fix1_tier2_idle_aging_releases() {
 fn v060_sigint_during_setup_phase_acks_and_exits_3() {
     // Setup phase: SIGINT within 200ms of spawn, before the first
     // sample completes. Must ack + exit 3, never hang in setup.
+    // Task 5 (d): the observed workload must survive the observer.
+    let workload = match Workload::spawn() {
+        Some(workload) => workload,
+        None => {
+            eprintln!("skip: need python3 with ssl for the workload");
+            return;
+        }
+    };
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
         .args(["scan", "--watch", "--interval", "1", "--duration", "60"])
         .stdout(std::process::Stdio::piped())
@@ -362,10 +371,19 @@ fn v060_sigint_during_setup_phase_acks_and_exits_3() {
     let out = child.wait_with_output().unwrap();
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stderr).contains("shutting down"));
+    workload.assert_alive("setup phase");
 }
 
 #[test]
 fn v060_sigint_mid_scan_acks_and_exits_3() {
+    // Task 5 (d): the observed workload must survive the observer.
+    let workload = match Workload::spawn() {
+        Some(workload) => workload,
+        None => {
+            eprintln!("skip: need python3 with ssl for the workload");
+            return;
+        }
+    };
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
         .args(["scan", "--watch", "--interval", "30", "--duration", "120"])
         .stdout(std::process::Stdio::piped())
@@ -381,12 +399,305 @@ fn v060_sigint_mid_scan_acks_and_exits_3() {
     assert!(err.contains("shutting down"), "no ack: {err}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("Watch ended:"), "no end record");
+    workload.assert_alive("mid-scan");
 }
 
 // Minimal kill without a new dependency.
 mod libc_kill {
     pub const SIGINT: i32 = 2;
+    pub const SIGTERM: i32 = 15;
     pub fn kill(pid: i32, signo: i32) {
         assert_eq!(unsafe { libc::kill(pid, signo) }, 0);
     }
+}
+
+/// Passive TLS workload for the Task 5 phase matrix (gaps §4.4
+/// recipe): a python `ssl` import asleep for 300s. The observer
+/// under test must never signal it — every leg asserts /proc
+/// aliveness after the observer exits. Killed + reaped on drop.
+struct Workload {
+    child: std::process::Child,
+}
+
+impl Workload {
+    /// Probe-then-spawn: `None` (the caller skips honestly) when
+    /// python3+ssl is unavailable — the harvest-test precedent.
+    fn spawn() -> Option<Self> {
+        let probe = std::process::Command::new("python3")
+            .args(["-c", "import ssl"])
+            .output();
+        match probe {
+            Ok(output) if output.status.success() => {}
+            _ => return None,
+        }
+        let child = std::process::Command::new("python3")
+            .args(["-c", "import ssl, time; time.sleep(300)"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .ok()?;
+        // Let the interpreter reach the sleep so the workload is a
+        // settled TLS process (libcrypto mapped) before any scan.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let workload = Self { child };
+        assert!(workload.alive(), "workload died right after spawn");
+        Some(workload)
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Brief-literal (d): /proc presence, not just `try_wait`.
+    fn alive(&self) -> bool {
+        let pid = self.pid();
+        std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    fn assert_alive(&self, leg: &str) {
+        let pid = self.pid();
+        assert!(
+            self.alive(),
+            "{leg}: workload pid {pid} gone — the observer must never signal it"
+        );
+    }
+}
+
+impl Drop for Workload {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Unique file sink for one signaled observer's stdout: a file
+/// never deadlocks a bounded `try_wait` poll, while a 300KB
+/// full-system record would fill a pipe the polling parent is not
+/// draining. Tags are unique per leg; the pid disambiguates
+/// concurrent test binaries.
+fn stdout_sink(tag: &str) -> std::path::PathBuf {
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("osslscope-sig-{tag}-{pid}.out"))
+}
+
+/// Bounded reap for signaled observers (shutdown liveness IS the
+/// assertion: a hang fails instead of hanging the suite).
+/// Stdout must NOT be piped — see [`stdout_sink`]; the small
+/// piped stderr (ack + reason lines) is drained after the reap.
+fn wait_bounded(
+    child: &mut std::process::Child,
+    limit: std::time::Duration,
+    leg: &str,
+) -> (std::process::ExitStatus, Vec<u8>) {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait().expect("try_wait") {
+            Some(status) => {
+                let mut stderr = Vec::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read as _;
+                    pipe.read_to_end(&mut stderr).expect("drain stderr");
+                }
+                return (status, stderr);
+            }
+            None => {
+                if started.elapsed() >= limit {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("{leg}: observer still alive after {limit:?} — shutdown hung");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Brief-literal bare full-system scan (runs 1 and 3 of the
+/// acquisition leg): self-terminating, so the repo-idiomatic
+/// unbounded `wait_with_output` applies. Returns the wall time —
+/// run 1 doubles as the acquisition baseline the middle run's
+/// signal timing self-calibrates against.
+fn bare_full_scan(workload: &Workload, run: u8) -> std::time::Duration {
+    let started = std::time::Instant::now();
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let wall = started.elapsed();
+    let code = output.status.code();
+    assert!(
+        matches!(code, Some(0) | Some(3) | Some(4)),
+        "run {run}: bare scan exit {code:?}"
+    );
+    // No-corruption clause, whole-document form: one-shot --json
+    // renders a single pretty document, so the bytes must parse
+    // whole (the NDJSON line form belongs to the watch run).
+    let doc: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("run {run}: stdout must parse as one JSON document: {e}"));
+    let wpid = workload.pid() as u64;
+    assert!(
+        doc["processes"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|r| r["pid"].as_u64() == Some(wpid))),
+        "run {run}: full sample must name workload pid {wpid}"
+    );
+    workload.assert_alive(&format!("run {run}"));
+    wall
+}
+
+/// Acquisition phase (Task 5 b, ADAPTED — Task-4-N1 family): the
+/// brief-literal bare `scan` cannot ack — one-shot scan/inspect
+/// routes are deliberately uninstrumented (no Shutdown; SIGINT
+/// kills with 128+signo — `service/signals.rs`, Task-3 N2/M3,
+/// reviewed). The acquisition phase that DOES share Shutdown is
+/// the in-flight sample of `scan --watch`, so only the signaled
+/// middle run is a watch; runs 1 and 3 stay brief-literal bare
+/// full-system scans (baseline + no-pollution, with full samples
+/// proving the workload is really observed).
+#[test]
+fn v060_sigint_mid_acquisition_acks_and_exits_3() {
+    let workload = match Workload::spawn() {
+        Some(workload) => workload,
+        None => {
+            eprintln!("skip: need python3 with ssl for the workload");
+            return;
+        }
+    };
+    // Run 1: baseline. A full watch sample costs ~= this (same
+    // scope + snapshot work), so the middle run signals at half
+    // the baseline — mid-sample-1 on any host whose full sample
+    // outlasts the 200ms setup floor (measured 3.4s here).
+    let baseline = bare_full_scan(&workload, 1);
+    // Run 2: full-system watch, SIGINT self-calibrated to
+    // mid-acquisition.
+    let signal_after = (baseline / 2).clamp(
+        std::time::Duration::from_millis(200),
+        std::time::Duration::from_secs(2),
+    );
+    let stdout_path = stdout_sink("acq2");
+    let sink = std::fs::File::create(&stdout_path).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--json",
+            "--interval",
+            "1",
+            "--duration",
+            "120",
+        ])
+        .stdout(sink)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(signal_after);
+    libc_kill::kill(child.id() as i32, libc_kill::SIGINT);
+    let (status, stderr) = wait_bounded(
+        &mut child,
+        std::time::Duration::from_secs(15),
+        "acquisition run",
+    );
+    assert_eq!(status.code(), Some(3));
+    let err = String::from_utf8_lossy(&stderr);
+    assert!(
+        err.contains("shutting down") && err.contains("SIGINT"),
+        "no SIGINT ack: {err}"
+    );
+    let text = std::fs::read_to_string(&stdout_path).unwrap();
+    let _ = std::fs::remove_file(&stdout_path);
+    // No-corruption clause, NDJSON form: watch --json emits one
+    // record per line — every line must parse (a signal only flips
+    // the cancel flag, never tears a write), and the last line is
+    // the interrupted end record (always present, even when the
+    // signal lands before the first sample).
+    let mut records = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        records.push(
+            serde_json::from_str::<Value>(line).expect("every stdout line must parse as JSON"),
+        );
+    }
+    assert!(!records.is_empty(), "watch must always emit its end record");
+    let end = records.last().unwrap();
+    assert_eq!(end["record"].as_str(), Some("end"));
+    assert_eq!(end["reason"].as_str(), Some("interrupted"));
+    assert_eq!(end["status"].as_u64(), Some(3));
+    // Proven-acquisition marker (gated on a proven precondition):
+    // with ≥300ms between the signal and the earliest possible
+    // sample end, the in-flight sample was provably cut early, so
+    // it carries Deadline gaps (Task 2: cancel ends acquisition
+    // with the same gap a timeout produces). Skipped only on
+    // hosts too fast to prove the phase — the contract above
+    // holds regardless of where the signal lands.
+    if signal_after + std::time::Duration::from_millis(300) < baseline {
+        assert!(
+            records
+                .iter()
+                .any(|r| r["record"].as_str() == Some("snapshot")
+                    && r["snapshot"]["gaps"].as_array().is_some_and(|g| g
+                        .iter()
+                        .any(|gap| gap["reason"].as_str() == Some("deadline")))),
+            "signal provably mid-sample but no deadline gap"
+        );
+    }
+    workload.assert_alive("acquisition run");
+    // Run 3: the environment is unpolluted (same full-sample
+    // proofs as run 1).
+    bare_full_scan(&workload, 3);
+}
+
+/// Observation-phase SIGTERM (Task 5 c): `--watch` scoped to the
+/// workload pid, whose samples take milliseconds — the 1.5s
+/// signal lands in the inter-sample wait, post-acquisition. The
+/// ack must NAME the signal.
+#[test]
+fn v060_sigterm_during_watch_acks_sigterm_and_exits_3() {
+    let workload = match Workload::spawn() {
+        Some(workload) => workload,
+        None => {
+            eprintln!("skip: need python3 with ssl for the workload");
+            return;
+        }
+    };
+    let pid = workload.pid().to_string();
+    let stdout_path = stdout_sink("term");
+    let sink = std::fs::File::create(&stdout_path).unwrap();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args([
+            "scan",
+            "--watch",
+            "--pid",
+            pid.as_str(),
+            "--interval",
+            "1",
+            "--duration",
+            "60",
+        ])
+        .stdout(sink)
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    libc_kill::kill(child.id() as i32, libc_kill::SIGTERM);
+    let (status, stderr) = wait_bounded(
+        &mut child,
+        std::time::Duration::from_secs(15),
+        "sigterm run",
+    );
+    assert_eq!(status.code(), Some(3));
+    let err = String::from_utf8_lossy(&stderr);
+    assert!(
+        err.contains("SIGTERM") && err.contains("shutting down"),
+        "ack must name SIGTERM: {err}"
+    );
+    let text = std::fs::read_to_string(&stdout_path).unwrap();
+    let _ = std::fs::remove_file(&stdout_path);
+    assert!(
+        text.contains("Watch ended:") && text.contains("interrupted"),
+        "no interrupted end record"
+    );
+    workload.assert_alive("sigterm run");
 }
