@@ -221,10 +221,13 @@ pub(super) fn incarnation_direct(directory: &File) -> Option<(u64, NamespaceId)>
 /// (sampled spelling, never proof). Both reads are bracketed by
 /// the incarnation: when the post-read starttime moved — or can no
 /// longer be read — both facts report `Changed` with no value, so
-/// bytes from another incarnation are never attributed. IO refusal
-/// reports `Unreadable`, never an error: unavailable identity
-/// degrades the record, never the inventory. Never reads
-/// `cmdline`: argv stays redacted.
+/// bytes from another incarnation are never attributed. `exe` is
+/// additionally continuity-bracketed: `execve` changes the
+/// spelling without changing starttime, so a re-sample must
+/// agree with the sample or `exe` reports `Changed` with no
+/// value. IO refusal reports `Unreadable`, never an error:
+/// unavailable identity degrades the record, never the
+/// inventory. Never reads `cmdline`: argv stays redacted.
 pub(crate) fn read_comm_exe(
     dir: &File,
     starttime_before: u64,
@@ -263,39 +266,46 @@ pub(crate) fn read_comm_exe(
         }
         Err(_) => (None, IdentityAvailability::Unreadable),
     };
-    let (exe, exe_status) = (|| {
-        let name = CString::new("exe").ok()?;
-        let mut bytes = vec![0u8; EXE_BOUND + 1];
-        // SAFETY: dirfd and the output buffer stay live for the
-        // call; readlinkat writes at most bufsiz bytes and its
-        // return length (not NUL-termination) delimits them.
-        let len = unsafe {
-            libc::readlinkat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                bytes.as_mut_ptr().cast(),
-                bytes.len(),
-            )
-        };
-        let len = usize::try_from(len).ok()?;
-        if len > bytes.len() {
-            return None;
-        }
-        let truncated = len > EXE_BOUND;
-        bytes.truncate(len.min(EXE_BOUND));
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        if text.is_empty() {
-            Some((None, IdentityAvailability::Unreadable))
-        } else if truncated {
-            Some((Some(text), IdentityAvailability::TooLong))
-        } else {
-            Some((Some(text), IdentityAvailability::Available))
-        }
-    })()
-    .unwrap_or((None, IdentityAvailability::Unreadable));
-    // Incarnation/exe-continuity bracket: attribute nothing sampled
-    // across a recycle. Modules acquired around this call are kept
-    // by the caller regardless (identity never discards inventory).
+    let sample_exe = || {
+        (|| {
+            let name = CString::new("exe").ok()?;
+            let mut bytes = vec![0u8; EXE_BOUND + 1];
+            // SAFETY: dirfd and the output buffer stay live for the
+            // call; readlinkat writes at most bufsiz bytes and its
+            // return length (not NUL-termination) delimits them.
+            let len = unsafe {
+                libc::readlinkat(
+                    dir.as_raw_fd(),
+                    name.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            let len = usize::try_from(len).ok()?;
+            if len > bytes.len() {
+                return None;
+            }
+            let truncated = len > EXE_BOUND;
+            bytes.truncate(len.min(EXE_BOUND));
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            if text.is_empty() {
+                Some((None, IdentityAvailability::Unreadable))
+            } else if truncated {
+                Some((Some(text), IdentityAvailability::TooLong))
+            } else {
+                Some((Some(text), IdentityAvailability::Available))
+            }
+        })()
+        .unwrap_or((None, IdentityAvailability::Unreadable))
+    };
+    let (exe, exe_status) = sample_exe();
+    // Deterministic exec-test seam: fires between the exe sample
+    // and the continuity re-sample below.
+    resolve::fire_hook(resolve::HookEvent::AfterExeSample);
+    let (exe_again, exe_again_status) = sample_exe();
+    // Incarnation bracket: attribute nothing sampled across a
+    // recycle. Modules acquired around this call are kept by the
+    // caller regardless (identity never discards inventory).
     if incarnation_direct(dir).is_none_or(|(after, _)| after != starttime_before) {
         return (
             None,
@@ -304,6 +314,21 @@ pub(crate) fn read_comm_exe(
             IdentityAvailability::Changed,
         );
     }
+    // Exe-continuity bracket (F2): `execve` changes exe without
+    // changing starttime, so the incarnation bracket above cannot
+    // catch it. The sampled spelling must survive to the
+    // re-sample; any difference — spelling or availability —
+    // reports `Changed` with no value, never the stale sample.
+    // (Spelling is the emitted fact, so bracketing the spelling
+    // is exact; an fstat-identity comparison would add nothing —
+    // `readlink` succeeds where `open` is refused — and a
+    // same-spelling exec keeps the emitted fact correct.)
+    let (exe, exe_status) = if (exe.as_ref(), exe_status) == (exe_again.as_ref(), exe_again_status)
+    {
+        (exe, exe_status)
+    } else {
+        (None, IdentityAvailability::Changed)
+    };
     (comm, comm_status, exe, exe_status)
 }
 
@@ -2049,6 +2074,164 @@ mod tests {
                 .iter()
                 .any(|gap| gap.reason == GapReason::IdentityUnverified),
             "downgrade must record unverified identity: {result:?}"
+        );
+    }
+
+    /// Owned test child: SIGKILL + reap on drop, so no stray or
+    /// zombie child survives any path (duplicated from the
+    /// resolve suite — same repo precedent as the integration
+    /// target helpers).
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// Spawn `sh -c 'read x; exec /bin/sleep 60'`: the child sits
+    /// in `read` until the hook writes its stdin, then execs —
+    /// `execve` without a starttime change (the F2 shape).
+    /// Returns the guarded child plus its taken stdin.
+    fn spawn_exec_child(
+        env_extra: Option<(&str, &std::ffi::OsStr)>,
+    ) -> (ChildGuard, std::process::ChildStdin) {
+        use std::process::Stdio;
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg("read x; exec /bin/sleep 60")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if let Some((key, value)) = env_extra {
+            command.env(key, value);
+        }
+        let mut child = ChildGuard(command.spawn().unwrap());
+        let stdin = child.0.stdin.take().unwrap();
+        (child, stdin)
+    }
+
+    #[test]
+    fn v060f2_exec_mid_sample_reports_changed() {
+        // F2: an exec landing between the exe sample and the
+        // continuity re-sample must report `Changed` with no
+        // value — never the stale pre-exec spelling. The hook
+        // releases the blocked child and returns only after the
+        // kernel reports the flipped spelling, so both samples
+        // straddle the exec deterministically (no timing).
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let (child, mut stdin) = spawn_exec_child(None);
+        let pid = child.0.id();
+        let exe_link = format!("/proc/{pid}/exe");
+        let before = std::fs::read_link(&exe_link).unwrap();
+        let dir = File::open(format!("/proc/{pid}")).unwrap();
+        let before_hook = before.clone();
+        let (starttime, _) = incarnation_direct(&dir).expect("live target");
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        resolve::set_hook(Some(Box::new(move |event| {
+            if event == resolve::HookEvent::AfterExeSample
+                && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                stdin.write_all(b"x\n").unwrap();
+                // The write guarantees the exec; the bound below
+                // is a hang detector, never a timing assumption.
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if std::fs::read_link(&exe_link).unwrap() != before_hook {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "exec must land");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        })));
+        let (_comm, _comm_status, exe, exe_status) = read_comm_exe(&dir, starttime);
+        resolve::set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        assert_eq!(exe, None);
+        assert_eq!(exe_status, IdentityAvailability::Changed);
+        // Post-assertions: the target exec'd (not exited) and its
+        // starttime never moved — this is the pure F2 shape.
+        let (start_after, _) = incarnation_direct(&dir).expect("target survives the exec");
+        assert_eq!(starttime, start_after);
+        assert_ne!(
+            std::fs::read_link(format!("/proc/{pid}/exe")).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn v060f2_exec_mid_sample_keeps_inventory() {
+        // F2 at the record layer: the same mid-sample exec must
+        // degrade only the exe fact — the full snapshot record
+        // keeps the modules mapped by the post-exec image
+        // (LD_PRELOADed libcrypto), with exe null + `Changed`.
+        use std::io::Write as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let lib = [
+            "/usr/lib64/libcrypto.so.3",
+            "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+            "/lib64/libcrypto.so.3",
+        ]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+        .expect("HOST exec-inventory test requires a system libcrypto");
+        let (child, mut stdin) = spawn_exec_child(Some(("LD_PRELOAD", std::ffi::OsStr::new(lib))));
+        let pid = child.0.id();
+        let exe_link = format!("/proc/{pid}/exe");
+        let before_hook = std::fs::read_link(&exe_link).unwrap();
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        resolve::set_hook(Some(Box::new(move |event| {
+            if event == resolve::HookEvent::AfterExeSample
+                && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                stdin.write_all(b"x\n").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                loop {
+                    if std::fs::read_link(&exe_link).unwrap() != before_hook {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "exec must land");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        })));
+        let result = snapshot(&SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        });
+        resolve::set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        let process = result
+            .processes
+            .iter()
+            .find(|p| p.pid == pid)
+            .expect("child must be inventoried");
+        assert_eq!(process.exe, None);
+        assert_eq!(process.exe_status, IdentityAvailability::Changed);
+        assert!(
+            !process.modules.is_empty(),
+            "identity must not discard inventory: {result:?}"
+        );
+        assert!(
+            process
+                .modules
+                .iter()
+                .any(|m| m.info.file_soname.as_deref() == Some("libcrypto.so.3")),
+            "post-exec libcrypto must be inventoried: {result:?}"
         );
     }
 }

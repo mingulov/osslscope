@@ -114,7 +114,11 @@ backing (such as `/proc/PID/exe` or `/proc/self/fd/N`) remain supported.
 Machine records always carry path evidence: `--json`/NDJSON documents
 include `verified_path`/`verified_path_unavailable`/`maps_spelling` on
 every mapped record whether or not `--resolve-paths` is passed, so
-machine bytes are identical with the flag on or off.
+machine bytes are identical with the flag on or off. That machine
+output may disclose sensitive filenames and exe spellings wherever
+those bytes travel — redirects, logs, support bundles, tickets,
+pastes — regardless of `--resolve-paths`; treat captured discovery
+output as potentially sensitive.
 `--resolve-paths` (argv only, default off) gates only the human `path=`
 fragment, and only on an interactive terminal. CBOM, policy records,
 diagnostics, and exit codes are byte-identical with the flag on or off;

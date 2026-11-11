@@ -47,6 +47,12 @@ pub(crate) const CHANGED: &str = "(changed)";
 /// `/proc` magic-link traversal by link type, at any procfs mount.
 const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
 
+/// `RESOLVE_NO_SYMLINKS` (uapi `linux/openat2.h`, same
+/// kernel baseline as above): resolve no symlink at any
+/// component — a swapped-in link fails `ELOOP` instead of
+/// traversing. The rooted descent's confinement primitive.
+const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+
 /// Chase expansion bound: the chase gives up past this many
 /// readlink splices (suppression, never unbounded pursuit).
 /// Defense in depth — the kernel's own MAXSYMLINKS (same value)
@@ -117,8 +123,9 @@ fn count_invocation() {
 }
 
 /// Test hook events: deterministic mutation points inside
-/// resolution (cell 4 symlink-swap races). Always compiled;
-/// `None` in production (no behavior delta).
+/// resolution (cell 4 symlink-swap races) and the D2
+/// exe-continuity sample (procfs). Always compiled; `None` in
+/// production (no behavior delta).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HookEvent {
     /// After the atomic constrained open pinned its FD, before
@@ -127,6 +134,18 @@ pub(crate) enum HookEvent {
     /// Before descending into chase component `index` (0-based
     /// over walked components, symlink expansions included).
     BeforeChaseStep { index: usize },
+    /// After a rooted-walk component classified as a non-symlink,
+    /// before the descent open (`index` 0-based over popped
+    /// components). Fires inside the former fstatat→open window —
+    /// the descent itself can no longer follow a swapped-in link.
+    BeforeRootedStep { index: usize },
+    /// After the rooted walk, backing-identity match, and
+    /// incarnation bracket all passed, before the fresh-root
+    /// re-proof walk.
+    BeforeRootedReproof,
+    /// After the D2 exe spelling sample, before the continuity
+    /// re-sample (fired by procfs, same per-thread slot).
+    AfterExeSample,
 }
 
 type HookFn = Box<dyn FnMut(HookEvent) + Send>;
@@ -147,7 +166,7 @@ pub(crate) fn set_hook(hook: Option<HookFn>) {
     HOOK.with(|slot| *slot.borrow_mut() = hook);
 }
 
-fn fire_hook(event: HookEvent) {
+pub(crate) fn fire_hook(event: HookEvent) {
     // try_borrow: a (never-written) reentrant resolve inside a
     // hook skips the nested fire instead of panicking.
     HOOK.with(|slot| {
@@ -259,17 +278,14 @@ struct OpenHow {
     resolve: u64,
 }
 
-/// Raw following `openat2(dirfd, name, O_PATH|O_CLOEXEC,
-/// `RESOLVE_NO_MAGICLINKS`). Returns the raw errno on failure.
-/// Always follows: the classifier relies on follow-vs-ELOOP to
-/// tell plain links from magic ones (O_NOFOLLOW would open the
-/// link itself either way — useless as a discriminator).
-fn openat2_no_magic(dirfd: i32, name: &std::ffi::CStr) -> Result<File, i32> {
+/// Raw `openat2(dirfd, name, O_PATH|O_CLOEXEC, resolve)`
+/// core. Returns the raw errno on failure.
+fn openat2_with(dirfd: i32, name: &std::ffi::CStr, resolve: u64) -> Result<File, i32> {
     let flags = (libc::O_PATH | libc::O_CLOEXEC) as u64;
     let how = OpenHow {
         flags,
         mode: 0,
-        resolve: RESOLVE_NO_MAGICLINKS,
+        resolve,
     };
     // SAFETY: `how` and the component name are valid for the
     // syscall duration; dirfd is borrowed, ownership of the
@@ -289,6 +305,25 @@ fn openat2_no_magic(dirfd: i32, name: &std::ffi::CStr) -> Result<File, i32> {
     }
     // SAFETY: fd was returned by openat2; ownership transfers once.
     Ok(unsafe { File::from_raw_fd(fd as i32) })
+}
+
+/// Following open with `RESOLVE_NO_MAGICLINKS`: the kernel
+/// resolves plain symlinks but rejects every magic link.
+/// Always follows: the classifier relies on follow-vs-ELOOP to
+/// tell plain links from magic ones (O_NOFOLLOW would open the
+/// link itself either way — useless as a discriminator).
+fn openat2_no_magic(dirfd: i32, name: &std::ffi::CStr) -> Result<File, i32> {
+    openat2_with(dirfd, name, RESOLVE_NO_MAGICLINKS)
+}
+
+/// Non-following descent open for [`walk_rooted`]: the mask adds
+/// `RESOLVE_NO_SYMLINKS`, so a component swapped for a (plain
+/// or absolute) symlink between the `fstatat` classification and
+/// this open fails `ELOOP` instead of escaping the root fd (F1:
+/// confinement is kernel-enforced at open time, never dependent
+/// on the check→open window).
+fn openat2_no_follow(dirfd: i32, name: &std::ffi::CStr) -> Result<File, i32> {
+    openat2_with(dirfd, name, RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS)
 }
 
 /// Enforcement support probe (cached per process): `openat2` on
@@ -671,13 +706,17 @@ fn establish_layer_locator(
 
 /// Root-fd walk: resolve `absolute` (target-namespace spelling, leading
 /// `/`) inside `root`, returning the canonical spelling plus the pinned
-/// final descriptor. Every descent is a single-component constrained
-/// `openat2` against a component PROVEN a non-symlink by `fstatat`
-/// NOFOLLOW; symlinks chase TEXTUALLY (readlink + splice, absolute
-/// targets restart at the root fd) so the kernel never interprets a
-/// link — magic links can only contribute text, never traversal, and
-/// absolute restarts land on the target root, never the host root.
-/// `..` pops lexically over the proven link-free prefix (after any
+/// final descriptor. Every descent is a single-component
+/// non-following `openat2` (`RESOLVE_NO_SYMLINKS`): a component
+/// swapped for a symlink between the `fstatat` NOFOLLOW
+/// classification and the descent open fails `ELOOP` instead of
+/// escaping the root fd — confinement is kernel-enforced at open
+/// time, never dependent on the check→open window. Symlinks chase
+/// TEXTUALLY (readlink + splice, absolute targets restart at the
+/// root fd) so the kernel never interprets a link — magic links
+/// can only contribute text, never traversal, and absolute
+/// restarts land on the target root, never the host root. `..`
+/// pops lexically over the proven link-free prefix (after any
 /// expansion, or above the root fd, it fails closed). Bounded by
 /// `MAX_CHASE_STEPS`/`MAX_SYMLINK_EXPANSIONS`; anything else fails
 /// closed to `None`.
@@ -704,6 +743,7 @@ fn walk_rooted(root: &File, absolute: &[u8]) -> Option<(Vec<u8>, File)> {
         if step >= MAX_CHASE_STEPS {
             return None;
         }
+        let index = step;
         step += 1;
         if component == b".." {
             // Lexical pop is exact only over a proven non-link
@@ -776,7 +816,10 @@ fn walk_rooted(root: &File, absolute: &[u8]) -> Option<(Vec<u8>, File)> {
             pending.extend(parts);
             continue;
         }
-        let child = openat2_no_magic(dir.as_raw_fd(), &name).ok()?;
+        // Deterministic race-test seam: fires after the non-link
+        // classification, before the descent open.
+        fire_hook(HookEvent::BeforeRootedStep { index });
+        let child = openat2_no_follow(dir.as_raw_fd(), &name).ok()?;
         dir = child;
         built.push(component);
     }
@@ -820,6 +863,9 @@ fn verify_root_anchored(
     if before != after {
         return None;
     }
+    // Deterministic re-proof-test seam: the first walk, backing
+    // match, and incarnation bracket all passed at this point.
+    fire_hook(HookEvent::BeforeRootedReproof);
     // Pathname re-proof from a fresh root fd (also re-proves target
     // liveness: a raced exit fails the fresh `root` open).
     let fresh = super::procfs::open_at(process_dir, b"root").ok()?;
@@ -2066,5 +2112,353 @@ mod tests {
         if kind == LocatorKind::ProcRootAnchored {
             assert_eq!(path, expected);
         }
+    }
+
+    #[test]
+    fn v060f1_rooted_walk_component_swap_cannot_escape() {
+        // F1: deterministic dir→symlink swap inside the
+        // fstatat→open window must fail the walk closed — the
+        // swapped absolute symlink is never followed out of the
+        // root fd, even when the escape landing carries the
+        // retained identity (shared-file stand-in: only
+        // confinement fails this closed, never identity).
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch("f1-race");
+        let root = dir.join("root");
+        let outside = dir.join("outside");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("sub").join("keep"), b"k").unwrap();
+        std::fs::write(outside.join("file"), b"host").unwrap();
+        // Positive control (no hook): the unattacked walk proves.
+        let root_fd = File::open(&root).unwrap();
+        assert!(super::walk_rooted(&root_fd, b"/sub/keep").is_some());
+        // The attack: `root/sub` (a proven dir) becomes an
+        // absolute symlink to `outside` after classification,
+        // before the descent open.
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let sub = root.join("sub");
+        let sub_clone = sub.clone();
+        let outside_clone = outside.clone();
+        set_hook(Some(Box::new(move |event| {
+            if event == (HookEvent::BeforeRootedStep { index: 0 })
+                && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                std::fs::remove_dir_all(&sub_clone).unwrap();
+                symlink(&outside_clone, &sub_clone);
+            }
+        })));
+        let walked = super::walk_rooted(&root_fd, b"/sub/file");
+        set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        assert!(
+            walked.is_none(),
+            "swapped symlink must not be followed out of the root"
+        );
+    }
+
+    #[test]
+    fn v060f1_rooted_escape_publishes_null_with_finite_reason() {
+        // F1 at the publish layer: an in-window swap at BOTH the
+        // first walk and the re-proof walk must surface as null +
+        // `ResolveFailed`, never a locator. Root-cause note: a
+        // single persistent swap does NOT escape publish even
+        // pre-fix — the re-proof re-classifies it textually and
+        // `rebuilt != canonical` fails closed. The end-to-end
+        // exploit is a flicker (dir at each classification, link
+        // at each descent open), choreographed here by swapping
+        // at the `sub` step and restoring at the `file` step in
+        // each walk. Pre-fix both walks follow the flicker, pin
+        // the shared identity, and agree on the spelling (Some);
+        // post-fix the first descent ELOOPs (None + reason).
+        use crate::inventory::PathUnavailableReason;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = scratch("f1-publish");
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let retained = elsewhere.join("file");
+        std::fs::write(&retained, b"host").unwrap();
+        let identity = identity_of(&retained);
+        let candidate = sub.join("file");
+        // Walk steps are 0-based over popped components, so `sub`
+        // (second-to-last normal component) fires at count - 3
+        // (`components` counts the leading root as well), and the
+        // link-free candidate keeps `file` immediately after.
+        let sub_step = candidate.components().count() - 3;
+        let file_step = sub_step + 1;
+        let swaps = std::sync::Arc::new(AtomicUsize::new(0));
+        let swaps_clone = swaps.clone();
+        let sub_clone = sub.clone();
+        let elsewhere_clone = elsewhere.clone();
+        set_hook(Some(Box::new(move |event| {
+            if event == (HookEvent::BeforeRootedStep { index: sub_step }) {
+                swaps_clone.fetch_add(1, Ordering::SeqCst);
+                std::fs::remove_dir(&sub_clone).unwrap();
+                symlink(&elsewhere_clone, &sub_clone);
+            } else if event == (HookEvent::BeforeRootedStep { index: file_step }) {
+                std::fs::remove_file(&sub_clone).unwrap();
+                std::fs::create_dir(&sub_clone).unwrap();
+            }
+        })));
+        let proc_dir = File::open("/proc/self").unwrap();
+        let (path, reason) = super::publish_root_anchored(&proc_dir, &candidate, identity);
+        set_hook(None);
+        assert!(
+            swaps.load(Ordering::SeqCst) >= 1,
+            "hook must swap in-window (anti-vacuity)"
+        );
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
+    }
+
+    /// Owned test child: SIGKILL + reap on drop, so no stray or
+    /// zombie child survives any path (including assertion
+    /// panics). Best-effort and exact-pid only.
+    struct ChildGuard(std::process::Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn v060f3_replacement_between_walk_and_reproof_fails_closed() {
+        // F3 root-walk replacement: the target is replaced (new
+        // inode, different bytes) after the first walk passed, so
+        // the fresh-root re-proof's identity leg must fire — null
+        // + `ResolveFailed`, never the retained spelling. The
+        // fired flag proves the hook (hence the first walk, the
+        // backing match, and the incarnation bracket) completed.
+        use crate::inventory::PathUnavailableReason;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch("f3-replace");
+        let target = dir.join("lib.so");
+        std::fs::write(&target, b"v1").unwrap();
+        let identity = identity_of(&target);
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let target_clone = target.clone();
+        set_hook(Some(Box::new(move |event| {
+            if event == HookEvent::BeforeRootedReproof && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                let fresh = target_clone.with_extension("new");
+                std::fs::write(&fresh, b"v2-different").unwrap();
+                std::fs::rename(&fresh, &target_clone).unwrap();
+            }
+        })));
+        let proc_dir = File::open("/proc/self").unwrap();
+        let (path, reason) = super::publish_root_anchored(&proc_dir, &target, identity);
+        set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
+    }
+
+    #[test]
+    fn v060f3_copyup_identical_bytes_fails_closed() {
+        // F3 copy-up: the target is replaced by a content-IDENTICAL
+        // copy (fresh inode, same bytes — what an overlay copy-up
+        // looks like at the verify layer) after the first walk
+        // passed. Verification is identity, not content, so the
+        // re-proof identity leg must fire all the same.
+        use crate::inventory::PathUnavailableReason;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch("f3-copyup");
+        let target = dir.join("lib.so");
+        std::fs::write(&target, b"same-bytes").unwrap();
+        let identity = identity_of(&target);
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let target_clone = target.clone();
+        set_hook(Some(Box::new(move |event| {
+            if event == HookEvent::BeforeRootedReproof && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                let fresh = target_clone.with_extension("up");
+                std::fs::write(&fresh, b"same-bytes").unwrap();
+                std::fs::rename(&fresh, &target_clone).unwrap();
+            }
+        })));
+        let proc_dir = File::open("/proc/self").unwrap();
+        let (path, reason) = super::publish_root_anchored(&proc_dir, &target, identity);
+        set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
+    }
+
+    #[test]
+    fn v060f3_namespace_change_mid_verify_fails_closed() {
+        // F3 namespace change: a live child enters a new user+mount
+        // namespace (one `unshare` call) between the incarnation
+        // bracket's two reads, synchronized by hook→stdin→ack (no
+        // sleeps, no timing). Both reads succeed with equal
+        // starttime and different mount-ns identity, so the
+        // `before != after` mismatch leg fires — null +
+        // `ResolveFailed`. Post-assertions prove the mismatch
+        // (not a read failure): the child is alive throughout and
+        // the namespace pair straddles the change.
+        use crate::inventory::PathUnavailableReason;
+        use std::io::{Read as _, Write as _};
+        use std::process::Stdio;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch("f3-ns");
+        let target = dir.join("lib.so");
+        std::fs::write(&target, b"x").unwrap();
+        let identity = identity_of(&target);
+        let mut child = ChildGuard(
+            std::process::Command::new("python3")
+                .arg("-c")
+                .arg(
+                    "import ctypes, sys, time; \
+                     sys.stdin.buffer.read(1); \
+                     rc = ctypes.CDLL(None).unshare(0x10000000 | 0x00020000); \
+                     sys.stdout.buffer.write(b'1' if rc == 0 else b'0'); \
+                     sys.stdout.buffer.flush(); \
+                     time.sleep(60)",
+                )
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let mut stdin = child.0.stdin.take().unwrap();
+        let mut stdout = child.0.stdout.take().unwrap();
+        let proc_dir = File::open(format!("/proc/{pid}")).unwrap();
+        let (start_before, ns_before) =
+            super::super::procfs::incarnation_direct(&proc_dir).expect("live target pre-read");
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        set_hook(Some(Box::new(move |event| {
+            if event == (HookEvent::BeforeRootedStep { index: 0 })
+                && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                stdin.write_all(b"x").unwrap();
+                let mut ack = [0u8; 1];
+                stdout.read_exact(&mut ack).unwrap();
+                assert_eq!(ack, [b'1'], "child must enter the new namespaces");
+            }
+        })));
+        let (path, reason) = super::publish_root_anchored(&proc_dir, &target, identity);
+        set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
+        // The mismatch leg (not a read failure): the child never
+        // died, starttime is stable, the mount ns moved.
+        assert!(child.0.try_wait().unwrap().is_none(), "target stays alive");
+        let (start_after, ns_after) =
+            super::super::procfs::incarnation_direct(&proc_dir).expect("live target post-read");
+        assert_eq!(start_before, start_after);
+        assert_ne!(ns_before, ns_after);
+    }
+
+    #[test]
+    fn v060f3_exit_mid_verify_fails_closed() {
+        // F3 real PID lifecycle (mid-verify exit): the target is
+        // SIGKILLed and reaped between the bracket's two reads, so
+        // the post-walk incarnation read fails and the bracket's
+        // liveness clause fails closed — null + `ResolveFailed`.
+        // The pre/post incarnation pair proves which leg fired:
+        // `Some` before (the first read passed), `None` after.
+        use crate::inventory::PathUnavailableReason;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let dir = scratch("f3-exit");
+        let target = dir.join("lib.so");
+        std::fs::write(&target, b"x").unwrap();
+        let identity = identity_of(&target);
+        // The guard owns the child until the hook takes it: no
+        // stray or zombie on any path, including pre-hook panics.
+        let mut slot = Some(ChildGuard(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        ));
+        let proc_dir = File::open(format!("/proc/{}", slot.as_ref().unwrap().0.id())).unwrap();
+        assert!(
+            super::super::procfs::incarnation_direct(&proc_dir).is_some(),
+            "target alive at the first read"
+        );
+        let fired = std::sync::Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        set_hook(Some(Box::new(move |event| {
+            if event == (HookEvent::BeforeRootedStep { index: 0 })
+                && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                let mut owned = slot.take().unwrap();
+                owned.0.kill().unwrap();
+                owned.0.wait().unwrap();
+            }
+        })));
+        let (path, reason) = super::publish_root_anchored(&proc_dir, &target, identity);
+        set_hook(None);
+        assert!(
+            fired.load(Ordering::SeqCst),
+            "hook must fire (anti-vacuity)"
+        );
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
+        assert!(
+            super::super::procfs::incarnation_direct(&proc_dir).is_none(),
+            "reaped target reads fail"
+        );
+    }
+
+    #[test]
+    fn v060f3_exit_between_establish_and_publish_fails_closed() {
+        // F3 real PID lifecycle (establish→publish reuse boundary):
+        // the root arm PROVES a live target, the target is then
+        // reaped, and publishing through the stale held dir must
+        // fail closed — null + `ResolveFailed`. A literal
+        // same-number reuse is unforceable (the kernel assigns
+        // PIDs), but the held dir fd pins the OLD proc entry, so a
+        // reused number reads through the stale entry exactly as
+        // this dead one does: the re-proof, not the number, is the
+        // boundary.
+        use crate::inventory::PathUnavailableReason;
+        let dir = scratch("f3-reuse");
+        let target = dir.join("lib.so");
+        std::fs::write(&target, b"x").unwrap();
+        let identity = identity_of(&target);
+        let mut child = ChildGuard(
+            std::process::Command::new("/bin/sleep")
+                .arg("60")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let proc_dir = File::open(format!("/proc/{}", child.0.id())).unwrap();
+        let locator =
+            super::verify_root_anchored(&proc_dir, &target, identity).expect("live target proves");
+        assert_eq!(locator, target);
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        let (path, reason) = super::publish_root_anchored(&proc_dir, &locator, identity);
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
     }
 }
