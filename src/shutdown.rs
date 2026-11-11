@@ -51,6 +51,15 @@ impl Shutdown {
         &CANCELLED
     }
 
+    /// Process-wide cancel state without an instance (v0.6.0 signals
+    /// Task 4): the live capture loops take `&dyn Fn() -> bool`, not
+    /// `&Shutdown`, so `capture::interrupted()` delegates here. A
+    /// single atomic load like the flag it replaces; it never stamps
+    /// `first_signal_at` (deadline accounting stays instance-side).
+    pub fn cancelled_global() -> bool {
+        CANCELLED.load(Ordering::SeqCst)
+    }
+
     pub fn cancelled(&self) -> bool {
         if CANCELLED.load(Ordering::SeqCst) {
             let mut slot = self.first_signal_at.lock().unwrap();

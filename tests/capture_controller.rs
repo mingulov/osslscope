@@ -10580,6 +10580,49 @@ fn g1_recycle_count_cleanup_cannot_extend_window() {
     );
 }
 
+#[test]
+fn v060_capture_cancel_hook_unwinds_without_signaling_target() {
+    // Async-signal model: cancel_hook fires true from the first poll,
+    // like SIGINT landing during setup. Observe must unwind with the
+    // target never signaled and no waitable child left behind.
+    //
+    // v0.6.0 Task 4 adaptations (brief-literal form cannot pass under a
+    // correct implementation, Task-3-N2 family):
+    // - foreign workload (`owned = false`): the literal owned form feeds
+    //   cancelled-from-the-start into setup, which must stay a typed
+    //   `Cancelled` error (`signal_during_setup_cuts_cleanly` pins it);
+    //   only the foreign path unwinds Ok with `Detached`.
+    // - `TargetLog` carries no signal record (brief escape hatch); the
+    //   real "left running, never signaled" contract is
+    //   `TargetDisposition::Detached` (capture.rs documents it).
+    let mut h = Harness::fresh("v060-cancel-unwind");
+    h.owned = false;
+    h.cancel_hook = Some(Rc::new(|| true));
+    let (out, ctx) = h.run();
+    assert!(out.is_ok(), "cancel must unwind, not error: {out:?}");
+    let c = out.unwrap();
+    assert!(
+        matches!(
+            c.disposition,
+            Some(target::TargetDisposition::Detached { pid: PID })
+        ),
+        "foreign target must detach (left running, never signaled): {:?}",
+        c.disposition
+    );
+    assert!(c.document.window.signal_cut, "cancel must cut the window");
+    let log = ctx.target_log.borrow();
+    assert!(
+        !log.released && !log.resolved,
+        "foreign target must see no custody action: {log:?}"
+    );
+    assert!(log.finished, "teardown must finish the target: {log:?}");
+    let order = ctx.order.borrow();
+    assert!(
+        order.iter().any(|e| e.contains("close")),
+        "no teardown order: {order:?}"
+    );
+}
+
 #[path = "support/lifecycle_driver.rs"]
 mod lifecycle_driver;
 use lifecycle_driver::run_connector_driver;

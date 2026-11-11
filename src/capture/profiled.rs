@@ -90,7 +90,9 @@ pub(crate) fn run_profiled_before(
             .checked_add(cfg.timeout)
             .context("preview setup deadline overflow")?,
     );
-    super::arm_signals();
+    // Shared shutdown (v0.6.0 signals Task 4): no-restart
+    // sigaction; `interrupted()` below already reads its flag.
+    let shutdown = crate::shutdown::Shutdown::install().context("preview signal setup failed")?;
     let check = || {
         if super::interrupted() || Instant::now() >= deadline {
             bail!("preview setup cancelled or timed out");
@@ -107,7 +109,7 @@ pub(crate) fn run_profiled_before(
         &argv,
         workload,
         deadline,
-        &super::INTERRUPTED,
+        shutdown.cancel_flag(),
     )?;
     let prepared = (|| {
         check()?;
@@ -120,7 +122,7 @@ pub(crate) fn run_profiled_before(
             child.pid(),
             Arc::new(crate::count_owner::CountForkBarrier::new()),
             deadline,
-            Some(&super::INTERRUPTED),
+            Some(shutdown.cancel_flag()),
         )
         .map_err(anyhow::Error::from)
     })();

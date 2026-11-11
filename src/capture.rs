@@ -634,22 +634,17 @@ fn evidence_partition(p: legacy::CallPartition) -> LegacyCallPartition {
 }
 
 // ---------------------------------------------------------------- signals
+//
+// v0.6.0 signals Task 4: the BSD `signal()` arm (SA_RESTART
+// semantics) is gone; both live call sites install the shared
+// `Shutdown` (no-restart sigaction, second signal `_exit`s
+// 128+signo) and every check below reads its shared flag.
 
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
-
-extern "C" fn on_signal(_sig: libc::c_int) {
-    INTERRUPTED.store(true, Ordering::Relaxed);
-}
-
-fn arm_signals() {
-    unsafe {
-        libc::signal(libc::SIGTERM, on_signal as libc::sighandler_t);
-        libc::signal(libc::SIGINT, on_signal as libc::sighandler_t);
-    }
-}
-
+// Shared-cancel delegate for the `&dyn Fn() -> bool` loop ports
+// (`observe`, `resume_owned_window`, profiled): a single atomic
+// load, no ack, no deadline stamp.
 fn interrupted() -> bool {
-    INTERRUPTED.load(Ordering::Relaxed)
+    crate::shutdown::Shutdown::cancelled_global()
 }
 
 // ---------------------------------------------------------------- ports
@@ -2756,6 +2751,10 @@ impl KernelLifecycle {
             if pr < 0 {
                 let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
                 if e == libc::EINTR {
+                    // EINTR checks cancel before retry (v0.6.0
+                    // signals Task 4): a signal that set the shared
+                    // flag surfaces here instead of spinning.
+                    check()?;
                     continue;
                 }
                 anyhow::bail!("connector accept poll: {}", std::io::Error::last_os_error());
@@ -2782,7 +2781,12 @@ impl KernelLifecycle {
                         wait_enobufs = true;
                         continue;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                        // EINTR checks cancel before retry (v0.6.0
+                        // signals Task 4).
+                        check()?;
+                        continue;
+                    }
                     Err(e) => return Err(e.into()),
                 };
                 records += 1;
@@ -11669,6 +11673,7 @@ fn run_controlled_owned(
     acquired_instant: Instant,
     acquired_wall: SystemTime,
     setup_ceiling: Option<Instant>,
+    cancel: &'static AtomicBool,
 ) -> anyhow::Result<Capture> {
     use crate::capture_setup::{SetupAttempt, SetupControl, SetupFailure, SetupInterrupt};
     let deadline = args::deadline_at(acquired_instant, cfg.harvest_timeout).ok_or_else(|| {
@@ -11704,7 +11709,7 @@ fn run_controlled_owned(
         LiveLifecycle,
     >::admit(SetupControl::new(
         deadline,
-        SetupInterrupt::Static(&INTERRUPTED),
+        SetupInterrupt::Static(cancel),
     )) {
         Ok(attempt) => attempt,
         Err(failure) => {
@@ -11742,7 +11747,7 @@ fn run_controlled_owned(
             .barrier
             .prefix_permit(deadline)
             .map_err(|e| anyhow::anyhow!("spawn prefix refused: {e:?}"))?;
-        target::OwnedTarget::spawn_stopped_with_control(&argv, workload, deadline, &INTERRUPTED)
+        target::OwnedTarget::spawn_stopped_with_control(&argv, workload, deadline, cancel)
     };
     match spawned {
         Ok(target) => {
@@ -11938,7 +11943,17 @@ fn run_inner_with_admitted(
         ))
     })?;
     let setup_ceiling = buffers.as_ref().and_then(|b| b.setup_deadline);
-    arm_signals();
+    // Shared shutdown (v0.6.0 signals Task 4): no-restart sigaction
+    // for SIGINT/SIGTERM; failure maps like the producer install
+    // above (loud setup infrastructure error, never silent).
+    let shutdown = crate::shutdown::Shutdown::install().map_err(|e| {
+        anyhow::Error::new(BoundaryFailure::new(
+            BoundaryStage::Setup,
+            BoundaryFailureClass::Infrastructure,
+            None,
+            &format!("capture signal setup failed: {e}"),
+        ))
+    })?;
     let (obj_bytes, obj_sha256, harvest_bytes) = match buffers {
         Some(b) => (b.count, b.count_sha256, Some(b.harvest)),
         None => {
@@ -12007,6 +12022,7 @@ fn run_inner_with_admitted(
             acq_instant,
             acq_wall,
             setup_ceiling,
+            shutdown.cancel_flag(),
         ),
         Target::Pid(p) => {
             // Offset table for target qualification (explicit file or
@@ -12203,6 +12219,20 @@ pub(crate) mod tests {
         AttachEvent, AttachKind, BackingRef, DiscoveredCandidate, DiscoveredObject, TableCoverage,
         TableRetirement,
     };
+
+    #[test]
+    fn v060_no_bsd_signal_in_capture_path() {
+        // P0-8 Task 4 pin: BSD `signal()` (SA_RESTART semantics) is
+        // gone from the capture path; all arming goes through the
+        // shared `Shutdown` (no-restart sigaction). The needle is
+        // split so this assertion cannot match its own source line.
+        let src = include_str!("capture.rs");
+        let needle = concat!("libc::", "signal(");
+        assert!(
+            !src.contains(needle),
+            "BSD signal() must stay out of the capture path (shared Shutdown only)"
+        );
+    }
 
     #[test]
     fn fix2_anchor_or_degrade_decision_table() {
