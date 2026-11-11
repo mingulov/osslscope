@@ -1463,3 +1463,39 @@ fn bpf_uses_shared_wire_types_exclusively() {
         "retired debug kind must be gone"
     );
 }
+
+#[test]
+fn v060_process_identity_is_bounded_nullable_statused() {
+    let me = std::process::id();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--pid"])
+        .arg(me.to_string())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(out.status.success() || out.status.code() == Some(3));
+    let doc: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let procs = doc["processes"].as_array().unwrap();
+    assert_eq!(procs.len(), 1);
+    let proc = &procs[0];
+    for key in ["comm", "comm_status", "exe", "exe_status"] {
+        assert!(proc.get(key).is_some(), "missing {key}");
+    }
+    assert!(
+        ["available", "unreadable", "changed", "too_long"]
+            .contains(&proc["comm_status"].as_str().unwrap())
+    );
+    assert!(
+        ["available", "unreadable", "changed", "too_long"]
+            .contains(&proc["exe_status"].as_str().unwrap())
+    );
+    if proc["comm_status"] == "available" {
+        assert!(!proc["comm"].as_str().unwrap().is_empty());
+        assert!(proc["comm"].as_str().unwrap().len() <= 64);
+    }
+    // v0.5 document without identity keys still reads.
+    let old: serde_json::Value =
+        serde_json::from_str(include_str!("goldens/discovery/v050_snapshot_min.json")).unwrap();
+    let procs_old = old["processes"].as_array().unwrap();
+    assert!(procs_old[0].get("comm").is_none());
+}

@@ -166,7 +166,34 @@ fn current_real_cgroup_selects_owned_child_and_reports_provenance() {
     let json = serde_json::to_string(&result).unwrap();
     assert!(!json.contains("PRIVATE_CANARY"));
     assert!(!json.contains("/sys/"));
-    assert!(!json.contains(f.0.to_str().unwrap()));
+    // v0.6.0 D2: the fixture dir LEGITIMATELY appears in the
+    // allowlisted per-process `exe` identity value (the fixture
+    // child binary lives under it), and nowhere else.
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    fn walk(value: &serde_json::Value, parent: &str, dir: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    walk(child, key, dir);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, parent, dir);
+                }
+            }
+            serde_json::Value::String(text) => {
+                if text.contains(dir) {
+                    assert!(
+                        parent == "path" || parent == "spelling" || parent == "exe",
+                        "canary path outside allowlisted values (key {parent:?}): {text}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&doc, "", f.0.to_str().unwrap());
 }
 #[test]
 fn unavailable_and_non_cgroup_selection_refuse_before_sampling() {

@@ -522,6 +522,29 @@ Discovery JSON path evidence (v0.6.0 D1, per-module keys):
   `source`, `verification`) are the only path-bearing keys in
   discovery JSON; maps text publishes nowhere else.
 
+Discovery JSON process identity (v0.6.0 D2, per-process keys):
+
+- `comm`: the `/proc/<pid>/comm` task name, at most 64 bytes
+  (overlong truncates to 64 with `comm_status: too_long`),
+  trailing NUL/newline trimmed, display controls sanitized. A
+  mutable operator-visible label, not authentication: the task
+  may rename itself at any time.
+- `comm_status`: finite availability of `comm` — `available` /
+  `unreadable` / `changed` / `too_long`. `comm` is null unless
+  `available` or `too_long`.
+- `exe`: the `/proc/<pid>/exe` readlink spelling, at most 4096
+  bytes verbatim (overlong truncates with `exe_status:
+  too_long`). A sampled spelling, not proof: the link is
+  re-checked against the process incarnation (starttime) after
+  the read, and `changed` reports with null when the PID
+  recycled mid-sample. Unavailable `exe` (refused, recycled)
+  never discards the process inventory.
+- `exe_status`: finite availability of `exe` — `available` /
+  `unreadable` / `changed` / `too_long`. `exe` is null unless
+  `available` or `too_long`.
+- argv/cmdline remain forbidden: no `cmdline`/`argv`/`args` key
+  exists anywhere in discovery JSON (see the Scope rule above).
+
 stderr diagnostics:
 
 - fixed labels plus allowlisted values: pids, counts, op/kind ids,

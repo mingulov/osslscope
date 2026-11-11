@@ -3,11 +3,11 @@
 //! as execution evidence. No producer bootstrap or target-memory dependency.
 
 use super::{
-    Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, LocatorKind,
-    MapsSource, MapsSpelling, MapsVerification, ModuleInfo, ModuleRecord, NamespaceId,
-    NamespaceIds, ObjectKind, ObservationState, PathUnavailableReason, ProcessRecord, Scope,
-    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, VerifiedPath, WorkTotals, backing, elf,
-    resolve,
+    Capabilities, CaptureClock, Gap, GapReason, IdentityAvailability, IdentityStatus,
+    InventoryState, LocatorKind, MapsSource, MapsSpelling, MapsVerification, ModuleInfo,
+    ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, PathUnavailableReason,
+    ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, VerifiedPath,
+    WorkTotals, backing, elf, resolve,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -211,6 +211,100 @@ pub(super) fn incarnation_direct(directory: &File) -> Option<(u64, NamespaceId)>
             inode: metadata.ino(),
         },
     ))
+}
+
+/// v0.6.0 D2 process identity: `comm` + `exe` sampled through the
+/// already-held `/proc/PID` dir, bounded, nullable, and finitely
+/// statused. `comm` truncates at 64 bytes (`TooLong` when the 65th
+/// byte is present), trims trailing NUL/newline, and sanitizes
+/// display controls; `exe` readlinks at most 4096 bytes verbatim
+/// (sampled spelling, never proof). Both reads are bracketed by
+/// the incarnation: when the post-read starttime moved — or can no
+/// longer be read — both facts report `Changed` with no value, so
+/// bytes from another incarnation are never attributed. IO refusal
+/// reports `Unreadable`, never an error: unavailable identity
+/// degrades the record, never the inventory. Never reads
+/// `cmdline`: argv stays redacted.
+pub(crate) fn read_comm_exe(
+    dir: &File,
+    starttime_before: u64,
+) -> (
+    Option<String>,
+    IdentityAvailability,
+    Option<String>,
+    IdentityAvailability,
+) {
+    const COMM_BOUND: usize = 64;
+    const EXE_BOUND: usize = 4096;
+    let (comm, comm_status) = match open_at(dir, b"comm") {
+        Ok(file) => {
+            let mut bytes = Vec::new();
+            match (&file)
+                .take((COMM_BOUND + 1) as u64)
+                .read_to_end(&mut bytes)
+            {
+                Ok(_) => {
+                    let truncated = bytes.len() > COMM_BOUND;
+                    bytes.truncate(COMM_BOUND);
+                    while bytes.last().is_some_and(|b| *b == b'\n' || *b == 0) {
+                        bytes.pop();
+                    }
+                    let text = crate::report::safe_display(&String::from_utf8_lossy(&bytes));
+                    if text.is_empty() {
+                        (None, IdentityAvailability::Unreadable)
+                    } else if truncated {
+                        (Some(text), IdentityAvailability::TooLong)
+                    } else {
+                        (Some(text), IdentityAvailability::Available)
+                    }
+                }
+                Err(_) => (None, IdentityAvailability::Unreadable),
+            }
+        }
+        Err(_) => (None, IdentityAvailability::Unreadable),
+    };
+    let (exe, exe_status) = (|| {
+        let name = CString::new("exe").ok()?;
+        let mut bytes = vec![0u8; EXE_BOUND + 1];
+        // SAFETY: dirfd and the output buffer stay live for the
+        // call; readlinkat writes at most bufsiz bytes and its
+        // return length (not NUL-termination) delimits them.
+        let len = unsafe {
+            libc::readlinkat(
+                dir.as_raw_fd(),
+                name.as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        let len = usize::try_from(len).ok()?;
+        if len > bytes.len() {
+            return None;
+        }
+        let truncated = len > EXE_BOUND;
+        bytes.truncate(len.min(EXE_BOUND));
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.is_empty() {
+            Some((None, IdentityAvailability::Unreadable))
+        } else if truncated {
+            Some((Some(text), IdentityAvailability::TooLong))
+        } else {
+            Some((Some(text), IdentityAvailability::Available))
+        }
+    })()
+    .unwrap_or((None, IdentityAvailability::Unreadable));
+    // Incarnation/exe-continuity bracket: attribute nothing sampled
+    // across a recycle. Modules acquired around this call are kept
+    // by the caller regardless (identity never discards inventory).
+    if incarnation_direct(dir).is_none_or(|(after, _)| after != starttime_before) {
+        return (
+            None,
+            IdentityAvailability::Changed,
+            None,
+            IdentityAvailability::Changed,
+        );
+    }
+    (comm, comm_status, exe, exe_status)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -853,6 +947,11 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     let clock = CaptureClock::start();
     work.reserve_record(1024)?;
     let process = Process::open(pid, work)?;
+    // v0.6.0 D2: sample identity through the held dir once its
+    // starttime is known. Every status (including Changed) keeps
+    // the modules acquired below — identity never discards
+    // inventory.
+    let (comm, comm_status, exe, exe_status) = read_comm_exe(&process.directory, process.starttime);
     let namespace = |name: &[u8]| {
         open_at(&process.directory, name).ok().and_then(|f| {
             f.metadata().ok().map(|m| {
@@ -1120,6 +1219,10 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
         namespaces,
         pid,
         starttime: process.starttime,
+        comm,
+        comm_status,
+        exe,
+        exe_status,
         modules: modules.into_iter().map(|(module, _)| module).collect(),
         provider_activation: ObservationState::Unknown,
         provider_interfaces: ObservationState::Unknown,

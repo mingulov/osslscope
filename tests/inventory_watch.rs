@@ -203,7 +203,35 @@ fn sampled_arrival_removal_visibility_and_direct_cancellation() {
     assert_eq!(writer.values[4]["reason"], "interrupted");
     let text = serde_json::to_string(&writer.values).unwrap();
     assert!(!text.contains("PRIVATE_CANARY"));
-    assert!(!text.contains(f.0.to_str().unwrap()));
+    // v0.6.0 D2: the fixture dir LEGITIMATELY appears in the
+    // allowlisted per-process `exe` identity value (watch records
+    // embed the full snapshot; the fixture child binary lives
+    // under the canary dir), and nowhere else.
+    let doc: serde_json::Value = serde_json::from_str(&text).unwrap();
+    fn walk(value: &serde_json::Value, parent: &str, dir: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    walk(child, key, dir);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, parent, dir);
+                }
+            }
+            serde_json::Value::String(text) => {
+                if text.contains(dir) {
+                    assert!(
+                        parent == "path" || parent == "spelling" || parent == "exe",
+                        "canary path outside allowlisted values (key {parent:?}): {text}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&doc, "", f.0.to_str().unwrap());
     assert!(child.child.try_wait().unwrap().is_none());
 }
 // Catches rehashing stable files, stale fingerprint reuse, and unbounded retained descriptors.

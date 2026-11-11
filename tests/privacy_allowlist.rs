@@ -1732,3 +1732,51 @@ fn v060_discovery_path_keys_are_allowlisted_only() {
         }
     }
 }
+
+/// v0.6.0 D2 (§5 discovery process identity): `comm`/`exe` exist
+/// on every discovery process, and no argv-shaped key
+/// (`cmdline`/`argv`/`args`) appears anywhere in discovery JSON.
+/// argv stays redacted: a new argv-shaped key is an allowlist
+/// change (§8), not a test fix.
+#[test]
+fn v060_discovery_identity_keys_bounded_and_argv_free() {
+    let me = std::process::id().to_string();
+    let snap = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--pid", &me, "--json"])
+        .output()
+        .unwrap();
+    assert!(snap.status.success() || snap.status.code() == Some(3));
+    let doc: serde_json::Value = serde_json::from_slice(&snap.stdout).unwrap();
+    let procs = doc["processes"].as_array().unwrap();
+    assert_eq!(procs.len(), 1);
+    for key in ["comm", "comm_status", "exe", "exe_status"] {
+        assert!(procs[0].get(key).is_some(), "missing {key}");
+    }
+    fn keys(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    out.push(key.clone());
+                    keys(child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    keys(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    keys(&doc, &mut found);
+    assert!(found.contains(&"comm".to_string()));
+    assert!(found.contains(&"exe".to_string()));
+    for key in &found {
+        let lower = key.to_lowercase();
+        assert!(
+            !["cmdline", "argv", "args"].contains(&lower.as_str()),
+            "argv-shaped key in discovery JSON: {key}"
+        );
+    }
+}

@@ -1847,7 +1847,7 @@ mod tests {
 
     #[test]
     fn writer_object_rows_shape() {
-        use crate::inventory::{IdentityStatus, ProcessRecord};
+        use crate::inventory::{IdentityAvailability, IdentityStatus, ProcessRecord};
         let dir = scratch("writer-rows");
         let real = dir.join("real.so");
         std::fs::write(&real, b"x").unwrap();
@@ -1868,6 +1868,10 @@ mod tests {
             },
             pid: 4242,
             starttime: 7,
+            comm: None,
+            comm_status: IdentityAvailability::Unreadable,
+            exe: None,
+            exe_status: IdentityAvailability::Unreadable,
             modules: vec![
                 writer_module_record(sha, identity, IdentityStatus::Verified),
                 writer_module_record(sha, (1, 2), IdentityStatus::LocatorCandidate),

@@ -190,7 +190,34 @@ fn finds_renamed_multiple_mapped_modules_without_profiles() {
     }
     let json = serde_json::to_string(&result).unwrap();
     assert!(!json.contains("PRIVATE_CANARY"));
-    assert!(!json.contains(fixture.0.to_str().unwrap()));
+    // v0.6.0 D2: the fixture dir LEGITIMATELY appears in the
+    // allowlisted per-process `exe` identity value (the fixture
+    // child binary lives under it), and nowhere else.
+    let doc: serde_json::Value = serde_json::from_str(&json).unwrap();
+    fn walk(value: &serde_json::Value, parent: &str, dir: &str) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    walk(child, key, dir);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, parent, dir);
+                }
+            }
+            serde_json::Value::String(text) => {
+                if text.contains(dir) {
+                    assert!(
+                        parent == "path" || parent == "spelling" || parent == "exe",
+                        "canary path outside allowlisted values (key {parent:?}): {text}"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(&doc, "", fixture.0.to_str().unwrap());
     assert!(!json.contains("ready"));
     assert!(matches!(result.exit_code(), 0 | 3));
 }

@@ -130,6 +130,9 @@ fn redacted(output: &Output, fixture: &Fixture) {
 /// the allowlisted machine path values (`verified_path.path`,
 /// `maps_spelling.spelling`), and nowhere else. Stderr keeps the
 /// blanket check (diagnostics carry no paths, before or after D1).
+/// v0.6.0 D2 adds the allowlisted per-process `exe` identity value
+/// (the fixture child binary lives under the canary dir); `comm`
+/// stays a short task label and never carries the path.
 fn redacted_discovery_json(output: &Output, fixture: &Fixture) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("PRIVATE_CANARY"), "{stderr}");
@@ -151,7 +154,7 @@ fn redacted_discovery_json(output: &Output, fixture: &Fixture) {
             serde_json::Value::String(text) => {
                 if text.contains("PRIVATE_CANARY") || text.contains(dir) {
                     assert!(
-                        parent == "path" || parent == "spelling",
+                        parent == "path" || parent == "spelling" || parent == "exe",
                         "canary path outside allowlisted path values (key {parent:?}): {text}"
                     );
                     *hits += 1;

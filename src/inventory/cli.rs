@@ -590,9 +590,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        Architecture, CaptureInterval, Gap, GapReason, IdentityStatus, ModuleInfo, ModuleRecord,
-        NamespaceIds, ObjectKind, ProcessRecord, Scope, ScopeRecord, Snapshot, SnapshotMode,
-        coalesce_gaps,
+        Architecture, CaptureInterval, Gap, GapReason, IdentityAvailability, IdentityStatus,
+        ModuleInfo, ModuleRecord, NamespaceIds, ObjectKind, ProcessRecord, Scope, ScopeRecord,
+        Snapshot, SnapshotMode, coalesce_gaps,
     };
     use super::*;
 
@@ -638,6 +638,10 @@ mod tests {
                 namespaces: NamespaceIds::default(),
                 pid: 1,
                 starttime: 0,
+                comm: None,
+                comm_status: IdentityAvailability::Unreadable,
+                exe: None,
+                exe_status: IdentityAvailability::Unreadable,
                 modules,
                 provider_activation: ObservationState::Unknown,
                 provider_interfaces: ObservationState::Unknown,

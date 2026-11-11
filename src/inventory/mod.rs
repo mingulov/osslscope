@@ -391,6 +391,20 @@ pub enum ObservationState {
     NotObserved,
 }
 
+/// Finite availability of one sampled process-identity fact
+/// (v0.6.0 D2): `comm` and `exe` are operator-visible `/proc`
+/// readings, never authentication or proof. Old documents default
+/// to `Unreadable` (absent), never to a fabricated value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityAvailability {
+    Available,
+    #[default]
+    Unreadable,
+    Changed,
+    TooLong,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProcessRecord {
@@ -398,6 +412,14 @@ pub struct ProcessRecord {
     pub namespaces: NamespaceIds,
     pub pid: u32,
     pub starttime: u64,
+    #[serde(default)]
+    pub comm: Option<String>,
+    #[serde(default)]
+    pub comm_status: IdentityAvailability,
+    #[serde(default)]
+    pub exe: Option<String>,
+    #[serde(default)]
+    pub exe_status: IdentityAvailability,
     pub modules: Vec<ModuleRecord>,
     pub provider_activation: ObservationState,
     pub provider_interfaces: ObservationState,
