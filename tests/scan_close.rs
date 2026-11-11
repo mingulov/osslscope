@@ -701,3 +701,22 @@ fn v060_sigterm_during_watch_acks_sigterm_and_exits_3() {
     );
     workload.assert_alive("sigterm run");
 }
+
+#[test]
+fn v060_guest_script_covers_observe_arm_contract() {
+    let script = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../tmp/vng-lane/sigint-observe-run.sh"
+    ))
+    .unwrap();
+    for required in [
+        "LD_LIBRARY_PATH=/dev/shm/ossl-tmpfs",
+        "--observe-crypto",
+        "kill -INT",
+        "shutting down",
+        "Watch ended",
+        "130",
+    ] {
+        assert!(script.contains(required), "guest script missing {required}");
+    }
+}
