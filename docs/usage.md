@@ -90,10 +90,13 @@ osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]
 
 With no selectors, `scan` inventories visible numeric entries in the observer's
 procfs view. Repeated PIDs are deduplicated. `--cgroup` selects a cgroup-v2
-directory and its inclusive subtree. `--module` selects mapped ELF content by
-SHA-256; repeat it to accept any supplied hash. PID, cgroup and module selector
-families intersect. A resolved empty intersection stays empty. Unavailable,
-invalid or changed selectors never widen the request to the system population.
+directory and its inclusive subtree. `--module` takes a file PATH (repeatable);
+each file is hashed and mapped ELF content matching any supplied hash is
+selected. Bare hashes are not accepted; they fail with exit 4 and a message
+naming the PATH form. Digest selectors (`sha256:...`) are not accepted in v0.6.
+PID, cgroup and module selector families intersect. A resolved empty
+intersection stays empty. Unavailable, invalid or changed selectors never widen
+the request to the system population.
 Physical copies with the same hash retain their distinct native file identities.
 `inspect` requires exactly one positive PID or one or more module paths;
 its selector families cannot be mixed. Unknown, missing or conflicting arguments
@@ -266,10 +269,17 @@ and mount namespaces. Unreadable or changing namespace metadata stays unknown
 with a gap. `scope_record` contains only the selected cgroup's native device/inode
 identity and computed supplied-module SHA-256 IDs.
 Module output has `mode: "module"`, deduplicated `modules`, finite `errors`
-with zero-based `input_index`, work totals, limits and capability status. No
-raw target paths, names, symbol strings or mapping addresses enter either
-output or discovery diagnostics. Human output includes the interpretation
-followed by the same readable structured records.
+with zero-based `input_index`, work totals, limits and capability status.
+Module facts carry the file's own `file_soname` plus validated rodata
+`file_openssl_version` with `file_version_status`; process records carry
+`comm`/`comm_status` and `exe`/`exe_status`; mapped records carry
+`verified_path`, `verified_path_unavailable` and `maps_spelling`; gaps may
+carry `errno`/`actor_euid`. The machine shape is pinned by
+`schemas/discovery-v1.json` (snapshot, module, and watch records). Reader
+break: v0.5 `deny_unknown_fields` readers reject v0.6 documents; v0.6 readers
+accept v0.5 documents. No raw target paths, names, symbol strings or mapping
+addresses enter either output or discovery diagnostics. Human output includes
+the interpretation followed by the same readable structured records.
 
 Module metadata describes a SHA-256, numeric device/inode/size, architecture,
 finite recognized exports and dependency flags. The interface classifications

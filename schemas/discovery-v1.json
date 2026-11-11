@@ -1,0 +1,772 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://osslscope.dev/schemas/discovery-v1.json",
+  "title": "osslscope discovery v1",
+  "description": "Passive file-backed discovery documents (schema_version osslscope.discovery.v1). The top-level document is the snapshot inventory (scan --json, mode snapshot). definitions.module_inventory covers independent file inspection (inspect --module --json, mode module); definitions.watch_snapshot and definitions.watch_end cover scan --watch NDJSON sample and end records (mode watch). Nested definitions cover the shared records. Every object forbids additional properties. v0.5 readers using deny_unknown_fields reject v0.6 documents (new keys: comm, comm_status, exe, exe_status, file_soname, file_openssl_version, file_version_status, verified_path, verified_path_unavailable, maps_spelling, and optional errno/actor_euid on gaps); v0.6 readers accept v0.5 documents (all new keys default). No raw target paths, names, symbol strings, mapping addresses, argv, cmdline, environment, keys or payloads anywhere.",
+  "type": "object",
+  "required": ["schema_version", "mode", "scope", "selected_pids", "processes", "gaps", "totals", "limits", "capabilities"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "osslscope.discovery.v1"
+    },
+    "mode": {
+      "const": "snapshot"
+    },
+    "scope": {
+      "$ref": "#/definitions/scope"
+    },
+    "selected_pids": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/u32"
+      }
+    },
+    "processes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/process_record"
+      }
+    },
+    "gaps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/gap"
+      }
+    },
+    "totals": {
+      "$ref": "#/definitions/work_totals"
+    },
+    "limits": {
+      "$ref": "#/definitions/limits"
+    },
+    "capabilities": {
+      "$ref": "#/definitions/capabilities"
+    },
+    "interval": {
+      "$ref": "#/definitions/capture_interval"
+    },
+    "scope_record": {
+      "$ref": "#/definitions/scope_record"
+    }
+  },
+  "definitions": {
+    "u32": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 4294967295
+    },
+    "u64": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 18446744073709551615
+    },
+    "duration": {
+      "description": "Serde Duration: secs plus nanos.",
+      "type": "object",
+      "required": ["secs", "nanos"],
+      "additionalProperties": false,
+      "properties": {
+        "secs": {
+          "$ref": "#/definitions/u64"
+        },
+        "nanos": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 999999999
+        }
+      }
+    },
+    "architecture": {
+      "enum": ["x86_64", "aarch64", "other"]
+    },
+    "object_kind": {
+      "enum": ["openssl_compatible", "provider_module", "openssl_consumer", "other"]
+    },
+    "api": {
+      "description": "Recognized dynamic code exports (Api::COUNT = 70); unknown symbol names are discarded by the producer.",
+      "enum": [
+        "ossl_provider_init",
+        "ossl_provider_load",
+        "ossl_provider_try_load",
+        "ossl_provider_unload",
+        "ossl_provider_load_ex",
+        "ossl_provider_try_load_ex",
+        "ossl_provider_add_builtin",
+        "ossl_provider_get0_dispatch",
+        "ossl_provider_query_operation",
+        "openssl_init_crypto",
+        "openssl_version_major",
+        "evp_md_fetch",
+        "evp_cipher_fetch",
+        "evp_mac_fetch",
+        "evp_kdf_fetch",
+        "evp_signature_fetch",
+        "evp_kem_fetch",
+        "evp_digest_init_ex",
+        "evp_digest_init_ex2",
+        "evp_digest_update",
+        "evp_digest_final_ex",
+        "evp_encrypt_init_ex",
+        "evp_encrypt_init_ex2",
+        "evp_encrypt_update",
+        "evp_encrypt_final_ex",
+        "evp_decrypt_init_ex",
+        "evp_decrypt_init_ex2",
+        "evp_decrypt_update",
+        "evp_decrypt_final_ex",
+        "evp_cipher_init_ex",
+        "evp_cipher_update",
+        "evp_cipher_final_ex",
+        "evp_mac_init",
+        "evp_mac_update",
+        "evp_mac_final",
+        "evp_kdf_derive",
+        "evp_pkey_sign",
+        "evp_pkey_verify",
+        "evp_pkey_encrypt",
+        "evp_pkey_decrypt",
+        "evp_pkey_derive",
+        "evp_digest_sign_final",
+        "evp_digest_verify_final",
+        "evp_digest_sign",
+        "evp_digest_verify",
+        "evp_rand_generate",
+        "evp_pkey_encapsulate",
+        "evp_pkey_decapsulate",
+        "evp_pkey_keygen_init",
+        "evp_pkey_keygen",
+        "evp_pkey_paramgen_init",
+        "evp_pkey_paramgen",
+        "evp_pkey_derive_init",
+        "evp_pkey_check",
+        "evp_pkey_public_check",
+        "evp_pkey_param_check",
+        "evp_pkey_copy_parameters",
+        "evp_digest_sign_init",
+        "evp_digest_sign_update",
+        "evp_digest_verify_init",
+        "evp_digest_verify_update",
+        "evp_q_digest",
+        "evp_q_mac",
+        "evp_rand_nonce",
+        "evp_rand_ctx_new",
+        "evp_rand_ctx_free",
+        "evp_md_ctx_new",
+        "evp_md_ctx_free",
+        "evp_cipher_ctx_new",
+        "evp_cipher_ctx_free"
+      ]
+    },
+    "gap_reason": {
+      "description": "Finite failure labels; underlying IO/parser messages never escape.",
+      "enum": [
+        "unavailable",
+        "non_regular",
+        "too_large",
+        "not_elf",
+        "malformed_elf",
+        "changed",
+        "unsupported_architecture",
+        "process_unavailable",
+        "identity_unverified",
+        "backing_unavailable",
+        "read_limit",
+        "process_limit",
+        "object_limit",
+        "malformed_maps",
+        "deadline",
+        "unsupported_cgroup",
+        "cgroup_unavailable",
+        "cgroup_limit",
+        "membership_unknown",
+        "namespace_unavailable"
+      ]
+    },
+    "file_version_status": {
+      "enum": ["present", "absent", "ambiguous", "not_fully_scanned"]
+    },
+    "module_info": {
+      "description": "File identity plus finite interface evidence; never paths or raw symbols. device is native Linux st_dev paired with st_ino. file_soname is the object's OWN DT_SONAME; file_openssl_version is the singular validated rodata version id, or null with the reason in file_version_status.",
+      "type": "object",
+      "required": ["sha256", "device", "inode", "size_bytes", "architecture", "kind", "exports", "depends_on_libcrypto", "depends_on_libssl", "file_soname", "file_openssl_version", "file_version_status"],
+      "additionalProperties": false,
+      "properties": {
+        "sha256": {
+          "type": "string"
+        },
+        "device": {
+          "$ref": "#/definitions/u64"
+        },
+        "inode": {
+          "$ref": "#/definitions/u64"
+        },
+        "size_bytes": {
+          "$ref": "#/definitions/u64"
+        },
+        "architecture": {
+          "$ref": "#/definitions/architecture"
+        },
+        "kind": {
+          "$ref": "#/definitions/object_kind"
+        },
+        "exports": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/api"
+          }
+        },
+        "depends_on_libcrypto": {
+          "type": "boolean"
+        },
+        "depends_on_libssl": {
+          "type": "boolean"
+        },
+        "file_soname": {
+          "type": ["string", "null"]
+        },
+        "file_openssl_version": {
+          "type": ["string", "null"]
+        },
+        "file_version_status": {
+          "$ref": "#/definitions/file_version_status"
+        }
+      }
+    },
+    "verified_path": {
+      "description": "Proven object path: retained identity re-proven at capture time, HOW it was proven, and WHEN. Consumers must never join paths across processes by (device, inode) alone; the enclosing process (pid, starttime, namespaces) triple is the identity the path is proven against.",
+      "type": "object",
+      "required": ["path", "path_encoding", "locator_kind", "capture_unix_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "path_encoding": {
+          "enum": ["utf8", "utf8_percent_escaped"]
+        },
+        "locator_kind": {
+          "enum": ["host_direct", "container_layer", "proc_root_anchored"]
+        },
+        "capture_unix_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        }
+      }
+    },
+    "maps_spelling": {
+      "description": "Unverified maps-text spelling hint; never a proven path.",
+      "type": "object",
+      "required": ["spelling", "source", "verification"],
+      "additionalProperties": false,
+      "properties": {
+        "spelling": {
+          "type": "string"
+        },
+        "source": {
+          "enum": ["proc_maps"]
+        },
+        "verification": {
+          "enum": ["unverified"]
+        }
+      }
+    },
+    "module_record": {
+      "type": "object",
+      "required": ["info", "identity_status", "verified_path", "verified_path_unavailable", "maps_spelling"],
+      "additionalProperties": false,
+      "properties": {
+        "info": {
+          "$ref": "#/definitions/module_info"
+        },
+        "identity_status": {
+          "enum": ["verified", "locator_candidate"]
+        },
+        "verified_path": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/verified_path"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "verified_path_unavailable": {
+          "enum": ["unverified_identity", "no_locator", "resolve_failed", "changed", "missing", "unavailable", null]
+        },
+        "maps_spelling": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/maps_spelling"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "capture_interval": {
+      "description": "Observer clocks describe capture only; wall time may move independently.",
+      "type": "object",
+      "required": ["started_unix_ms", "finished_unix_ms", "elapsed_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "started_unix_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "finished_unix_ms": {
+          "type": ["integer", "null"],
+          "minimum": 0
+        },
+        "elapsed_ns": {
+          "$ref": "#/definitions/u64"
+        }
+      }
+    },
+    "namespace_id": {
+      "type": "object",
+      "required": ["device", "inode"],
+      "additionalProperties": false,
+      "properties": {
+        "device": {
+          "$ref": "#/definitions/u64"
+        },
+        "inode": {
+          "$ref": "#/definitions/u64"
+        }
+      }
+    },
+    "namespace_ids": {
+      "type": "object",
+      "required": ["pid", "mount"],
+      "additionalProperties": false,
+      "properties": {
+        "pid": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/namespace_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "mount": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/namespace_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "identity_availability": {
+      "description": "Finite availability of one sampled process-identity fact; never authentication or proof.",
+      "enum": ["available", "unreadable", "changed", "too_long"]
+    },
+    "observation_state": {
+      "enum": ["unknown", "not_observed"]
+    },
+    "process_record": {
+      "type": "object",
+      "required": ["interval", "namespaces", "pid", "starttime", "comm", "comm_status", "exe", "exe_status", "modules", "provider_activation", "provider_interfaces", "execution"],
+      "additionalProperties": false,
+      "properties": {
+        "interval": {
+          "$ref": "#/definitions/capture_interval"
+        },
+        "namespaces": {
+          "$ref": "#/definitions/namespace_ids"
+        },
+        "pid": {
+          "$ref": "#/definitions/u32"
+        },
+        "starttime": {
+          "$ref": "#/definitions/u64"
+        },
+        "comm": {
+          "type": ["string", "null"]
+        },
+        "comm_status": {
+          "$ref": "#/definitions/identity_availability"
+        },
+        "exe": {
+          "type": ["string", "null"]
+        },
+        "exe_status": {
+          "$ref": "#/definitions/identity_availability"
+        },
+        "modules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/module_record"
+          }
+        },
+        "provider_activation": {
+          "$ref": "#/definitions/observation_state"
+        },
+        "provider_interfaces": {
+          "$ref": "#/definitions/observation_state"
+        },
+        "execution": {
+          "$ref": "#/definitions/observation_state"
+        }
+      }
+    },
+    "scope": {
+      "enum": ["system", "pids", "cgroup", "modules", "intersection"]
+    },
+    "inventory_state": {
+      "enum": ["complete", "partial", "unavailable"]
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["inventory", "provider_activation", "provider_interfaces", "execution"],
+      "additionalProperties": false,
+      "properties": {
+        "inventory": {
+          "$ref": "#/definitions/inventory_state"
+        },
+        "provider_activation": {
+          "$ref": "#/definitions/observation_state"
+        },
+        "provider_interfaces": {
+          "$ref": "#/definitions/observation_state"
+        },
+        "execution": {
+          "$ref": "#/definitions/observation_state"
+        }
+      }
+    },
+    "gap": {
+      "description": "Only safe process/file fingerprints accompany finite gap labels. errno/actor_euid are appended last and omitted when no backing operation failed.",
+      "type": "object",
+      "required": ["pid", "device", "inode", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "pid": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/u32"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "device": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "inode": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/u64"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reason": {
+          "$ref": "#/definitions/gap_reason"
+        },
+        "errno": {
+          "type": "integer"
+        },
+        "actor_euid": {
+          "$ref": "#/definitions/u32"
+        }
+      }
+    },
+    "work_totals": {
+      "type": "object",
+      "required": ["processes_attempted", "objects_attempted", "objects_inspected", "read_bytes"],
+      "additionalProperties": false,
+      "properties": {
+        "processes_attempted": {
+          "$ref": "#/definitions/u64"
+        },
+        "objects_attempted": {
+          "$ref": "#/definitions/u64"
+        },
+        "objects_inspected": {
+          "$ref": "#/definitions/u64"
+        },
+        "read_bytes": {
+          "$ref": "#/definitions/u64"
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "required": ["max_module_bytes", "max_maps_bytes", "max_pids", "max_objects_per_process", "max_objects", "max_read_bytes", "timeout"],
+      "additionalProperties": false,
+      "properties": {
+        "max_module_bytes": {
+          "$ref": "#/definitions/u64"
+        },
+        "max_maps_bytes": {
+          "$ref": "#/definitions/u64"
+        },
+        "max_pids": {
+          "$ref": "#/definitions/u64"
+        },
+        "max_objects_per_process": {
+          "$ref": "#/definitions/u64"
+        },
+        "max_objects": {
+          "$ref": "#/definitions/u64"
+        },
+        "max_read_bytes": {
+          "$ref": "#/definitions/u64"
+        },
+        "timeout": {
+          "$ref": "#/definitions/duration"
+        }
+      }
+    },
+    "scope_record": {
+      "description": "Native cgroup identity and supplied content hashes, without locators.",
+      "type": "object",
+      "required": ["cgroup", "modules"],
+      "additionalProperties": false,
+      "properties": {
+        "cgroup": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/namespace_id"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "modules": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "module_error": {
+      "type": "object",
+      "required": ["input_index", "reason"],
+      "additionalProperties": false,
+      "properties": {
+        "input_index": {
+          "$ref": "#/definitions/u64"
+        },
+        "reason": {
+          "$ref": "#/definitions/gap_reason"
+        }
+      }
+    },
+    "module_inventory": {
+      "description": "Independent file inspection (inspect --module --json). modules are deduplicated bare ModuleInfo facts about the supplied files; errors carry zero-based input_index. Module inspection by itself makes no claim that a process maps the file.",
+      "type": "object",
+      "required": ["schema_version", "mode", "modules", "errors", "totals", "limits", "capabilities"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "osslscope.discovery.v1"
+        },
+        "mode": {
+          "const": "module"
+        },
+        "modules": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/module_info"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/module_error"
+          }
+        },
+        "totals": {
+          "$ref": "#/definitions/work_totals"
+        },
+        "limits": {
+          "$ref": "#/definitions/limits"
+        },
+        "capabilities": {
+          "$ref": "#/definitions/capabilities"
+        }
+      }
+    },
+    "change": {
+      "description": "One finite sampled-membership change. process_seen/module_seen mean present in this sample relative to the previous one, never a fresh start/load; not_seen requires usable current inventory and means absent from the sampled selection, never exit/unload; read/backing/membership/namespace/identity-change/resource failures produce visibility_lost instead of absence claims.",
+      "type": "object",
+      "required": ["kind", "pid", "starttime", "module"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["process_seen", "module_seen", "process_not_seen", "module_not_seen", "visibility_lost"]
+        },
+        "pid": {
+          "$ref": "#/definitions/u32"
+        },
+        "starttime": {
+          "$ref": "#/definitions/u64"
+        },
+        "module": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/module_record"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "watch_snapshot": {
+      "description": "One scan --watch NDJSON sample record. sampled_history is always incomplete: polling can miss activity between samples; only the immediately previous bounded snapshot is retained.",
+      "type": "object",
+      "required": ["schema_version", "mode", "record", "sequence", "interval", "poll_interval", "snapshot", "changes", "sampled_history"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "osslscope.discovery.v1"
+        },
+        "mode": {
+          "const": "watch"
+        },
+        "record": {
+          "const": "snapshot"
+        },
+        "sequence": {
+          "$ref": "#/definitions/u64"
+        },
+        "interval": {
+          "$ref": "#/definitions/capture_interval"
+        },
+        "poll_interval": {
+          "$ref": "#/definitions/duration"
+        },
+        "snapshot": {
+          "type": "object",
+          "required": ["schema_version", "mode", "scope", "selected_pids", "processes", "gaps", "totals", "limits", "capabilities"],
+          "additionalProperties": false,
+          "properties": {
+            "schema_version": {
+              "const": "osslscope.discovery.v1"
+            },
+            "mode": {
+              "const": "snapshot"
+            },
+            "scope": {
+              "$ref": "#/definitions/scope"
+            },
+            "selected_pids": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/u32"
+              }
+            },
+            "processes": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/process_record"
+              }
+            },
+            "gaps": {
+              "type": "array",
+              "items": {
+                "$ref": "#/definitions/gap"
+              }
+            },
+            "totals": {
+              "$ref": "#/definitions/work_totals"
+            },
+            "limits": {
+              "$ref": "#/definitions/limits"
+            },
+            "capabilities": {
+              "$ref": "#/definitions/capabilities"
+            },
+            "interval": {
+              "$ref": "#/definitions/capture_interval"
+            },
+            "scope_record": {
+              "$ref": "#/definitions/scope_record"
+            }
+          }
+        },
+        "changes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/definitions/change"
+          }
+        },
+        "sampled_history": {
+          "const": "incomplete"
+        }
+      }
+    },
+    "watch_end": {
+      "description": "The single scan --watch NDJSON end record. sequence counts sampled snapshots; status is the numeric exit code.",
+      "type": "object",
+      "required": ["schema_version", "mode", "record", "sequence", "reason", "status", "elapsed", "limits", "gap", "sampled_history"],
+      "additionalProperties": false,
+      "properties": {
+        "schema_version": {
+          "const": "osslscope.discovery.v1"
+        },
+        "mode": {
+          "const": "watch"
+        },
+        "record": {
+          "const": "end"
+        },
+        "sequence": {
+          "$ref": "#/definitions/u64"
+        },
+        "reason": {
+          "enum": ["duration", "interrupted", "scope_unavailable", "output"]
+        },
+        "status": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "elapsed": {
+          "$ref": "#/definitions/duration"
+        },
+        "limits": {
+          "$ref": "#/definitions/limits"
+        },
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/gap_reason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sampled_history": {
+          "const": "incomplete"
+        }
+      }
+    }
+  }
+}

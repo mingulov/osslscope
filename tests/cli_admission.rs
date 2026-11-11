@@ -1067,3 +1067,36 @@ fn malformed_policy_file_rejected_before_setup() {
         "valid policy reaches setup"
     );
 }
+
+#[test]
+fn discovery_module_path_only_scope_failure_is_exit4() {
+    // v0.6.0 D7/P0-7: `scan --module` takes a file PATH (repeatable);
+    // each file is hashed and mapped ELF content matching any
+    // supplied hash is selected. A bare hash is not a path, so
+    // scope establishment fails: exit 4, empty stdout, and a
+    // finite single-line stderr message naming the PATH form —
+    // with the input itself never echoed.
+    let hash = "a".repeat(64);
+    let code = osslscope::inventory::cli::run("scan", &argv(&["--module", &hash, "--json"]));
+    assert_eq!(code, ExitCode::from(4));
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--module", &hash, "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("takes a file PATH"), "stderr was: {err}");
+    assert!(!err.contains(&hash), "input echoed");
+    assert_eq!(err.lines().count(), 1, "finite single-line diagnostic");
+    // Non-module scope failure keeps the bare message (else branch
+    // of the same split): no PATH text is invented.
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--cgroup", "/nonexistent-t6-scope", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(4));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(err, "osslscope discovery: requested scope unavailable\n");
+}

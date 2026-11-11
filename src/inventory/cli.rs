@@ -511,6 +511,8 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 outcome.exit_code()
             })
         } else if command == "scan" {
+            // Read before the Selection move below consumes the vectors.
+            let module_scoped = !options.modules.is_empty();
             let mut scanner = match super::scope::ScopedScanner::new(
                 super::scope::Selection {
                     pids: options.pids,
@@ -522,7 +524,20 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
             ) {
                 Ok(scanner) => scanner,
                 Err(_) => {
-                    crate::report::err_line("osslscope discovery: requested scope unavailable");
+                    // v0.6.0 D7: `--module` takes a file PATH only; a
+                    // bare hash (or any other unopenable spelling)
+                    // fails scope establishment, and the finite
+                    // stderr line names the PATH form. The input
+                    // itself and IO details never enter diagnostics.
+                    // Digest selectors (`sha256:...`) are explicitly
+                    // deferred to P1: not accepted in v0.6.
+                    if module_scoped {
+                        crate::report::err_line(
+                            "osslscope discovery: requested scope unavailable (scan --module takes a file PATH, not a hash; see scan --help)",
+                        );
+                    } else {
+                        crate::report::err_line("osslscope discovery: requested scope unavailable");
+                    }
                     return ExitCode::from(4);
                 }
             };
