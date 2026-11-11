@@ -12,7 +12,13 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
+
+/// Never-cancelled flag for entry points that pass no cancel
+/// token: the old snapshot names delegate to the
+/// `*_with_cancel` variants with this (v0.6.0 signals, Task 2).
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
@@ -192,9 +198,19 @@ impl ScopedScanner {
         self.follow = pids;
     }
     pub(crate) fn snapshot_for(&mut self, timeout: std::time::Duration) -> Snapshot {
+        self.snapshot_for_with_cancel(timeout, &NEVER_CANCELLED)
+    }
+    /// Cancel-aware sample: a set flag ends acquisition early
+    /// with the same Deadline gap a timeout produces, so a
+    /// cancelled scan finishes instead of hanging.
+    pub(crate) fn snapshot_for_with_cancel(
+        &mut self,
+        timeout: std::time::Duration,
+        cancel: &AtomicBool,
+    ) -> Snapshot {
         let original = self.limits.timeout;
         self.limits.timeout = original.min(timeout);
-        let snapshot = self.snapshot();
+        let snapshot = self.snapshot_with_cancel(cancel);
         self.limits.timeout = original;
         snapshot
     }
@@ -203,9 +219,17 @@ impl ScopedScanner {
         &mut self,
         timeout: std::time::Duration,
     ) -> ObservationSnapshot {
+        self.observation_snapshot_for_with_cancel(timeout, &NEVER_CANCELLED)
+    }
+    /// Cancel-aware full sample (see [`Self::snapshot_for_with_cancel`]).
+    pub(crate) fn observation_snapshot_for_with_cancel(
+        &mut self,
+        timeout: std::time::Duration,
+        cancel: &AtomicBool,
+    ) -> ObservationSnapshot {
         let original = self.limits.timeout;
         self.limits.timeout = original.min(timeout);
-        let snapshot = self.snapshot_inner(true);
+        let snapshot = self.snapshot_inner(true, cancel);
         self.limits.timeout = original;
         ObservationSnapshot {
             snapshot,
@@ -213,9 +237,13 @@ impl ScopedScanner {
         }
     }
     pub fn snapshot(&mut self) -> Snapshot {
-        self.snapshot_inner(false)
+        self.snapshot_with_cancel(&NEVER_CANCELLED)
     }
-    fn snapshot_inner(&mut self, full: bool) -> Snapshot {
+    /// Cancel-aware sample (see [`Self::snapshot_for_with_cancel`]).
+    pub(crate) fn snapshot_with_cancel(&mut self, cancel: &AtomicBool) -> Snapshot {
+        self.snapshot_inner(false, cancel)
+    }
+    fn snapshot_inner(&mut self, full: bool, cancel: &AtomicBool) -> Snapshot {
         let clock = CaptureClock::start();
         let mut budget = Budget::new(&self.limits);
         budget.memory = self.scan_state.memory.clone();
@@ -224,11 +252,11 @@ impl ScopedScanner {
             .iter()
             .all(|m| m.file.metadata().map(|v| fingerprint(&v)).ok() == Some(m.fingerprint));
         if !valid {
-            return self.failed(GapReason::Changed, &clock, budget.bytes);
+            return self.failed(GapReason::Changed, &clock, budget.bytes, cancel);
         }
         if self.cgroup.is_some() {
             if let Err(reason) = validate_pid_view(&mut budget) {
-                return self.failed(reason, &clock, budget.bytes);
+                return self.failed(reason, &clock, budget.bytes, cancel);
             }
         }
         let before = match self
@@ -238,7 +266,7 @@ impl ScopedScanner {
             .transpose()
         {
             Ok(value) => value,
-            Err(reason) => return self.failed(reason, &clock, budget.bytes),
+            Err(reason) => return self.failed(reason, &clock, budget.bytes, cancel),
         };
         // 6A: the discovery scope is the CONSTRUCTION selection
         // (pids × cgroup intersection when both were selected);
@@ -276,7 +304,7 @@ impl ScopedScanner {
         // a pid-restricted one (the unioned `pids` above only matter
         // when the scan is already pid-scoped).
         let system = self.pids.is_empty() && self.cgroup.is_none();
-        let mut result = procfs::snapshot_reused(
+        let mut result = procfs::snapshot_reused_with_cancel(
             &SnapshotOptions {
                 pids,
                 limits,
@@ -285,6 +313,7 @@ impl ScopedScanner {
             system,
             !self.modules.is_empty(),
             &mut self.scan_state,
+            cancel,
         );
         budget.bytes = budget.bytes.saturating_add(result.totals.read_bytes);
         if let Some(before) = &before {
@@ -384,7 +413,13 @@ impl ScopedScanner {
         };
         result
     }
-    fn failed(&mut self, reason: GapReason, clock: &CaptureClock, bytes: u64) -> Snapshot {
+    fn failed(
+        &mut self,
+        reason: GapReason,
+        clock: &CaptureClock,
+        bytes: u64,
+        cancel: &AtomicBool,
+    ) -> Snapshot {
         // A wholly unavailable sampling pass observed no reusable objects.
         // Keep pinned selectors, but release obsolete sampled descriptors.
         let memory = self.scan_state.memory.take();
@@ -392,13 +427,14 @@ impl ScopedScanner {
         self.scan_state = procfs::ScanState::default();
         self.scan_state.memory = memory;
         self.scan_state.parsed_cache = parsed_cache;
-        let mut result = procfs::snapshot_selected(
+        let mut result = procfs::snapshot_selected_with_cancel(
             &SnapshotOptions {
                 pids: vec![],
                 limits: self.limits.clone(),
                 resolve_paths: self.resolve_paths,
             },
             false,
+            cancel,
         );
         result.interval = clock.finish();
         result.scope = self.scope;

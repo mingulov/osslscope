@@ -625,9 +625,14 @@ pub(super) fn run_formatted(
             break;
         }
         let poll_started = Instant::now();
+        // v0.6.0 signals (Task 2): the run's cancel flag flows
+        // into acquisition, so a signal ends the in-flight sample
+        // early with a Deadline gap instead of running it out.
         let snapshot = match options.duration {
-            Some(duration) => scanner.snapshot_for(duration.saturating_sub(started.elapsed())),
-            None => scanner.snapshot(),
+            Some(duration) => {
+                scanner.snapshot_for_with_cancel(duration.saturating_sub(started.elapsed()), cancel)
+            }
+            None => scanner.snapshot_with_cancel(cancel),
         };
         // The blindness boundary prints once per run, before the first
         // sample that establishes it (a snapshot is the knowledge

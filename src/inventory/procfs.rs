@@ -19,7 +19,13 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+
+/// Never-cancelled flag for entry points that pass no cancel
+/// token: the old `snapshot*` names delegate to the
+/// `*_with_cancel` variants with this (v0.6.0 signals, Task 2).
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, PartialEq, Eq)]
 struct Mapping<'a> {
@@ -413,6 +419,11 @@ struct Work<'a> {
     memory: Option<crate::observation_memory::MemoryPool>,
     options: &'a SnapshotOptions,
     include_other: bool,
+    /// Cooperative cancel token (v0.6.0 signals): checked
+    /// between objects and after every EINTR; a set flag ends
+    /// acquisition early with the same Deadline gap a timeout
+    /// produces. Never-cancelled for callers that pass none.
+    cancel: &'a AtomicBool,
     started: Instant,
     totals: WorkTotals,
     gaps: BTreeSet<Gap>,
@@ -525,6 +536,9 @@ impl Work<'_> {
             Ok(())
         }
     }
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
     fn gap(&mut self, pid: Option<u32>, mapping: Option<&Mapping<'_>>, reason: GapReason) {
         self.gap_full(pid, mapping, reason, None, None);
     }
@@ -577,6 +591,11 @@ impl Work<'_> {
             .saturating_sub(self.totals.read_bytes)
     }
     fn read(&mut self, mut file: File, maximum: usize) -> Result<ReadBuffer, GapReason> {
+        // Between-objects cancel check: a cancelled scan finishes
+        // early with the same Deadline gap a timeout produces.
+        if self.cancelled() {
+            return Err(GapReason::Deadline);
+        }
         let mut bytes = Vec::new();
         let mut leases = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -591,9 +610,19 @@ impl Work<'_> {
             let count = allowed
                 .min(chunk.len())
                 .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-            let read = file
-                .read(&mut chunk[..count])
-                .map_err(|_| GapReason::Unavailable)?;
+            let read = match file.read(&mut chunk[..count]) {
+                // EINTR checks cancel before retry: a signal that
+                // cancelled the scan ends the read; any other
+                // interruption retries as before.
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    if self.cancelled() {
+                        return Err(GapReason::Deadline);
+                    }
+                    continue;
+                }
+                Err(_) => return Err(GapReason::Unavailable),
+                Ok(read) => read,
+            };
             self.totals.read_bytes += read as u64;
             if read == 0 {
                 return Ok(ReadBuffer {
@@ -648,6 +677,11 @@ impl Work<'_> {
         metadata: &Metadata,
         page: Option<u64>,
     ) -> Result<ModuleInfo, GapReason> {
+        // Between-objects cancel check: a cancelled scan finishes
+        // early with the same Deadline gap a timeout produces.
+        if self.cancelled() {
+            return Err(GapReason::Deadline);
+        }
         let fingerprint = Fingerprint::from(metadata);
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
@@ -688,7 +722,7 @@ impl Work<'_> {
         self.totals.objects_inspected += 1;
         // The external lease covers this parser; metadata.len() still bounds
         // growth between admission and its independent descriptor checks.
-        let result = elf::inspect_file(&mut file, metadata.len());
+        let result = elf::inspect_file_with_cancel(&mut file, metadata.len(), self.cancel);
         self.deadline()?;
         if file.metadata().map(|m| Fingerprint::from(&m)).ok().as_ref() != Some(&fingerprint) {
             return Err(GapReason::Changed);
@@ -1063,6 +1097,12 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, (GapReason, O
             work.gap(Some(pid), None, reason);
             break;
         }
+        // Between-objects cancel check: same early-finish shape
+        // as a deadline — a Deadline gap, then stop acquiring.
+        if work.cancelled() {
+            work.gap(Some(pid), None, GapReason::Deadline);
+            break;
+        }
         let mapping = match parse_line(line) {
             Ok(mapping) => mapping,
             Err(reason) => {
@@ -1357,25 +1397,71 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, (GapReason, O
 }
 
 pub(super) fn snapshot(options: &SnapshotOptions) -> Snapshot {
-    snapshot_selected(options, options.pids.is_empty())
+    snapshot_with_cancel(options, &NEVER_CANCELLED)
+}
+pub(super) fn snapshot_with_cancel(options: &SnapshotOptions, cancel: &AtomicBool) -> Snapshot {
+    snapshot_selected_with_cancel(options, options.pids.is_empty(), cancel)
 }
 /// The explicit mode preserves an empty resolved selection as empty.
+// Kept per the Task-2 interface (old names delegate for callers
+// that pass no token); every current in-crate caller passes an
+// explicit flag, so this shim is presently unreferenced.
+#[allow(dead_code)]
 pub(super) fn snapshot_selected(options: &SnapshotOptions, system: bool) -> Snapshot {
-    snapshot_scoped(options, system, false)
+    snapshot_selected_with_cancel(options, system, &NEVER_CANCELLED)
 }
+pub(super) fn snapshot_selected_with_cancel(
+    options: &SnapshotOptions,
+    system: bool,
+    cancel: &AtomicBool,
+) -> Snapshot {
+    snapshot_scoped_with_cancel(options, system, false, cancel)
+}
+// Kept per the Task-2 interface (old names delegate for callers
+// that pass no token); every current in-crate caller passes an
+// explicit flag, so this shim is presently unreferenced.
+#[allow(dead_code)]
 pub(super) fn snapshot_scoped(
     options: &SnapshotOptions,
     system: bool,
     include_other: bool,
 ) -> Snapshot {
-    snapshot_reused(options, system, include_other, &mut ScanState::default())
+    snapshot_scoped_with_cancel(options, system, include_other, &NEVER_CANCELLED)
+}
+pub(super) fn snapshot_scoped_with_cancel(
+    options: &SnapshotOptions,
+    system: bool,
+    include_other: bool,
+    cancel: &AtomicBool,
+) -> Snapshot {
+    snapshot_reused_with_cancel(
+        options,
+        system,
+        include_other,
+        &mut ScanState::default(),
+        cancel,
+    )
 }
 
+// Kept per the Task-2 interface (old names delegate for callers
+// that pass no token); every current in-crate caller passes an
+// explicit flag, so this shim is presently unreferenced.
+#[allow(dead_code)]
 pub(super) fn snapshot_reused(
     options: &SnapshotOptions,
     system: bool,
     include_other: bool,
     state: &mut ScanState,
+) -> Snapshot {
+    snapshot_reused_with_cancel(options, system, include_other, state, &NEVER_CANCELLED)
+}
+
+pub(super) fn snapshot_reused_with_cancel(
+    options: &SnapshotOptions,
+    system: bool,
+    include_other: bool,
+    state: &mut ScanState,
+    cancel: &AtomicBool,
 ) -> Snapshot {
     state.records_memory.clear();
     let clock = CaptureClock::start();
@@ -1396,6 +1482,7 @@ pub(super) fn snapshot_reused(
         records_memory: Vec::new(),
         memory: state.memory.clone(),
         include_other,
+        cancel,
         options,
         started,
         totals: WorkTotals::default(),
@@ -1552,6 +1639,13 @@ fn sample_order(order: &[u32], work: &mut Work<'_>, state: &mut ScanState) -> Ve
             work.gap(None, None, reason);
             break;
         }
+        // Cancelled scans finish early with the same PID-less
+        // Deadline gap a timeout produces (per-PID gaps here
+        // would read as successful absences, as above).
+        if work.cancelled() {
+            work.gap(None, None, GapReason::Deadline);
+            break;
+        }
         state.cursor = Some(pid);
         work.totals.processes_attempted += 1;
         match process(pid, work) {
@@ -1600,6 +1694,7 @@ mod tests {
             memory: None,
             options: &options,
             include_other: false,
+            cancel: &NEVER_CANCELLED,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
@@ -1663,6 +1758,7 @@ mod tests {
             memory: Some(pool),
             options: &options,
             include_other: false,
+            cancel: &NEVER_CANCELLED,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
@@ -1828,6 +1924,7 @@ mod tests {
             memory: Some(pool),
             options: &options,
             include_other: false,
+            cancel: &NEVER_CANCELLED,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
@@ -1872,6 +1969,7 @@ mod tests {
             memory: None,
             options: &options,
             include_other: false,
+            cancel: &NEVER_CANCELLED,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),
@@ -1897,6 +1995,7 @@ mod tests {
             memory: None,
             options: &options,
             include_other: false,
+            cancel: &NEVER_CANCELLED,
             started: Instant::now(),
             totals: WorkTotals::default(),
             gaps: BTreeSet::new(),

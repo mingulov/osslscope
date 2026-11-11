@@ -11,7 +11,6 @@ use std::io::{self, IsTerminal as _, Write};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths] [-v]\n       osslscope inspect --pid PID [--json] [--resolve-paths] [-v]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths] [-v]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows (default off; --json acquires machine path evidence without the flag; never in diagnostics).\n-v/--verbose (repeatable, -vv = 2) raises human detail only: -v adds grouped gaps, per-module exports, and full per-process state; -vv adds per-object gap records and safe counters. Default human output is quiet; JSON output is complete at every level.\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
@@ -161,43 +160,14 @@ fn seconds(text: &str, interval: bool) -> Result<Duration, ()> {
     Ok(duration)
 }
 
-static WATCH_INTERRUPTED: AtomicBool = AtomicBool::new(false);
-extern "C" fn watch_signal(_: libc::c_int) {
-    WATCH_INTERRUPTED.store(true, Ordering::Relaxed);
-}
-/// CLI lifetime only: save/restore the observer's exact dispositions. The
-/// library API uses its caller's AtomicBool and never changes signal state.
-struct WatchSignals(Vec<(libc::c_int, libc::sigaction)>);
-impl WatchSignals {
-    fn install() -> io::Result<Self> {
-        WATCH_INTERRUPTED.store(false, Ordering::Relaxed);
-        let mut guard = Self(Vec::new());
-        for signal in [libc::SIGINT, libc::SIGTERM] {
-            // SAFETY: both sigaction values are initialized, sigemptyset
-            // initializes the mask, and this handler only stores an atomic.
-            let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
-            let mut previous: libc::sigaction = unsafe { std::mem::zeroed() };
-            action.sa_sigaction = watch_signal as usize;
-            unsafe {
-                libc::sigemptyset(&mut action.sa_mask);
-            }
-            if unsafe { libc::sigaction(signal, &action, &mut previous) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            guard.0.push((signal, previous));
-        }
-        Ok(guard)
-    }
-}
-impl Drop for WatchSignals {
-    fn drop(&mut self) {
-        for (signal, previous) in self.0.iter().rev() {
-            // SAFETY: restoring the exact initialized disposition saved above.
-            unsafe {
-                libc::sigaction(*signal, previous, std::ptr::null_mut());
-            }
-        }
-    }
+/// Prompt first-signal ack to locked stderr, panic-free like
+/// [`crate::report::err_line`] (a broken stderr degrades to
+/// silence, never to exit 101) but byte-exact: the ack already
+/// ends in newline, so no extra line is added. Verbosity-independent.
+fn write_ack(ack: &str) {
+    let stderr = io::stderr();
+    let mut locked = stderr.lock();
+    let _ = locked.write_all(ack.as_bytes());
 }
 
 #[derive(Serialize)]
@@ -972,14 +942,14 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
         // Read before the Selection moves below consume the vectors.
         let verbosity = options.verbosity;
         if options.watch {
-            let _signals = match WatchSignals::install() {
-                Ok(guard) => guard,
+            let shutdown = match crate::shutdown::Shutdown::install() {
+                Ok(shutdown) => shutdown,
                 Err(_) => {
                     crate::report::err_line("osslscope discovery: observer signal setup failed");
                     return ExitCode::from(1);
                 }
             };
-            super::watch::run_formatted(
+            let outcome = super::watch::run_formatted(
                 &super::watch::WatchOptions {
                     selection: super::scope::Selection {
                         pids: options.pids,
@@ -993,12 +963,18 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                     resolve_paths: render_paths,
                 },
                 &mut output,
-                &WATCH_INTERRUPTED,
+                shutdown.cancel_flag(),
                 !options.json,
                 terminal,
                 verbosity,
-            )
-            .map(|outcome| {
+            );
+            // Prompt first-signal ack on stderr (`None` when no
+            // signal arrived — no behavior change then), even when
+            // the stdout sink broke: the ack is stderr's own line.
+            if let Some(ack) = shutdown.ack() {
+                write_ack(&ack);
+            }
+            outcome.map(|outcome| {
                 if let Some(line) = super::watch::exit_reason(&outcome) {
                     crate::report::err_line(&line);
                 }

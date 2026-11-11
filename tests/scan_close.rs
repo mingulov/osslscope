@@ -346,3 +346,47 @@ fn fix1_tier2_idle_aging_releases() {
     assert_eq!(t.age(3_000_000_000), Some(ThrottleAction::ReleaseSkipAll));
     assert!(!t.throttled());
 }
+
+#[test]
+fn v060_sigint_during_setup_phase_acks_and_exits_3() {
+    // Setup phase: SIGINT within 200ms of spawn, before the first
+    // sample completes. Must ack + exit 3, never hang in setup.
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--watch", "--interval", "1", "--duration", "60"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("shutting down"));
+}
+
+#[test]
+fn v060_sigint_mid_scan_acks_and_exits_3() {
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--watch", "--interval", "30", "--duration", "120"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let pid = child.id() as i32;
+    libc_kill::kill(pid, libc_kill::SIGINT);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("shutting down"), "no ack: {err}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Watch ended:"), "no end record");
+}
+
+// Minimal kill without a new dependency.
+mod libc_kill {
+    pub const SIGINT: i32 = 2;
+    pub fn kill(pid: i32, signo: i32) {
+        assert_eq!(unsafe { libc::kill(pid, signo) }, 0);
+    }
+}

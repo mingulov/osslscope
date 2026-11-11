@@ -11,6 +11,12 @@ use std::io;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::fs::{FileExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Never-cancelled flag for entry points that pass no cancel
+/// token: the old names delegate to the `*_with_cancel` variants
+/// with this (v0.6.0 signals, Task 2).
+static NEVER_CANCELLED: AtomicBool = AtomicBool::new(false);
 
 /// Open once, nonblocking for FIFOs, then inspect only a regular descriptor.
 /// Nonblocking flags do not bound filesystem latency on regular files.
@@ -27,12 +33,30 @@ pub fn inspect_module(path: &Path, max_bytes: u64) -> Result<ModuleInfo, GapReas
 /// a path or changing the descriptor's cursor. Foreign ELF machines are
 /// descriptive inventory; tracing support is a separate decision.
 pub fn inspect_file(file: &mut File, max_bytes: u64) -> Result<ModuleInfo, GapReason> {
-    inspect_file_budgeted(file, max_bytes, None)
+    inspect_file_with_cancel(file, max_bytes, &NEVER_CANCELLED)
+}
+/// Cancel-aware parse: a set flag ends the bounded read early
+/// with the same [`GapReason::Deadline`] a timeout produces, so a
+/// cancelled scan finishes early instead of hanging in acquisition.
+pub fn inspect_file_with_cancel(
+    file: &mut File,
+    max_bytes: u64,
+    cancel: &AtomicBool,
+) -> Result<ModuleInfo, GapReason> {
+    inspect_file_budgeted_with_cancel(file, max_bytes, None, cancel)
 }
 pub(crate) fn inspect_file_budgeted(
     file: &mut File,
     max_bytes: u64,
     memory: Option<&crate::observation_memory::MemoryPool>,
+) -> Result<ModuleInfo, GapReason> {
+    inspect_file_budgeted_with_cancel(file, max_bytes, memory, &NEVER_CANCELLED)
+}
+pub(crate) fn inspect_file_budgeted_with_cancel(
+    file: &mut File,
+    max_bytes: u64,
+    memory: Option<&crate::observation_memory::MemoryPool>,
+    cancel: &AtomicBool,
 ) -> Result<ModuleInfo, GapReason> {
     let before = file.metadata().map_err(|_| GapReason::Unavailable)?;
     if !before.is_file() {
@@ -67,7 +91,7 @@ pub(crate) fn inspect_file_budgeted(
         ),
         None => None,
     };
-    let bytes = read_bounded(file, before.len());
+    let bytes = read_bounded(file, before.len(), cancel);
     verify_unchanged(file, &before)?;
     let bytes = bytes?;
     if bytes.len() as u64 != before.len() {
@@ -402,7 +426,7 @@ fn admit_hash_work(
     Err(GapReason::ReadLimit)
 }
 
-fn read_bounded(file: &File, size: u64) -> Result<Vec<u8>, GapReason> {
+fn read_bounded(file: &File, size: u64, cancel: &AtomicBool) -> Result<Vec<u8>, GapReason> {
     // Read at most the admitted size plus one, so growth cannot turn into
     // an unbounded read. The extra byte detects growth before fstat too.
     let limit = usize::try_from(size)
@@ -415,11 +439,24 @@ fn read_bounded(file: &File, size: u64) -> Result<Vec<u8>, GapReason> {
         .map_err(|_| GapReason::ReadLimit)?;
     let mut buffer = [0; 65_536];
     while bytes.len() < limit {
+        // v0.6.0 signals: a cancelled scan finishes early with the
+        // same Deadline gap a timeout produces — never a hang.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GapReason::Deadline);
+        }
         let count = buffer.len().min(limit - bytes.len());
         match file.read_at(&mut buffer[..count], bytes.len() as u64) {
             Ok(0) => break,
             Ok(n) => bytes.extend_from_slice(&buffer[..n]),
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // EINTR checks cancel before retry: a signal that
+            // cancelled the scan ends the read; any other
+            // interruption retries as before.
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(GapReason::Deadline);
+                }
+                continue;
+            }
             Err(_) => return Err(GapReason::Unavailable),
         }
     }
