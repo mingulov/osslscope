@@ -124,6 +124,49 @@ fn redacted(output: &Output, fixture: &Fixture) {
         assert!(!text.contains(fixture.0.to_str().unwrap()), "{text}");
     }
 }
+
+/// v0.6.0 D1 discovery-JSON redaction: the never-in-JSON gate is
+/// rejected — the fixture's canary path LEGITIMATELY appears in
+/// the allowlisted machine path values (`verified_path.path`,
+/// `maps_spelling.spelling`), and nowhere else. Stderr keeps the
+/// blanket check (diagnostics carry no paths, before or after D1).
+fn redacted_discovery_json(output: &Output, fixture: &Fixture) {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("PRIVATE_CANARY"), "{stderr}");
+    assert!(!stderr.contains(fixture.0.to_str().unwrap()), "{stderr}");
+    let doc = json(output);
+    let dir = fixture.0.to_str().unwrap().to_string();
+    fn walk(value: &serde_json::Value, parent: &str, dir: &str, hits: &mut usize) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    walk(child, key, dir, hits);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, parent, dir, hits);
+                }
+            }
+            serde_json::Value::String(text) => {
+                if text.contains("PRIVATE_CANARY") || text.contains(dir) {
+                    assert!(
+                        parent == "path" || parent == "spelling",
+                        "canary path outside allowlisted path values (key {parent:?}): {text}"
+                    );
+                    *hits += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut hits = 0;
+    walk(&doc, "", &dir, &mut hits);
+    // The mapped fixture module MUST surface in the allowlisted
+    // values (acquisition ran) — absence would be a silent skip.
+    assert!(hits > 0, "canary module missing from path values");
+}
+
 #[test]
 fn scan_pid_json_needs_no_profile_or_bpf() {
     let f = Fixture::new();
@@ -144,7 +187,7 @@ fn scan_pid_json_needs_no_profile_or_bpf() {
             .iter()
             .any(|m| m["info"]["sha256"] == hash && m["info"]["kind"] == "provider_module")
     );
-    redacted(&output, &f);
+    redacted_discovery_json(&output, &f);
 }
 // Catches admitting non-executable data before module/read-budget charging.
 // IN_ACCESS is an independent kernel oracle; its positive read control follows
@@ -218,7 +261,7 @@ fn non_executable_data_is_never_read_or_charged_as_a_module() {
             .any(|p| p.modules.iter().any(|m| m.info.sha256 == digest(&module)))
     );
     assert!(!f.0.join("PRIVATE_CANARY_executed").exists());
-    redacted(&output, &f);
+    redacted_discovery_json(&output, &f);
     let mut byte = [0];
     fs::File::open(&data)
         .unwrap()

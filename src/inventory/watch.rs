@@ -21,8 +21,8 @@ pub struct WatchOptions {
     /// computed by the caller): human change-row fragments render
     /// iff this is on AND the sink is a terminal. Acquisition is
     /// gated separately by `selection.resolve_paths` (effective:
-    /// also requires a terminal) — machine modes bypass resolution
-    /// entirely (external F2).
+    /// JSON output and flagged runs acquire alike — v0.6.0 D1
+    /// rejected the never-in-JSON gate; external F2).
     pub resolve_paths: bool,
 }
 impl Default for WatchOptions {

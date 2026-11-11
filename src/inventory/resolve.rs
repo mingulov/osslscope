@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Terminal-only resolved host paths (T5 privacy D-record,
-//! `--resolve-paths`): render verified object locators on
-//! TTY-attached human rows, nothing else.
+//! Constrained resolved host paths (T5 privacy D-record,
+//! `--resolve-paths`, v0.6.0 D1): the terminal writer renders
+//! verified object locators on TTY-attached human rows, and the D1
+//! machine publisher re-resolves the same retained locators into
+//! JSON path evidence — through the same constrained machinery,
+//! never maps text.
 //!
 //! Design (D-record rules 2–7 + implementation caveat):
 //! - The ONLY resolution primitive is [`open_constrained`]: one
@@ -554,6 +557,95 @@ pub(crate) fn resolve_for_display(capability: &RowCapability) -> Result<PathBuf,
     // acquired file, even if the match above ever weakens
     // (external F1 defense in depth).
     chase_canonical(locator, capability.identity)
+}
+
+/// Machine publish for one verified row (D1): re-resolve the
+/// retained locator through the SAME constrained machinery as the
+/// terminal writer, then encode losslessly. `None` path always
+/// pairs with a finite reason; locator candidates never reach here
+/// (callers gate on `IdentityStatus::Verified`).
+pub(crate) fn publish_verified_path(
+    capability: &RowCapability,
+) -> (
+    Option<super::VerifiedPath>,
+    Option<super::PathUnavailableReason>,
+) {
+    use super::{PathUnavailableReason, VerifiedPath};
+    let Some(locator) = capability.locator.as_ref() else {
+        return (None, Some(PathUnavailableReason::NoLocator));
+    };
+    let _ = locator;
+    match resolve_for_display(capability) {
+        Ok(canonical) => {
+            let (path, path_encoding) = encode_machine_path(canonical.as_os_str().as_bytes());
+            (
+                Some(VerifiedPath {
+                    path,
+                    path_encoding,
+                    locator_kind: super::LocatorKind::HostDirect,
+                    capture_unix_ms: crate::inventory::wall_ms_pub(),
+                }),
+                None,
+            )
+        }
+        Err(ResolveError::Missing) => (None, Some(PathUnavailableReason::Missing)),
+        Err(ResolveError::Changed) => (None, Some(PathUnavailableReason::Changed)),
+        Err(ResolveError::Unavailable) => (None, Some(PathUnavailableReason::ResolveFailed)),
+    }
+}
+
+/// Machine path bound (D1): valid UTF-8 publishes verbatim to
+/// 4096 chars; longer strings truncate to 4095 chars + `…`.
+pub(crate) const MACHINE_PATH_CHARS: usize = 4096;
+
+/// Escaped machine path bound (D1): 3× the verbatim bound, so a
+/// fully-escaped PATH_MAX spelling still fits; truncation marks
+/// `…` and never splits a `%XX` escape.
+pub(crate) const MACHINE_PATH_ESCAPED_CHARS: usize = 12288;
+
+/// Lossless machine encoding for proven path bytes (D1): valid
+/// UTF-8 publishes verbatim ([`MACHINE_PATH_CHARS`]); otherwise
+/// valid runs publish verbatim with each invalid byte `%XX`
+/// percent-escaped (uppercase hex, [`MACHINE_PATH_ESCAPED_CHARS`]).
+/// No sanitization (unlike [`display_path`): control bytes in
+/// valid UTF-8 stay verbatim — JSON string escaping, not lossy
+/// display folding, carries machine evidence.
+pub(crate) fn encode_machine_path(bytes: &[u8]) -> (String, super::PathEncoding) {
+    use super::PathEncoding;
+    if let Ok(valid) = std::str::from_utf8(bytes) {
+        if valid.chars().count() <= MACHINE_PATH_CHARS {
+            return (valid.to_string(), PathEncoding::Utf8);
+        }
+        let truncated: String = valid.chars().take(MACHINE_PATH_CHARS - 1).collect();
+        return (format!("{truncated}…"), PathEncoding::Utf8);
+    }
+    let mut escaped = String::new();
+    for chunk in bytes.utf8_chunks() {
+        escaped.push_str(chunk.valid());
+        for byte in chunk.invalid() {
+            escaped.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    if escaped.chars().count() <= MACHINE_PATH_ESCAPED_CHARS {
+        return (escaped, PathEncoding::Utf8PercentEscaped);
+    }
+    let mut cut: String = escaped
+        .chars()
+        .take(MACHINE_PATH_ESCAPED_CHARS - 1)
+        .collect();
+    // Never split a `%XX` escape: back off over a trailing
+    // partial escape (`%` or `%X`; a trailing literal `%`/`%X`
+    // costs at most two chars — still within bound, still marked).
+    if cut.ends_with('%') {
+        cut.pop();
+    } else {
+        let tail: Vec<char> = cut.chars().rev().take(2).collect();
+        if tail.len() == 2 && tail[0].is_ascii_hexdigit() && tail[1] == '%' {
+            cut.truncate(cut.len() - 2);
+        }
+    }
+    cut.push('…');
+    (cut, PathEncoding::Utf8PercentEscaped)
 }
 
 /// Display pipeline (rule 7 + defense in depth): lossy decode,
@@ -1494,5 +1586,101 @@ mod tests {
         // Clones share custody (same rows, dup'd FDs pin on).
         let dupe = sidecar.clone();
         assert_eq!(sidecar, dupe);
+    }
+
+    #[test]
+    fn v060_encode_machine_path_verbatim_escapes_and_bounds() {
+        use crate::inventory::PathEncoding;
+        // Valid UTF-8 publishes verbatim — controls included
+        // (machine evidence is lossless, unlike display).
+        let (text, encoding) = encode_machine_path(b"/usr/lib/x.so");
+        assert_eq!(text, "/usr/lib/x.so");
+        assert_eq!(encoding, PathEncoding::Utf8);
+        let hostile = "a\x1b]0;b\x07c\r\nd";
+        let (text, encoding) = encode_machine_path(hostile.as_bytes());
+        assert_eq!(text, hostile);
+        assert_eq!(encoding, PathEncoding::Utf8);
+        // Exactly 4096 chars passes unmarked; 4097 truncates marked.
+        let exact = "x".repeat(MACHINE_PATH_CHARS);
+        let (text, _) = encode_machine_path(exact.as_bytes());
+        assert_eq!(text, exact);
+        let over = "y".repeat(MACHINE_PATH_CHARS + 1);
+        let (text, encoding) = encode_machine_path(over.as_bytes());
+        assert_eq!(text.chars().count(), MACHINE_PATH_CHARS);
+        assert!(text.ends_with('…'), "{text:?}");
+        assert_eq!(encoding, PathEncoding::Utf8);
+        // Invalid bytes escape `%XX` (uppercase hex), valid runs verbatim.
+        let (text, encoding) = encode_machine_path(b"/lib/\xff\xfe.so");
+        assert_eq!(text, "/lib/%FF%FE.so");
+        assert_eq!(encoding, PathEncoding::Utf8PercentEscaped);
+        // Escaped truncation never splits an escape: a cut landing on
+        // `%F` backs off to the escape boundary (12285 + `…`).
+        let raw = vec![0xff; MACHINE_PATH_ESCAPED_CHARS];
+        let (text, encoding) = encode_machine_path(&raw);
+        assert_eq!(encoding, PathEncoding::Utf8PercentEscaped);
+        assert_eq!(text.chars().count(), MACHINE_PATH_ESCAPED_CHARS - 2);
+        assert!(text.ends_with("…"), "{text:?}");
+        assert!(text[..text.len() - '…'.len_utf8()].ends_with("%FF"));
+        // A cut landing on a bare `%` backs off one char instead.
+        let mut raw = vec![b'a'];
+        raw.extend(std::iter::repeat_n(0xff, MACHINE_PATH_ESCAPED_CHARS));
+        let (text, _) = encode_machine_path(&raw);
+        assert!(text.ends_with('…'));
+        assert!(text.chars().count() <= MACHINE_PATH_ESCAPED_CHARS);
+        let body = text.trim_end_matches('…');
+        assert!(!body.ends_with('%'), "{body:?}");
+        // Every retained `%` still opens a complete escape.
+        let chars: Vec<char> = body.chars().collect();
+        for (i, c) in chars.iter().enumerate() {
+            if *c == '%' {
+                assert!(chars.get(i + 1).is_some_and(|c| c.is_ascii_hexdigit()));
+                assert!(chars.get(i + 2).is_some_and(|c| c.is_ascii_hexdigit()));
+            }
+        }
+    }
+
+    #[test]
+    fn v060_publish_verified_path_pairs_path_or_reason() {
+        use crate::inventory::{LocatorKind, PathEncoding, PathUnavailableReason};
+        // Proven locator publishes the CANONICAL path (chain links
+        // resolve away — custody, not maps text).
+        let dir = scratch("publish");
+        let real = dir.join("real.so");
+        std::fs::write(&real, b"x").unwrap();
+        let link = dir.join("link.so");
+        symlink(&real, &link);
+        let capability = capability_for(&link);
+        let (path, reason) = publish_verified_path(&capability);
+        let path = path.expect("proven locator publishes");
+        assert_eq!(path.path, real.to_string_lossy());
+        assert_eq!(path.path_encoding, PathEncoding::Utf8);
+        assert_eq!(path.locator_kind, LocatorKind::HostDirect);
+        assert!(path.capture_unix_ms.is_some());
+        assert_eq!(reason, None);
+        // No locator: finite reason, never a path.
+        let bare = RowCapability::new(identity_of(&real), File::open(&real).unwrap(), None);
+        assert_eq!(
+            publish_verified_path(&bare),
+            (None, Some(PathUnavailableReason::NoLocator))
+        );
+        // Removal after custody: Missing (the retained FD still pins
+        // the inode — the PATH is what's missing).
+        let doomed = dir.join("doomed.so");
+        std::fs::write(&doomed, b"x").unwrap();
+        let capability = capability_for(&doomed);
+        std::fs::remove_file(&doomed).unwrap();
+        assert_eq!(
+            publish_verified_path(&capability),
+            (None, Some(PathUnavailableReason::Missing))
+        );
+        // Magic spelling: ResolveFailed, never the spelling.
+        let magic = RowCapability::new(
+            identity_of(&real),
+            File::open(&real).unwrap(),
+            Some(PathBuf::from(format!("/proc/{}/exe", std::process::id()))),
+        );
+        let (path, reason) = publish_verified_path(&magic);
+        assert_eq!(path, None);
+        assert_eq!(reason, Some(PathUnavailableReason::ResolveFailed));
     }
 }

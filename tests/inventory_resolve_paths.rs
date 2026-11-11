@@ -205,15 +205,20 @@ fn cell5_flag_absent_omits_fragments() {
     assert_eq!(tail.as_bytes(), machine.stdout.as_slice());
 }
 
-/// Cell 6: machine modes bypass resolution entirely; redirected
-/// human output renders the not-a-terminal placeholder, never a path.
+/// Cell 6 as amended by v0.6.0 D1 (never-in-JSON gate rejected):
+/// machine modes ACQUIRE path evidence now, but stay flag-identical
+/// (the module route carries no path keys; discovery JSON acquires
+/// in both runs — see `v060_json_paths_come_from_custody_not_maps_text`);
+/// redirected human output renders the not-a-terminal placeholder,
+/// never a path.
 #[test]
 fn cell6_machine_and_redirected_bypass() {
     let dir = scratch("cell6");
     let real = build_so(&dir, "real.so");
     let module = real.to_str().unwrap().to_string();
 
-    // --json with the flag: bytes identical to --json without.
+    // --json with the flag: bytes identical to --json without (both
+    // runs acquire under D1; the module route has no path keys).
     let off = bin()
         .args(["inspect", "--module", &module, "--json"])
         .output()
@@ -224,8 +229,8 @@ fn cell6_machine_and_redirected_bypass() {
         .unwrap();
     assert_eq!(off.stdout, on.stdout);
     assert!(!stdout_text(&on).contains("path="));
-    // F2: --json on a TTY with the flag resolves nothing either
-    // (no build-and-discard): pty JSON bytes equal piped bytes.
+    // D1: --json on a TTY acquires like piped JSON (same evidence
+    // both sides): pty JSON bytes equal piped bytes.
     let tty_json = pty_run(&[
         env!("CARGO_BIN_EXE_osslscope"),
         "inspect",
@@ -238,8 +243,9 @@ fn cell6_machine_and_redirected_bypass() {
 
     // Watch NDJSON with/without the flag: identical records
     // modulo wall-clock stamps (F5a — a TLS child guarantees
-    // inventoried rows; stripping covers interval/elapsed only,
-    // so any flag-induced record delta still fails).
+    // inventoried rows; both runs acquire under D1, and stripping
+    // covers wall-clock stamps only, so any flag-induced record
+    // delta still fails).
     let mut child = Sleeper::spawn_tls();
     std::thread::sleep(std::time::Duration::from_secs(2));
     let pid = child.pid().to_string();
@@ -263,9 +269,17 @@ fn cell6_machine_and_redirected_bypass() {
     fn strip(value: &mut serde_json::Value) {
         // Wall-clock stamps + remaining-time budgets are
         // run-varying; everything else must be flag-identical.
+        // (`capture_unix_ms` is D1's per-row wall stamp — same
+        // class as the interval edges.)
         match value {
             serde_json::Value::Object(object) => {
-                for key in ["interval", "poll_interval", "elapsed", "timeout"] {
+                for key in [
+                    "interval",
+                    "poll_interval",
+                    "elapsed",
+                    "timeout",
+                    "capture_unix_ms",
+                ] {
                     object.remove(key);
                 }
                 for value in object.values_mut() {
@@ -653,4 +667,48 @@ fn cell3_and_10_removal_stable_no_path_in_diagnostics() {
     let stderr = String::from_utf8_lossy(&on.stderr);
     assert!(!stderr.contains("dangling"), "{stderr}");
     assert!(!stderr.contains(dir.to_str().unwrap()), "{stderr}");
+}
+
+#[test]
+fn v060_json_paths_come_from_custody_not_maps_text() {
+    // Uses the file's existing helpers: scratch(), bin().
+    let _dir = scratch("v060-paths");
+    let mut workload = Command::new("python3")
+        .args(["-c", "import ssl, time; time.sleep(120)"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = workload.id().to_string();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let snap = bin()
+        .args(["scan", "--pid", &pid, "--json"])
+        .output()
+        .unwrap();
+    let _ = workload.kill();
+    let doc: serde_json::Value = serde_json::from_slice(&snap.stdout).unwrap();
+    let modules = doc["processes"][0]["modules"].as_array().unwrap();
+    assert!(!modules.is_empty(), "ssl workload has no modules");
+    for module in modules {
+        assert!(module.get("verified_path").is_some());
+        assert!(module.get("verified_path_unavailable").is_some());
+        assert!(module.get("maps_spelling").is_some());
+        if module["identity_status"] == "verified" {
+            if module["verified_path"].is_null() {
+                assert!(!module["verified_path_unavailable"].is_null());
+            } else {
+                assert_eq!(
+                    module["verified_path"]["path_encoding"].as_str().unwrap(),
+                    "utf8"
+                );
+            }
+        } else {
+            assert!(module["verified_path"].is_null());
+            assert_eq!(module["verified_path_unavailable"], "unverified_identity");
+        }
+        if !module["maps_spelling"].is_null() {
+            assert_eq!(module["maps_spelling"]["source"], "proc_maps");
+            assert_eq!(module["maps_spelling"]["verification"], "unverified");
+        }
+    }
 }

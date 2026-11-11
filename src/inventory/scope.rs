@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! Pinned, bounded selectors. Paths are private locators, never report fields.
+//! Pinned, bounded selectors. Maps text stays private; only proven
+//! machine path evidence (v0.6.0 D1) joins reports.
 use super::{
     CaptureClock, Gap, GapReason, InventoryState, Limits, NamespaceId, Scope, ScopeRecord,
     Snapshot, SnapshotOptions, elf, procfs,
@@ -20,8 +21,9 @@ pub struct Selection {
     pub modules: Vec<PathBuf>,
     /// T5 `--resolve-paths` EFFECTIVE acquire intent: the caller
     /// passes `acquire_paths(raw, json, terminal)` — acquisition
-    /// establishes locators only for human output on a terminal.
-    /// Render intent travels separately (external F2).
+    /// establishes locators and machine path evidence for JSON
+    /// output and flagged runs alike (v0.6.0 D1). Render intent
+    /// travels separately (external F2).
     pub resolve_paths: bool,
 }
 

@@ -489,6 +489,39 @@ CBOM:
   verdict/exit. Disk-ELF flavor/build-id/arch rows come from file
   bytes, never target memory.
 
+Discovery JSON path evidence (v0.6.0 D1, per-module keys):
+
+- `verified_path`: present (object) only for `verified` rows whose
+  host locator re-proved through the constrained H4 machinery at
+  acquisition — the same `openat2` + identity-match + verified
+  chase as the terminal writer, never maps text.
+  `{path, path_encoding, locator_kind, capture_unix_ms}`. `path`
+  is the canonical locator bytes: valid UTF-8 verbatim (at most
+  4096 chars, overlong truncated to 4095 chars + `…`), else valid
+  runs verbatim with each invalid byte `%XX` percent-escaped
+  (uppercase hex, at most 12288 chars, truncation never splits an
+  escape); `path_encoding` names the form (`utf8` /
+  `utf8_percent_escaped`); `locator_kind` is the proven route
+  (`host_direct` in D1/D3-host; container kinds join later);
+  `capture_unix_ms` is the observer wall-clock capture instant
+  (same class as the interval edges).
+- `verified_path_unavailable`: finite reason when `verified_path`
+  is null — `unverified_identity` for locator candidates (the
+  only candidate value), `no_locator` / `resolve_failed` /
+  `changed` / `missing` for verified rows whose locator never
+  proved or whose re-resolution failed. Exactly one of the pair
+  is non-null on acquiring runs.
+- `maps_spelling`: the sample's own `/proc/<pid>/maps` pathname
+  for the row's incarnation
+  (`{spelling, source: proc_maps, verification: unverified}`),
+  verbatim including ` (deleted)` markers, under the same
+  4096/12288 machine bounds. Unverified hint only — never
+  custody, never joined across processes (no global dev/ino
+  join). These three keys (plus their fixed sub-keys `path`,
+  `path_encoding`, `locator_kind`, `capture_unix_ms`, `spelling`,
+  `source`, `verification`) are the only path-bearing keys in
+  discovery JSON; maps text publishes nowhere else.
+
 stderr diagnostics:
 
 - fixed labels plus allowlisted values: pids, counts, op/kind ids,

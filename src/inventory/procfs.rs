@@ -3,9 +3,10 @@
 //! as execution evidence. No producer bootstrap or target-memory dependency.
 
 use super::{
-    Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, ModuleInfo,
-    ModuleRecord, NamespaceId, NamespaceIds, ObjectKind, ObservationState, ProcessRecord, Scope,
-    ScopeRecord, Snapshot, SnapshotMode, SnapshotOptions, WorkTotals, backing, elf, resolve,
+    Capabilities, CaptureClock, Gap, GapReason, IdentityStatus, InventoryState, MapsSource,
+    MapsSpelling, MapsVerification, ModuleInfo, ModuleRecord, NamespaceId, NamespaceIds,
+    ObjectKind, ObservationState, PathUnavailableReason, ProcessRecord, Scope, ScopeRecord,
+    Snapshot, SnapshotMode, SnapshotOptions, VerifiedPath, WorkTotals, backing, elf, resolve,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -756,6 +757,43 @@ fn backing(
     ))
 }
 
+/// v0.6.0 D1 maps hint for one row: the sample's own maps
+/// pathname, verbatim (including ` (deleted)` markers — stripping
+/// would mint a spelling the kernel never printed) under the
+/// machine bounds. Unverified by construction; never custody.
+fn maps_spelling_for(path: &[u8]) -> MapsSpelling {
+    let (spelling, _) = resolve::encode_machine_path(path);
+    MapsSpelling {
+        spelling,
+        source: MapsSource::ProcMaps,
+        verification: MapsVerification::Unverified,
+    }
+}
+
+/// v0.6.0 D1 machine publish for one still-Verified row: re-resolve
+/// the row's OWN retained locator through the same constrained H4
+/// machinery as the terminal writer, then encode losslessly. The
+/// join key is the row's own cache key (fingerprint + witnessed
+/// page) — never a global dev/ino lookup. A missing cache entry
+/// or an unduppable verifying FD degrades to `ResolveFailed` (the
+/// row stays Verified; only the path evidence is unavailable).
+/// The transient dup is dropped before return (F3: no retained FD
+/// mid-acquisition).
+fn publish_for_key(
+    cache: &BTreeMap<CacheKey, Cached>,
+    key: &CacheKey,
+    identity: (u64, u64),
+) -> (Option<VerifiedPath>, Option<PathUnavailableReason>) {
+    let Some(cached) = cache.get(key) else {
+        return (None, Some(PathUnavailableReason::ResolveFailed));
+    };
+    let Ok(file) = cached.file.try_clone() else {
+        return (None, Some(PathUnavailableReason::ResolveFailed));
+    };
+    let capability = resolve::RowCapability::new(identity, file, cached.locator.clone());
+    resolve::publish_verified_path(&capability)
+}
+
 fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     let clock = CaptureClock::start();
     work.reserve_record(1024)?;
@@ -895,13 +933,22 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
                             cached.locator = Some(locator);
                         }
                     }
+                    // v0.6.0 D1: the sample's OWN maps pathname for
+                    // this row's incarnation (this pid+starttime, read
+                    // above — never a cross-process dev/ino join).
+                    // Unverified hint; the verified pair publishes
+                    // below, after final status settles.
+                    let maps_spelling = work
+                        .options
+                        .resolve_paths
+                        .then(|| maps_spelling_for(mapping.path));
                     modules.push((
                         ModuleRecord {
                             info,
                             identity_status: status,
                             verified_path: None,
                             verified_path_unavailable: None,
-                            maps_spelling: None,
+                            maps_spelling,
                         },
                         key.clone(),
                     ));
@@ -976,12 +1023,21 @@ fn process(pid: u32, work: &mut Work<'_>) -> Result<ProcessRecord, GapReason> {
     // Materialization (dup + sidecar push) happens AFTER all
     // machine acquisition in `snapshot_reused` (external F3 —
     // retained dups must not consume FDs needed by later
-    // inventory opens).
+    // inventory opens). v0.6.0 D1 publishes the machine verified
+    // pair here too, against FINAL status: verified rows
+    // re-resolve their own retained locator; every other row
+    // carries the finite candidate reason, never a path.
     if work.options.resolve_paths {
-        for (module, key) in &modules {
+        for (module, key) in &mut modules {
             if module.identity_status != IdentityStatus::Verified {
+                module.verified_path = None;
+                module.verified_path_unavailable = Some(PathUnavailableReason::UnverifiedIdentity);
                 continue;
             }
+            let (verified_path, verified_path_unavailable) =
+                publish_for_key(&work.cache, key, (module.info.device, module.info.inode));
+            module.verified_path = verified_path;
+            module.verified_path_unavailable = verified_path_unavailable;
             work.resolve_staged
                 .push((key.clone(), (module.info.device, module.info.inode)));
         }
@@ -1340,6 +1396,69 @@ mod tests {
         let parsed = parse_line(b"0000000a-000000bc r--p 0 00:01 42 /secret name").unwrap();
         assert_eq!(parsed.map_name(), "a-bc");
         assert_eq!(parsed.inode, 42);
+    }
+
+    // v0.6.0 D1: maps hints keep ` (deleted)` markers verbatim under
+    // the machine bounds and never verify.
+    #[test]
+    fn v060_maps_spelling_keeps_deleted_verbatim_and_bounds() {
+        let hint = maps_spelling_for(b"/usr/lib/libcrypto.so.3 (deleted)");
+        assert_eq!(hint.spelling, "/usr/lib/libcrypto.so.3 (deleted)");
+        assert_eq!(hint.source, MapsSource::ProcMaps);
+        assert_eq!(hint.verification, MapsVerification::Unverified);
+        // Non-UTF8 maps bytes escape losslessly.
+        let hint = maps_spelling_for(b"/lib/\xff.so");
+        assert_eq!(hint.spelling, "/lib/%FF.so");
+        // Overlong spellings truncate marked.
+        let long = "s".repeat(resolve::MACHINE_PATH_CHARS + 1);
+        let hint = maps_spelling_for(long.as_bytes());
+        assert_eq!(hint.spelling.chars().count(), resolve::MACHINE_PATH_CHARS);
+        assert!(hint.spelling.ends_with('…'));
+    }
+
+    // v0.6.0 D1: machine publish re-proves the row's OWN retained
+    // locator (never maps text); missing custody degrades finitely.
+    #[test]
+    fn v060_publish_reproves_own_locator_or_degrades() {
+        let dir = std::env::temp_dir().join(format!("osslscope-publish-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = dir.join("lib.so");
+        std::fs::write(&real, b"x").unwrap();
+        let metadata = std::fs::metadata(&real).unwrap();
+        let key = (Fingerprint::from(&metadata), None);
+        let identity = (metadata.dev(), metadata.ino());
+        let mut cache = BTreeMap::new();
+        cache.insert(
+            key.clone(),
+            Cached {
+                _memory: None,
+                file: File::open(&real).unwrap(),
+                info: Err(GapReason::NotElf),
+                seen: true,
+                locator: Some(real.clone()),
+            },
+        );
+        let (path, reason) = publish_for_key(&cache, &key, identity);
+        let path = path.expect("proven locator publishes");
+        assert_eq!(path.path, real.to_string_lossy());
+        assert_eq!(path.path_encoding, super::super::PathEncoding::Utf8);
+        assert_eq!(path.locator_kind, super::super::LocatorKind::HostDirect);
+        assert!(path.capture_unix_ms.is_some());
+        assert_eq!(reason, None);
+        // No locator: finite reason, never a path.
+        cache.get_mut(&key).unwrap().locator = None;
+        assert_eq!(
+            publish_for_key(&cache, &key, identity),
+            (None, Some(PathUnavailableReason::NoLocator))
+        );
+        // Unknown key: finite reason, never a path.
+        let probe = dir.join("probe");
+        std::fs::write(&probe, b"y").unwrap();
+        let missing = (Fingerprint::from(&std::fs::metadata(&probe).unwrap()), None);
+        assert_eq!(
+            publish_for_key(&cache, &missing, identity),
+            (None, Some(PathUnavailableReason::ResolveFailed))
+        );
     }
 
     #[test]

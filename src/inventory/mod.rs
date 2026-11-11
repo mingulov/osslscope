@@ -290,9 +290,12 @@ pub struct SnapshotOptions {
     pub limits: Limits,
     /// T5 `--resolve-paths` EFFECTIVE acquire intent: the caller
     /// passes `acquire_paths(raw, json, terminal)` — locators are
-    /// established and capabilities retained only for human output
-    /// on a terminal. Off (default): no resolution I/O, no
-    /// retained locator bytes (cells 5/6).
+    /// established, sidecar capabilities retained, and machine path
+    /// evidence (`verified_path`, `maps_spelling`) populated for
+    /// JSON output and flagged runs alike (v0.6.0 D1 dropped the
+    /// never-in-JSON gate; the TTY-only rule survives solely for
+    /// the human `path=` fragment). Off (default): no resolution
+    /// I/O, no retained locator bytes (cells 5/6).
     pub resolve_paths: bool,
 }
 
@@ -475,8 +478,9 @@ pub struct Snapshot {
     /// Render-time row capabilities (T5 `--resolve-paths` rule 3):
     /// retained backing custody + proven host locators, joined by
     /// exact object identity. Skipped by serde in BOTH directions
-    /// (never emitted; defaults to empty on read) — machine bytes
-    /// are identical with the flag on or off (cell 2).
+    /// (never emitted; defaults to empty on read) — the sidecar
+    /// itself never moves machine bytes (cell 2); v0.6.0 D1 machine
+    /// path evidence on the records may differ by acquisition.
     #[serde(skip)]
     pub(crate) resolve: resolve::ResolveSidecar,
     /// 6A cgroup stable-set sidecar: pid → directory identity
@@ -682,6 +686,13 @@ fn wall_ms() -> Option<u64> {
         .duration_since(std::time::UNIX_EPOCH)
         .ok()
         .and_then(|d| u64::try_from(d.as_millis()).ok())
+}
+
+/// v0.6.0 D1 machine publish clock: capture instant for
+/// `VerifiedPath::capture_unix_ms` (wall time, like the capture
+/// interval edges — observer clock, not target data).
+pub(crate) fn wall_ms_pub() -> Option<u64> {
+    wall_ms()
 }
 
 #[cfg(test)]

@@ -1646,3 +1646,89 @@ fn refusal_diagnostics_shape_is_numeric_only() {
         assert!(parts[4].strip_prefix("allowance=").is_some_and(num));
     }
 }
+
+/// v0.6.0 D1 (§5 discovery path evidence): `verified_path` and
+/// `maps_spelling` exist on every discovery module, and no other
+/// path-bearing key appears anywhere in discovery JSON. A new
+/// path-shaped key is an allowlist change (§8), not a test fix.
+#[test]
+fn v060_discovery_path_keys_are_allowlisted_only() {
+    use std::process::{Command, Stdio};
+    let mut workload = Command::new("python3")
+        .args(["-c", "import ssl, time; time.sleep(120)"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = workload.id().to_string();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let snap = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+        .args(["scan", "--pid", &pid, "--json"])
+        .output()
+        .unwrap();
+    let _ = workload.kill();
+    let _ = workload.wait();
+    let doc: serde_json::Value = serde_json::from_slice(&snap.stdout).unwrap();
+    let modules = doc["processes"][0]["modules"].as_array().unwrap();
+    assert!(!modules.is_empty(), "ssl workload has no modules");
+    for module in modules {
+        assert!(module.get("verified_path").is_some());
+        assert!(module.get("verified_path_unavailable").is_some());
+        assert!(module.get("maps_spelling").is_some());
+    }
+    // Custody flows in this environment: verified rows publish.
+    if modules.iter().any(|m| m["identity_status"] == "verified") {
+        assert!(
+            modules.iter().any(|m| !m["verified_path"].is_null()),
+            "verified rows publish no verified_path"
+        );
+    }
+    // Whole-document sweep: every path-shaped key is allowlisted.
+    fn keys(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(object) => {
+                for (key, child) in object {
+                    out.push(key.clone());
+                    keys(child, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    keys(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut found = Vec::new();
+    keys(&doc, &mut found);
+    assert!(found.contains(&"verified_path".to_string()));
+    assert!(found.contains(&"maps_spelling".to_string()));
+    for key in &found {
+        let lower = key.to_lowercase();
+        if lower.contains("path") {
+            assert!(
+                [
+                    "verified_path",
+                    "verified_path_unavailable",
+                    "path",
+                    "path_encoding"
+                ]
+                .contains(&key.as_str()),
+                "unallowlisted path-bearing key: {key}"
+            );
+        }
+        if lower.contains("spell") {
+            assert!(
+                ["maps_spelling", "spelling"].contains(&key.as_str()),
+                "unallowlisted spelling key: {key}"
+            );
+        }
+        if lower.contains("locator") {
+            assert!(
+                ["locator_kind"].contains(&key.as_str()),
+                "unallowlisted locator key: {key}"
+            );
+        }
+    }
+}

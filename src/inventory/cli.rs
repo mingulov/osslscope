@@ -14,7 +14,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths]\n       osslscope inspect --pid PID [--json] [--resolve-paths]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows only (default off; never in JSON, redirects, or diagnostics).\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
+const HELP: &str = "usage: osslscope scan [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--interval S] [--duration S]] [--json] [--resolve-paths]\n       osslscope inspect --pid PID [--json] [--resolve-paths]\n       osslscope inspect --module PATH [--module PATH ...] [--json] [--resolve-paths]\nAdd --observe-crypto to scan --watch for automatic per-process crypto observations.\n--resolve-paths renders verified host paths on TTY-attached human rows (default off; discovery JSON carries machine path evidence; never in diagnostics).\nPassive file-backed inventory; ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces remain unknown; execution is not_observed.\n";
 const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove activation or execution.\nProvider activation/interfaces: unknown; execution: not_observed.\n";
 /// Value-taking options of [`parse`]: the scan router consumes the
 /// token after each of these, so flag-shaped values never misroute.
@@ -22,15 +22,16 @@ const MEANING: &str = "Passive inventory: ELF exports and mappings do not prove 
 pub(crate) const VALUE_OPTIONS: &[&str] =
     &["--interval", "--duration", "--pid", "--module", "--cgroup"];
 
-/// Effective `--resolve-paths` acquisition gate (external F2):
-/// locator establishment + sidecar staging run ONLY for human
-/// output on a terminal. Machine modes (`--json`) and redirected
-/// stdout bypass resolution ENTIRELY (zero resolver I/O — the
-/// writer's flag-off/placeholder arms are I/O-free by unit test);
-/// redirected human output still renders `(not-a-terminal)`
-/// placeholders from the raw flag (cell 6).
-pub(crate) fn acquire_paths(resolve_paths: bool, json: bool, terminal: bool) -> bool {
-    resolve_paths && !json && terminal
+/// Effective `--resolve-paths` acquisition gate (external F2 as
+/// amended by v0.6.0 D1): D1 rejected the never-in-JSON gate —
+/// locator establishment + sidecar staging + machine path
+/// evidence (`verified_path` via H4 custody, `maps_spelling`
+/// hint) run for JSON output and flagged runs alike. The
+/// terminal gates ONLY the human `path=` fragment (`render_paths`
+/// at the call sites); redirected human output still renders
+/// `(not-a-terminal)` placeholders from the raw flag (cell 6).
+pub(crate) fn acquire_paths(resolve_paths: bool, json: bool, _terminal: bool) -> bool {
+    resolve_paths || json
 }
 
 pub(crate) struct Options {
@@ -470,8 +471,9 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        // F2 gate inputs: acquisition runs only for human
-        // output on a terminal; writers keep the raw flag (plus a
+        // F2 gate inputs as amended by v0.6.0 D1 (never-in-JSON
+        // gate rejected): acquisition runs for JSON output and
+        // flagged runs alike; writers keep the raw flag (plus a
         // JSON veto) so redirected human rows still placeholder.
         let terminal = output.is_terminal();
         let acquire = acquire_paths(options.resolve_paths, options.json, terminal);
@@ -875,30 +877,48 @@ mod tests {
 
     #[test]
     fn acquire_gate_truth_table() {
-        // External F2: acquisition (locator establishment +
-        // sidecar staging) runs ONLY for human output on a
-        // terminal; machine/redirected modes bypass entirely.
+        // External F2 as amended by v0.6.0 D1 (never-in-JSON gate
+        // rejected): acquisition (locator establishment + sidecar
+        // staging + machine path evidence) runs for JSON output
+        // and flagged runs alike; only unflagged human output
+        // bypasses. The terminal gates just the human `path=`
+        // fragment (`render_paths`).
         assert!(acquire_paths(true, false, true));
+        assert!(acquire_paths(true, false, false));
+        assert!(acquire_paths(false, true, true));
+        assert!(acquire_paths(false, true, false));
+        assert!(acquire_paths(true, true, true));
+        assert!(acquire_paths(true, true, false));
         assert!(!acquire_paths(false, false, true));
-        assert!(!acquire_paths(true, true, true));
-        assert!(!acquire_paths(true, false, false));
-        assert!(!acquire_paths(true, true, false));
-        assert!(!acquire_paths(false, true, false));
+        assert!(!acquire_paths(false, false, false));
     }
 
     #[test]
     fn inspect_sidecar_populated_only_when_acquiring() {
-        // F2 acquisition leg: flag-off acquisition stages no
-        // capabilities (no retained FDs/bytes); flag-on stages
-        // exactly one per inspected module.
+        // F2 acquisition leg as amended by v0.6.0 D1
+        // (never-in-JSON gate rejected): inputs flow through
+        // `acquire_paths` — JSON output acquires even without the
+        // flag; only unflagged human output stages nothing (no
+        // retained FDs/bytes). The module route carries no machine
+        // path keys, so its records stay identical either way
+        // (discovery ModuleRecords differ when acquiring — see
+        // `v060_json_paths_come_from_custody_not_maps_text`).
         let executable = PathBuf::from("/bin/true");
-        let off = inspect_modules(std::slice::from_ref(&executable), Limits::default(), false);
+        let off = inspect_modules(
+            std::slice::from_ref(&executable),
+            Limits::default(),
+            acquire_paths(false, false, false),
+        );
         assert_eq!(off.modules.len(), 1);
         assert!(off.resolve.is_empty());
-        let on = inspect_modules(std::slice::from_ref(&executable), Limits::default(), true);
+        let on = inspect_modules(
+            std::slice::from_ref(&executable),
+            Limits::default(),
+            acquire_paths(false, true, false),
+        );
         assert_eq!(on.modules.len(), 1);
         assert_eq!(on.resolve.len(), 1);
-        // Machine records identical either way.
+        // Machine records identical either way (module route has no path keys).
         assert_eq!(
             serde_json::to_value(&off).unwrap(),
             serde_json::to_value(&on).unwrap()
