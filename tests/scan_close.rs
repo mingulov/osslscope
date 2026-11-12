@@ -706,7 +706,7 @@ fn v060_sigterm_during_watch_acks_sigterm_and_exits_3() {
 fn v060_guest_script_covers_observe_arm_contract() {
     let script = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../tmp/vng-lane/sigint-observe-run.sh"
+        "/tests/fixtures/vng/sigint-observe-run.sh"
     ))
     .unwrap();
     for required in [
