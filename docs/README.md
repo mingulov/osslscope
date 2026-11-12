@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # docs
 
-Current v0.5.0 workflows include passive discovery/watch, PID/cgroup/module
+Current v0.6.0 workflows include passive discovery/watch, PID/cgroup/module
 inventory, public provider observation and focused PID/owned-run callback
 counting. Start with [quickstart](quickstart.md), [usage](usage.md),
 [build](build.md), [install](install.md),
