@@ -5,6 +5,12 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and push (e.g. v0.6.0)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -29,6 +35,8 @@ jobs:
         with:
           # Full history: the Dockerfile's install receipt binds to the
           # committed source identity (same fidelity as release.yml).
+          # Dispatch builds the named tag's source with this tree's recipe.
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Resolve image tag
@@ -36,37 +44,54 @@ jobs:
         env:
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
+          INPUT_TAG: ${{ inputs.tag }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         shell: bash
         run: |
           set -euo pipefail
-          if [[ "$REF_TYPE" == "tag" ]]; then
-            tag="${REF_NAME#v}"
+          push=false
+          if [[ -n "$INPUT_TAG" ]]; then
+            ref_name="$INPUT_TAG"
+          else
+            ref_name="$REF_NAME"
+            [[ "$REF_TYPE" == "tag" ]] && push=true
+          fi
+          if [[ "$push" == "true" || -n "$INPUT_TAG" ]]; then
+            tag="${ref_name#v}"
             if [[ ! "$tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-              echo "::error::refusing to push image tag for non-version tag: $REF_NAME"
+              echo "::error::refusing to push image tag for non-version tag: $ref_name"
               exit 1
             fi
+            push=true
           else
             tag="pr-$PR_NUMBER"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "push=$push" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
-        if: github.ref_type == 'tag'
+        if: steps.meta.outputs.push == 'true'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          driver: docker-container
+
       - name: Build image
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
-          # Pull requests build only; version tags build and push.
-          push: ${{ github.ref_type == 'tag' }}
+          # Pull requests build only; version tags (and tag
+          # dispatches) build and push.
+          push: ${{ steps.meta.outputs.push == 'true' }}
           tags: ghcr.io/mingulov/osslscope:${{ steps.meta.outputs.tag }}
-          # Version tags ship SLSA provenance attestations alongside
-          # the image (no SBOM in 0.x); PR builds stay bare.
-          provenance: ${{ github.ref_type == 'tag' }}
+          # Pushed images ship SLSA provenance attestations
+          # alongside the image (no SBOM in 0.x); PR builds
+          # stay bare.
+          provenance: ${{ steps.meta.outputs.push == 'true' }}
           sbom: false
