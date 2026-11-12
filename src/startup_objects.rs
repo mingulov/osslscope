@@ -54,6 +54,48 @@ fn check(deadline: Instant, cancel: &AtomicBool) -> Result<(), ObservationGap> {
         Ok(())
     }
 }
+// Codex R1: bounded startup file read (at most `limit` bytes),
+// cancellable between chunks exactly like the F3 scan-path
+// `Work::read`. Cancellation/deadline aborts use the same
+// SnapshotLag outcome `check` produces everywhere in this
+// acquisition path.
+fn read_startup_bytes(
+    file: impl Read,
+    limit: u64,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> Result<Vec<u8>, ObservationGap> {
+    let mut file = file;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        check(deadline, cancel)?;
+        let allowed = limit.saturating_sub(bytes.len() as u64);
+        if allowed == 0 {
+            check(deadline, cancel)?;
+            return Ok(bytes);
+        }
+        let count = chunk
+            .len()
+            .min(usize::try_from(allowed).unwrap_or(usize::MAX));
+        let read = match file.read(&mut chunk[..count]) {
+            // EINTR checks cancel before retry: a signal that
+            // cancelled the acquisition ends the read; any other
+            // interruption retries as before.
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                check(deadline, cancel)?;
+                continue;
+            }
+            Err(_) => return Err(ObservationGap::BackingUnavailable),
+            Ok(read) => read,
+        };
+        if read == 0 {
+            check(deadline, cancel)?;
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
 fn expand_dirs(value: &str, origin: &Path) -> Vec<PathBuf> {
     value
         .split(':')
@@ -182,12 +224,7 @@ pub(crate) fn prepare_owned_startup(
             result.gaps.insert(gap);
             break;
         }
-        let mut bytes = Vec::with_capacity(before.len() as usize + 1);
-        file.by_ref()
-            .take(before.len() + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| ObservationGap::BackingUnavailable)?;
-        check(deadline, cancel)?;
+        let bytes = read_startup_bytes(file.by_ref(), before.len() + 1, deadline, cancel)?;
         let after = file.metadata().map_err(|_| ObservationGap::ObjectChanged)?;
         if bytes.len() as u64 != before.len()
             || before.len() != after.len()
@@ -211,6 +248,12 @@ pub(crate) fn prepare_owned_startup(
                 continue;
             }
         }
+        // Codex R1: a signal landing between the read and the parse
+        // aborts before the non-interruptible goblin parse instead of
+        // paying for the parse plus the dependency walks below. The
+        // post-parse side is the existing `check` before
+        // `startup_candidates`.
+        check(deadline, cancel)?;
         let elf = match goblin::elf::Elf::parse(&bytes) {
             Ok(e)
                 if e.is_64
@@ -433,5 +476,59 @@ mod tests {
             expand_dirs("$ORIGIN/lib:${ORIGIN}/../lib:$LIB", Path::new("/a/b")),
             vec![PathBuf::from("/a/b/lib"), PathBuf::from("/a/b/../lib")]
         );
+    }
+    // Codex R1: cancellation landing after a successful read chunk
+    // aborts the startup acquisition read promptly with SnapshotLag —
+    // it never waits for the whole object. Deterministic without
+    // sleeps: the first write is sized above the pipe capacity (N1),
+    // so its return PROVES the reader drained chunks; the writer
+    // then sets cancel and starts a blocking 1 MiB probe write that
+    // exceeds any pipe capacity. A prompt abort closes the read end
+    // (probe fails with EPIPE); a reader that keeps draining lets
+    // the probe complete — which the post-read cancel check would
+    // then mask as SnapshotLag, so the probe outcome (not just the
+    // error) is what proves promptness.
+    #[test]
+    fn v060_startup_read_aborts_promptly_on_cancel_after_chunk() {
+        use std::os::fd::FromRawFd as _;
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let mut write = unsafe { File::from_raw_fd(fds[1]) };
+        // N1: size the first write from the pipe capacity with
+        // margin — never assume a fixed payload exceeds it.
+        let pipe_cap = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        assert!(
+            pipe_cap > 0,
+            "pipe must report a positive capacity, got {pipe_cap}"
+        );
+        let first_write = pipe_cap as usize + 64 * 1024;
+        let cancel = AtomicBool::new(false);
+        let writer_cancel = &cancel;
+        std::thread::scope(|s| {
+            // `move`: the writer OWNS the write end, so it closes
+            // when the writer finishes — a borrow would leak the FD
+            // on this stack and the reader would block past EOF
+            // forever (deadlock, not a timeout).
+            let probe = s.spawn(move || {
+                use std::io::Write as _;
+                write.write_all(&vec![0x41u8; first_write]).unwrap();
+                writer_cancel.store(true, Ordering::Relaxed);
+                // Blocking probe: EPIPE here is the fix working (the
+                // reader aborted and closed the read end), completion
+                // means the reader kept draining past the cancel.
+                write.write_all(&vec![0x43u8; 1024 * 1024]).is_err()
+            });
+            let deadline = Instant::now() + std::time::Duration::from_secs(30);
+            let outcome = read_startup_bytes(read, u64::MAX, deadline, &cancel);
+            assert!(
+                matches!(outcome, Err(ObservationGap::SnapshotLag)),
+                "cancel after a successful chunk must abort the startup read"
+            );
+            assert!(
+                probe.join().unwrap(),
+                "startup read kept draining past cancel instead of aborting promptly"
+            );
+        });
     }
 }

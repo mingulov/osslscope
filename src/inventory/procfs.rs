@@ -1733,18 +1733,28 @@ mod tests {
     // after a successful read chunk aborts the in-flight object
     // read with the same Deadline gap a timeout produces — it
     // never waits for the whole object. Deterministic without
-    // sleeps: the writer's 256 KiB first write exceeds the 64 KiB
-    // pipe capacity, so its return PROVES the reader drained
-    // chunks; the writer then sets cancel, writes one more byte,
-    // and closes. The trailing byte rules out an EOF-completes
-    // race (a blocked read returns data, never EOF, before the
-    // close).
+    // sleeps: the first write is sized above the pipe capacity
+    // (N1), so its return PROVES the reader drained chunks; the
+    // writer then sets cancel, writes one more byte, and closes.
+    // The trailing byte rules out an EOF-completes race (a blocked
+    // read returns data, never EOF, before the close).
     #[test]
     fn v060_cancel_after_successful_read_chunk_aborts_with_deadline() {
         let mut fds = [0; 2];
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let read = unsafe { File::from_raw_fd(fds[0]) };
         let mut write = unsafe { File::from_raw_fd(fds[1]) };
+        // Codex N1: enforce the capacity assumption — size the
+        // first write from the pipe capacity with margin instead
+        // of assuming a fixed 256 KiB payload exceeds it (on a
+        // roomier pipe the old form passed via the entry check
+        // without proving mid-read cancellation).
+        let pipe_cap = unsafe { libc::fcntl(fds[0], libc::F_GETPIPE_SZ) };
+        assert!(
+            pipe_cap > 0,
+            "pipe must report a positive capacity, got {pipe_cap}"
+        );
+        let first_write = pipe_cap as usize + 64 * 1024;
         let cancel = AtomicBool::new(false);
         let writer_cancel = &cancel;
         std::thread::scope(|s| {
@@ -1754,7 +1764,7 @@ mod tests {
             // forever (deadlock, not a timeout).
             s.spawn(move || {
                 use std::io::Write as _;
-                write.write_all(&vec![0x41u8; 256 * 1024]).unwrap();
+                write.write_all(&vec![0x41u8; first_write]).unwrap();
                 writer_cancel.store(true, Ordering::Relaxed);
                 // Best-effort trailing byte: the reader may already
                 // have aborted (Deadline) and closed the read end —
