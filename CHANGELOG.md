@@ -77,6 +77,10 @@
   wall-clock fields (`interval`, `capture_unix_ms`) and the
   live-input `read_bytes` accounting total (covered by
   `v060_json_bytes_deterministic_modulo_wall_clock`).
+- Supply chain: release assets and the GHCR image carry
+  Sigstore build-provenance attestations (verify with `gh
+  attestation verify`); checksums stay unsigned and no SBOM
+  ships in 0.x.
 - Root package version 0.6.0; helper crates retain their versions.
 
 ## 0.5.0 (candidate — 2026-11-02)

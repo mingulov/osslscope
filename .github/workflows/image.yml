@@ -9,6 +9,10 @@ on:
 permissions:
   contents: read
   packages: write
+  # Sigstore signing for tag provenance attestations (pushed to
+  # GHCR alongside the image; verify with `gh attestation verify
+  # oci://ghcr.io/mingulov/osslscope:<tag> --owner mingulov`).
+  id-token: write
 
 concurrency:
   group: image-${{ github.ref }}
@@ -62,7 +66,7 @@ jobs:
           # Pull requests build only; version tags build and push.
           push: ${{ github.ref_type == 'tag' }}
           tags: ghcr.io/mingulov/osslscope:${{ steps.meta.outputs.tag }}
-          # 0.x ships no attestations (checksums unsigned, no SBOM):
-          # keep the image free of provenance/SBOM attachments.
-          provenance: false
+          # Version tags ship SLSA provenance attestations alongside
+          # the image (no SBOM in 0.x); PR builds stay bare.
+          provenance: ${{ github.ref_type == 'tag' }}
           sbom: false

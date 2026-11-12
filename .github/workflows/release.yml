@@ -18,6 +18,12 @@ on:
 
 permissions:
   contents: write
+  # SLSA provenance attestations for the package assets (Sigstore
+  # via the workflow OIDC token; verify with `gh attestation
+  # verify <asset> --repo mingulov/osslscope`).
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -135,6 +141,11 @@ jobs:
             cd "$PACKAGE_DIR"
             sha256sum -- * > SHA256SUMS
           )
+
+      - name: Attest package provenance
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.release.outputs.package-dir }}/*
 
       - name: Retain workflow artifacts
         uses: actions/upload-artifact@v4
