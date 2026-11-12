@@ -97,33 +97,37 @@ for limits, failure precedence, output delivery and cleanup.
 
 ## Install a release package
 
-From the 0.5.0 release artifacts (revision 1):
+From the 0.6.0 release artifacts:
 
 ```sh
-sudo dpkg -i osslscope_0.5.0-1_amd64.deb      # Debian/Ubuntu
+sudo dpkg -i osslscope_0.6.0-1_amd64.deb      # Debian/Ubuntu
 osslscope --version
 osslscope doctor --format json
 ```
+(DEB proven live post-publish on Ubuntu: install exit 0 →
+version 0.6.0 → unprivileged doctor sees `bpf: available`
+(postinst file caps set) → erase exit 0 with the binary gone.)
 
 ```sh
-sudo rpm -i osslscope-0.5.0-1.x86_64.rpm      # Fedora/RHEL
+sudo rpm -i osslscope-0.6.0-1.x86_64.rpm      # Fedora/RHEL
 osslscope --version
 osslscope doctor --format json
 ```
-(RPM proven live in the 0.5.0 lane, not just `rpm -qlp`: Fedora
-43 cell, install exit 0 → version 0.5.0 → caps `cap_perfmon,
-cap_bpf=ep` → doctor exit 0 with silent stderr → erase exit 0
-with file-level verify. Container-cell caveats only: install
-with default caps — `rpm -i` under `--cap-drop ALL` fails in
-cpio — and grant `BPF`+`PERFMON` to run, or exec refuses the
-file caps with `Operation not permitted`.)
+(RPM metadata + manifest validated in the release pipeline and
+the CI packaging suite; the last live Fedora-cell install drill
+was the 0.5.0 lane. Container-cell caveats: install with default
+caps — `rpm -i` under `--cap-drop ALL` fails in cpio — and grant
+`BPF`+`PERFMON` to run, or exec refuses the file caps with
+`Operation not permitted`.)
 
 ```sh
-sudo tar -xzf osslscope-0.5.0-prefix.tar.gz -C /usr   # any lane host
+sudo tar -xzf osslscope-0.6.0-prefix.tar.gz -C /usr   # any lane host
 sudo setcap cap_bpf,cap_perfmon+ep /usr/bin/osslscope
 osslscope --version
 osslscope doctor --format json
 ```
+(Prefix tarball smoked post-publish: extract → version 0.6.0 →
+JSON scan of pid 1.)
 
 The DEB `Depends: libcap2-bin` and the RPM `Requires: libcap` pull in
 `setcap`. The DEB grants the two file capabilities in postinst and

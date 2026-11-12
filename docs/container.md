@@ -75,7 +75,7 @@ Expected: exit 3 PARTIAL with nonzero observed counts. Drill output
 ```text
 $ docker run --rm --cap-drop ALL --cap-add BPF --cap-add PERFMON \
     --security-opt seccomp=deploy/seccomp-osslscope.json \
-    osslscope:0.5.0 report --duration 5 --format json run -- openssl dgst -sha256 /dev/null
+    osslscope:0.6.0 report --duration 5 --format json run -- openssl dgst -sha256 /dev/null
 osslscope: focused callbacks attached (pid=7, sites=2780)
 osslscope: partial evidence (11 gaps: unknown-denominator, …)
 exit code: 3
@@ -150,7 +150,7 @@ $ docker run --rm --user root --pid=host \
     -v /sys/kernel/btf:/sys/kernel/btf:ro \
     -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
     -v /sys/kernel/security:/sys/kernel/security:ro \
-    osslscope:0.5.0 doctor --format json
+    osslscope:0.6.0 doctor --format json
 {"capabilities":{"bpf":"available","count_companion":"available","count_load":"available","inventory":"available","observation_companion":"available","observation_load":"available","pid_namespace":"available","ring_buffer":"available","uprobe_multi":"available","user_read":"available"},"execution":"not_observed","historical_activation":"unknown","record":"doctor","schema_version":"osslscope.focused.doctor.v1"}
 exit code: 0
 ```

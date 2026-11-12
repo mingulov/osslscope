@@ -377,7 +377,7 @@ exit=0
 
 Exit 0 with `identity=verified` rows carrying plain `path=`
 values: with host visibility the backing proof closes. Tracing
-recipes stay in [container](container.md) (0.5.0-lane drills);
+recipes stay in [container](container.md) (container drills);
 Kubernetes stays in
 [deploy/kubernetes/README.md](../deploy/kubernetes/README.md).
 
