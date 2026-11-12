@@ -108,11 +108,13 @@ impl ResolveError {
 
 // Per-thread resolver invocation count: incremented on every
 // resolve_for_display, establish_locator, establish_container_locator,
-// and publish_root_anchored entry. Hostile cells
-// assert zero deltas (rules 1/4/5: the resolver never runs for
-// candidates, without the flag, or off-terminal). Thread-local,
-// so parallel suites stay isolated; production overhead is one
-// cell increment per render-time resolution.
+// and publish_root_anchored entry. Hostile cells assert zero
+// deltas for RENDER-time re-resolution (rules 1/4/5: live
+// re-resolution never runs for candidates, without the flag, or
+// off-terminal); ACQUISITION-time establishment runs on every
+// scan since H8/R13 rejected the gate. Thread-local, so parallel
+// suites stay isolated; production overhead is one cell increment
+// per resolution.
 thread_local! {
     static RESOLVE_INVOCATIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }

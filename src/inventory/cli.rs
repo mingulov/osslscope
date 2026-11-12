@@ -32,15 +32,20 @@ pub(crate) const VALUE_OPTIONS: &[&str] =
     &["--interval", "--duration", "--pid", "--module", "--cgroup"];
 
 /// Effective `--resolve-paths` acquisition gate (external F2 as
-/// amended by v0.6.0 D1): D1 rejected the never-in-JSON gate —
-/// locator establishment + sidecar staging + machine path
-/// evidence (`verified_path` via H4 custody, `maps_spelling`
-/// hint) run for JSON output and flagged runs alike. The
-/// terminal gates ONLY the human `path=` fragment (`render_paths`
-/// at the call sites); redirected human output still renders
-/// `(not-a-terminal)` placeholders from the raw flag (cell 6).
-pub(crate) fn acquire_paths(resolve_paths: bool, json: bool, _terminal: bool) -> bool {
-    resolve_paths || json
+/// amended by v0.6.0 D1, then H8/R13): D1 rejected the
+/// never-in-JSON gate; R13 ("start it and see" — default human
+/// rows carry paths) rejects the gate entirely. Locator
+/// establishment + sidecar staging + machine path evidence
+/// (`verified_path` via H4 custody, `maps_spelling` hint) run on
+/// EVERY route, so all routes consume paths and the only
+/// `(unavailable)` rows are genuinely unacquirable ones. The
+/// flag now gates ONLY live TTY re-resolution inside the human
+/// `path=` fragment (`render_paths` at the call sites); the
+/// `--module` route keeps its operator-spelling /
+/// `(not-a-terminal)` render rules (cell 6). Signatures and call
+/// sites stay so the gate reads as a rule, not plumbing.
+pub(crate) fn acquire_paths(_resolve_paths: bool, _json: bool, _terminal: bool) -> bool {
+    true
 }
 
 pub(crate) struct Options {
@@ -922,10 +927,10 @@ pub fn run(command: &str, args: &[String]) -> ExitCode {
                 return ExitCode::from(2);
             }
         };
-        // F2 gate inputs as amended by v0.6.0 D1 (never-in-JSON
-        // gate rejected): acquisition runs for JSON output and
-        // flagged runs alike; writers keep the raw flag (plus a
-        // JSON veto) so redirected human rows still placeholder.
+        // F2 gate inputs as amended by v0.6.0 D1, then H8/R13
+        // (gate rejected entirely): acquisition runs on every
+        // route; writers keep the raw flag (plus a JSON veto) so
+        // live TTY re-resolution stays flag-gated.
         let terminal = output.is_terminal();
         let acquire = acquire_paths(options.resolve_paths, options.json, terminal);
         let render_paths = options.resolve_paths && !options.json;
@@ -1857,44 +1862,43 @@ mod tests {
 
     #[test]
     fn acquire_gate_truth_table() {
-        // External F2 as amended by v0.6.0 D1 (never-in-JSON gate
-        // rejected): acquisition (locator establishment + sidecar
-        // staging + machine path evidence) runs for JSON output
-        // and flagged runs alike; only unflagged human output
-        // bypasses. The terminal gates just the human `path=`
-        // fragment (`render_paths`).
+        // External F2 as amended by v0.6.0 D1, then H8/R13 (gate
+        // rejected entirely — "start it and see"): acquisition
+        // (locator establishment + sidecar staging + machine path
+        // evidence) runs on EVERY route, all 8 legs true; default
+        // human rows carry paths. The flag gates just live TTY
+        // re-resolution inside the human `path=` fragment
+        // (`render_paths`).
         assert!(acquire_paths(true, false, true));
         assert!(acquire_paths(true, false, false));
         assert!(acquire_paths(false, true, true));
         assert!(acquire_paths(false, true, false));
         assert!(acquire_paths(true, true, true));
         assert!(acquire_paths(true, true, false));
-        assert!(!acquire_paths(false, false, true));
-        assert!(!acquire_paths(false, false, false));
+        assert!(acquire_paths(false, false, true));
+        assert!(acquire_paths(false, false, false));
     }
 
     #[test]
     fn inspect_sidecar_populated_only_when_acquiring() {
-        // F2 acquisition leg as amended by v0.6.0 D1
-        // (never-in-JSON gate rejected): inputs flow through
-        // `acquire_paths` — JSON output acquires even without the
-        // flag; only unflagged human output stages nothing (no
-        // retained FDs/bytes). The module route carries no machine
-        // path keys, so its records stay identical either way
-        // (discovery ModuleRecords differ when acquiring — see
+        // F2 acquisition leg as amended by v0.6.0 D1, then H8/R13
+        // (gate rejected entirely): the `inspect_modules`
+        // primitive still stages only when its flag is set (the
+        // literal-false leg retains no FDs/bytes), but the CLI
+        // rule `acquire_paths` is now true even unflagged — no
+        // route stages nothing anymore. The module route carries
+        // no machine path keys, so its records stay identical
+        // either way (discovery ModuleRecords differ when
+        // acquiring — see
         // `v060_json_paths_come_from_custody_not_maps_text`).
         let executable = PathBuf::from("/bin/true");
-        let off = inspect_modules(
-            std::slice::from_ref(&executable),
-            Limits::default(),
-            acquire_paths(false, false, false),
-        );
+        let off = inspect_modules(std::slice::from_ref(&executable), Limits::default(), false);
         assert_eq!(off.modules.len(), 1);
         assert!(off.resolve.is_empty());
         let on = inspect_modules(
             std::slice::from_ref(&executable),
             Limits::default(),
-            acquire_paths(false, true, false),
+            acquire_paths(false, false, false),
         );
         assert_eq!(on.modules.len(), 1);
         assert_eq!(on.resolve.len(), 1);

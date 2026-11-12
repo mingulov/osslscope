@@ -111,29 +111,34 @@ signals to targets. It does not inject code or change the target. Procfs
 pseudofiles are unavailable as module inputs; procfs links to ordinary ELF
 backing (such as `/proc/PID/exe` or `/proc/self/fd/N`) remain supported.
 
-Machine records always carry path evidence: `--json`/NDJSON documents
-include `verified_path`/`verified_path_unavailable`/`maps_spelling` on
-every mapped record whether or not `--resolve-paths` is passed, so
-machine bytes are identical with the flag on or off. That machine
-output may disclose sensitive filenames and exe spellings wherever
-those bytes travel — redirects, logs, support bundles, tickets,
+Path evidence is acquired on every run, human or machine: `--json`/NDJSON
+documents include `verified_path`/`verified_path_unavailable`/`maps_spelling`
+on every mapped record whether or not `--resolve-paths` is passed, so
+machine bytes are identical with the flag on or off — and default human
+rows carry the same evidence (verified rows show their verified path,
+locator candidates show an explicitly-unverified `(unverified maps hint:
+...)`, and only genuinely unacquirable rows render `(unavailable)` or
+`(changed)` without ever publishing the attempted spelling). That output
+may disclose sensitive filenames and exe spellings wherever those bytes
+travel — terminal scrollback, redirects, logs, support bundles, tickets,
 pastes — regardless of `--resolve-paths`; treat captured discovery
 output as potentially sensitive.
-`--resolve-paths` (argv only, default off) gates only the human `path=`
-fragment, and only on an interactive terminal. CBOM, policy records,
-diagnostics, and exit codes are byte-identical with the flag on or off;
-redirected human output renders `path=(not-a-terminal)` placeholders
-instead of paths (so redirected human bytes do differ from flag-off by
-those placeholders — never by path text). Only objects whose identity was
-verified render a path; locator candidates render `path=(unverified)`
-without any resolution attempt, and failures render `(unavailable)` or
-`(changed)` without ever publishing the attempted spelling. Resolved
-strings are sanitized (control bytes neutralized) and bounded to 200
-chars for terminal display. Residuals, documented and accepted: with
-the flag on, terminal scrollback becomes host-path-bearing — visible
-to terminal recording, shared tmux/screen sessions, screen sharing,
+`--resolve-paths` (argv only, default off) now gates only live
+re-resolution of the human `path=` fragment on an interactive terminal:
+with the flag on a TTY, verified discovery rows re-resolve at render
+time and candidates render `path=(unverified)` without any resolution
+attempt. CBOM, policy records, diagnostics, and exit codes are
+byte-identical with the flag on or off. The `--module` route keeps its
+own render rules: flag-off rows show the labeled operator-supplied
+spelling, and piped flag-on rows render `path=(not-a-terminal)`
+placeholders instead of paths (so redirected `--module` human bytes do
+differ from flag-off by those placeholders — never by path text).
+Resolved strings are sanitized (control bytes neutralized) and bounded
+to 200 chars for terminal display. Residuals, documented and accepted:
+default output is host-path-bearing everywhere it travels — visible to
+terminal recording, shared tmux/screen sessions, screen sharing,
 shoulder-surfing, and anyone receiving support bundles, tickets, or
-pastes of that scrollback — so avoid the flag when the viewing
+pastes of that output — so avoid running discovery where the viewing
 context itself is sensitive. Sanitization preserves filename TEXT
 (other than escapes/bounds), so a name carrying secrets or identifiers
 still discloses them.

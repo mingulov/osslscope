@@ -7146,3 +7146,81 @@ fn v060_inspect_module_verbosity_adds_detail_without_moving_machine() {
         "operator spelling leaked into JSON"
     );
 }
+
+#[test]
+fn v060_default_human_scan_acquires_real_paths() {
+    // H8 (R13): default human `scan --pid` acquires paths — rows
+    // carry `verified_path` for a root observer, or the
+    // explicitly-unverified maps hint for an unprivileged one.
+    // Live file-backed mappings never render `(unavailable)` by
+    // default. Pre-H8 this failed: `acquire_paths = resolve_paths
+    // || json` staged no evidence for default human rows.
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let child = Guard(
+        std::process::Command::new("python3")
+            .args(["-c", "import ssl, time; time.sleep(120)"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("python3 ssl sleeper must spawn"),
+    );
+    let pid = child.0.id().to_string();
+    // The ssl import races the first scan: wait for the mapping.
+    let maps = format!("/proc/{pid}/maps");
+    let mut mapped = false;
+    for _ in 0..100 {
+        if std::fs::read_to_string(&maps)
+            .map(|text| text.contains("libssl"))
+            .unwrap_or(false)
+        {
+            mapped = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(mapped, "TLS child {pid} never mapped libssl");
+    // Most-verifiable observer available: direct when root,
+    // passwordless sudo when offered, else the unprivileged leg
+    // (candidate rows carry the maps hint — still acquired
+    // evidence, still failing pre-H8 as `(unavailable)`).
+    let euid_root = unsafe { libc::geteuid() } == 0;
+    let sudo_ok = !euid_root
+        && std::process::Command::new("sudo")
+            .args(["-n", "true"])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|probe| probe.status.success());
+    let output = if euid_root || !sudo_ok {
+        std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args(["scan", "--pid", &pid])
+            .output()
+            .unwrap()
+    } else {
+        std::process::Command::new("sudo")
+            .args(["-n", env!("CARGO_BIN_EXE_osslscope"), "scan", "--pid", &pid])
+            .output()
+            .unwrap()
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let rows: Vec<&str> = text.lines().filter(|l| l.contains("sha256=")).collect();
+    assert!(!rows.is_empty(), "no module rows for TLS child: {text}");
+    if euid_root || sudo_ok {
+        assert!(
+            rows.iter().any(|row| row.contains("path=/")),
+            "H8: no real path in default human rows: {text}"
+        );
+    } else {
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("path=(unverified maps hint: /")),
+            "H8: no maps hint in default human rows: {text}"
+        );
+    }
+}
