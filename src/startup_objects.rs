@@ -482,12 +482,12 @@ mod tests {
     // it never waits for the whole object. Deterministic without
     // sleeps: the first write is sized above the pipe capacity (N1),
     // so its return PROVES the reader drained chunks; the writer
-    // then sets cancel and starts a blocking 1 MiB probe write that
-    // exceeds any pipe capacity. A prompt abort closes the read end
-    // (probe fails with EPIPE); a reader that keeps draining lets
-    // the probe complete — which the post-read cancel check would
-    // then mask as SnapshotLag, so the probe outcome (not just the
-    // error) is what proves promptness.
+    // then sets cancel and starts a blocking probe write also sized
+    // above the measured capacity (N2). A prompt abort closes the
+    // read end (probe fails with EPIPE); a reader that keeps
+    // draining lets the probe complete — which the post-read cancel
+    // check would then mask as SnapshotLag, so the probe outcome
+    // (not just the error) is what proves promptness.
     #[test]
     fn v060_startup_read_aborts_promptly_on_cancel_after_chunk() {
         use std::os::fd::FromRawFd as _;
@@ -503,6 +503,13 @@ mod tests {
             "pipe must report a positive capacity, got {pipe_cap}"
         );
         let first_write = pipe_cap as usize + 64 * 1024;
+        // N2: size the post-cancel probe from the measured
+        // capacity too — a fixed 1 MiB probe could complete on a
+        // ≥1 MiB pipe before the reader closes and fail a correct
+        // implementation. The 64 KiB margin exceeds the worst-case
+        // racy drain (one 8 KiB chunk past a loop-top check) 8×,
+        // so only a reader that keeps draining lets it complete.
+        let probe_write = pipe_cap as usize + 64 * 1024;
         let cancel = AtomicBool::new(false);
         let writer_cancel = &cancel;
         std::thread::scope(|s| {
@@ -517,7 +524,7 @@ mod tests {
                 // Blocking probe: EPIPE here is the fix working (the
                 // reader aborted and closed the read end), completion
                 // means the reader kept draining past the cancel.
-                write.write_all(&vec![0x43u8; 1024 * 1024]).is_err()
+                write.write_all(&vec![0x43u8; probe_write]).is_err()
             });
             let deadline = Instant::now() + std::time::Duration::from_secs(30);
             let outcome = read_startup_bytes(read, u64::MAX, deadline, &cancel);
