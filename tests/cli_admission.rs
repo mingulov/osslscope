@@ -1120,7 +1120,33 @@ fn v060_verbosity_contract() {
     assert_eq!(base.status.code(), v1.status.code());
     assert_eq!(base.status.code(), v2.status.code());
     assert_eq!(base.stderr, v1.stderr);
-    assert_eq!(v2.stdout, v3.stdout, "verbosity must clamp at 2");
+    // The clamp contract is rendered detail, not accounting: the
+    // target is this live test process, so `read_bytes` advances
+    // between the two scans (proc-field digit churn — CI saw
+    // 2571038 vs 2571042) and byte-compare flakes. Normalize the
+    // volatile counters line, then require the rest identical.
+    let sculpted = |out: &[u8]| {
+        String::from_utf8_lossy(out)
+            .lines()
+            .filter(|l| !l.starts_with("counters:"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        sculpted(&v2.stdout),
+        sculpted(&v3.stdout),
+        "verbosity must clamp at 2"
+    );
+    // Anti-vacuity: the normalization must not hide a dropped
+    // counters line — both levels still emit it.
+    for (name, out) in [("vv", &v2.stdout), ("vvv", &v3.stdout)] {
+        assert!(
+            String::from_utf8_lossy(out)
+                .lines()
+                .any(|l| l.starts_with("counters: read_bytes=")),
+            "{name} lost its counters line"
+        );
+    }
     let s1 = String::from_utf8_lossy(&v1.stdout);
     assert!(
         s1.contains("groups") || s1.contains("exports"),
