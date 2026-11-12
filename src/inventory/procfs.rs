@@ -420,7 +420,8 @@ struct Work<'a> {
     options: &'a SnapshotOptions,
     include_other: bool,
     /// Cooperative cancel token (v0.6.0 signals): checked
-    /// between objects and after every EINTR; a set flag ends
+    /// between objects, between read chunks (codex F3 closes
+    /// parked T2 M1) and after every EINTR; a set flag ends
     /// acquisition early with the same Deadline gap a timeout
     /// produces. Never-cancelled for callers that pass none.
     cancel: &'a AtomicBool,
@@ -601,6 +602,13 @@ impl Work<'_> {
         let mut chunk = [0u8; 8192];
         loop {
             self.deadline()?;
+            // Codex F3 (parked T2 M1): cancellation inside an
+            // in-flight object read — between chunks, not just at
+            // entry — ends the read with the same Deadline gap a
+            // timeout produces.
+            if self.cancelled() {
+                return Err(GapReason::Deadline);
+            }
             let remaining = self.remaining();
             if remaining == 0 {
                 return Err(GapReason::ReadLimit);
@@ -1719,6 +1727,67 @@ mod tests {
                 work.gaps
             );
         }
+    }
+
+    // Codex F3 (closes parked T2 M1): cancellation landing
+    // after a successful read chunk aborts the in-flight object
+    // read with the same Deadline gap a timeout produces — it
+    // never waits for the whole object. Deterministic without
+    // sleeps: the writer's 256 KiB first write exceeds the 64 KiB
+    // pipe capacity, so its return PROVES the reader drained
+    // chunks; the writer then sets cancel, writes one more byte,
+    // and closes. The trailing byte rules out an EOF-completes
+    // race (a blocked read returns data, never EOF, before the
+    // close).
+    #[test]
+    fn v060_cancel_after_successful_read_chunk_aborts_with_deadline() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let mut write = unsafe { File::from_raw_fd(fds[1]) };
+        let cancel = AtomicBool::new(false);
+        let writer_cancel = &cancel;
+        std::thread::scope(|s| {
+            // `move`: the writer OWNS the write end, so it closes
+            // when the writer finishes — a borrow would leak the FD
+            // on this stack and the reader would block past EOF
+            // forever (deadlock, not a timeout).
+            s.spawn(move || {
+                use std::io::Write as _;
+                write.write_all(&vec![0x41u8; 256 * 1024]).unwrap();
+                writer_cancel.store(true, Ordering::Relaxed);
+                // Best-effort trailing byte: the reader may already
+                // have aborted (Deadline) and closed the read end —
+                // EPIPE here is the fix working, not a failure.
+                let _ = write.write_all(&[0x42]);
+            });
+            let options = SnapshotOptions {
+                pids: vec![],
+                resolve_paths: false,
+                limits: super::super::Limits::default(),
+            };
+            let mut work = Work {
+                records_memory: Vec::new(),
+                memory: None,
+                options: &options,
+                include_other: false,
+                cancel: &cancel,
+                started: Instant::now(),
+                totals: WorkTotals::default(),
+                gaps: BTreeSet::new(),
+                cache: BTreeMap::new(),
+                backing_limit: None,
+                sidecar: resolve::ResolveSidecar::default(),
+                resolve_staged: Vec::new(),
+                resolve_bytes: 0,
+                parsed_cache: None,
+                prefill_used: 0,
+            };
+            assert!(
+                matches!(work.read(read, usize::MAX), Err(GapReason::Deadline)),
+                "cancel after a successful chunk must abort the read"
+            );
+        });
     }
 
     // Scan-time prefill (F8d restoration): the first export-bearing

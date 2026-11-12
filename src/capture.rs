@@ -639,13 +639,14 @@ fn evidence_partition(p: legacy::CallPartition) -> LegacyCallPartition {
 // semantics) is gone; both live call sites install the shared
 // `Shutdown` (no-restart sigaction, second signal `_exit`s
 // 128+signo) and every check below reads its shared flag.
-
-// Shared-cancel delegate for the `&dyn Fn() -> bool` loop ports
-// (`observe`, `resume_owned_window`, profiled): a single atomic
-// load, no ack, no deadline stamp.
-fn interrupted() -> bool {
-    crate::shutdown::Shutdown::cancelled_global()
-}
+//
+// Codex F1: the loop ports (`observe`, `resume_owned_window`,
+// profiled) take acking closures (`||
+// shutdown.cancelled_and_acked()`), never the bare global flag —
+// the first observed signal prints exactly one ack at the next
+// polled boundary. Setup/acquisition/teardown error returns,
+// which never poll a boundary, are covered by an `AckOnExit`
+// guard armed next to each `install()`.
 
 // ---------------------------------------------------------------- ports
 //
@@ -11673,9 +11674,14 @@ fn run_controlled_owned(
     acquired_instant: Instant,
     acquired_wall: SystemTime,
     setup_ceiling: Option<Instant>,
-    cancel: &'static AtomicBool,
+    shutdown: &crate::shutdown::Shutdown,
 ) -> anyhow::Result<Capture> {
     use crate::capture_setup::{SetupAttempt, SetupControl, SetupFailure, SetupInterrupt};
+    // Codex F1: worker threads poll the bare flag (no stderr from
+    // workers); the main-thread observation port acks (exactly once
+    // per install, via the shared swap).
+    let cancel = shutdown.cancel_flag();
+    let acked_cancel = || shutdown.cancelled_and_acked();
     let deadline = args::deadline_at(acquired_instant, cfg.harvest_timeout).ok_or_else(|| {
         BoundaryFailure::new(
             BoundaryStage::Setup,
@@ -11827,7 +11833,7 @@ fn run_controlled_owned(
         commit,
         &LiveClock,
         &mut LiveProc,
-        &interrupted,
+        &acked_cancel,
     )
 }
 
@@ -11954,6 +11960,12 @@ fn run_inner_with_admitted(
             &format!("capture signal setup failed: {e}"),
         ))
     })?;
+    // Codex F1: ack backstop for every setup/acquisition/teardown
+    // error return below (drops before `shutdown`).
+    let _ack_guard = crate::shutdown::AckOnExit::arm(&shutdown);
+    // Codex F1: the observation port acks at the next polled
+    // boundary (same cancel bit the bare flag read).
+    let acked_cancel = || shutdown.cancelled_and_acked();
     let (obj_bytes, obj_sha256, harvest_bytes) = match buffers {
         Some(b) => (b.count, b.count_sha256, Some(b.harvest)),
         None => {
@@ -12022,7 +12034,7 @@ fn run_inner_with_admitted(
             acq_instant,
             acq_wall,
             setup_ceiling,
-            shutdown.cancel_flag(),
+            &shutdown,
         ),
         Target::Pid(p) => {
             // Offset table for target qualification (explicit file or
@@ -12167,7 +12179,7 @@ fn run_inner_with_admitted(
                 },
                 &LiveClock,
                 &mut LiveProc,
-                &interrupted,
+                &acked_cancel,
             )
         }
     };
@@ -12231,6 +12243,23 @@ pub(crate) mod tests {
         assert!(
             !src.contains(needle),
             "BSD signal() must stay out of the capture path (shared Shutdown only)"
+        );
+    }
+
+    #[test]
+    fn v060_capture_paths_acks_first_signal() {
+        // Codex F1 pin: the capture paths must route their cancel
+        // checks through the acking Shutdown check, never through
+        // the bare global flag (which never acks). Both needles are
+        // split so this assertion cannot match its own source line.
+        let src = include_str!("capture.rs");
+        assert!(
+            src.contains(concat!("cancelled_and", "_acked")),
+            "capture paths must ack the first signal"
+        );
+        assert!(
+            !src.contains(concat!("&", "interrupted")),
+            "the bare global flag must not feed the observation ports"
         );
     }
 

@@ -91,10 +91,13 @@ pub(crate) fn run_profiled_before(
             .context("preview setup deadline overflow")?,
     );
     // Shared shutdown (v0.6.0 signals Task 4): no-restart
-    // sigaction; `interrupted()` below already reads its flag.
+    // sigaction. Codex F1: the setup/acquisition checks and the
+    // observation port below all ack (exactly once per install);
+    // the guard backstops the error returns (drops first).
     let shutdown = crate::shutdown::Shutdown::install().context("preview signal setup failed")?;
+    let _ack_guard = crate::shutdown::AckOnExit::arm(&shutdown);
     let check = || {
-        if super::interrupted() || Instant::now() >= deadline {
+        if shutdown.cancelled_and_acked() || Instant::now() >= deadline {
             bail!("preview setup cancelled or timed out");
         }
         Ok(())
@@ -136,6 +139,7 @@ pub(crate) fn run_profiled_before(
         }
     };
     let mut session = CountSession::new(child.pid(), backend);
+    let check_cancelled = || shutdown.cancelled_and_acked();
     let ctx = RunContext {
         cfg,
         profile_id: &profile.profile_id,
@@ -153,7 +157,7 @@ pub(crate) fn run_profiled_before(
             build_input_id: None,
         },
         setup_deadline: deadline,
-        cancelled: &super::interrupted,
+        cancelled: &check_cancelled,
     };
     // profile retains the exact opened file for the entire observation. The
     // owner's pin independently checks and retains that same dev/inode.
@@ -718,17 +722,28 @@ mod tests {
         }
     }
 
-    fn run_model(
+    /// Owned model inputs (Codex F1 split): `run_model` keeps its
+    /// bool-cancel behavior; the ack-composition tests below reuse
+    /// the same fixtures with a real `Shutdown` acking check.
+    struct ModelParts {
+        _backing: std::fs::File,
+        locator: PathBuf,
+        site: DiscoveredSite,
+        object: ObjectRecord,
+        cfg: ProfiledConfig,
+        provenance: PackageRoleProvenance,
+        log: Log,
+        child: Child,
+        count: CountSession<TracedBackend>,
+        clock: Clock,
+    }
+
+    fn model_parts(
         fail_release: bool,
         fail_wait: bool,
         remains_alive: bool,
-        signal: bool,
         fault: ModelCase,
-    ) -> (
-        anyhow::Result<Capture>,
-        Vec<&'static str>,
-        CountSession<TracedBackend>,
-    ) {
+    ) -> ModelParts {
         let (_backing, locator, mut site) = crate::count_session::tests::preplanned_fixture();
         // Two possible meanings, one physical site. Unknown must stay unknown.
         let mut alias = site.candidates[0].clone();
@@ -743,7 +758,6 @@ mod tests {
             inode: site.site.inode,
             display_locator: "fixture-library".into(),
         };
-        let sites = [site];
         let log = Rc::new(RefCell::new(Vec::new()));
         let mut inner = FakeCountBackend::new();
         inner.set_modeled_seal(Some(5_000_100), Some(5_000_101));
@@ -768,7 +782,7 @@ mod tests {
             }),
             _ => {}
         }
-        let mut count = CountSession::new(
+        let count = CountSession::new(
             42,
             TracedBackend {
                 inner,
@@ -776,7 +790,7 @@ mod tests {
                 invalid_timestamp: matches!(fault, ModelCase::InvalidTimestamp),
             },
         );
-        let mut child = Child {
+        let child = Child {
             log: Rc::clone(&log),
             polls: Cell::new(0),
             fail_release,
@@ -794,7 +808,64 @@ mod tests {
             timeout: Duration::from_secs(1),
             grace: Duration::from_secs(1),
         };
-        let cancelled = || signal && child_poll_signal(&log);
+        let provenance = PackageRoleProvenance {
+            selection: RoleSelection::OperatorExplicit,
+            sha256: Digest([0x48; 32]),
+            bytes: 128,
+            build_input_id: None,
+        };
+        ModelParts {
+            _backing,
+            locator,
+            site,
+            object,
+            cfg,
+            provenance,
+            log,
+            child,
+            count,
+            clock,
+        }
+    }
+
+    fn run_model(
+        fail_release: bool,
+        fail_wait: bool,
+        remains_alive: bool,
+        signal: bool,
+        fault: ModelCase,
+    ) -> (
+        anyhow::Result<Capture>,
+        Vec<&'static str>,
+        CountSession<TracedBackend>,
+    ) {
+        let parts = model_parts(fail_release, fail_wait, remains_alive, fault);
+        let log = Rc::clone(&parts.log);
+        let cancelled = move || signal && child_poll_signal(&log);
+        observe_with_cancel(parts, &cancelled)
+    }
+
+    fn observe_with_cancel(
+        parts: ModelParts,
+        cancelled: &dyn Fn() -> bool,
+    ) -> (
+        anyhow::Result<Capture>,
+        Vec<&'static str>,
+        CountSession<TracedBackend>,
+    ) {
+        let ModelParts {
+            _backing: _kept,
+            locator,
+            site,
+            object,
+            cfg,
+            provenance,
+            log,
+            mut child,
+            mut count,
+            clock,
+        } = parts;
+        let sites = [site];
         let ctx = RunContext {
             cfg: &cfg,
             profile_id: "fixture-preview",
@@ -803,14 +874,9 @@ mod tests {
             object: &object,
             sites: &sites,
             locator: &locator,
-            count_provenance: PackageRoleProvenance {
-                selection: RoleSelection::OperatorExplicit,
-                sha256: Digest([0x48; 32]),
-                bytes: 128,
-                build_input_id: None,
-            },
+            count_provenance: provenance,
             setup_deadline: clock.base + Duration::from_secs(1),
-            cancelled: &cancelled,
+            cancelled,
         };
         let result = observe_profiled(&ctx, &mut child, &mut count, &clock);
         let events = log.borrow().clone();
@@ -835,6 +901,69 @@ mod tests {
         .0
         .unwrap()
         .document
+    }
+
+    #[test]
+    fn v060_profiled_path_acks_first_signal() {
+        // Codex F1 pin: the profiled path must route its cancel
+        // checks through the acking Shutdown check, never through
+        // the bare global flag (which never acks). Both needles are
+        // split so this assertion cannot match its own source line.
+        let src = include_str!("profiled.rs");
+        assert!(
+            src.contains(concat!("cancelled_and", "_acked")),
+            "profiled path must ack the first signal"
+        );
+        assert!(
+            !src.contains(concat!("&super::", "interrupted")),
+            "the bare global flag must not feed the profiled checks"
+        );
+    }
+
+    #[test]
+    fn v060_setup_cancel_acks_exactly_once() {
+        // Codex F1 setup phase: a signal observed at setup aborts
+        // the window AND consumes the one ack through the acking
+        // check (the production `check` closure below must be this
+        // shape — the pin above guards the wiring).
+        let shutdown = crate::shutdown::Shutdown::install().unwrap();
+        let parts = model_parts(false, false, true, ModelCase::None);
+        unsafe { libc::raise(libc::SIGINT) };
+        let cancelled = || shutdown.cancelled_and_acked();
+        let (result, _, _) = observe_with_cancel(parts, &cancelled);
+        assert!(result.is_err(), "setup must abort on cancel");
+        assert!(shutdown.ack().is_none(), "setup must consume the one ack");
+    }
+
+    #[test]
+    fn v060_observation_cancel_acks_exactly_once() {
+        // Codex F1 observation phase: a signal landing mid-window
+        // cuts the window Interrupted AND consumes the one ack
+        // through the acking loop check. The raise fires
+        // deterministically once the first child poll is logged
+        // (no sleeps, no threads — exactly one raise, since a
+        // second delivery would `_exit` the test process).
+        let shutdown = crate::shutdown::Shutdown::install().unwrap();
+        let parts = model_parts(false, false, true, ModelCase::None);
+        let log = Rc::clone(&parts.log);
+        let raised = Cell::new(false);
+        let cancelled = || {
+            if !raised.get() && child_poll_signal(&log) {
+                raised.set(true);
+                unsafe { libc::raise(libc::SIGINT) };
+            }
+            shutdown.cancelled_and_acked()
+        };
+        let (result, _, _) = observe_with_cancel(parts, &cancelled);
+        let capture = result.expect("observation must cut, not fail");
+        assert!(
+            capture.document.window.signal_cut,
+            "window must cut Interrupted"
+        );
+        assert!(
+            shutdown.ack().is_none(),
+            "observation must consume the one ack"
+        );
     }
 
     #[test]

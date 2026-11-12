@@ -109,6 +109,29 @@ impl Shutdown {
     }
 }
 
+/// Ack-on-scope-exit backstop (v0.6.0 signals codex F1): the
+/// capture paths exit through many setup/acquisition/teardown
+/// error returns that never poll a loop boundary, so each arms
+/// this guard right after `install()` — dropping it acks the
+/// first observed signal exactly once, on every exit path, ok or
+/// err. A no-op when the loops already acked or no signal
+/// arrived. Must drop before its `Shutdown` (declare it after).
+pub(crate) struct AckOnExit<'a> {
+    shutdown: &'a Shutdown,
+}
+
+impl<'a> AckOnExit<'a> {
+    pub(crate) fn arm(shutdown: &'a Shutdown) -> Self {
+        Self { shutdown }
+    }
+}
+
+impl Drop for AckOnExit<'_> {
+    fn drop(&mut self) {
+        self.shutdown.cancelled_and_acked();
+    }
+}
+
 /// Prompt first-signal ack to locked stderr, panic-free like
 /// [`crate::report::err_line`] (a broken stderr degrades to silence,
 /// never to exit 101) but byte-exact: the ack already ends in
@@ -151,5 +174,50 @@ mod tests {
         assert!(!shutdown.expired());
         std::thread::sleep(Duration::from_millis(1100));
         assert!(shutdown.expired());
+    }
+
+    #[test]
+    fn v060_first_signal_ack_names_sigint_and_sigterm() {
+        // Codex F1 wording pin: each signal's ack names that signal.
+        let shutdown = Shutdown::install().unwrap();
+        unsafe { libc::raise(libc::SIGINT) };
+        assert!(
+            shutdown.ack().unwrap().contains("SIGINT"),
+            "SIGINT ack must name SIGINT"
+        );
+        let shutdown = Shutdown::install().unwrap();
+        unsafe { libc::raise(libc::SIGTERM) };
+        assert!(
+            shutdown.ack().unwrap().contains("SIGTERM"),
+            "SIGTERM ack must name SIGTERM"
+        );
+    }
+
+    #[test]
+    fn v060_ack_on_exit_consumes_first_signal_ack_once() {
+        // Codex F1: the capture backstop guard acks through drop —
+        // the one ack is consumed exactly once, a second guard (or
+        // a later ack()) stays silent.
+        let shutdown = Shutdown::install().unwrap();
+        unsafe { libc::raise(libc::SIGINT) };
+        {
+            let _guard = AckOnExit::arm(&shutdown);
+        }
+        assert!(shutdown.ack().is_none(), "guard must consume the one ack");
+        {
+            let _guard = AckOnExit::arm(&shutdown);
+        }
+        assert!(shutdown.ack().is_none(), "second guard must stay silent");
+    }
+
+    #[test]
+    fn v060_ack_on_exit_silent_without_signal() {
+        // Codex F1: no signal, no ack — the guard is a pure backstop.
+        let shutdown = Shutdown::install().unwrap();
+        {
+            let _guard = AckOnExit::arm(&shutdown);
+        }
+        assert!(shutdown.ack().is_none());
+        assert!(!shutdown.cancelled());
     }
 }

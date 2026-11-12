@@ -198,9 +198,18 @@ pub(crate) fn prepare_owned_startup(
         {
             return Err(ObservationGap::ObjectChanged);
         }
-        if crate::inventory::elf::admit_parser_metadata(&bytes).is_err() {
-            result.gaps.insert(ObservationGap::MalformedElf);
-            continue;
+        // Codex F3: admission is cancel-aware; a Deadline abort
+        // is lag (like `check` above), never malformed evidence.
+        match crate::inventory::elf::admit_parser_metadata(&bytes, cancel) {
+            Ok(()) => {}
+            Err(crate::inventory::GapReason::Deadline) => {
+                result.gaps.insert(ObservationGap::SnapshotLag);
+                continue;
+            }
+            Err(_) => {
+                result.gaps.insert(ObservationGap::MalformedElf);
+                continue;
+            }
         }
         let elf = match goblin::elf::Elf::parse(&bytes) {
             Ok(e)

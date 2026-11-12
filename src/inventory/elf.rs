@@ -100,7 +100,7 @@ pub(crate) fn inspect_file_budgeted_with_cancel(
     if !bytes.starts_with(b"\x7fELF") {
         return Err(GapReason::NotElf);
     }
-    admit_parser_metadata(&bytes)?;
+    admit_parser_metadata(&bytes, cancel)?;
     let elf = Elf::parse(&bytes).map_err(|_| GapReason::MalformedElf)?;
     if elf.dynsyms.len() > MAX_SYMBOLS {
         return Err(GapReason::ReadLimit);
@@ -113,6 +113,12 @@ pub(crate) fn inspect_file_budgeted_with_cancel(
     let mut exports = BTreeSet::new();
     let mut imports_api = false;
     for symbol in elf.dynsyms.iter() {
+        // Codex F3: cancellation inside the bounded symbol walk
+        // (up to MAX_SYMBOLS rows) ends the parse with the same
+        // Deadline gap a timeout produces.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GapReason::Deadline);
+        }
         let Some(api) = elf
             .dynstrtab
             .get_at(symbol.st_name)
@@ -165,12 +171,9 @@ pub(crate) fn inspect_file_budgeted_with_cancel(
     // singular validated rodata version id, or null with a finite reason.
     // Strings never change `kind` and never cross object boundaries.
     let (file_soname, file_openssl_version, file_version_status) =
-        extract_file_version(&bytes, &elf);
+        extract_file_version(&bytes, &elf, cancel)?;
     let result = ModuleInfo {
-        sha256: Sha256::digest(&bytes)
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect(),
+        sha256: sha256_hex_cancelled(&bytes, cancel)?,
         device: before.dev(),
         inode: before.ino(),
         size_bytes: before.len(),
@@ -238,7 +241,12 @@ impl ParserBudget {
 /// Admit every eager allocation class before invoking Elf::parse. Repeated
 /// references count repeatedly: Goblin builds separate indexes even when
 /// section-name, ordinary symbol-name and dynamic string tables alias.
-pub(crate) fn admit_parser_metadata(bytes: &[u8]) -> Result<(), GapReason> {
+/// Codex F3: the check is first, so a set flag aborts Deadline even
+/// on bytes that would otherwise fail differently.
+pub(crate) fn admit_parser_metadata(bytes: &[u8], cancel: &AtomicBool) -> Result<(), GapReason> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(GapReason::Deadline);
+    }
     let h = Elf::parse_header(bytes).map_err(|_| GapReason::MalformedElf)?;
     let container = match h.e_ident[header::EI_CLASS] {
         header::ELFCLASS64 => Container::Big,
@@ -340,7 +348,7 @@ pub(crate) fn admit_parser_metadata(bytes: &[u8]) -> Result<(), GapReason> {
         for size in [info.relasz, info.relsz, info.pltrelsz] {
             budget.charge(size)?;
         }
-        admit_hash_work(bytes, info, ctx, &mut budget)?;
+        admit_hash_work(bytes, info, ctx, &mut budget, cancel)?;
     }
     Ok(())
 }
@@ -367,6 +375,7 @@ fn admit_hash_work(
     info: &dynamic::DynamicInfo,
     ctx: Ctx,
     budget: &mut ParserBudget,
+    cancel: &AtomicBool,
 ) -> Result<(), GapReason> {
     let Some(offset) = info.gnu_hash else {
         return Ok(());
@@ -412,6 +421,10 @@ fn admit_hash_work(
         .and_then(|n| n.checked_add((maximum - minimum) * 4))
         .ok_or(GapReason::MalformedElf)?;
     for _ in 0..MAX_HASH_STEPS - buckets {
+        // Codex F3: cancellation inside the bounded chain walk.
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GapReason::Deadline);
+        }
         let word = read_word(bytes, chain_offset, ctx)?;
         budget.charge(4)?;
         maximum += 1;
@@ -461,6 +474,25 @@ fn read_bounded(file: &File, size: u64, cancel: &AtomicBool) -> Result<Vec<u8>, 
         }
     }
     Ok(bytes)
+}
+
+/// Lowercase hex SHA-256 over the admitted bytes, hashed in 64 KiB
+/// chunks so a set flag aborts promptly (Codex F3: the one-shot
+/// digest over a 128 MiB object would otherwise delay a cancelled
+/// scan by hundreds of ms). Bit-identical to the one-shot digest.
+fn sha256_hex_cancelled(bytes: &[u8], cancel: &AtomicBool) -> Result<String, GapReason> {
+    let mut hasher = Sha256::new();
+    for chunk in bytes.chunks(64 * 1024) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GapReason::Deadline);
+        }
+        hasher.update(chunk);
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 fn verify_unchanged(file: &File, before: &Metadata) -> Result<(), GapReason> {
@@ -623,11 +655,18 @@ const MAX_VERSION_SCAN_BYTES: usize = 4 * 1024 * 1024;
 pub(crate) fn extract_file_version(
     bytes: &[u8],
     elf: &Elf,
-) -> (Option<String>, Option<String>, FileVersionStatus) {
+    cancel: &AtomicBool,
+) -> Result<(Option<String>, Option<String>, FileVersionStatus), GapReason> {
     let soname = elf.soname.map(str::to_string);
     let mut candidates = Vec::new();
     let mut scanned: usize = 0;
     for section in &elf.section_headers {
+        // Codex F3: cancellation inside the bounded version scan
+        // ends the parse Deadline (a truncated candidate set would
+        // lie about singular-or-null, so it must not return one).
+        if cancel.load(Ordering::Relaxed) {
+            return Err(GapReason::Deadline);
+        }
         if section.sh_type != section_header::SHT_PROGBITS {
             continue;
         }
@@ -642,25 +681,25 @@ pub(crate) fn extract_file_version(
             usize::try_from(section.sh_offset).ok(),
             usize::try_from(section.sh_size).ok(),
         ) else {
-            return (soname, None, FileVersionStatus::NotFullyScanned);
+            return Ok((soname, None, FileVersionStatus::NotFullyScanned));
         };
         let Some(end) = offset.checked_add(size) else {
-            return (soname, None, FileVersionStatus::NotFullyScanned);
+            return Ok((soname, None, FileVersionStatus::NotFullyScanned));
         };
         let Some(region) = bytes.get(offset..end) else {
-            return (soname, None, FileVersionStatus::NotFullyScanned);
+            return Ok((soname, None, FileVersionStatus::NotFullyScanned));
         };
         let Some(total) = scanned.checked_add(region.len()) else {
-            return (soname, None, FileVersionStatus::NotFullyScanned);
+            return Ok((soname, None, FileVersionStatus::NotFullyScanned));
         };
         if total > MAX_VERSION_SCAN_BYTES {
-            return (soname, None, FileVersionStatus::NotFullyScanned);
+            return Ok((soname, None, FileVersionStatus::NotFullyScanned));
         }
         scanned = total;
-        candidates.extend(scan_rodata_region(region));
+        candidates.extend(scan_rodata_region(region, cancel)?);
     }
     let (version, status) = select_file_version(&candidates);
-    (soname, version, status)
+    Ok((soname, version, status))
 }
 
 /// Singular-or-null selection (D4): dedupe; exactly one distinct candidate
@@ -681,11 +720,19 @@ pub(crate) fn select_file_version(candidates: &[String]) -> (Option<String>, Fil
 /// with 1-2 digits per component, optionally followed by a validated
 /// `<day> <Mon> <year>` date. Near-misses never match; a match carries the
 /// date only when fully valid, else the bare recognized id.
-pub(crate) fn scan_rodata_region(region: &[u8]) -> Vec<String> {
+pub(crate) fn scan_rodata_region(
+    region: &[u8],
+    cancel: &AtomicBool,
+) -> Result<Vec<String>, GapReason> {
     const PREFIX: &[u8] = b"OpenSSL ";
     let mut found = Vec::new();
     let mut i = 0;
     while i + PREFIX.len() <= region.len() {
+        // Codex F3: periodic check in the byte loop (a truncated
+        // candidate set must error, never return partial).
+        if i % 1024 == 0 && cancel.load(Ordering::Relaxed) {
+            return Err(GapReason::Deadline);
+        }
         // No match inside a larger token (`FooOpenSSL 1.2.3` is not evidence).
         let start_boundary = i == 0 || !region[i - 1].is_ascii_alphanumeric();
         if start_boundary && region[i..].starts_with(PREFIX) {
@@ -695,7 +742,7 @@ pub(crate) fn scan_rodata_region(region: &[u8]) -> Vec<String> {
         }
         i += 1;
     }
-    found
+    Ok(found)
 }
 
 /// Recognized id at `input` (which starts with `OpenSSL `), or `None` for a
@@ -836,7 +883,47 @@ mod tests {
         assert!(version.is_none());
         // Region scan: closed grammar only; near-misses never match.
         let region = b"\0OpenSSL 3.0.0 7 Sep 2021\0OpenSSL X\0 LibreSSL 3.0\0";
-        let found = super::scan_rodata_region(region);
+        let found = super::scan_rodata_region(region, &super::NEVER_CANCELLED).unwrap();
         assert_eq!(found, vec!["OpenSSL 3.0.0 7 Sep 2021".to_string()]);
+    }
+
+    #[test]
+    fn v060_chunked_hash_matches_oneshot_and_honors_cancel() {
+        // Codex F3: the cancellable digest matches the one-shot
+        // oracle bit-for-bit, and a set flag aborts Deadline.
+        use sha2::Digest as _;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let bytes = vec![0x5Au8; 300_000];
+        let cancel = AtomicBool::new(false);
+        let hexed = super::sha256_hex_cancelled(&bytes, &cancel).unwrap();
+        let oracle: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(hexed, oracle);
+        cancel.store(true, Ordering::Relaxed);
+        assert_eq!(
+            super::sha256_hex_cancelled(&bytes, &cancel),
+            Err(super::GapReason::Deadline)
+        );
+    }
+
+    #[test]
+    fn v060_admit_parser_metadata_honors_cancel_first() {
+        // Codex F3: a set flag aborts admission Deadline even on
+        // bytes that would otherwise fail differently (the check
+        // is first); unset behavior is unchanged.
+        use std::sync::atomic::AtomicBool;
+        let bytes = b"not an elf at all";
+        let cancelled = AtomicBool::new(true);
+        assert_eq!(
+            super::admit_parser_metadata(bytes, &cancelled),
+            Err(super::GapReason::Deadline)
+        );
+        let live = AtomicBool::new(false);
+        assert_eq!(
+            super::admit_parser_metadata(bytes, &live),
+            Err(super::GapReason::MalformedElf)
+        );
     }
 }

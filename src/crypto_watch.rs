@@ -380,6 +380,14 @@ struct SessionLoss {
     signal_dropped: u64,
     signal_prefix_unwitnessed: u64,
     drain_pending: u64,
+    /// Codex F2: members still open when the close drain ended
+    /// without sealing them — 0 on a complete drain; every
+    /// still-open member on the interrupt fast close (their seals
+    /// never emitted, their tails unwitnessed, their links reaped
+    /// by the kernel on exit); the remainder when the 1s deadline
+    /// cut a natural close short. H2: undrained tails are counted,
+    /// never claimed.
+    unsealed_members: u64,
     polling_fallback: bool,
     unattributed_events: u64,
     /// R3-9: EXIT events quarantined as live-member artifacts —
@@ -1279,14 +1287,30 @@ impl<W: Write> Output<'_, W> {
                 // W5: the default end line is a plain summary; the
                 // loss/deferred counters ride a `-vv` detail line.
                 // The unknown-coverage suffix stays at every level.
-                writeln!(
+                // Codex F2: the partial-drain note rides the default
+                // line too (H2 — undrained tails are never silent);
+                // the count also rides `-vv`.
+                write!(
                     w,
                     "Crypto watch end: {reason}, {segments} segments, coverage {coverage}; unsampled membership and unobserved activity remain unknown"
                 )?;
+                if session_loss.unsealed_members > 0 {
+                    write!(
+                        w,
+                        "; close drain cut short: {} member seal{} skipped",
+                        session_loss.unsealed_members,
+                        if session_loss.unsealed_members == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    )?;
+                }
+                writeln!(w)?;
                 if level >= 2 {
                     writeln!(
                         w,
-                        "  detail peak_accounted_bytes={peak_accounted_bytes} peak_deferred_depth={peak_deferred_depth} deferred_drops={deferred_drops} deferred_removed={}/{}/{}/{} signal_dropped={} scan_loss={} prefix_unwitnessed={} drain_pending={} unattributed={} admitted_exit_artifacts={} ring_loss={} lost_intervals={} polling_fallback={}",
+                        "  detail peak_accounted_bytes={peak_accounted_bytes} peak_deferred_depth={peak_deferred_depth} deferred_drops={deferred_drops} deferred_removed={}/{}/{}/{} signal_dropped={} scan_loss={} prefix_unwitnessed={} drain_pending={} unsealed_members={} unattributed={} admitted_exit_artifacts={} ring_loss={} lost_intervals={} polling_fallback={}",
                         deferred_removed.exited,
                         deferred_removed.reused,
                         deferred_removed.ineligible,
@@ -1295,6 +1319,7 @@ impl<W: Write> Output<'_, W> {
                         session_loss.scan_loss,
                         session_loss.signal_prefix_unwitnessed,
                         session_loss.drain_pending,
+                        session_loss.unsealed_members,
                         session_loss.unattributed_events,
                         session_loss.admitted_exit_artifacts,
                         ring,
@@ -4298,6 +4323,7 @@ impl ServiceEngine {
                         signal_dropped: 0,
                         signal_prefix_unwitnessed: 0,
                         drain_pending: 0,
+                        unsealed_members: 0,
                         polling_fallback: false,
                         unattributed_events: 0,
                         admitted_exit_artifacts: 0,
@@ -4728,16 +4754,14 @@ impl ServiceEngine {
     /// the service passes its minted `--grace` deadline so the
     /// transport drain honors the shutdown remainder instead of
     /// only its internal bound; `None` keeps the plain drain (6A).
-    // Test builds serve drains from `FakeCloseEngine`
-    // (`Run.engine` is the fake under `cfg(test)`), so the real
-    // capped drain has no test-build caller.
-    #[cfg_attr(test, allow(dead_code))]
+    /// Never skips: the full drain runs (unit-tested over hollow
+    /// sessions).
     pub(crate) fn close_drain_capped(
         &mut self,
         cancel: &AtomicBool,
         deadline: Option<Instant>,
     ) -> io::Result<CloseOut> {
-        self.close_drain_inner(cancel, deadline, &|| false)
+        self.close_drain_inner(cancel, deadline, &|| false, false)
     }
 
     /// CLI shutdown-aware close drain (v0.6.0 signals Task 3):
@@ -4751,7 +4775,23 @@ impl ServiceEngine {
         &mut self,
         shutdown: &crate::shutdown::Shutdown,
     ) -> io::Result<CloseOut> {
-        self.close_drain_inner(shutdown.cancel_flag(), None, &|| shutdown.expired())
+        self.close_drain_inner(shutdown.cancel_flag(), None, &|| shutdown.expired(), false)
+    }
+
+    /// CLI interrupt fast close (v0.6.0 signals codex F2): the
+    /// loop already acked and observed cancel, so the close drain
+    /// skips its slow phases outright — the final poll, every
+    /// member seal (each detaches its links: ~2.3 s for 536), the
+    /// deferred/follow close-outs, the deferred flush — and emits
+    /// the End record promptly with the unsealed count (H2). The
+    /// caller then forgets the member sessions instead of dropping
+    /// them (see `observe`): the skipped link detach is work the
+    /// kernel redoes on process exit anyway (standard, safe — the
+    /// same reap the second-signal `_exit(130)` path already relies
+    /// on). Kill-to-exit stays within the 1 s target on responsive
+    /// sinks; stalled syscalls and blocked sinks still caveat it.
+    pub(crate) fn close_drain_interrupt(&mut self, cancel: &AtomicBool) -> io::Result<CloseOut> {
+        self.close_drain_inner(cancel, None, &|| false, true)
     }
 
     /// 6A close drain (moved verbatim from `observe()`): the final
@@ -4760,12 +4800,15 @@ impl ServiceEngine {
     /// caller's `cancel` decides the reason word (`cancelled` vs
     /// `duration`); service stops always cancel first (the engine
     /// run IS cancelled — the window-level reason rides the
-    /// envelope/summary, never the 6A vocabulary).
+    /// envelope/summary, never the 6A vocabulary). `fast` (codex
+    /// F2, interrupt path only) skips the slow middle phases
+    /// outright — End still emits, with the unsealed count.
     fn close_drain_inner(
         &mut self,
         cancel: &AtomicBool,
         deadline: Option<Instant>,
         expired: &dyn Fn() -> bool,
+        fast: bool,
     ) -> io::Result<CloseOut> {
         let mut buf = Vec::new();
         let mut out = Output {
@@ -4790,7 +4833,9 @@ impl ServiceEngine {
         // bind (births may gap; exits may confirm; execs seal without
         // readmit). No suffix witness exists on the §7 boundary, so the
         // close witness is not recorded.
-        {
+        // Codex F2: skipped on the interrupt fast close (End carries
+        // the unsealed count instead).
+        if !fast {
             let edge = crate::capture::LifecycleEdge {
                 start_ns: run_origin_ns,
                 end_ns: LiveClock.monotonic_ns(),
@@ -4832,117 +4877,130 @@ impl ServiceEngine {
         }
         // Stop every member before potentially slow final projection/output. This
         // also propagates cancellation arriving between poll passes into documents.
-        for a in &mut run.active {
-            a.session.stop_admission(cancel);
-        }
-        // Flagged seals first (proven deaths/reuses/execs keep their
-        // exact reasons at close).
-        run.seal_exit_flags(&mut out)?;
-        let flagged: Vec<u32> = run.exec_flags.keys().copied().collect();
-        for pid in flagged {
-            let Some((fence_tick, _ts, count)) = run.exec_flags.get(&pid).copied() else {
-                continue;
-            };
-            let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) else {
-                run.exec_flags.remove(&pid);
-                continue;
-            };
-            let epoch = run.active[pos].image_epoch;
-            let identity = run.active[pos].identity.clone();
-            let tick = run.current_tick;
-            run.active[pos].ledger.windows.append(
-                fence_tick,
-                tick.saturating_add(1),
-                LossCause::ExecSpanningAggregate,
-            );
-            let active = run.active.remove(pos);
-            run.drop_flags_for(pid);
-            let outcome = out.finish_exec_seal(active)?;
-            run.seal_fold(outcome.loss_totals);
-            // Middle images seal in drain order (no readmit at close —
-            // the run ends inside the transition window).
-            for middle in 1..count.max(1) {
-                let middle_epoch = epoch.saturating_add(middle);
-                out.emit_middle_seal(&identity, middle_epoch, &outcome.ledger)?;
+        // Codex F2: the whole seal sequence below is skipped on the
+        // interrupt fast close (each seal detaches links).
+        if !fast {
+            for a in &mut run.active {
+                a.session.stop_admission(cancel);
             }
-        }
-        let flagged: Vec<u32> = run.retire_flags.keys().copied().collect();
-        for pid in flagged {
-            let Some((flag_reason, fenced)) = run.retire_flags.get(&pid).copied() else {
-                continue;
-            };
-            run.retire_flags.remove(&pid);
-            if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
-                run.seal_active(&mut out, pos, flag_reason, fenced)?;
+            // Flagged seals first (proven deaths/reuses/execs keep their
+            // exact reasons at close).
+            run.seal_exit_flags(&mut out)?;
+            let flagged: Vec<u32> = run.exec_flags.keys().copied().collect();
+            for pid in flagged {
+                let Some((fence_tick, _ts, count)) = run.exec_flags.get(&pid).copied() else {
+                    continue;
+                };
+                let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) else {
+                    run.exec_flags.remove(&pid);
+                    continue;
+                };
+                let epoch = run.active[pos].image_epoch;
+                let identity = run.active[pos].identity.clone();
+                let tick = run.current_tick;
+                run.active[pos].ledger.windows.append(
+                    fence_tick,
+                    tick.saturating_add(1),
+                    LossCause::ExecSpanningAggregate,
+                );
+                let active = run.active.remove(pos);
+                run.drop_flags_for(pid);
+                let outcome = out.finish_exec_seal(active)?;
+                run.seal_fold(outcome.loss_totals);
+                // Middle images seal in drain order (no readmit at close —
+                // the run ends inside the transition window).
+                for middle in 1..count.max(1) {
+                    let middle_epoch = epoch.saturating_add(middle);
+                    out.emit_middle_seal(&identity, middle_epoch, &outcome.ledger)?;
+                }
             }
-        }
-        let flagged: Vec<u32> = run.unsteady.iter().copied().collect();
-        for pid in flagged {
-            run.unsteady.remove(&pid);
-            if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
-                run.seal_active(&mut out, pos, "visibility_lost", true)?;
+            let flagged: Vec<u32> = run.retire_flags.keys().copied().collect();
+            for pid in flagged {
+                let Some((flag_reason, fenced)) = run.retire_flags.get(&pid).copied() else {
+                    continue;
+                };
+                run.retire_flags.remove(&pid);
+                if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
+                    run.seal_active(&mut out, pos, flag_reason, fenced)?;
+                }
+            }
+            let flagged: Vec<u32> = run.unsteady.iter().copied().collect();
+            for pid in flagged {
+                run.unsteady.remove(&pid);
+                if let Some(pos) = run.active.iter().position(|a| a.identity.pid == pid) {
+                    run.seal_active(&mut out, pos, "visibility_lost", true)?;
+                }
             }
         }
         // Seal-all: the run ended (death unproven either way — stopping
-        // observation, never inventing exits).
-        while let Some(active) = run.active.pop() {
-            // Bounded teardown: past `expired()` the remaining seals
-            // stop here (End still emits below).
-            if expired() {
-                break;
+        // observation, never inventing exits). Codex F2: skipped on
+        // the interrupt fast close.
+        if !fast {
+            while let Some(active) = run.active.pop() {
+                // Bounded teardown: past `expired()` the remaining seals
+                // stop here (End still emits below).
+                if expired() {
+                    break;
+                }
+                let pid = active.identity.pid;
+                let outcome = out.finish(active, reason, false)?;
+                run.seal_fold(outcome.loss_totals);
+                run.drop_flags_for(pid);
             }
-            let pid = active.identity.pid;
-            let outcome = out.finish(active, reason, false)?;
-            run.seal_fold(outcome.loss_totals);
-            run.drop_flags_for(pid);
         }
         // Deferred close: every entry still deferred emits
         // `deferred_removed` (cancel/timeout path vs natural expiry).
         // R6-2a: run-end DISCARDS continuations (the run ends — no
         // readmission follows, so nothing resumes them).
-        let close_reason = if cancel.load(Ordering::Relaxed) {
-            "cancelled"
-        } else {
-            "end_of_observation"
-        };
-        let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
-        for key in keys {
-            // Bounded teardown: past `expired()` the remaining
-            // close-outs stop here (End still emits below).
-            if expired() {
-                break;
-            }
-            if let Some(entry) = run.deferred.remove(&key) {
-                run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
-                run.removed.closed = run.removed.closed.saturating_add(1);
+        // Codex F2: skipped on the interrupt fast close.
+        if !fast {
+            let close_reason = if cancel.load(Ordering::Relaxed) {
+                "cancelled"
+            } else {
+                "end_of_observation"
+            };
+            let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
+            for key in keys {
+                // Bounded teardown: past `expired()` the remaining
+                // close-outs stop here (End still emits below).
+                if expired() {
+                    break;
+                }
+                if let Some(entry) = run.deferred.remove(&key) {
+                    run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
+                    run.removed.closed = run.removed.closed.saturating_add(1);
+                }
             }
         }
         // Follow-pending at close: dead births gap (counted per root);
         // live-but-never-classified births gap as unknown (no root bill).
-        let pids: Vec<u32> = run.follow_pending.keys().copied().collect();
-        for pid in pids {
-            // Bounded teardown: past `expired()` the remaining
-            // close-outs stop here (End still emits below).
-            if expired() {
-                break;
-            }
-            let Some((_recorded, parent, _)) = run.follow_pending.remove(&pid) else {
-                continue;
-            };
-            let gap = inventory::Gap {
-                pid: Some(pid),
-                device: None,
-                inode: None,
-                reason: GapReason::MembershipUnknown,
-                errno: None,
-                actor_euid: None,
-            };
-            if matches!(probe_liveness(pid), Liveness::Dead) {
-                if let Some(root) = parent {
-                    run.count_ignored(root);
+        // Codex F2: skipped on the interrupt fast close.
+        if !fast {
+            let pids: Vec<u32> = run.follow_pending.keys().copied().collect();
+            for pid in pids {
+                // Bounded teardown: past `expired()` the remaining
+                // close-outs stop here (End still emits below).
+                if expired() {
+                    break;
                 }
+                let Some((_recorded, parent, _)) = run.follow_pending.remove(&pid) else {
+                    continue;
+                };
+                let gap = inventory::Gap {
+                    pid: Some(pid),
+                    device: None,
+                    inode: None,
+                    reason: GapReason::MembershipUnknown,
+                    errno: None,
+                    actor_euid: None,
+                };
+                if matches!(probe_liveness(pid), Liveness::Dead) {
+                    if let Some(root) = parent {
+                        run.count_ignored(root);
+                    }
+                }
+                out.emit(Record::Gap { gap: &gap })?;
             }
-            out.emit(Record::Gap { gap: &gap })?;
         }
         run.pending_epoch.clear();
         // R3-4b: the run ends — no readmission follows, so demoted
@@ -4953,7 +5011,8 @@ impl ServiceEngine {
         // R6-3: run-end flush of live-path deferred closes (terminal —
         // no more polling, so bounded synchronous close is allowed).
         // Bounded teardown: skipped past `expired()` (End still emits).
-        if !expired() {
+        // Codex F2: skipped on the interrupt fast close.
+        if !expired() && !fast {
             crate::provider_observation::session::flush_deferred_offpath_sync();
         }
         // 6A seal-fold evaluation (§4.1): final ring reads folded during
@@ -4976,6 +5035,9 @@ impl ServiceEngine {
             signal_dropped: run.signal_dropped,
             signal_prefix_unwitnessed: run.signal_prefix_unwitnessed,
             drain_pending: run.drain_pending,
+            // Codex F2: whatever the drain did not seal — empty on
+            // a complete drain, the skipped remainder otherwise.
+            unsealed_members: run.active.len() as u64,
             polling_fallback: run.polling,
             unattributed_events: run.unattributed,
             admitted_exit_artifacts: run.admitted_exit_artifacts,
@@ -5263,9 +5325,37 @@ fn observe(
     // Teardown bounded by `expired()`: past the deadline the drain
     // skips its slow phases but still emits End (checked again after
     // the drain so a signal racing the final emit still acks).
-    let closed = engine.close_drain_shutdown(shutdown)?;
+    // Codex F2: on interrupt the loop above already acked — emit
+    // the End record through the fast close (no link-detach seals),
+    // write it, then forget the engine instead of dropping it. The
+    // natural path keeps the full `expired()`-bounded drain.
+    let interrupted = shutdown.cancelled();
+    let closed = if interrupted {
+        engine.close_drain_interrupt(cancel)?
+    } else {
+        engine.close_drain_shutdown(shutdown)?
+    };
     shutdown.cancelled_and_acked();
     output.write_all(&closed.bytes)?;
+    if interrupted {
+        // Skip the explicit link detach: dropping the member
+        // sessions here would detach every link one by one (~2.3 s
+        // for 536), blowing the 1 s kill-to-exit target after the
+        // End record already went out. Only the sessions are
+        // forgotten — the engine itself still drops normally below,
+        // notably the lifecycle port's connector unsubscribe, which
+        // the kernel requires (socket release alone does not
+        // decrement its listener count). The process exits
+        // immediately after, and the kernel detaches
+        // still-attached links on exit — standard, safe, and the
+        // same reap the second-signal `_exit(130)` path already
+        // relies on. The observed processes are untouched either
+        // way (links are observer FDs; no signal is ever sent to a
+        // workload). These sessions attach to live PIDs
+        // (`Target::Pid`), so none holds owned-child custody that a
+        // drop would need to resolve.
+        std::mem::forget(std::mem::take(&mut engine.run.active));
+    }
     Ok(closed.code)
 }
 /// Complete grammar admission precedes selectors, companion reads and signals.
@@ -6679,6 +6769,7 @@ mod tests {
                     signal_dropped: 6,
                     signal_prefix_unwitnessed: 7,
                     drain_pending: 8,
+                    unsealed_members: 0,
                     polling_fallback: true,
                     unattributed_events: 9,
                     admitted_exit_artifacts: 10,
@@ -7088,6 +7179,107 @@ mod tests {
             grace_noted: None,
             loss_seen: [0; 8],
         }
+    }
+
+    /// Engine with one hollow open member and one admitted segment
+    /// (Codex F2 tests): no BPF, no custody — the close paths run
+    /// their real record logic over hollow sessions.
+    fn interrupt_close_fixture(json: bool) -> ServiceEngine {
+        let pool = MemoryPool::new(GLOBAL_BYTES);
+        let config = CryptoWatchConfig {
+            selection: Selection::default(),
+            duration: Duration::from_secs(30),
+            interval: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let objects = FocusedObjects {
+            observation: Arc::from([]),
+            count: Arc::from([]),
+            count_sha256: [0; 32],
+        };
+        let opened = ServiceEngine::open(&config, objects, &pool, json, None)
+            .expect("open with empty companions");
+        let mut engine = opened.engine.expect("engine");
+        // Leases charge the engine's own pool (the local `pool`
+        // drops with this fixture).
+        let member = hollow_active(
+            &engine.pool,
+            4242,
+            999,
+            inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        );
+        engine.run.active.push(member);
+        engine.run.segments = 1;
+        engine
+    }
+
+    #[test]
+    fn v060_interrupt_close_marks_unsealed_members_and_exits_3() {
+        // Codex F2 (human): the interrupt fast close skips the
+        // link-detach seals, still emits End with exit 3, and says
+        // plainly that the drain was cut short.
+        let mut engine = interrupt_close_fixture(false);
+        let cancel = AtomicBool::new(true);
+        let closed = engine.close_drain_interrupt(&cancel).unwrap();
+        assert_eq!(closed.code, 3);
+        let text = String::from_utf8(closed.bytes).unwrap();
+        assert!(
+            text.contains("Crypto watch end: cancelled, 1 segments, coverage partial"),
+            "{text}"
+        );
+        assert!(
+            text.contains("cut short") && text.contains("1 member"),
+            "end must carry the partial-drain note: {text}"
+        );
+    }
+
+    #[test]
+    fn v060_interrupt_close_json_marks_unsealed_members() {
+        // Codex F2 (machine): the end envelope carries the unsealed
+        // count — undrained tails are never silent.
+        let mut engine = interrupt_close_fixture(true);
+        let cancel = AtomicBool::new(true);
+        let closed = engine.close_drain_interrupt(&cancel).unwrap();
+        assert_eq!(closed.code, 3);
+        let text = String::from_utf8(closed.bytes).unwrap();
+        let end = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["kind"] == "end")
+            .expect("end envelope");
+        assert_eq!(end["reason"], "cancelled");
+        assert_eq!(end["session_loss"]["unsealed_members"], 1);
+    }
+
+    #[test]
+    fn v060_complete_close_reports_no_unsealed_members() {
+        // Codex F2: the natural close seals every member, so the
+        // note stays off on both surfaces.
+        let mut engine = interrupt_close_fixture(false);
+        let cancel = AtomicBool::new(false);
+        let closed = engine.close_drain_capped(&cancel, None).unwrap();
+        assert_eq!(closed.code, 3);
+        let text = String::from_utf8(closed.bytes).unwrap();
+        assert!(
+            text.contains("Crypto watch end: duration, 1 segments, coverage partial"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("cut short"),
+            "complete drain must not carry the note: {text}"
+        );
+        let mut engine = interrupt_close_fixture(true);
+        let closed = engine.close_drain_capped(&cancel, None).unwrap();
+        let text = String::from_utf8(closed.bytes).unwrap();
+        let end = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|row| row["kind"] == "end")
+            .expect("end envelope");
+        assert_eq!(end["session_loss"]["unsealed_members"], 0);
     }
     #[test]
     fn middle_image_seals_retired_only_without_admission() {
