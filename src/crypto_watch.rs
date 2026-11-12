@@ -4791,8 +4791,10 @@ impl ServiceEngine {
     /// loop already acked and observed cancel, so the close drain
     /// skips its slow phases outright — the final poll, every
     /// member seal (each detaches its links: ~2.3 s for 536), the
-    /// deferred/follow close-outs, the deferred flush — and emits
+    /// follow-pending close-out, the deferred flush — and emits
     /// the End record promptly with the unsealed count (H2). The
+    /// deferred close-out still runs (R17): pure `deferred_removed`
+    /// row emission over a capped queue, no link detach. The
     /// caller then forgets the member sessions instead of dropping
     /// them (see `observe`): the skipped link detach is work the
     /// kernel redoes on process exit anyway (standard, safe — the
@@ -4811,7 +4813,8 @@ impl ServiceEngine {
     /// run IS cancelled — the window-level reason rides the
     /// envelope/summary, never the 6A vocabulary). `fast` (codex
     /// F2, interrupt path only) skips the slow middle phases
-    /// outright — End still emits, with the unsealed count.
+    /// outright — except the deferred close-out (R17) — End still
+    /// emits, with the unsealed count.
     fn close_drain_inner(
         &mut self,
         cancel: &AtomicBool,
@@ -4961,24 +4964,25 @@ impl ServiceEngine {
         // `deferred_removed` (cancel/timeout path vs natural expiry).
         // R6-2a: run-end DISCARDS continuations (the run ends — no
         // readmission follows, so nothing resumes them).
-        // Codex F2: skipped on the interrupt fast close.
-        if !fast {
-            let close_reason = if cancel.load(Ordering::Relaxed) {
-                "cancelled"
-            } else {
-                "end_of_observation"
-            };
-            let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
-            for key in keys {
-                // Bounded teardown: past `expired()` the remaining
-                // close-outs stop here (End still emits below).
-                if expired() {
-                    break;
-                }
-                if let Some(entry) = run.deferred.remove(&key) {
-                    run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
-                    run.removed.closed = run.removed.closed.saturating_add(1);
-                }
+        // R17: runs on the interrupt fast close too — pure row
+        // emission over a capped queue (DEFERRED_CAP), no link
+        // detach, so the kill-to-exit target holds; the rows are
+        // real observations the tool already holds (control_9d).
+        let close_reason = if cancel.load(Ordering::Relaxed) {
+            "cancelled"
+        } else {
+            "end_of_observation"
+        };
+        let keys: Vec<DeferredKey> = run.deferred.keys().cloned().collect();
+        for key in keys {
+            // Bounded teardown: past `expired()` the remaining
+            // close-outs stop here (End still emits below).
+            if expired() {
+                break;
+            }
+            if let Some(entry) = run.deferred.remove(&key) {
+                run.emit_removal(&mut out, &entry, entry.image_epoch, close_reason)?;
+                run.removed.closed = run.removed.closed.saturating_add(1);
             }
         }
         // Follow-pending at close: dead births gap (counted per root);
@@ -7310,6 +7314,88 @@ mod tests {
             .find(|row| row["kind"] == "end")
             .expect("end envelope");
         assert_eq!(end["reason"], "cancelled");
+        assert_eq!(end["session_loss"]["unsealed_members"], 1);
+    }
+
+    #[test]
+    fn v060_interrupt_close_emits_deferred_closeout_rows() {
+        // R17 (control_9d regression): the interrupt fast close
+        // must still emit `deferred_removed` rows for unflushed
+        // items — real observations the tool already holds.
+        // Seals stay skipped (the partial-drain note still rides
+        // the End); only the pure row emission is restored.
+        let mut engine = interrupt_close_fixture(true);
+        let pid = std::process::id();
+        let identity = super::verify_triple(pid).expect("own triple");
+        let second = Incarnation {
+            pid: 4242,
+            starttime: 999,
+            namespaces: identity.namespaces.clone(),
+        };
+        for (identity, first, last) in [(identity, 4, 5), (second, 3, 5)] {
+            let key = DeferredKey::from(&identity);
+            engine.run.deferred.insert(
+                key,
+                DeferredEntry {
+                    identity,
+                    image_epoch: 0,
+                    first_tick: first,
+                    last_tick: last,
+                    ticks: 2,
+                    reason: "active_limit",
+                    marks: WindowStore::new(DEFERRED_MARKS),
+                    exe: None,
+                    readmit: None,
+                    carried_loss: 0,
+                    carried_deferred: DeferredSpan::default(),
+                    admit_ns: LiveClock.monotonic_ns(),
+                    tombstoned: false,
+                },
+            );
+        }
+        engine.run.current_tick = 6;
+        let cancel = AtomicBool::new(true);
+        let closed = engine.close_drain_interrupt(&cancel).unwrap();
+        assert_eq!(closed.code, 3);
+        let text = String::from_utf8(closed.bytes).unwrap();
+        let rows: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let removed: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|r| r["kind"] == "membership" && r["state"] == "deferred_removed")
+            .collect();
+        assert_eq!(
+            removed.len(),
+            2,
+            "interrupt close dropped the deferred backlog: {text}"
+        );
+        for row in &removed {
+            assert_eq!(row["reason"], "cancelled");
+            // M5 (mirrors control_9d): sealed spans stay coherent.
+            let span = &row["loss"]["deferred"];
+            let ticks = span["ticks"].as_u64().unwrap_or(0);
+            let first = span["first_tick"].as_u64();
+            let last = span["last_tick"].as_u64();
+            assert!(ticks > 0, "removed entry without sealed span: {row}");
+            let (Some(first), Some(last)) = (first, last) else {
+                panic!("removed entry without span bounds: {row}");
+            };
+            assert!(
+                first <= last,
+                "removed entry with incoherent span bounds: {row}"
+            );
+            assert!(
+                ticks <= last.saturating_sub(first).saturating_add(1),
+                "removed entry ticks exceed its span: {row}"
+            );
+        }
+        let end = rows
+            .iter()
+            .find(|r| r["kind"] == "end")
+            .expect("end envelope");
+        assert_eq!(end["deferred_removed"]["closed"], 2);
         assert_eq!(end["session_loss"]["unsealed_members"], 1);
     }
 
