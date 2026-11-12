@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # osslscope continuous observer, one pod per amd64 node.
 #
-# EXPERIMENTAL: the in-Kubernetes service is experimental in 0.5.0 (see
+# EXPERIMENTAL: the in-Kubernetes service is experimental in 0.6.0 (see
 # README.md). The SUPPORTED in-cluster path is the one-shot Job
 # (job-report.yaml).
 #
@@ -40,7 +40,7 @@ metadata:
   labels:
     app.kubernetes.io/name: osslscope
     app.kubernetes.io/component: service
-    app.kubernetes.io/version: "0.5.0"
+    app.kubernetes.io/version: "0.6.0"
     osslscope.io/experimental-service: "true"
 spec:
   selector:
@@ -52,7 +52,7 @@ spec:
       labels:
         app.kubernetes.io/name: osslscope
         app.kubernetes.io/component: service
-        app.kubernetes.io/version: "0.5.0"
+        app.kubernetes.io/version: "0.6.0"
         osslscope.io/experimental-service: "true"
     spec:
       hostPID: true
@@ -66,8 +66,8 @@ spec:
           # manifests (delete + recreate; host `docker rmi` does not
           # evict kind's node-local containerd cache), verify imageID
           # identity, or digest-pin post-publish. (No digest exists
-          # to pin until 0.5.0 is pushed.)
-          image: ghcr.io/mingulov/osslscope:0.5.0
+          # to pin until 0.6.0 is pushed.)
+          image: ghcr.io/mingulov/osslscope:0.6.0
           imagePullPolicy: IfNotPresent
           args: ["service", "--config", "/etc/osslscope/service.toml"]
           # Measured, not guessed: the tracing engine peaks at ~1.31 GiB

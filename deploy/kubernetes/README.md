@@ -1,4 +1,4 @@
-# osslscope on Kubernetes (0.5.0)
+# osslscope on Kubernetes (0.6.0)
 
 Plain-YAML manifests, no Helm. Two workloads:
 
@@ -10,7 +10,7 @@ Plain-YAML manifests, no Helm. Two workloads:
 | `job-report.yaml` | one-shot owned-workload report | SUPPORTED |
 
 The SUPPORTED in-cluster path is the one-shot Job. The DaemonSet service
-is EXPERIMENTAL in 0.5.0: it runs, its Ready state tracks per-node
+is EXPERIMENTAL in 0.6.0: it runs, its Ready state tracks per-node
 doctor qualification, but continuous in-cluster observation has not had
 the soak or matrix a supported claim needs.
 
@@ -20,7 +20,7 @@ the soak or matrix a supported claim needs.
   workloads), Linux kernel 6.9+ (feature-probed), BTF
   (`/sys/kernel/btf/vmlinux`), cgroup v2.
 - kubelet >= 1.30 (the DaemonSet uses the `appArmorProfile` field).
-- The published image `ghcr.io/mingulov/osslscope:0.5.0`
+- The published image `ghcr.io/mingulov/osslscope:0.6.0`
   (`imagePullPolicy: IfNotPresent`; pre-publish, `kind load` a local
   build — see below).
 - ~2 GiB allocatable memory per osslscope pod. Measured, not guessed:
@@ -124,7 +124,7 @@ $ kubectl -n osslscope edit configmap osslscope-service
 $ kubectl -n osslscope rollout restart daemonset/osslscope
 ```
 
-## No-install option: none supported in 0.5.0
+## No-install option: none supported in 0.6.0
 
 There is NO supported no-install recipe in this release. What was
 tried and rejected: `kubectl debug` with the default profile cannot

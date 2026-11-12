@@ -1,7 +1,7 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Install from source
 
-The v0.5.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
+The v0.6.0 automatic observation candidate uses the pinned [build recipe](build.md) and a
 manifest-verified install. Source/install simulations do not qualify actual
 BPF loading, provider behavior or a platform.
 
@@ -175,7 +175,7 @@ follows. The RPM ships no unit or conffile. Also delete any
 Kubernetes:
 
 ```sh
-docker rmi osslscope:0.5.0
+docker rmi osslscope:0.6.0
 kubectl delete -f deploy/kubernetes/daemonset.yaml \
   -f deploy/kubernetes/job-report.yaml \
   -f deploy/kubernetes/configmap.yaml \

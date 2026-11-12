@@ -7,7 +7,7 @@ for selected processes or automatically discovered watched scopes. Normal workfl
 need no enrolled library profile,
 manual offsets or application changes.
 
-**v0.5.0 RnD release (initial public 0.x).** Honest PARTIAL-only
+**v0.6.0 RnD release (initial public 0.x).** Honest PARTIAL-only
 observation on one declared lane (table below): short owned commands,
 warm processes and sampled watched scopes expose physical callback
 entries and separate public API activity. Reports stay PARTIAL,
@@ -156,7 +156,7 @@ sudo rm -rf /usr/local/bin/osslscope /usr/local/lib/osslscope /usr/local/share/o
 ```
 
 ```sh
-docker rmi osslscope:0.5.0
+docker rmi osslscope:0.6.0
 kubectl delete -f deploy/kubernetes/daemonset.yaml \
   -f deploy/kubernetes/job-report.yaml \
   -f deploy/kubernetes/configmap.yaml \

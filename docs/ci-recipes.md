@@ -47,7 +47,7 @@ Current packages ship the binary, all five BPF roles and the
 matching receipt — no separate companion build is needed (the
 pinned-toolchain build in [build](build.md) is what the package
 itself is built from). `dpkg -c` on a freshly built
-`osslscope_0.5.0-1_amd64.deb` lists `usr/bin/osslscope`,
+`osslscope_0.6.0-1_amd64.deb` lists `usr/bin/osslscope`,
 `usr/lib/osslscope/osslscope-{harvest,count,members,
 provider-observation,focused-count}` and
 `usr/share/osslscope/install-manifest.json` (plus install docs,

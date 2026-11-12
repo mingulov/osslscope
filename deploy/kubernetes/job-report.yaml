@@ -29,7 +29,7 @@ metadata:
   labels:
     app.kubernetes.io/name: osslscope
     app.kubernetes.io/component: report
-    app.kubernetes.io/version: "0.5.0"
+    app.kubernetes.io/version: "0.6.0"
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 3600
@@ -39,7 +39,7 @@ spec:
       labels:
         app.kubernetes.io/name: osslscope
         app.kubernetes.io/component: report
-        app.kubernetes.io/version: "0.5.0"
+        app.kubernetes.io/version: "0.6.0"
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -52,8 +52,8 @@ spec:
           # manifests (delete + recreate; host `docker rmi` does not
           # evict kind's node-local containerd cache), verify imageID
           # identity, or digest-pin post-publish. (No digest exists
-          # to pin until 0.5.0 is pushed.)
-          image: ghcr.io/mingulov/osslscope:0.5.0
+          # to pin until 0.6.0 is pushed.)
+          image: ghcr.io/mingulov/osslscope:0.6.0
           imagePullPolicy: IfNotPresent
           args:
             - report
