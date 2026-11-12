@@ -1,62 +1,83 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
-## Unreleased (v0.6.0 signals)
+## 0.6.0 (candidate — 2026-11-12)
 
-- P0-8 interrupt contract: the first SIGINT/SIGTERM across setup,
-  acquisition, observation, and teardown prints one stderr ack
-  (`osslscope: received {SIGINT|SIGTERM}, shutting down…`), then ends
-  with the arm's normal end record plus the normal exit (usually 3),
-  and never signals the observed workload. EINTR checks cancellation
-  before retry; teardown closes are bounded by a best-effort
-  one-second `SHUTDOWN_DEADLINE` (no universal 1s shutdown guarantee).
-  A second signal exits immediately with 130 (SIGINT) or 143 (SIGTERM)
-  and no end-record guarantee. The capture path is off BSD `signal()`
-  onto the shared `Shutdown` token; one-shot `scan`/`inspect` stay
-  uninstrumented (conventional `128 + signo` status). See
-  `docs/usage.md` ("Interrupt contract").
-
-## Unreleased (v0.6.0 human surface)
-
-- BREAKING (S1/S3/S5/S6 stdout split): human stdout no longer
-  embeds the JSON document — `scan`/`inspect` print readable rows
-  by default and `--json` stdout is now pure (parses alone).
-  Consumers parsing mixed stdout must pass `--json`. See
-  `docs/usage.md` ("Human output") for the row shapes, `-v`/`-vv`
-  levels, kind legend, privilege hint, and per-reason gap
-  meanings.
+- Usability slice over 0.5.0: discovery answers read as rows,
+  machines get file paths, process identity, and version evidence,
+  and Ctrl-C stops long runs promptly. Reports stay PARTIAL
+  (exit 3) where evidence is partial; mappings never prove
+  activation or execution.
+- BREAKING (stdout split): human stdout no longer embeds the JSON
+  document — `scan`/`inspect` print readable rows by default and
+  `--json` stdout is now pure (parses alone). Tooling that parsed
+  pre-0.6 mixed stdout must pass `--json`. See `docs/usage.md`
+  ("Human output") for the row shapes, `-v`/`-vv` levels, kind
+  legend, privilege hint, and per-reason gap meanings.
+- Machine evidence (P0-1/P0-2/P0-4, pinned by
+  `schemas/discovery-v1.json`): `verified_path` /
+  `verified_path_unavailable` / `maps_spelling` on every mapped
+  record, bounded `comm`/`comm_status` + `exe`/`exe_status`
+  process identity, the file's own `DT_SONAME` (`file_soname`)
+  with validated rodata `file_openssl_version` /
+  `file_version_status`, and `errno`/`actor_euid` on gaps.
+  SONAME and version strings describe bytes on disk, never
+  loaded or executed code. Reader break: v0.5
+  `deny_unknown_fields` readers reject v0.6 documents; v0.6
+  readers accept v0.5 documents. Machine consumers must parse
+  `--json`/NDJSON only.
+- Paths are acquired on every run, human or machine (P0-1/R13):
+  default human rows show verified paths, explicitly-unverified
+  maps hints, or a genuinely-unacquirable placeholder —
+  `--resolve-paths` now gates only live re-resolution of the
+  human `path=` fragment on a TTY. Watch change lines and
+  crypto discovery rows carry the same `path=` evidence as
+  snapshot rows. `inspect --module` rows label the
+  operator-supplied spelling and carry the legend plus
+  `-v`/`-vv` detail. Machine bytes are identical with the flag
+  on or off.
+- Human default is rows with a quiet contract (P0-3): no `-q`
+  (the default is already quiet); `-v` adds grouped gaps,
+  per-module exports, and full per-process state, `-vv` adds
+  per-object gap records and counters. Exits, stderr, counts,
+  and `--json` bytes are identical at every verbosity.
+- Kind legend plus honest `other` counts (P0-5): human output
+  and `scan --help` decode every kind word, and `other` objects
+  are counted per process (verified vs candidate vs failed),
+  never silently dropped.
+- Errno-proven privilege hint (P0-6/T6b): when a gap carries a
+  refused-open `EPERM`/`EACCES`, one stderr hint names the
+  unverified portion and the supported re-run-as-root remedy —
+  never for limits, churn, or dead PIDs. `inspect --module`
+  errors carry the same refused-open `errno` and fire the hint
+  too.
+- Interrupt contract (P0-8): the first SIGINT/SIGTERM across
+  setup, acquisition, observation, and teardown prints one
+  stderr ack (`osslscope: received {SIGINT|SIGTERM}, shutting
+  down…`), then ends with the arm's normal end record plus the
+  normal exit (usually 3), and never signals the observed
+  workload. Teardown closes are bounded by a best-effort
+  one-second `SHUTDOWN_DEADLINE` (no universal 1s shutdown
+  guarantee). A second signal exits immediately with 130
+  (SIGINT) or 143 (SIGTERM) and no end-record guarantee. The
+  capture path is off BSD `signal()` onto the shared `Shutdown`
+  token; one-shot `scan`/`inspect` stay uninstrumented
+  (conventional `128 + signo` status), and the modern focused
+  `report`/`check` route stays ack-less in v0.6.0 (follow-up
+  work). See `docs/usage.md` ("Interrupt contract").
 - Machine-visible refinement (serialization shape unchanged):
   watch `changes[]` no longer repeats steady-state
-  `visibility_lost` entries every tick — they fire on transition,
-  with steady uncertainty heartbeats instead of per-tick repeats.
-- `inspect --module` human output now carries `path=` on every
-  row by default (the operator-supplied spelling, labeled —
-  previously omitted without `--resolve-paths`), the `kinds:`
-  legend, and `-v`/`-vv` detail (grouped errors, per-module
-  exports, per-error records, safe counters). Exits, stderr,
-  counts, and `--json` bytes are unchanged.
-
-## Unreleased (v0.6.0 machine surface)
-
-- Additive discovery machine fields, pinned by
-  `schemas/discovery-v1.json`: `verified_path` /
-  `verified_path_unavailable` / `maps_spelling` on every mapped record
-  (JSON always carries them; `--resolve-paths` now gates only the human
-  TTY `path=` fragment), bounded `comm`/`comm_status` + `exe`/`exe_status`
-  process identity, own-`DT_SONAME` `file_soname` with validated rodata
-  `file_openssl_version` / `file_version_status`, and `errno`/`actor_euid`
-  on gaps. File evidence is never a runtime claim. Reader break: v0.5
-  `deny_unknown_fields` readers reject v0.6 documents; v0.6 readers accept
-  v0.5 documents. Machine consumers must parse `--json`/NDJSON only — the
-  human stdout shape is owned by the human-surface plan, which splits
-  stdout by mode (human rows by default, pure JSON under `--json`).
-- `scan --module` takes a file PATH only (repeatable); bare hashes fail
-  with exit 4 and a message naming the PATH form. Digest selectors
-  (`sha256:...`) are not accepted in v0.6.
-- `--json` snapshot bytes are deterministic across runs modulo wall-clock
-  fields (`interval`, `capture_unix_ms`) and the live-input `read_bytes`
-  accounting total (covered by
+  `visibility_lost` entries every tick — they fire on
+  transition, with steady uncertainty heartbeats instead of
+  per-tick repeats.
+- `scan --module` takes a file PATH only (repeatable); bare
+  hashes fail with exit 4 and a message naming the PATH form.
+  Digest selectors (`sha256:...`) are not accepted in v0.6.
+- `--json` snapshot bytes are deterministic across runs modulo
+  wall-clock fields (`interval`, `capture_unix_ms`) and the
+  live-input `read_bytes` accounting total (covered by
   `v060_json_bytes_deterministic_modulo_wall_clock`).
+- Root package version 0.6.0; helper crates retain their versions.
 
 ## 0.5.0 (candidate — 2026-11-02)
 
