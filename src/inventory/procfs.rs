@@ -2483,6 +2483,25 @@ mod tests {
                     assert!(Instant::now() < deadline, "exec must land");
                     std::thread::sleep(Duration::from_millis(1));
                 }
+                // The exe link flips before ld.so maps the
+                // preloaded libraries: a maps sample taken at
+                // the flip can see the transitional image
+                // (sleep + ld only, libcrypto not yet mapped)
+                // and deterministically yields no libcrypto
+                // module. Wait for the settled post-exec
+                // image — the lib stays mapped while `sleep
+                // 60` runs, so anything the product samples
+                // afterwards keeps it. Same hang-detector
+                // bound, never a timing assumption.
+                let maps_link = format!("/proc/{pid}/maps");
+                loop {
+                    let maps = std::fs::read(&maps_link).unwrap();
+                    if maps.windows(b"libcrypto".len()).any(|w| w == b"libcrypto") {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "post-exec image must settle");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
             }
         })));
         let result = snapshot(&SnapshotOptions {
