@@ -516,7 +516,45 @@ fn public_c_fixtures_remain_inventory_when_observation_is_unavailable() {
             .filter_map(|r| r["facts"].as_array())
             .all(Vec::is_empty)
     );
-    redacted(&output);
+    // F-NEW-1 (R13 always-acquire; F7 canary-re-pin precedent):
+    // the canary provider filename now LEGITIMATELY appears in
+    // machine records — but ONLY under the D1 path-evidence keys
+    // (`verified_path.path`, `maps_spelling.spelling`). Anywhere
+    // else is a leak; stderr keeps the blanket ban.
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("0x"), "{text}");
+    assert!(!text.contains("panicked"), "{text}");
+    for line in text.lines() {
+        let doc: serde_json::Value = serde_json::from_str(line).expect("provider NDJSON");
+        fn walk(value: &serde_json::Value, parent: &str) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    for (key, child) in object {
+                        walk(child, key);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for item in items {
+                        walk(item, parent);
+                    }
+                }
+                serde_json::Value::String(text) => {
+                    if text.contains("PRIVATE_CANARY") {
+                        assert!(
+                            parent == "path" || parent == "spelling",
+                            "canary filename outside D1 path-evidence keys (key {parent:?}): {text}"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+        walk(&doc, "");
+    }
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(!err.contains("PRIVATE_CANARY"), "{err}");
+    assert!(!err.contains("0x"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
 }
 
 #[test]
@@ -886,4 +924,117 @@ fn v060_provider_watch_sigint_acks_once_with_interrupted_end() {
         "no interrupt end: {first}{rest}"
     );
     assert!(rest.contains("\"record\":\"end\""), "no end record: {rest}");
+}
+
+fn spawn_tls_workload() -> std::process::Child {
+    // Sleeper with libssl/libcrypto mapped (module rows expected;
+    // a plain sleep maps no OpenSSL — a vacuous fixture).
+    std::process::Command::new("python3")
+        .args(["-c", "import ssl, time; time.sleep(120)"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+#[test]
+fn provider_json_snapshots_carry_path_evidence_by_default() {
+    // F-NEW-1 (R13 always-acquire): provider NDJSON embedded
+    // snapshots carry D1 path evidence by default — every module
+    // carries verified-or-reason plus a maps spelling, never the
+    // bare-null triple of the acquire-off shape.
+    let mut workload = spawn_tls_workload();
+    std::thread::sleep(Duration::from_millis(500));
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        &workload.id().to_string(),
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.12",
+        "--interval",
+        "0.05",
+        "--json",
+    ]);
+    let _ = workload.kill();
+    let _ = workload.wait();
+    assert_eq!(output.status.code(), Some(3));
+    let mut modules = 0;
+    let mut evidenced = 0;
+    for doc in records(&output)
+        .iter()
+        .filter(|doc| doc["record"] == "snapshot")
+    {
+        let processes = doc["snapshot"]["processes"].as_array();
+        for module in processes
+            .into_iter()
+            .flatten()
+            .flat_map(|p| p["modules"].as_array().into_iter().flatten())
+        {
+            modules += 1;
+            assert!(
+                module["verified_path"].is_null() != module["verified_path_unavailable"].is_null(),
+                "bare-null triple without a D1 reason: {module}"
+            );
+            if !module["maps_spelling"].is_null() {
+                evidenced += 1;
+            }
+        }
+    }
+    assert!(
+        modules > 0 && evidenced > 0,
+        "acquisition off: no D1 evidence in {modules} module records"
+    );
+    redacted(&output);
+}
+
+#[test]
+fn provider_human_rows_carry_paths_by_default() {
+    // F-NEW-1 (quiet contract + H8 precedent): provider human
+    // module rows carry `path=`/`version=` and process lines
+    // carry `comm=`/`exe=` by default.
+    let mut workload = spawn_tls_workload();
+    std::thread::sleep(Duration::from_millis(500));
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--pid",
+        &workload.id().to_string(),
+        "--observe-providers",
+        "--watch",
+        "--duration",
+        "0.12",
+        "--interval",
+        "0.05",
+    ]);
+    let _ = workload.kill();
+    let _ = workload.wait();
+    assert_eq!(output.status.code(), Some(3));
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    let rows: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("    sha256="))
+        .collect();
+    assert!(!rows.is_empty(), "no module rows, got: {text}");
+    for row in &rows {
+        assert!(
+            row.contains("path=") && row.contains("version="),
+            "row without path/version, got: {row}"
+        );
+    }
+    let processes: Vec<&str> = text
+        .lines()
+        .filter(|l| l.starts_with("  process "))
+        .collect();
+    assert!(!processes.is_empty(), "no process lines, got: {text}");
+    for line in &processes {
+        assert!(
+            line.contains("comm=") && line.contains("exe="),
+            "process line without comm/exe, got: {line}"
+        );
+    }
+    redacted(&output);
 }

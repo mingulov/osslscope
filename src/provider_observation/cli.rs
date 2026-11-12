@@ -53,7 +53,16 @@ fn parse(args: &[String]) -> Result<Options, ()> {
     if !matches!(command, "scan" | "inspect") {
         return Err(());
     }
-    let mut selection = Selection::default();
+    // R13 always-acquire (F-NEW-1): provider snapshots always
+    // carry D1 path evidence — verified path or null + finite
+    // reason — exactly like scan/inspect/watch/crypto (the
+    // shared `acquire_paths` rule, unconditionally true). A
+    // default (acquire-off) selection here emits bare-null path
+    // triples on every production run, breaching P0-1.
+    let mut selection = Selection {
+        resolve_paths: true,
+        ..Default::default()
+    };
     let mut json = false;
     let mut watch = false;
     let mut observe = false;
@@ -291,11 +300,22 @@ impl Render for Record<'_> {
                 "  {}",
                 crate::inventory::identity_totals_line(verified, locator)
             )?;
+            // R13 snapshot-evidence writer (F-NEW-1, b540ae8
+            // pattern): the provider route has no
+            // `--resolve-paths` flag, so live re-resolution
+            // stays off and rows show acquired snapshot
+            // evidence — never omit what was acquired (the
+            // flag-off live branch is dead here).
+            let paths =
+                crate::inventory::resolve::TerminalPathWriter::new(false, false, &snapshot.resolve);
             for process in &snapshot.processes {
                 write!(
                     writer,
-                    "  process pid={} starttime={}",
-                    process.pid, process.starttime
+                    "  process pid={} starttime={} comm={} exe={}",
+                    process.pid,
+                    process.starttime,
+                    crate::inventory::cli::human_comm(process),
+                    crate::inventory::cli::human_exe(process)
                 )?;
                 if level >= 1 {
                     write!(
@@ -318,6 +338,17 @@ impl Render for Record<'_> {
                         ),
                         finite(&module.info.kind)?,
                         finite(&module.identity_status)?
+                    )?;
+                    // Scan-route shapes for the same record
+                    // (`human_path`/`human_version`): verified
+                    // path, explicitly-unverified maps hint, or
+                    // the genuinely-unacquirable placeholder —
+                    // null/missing never crashes.
+                    write!(
+                        writer,
+                        " path={} version={}",
+                        paths.human_path(module),
+                        crate::inventory::resolve::TerminalPathWriter::human_version(&module.info),
                     )?;
                     if level >= 1 {
                         write!(
@@ -1941,6 +1972,224 @@ mod tests {
                 && end.get("cumulative_partial").is_none()
                 && end.get("cumulative_unavailable").is_none(),
             "machine end shape changed: {end}"
+        );
+    }
+
+    // F-NEW-1 (R13 always-acquire): the provider arm parses to an
+    // acquiring selection on BOTH commands — a default
+    // (acquire-off) selection emits bare-null D1 path triples,
+    // breaching P0-1 and the CHANGELOG always-acquire claim.
+    #[test]
+    fn parse_acquires_paths_by_default() {
+        let scan = ["scan".to_string(), "--observe-providers".to_string()];
+        assert!(
+            super::parse(&scan).unwrap().selection.resolve_paths,
+            "scan provider arm must acquire D1 path evidence"
+        );
+        let inspect = [
+            "inspect".to_string(),
+            "--pid".to_string(),
+            "1".to_string(),
+            "--observe-providers".to_string(),
+        ];
+        assert!(
+            super::parse(&inspect).unwrap().selection.resolve_paths,
+            "inspect provider arm must acquire D1 path evidence"
+        );
+    }
+
+    // F-NEW-1 (H8 precedent, b540ae8 pattern): provider human
+    // module rows carry `path=`/`version=` with the scan-route
+    // shapes (`human_path`/`human_version`), and process lines
+    // carry `comm=`/`exe=` with the scan verdict shapes
+    // (`human_comm`/`human_exe`); null/missing renders
+    // placeholders, never crashes.
+    #[test]
+    fn human_rows_carry_path_version_and_process_lines_carry_comm_exe() {
+        use crate::inventory as inv;
+        let module = |sha: &str,
+                      status: inv::IdentityStatus,
+                      verified: Option<inv::VerifiedPath>,
+                      unavailable: Option<inv::PathUnavailableReason>,
+                      maps: Option<inv::MapsSpelling>,
+                      soname: Option<&str>,
+                      version: Option<&str>| {
+            inv::ModuleRecord {
+                info: inv::ModuleInfo {
+                    sha256: sha.to_string(),
+                    device: 1,
+                    inode: 2,
+                    size_bytes: 3,
+                    architecture: inv::Architecture::X86_64,
+                    kind: inv::ObjectKind::Other,
+                    exports: Vec::new(),
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                    file_soname: soname.map(str::to_string),
+                    file_openssl_version: version.map(str::to_string),
+                    file_version_status: inv::FileVersionStatus::Absent,
+                },
+                identity_status: status,
+                verified_path: verified,
+                verified_path_unavailable: unavailable,
+                maps_spelling: maps,
+            }
+        };
+        let interval = inv::CaptureInterval {
+            started_unix_ms: None,
+            finished_unix_ms: None,
+            elapsed_ns: 0,
+        };
+        let snapshot = inv::Snapshot {
+            interval: interval.clone(),
+            scope_record: inv::ScopeRecord::default(),
+            schema_version: "osslscope.discovery.v1".into(),
+            mode: inv::SnapshotMode::Snapshot,
+            scope: inv::Scope::Pids,
+            selected_pids: vec![7, 9],
+            processes: vec![
+                inv::ProcessRecord {
+                    interval: interval.clone(),
+                    namespaces: inv::NamespaceIds::default(),
+                    pid: 7,
+                    starttime: 70,
+                    comm: Some("python3".to_string()),
+                    comm_status: inv::IdentityAvailability::Available,
+                    exe: Some("/usr/bin/python3".to_string()),
+                    exe_status: inv::IdentityAvailability::Available,
+                    modules: vec![
+                        module(
+                            &"aa".repeat(32),
+                            inv::IdentityStatus::Verified,
+                            Some(inv::VerifiedPath {
+                                path: "/lib/x86_64-linux-gnu/libcrypto.so.3".to_string(),
+                                path_encoding: inv::PathEncoding::Utf8,
+                                locator_kind: inv::LocatorKind::HostDirect,
+                                capture_unix_ms: None,
+                            }),
+                            None,
+                            Some(inv::MapsSpelling {
+                                spelling: "/lib/x86_64-linux-gnu/libcrypto.so.3".to_string(),
+                                source: inv::MapsSource::ProcMaps,
+                                verification: inv::MapsVerification::Unverified,
+                            }),
+                            Some("libcrypto.so.3"),
+                            Some("3.5.5"),
+                        ),
+                        module(
+                            &"bb".repeat(32),
+                            inv::IdentityStatus::LocatorCandidate,
+                            None,
+                            Some(inv::PathUnavailableReason::UnverifiedIdentity),
+                            Some(inv::MapsSpelling {
+                                spelling: "/mem/fd:deleted-lib.so".to_string(),
+                                source: inv::MapsSource::ProcMaps,
+                                verification: inv::MapsVerification::Unverified,
+                            }),
+                            None,
+                            None,
+                        ),
+                        module(
+                            &"cc".repeat(32),
+                            inv::IdentityStatus::Verified,
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        ),
+                    ],
+                    other_objects: inv::OtherCounts::default(),
+                    provider_activation: inv::ObservationState::Unknown,
+                    provider_interfaces: inv::ObservationState::Unknown,
+                    execution: inv::ObservationState::NotObserved,
+                },
+                inv::ProcessRecord {
+                    interval,
+                    namespaces: inv::NamespaceIds::default(),
+                    pid: 9,
+                    starttime: 90,
+                    comm: None,
+                    comm_status: inv::IdentityAvailability::Unreadable,
+                    exe: None,
+                    exe_status: inv::IdentityAvailability::Changed,
+                    modules: Vec::new(),
+                    other_objects: inv::OtherCounts::default(),
+                    provider_activation: inv::ObservationState::Unknown,
+                    provider_interfaces: inv::ObservationState::Unknown,
+                    execution: inv::ObservationState::NotObserved,
+                },
+            ],
+            gaps: Vec::new(),
+            totals: inv::WorkTotals::default(),
+            limits: inv::Limits::default(),
+            capabilities: inv::Capabilities {
+                inventory: inv::InventoryState::Complete,
+                provider_activation: inv::ObservationState::Unknown,
+                provider_interfaces: inv::ObservationState::Unknown,
+                execution: inv::ObservationState::NotObserved,
+            },
+            resolve: inv::resolve::ResolveSidecar::default(),
+            cgroup_identity: std::collections::BTreeMap::new(),
+        };
+        let capabilities = super::Capabilities::new(true);
+        let record = super::Record {
+            schema_version: super::SCHEMA,
+            mode: "watch",
+            record: "snapshot",
+            sequence: 1,
+            interval: super::Interval {
+                started_elapsed_ns: 0,
+                finished_elapsed_ns: 10,
+                drain_lag_ns: 10,
+            },
+            poll_interval: Duration::from_secs(1),
+            snapshot: Some(&snapshot),
+            facts: &[],
+            gaps: &[],
+            interval_causes: &[],
+            capabilities: &capabilities,
+            sampled_history: "incomplete",
+        };
+        let mut bytes = Vec::new();
+        super::emit(&record, &mut bytes, true, 0).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        let processes: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("  process "))
+            .collect();
+        assert_eq!(processes.len(), 2, "{text}");
+        assert!(
+            processes[0].contains("comm=python3") && processes[0].contains("exe=bin/python3"),
+            "scan verdict shapes, got: {}",
+            processes[0]
+        );
+        assert!(
+            processes[1].contains("comm=-") && processes[1].contains("exe=unavailable"),
+            "null/missing placeholders, got: {}",
+            processes[1]
+        );
+        let rows: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("    sha256="))
+            .collect();
+        assert_eq!(rows.len(), 3, "{text}");
+        assert!(
+            rows[0].contains("path=/lib/x86_64-linux-gnu/libcrypto.so.3")
+                && rows[0].contains("version=3.5.5"),
+            "verified evidence, got: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1].contains("path=(unverified maps hint: /mem/fd:deleted-lib.so)")
+                && rows[1].contains("version=none"),
+            "maps hint + no version, got: {}",
+            rows[1]
+        );
+        assert!(
+            rows[2].contains("path=(unavailable)") && rows[2].contains("version=none"),
+            "genuinely-unacquirable placeholders, got: {}",
+            rows[2]
         );
     }
 }

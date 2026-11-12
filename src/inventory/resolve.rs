@@ -1150,8 +1150,8 @@ impl<'a> TerminalPathWriter<'a> {
     /// explicitly-unverified maps hint (80 chars), else
     /// `(unavailable)`. Piped rows never render `(not-a-terminal)`.
     /// Shared by snapshot rows (`object_rows`), watch change lines,
-    /// and crypto discovery rows: every human renderer shows the
-    /// same acquired evidence for the same record.
+    /// crypto discovery rows, and provider module rows: every human
+    /// renderer shows the same acquired evidence for the same record.
     pub(crate) fn human_path(&self, module: &super::ModuleRecord) -> String {
         if self.flag && self.terminal {
             return self
@@ -1181,7 +1181,10 @@ impl<'a> TerminalPathWriter<'a> {
     /// evidence first, SONAME second, `none` when neither exists.
     /// Both inputs are ELF-derived bytes, so both sanitize at this
     /// human boundary. File evidence only, never a runtime claim.
-    fn human_version(info: &ModuleInfo) -> String {
+    /// Shared by snapshot rows (`object_rows`) and provider module
+    /// rows: every human renderer shows the same file evidence
+    /// for the same record.
+    pub(crate) fn human_version(info: &ModuleInfo) -> String {
         info.file_openssl_version
             .as_deref()
             .or(info.file_soname.as_deref())

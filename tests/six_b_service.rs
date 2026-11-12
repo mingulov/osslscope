@@ -248,6 +248,83 @@ fn sixb_one_window_finalizes() {
     assert_eq!(sum["diagnostics_dropped"], 0, "no drops on clean close");
 }
 
+/// F-NEW-2 (R13 always-acquire): the coordinator engine acquires
+/// D1 path evidence — window `crypto_watch` Discovery records
+/// carry verified-or-reason triples, never the bare-null triple
+/// of the acquire-off shape.
+#[test]
+fn sixb_window_discovery_carries_path_evidence() {
+    let dir = fresh_dir("window-paths");
+    // TLS workload (a plain sleep maps no OpenSSL — a vacuous
+    // fixture with no module rows).
+    let mut child = Command::new("python3")
+        .args(["-c", "import ssl, time; time.sleep(120)"])
+        .spawn()
+        .expect("spawn tls sleeper");
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let pid = child.id().to_string();
+    let mut svc = bin()
+        .arg("--out")
+        .arg(&dir)
+        .arg("--pid")
+        .arg(&pid)
+        .arg("--window")
+        .arg("1")
+        .arg("--interval")
+        .arg("0.2")
+        .spawn()
+        .expect("spawn service");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
+    let status = svc.wait().expect("wait service");
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        status.code() == Some(3),
+        "cancel-after-windows exits 3, got {status:?}"
+    );
+    // Discovery records ride windows 1+ (window 0 carries setup
+    // bytes only), so every finalized window joins the sweep.
+    let mut windows = 0;
+    let mut modules = 0;
+    let mut evidenced = 0;
+    let mut entries: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("window-") && n.ends_with(".json"))
+        })
+        .collect();
+    entries.sort();
+    assert!(!entries.is_empty(), "no windows published, dir: {dir:?}");
+    for win in &entries {
+        windows += 1;
+        let body = std::fs::read_to_string(win).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&body).expect("window is valid JSON");
+        let records = doc["crypto_watch"].as_array().unwrap();
+        for record in records.iter().filter(|r| r["kind"] == "discovery") {
+            let found = record["process"]["modules"].as_array();
+            for module in found.into_iter().flatten() {
+                modules += 1;
+                assert!(
+                    module["verified_path"].is_null()
+                        != module["verified_path_unavailable"].is_null(),
+                    "bare-null triple without a D1 reason: {module}"
+                );
+                if !module["maps_spelling"].is_null() {
+                    evidenced += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        modules > 0 && evidenced > 0,
+        "acquisition off: no D1 evidence in {modules} module records across {windows} windows"
+    );
+}
+
 /// Second coordinator on a live out-DIR refuses pre-start (exit 2).
 #[test]
 fn sixb_double_coordinator_refused() {

@@ -482,11 +482,12 @@ fn privilege_hint_for_modules(inventory: &ModuleInventory) -> Option<String> {
         inventory.modules.len() + inventory.errors.len(),
     )
 }
-/// Human `comm=` value for one verdict line: the sampled name
-/// sanitized at this human boundary, `-` whenever the sample is
-/// anything but a present `Available` value. Null/missing renders
-/// the placeholder, never crashes.
-fn human_comm(process: &ProcessRecord) -> String {
+/// Human `comm=` value for one process line (scan verdict lines
+/// and provider process lines): the sampled name sanitized at
+/// this human boundary, `-` whenever the sample is anything but
+/// a present `Available` value. Null/missing renders the
+/// placeholder, never crashes.
+pub(crate) fn human_comm(process: &ProcessRecord) -> String {
     if process.comm_status == IdentityAvailability::Available {
         let shown = process
             .comm
@@ -500,8 +501,9 @@ fn human_comm(process: &ProcessRecord) -> String {
     "-".to_string()
 }
 
-/// Human `exe=` value for one verdict line: the last two components
-/// of the sampled spelling, sanitized via
+/// Human `exe=` value for one process line (scan verdict lines
+/// and provider process lines): the last two components of the
+/// sampled spelling, sanitized via
 /// [`crate::report::safe_display`] at this human boundary (`exe` is
 /// verbatim-lossy in JSON — machine T4 parked minor). `-` when the
 /// sample never observed anything (`Unreadable`); `unavailable`
@@ -509,7 +511,7 @@ fn human_comm(process: &ProcessRecord) -> String {
 /// `TooLong` — a truncated tail would mislabel — or a missing value
 /// despite `Available`). Null/missing renders a placeholder, never
 /// crashes.
-fn human_exe(process: &ProcessRecord) -> String {
+pub(crate) fn human_exe(process: &ProcessRecord) -> String {
     if process.exe_status == IdentityAvailability::Available {
         if let Some(exe) = process.exe.as_deref() {
             let safe = crate::report::safe_display(exe);

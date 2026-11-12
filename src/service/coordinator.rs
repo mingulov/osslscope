@@ -1441,12 +1441,17 @@ fn open_engine(
         Some(lease) => leases.push(lease),
         None => return prestart_exit4(diag, lock, "engine pool exhausted"),
     }
+    // R13 always-acquire (F-NEW-2): the engine always acquires
+    // D1 path evidence — verified path or null + finite reason —
+    // exactly like the CLI crypto-watch path (`acquire_paths`).
+    // The outer `resolve_paths` below stays render intent
+    // (machine-JSON-only service, `terminal: false`).
     let engine_config = crate::crypto_watch::CryptoWatchConfig {
         selection: crate::inventory::scope::Selection {
             pids: cfg.pids.clone(),
             cgroup: cfg.cgroup.clone(),
             modules: cfg.modules.clone(),
-            resolve_paths: false,
+            resolve_paths: true,
         },
         max_active: crate::crypto_watch::CryptoWatchConfig::default().max_active,
         max_state_bytes: POOL_BYTES,
