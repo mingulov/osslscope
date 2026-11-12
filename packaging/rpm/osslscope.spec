@@ -95,6 +95,10 @@ exit 0
 /usr/share/doc/%{name}/
 
 %changelog
+* Thu Nov 12 2026 Denis Mingulov <denis@mingulov.com> - 0.6.0-1
+- 0.6.0 candidate package: usability slice (machine path/identity/version
+  evidence, human rows by default, interrupt contract, paths acquired by
+  default); suite green, typed-load positives blocked.
 * Mon Nov 02 2026 Denis Mingulov <denis@mingulov.com> - 0.5.0-1
 - 0.5.0 candidate package: honesty slice (named acquisition failures,
   sectioned doctor, exit 3/4 reasons, inventory identity/coalesced gaps),

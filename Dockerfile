@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# osslscope limited-capability container image (0.5.0).
+# osslscope limited-capability container image (0.6.0).
 #
 # Multi-stage source build. The builder compiles the pinned toolchains
 # (Rust 1.88.0 + nightly-2026-05-20 + bpf-linker 0.10.4) and runs the
