@@ -179,11 +179,15 @@ fn human_output_carries_the_same_finite_facts_and_gaps() {
     ]);
     assert_eq!(output.status.code(), Some(3));
     let text = String::from_utf8_lossy(&output.stdout);
+    // v0.6.0 renders the sample line as `provider sample:` (the old
+    // `snapshot N:` tick dump is gone); expecting the bare word
+    // `snapshot` only passed via the timing-dependent
+    // `snapshot_lag` gap and flaked on CI. Pin the contract line.
     for expected in [
         "bpf_unavailable",
         "unknown",
         "not_observed",
-        "snapshot",
+        "provider sample:",
         "end",
     ] {
         assert!(text.contains(expected), "{text}");
