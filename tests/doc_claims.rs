@@ -142,6 +142,40 @@ fn m3_examples_and_response_tables_are_current() {
     );
 }
 
+/// R15 (codex fix round 2): the interrupt-contract ack promise is
+/// scoped to the acking routes — inventory scan/watch, provider
+/// observe, crypto watch, classic capture report/check — and the
+/// modern focused report/check route is explicitly ack-less in
+/// v0.6.0 with a follow-up note. Behavior side:
+/// `focused_capture::run` installs the legacy non-acking `Signals`
+/// token (`src/provider_observation/cli.rs:123-125`, explicitly out
+/// of v0.6.0-signals scope).
+#[test]
+fn r15_interrupt_contract_scopes_ack_promise_to_acking_routes() {
+    let text = read_doc("usage.md");
+    let flat = text.replace('\n', " ");
+    assert!(
+        !text.contains("covers every long-running command"),
+        "usage.md must not promise the interrupt contract for every long-running command"
+    );
+    assert!(
+        flat.contains("classic `report`/`check` capture"),
+        "usage.md must scope the ack promise to classic report/check capture"
+    );
+    assert!(
+        text.contains("The modern focused `report`/`check` route is ack-less in v0.6.0:"),
+        "usage.md must name the focused report/check route ack-less in v0.6.0"
+    );
+    assert!(
+        text.contains("it keeps the legacy non-acking signal token"),
+        "usage.md must state the focused route keeps the non-acking token"
+    );
+    assert!(
+        flat.contains("Extending the first-signal ack to the focused route is follow-up work."),
+        "usage.md must note the focused ack as follow-up work"
+    );
+}
+
 /// M3: the proof-boundary doc no longer presents v0.3 as
 /// current for a v0.5.0 tree.
 #[test]

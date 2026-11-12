@@ -554,11 +554,17 @@ sink may prevent delivery, including delivery of the end record itself.
 
 ## Interrupt contract
 
-This covers every long-running command: `scan --watch`, the
-`--observe-providers` and `--observe-crypto` arms, and `report`/`check`
-capture. One-shot `scan` and `inspect` install no signal handling: a
-signal ends them with the conventional `128 + signo` status and no ack
-or end record.
+This covers the acking long-running routes: `scan --watch`, the
+`--observe-providers` and `--observe-crypto` arms, and classic
+`report`/`check` capture. One-shot `scan` and `inspect` install
+no signal handling: a signal ends them with the conventional
+`128 + signo` status and no ack or end record.
+
+The modern focused `report`/`check` route is ack-less in v0.6.0:
+it keeps the legacy non-acking signal token, so the first
+SIGINT/SIGTERM prints no ack there (cancellation still stops it
+at the next boundary). Extending the first-signal ack to the
+focused route is follow-up work.
 
 Send SIGINT/SIGTERM (Ctrl-C, `kill`, `docker kill --signal=…`) to the
 osslscope observer PID only — never to a process group containing the
@@ -567,8 +573,8 @@ waits on, or otherwise disturbs the observed processes; they keep
 running after it exits. Check workload survival with your independent
 runtime/host tools.
 
-The first SIGINT/SIGTERM prints exactly one ack on stderr, at every
-verbosity level:
+On the covered routes, the first SIGINT/SIGTERM prints exactly one
+ack on stderr, at every verbosity level:
 
 `osslscope: received {SIGINT|SIGTERM}, shutting down…`
 
