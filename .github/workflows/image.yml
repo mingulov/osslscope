@@ -15,10 +15,14 @@ on:
 permissions:
   contents: read
   packages: write
-  # Sigstore signing for tag provenance attestations (pushed to
-  # GHCR alongside the image; verify with `gh attestation verify
+  # Sigstore signing for tag provenance attestations: registry
+  # provenance rides the push, and the API entry below makes
+  # plain `gh attestation verify oci://...` work (verify with
+  # `gh attestation verify
   # oci://ghcr.io/mingulov/osslscope:<tag> --owner mingulov`).
   id-token: write
+  attestations: write
+  artifact-metadata: write
 
 concurrency:
   group: image-${{ github.ref }}
@@ -83,6 +87,7 @@ jobs:
           driver: docker-container
 
       - name: Build image
+        id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
@@ -95,3 +100,10 @@ jobs:
           # stay bare.
           provenance: ${{ steps.meta.outputs.push == 'true' }}
           sbom: false
+
+      - name: Attest image provenance
+        if: steps.meta.outputs.push == 'true'
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ghcr.io/mingulov/osslscope
+          subject-digest: ${{ steps.build.outputs.digest }}
