@@ -1011,8 +1011,10 @@ impl<W: Write> Output<'_, W> {
                 )?;
                 // T5 `--resolve-paths` (external F4): per-record
                 // writer over the source snapshot's sidecar
-                // (construction is I/O-free; fragments render only
-                // when flag + terminal + human all hold).
+                // (construction is I/O-free; live fragments render
+                // only when flag + terminal + human all hold —
+                // otherwise the snapshot-evidence fallback below
+                // renders instead).
                 let writer = sidecar.map(|sidecar| {
                     crate::inventory::resolve::TerminalPathWriter::new(
                         self.resolve_paths && !self.json,

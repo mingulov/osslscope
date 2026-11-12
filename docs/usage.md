@@ -1,14 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Usage
 
-The v0.5.0 observer starts with passive discovery, optionally observes
+The v0.6.0 observer starts with passive discovery, optionally observes
 public provider interfaces, and counts learned physical callback entries for
 one selected process. The supported lane (x86-64, 6.9+ feature-probed
 kernel, BTF, cgroup v2, stock OpenSSL 3.5.x) is in the
 [README support matrix](../README.md#support-matrix-050-lane); start with the
 [quickstart](quickstart.md). Installed/platform qualification is separate
 from source behavior; the latest qualification record is
-[v0.4.0](release-v0.4.0.md) (no v0.5.0 record exists yet).
+[v0.4.0](release-v0.4.0.md) (no v0.5.0 or v0.6.0 record exists yet).
 
 ## Automatic crypto watch
 
@@ -133,8 +133,11 @@ own render rules: flag-off rows show the labeled operator-supplied
 spelling, and piped flag-on rows render `path=(not-a-terminal)`
 placeholders instead of paths (so redirected `--module` human bytes do
 differ from flag-off by those placeholders — never by path text).
-Resolved strings are sanitized (control bytes neutralized) and bounded
-to 200 chars for terminal display. Residuals, documented and accepted:
+Resolved strings are sanitized (control bytes neutralized) for
+terminal display: live re-resolutions and operator spellings
+truncate to 200 chars, maps hints to 80, and snapshot verified
+paths render the machine spelling (bounded at 4096 at
+acquisition). Residuals, documented and accepted:
 default output is host-path-bearing everywhere it travels — visible to
 terminal recording, shared tmux/screen sessions, screen sharing,
 shoulder-surfing, and anyone receiving support bundles, tickets, or

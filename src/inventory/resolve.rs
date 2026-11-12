@@ -1028,7 +1028,9 @@ pub(crate) fn encode_machine_path(bytes: &[u8]) -> (String, super::PathEncoding)
 
 /// Display pipeline (rule 7 + defense in depth): lossy decode,
 /// target-pid normalization, control sanitization, 200-char bound
-/// with `…`. Applied to EVERY emitted path; placeholders bypass.
+/// with `…`. Applied to every live re-resolution; snapshot
+/// verified paths render the machine spelling via `human_path`,
+/// placeholders bypass.
 pub(crate) fn display_path(canonical: &Path) -> String {
     let lossy = canonical.as_os_str().to_string_lossy();
     // Defense in depth (rule 6 already enforced structurally):
@@ -1073,10 +1075,12 @@ pub(crate) fn path_value(capability: Option<&RowCapability>) -> String {
 }
 
 /// Dedicated terminal writer (rules 2-4): the ONLY home that turns
-/// row capabilities into display strings. Flag-off callers OMIT
-/// the fragment (`None` — byte-identical output, zero resolver
-/// I/O); flag-on callers render exactly one `path=...` value per
-/// object row.
+/// row capabilities into display strings. Flag-off live fragments
+/// return `None` (zero resolver I/O); callers fall back to
+/// acquired evidence instead of omitting (`human_path` snapshot
+/// evidence on discovery rows, the operator spelling on
+/// `--module` rows). Flag-on callers render exactly one
+/// `path=...` value per object row.
 pub(crate) struct TerminalPathWriter<'a> {
     flag: bool,
     terminal: bool,
