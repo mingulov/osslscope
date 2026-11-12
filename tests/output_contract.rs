@@ -7188,8 +7188,9 @@ fn v060_default_human_scan_acquires_real_paths() {
     assert!(mapped, "TLS child {pid} never mapped libssl");
     // Most-verifiable observer available: direct when root,
     // passwordless sudo when offered, else the unprivileged leg
-    // (candidate rows carry the maps hint — still acquired
-    // evidence, still failing pre-H8 as `(unavailable)`).
+    // (same-user scans may VERIFY or fall back to the maps hint —
+    // accept any acquired evidence, still failing pre-H8 as
+    // `(unavailable)` either way).
     let euid_root = unsafe { libc::geteuid() } == 0;
     let sudo_ok = !euid_root
         && std::process::Command::new("sudo")
@@ -7219,8 +7220,8 @@ fn v060_default_human_scan_acquires_real_paths() {
     } else {
         assert!(
             rows.iter()
-                .any(|row| row.contains("path=(unverified maps hint: /")),
-            "H8: no maps hint in default human rows: {text}"
+                .any(|row| row.contains("path=/") || row.contains("path=(unverified maps hint: /")),
+            "H8: no path evidence in default human rows: {text}"
         );
     }
 }
