@@ -1,6 +1,21 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 # Changelog
 
+## Unreleased (v0.6.0 signals)
+
+- P0-8 interrupt contract: the first SIGINT/SIGTERM across setup,
+  acquisition, observation, and teardown prints one stderr ack
+  (`osslscope: received {SIGINT|SIGTERM}, shutting down…`), then ends
+  with the arm's normal end record plus the normal exit (usually 3),
+  and never signals the observed workload. EINTR checks cancellation
+  before retry; teardown closes are bounded by a best-effort
+  one-second `SHUTDOWN_DEADLINE` (no universal 1s shutdown guarantee).
+  A second signal exits immediately with 130 (SIGINT) or 143 (SIGTERM)
+  and no end-record guarantee. The capture path is off BSD `signal()`
+  onto the shared `Shutdown` token; one-shot `scan`/`inspect` stay
+  uninstrumented (conventional `128 + signo` status). See
+  `docs/usage.md` ("Interrupt contract").
+
 ## Unreleased (v0.6.0 human surface)
 
 - BREAKING (S1/S3/S5/S6 stdout split): human stdout no longer

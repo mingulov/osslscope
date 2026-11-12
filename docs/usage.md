@@ -547,6 +547,48 @@ workloads keep running. The library `watch::run` uses a caller-supplied
 and stops acquisition. An output end record is attempted once, but a failed
 sink may prevent delivery, including delivery of the end record itself.
 
+## Interrupt contract
+
+This covers every long-running command: `scan --watch`, the
+`--observe-providers` and `--observe-crypto` arms, and `report`/`check`
+capture. One-shot `scan` and `inspect` install no signal handling: a
+signal ends them with the conventional `128 + signo` status and no ack
+or end record.
+
+Send SIGINT/SIGTERM (Ctrl-C, `kill`, `docker kill --signal=…`) to the
+osslscope observer PID only — never to a process group containing the
+workload, and never to the workload itself. The observer never signals,
+waits on, or otherwise disturbs the observed processes; they keep
+running after it exits. Check workload survival with your independent
+runtime/host tools.
+
+The first SIGINT/SIGTERM prints exactly one ack on stderr, at every
+verbosity level:
+
+`osslscope: received {SIGINT|SIGTERM}, shutting down…`
+
+The observer then stops at the next cancellation boundary — in setup,
+acquisition, observation, or teardown — and ends with the arm's normal
+end record (`interrupted` / `Watch ended:` for passive watch, the
+corresponding provider or `Crypto watch end: cancelled` block for the
+observe arms) plus the normal exit status, usually 3. Partial history is
+never erased: cumulative uncertainty from earlier samples survives the
+interrupt.
+
+Teardown closes are bounded by a one-second shutdown deadline
+(`SHUTDOWN_DEADLINE`): closes still pending past the deadline are
+skipped and recorded as a gap. The deadline is best-effort, not a
+guarantee: a stalled filesystem/output syscall or a blocked sink can
+delay shutdown past it, and no universal 1s shutdown bound is claimed.
+A second SIGINT/SIGTERM while the first is still shutting down exits
+immediately with `128 + signo` — 130 for SIGINT, 143 for SIGTERM —
+with no end-record guarantee.
+
+When attached via the docker client, its `got N SIGTERM/SIGINTs` line
+is client chatter counting your keystrokes, not observer output (the
+string lives in the docker binary, nowhere in osslscope sources);
+read the observer's own ack and end record instead.
+
 ## Provider observation
 
 ```sh
