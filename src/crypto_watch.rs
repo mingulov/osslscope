@@ -1033,6 +1033,13 @@ impl<W: Write> Output<'_, W> {
                         writer.fragment(m.identity_status, (m.info.device, m.info.inode))
                     }) {
                         write!(w, " path={fragment}")?;
+                    } else if let Some(writer) = writer.as_ref() {
+                        // R13: flag-off rows fall back to the acquired
+                        // snapshot evidence — never omit what was
+                        // acquired (`fragment` returns `None` only
+                        // when the flag is off, so the fallback's
+                        // live branch is dead here).
+                        write!(w, " path={}", writer.human_path(m))?;
                     }
                     if level >= 1 {
                         write!(w, " {}", inventory::human_exports(&m.info.exports))?;
@@ -6358,8 +6365,11 @@ mod tests {
             .unwrap();
             String::from_utf8(bytes).unwrap()
         };
-        // Flag off: byte-identical rows, no fragments.
-        assert!(!render(false, true, false).contains("path="));
+        // Flag off: rows carry acquired snapshot evidence (this
+        // fixture acquires nothing, so both rows report the
+        // genuinely-unacquirable placeholder — R13, never omit).
+        let text = render(false, true, false);
+        assert_eq!(text.matches("path=(unavailable)").count(), 2, "got: {text}");
         // Flag on, terminal: verified joins nothing (unavailable),
         // candidate never resolves (unverified).
         let text = render(true, true, false);
@@ -6374,6 +6384,53 @@ mod tests {
         );
         // JSON: machine envelope, no fragments.
         assert!(!render(true, true, true).contains("path="));
+    }
+
+    // R13 follow-up (H8 review minor 3): flag-off crypto Object
+    // rows carry acquired snapshot evidence — the verified path
+    // or the explicitly-unverified maps hint — never omit what
+    // was acquired.
+    #[test]
+    fn human_discovery_flag_off_carries_acquired_path() {
+        let process: inventory::ProcessRecord = serde_json::from_value(serde_json::json!({
+            "interval": {"started_unix_ms": null, "finished_unix_ms": null, "elapsed_ns": 0},
+            "namespaces": {"pid": null, "mount": null},
+            "pid": 42, "starttime": 123,
+            "modules": [
+                {"info": {"sha256": "aa", "device": 1, "inode": 2, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false}, "identity_status": "verified",
+                 "verified_path": {"path": "/lib/x86_64-linux-gnu/libcrypto.so.3", "path_encoding": "utf8", "locator_kind": "host_direct", "capture_unix_ms": null}, "verified_path_unavailable": null,
+                 "maps_spelling": {"spelling": "/lib/x86_64-linux-gnu/libcrypto.so.3", "source": "proc_maps", "verification": "unverified"}},
+                {"info": {"sha256": "bb", "device": 1, "inode": 3, "size_bytes": 3, "architecture": "x86_64", "kind": "other", "exports": [], "depends_on_libcrypto": false, "depends_on_libssl": false}, "identity_status": "locator_candidate",
+                 "verified_path": null, "verified_path_unavailable": "unverified_identity",
+                 "maps_spelling": {"spelling": "/mem/fd:deleted-lib.so", "source": "proc_maps", "verification": "unverified"}}
+            ],
+            "provider_activation": "unknown", "provider_interfaces": "unknown", "execution": "not_observed"
+        })).unwrap();
+        let sidecar = crate::inventory::resolve::ResolveSidecar::default();
+        let mut bytes = Vec::new();
+        let mut out = Output {
+            writer: &mut bytes,
+            sequence: 0,
+            json: false,
+            pending_gaps: Vec::new(),
+            resolve_paths: false,
+            terminal: false,
+            verbosity: 0,
+        };
+        out.emit(Record::Discovery {
+            process: &process,
+            sidecar: Some(&sidecar),
+        })
+        .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(
+            text.contains("path=/lib/x86_64-linux-gnu/libcrypto.so.3"),
+            "got: {text}"
+        );
+        assert!(
+            text.contains("path=(unverified maps hint: /mem/fd:deleted-lib.so)"),
+            "got: {text}"
+        );
     }
 
     #[test]

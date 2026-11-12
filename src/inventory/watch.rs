@@ -411,11 +411,17 @@ fn human_change_line(
             super::resolve::TerminalPathWriter::short_sha(&module.info.sha256)
         )?;
         // T5 `--resolve-paths`: TTY-only fragment from the
-        // dedicated writer (omitted unless flag on; never in the
-        // machine record).
+        // dedicated writer (never in the machine record). R13:
+        // flag-off lines fall back to the acquired snapshot
+        // evidence via `human_path` — never omit what was
+        // acquired (`change_fragment` returns `None` only when
+        // the flag is off, so the fallback's live branch is dead
+        // here).
         let value = serde_json::to_value(module).map_err(io::Error::other)?;
         if let Some(fragment) = paths.change_fragment(&value) {
             write!(writer, " path={fragment}")?;
+        } else {
+            write!(writer, " path={}", paths.human_path(module))?;
         }
     }
     writeln!(writer)
@@ -1245,6 +1251,78 @@ mod tests {
         assert!(line.contains("module_seen pid=42 starttime=7"), "{line}");
         assert!(line.contains("sha256=abababababab"), "{line}");
         assert!(!line.contains(&full), "full hash on human line: {line}");
+    }
+
+    // R13 follow-up (H8 review minor 3): flag-off change lines
+    // carry acquired snapshot evidence — the verified path, the
+    // explicitly-unverified maps hint, or the genuinely-
+    // unacquirable placeholder — never omit what was acquired.
+    #[test]
+    fn human_change_line_flag_off_carries_acquired_path() {
+        use crate::inventory as inv;
+        let sidecar = inv::resolve::ResolveSidecar::default();
+        let paths = inv::resolve::TerminalPathWriter::new(false, false, &sidecar);
+        let record = |verified_path: Option<inv::VerifiedPath>,
+                      maps_spelling: Option<inv::MapsSpelling>| {
+            inv::ModuleRecord {
+                info: inv::ModuleInfo {
+                    sha256: "ab".repeat(32),
+                    device: 1,
+                    inode: 2,
+                    size_bytes: 3,
+                    architecture: inv::Architecture::X86_64,
+                    kind: inv::ObjectKind::Other,
+                    exports: Vec::new(),
+                    depends_on_libcrypto: false,
+                    depends_on_libssl: false,
+                    file_soname: None,
+                    file_openssl_version: None,
+                    file_version_status: inv::FileVersionStatus::Absent,
+                },
+                identity_status: inv::IdentityStatus::Verified,
+                verified_path,
+                verified_path_unavailable: None,
+                maps_spelling,
+            }
+        };
+        let render = |module: inv::ModuleRecord| {
+            let change = super::Change {
+                kind: super::ChangeKind::ModuleSeen,
+                pid: 42,
+                starttime: 7,
+                module: Some(module),
+            };
+            let mut bytes = Vec::new();
+            super::human_change_line(&mut bytes, &change, &paths).unwrap();
+            String::from_utf8(bytes).unwrap()
+        };
+        let line = render(record(
+            Some(inv::VerifiedPath {
+                path: "/lib/x86_64-linux-gnu/libcrypto.so.3".to_string(),
+                path_encoding: inv::PathEncoding::Utf8,
+                locator_kind: inv::LocatorKind::HostDirect,
+                capture_unix_ms: None,
+            }),
+            None,
+        ));
+        assert!(
+            line.contains("path=/lib/x86_64-linux-gnu/libcrypto.so.3"),
+            "{line}"
+        );
+        let line = render(record(
+            None,
+            Some(inv::MapsSpelling {
+                spelling: "/mem/fd:deleted-lib.so".to_string(),
+                source: inv::MapsSource::ProcMaps,
+                verification: inv::MapsVerification::Unverified,
+            }),
+        ));
+        assert!(
+            line.contains("path=(unverified maps hint: /mem/fd:deleted-lib.so)"),
+            "{line}"
+        );
+        let line = render(record(None, None));
+        assert!(line.contains("path=(unavailable)"), "{line}");
     }
 
     // F8/H2: the run end status is cumulative, never the last

@@ -1145,7 +1145,10 @@ impl<'a> TerminalPathWriter<'a> {
     /// `verified_path.path` (sanitized for display), else the
     /// explicitly-unverified maps hint (80 chars), else
     /// `(unavailable)`. Piped rows never render `(not-a-terminal)`.
-    fn human_path(&self, module: &super::ModuleRecord) -> String {
+    /// Shared by snapshot rows (`object_rows`), watch change lines,
+    /// and crypto discovery rows: every human renderer shows the
+    /// same acquired evidence for the same record.
+    pub(crate) fn human_path(&self, module: &super::ModuleRecord) -> String {
         if self.flag && self.terminal {
             return self
                 .fragment(
