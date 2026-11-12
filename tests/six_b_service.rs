@@ -255,12 +255,29 @@ fn sixb_one_window_finalizes() {
 #[test]
 fn sixb_window_discovery_carries_path_evidence() {
     let dir = fresh_dir("window-paths");
-    // TLS workload (a plain sleep maps no OpenSSL — a vacuous
-    // fixture with no module rows).
-    let mut child = Command::new("python3")
-        .args(["-c", "import ssl, time; time.sleep(120)"])
+    // Preloaded sleeper, not python+ssl: a cold debug scan costs
+    // ~0.4-0.5s (hogs/CI slower) against a tick budget, and an
+    // over-budget scan drops the WHOLE process record in
+    // `validate()` — no Discovery, no segment, ever (death
+    // spiral: the parse cache never warms). Python+0.2s escapes
+    // on fast machines but not on loaded CI (0 modules across 4
+    // windows); the preloaded sleep's two big files never escape
+    // 0.2s anywhere. The 2s tick below fits the worst case with
+    // 4x margin here and still fits a 3x-slower CI; the D1
+    // assertion is timing-agnostic.
+    let lib = [
+        "/usr/lib64/libcrypto.so.3",
+        "/usr/lib/x86_64-linux-gnu/libcrypto.so.3",
+        "/lib64/libcrypto.so.3",
+    ]
+    .into_iter()
+    .find(|p| std::path::Path::new(p).exists())
+    .expect("HOST discovery-path test requires a system libcrypto");
+    let mut child = Command::new("/bin/sleep")
+        .arg("120")
+        .env("LD_PRELOAD", lib)
         .spawn()
-        .expect("spawn tls sleeper");
+        .expect("spawn preloaded sleeper");
     std::thread::sleep(std::time::Duration::from_millis(500));
     let pid = child.id().to_string();
     let mut svc = bin()
@@ -269,12 +286,12 @@ fn sixb_window_discovery_carries_path_evidence() {
         .arg("--pid")
         .arg(&pid)
         .arg("--window")
-        .arg("1")
+        .arg("2")
         .arg("--interval")
-        .arg("0.2")
+        .arg("2")
         .spawn()
         .expect("spawn service");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    std::thread::sleep(std::time::Duration::from_secs(6));
     unsafe { libc::kill(svc.id() as i32, libc::SIGTERM) };
     let status = svc.wait().expect("wait service");
     let _ = child.kill();
