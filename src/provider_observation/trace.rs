@@ -468,16 +468,48 @@ pub(crate) fn is_false(b: &bool) -> bool {
     !b
 }
 
-/// Document schema minor (`observed-crypto-v2.N`) from either
-/// document shape (producer `schema`, doc_json/raw
-/// `schema_version`). Unparseable/absent reads `None` (the
-/// contract fails closed where a version is required).
-pub(crate) fn doc_minor(doc: &serde_json::Value) -> Option<u64> {
-    let v = doc
-        .get("schema_version")
+/// Document shape for canonical discriminator binding (P2fix8
+/// NEW-51): each input shape carries exactly ONE version
+/// discriminator — producer documents `schema`, doc_json/raw
+/// documents `schema_version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocShape {
+    Producer,
+    Raw,
+}
+
+/// Document schema minor (`observed-crypto-v2.N`) from the
+/// CANONICAL discriminator for the input shape (P2fix8 NEW-51 —
+/// `schema` for producer docs, `schema_version` for
+/// doc_json/raw docs; no override). A present FOREIGN
+/// discriminator rejects (a conflicting alias — even an
+/// agreeing one — has no standing: the shared selector's
+/// alias-priority let a producer v2.9 document with an added
+/// earlier-version alias skip the v2.9 trigger and enter the
+/// fold sectionless). Unparseable/absent canonical reads
+/// `None` (the contract fails closed where a version is
+/// required).
+pub(crate) fn canonical_minor(
+    doc: &serde_json::Value,
+    shape: DocShape,
+) -> Result<Option<u64>, String> {
+    let (canonical, foreign) = match shape {
+        DocShape::Producer => ("schema", "schema_version"),
+        DocShape::Raw => ("schema_version", "schema"),
+    };
+    if doc.get(foreign).is_some() {
+        return Err(format!(
+            "doc.{foreign}: foreign discriminator on a {} document (canonical is {canonical})",
+            match shape {
+                DocShape::Producer => "producer",
+                DocShape::Raw => "doc_json/raw",
+            }
+        ));
+    }
+    Ok(doc
+        .get(canonical)
         .and_then(|x| x.as_str())
-        .or_else(|| doc.get("schema").and_then(|x| x.as_str()))?;
-    v.strip_prefix("observed-crypto-v2.")?.parse().ok()
+        .and_then(|v| v.strip_prefix("observed-crypto-v2.")?.parse().ok()))
 }
 
 /// Required-nullable presence + non-nullable null rules (P2fix4
@@ -1673,8 +1705,9 @@ pub struct TraceProducer {
     boundary_failed: bool,
     /// Positive terminal-drain receipt (P2fix5 NEW-23): set ONLY
     /// by [`Self::note_terminal_drain`] on a quiescence-confirmed
-    /// clean terminal drain (affirmative writer quiescence + ring
-    /// exhaustion — a bare `None` is NOT clean). The fresh-
+    /// clean terminal drain (successful RCU gate close = writer
+    /// quiescence, spaced position samples = ring exhaustion —
+    /// P2fix8 NEW-49 attribution; a bare `None` is NOT clean). The fresh-
     /// boundary proof requires it: host finalization alone
     /// (settled + clean, no drainage evidence) carries taint,
     /// never clears it. Consumed by the next close; voided by any
@@ -2139,7 +2172,9 @@ impl TraceProducer {
     /// carries through the terminal seal, never clears on it). A
     /// QUIESCENCE-CONFIRMED clean terminal drain stores the
     /// positive drain receipt (the session passes true ONLY after
-    /// affirmative writer quiescence + ring exhaustion — a bare
+    /// a successful RCU gate close (writer quiescence) +
+    /// affirmative ring exhaustion (spaced producer==consumer
+    /// position samples — P2fix8 NEW-49 attribution) — a bare
     /// ring `None` is busy-or-empty, never clean by itself). The
     /// fresh-boundary proof requires the receipt: without it the
     /// seal carries, never clears. Called by the session exactly
@@ -2315,10 +2350,11 @@ impl TraceProducer {
         // accounted) plus a clean close (empty pending, no fresh
         // corruption of any kind) on a SUCCESSFUL producer
         // boundary (no terminal-cut failure latched) WITH a
-        // positive terminal-drain receipt (the session proved
-        // writer quiescence + ring exhaustion — host finalization
-        // alone withholds interpreted data on the unproved
-        // terminal boundary). Empty host pending maps alone NEVER
+        // positive terminal-drain receipt (the session proved the
+        // RCU gate close (writer quiescence) + ring exhaustion
+        // (position samples — P2fix8 NEW-49 attribution) — host
+        // finalization alone withholds interpreted data on the
+        // unproved terminal boundary). Empty host pending maps alone NEVER
         // clear taint (an idle close after a tainted one stays
         // carried): mid-run closes carry; only a settled clean
         // close proves the next window fresh. Epoch totals latch

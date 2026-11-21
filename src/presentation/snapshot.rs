@@ -1173,14 +1173,16 @@ fn checkpoint_parent_id(checkpoint: &Path) -> Option<(u64, u64)> {
 }
 
 /// Prove containment + identity of an OPENED checkpoint parent
-/// (P2fix7 NEW-44): the directory is opened FIRST, then the
-/// caller-supplied parent path is resolved FRESH
-/// (canonical — every symlink level defeated), containment is
-/// proven on it (outside the canonical producer dir), and the
-/// path's CURRENT occupant must BE the opened fd (identity
-/// match — a substitution between open and validation fails
-/// closed, never binds the stranger). The returned identity is
-/// the OPENED fd's own (device, inode) — the SAME directory
+/// (P2fix7 NEW-44, reworked P2fix8 NEW-50): the directory is
+/// opened FIRST, then TWO separate checks run — pathname
+/// OCCUPANCY (the path's current occupant must BE the opened
+/// fd — a pure identity check, carrying no containment) and
+/// fd-anchored CONTAINMENT (outside-ness proven on the OPENED
+/// fd itself by walking its real ancestry — no
+/// canonicalize-then-metadata split across a swap: a path that
+/// resolves outside for one lookup and inside for the next can
+/// no longer bless an inside directory). The returned identity
+/// is the OPENED fd's own (device, inode) — the SAME directory
 /// the staging below runs in (dirfd-relative), validated before
 /// any staging write. (No `/proc/self/fd` readlink: the kernel
 /// tracks the fd across renames, so a readlink would follow the
@@ -1193,6 +1195,9 @@ fn validate_opened_parent(
     display: &Path,
 ) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
+    // Occupancy (pure identity — the path's CURRENT occupant
+    // must BE the opened fd; a substitution between open and
+    // validation fails closed, never binds the stranger).
     let canon = std::fs::canonicalize(parent).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1202,28 +1207,11 @@ fn validate_opened_parent(
             ),
         )
     })?;
-    let out_canon = std::fs::canonicalize(out_dir).map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "osslscope: producer out-DIR unresolvable at write: {} ({e})",
-                out_dir.display()
-            ),
-        )
-    })?;
-    if canon == out_canon || canon.starts_with(&out_canon) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            format!(
-                "osslscope: checkpoint must live outside the producer out-DIR (not {})",
-                display.display()
-            ),
-        ));
-    }
-    // The path's CURRENT occupant must BE the opened fd (a
-    // substitution between open and validation fails closed —
-    // the bound identity is the fd's own, never a re-resolved
-    // stranger's).
+    // Fault injection (P2fix8 NEW-50, test-only): run the armed
+    // swap between the canonicalize and the metadata lookup
+    // (the exact fp-confirmed interleave — inert at zero).
+    #[cfg(test)]
+    parent_swap_hook::take_and_run();
     let current = std::fs::metadata(&canon).map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1243,7 +1231,147 @@ fn validate_opened_parent(
             ),
         ));
     }
+    // Containment on the OPENED fd itself (P2fix8 NEW-50).
+    if !opened_dir_is_outside(dir_fd, out_dir, display)? {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "osslscope: checkpoint must live outside the producer out-DIR (not {})",
+                display.display()
+            ),
+        ));
+    }
     Ok((opened.dev(), opened.ino()))
+}
+
+/// Outside-ness of an OPENED directory (P2fix8 NEW-50):
+/// fd-anchored ancestry — the checked side resolves NO
+/// pathname (each step opens `..` relative to the current fd,
+/// so symlink games on the path string cannot enter the
+/// proof). The producer dir opens once for its identity; the
+/// walk refuses on inside-or-equal and accepts at the
+/// filesystem root (where `..` is self). Bounded (fail
+/// closed past the cap); a non-directory fd refuses via the
+/// first openat (ENOTDIR).
+fn opened_dir_is_outside(
+    dir_fd: &std::fs::File,
+    out_dir: &Path,
+    display: &Path,
+) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    let out_id = {
+        let out_fd = std::fs::File::open(out_dir).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "osslscope: producer out-DIR unresolvable at write: {} ({e})",
+                    out_dir.display()
+                ),
+            )
+        })?;
+        let md = out_fd.metadata()?;
+        (md.dev(), md.ino())
+    };
+    let opened = dir_fd.metadata()?;
+    let mut cur_id = (opened.dev(), opened.ino());
+    if cur_id == out_id {
+        return Ok(false);
+    }
+    let mut cur = dir_fd.try_clone()?;
+    let dotdot = std::ffi::CString::new("..").expect("static");
+    for _ in 0..65536 {
+        // SAFETY: cur is a live fd; ".." is a NUL-free name
+        // (never a symlink — O_NOFOLLOW only hardens).
+        let fd = unsafe {
+            libc::openat(
+                cur.as_raw_fd(),
+                dotdot.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "osslscope: checkpoint dir ancestry unreadable at write: {} ({})",
+                    display.display(),
+                    std::io::Error::last_os_error()
+                ),
+            ));
+        }
+        // SAFETY: openat returned a fresh owned fd.
+        let parent = unsafe {
+            use std::os::fd::FromRawFd as _;
+            std::fs::File::from(std::os::fd::OwnedFd::from_raw_fd(fd))
+        };
+        let md = parent.metadata()?;
+        let parent_id = (md.dev(), md.ino());
+        if parent_id == out_id {
+            return Ok(false);
+        }
+        if parent_id == cur_id {
+            return Ok(true);
+        }
+        cur = parent;
+        cur_id = parent_id;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "osslscope: checkpoint dir ancestry too deep at write: {}",
+            display.display()
+        ),
+    ))
+}
+
+/// Test-only one-shot swap hook (P2fix8 NEW-50): armed by the
+/// pin, run once between the occupancy canonicalize and the
+/// metadata lookup (the fp-confirmed interleave — a path that
+/// resolves outside for one lookup and inside for the next).
+/// Inert unless armed; production never arms it.
+#[cfg(test)]
+mod parent_swap_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    pub fn take_and_run() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+    pub fn disarm() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+
+/// Test-only one-shot relocation hook (P2fix8 NEW-50): armed by
+/// the pin, run once after checkpoint-parent validation and
+/// before the first staging write (proves placement stabilizes
+/// through the validated fd + dirfd-relative staging, never by
+/// re-resolving the path). Inert unless armed; production never
+/// arms it.
+#[cfg(test)]
+mod post_validation_hook {
+    use std::cell::RefCell;
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+    }
+    pub fn arm(hook: impl FnOnce() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+    pub fn take_and_run() {
+        if let Some(hook) = HOOK.with(|h| h.borrow_mut().take()) {
+            hook();
+        }
+    }
+    pub fn disarm() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
 }
 
 /// Open the checkpoint parent, then validate the SAME opened
@@ -1316,16 +1444,23 @@ pub struct DocSignals {
 pub type TraceSummaryData = crate::provider_observation::trace::TraceSummary;
 
 /// Shared trace intake (P2fix3 GATE29): run the ONE
-/// document-level contract over a document of either shape
-/// (`None` = reject — malformed trace never projects).
-fn contract_trace(doc: &serde_json::Value) -> Option<Option<TraceSummaryData>> {
+/// document-level contract over a document of the given shape
+/// (`None` = reject — malformed trace never projects). The
+/// version trigger binds the shape's CANONICAL discriminator
+/// (P2fix8 NEW-51 — producer `schema`, doc_json
+/// `schema_version`; a foreign alias rejects).
+fn contract_trace(
+    doc: &serde_json::Value,
+    shape: crate::provider_observation::trace::DocShape,
+) -> Option<Option<TraceSummaryData>> {
     use crate::provider_observation::trace as t;
     let parsed = doc
         .get("trace_summary")
         .map(t::parse_trace_section)
         .transpose()
         .ok()?;
-    t::check_trace_contract(t::doc_minor(doc), parsed.as_ref(), doc.get("api_activity")).ok()
+    let minor = t::canonical_minor(doc, shape).ok()?;
+    t::check_trace_contract(minor, parsed.as_ref(), doc.get("api_activity")).ok()
 }
 
 /// Read producer-shaped `CaptureDocument` signals (service envelope
@@ -1408,8 +1543,9 @@ pub fn signals_from_producer(doc: &serde_json::Value) -> Option<DocSignals> {
     // required-vs-withheld, inner/outer coherence, conservation,
     // and coverage-vs-api_activity reconciliation — malformed
     // trace rejects the document before rendering/checkpointing
-    // (never a silent None).
-    let trace = contract_trace(doc)?;
+    // (never a silent None). Producer shape: canonical `schema`
+    // (P2fix8 NEW-51).
+    let trace = contract_trace(doc, crate::provider_observation::trace::DocShape::Producer)?;
     Some(DocSignals {
         state: state.to_string(),
         reasons,
@@ -1501,8 +1637,9 @@ pub fn signals_from_doc_json(doc: &serde_json::Value) -> Option<DocSignals> {
     };
     // Strict trace intake (P2fix3 GATE29 — the SAME contract
     // as the producer path): a PRESENT section must parse AND
-    // validate.
-    let trace = contract_trace(doc)?;
+    // validate. doc_json shape: canonical `schema_version`
+    // (P2fix8 NEW-51).
+    let trace = contract_trace(doc, crate::provider_observation::trace::DocShape::Raw)?;
     // The doc_json R05 `engine_observations` plane carries the
     // proved-ENGINE usability signal (DELTA-6 parity). The flat
     // projection spelling (`window` word + `calls`) applies the
@@ -2469,10 +2606,37 @@ impl Presenter {
         };
         let doc = obj_at(env, "document").ok_or_else(|| "envelope without document".to_string())?;
         let sig = signals_from_producer(doc).ok_or_else(|| "unreadable document".to_string())?;
+        // Persisted minor (P2fix8 NEW-51): derived here (before
+        // ANY mutation) from the producer CANONICAL
+        // discriminator — a foreign alias rejects the window
+        // above (via `sig`), never persists a bypassed minor.
+        let schema_minor = crate::provider_observation::trace::canonical_minor(
+            doc,
+            crate::provider_observation::trace::DocShape::Producer,
+        )
+        .map_err(|e| format!("discriminator: {e}"))?;
         // Session loss + deferred depth validate here too (typed +
         // bounded End tallies — a malformed tally rejects before
         // any mutation, like the document above).
         let (session_loss, deferred_depth) = read_end_tallies(env)?;
+        // Present window gross validates here too (P2fix8 NEW-53
+        // — strict shape + conservation BEFORE the window
+        // mutates fold state; a malformed gross rejects the
+        // whole envelope, like the tallies). ABSENT stays the
+        // documented legacy zeros (`None` below).
+        let validated_close: Option<StreamDropsShape> = match obj_at(env, "stream_gross_close") {
+            None => None,
+            Some(g) => {
+                let shape = read_stream_drops_strict(g)
+                    .ok_or_else(|| "stream_gross_close: malformed gross".to_string())?;
+                if !stream_drops_conserves(&shape) {
+                    return Err(
+                        "stream_gross_close: gross totals must equal per-reason sums".to_string(),
+                    );
+                }
+                Some(shape)
+            }
+        };
         let policy_active = obj_at(env, "policy").and_then(read_policy_active);
         // --- Validated: mutate. ---
         if self.generation != Some(generation) {
@@ -2566,18 +2730,18 @@ impl Presenter {
         // exactly-once per interval.
         self.fold_member_views(env, &run_tag);
         self.fold_seal_ledgers(env, &run_tag);
-        // Stream close GROSS (additive † field; zeros when unset).
-        let mut close = StreamDropsShape {
+        // Stream close GROSS (additive † field; zeros when unset
+        // — the documented absent legacy field). The present
+        // value was validated up front (P2fix8 NEW-53 — no
+        // zero-defaulting reader on this path anymore).
+        let close = validated_close.unwrap_or(StreamDropsShape {
             records: 0,
             bytes: 0,
             queue_full: ReasonTotals::default(),
             epipe: ReasonTotals::default(),
             stream_abandoned: ReasonTotals::default(),
-        };
+        });
         let mut configured = false;
-        if let Some(g) = obj_at(env, "stream_gross_close") {
-            close = read_stream_drops(g);
-        }
         // Configured-ness comes ONLY from the explicit marker (a
         // zero-valued additive field is unconfigured, not
         // configured-quiet) or from observed nonzero GROSS (old
@@ -2669,8 +2833,9 @@ impl Presenter {
         // Source version + activity rows (P2fix3 GATE29 — the
         // checkpoint carries what restore re-validates: the minor
         // for the section/version trigger, the rows for coverage
-        // reconciliation).
-        let schema_minor = crate::provider_observation::trace::doc_minor(doc);
+        // reconciliation). `schema_minor` was derived up front
+        // from the producer canonical discriminator (P2fix8
+        // NEW-51).
         let api_activity = doc
             .get("api_activity")
             .and_then(|a| a.as_array())
@@ -3447,6 +3612,12 @@ impl Presenter {
                 self.checkpoint_parent_id = Some(parent_id);
             }
         }
+        // Fault injection (P2fix8 NEW-50, test-only): run the
+        // armed relocation after validation, before the first
+        // staging write (placement must stabilize through the
+        // validated fd — inert at zero).
+        #[cfg(test)]
+        post_validation_hook::take_and_run();
         let bad_name = |what: &str| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -3600,6 +3771,23 @@ impl Presenter {
         let Ok(summary) = serde_json::from_slice::<serde_json::Value>(&body) else {
             return;
         };
+        // Source identity + raw uniqueness BEFORE anything
+        // mutates fold state (P2fix8 NEW-53): the summary must
+        // BE a service run summary (exact `service-run-v1`
+        // discriminator — wrong-schema artifacts never drive
+        // authoritative sealing) with unique raw keys
+        // (machine-written JSON never legitimately duplicates —
+        // whole-tree strict, like envelopes). A malformed
+        // summary ignores the WHOLE file (all-or-nothing).
+        if str_at(&summary, "schema") != Some(crate::service::state::SCHEMA_RUN) {
+            return;
+        }
+        let Ok(text) = std::str::from_utf8(&body) else {
+            return;
+        };
+        if crate::schema::check_envelope_raw_duplicates(text).is_err() {
+            return;
+        }
         let Some(run) = obj_at(&summary, "run_id").and_then(read_run_id) else {
             return;
         };
@@ -3626,9 +3814,15 @@ impl Presenter {
         // components, wrong types, either reason shape) or a
         // present-but-non-bool marker ignores the WHOLE summary
         // (the live fold continues — adoption is all-or-nothing).
+        // P2fix8 NEW-53: the gross must also CONSERVE (totals
+        // equal the per-reason sums — numerically impossible
+        // gross never enters the authority slot).
         let Some(gross) = read_stream_drops_strict(drops) else {
             return;
         };
+        if !stream_drops_conserves(&gross) {
+            return;
+        }
         if let Some(marker) = summary.get("stream_configured") {
             if !marker.is_boolean() {
                 return;
@@ -4417,49 +4611,10 @@ fn partial_for_window(state: &str, reasons: &[String]) -> EpochPartial {
     }
 }
 
-fn read_reason_totals(v: &serde_json::Value) -> ReasonTotals {
-    ReasonTotals {
-        records: u64_at(v, "records").unwrap_or(0),
-        bytes: u64_at(v, "bytes").unwrap_or(0),
-    }
-}
-
-/// Read `StreamDrops` in either shape (typed `by_reason` object or
-/// the snapshot's flattened reason keys).
-fn read_stream_drops(v: &serde_json::Value) -> StreamDropsShape {
-    let (qf, ep, sa) = if let Some(by) = obj_at(v, "by_reason") {
-        (
-            obj_at(by, "queue_full")
-                .map(read_reason_totals)
-                .unwrap_or_default(),
-            obj_at(by, "epipe")
-                .map(read_reason_totals)
-                .unwrap_or_default(),
-            obj_at(by, "stream_abandoned")
-                .map(read_reason_totals)
-                .unwrap_or_default(),
-        )
-    } else {
-        (
-            obj_at(v, "queue_full")
-                .map(read_reason_totals)
-                .unwrap_or_default(),
-            obj_at(v, "epipe")
-                .map(read_reason_totals)
-                .unwrap_or_default(),
-            obj_at(v, "stream_abandoned")
-                .map(read_reason_totals)
-                .unwrap_or_default(),
-        )
-    };
-    StreamDropsShape {
-        records: u64_at(v, "records").unwrap_or(0),
-        bytes: u64_at(v, "bytes").unwrap_or(0),
-        queue_full: qf,
-        epipe: ep,
-        stream_abandoned: sa,
-    }
-}
+// P2fix8 NEW-53: the lenient zero-defaulting gross readers
+// were REMOVED — both intake paths (summary adoption, present
+// window gross) read strict + conservation-checked via
+// `read_stream_drops_strict` + `stream_drops_conserves`.
 
 /// Latest `End` record's session loss + deferred depth (P2fix2
 /// item 24 — typed + bounded, REAL flattened `kind` shape). Absent
@@ -4661,6 +4816,26 @@ fn read_stream_drops_strict(v: &serde_json::Value) -> Option<StreamDropsShape> {
         epipe,
         stream_abandoned,
     })
+}
+
+/// Gross conservation (P2fix8 NEW-53): the producer charges
+/// gross + reason together on every fold (`queue.fold` — each
+/// dropped record adds 1 to gross records and 1 to its reason,
+/// bytes likewise), so incoming gross totals MUST equal the
+/// per-reason sums exactly. Applies to INCOMING artifacts only
+/// (summary files, present window gross) — merged slots
+/// (`current_gross`/`current_close` running maxes) need not
+/// conserve (max-merging two conserving vectors can split
+/// totals from reasons) and are validated for shape only.
+/// u128 sums (exact even near u64::MAX — no wrap).
+fn stream_drops_conserves(shape: &StreamDropsShape) -> bool {
+    let reason_records = shape.queue_full.records as u128
+        + shape.epipe.records as u128
+        + shape.stream_abandoned.records as u128;
+    let reason_bytes = shape.queue_full.bytes as u128
+        + shape.epipe.bytes as u128
+        + shape.stream_abandoned.bytes as u128;
+    shape.records as u128 == reason_records && shape.bytes as u128 == reason_bytes
 }
 
 // --- Test builders (unit-test fixtures through the real fold; NOT
@@ -4893,16 +5068,124 @@ mod tests {
     }
 
     #[test]
+    fn new50_inside_substitution_between_checks_refuses() {
+        // P2fix8 NEW-50: the fp-confirmed canonicalize/metadata
+        // split — a path resolving OUTSIDE for the canonicalize
+        // and INSIDE for the metadata lookup must NOT bless the
+        // inside directory. The fd opens on the inside dir
+        // (stays put); the parent path names a real outside dir
+        // at entry; the armed hook swaps the canonical path to a
+        // symlink over the inside dir between the two lookups
+        // (occupancy then matches the fd — the path DOES name
+        // it — so only fd-anchored containment convicts).
+        // Pre-fix (occupancy-only decision): binds the inside
+        // identity (RED). Post-fix: refuses naming outside-ness.
+        let base = unique_dir("inside-substitution");
+        let out = base.join("out");
+        let inner = out.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let x = base.join("x");
+        std::fs::create_dir_all(&x).unwrap();
+        let display = base.join("ckpt.json");
+        let fd = std::fs::File::open(&inner).unwrap();
+        let inner_id = dir_id(&inner);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        let (x_moved, inner_p) = (x.clone(), inner.clone());
+        super::parent_swap_hook::arm(move || {
+            std::fs::rename(&x_moved, x_moved.with_extension("saved")).unwrap();
+            std::os::unix::fs::symlink(&inner_p, &x_moved).unwrap();
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let err = super::validate_opened_parent(&fd, &x, &out, &display)
+            .expect_err("inside substitution between the checks must not validate");
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the hook ran between the lookups"
+        );
+        assert!(
+            format!("{err:?}").contains("outside the producer out-DIR"),
+            "fd-anchored containment names itself: {err:?}"
+        );
+        assert_eq!(
+            dir_id(&inner),
+            inner_id,
+            "premise: the fd target stayed put"
+        );
+        super::parent_swap_hook::disarm();
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn new50_destination_relocation_before_first_write_stays_stable() {
+        // P2fix8 NEW-50: placement stabilizes through staging —
+        // a destination relocation AFTER validation and BEFORE
+        // the first staging write cannot redirect the bytes: the
+        // write lands in the VALIDATED fd (dirfd-relative), never
+        // by re-resolving the path. The armed hook renames the
+        // validated parent away and replants the path as a
+        // symlink over the inside dir; the flush still commits
+        // into the moved directory and the inside dir stays
+        // empty. (Guard pin — pre-fix staging is already
+        // dirfd-relative, so this holds pre/post; it proves the
+        // stabilization half of NEW-50.)
+        let base = unique_dir("destination-relocation");
+        let out = base.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let inner = out.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            out.join("window-0000000000.json"),
+            serde_json::to_string(&test_envelope(0, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        let p = base.join("p");
+        std::fs::create_dir_all(&p).unwrap();
+        let ckpt = p.join("ckpt.json");
+        let mut presenter =
+            Presenter::open_with_checkpoint(&out, &ckpt, 1, "export").expect("open succeeds");
+        presenter.build_service().expect("first fold commits");
+        let moved = base.join("p-moved");
+        let (p2, moved2, inner2) = (p.clone(), moved.clone(), inner.clone());
+        super::post_validation_hook::arm(move || {
+            std::fs::rename(&p2, &moved2).unwrap();
+            std::os::unix::fs::symlink(&inner2, &p2).unwrap();
+        });
+        presenter
+            .flush_checkpoint()
+            .expect("post-validation relocation still commits");
+        super::post_validation_hook::disarm();
+        let moved_ckpt = moved.join("ckpt.json");
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&moved_ckpt).unwrap()).unwrap();
+        assert!(
+            v.get("checkpoint_seq").and_then(|s| s.as_u64()).is_some(),
+            "the moved dir holds a valid checkpoint: {v:?}"
+        );
+        Presenter::open_with_checkpoint(&out, &moved_ckpt, 1, "export")
+            .expect("the relocated checkpoint reloads");
+        assert!(
+            std::fs::read_dir(&inner).unwrap().next().is_none(),
+            "the inside dir stays empty"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn new44_concurrent_parent_swap_never_lands_unvalidated() {
         // P2fix7 NEW-44 race pin (COORDINATED — free-running
-        // swappers phase-lock into zero-trip trajectories): main
-        // parks the parent path (dangling/X1/inner) or orders a
-        // tight X1↔X2 flip storm, then runs a deferred-first-
-        // resolution flush (open-while-parked-dangling, so every
-        // open binds None — strict). Calm-X1 attempts commit +
-        // reload strictly; calm-inner attempts refuse on
-        // containment before any staging write; storm attempts
-        // trip the occupant match or bind X1/X2 only. EVERY
+        // swappers phase-lock into zero-trip trajectories),
+        // storm widened P2fix8 NEW-50: main parks the parent
+        // path (dangling/X1/inner) or orders a tight
+        // X1↔X2↔inner flip storm (inside substitution WHILE
+        // UNSTABLE — alternating-outside-only is insufficient),
+        // then runs a deferred-first-resolution flush
+        // (open-while-parked-dangling, so every open binds None
+        // — strict). Calm-X1 attempts commit + reload strictly;
+        // calm-inner attempts refuse on containment before any
+        // staging write; storm attempts trip the occupant match,
+        // refuse at containment, or bind X1/X2 only. EVERY
         // attempt is accounted; the inside dir never receives a
         // byte. (The C2 pin above carries the RED→GREEN; this
         // pin proves the end-to-end invariant under real races.)
@@ -4954,13 +5237,23 @@ mod tests {
                 while !done.load(Ordering::Relaxed) {
                     match mode.load(Ordering::Acquire) {
                         2 => {
-                            // Storm: tight X1↔X2 flips (every
+                            // Storm: tight X1↔X2↔inner flips
+                            // (P2fix8 NEW-50 — inside
+                            // substitution WHILE UNSTABLE, not
+                            // just alternating-outside: every
                             // flip inside an open→validate
-                            // window trips the occupant match).
-                            // Invalidates `parked` (the storm
-                            // leaves an unknown target, so the
-                            // next park must re-act).
-                            plant(if n % 2 == 0 { &x1 } else { &x2 });
+                            // window trips the occupant match,
+                            // and any open binding inner must
+                            // refuse at fd-anchored
+                            // containment). Invalidates `parked`
+                            // (the storm leaves an unknown
+                            // target, so the next park must
+                            // re-act).
+                            plant(match n % 3 {
+                                0 => &x1,
+                                1 => &x2,
+                                _ => &inner,
+                            });
                             n += 1;
                             parked = 255;
                             ack.store(2, Ordering::Release);
@@ -5011,10 +5304,10 @@ mod tests {
         // (open-while-parked-dangling, so every open binds None —
         // strict): 10 calm-X1 (stable success + strict reload),
         // 10 calm-inner (containment refusal before any staging
-        // write), 400 storm (tight X1↔X2 flips across
+        // write), 400 storm (tight X1↔X2↔inner flips across
         // open→validate windows — trips are ~3%/attempt on this
         // fs, so volume carries the occupant-match proof while
-        // successes bind X1/X2 only).
+        // successes bind X1/X2 only and inner never lands).
         for attempt in 0..420 {
             park(0);
             let mut presenter = Presenter::open_with_checkpoint(&out, &ckpt, 1, "export")
@@ -5051,7 +5344,7 @@ mod tests {
                     "attempt {attempt}: containment names itself: {err:?}"
                 );
             } else {
-                // Storm: tight X1↔X2 flips across the
+                // Storm: tight X1↔X2↔inner flips across the
                 // open→validate window.
                 park(2);
                 match presenter.flush_checkpoint() {

@@ -1280,7 +1280,7 @@ fn stream_gross_counts_one_authoritative_value_per_run() {
     // Run A's summary agrees (same run, second read — must NOT add).
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"}, "stream_configured": true, "stream_drops": {"records": 10, "bytes": 100, "by_reason": {"queue_full": {"records": 10, "bytes": 100}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"}, "stream_configured": true, "stream_drops": {"records": 10, "bytes": 100, "by_reason": {"queue_full": {"records": 10, "bytes": 100}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     std::fs::write(
@@ -1356,7 +1356,7 @@ fn summary_adoption_binds_generation_run_and_flags_disagreement() {
         .unwrap();
         p.build_service().unwrap()
     };
-    let summary_for = |generation: u64, drops: &serde_json::Value| serde_json::json!({"run_id": {"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"}, "generation": generation, "stream_configured": true, "stream_drops": drops});
+    let summary_for = |generation: u64, drops: &serde_json::Value| serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"}, "generation": generation, "stream_configured": true, "stream_drops": drops});
     // Foreign generation: ignored (gross stays close-only 10/100).
     let drops20 = serde_json::json!({"records": 20, "bytes": 200, "by_reason": {"queue_full": {"records": 20, "bytes": 200}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
     let snap = build_with("adopt-gen", &close10, &summary_for(1, &drops20));
@@ -5260,6 +5260,7 @@ fn new15_one_authoritative_gross_while_current() {
         std::fs::write(
             dir.join("run-summary.json"),
             serde_json::json!({
+                "schema": "service-run-v1",
                 "generation": 0,
                 "run_id": {"pid": 1, "starttime": 2, "boot_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
                 "stream_configured": true,
@@ -5365,7 +5366,7 @@ fn new30_successor_summary_seals_departed_run() {
     // Successor summary lands with NO successor windows yet.
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     let snap = p.build_service().expect("summary-only transition builds");
@@ -5445,7 +5446,7 @@ fn new30_mixed_provenance_survives_restart() {
     // B summary first (records-high, bytes-low).
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 10, "bytes": 50, "by_reason": {"queue_full": {"records": 10, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 10, "bytes": 50, "by_reason": {"queue_full": {"records": 10, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     p.build_service().expect("B summary adopts");
@@ -5467,7 +5468,7 @@ fn new30_mixed_provenance_survives_restart() {
     // Successor summary seals B (no C windows at all).
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 5, "starttime": 6, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 1, "bytes": 10, "by_reason": {"queue_full": {"records": 1, "bytes": 10}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 5, "starttime": 6, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 1, "bytes": 10, "by_reason": {"queue_full": {"records": 1, "bytes": 10}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     let snap = p2.build_service().expect("successor summary seals B");
@@ -5526,7 +5527,7 @@ fn new35_current_summary_reconciles_on_successor_replacement() {
     // A's summary lands while A is current (close 5, summary 8).
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 1, "starttime": 2, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 1, "starttime": 2, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     p.build_service().expect("A summary adopts while current");
@@ -5534,7 +5535,7 @@ fn new35_current_summary_reconciles_on_successor_replacement() {
     // next refresh.
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 1, "bytes": 10, "by_reason": {"queue_full": {"records": 1, "bytes": 10}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 1, "bytes": 10, "by_reason": {"queue_full": {"records": 1, "bytes": 10}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     p.build_service().expect("successor summary seals A");
@@ -5593,7 +5594,7 @@ fn new35_current_summary_survives_restart() {
     p.build_service().expect("A folds");
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 1, "starttime": 2, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 1, "starttime": 2, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     p.build_service().expect("A summary adopts while current");
@@ -5604,7 +5605,7 @@ fn new35_current_summary_survives_restart() {
         .expect("reopen restores the retained summary");
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 1, "bytes": 10, "by_reason": {"queue_full": {"records": 1, "bytes": 10}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 3, "starttime": 4, "boot_id": boot}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 1, "bytes": 10, "by_reason": {"queue_full": {"records": 1, "bytes": 10}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     p2.build_service().expect("successor summary seals A");
@@ -5637,9 +5638,11 @@ fn new46_valid_drops(records: u64, bytes: u64) -> serde_json::Value {
 }
 
 /// `run-summary.json` body for (pid, starttime) with the given
-/// drops + a valid configured marker (P2fix7 NEW-46).
+/// drops + a valid configured marker (P2fix7 NEW-46; [p2fix8
+/// NEW-53: exact source identity — sourceless summaries no
+/// longer adopt]).
 fn new46_summary(pid: u32, starttime: u64, drops: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"run_id": {"pid": pid, "starttime": starttime, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"}, "generation": 0, "stream_configured": true, "stream_drops": drops})
+    serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": pid, "starttime": starttime, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"}, "generation": 0, "stream_configured": true, "stream_drops": drops})
 }
 
 /// Malformed gross drops, one per corruption shape (P2fix7
@@ -5928,6 +5931,263 @@ fn new46_malformed_summary_ignored_across_restart() {
 }
 
 #[test]
+fn new53_malformed_current_summary_ignored() {
+    // P2fix8 NEW-53: a CURRENT-run summary with a WRONG source
+    // identity, MISSING identity, DUPLICATE raw keys, or a
+    // NON-CONSERVING gross never reaches the authority slot —
+    // validation runs BEFORE the summary mutates fold state
+    // (all-or-nothing, like NEW-46). Pre-fix: the reader
+    // accepts any `schema`, collapses raw duplicates into
+    // `Value`, and adopts gross totals inconsistent with the
+    // per-reason accounting (RED — the authority slot fills and
+    // mismatch latches against close 5).
+    use osslscope::presentation::snapshot;
+    let nonconserving = serde_json::json!({"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 5, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
+    for (what, text) in [
+        ("wrong-schema", {
+            let mut s = new46_summary(1, 2, new46_valid_drops(8, 80));
+            s["schema"] = serde_json::json!("service-window-v1");
+            s.to_string()
+        }),
+        ("missing-schema", {
+            let mut s = new46_summary(1, 2, new46_valid_drops(8, 80));
+            s.as_object_mut().unwrap().remove("schema");
+            s.to_string()
+        }),
+        ("duplicate-keys", {
+            let mut s = new46_summary(1, 2, new46_valid_drops(8, 80));
+            s["schema"] = serde_json::json!("service-run-v1");
+            let mut t = s.to_string();
+            t = t.replacen(
+                "\"stream_drops\"",
+                "\"stream_drops\":{},\"stream_drops\"",
+                1,
+            );
+            t
+        }),
+        ("non-conserving", {
+            let mut s = new46_summary(1, 2, nonconserving);
+            s["schema"] = serde_json::json!("service-run-v1");
+            s.to_string()
+        }),
+    ] {
+        let (dir, ckpt, mut p) = new46_open_a(&format!("new53-current-{what}"));
+        std::fs::write(dir.join("run-summary.json"), &text).unwrap();
+        p.build_service()
+            .expect("malformed current summary never fails the build");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        let acc = &v["accumulators"];
+        assert_eq!(
+            acc["stream_mismatch_note"], false,
+            "{what}: no mismatch latches on an ignored summary: {acc:?}"
+        );
+        assert!(
+            acc["current_summary"].is_null(),
+            "{what}: nothing reaches the authority slot: {acc:?}"
+        );
+        assert_eq!(
+            acc["current_gross"]["records"], 5,
+            "{what}: the observed close stands: {acc:?}"
+        );
+    }
+    // Valid twin (control): exact identity + conserving gross
+    // adopts (mismatch latches against close 5 — the adoption
+    // path stays intact).
+    let (dir, ckpt, mut p) = new46_open_a("new53-current-valid");
+    let mut s = new46_summary(1, 2, new46_valid_drops(8, 80));
+    s["schema"] = serde_json::json!("service-run-v1");
+    std::fs::write(dir.join("run-summary.json"), s.to_string()).unwrap();
+    p.build_service().expect("valid summary adopts");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        v["accumulators"]["current_gross"]["records"], 8,
+        "the valid gross adopts: {:?}",
+        v["accumulators"]
+    );
+}
+
+#[test]
+fn new53_malformed_successor_summary_ignored() {
+    // P2fix8 NEW-53 successor twin: a SUCCESSOR summary with a
+    // wrong identity or a non-conserving gross never triggers
+    // the seal-on-transition — the departed run stays current
+    // until a VALID successor seals it. Pre-fix: the transition
+    // fires on the malformed gross, sealing A early (RED).
+    use osslscope::presentation::snapshot;
+    let boot = "12345678-9abc-def0-1234-56789abcdef0";
+    let tag_a = format!("1-2-{boot}");
+    let nonconserving = serde_json::json!({"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 5, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
+    for (what, text) in [
+        ("wrong-schema", {
+            let mut s = new46_summary(3, 4, new46_valid_drops(1, 10));
+            s["schema"] = serde_json::json!("service-window-v1");
+            s.to_string()
+        }),
+        ("non-conserving", {
+            let mut s = new46_summary(3, 4, nonconserving);
+            s["schema"] = serde_json::json!("service-run-v1");
+            s.to_string()
+        }),
+    ] {
+        let (dir, ckpt, mut p) = new46_open_a(&format!("new53-successor-{what}"));
+        std::fs::write(dir.join("run-summary.json"), &text).unwrap();
+        p.build_service()
+            .expect("malformed successor never fails the build");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        let acc = &v["accumulators"];
+        assert!(
+            acc["sealed"].get(&tag_a).is_none(),
+            "{what}: A stays unsealed (still current): {acc:?}"
+        );
+        assert_eq!(
+            acc["current_run"],
+            serde_json::json!(tag_a),
+            "{what}: A stays current: {acc:?}"
+        );
+        // A valid successor still seals A from the observed
+        // close with the honest note.
+        let mut s = new46_summary(3, 4, new46_valid_drops(1, 10));
+        s["schema"] = serde_json::json!("service-run-v1");
+        std::fs::write(dir.join("run-summary.json"), s.to_string()).unwrap();
+        p.build_service().expect("valid successor seals A");
+        let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(
+            v["accumulators"]["sealed"][&tag_a]["source"], "close",
+            "{what}: close-only provenance: {:?}",
+            v["accumulators"]["sealed"][&tag_a]
+        );
+    }
+}
+
+#[test]
+fn new53_malformed_summary_ignored_across_restart() {
+    // P2fix8 NEW-53 restart twin: malformed current + successor
+    // artifacts stay ignored across a checkpoint restart —
+    // nothing persists a phantom gross, and the post-restart
+    // seal reads the observed close with the honest note. The
+    // valid twin (control) proves restart adoption still works.
+    use osslscope::presentation::snapshot;
+    let boot = "12345678-9abc-def0-1234-56789abcdef0";
+    let tag_a = format!("1-2-{boot}");
+    let nonconserving = serde_json::json!({"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 5, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
+    let (dir, ckpt, mut p) = new46_open_a("new53-restart");
+    let mut bad = new46_summary(1, 2, nonconserving);
+    bad["schema"] = serde_json::json!("service-window-v1");
+    std::fs::write(dir.join("run-summary.json"), bad.to_string()).unwrap();
+    p.build_service()
+        .expect("malformed current never fails the build");
+    drop(p);
+    let mut p2 =
+        snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").expect("reopen works");
+    let mut bad_b = new46_summary(3, 4, new46_valid_drops(1, 10));
+    bad_b["schema"] = serde_json::json!("service-window-v1");
+    std::fs::write(dir.join("run-summary.json"), bad_b.to_string()).unwrap();
+    p2.build_service()
+        .expect("malformed successor never fails the build");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert!(
+        v["accumulators"]["sealed"].get(&tag_a).is_none(),
+        "A stays unsealed across restart: {:?}",
+        v["accumulators"]
+    );
+    assert!(
+        v["accumulators"]["current_summary"].is_null(),
+        "nothing reaches the authority slot across restart: {:?}",
+        v["accumulators"]
+    );
+    let mut good_b = new46_summary(3, 4, new46_valid_drops(1, 10));
+    good_b["schema"] = serde_json::json!("service-run-v1");
+    std::fs::write(dir.join("run-summary.json"), good_b.to_string()).unwrap();
+    p2.build_service().expect("valid successor seals A");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        v["accumulators"]["sealed"][&tag_a]["tail_note"],
+        serde_json::json!(snapshot::NOTE_SEALED_FROM_CLOSE),
+        "the honest no-summary note survives restart: {:?}",
+        v["accumulators"]["sealed"][&tag_a]
+    );
+    // Valid twin (control): valid adoption still crosses restart.
+    let (dir2, ckpt2, mut q) = new46_open_a("new53-restart-valid");
+    let mut s = new46_summary(1, 2, new46_valid_drops(8, 80));
+    s["schema"] = serde_json::json!("service-run-v1");
+    std::fs::write(dir2.join("run-summary.json"), s.to_string()).unwrap();
+    q.build_service().expect("valid summary adopts");
+    drop(q);
+    let mut q2 = snapshot::Presenter::open_with_checkpoint(&dir2, &ckpt2, 1, "export")
+        .expect("reopen works");
+    let mut s2 = new46_summary(3, 4, new46_valid_drops(1, 10));
+    s2["schema"] = serde_json::json!("service-run-v1");
+    std::fs::write(dir2.join("run-summary.json"), s2.to_string()).unwrap();
+    q2.build_service().expect("valid successor seals A");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt2).unwrap()).unwrap();
+    assert_eq!(
+        v["accumulators"]["sealed"][&tag_a]["records"], 8,
+        "valid adoption still crosses restart: {:?}",
+        v["accumulators"]["sealed"][&tag_a]
+    );
+}
+
+#[test]
+fn new53_malformed_window_gross_rejects_envelope() {
+    // P2fix8 NEW-53 window twin: a PRESENT `stream_gross_close`
+    // validates strict shape + conservation BEFORE the window
+    // mutates fold state — a malformed gross rejects the whole
+    // envelope (like the End tallies). ABSENT stays the
+    // documented legacy zeros (control). Pre-fix: the
+    // zero-defaulting reader folds every corruption shape
+    // (RED).
+    use osslscope::presentation::snapshot;
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    for (what, gross) in [
+        (
+            "missing-records",
+            serde_json::json!({"bytes": 80, "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}),
+        ),
+        (
+            "string-bytes",
+            serde_json::json!({"records": 8, "bytes": "80", "by_reason": {"queue_full": {"records": 8, "bytes": 80}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}),
+        ),
+        (
+            "non-conserving",
+            serde_json::json!({"records": 8, "bytes": 80, "by_reason": {"queue_full": {"records": 5, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}),
+        ),
+    ] {
+        let dir = out_dir(&format!("new53-window-{what}"));
+        let mut env0 = snapshot::test_envelope(0, 0, run.clone(), 10);
+        env0["stream_gross_close"] = gross;
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&env0).unwrap(),
+        )
+        .unwrap();
+        let ckpt = ckpt_for(&dir);
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        assert!(
+            p.build_service().is_err(),
+            "{what}: a malformed window gross rejects the envelope"
+        );
+    }
+    // Absent-gross legacy control: folds with zeros.
+    let dir = out_dir("new53-window-absent");
+    let env0 = snapshot::test_envelope(0, 0, run, 10);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env0).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    p.build_service()
+        .expect("absent gross folds (legacy zeros)");
+    let v: serde_json::Value = serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+    assert_eq!(
+        v["accumulators"]["current_gross"]["records"], 0,
+        "absent gross reads legacy zeros: {:?}",
+        v["accumulators"]
+    );
+}
+
+#[test]
 fn newp2b_summary_before_window_preserves_one_gross() {
     // P2fix3 NEW-P2b: when the summary arrives BEFORE the run's
     // windows, the later seal-from-close reconciles (compare-
@@ -5944,6 +6204,7 @@ fn newp2b_summary_before_window_preserves_one_gross() {
         std::fs::write(
             dir.join("run-summary.json"),
             serde_json::json!({
+                "schema": "service-run-v1",
                 "generation": 0,
                 "run_id": {"pid": 1, "starttime": 2, "boot_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
                 "stream_configured": true,
@@ -6022,6 +6283,7 @@ fn newp2b_current_run_summary_cross_checked_strictly() {
         std::fs::write(
             dir.join("run-summary.json"),
             serde_json::json!({
+                "schema": "service-run-v1",
                 "generation": 0,
                 "run_id": {"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"},
                 "stream_configured": true,
@@ -7492,6 +7754,238 @@ fn new43_framing_grammar_counts_through_executable() {
 }
 
 #[test]
+fn new51_canonical_discriminator_binds_per_shape() {
+    // P2fix8 NEW-51 (+ GATE29-OPEN): validation binds the
+    // CANONICAL discriminator per input shape (`schema` for
+    // producer docs, `schema_version` for doc_json/raw docs) —
+    // a foreign discriminator alias never overrides it, and
+    // conflicts + duplicate raw discriminators reject. The
+    // bypass (RED pre-fix): a producer-shaped v2.9 document
+    // with an added earlier-version alias omits `trace_summary`
+    // and enters the fold (the shared selector reads the alias
+    // minor 8, so the v2.9 trigger never fires). Post-fix every
+    // gate below rejects it while legacy + v2.9 controls pass.
+    use osslscope::presentation::snapshot;
+    // Bypass shell: producer v2.9, NO trace_summary, alias v2.8.
+    let mut bypass = snapshot::test_document(3, "complete");
+    bypass["schema"] = serde_json::json!("observed-crypto-v2.9");
+    bypass["schema_version"] = serde_json::json!("observed-crypto-v2.8");
+    assert!(
+        snapshot::signals_from_producer(&bypass).is_none(),
+        "producer v2.9 + earlier alias without its section rejects"
+    );
+    // Legacy control: producer v2.8, no section, no alias —
+    // legitimately sectionless (trigger only at 9+).
+    let mut legacy = snapshot::test_document(3, "complete");
+    legacy["schema"] = serde_json::json!("observed-crypto-v2.8");
+    assert!(
+        snapshot::signals_from_producer(&legacy).is_some(),
+        "producer legacy v2.8 without a section passes"
+    );
+    // v2.9 control: producer v2.9 WITH its section, no alias.
+    let plain = new42_plain_seal();
+    let mut v29 = snapshot::test_document(3, "complete");
+    v29["schema"] = serde_json::json!("observed-crypto-v2.9");
+    v29["trace_summary"] = plain.clone();
+    assert!(
+        snapshot::signals_from_producer(&v29).is_some(),
+        "producer v2.9 with its section passes"
+    );
+    // Agreeing alias control: producer v2.9 + alias v2.9 WITH
+    // its section — the foreign discriminator still rejects
+    // (each shape carries exactly its canonical field).
+    let mut agree = v29.clone();
+    agree["schema_version"] = serde_json::json!("observed-crypto-v2.9");
+    assert!(
+        snapshot::signals_from_producer(&agree).is_none(),
+        "producer v2.9 + agreeing alias rejects"
+    );
+    // doc_json shape: canonical `schema_version`; a `schema`
+    // alias never overrides it.
+    let mut d29 = doc_json_shell();
+    d29["schema_version"] = serde_json::json!("observed-crypto-v2.9");
+    d29["trace_summary"] = plain.clone();
+    assert!(
+        snapshot::signals_from_doc_json(&d29).is_some(),
+        "doc_json v2.9 with its section passes"
+    );
+    let mut d29_alias = d29.clone();
+    d29_alias["schema"] = serde_json::json!("observed-crypto-v2.8");
+    assert!(
+        snapshot::signals_from_doc_json(&d29_alias).is_none(),
+        "doc_json v2.9 + earlier `schema` alias rejects"
+    );
+    let mut d8 = doc_json_shell();
+    d8["schema_version"] = serde_json::json!("observed-crypto-v2.8");
+    assert!(
+        snapshot::signals_from_doc_json(&d8).is_some(),
+        "doc_json legacy v2.8 without a section passes"
+    );
+    // Checkpoint persistence binds canonical too: the bypass
+    // document must reject the WINDOW (never fold + persist a
+    // bypassed minor).
+    let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+    let dir = out_dir("new51-bypass-fold");
+    let env = snapshot::test_envelope_with_doc(0, 0, run, bypass);
+    std::fs::write(
+        dir.join("window-0000000000.json"),
+        serde_json::to_string(&env).unwrap(),
+    )
+    .unwrap();
+    let ckpt = ckpt_for(&dir);
+    let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+    assert!(
+        p.build_service().is_err(),
+        "the bypass document rejects the window (never folds)"
+    );
+}
+
+#[test]
+fn new51_duplicate_raw_discriminators_reject() {
+    // P2fix8 NEW-51: duplicate raw discriminator members reject
+    // BEFORE normalization (last-wins must not pick one version
+    // for the trigger). Pre-fix: the duplicated member
+    // last-wins into a typed-valid shape and raw intake accepts
+    // (RED).
+    let plain = new42_plain_seal();
+    let complete = serde_json::json!([new37_complete_row(20, false, false, false)]);
+    let good_text = new37_doc_text(&plain, &complete);
+    osslscope::schema::check_v2_document_text(&good_text).expect("premise: valid text passes");
+    // Duplicate the top-level `schema_version` (first v2.8, then
+    // the original v2.9 — last-wins would read 9 and pass).
+    let dup = good_text.replacen(
+        "\"schema_version\"",
+        "\"schema_version\":\"observed-crypto-v2.8\",\"schema_version\"",
+        1,
+    );
+    assert_ne!(dup, good_text, "premise: the text gained a member");
+    assert!(
+        osslscope::schema::check_v2_document_text(&dup).is_err(),
+        "raw intake rejects duplicate discriminators"
+    );
+}
+
+#[test]
+fn new52_ignored_header_control_counts_through_executable() {
+    // P2fix8 NEW-52 (+ NEW-P2a-OPEN, NEW-8-OPEN, NEW-39-OPEN,
+    // NEW-43-OPEN): a recognized 2xx with an invalid control
+    // (NUL) in an IGNORED header value through the EXECUTABLE
+    // worker — the real `export` binary pushes against a stub
+    // collector. One malformed drop per push, zero redelivery
+    // (attempts == drops, every drop malformed, nothing pushes,
+    // the stub cross-checks the attempt count). Pre-fix: the
+    // NUL survives decoding and the push SUCCEEDS (RED).
+    use std::io::BufRead;
+    use std::process::Stdio;
+    struct OwnedChild(std::process::Child);
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = out_dir("new52-exec-nul");
+    seed_windows(&dir, 1);
+    let ckpt = ckpt_for(&dir);
+    let response: &'static [u8] =
+        b"HTTP/1.0 200 OK\r\nX-Trace: a\x00b\r\nContent-Length: 2\r\n\r\n{}";
+    let (port, seen, done, stub) = new39_stub(response);
+    let mut child = OwnedChild(
+        std::process::Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args([
+                "export",
+                "--out",
+                dir.to_str().unwrap(),
+                "--listen",
+                &format!("127.0.0.1:{}", free_port()),
+                "--poll-seconds",
+                "1",
+                "--otlp-enable",
+                "--otlp-endpoint",
+                &format!("http://127.0.0.1:{port}/v1/metrics"),
+                "--otlp-push-seconds",
+                "5",
+                "--checkpoint",
+                ckpt.to_str().unwrap(),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<(bool, String)>();
+    let tx2 = tx.clone();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx.send((true, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            if tx2.send((false, line)).is_err() {
+                break;
+            }
+        }
+    });
+    std::thread::sleep(std::time::Duration::from_secs(13));
+    drop(child);
+    let mut err_lines = vec![];
+    while let Ok((is_out, line)) = rx.recv_timeout(std::time::Duration::from_millis(200)) {
+        if !is_out {
+            err_lines.push(line);
+        }
+    }
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
+    stub.join().unwrap();
+    assert!(
+        err_lines.iter().any(|l| l.contains("malformed response")),
+        "notes malformed responses: {err_lines:?}"
+    );
+    let line = err_lines
+        .iter()
+        .filter(|l| l.contains("otlp push"))
+        .last()
+        .expect("premise: worker notes exist");
+    let num = |key: &str| {
+        line.split_whitespace()
+            .find_map(|w| w.trim_start_matches('(').strip_prefix(&format!("{key}=")))
+            .and_then(|v| v.trim_end_matches(')').parse::<u64>().ok())
+            .unwrap()
+    };
+    let (pushed, attempts, dropped, malformed) = (
+        num("pushed"),
+        num("attempts"),
+        num("dropped_push"),
+        num("malformed_responses"),
+    );
+    assert_eq!(pushed, 0, "nothing pushes: {err_lines:?}");
+    assert!(
+        dropped >= 2,
+        "several pushes account (13 s window): {err_lines:?}"
+    );
+    assert_eq!(
+        attempts, dropped,
+        "one attempt per push (never redelivered): {err_lines:?}"
+    );
+    assert_eq!(
+        malformed, dropped,
+        "every drop is a malformed response: {err_lines:?}"
+    );
+    assert_eq!(
+        seen.load(std::sync::atomic::Ordering::Relaxed),
+        attempts,
+        "the stub cross-checks the attempt count"
+    );
+}
+
+#[test]
 fn export_serves_scrapes_between_collection_ticks() {
     // P2fix2 item 21 (codex NEW-P2a): scrape serving never pauses
     // between collection ticks — with a 10 s poll cadence, a scrape
@@ -7967,14 +8461,17 @@ fn sealed_summary_compares_all_byte_components() {
     let run_a = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "dddddddd-eeee-ffff-0000-111111111111"});
     let run_b = serde_json::json!({"pid": 3, "starttime": 4, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
     let dir = out_dir("adopt-bytes");
-    // Run A window 0: close gross records 10, queue_full bytes 50.
+    // Run A window 0: close gross records 10, queue_full bytes 50
+    // ([p2fix8 NEW-53: self-consistent totals — records 10 /
+    // bytes 50 with matching reasons; the summary below still
+    // leads on bytes only).
     let mut env0 = snapshot::test_envelope_with_doc(
         0,
         0,
         run_a.clone(),
         snapshot::test_document(5, "complete"),
     );
-    env0["stream_gross_close"] = serde_json::json!({"records": 10, "bytes": 100, "by_reason": {"queue_full": {"records": 10, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
+    env0["stream_gross_close"] = serde_json::json!({"records": 10, "bytes": 50, "by_reason": {"queue_full": {"records": 10, "bytes": 50}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
     env0["stream_configured"] = serde_json::json!(true);
     std::fs::write(
         dir.join("window-0000000000.json"),
@@ -7988,7 +8485,7 @@ fn sealed_summary_compares_all_byte_components() {
         run_b.clone(),
         snapshot::test_document(5, "complete"),
     );
-    env1["stream_gross_close"] = serde_json::json!({"records": 0, "bytes": 0});
+    env1["stream_gross_close"] = serde_json::json!({"records": 0, "bytes": 0, "by_reason": {"queue_full": {"records": 0, "bytes": 0}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}});
     env1["stream_configured"] = serde_json::json!(true);
     std::fs::write(
         dir.join("window-0000000001.json"),
@@ -7998,7 +8495,7 @@ fn sealed_summary_compares_all_byte_components() {
     // Run A's summary: records agree, queue_full bytes lead (100).
     std::fs::write(
         dir.join("run-summary.json"),
-        serde_json::json!({"run_id": {"pid": 1, "starttime": 2, "boot_id": "dddddddd-eeee-ffff-0000-111111111111"}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 10, "bytes": 100, "by_reason": {"queue_full": {"records": 10, "bytes": 100}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
+        serde_json::json!({"schema": "service-run-v1", "run_id": {"pid": 1, "starttime": 2, "boot_id": "dddddddd-eeee-ffff-0000-111111111111"}, "generation": 0, "stream_configured": true, "stream_drops": {"records": 10, "bytes": 100, "by_reason": {"queue_full": {"records": 10, "bytes": 100}, "epipe": {"records": 0, "bytes": 0}, "stream_abandoned": {"records": 0, "bytes": 0}}}}).to_string(),
     )
     .unwrap();
     std::fs::write(

@@ -903,6 +903,54 @@ pub fn check_api_activity_raw_duplicates(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// P2fix8 NEW-51: reject duplicate discriminator members
+/// (`schema` / `schema_version`) at a document's top level (or
+/// its `document.`-nested object) in the RAW text — BEFORE
+/// `Value` normalization collapses them (last-wins). A repeated
+/// discriminator would let one version conceal the checked one
+/// from the trigger; the typed gate below receives a `Value`,
+/// so without this raw check the duplication is invisible to
+/// it. (Service envelopes + checkpoints are whole-tree strict
+/// already via [`check_envelope_raw_duplicates`].)
+pub fn check_discriminator_raw_duplicates(text: &str) -> Result<(), String> {
+    let raw: RawJson =
+        serde_json::from_str(text).map_err(|error| format!("doc: invalid JSON ({error})"))?;
+    fn members(raw: &RawJson) -> Vec<&Vec<(String, RawJson)>> {
+        match raw {
+            RawJson::Object(members) => vec![members],
+            _ => vec![],
+        }
+    }
+    fn nested<'a>(raw: &'a RawJson, key: &str) -> Vec<&'a RawJson> {
+        match raw {
+            RawJson::Object(members) => members
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect(),
+            _ => vec![],
+        }
+    }
+    let mut levels: Vec<(&Vec<(String, RawJson)>, &str)> = vec![];
+    for top in members(&raw) {
+        levels.push((top, "doc"));
+    }
+    for doc in nested(&raw, "document") {
+        for inner in members(doc) {
+            levels.push((inner, "doc.document"));
+        }
+    }
+    for (level, where_) in levels {
+        for key in ["schema", "schema_version"] {
+            let n = level.iter().filter(|(k, _)| k == key).count();
+            if n > 1 {
+                return Err(format!("{where_}: duplicate field `{key}`"));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// P2fix2 item 13: reject duplicate object keys ANYWHERE in a
 /// service window envelope's RAW bytes — BEFORE `Value`
 /// normalization collapses them (last-wins). A repeated envelope
@@ -926,6 +974,7 @@ pub fn check_v2_document_text(text: &str) -> Result<(), String> {
     check_request_evidence_raw_duplicates(text)?;
     check_trace_summary_raw_duplicates(text)?;
     check_api_activity_raw_duplicates(text)?;
+    check_discriminator_raw_duplicates(text)?;
     let doc: serde_json::Value =
         serde_json::from_str(text).map_err(|error| format!("doc: invalid JSON ({error})"))?;
     validate_v2(&doc).map_err(|error| error.to_string())?;
@@ -1112,12 +1161,12 @@ fn check_trace_summary(root: &serde_json::Map<String, serde_json::Value>) -> Res
         .map(t::parse_trace_section)
         .transpose()
         .map_err(|error| format!("doc.trace_summary: {error}"))?;
-    t::check_trace_contract(
-        t::doc_minor(&doc),
-        parsed.as_ref(),
-        root.get("api_activity"),
-    )
-    .map_err(|error| format!("doc.trace_summary: {error}"))?;
+    // Raw shape: canonical `schema_version` (P2fix8 NEW-51 — a
+    // foreign `schema` alias rejects, never overrides).
+    let minor = t::canonical_minor(&doc, t::DocShape::Raw)
+        .map_err(|error| format!("doc.trace_summary: {error}"))?;
+    t::check_trace_contract(minor, parsed.as_ref(), root.get("api_activity"))
+        .map_err(|error| format!("doc.trace_summary: {error}"))?;
     Ok(())
 }
 

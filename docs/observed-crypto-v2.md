@@ -1008,9 +1008,14 @@ completeness rules are unchanged by this section.
 All older required fields keep their meanings. When the window ran
 a provider session in a pairing mode (`latency`, `status`, `all`)
 or the D0-6 aggregate-only fallback, the producer seals its trace
-fold into one optional `trace_summary` section and upgrades
-`schema_version` to `observed-crypto-v2.9` (older documents never
-carry it). The section lives on the PUBLIC-API plane: pairs,
+fold into one optional `trace_summary` section and stamps
+`observed-crypto-v2.9` (older documents never carry the
+section; P2fix8 NEW-51: producer documents spell the
+discriminator `schema`, rendered/raw v2 documents spell it
+`schema_version` — each input shape binds its CANONICAL
+spelling, a foreign alias rejects, and duplicate raw
+discriminators reject). The section lives on the PUBLIC-API
+plane: pairs,
 return classes, and durations of public export invocations —
 never physical callback entries, never observer overhead, never
 application outcomes.
@@ -1043,7 +1048,12 @@ application outcomes.
   document-level trace contract runs identically across every
   reader — raw intake, both presenter inputs, and restored
   checkpoints run the same function (P2fix4 NEW-P3 — narrowed
-  to the proven paths): the section/version trigger both ways,
+  to the proven paths; P2fix8 NEW-51 — the section/version
+  trigger binds the input shape's CANONICAL discriminator,
+  producer `schema` vs raw/doc_json `schema_version`, never a
+  uniform either/or selector): the section/version trigger both
+  ways (minor 9 needs its section; a section needs minor ≥ 9;
+  a foreign alias or duplicate raw discriminator rejects),
   required-nullable presence + null rules (explicit
   `class_epoch`/`class_window`, no null on non-nullables),
   required-vs-withheld field rules, inner/outer mode +
@@ -1065,7 +1075,8 @@ application outcomes.
   P2fix6 NEW-37, P2fix7 NEW-42). Raw pre-normalization
   duplicate checks run on every path that receives raw text
   (document text: the `request_evidence`, `trace_summary`, and
-  `api_activity` sections; window envelopes and checkpoint
+  `api_activity` sections plus the top-level discriminator
+  members — P2fix8 NEW-51; window envelopes and checkpoint
   files: whole-tree — P2fix7 NEW-42); Value-only intake
   validates the typed contract (no raw text exists to check).
   Typed readers enforce the raw schema's closed shape (extra
@@ -1083,27 +1094,34 @@ application outcomes.
   corruption (pending eviction, depth overflow, decode
   rejection, late cut), interpreted duration/status
   distributions withhold until a proved fresh boundary on a
-  successful producer boundary (P2fix7 NEW-41 — gate close AND
-  affirmative writer quiescence + ring exhaustion (the terminal
-  drain samples ringbuf producer/consumer positions: a bare
-  ring `None` is busy-or-empty and proves nothing, but
-  producer==consumer proves zero outstanding bytes — a busy
-  head implies producer > consumer, so equality rules it out by
-  construction; two consecutive equal samples straddling a
-  scheduling opportunity prove quiescence + exhaustion, a
+  successful producer boundary (P2fix7 NEW-41, attribution
+  P2fix8 NEW-49 — a successful RCU gate close (map-in-map
+  deletion waits out the grace period, so writers are detached
+  and no new reserves can start — THAT is writer quiescence)
+  AND affirmative ring exhaustion (the terminal drain samples
+  ringbuf producer/consumer positions: a bare ring `None` is
+  busy-or-empty and proves nothing, but producer==consumer
+  proves zero outstanding bytes — a busy head implies producer
+  > consumer, so equality rules it out by construction; two
+  consecutive equal samples straddling a scheduling
+  opportunity prove exhaustion stable across the sleep, a
   recovered record resets the count and folds first, and
   outstanding/unreadable positions or an expired deadline fail
   closed, never confirm) AND successful terminal loss-lane
   reads on every lane (P2fix7 NEW-47 — the loss poll precedes
   the receipt; a missing/failed terminal loss read withholds
-  and voids) AND terminal settlement AND a clean close with
-  empty pending and no fresh corruption, WITH the positive
-  terminal-drain receipt the drain stores; host finalization
-  alone — settled and clean with no drainage evidence —
-  carries taint, never clears it; an explicit failed/unproved
-  terminal boundary (failed gate close OR dirty/unproved
-  terminal drain OR failed terminal loss read) withholds
-  interpretations even with clean history — the seal names
+  and voids) AND proof acquisition inside the terminal
+  deadline (P2fix8 NEW-49 — a final sweep + recheck finishing
+  at/past the deadline withholds, never mints, while the
+  observed terminal loss stays accounted) AND terminal
+  settlement AND a clean close with empty pending and no fresh
+  corruption, WITH the positive terminal-drain receipt the
+  drain stores; host finalization alone — settled and clean
+  with no drainage evidence — carries taint, never clears it;
+  an explicit failed/unproved terminal boundary (failed gate
+  close OR dirty/unproved terminal drain OR failed terminal
+  loss read OR post-deadline proof) withholds interpretations
+  even with clean history — the seal names
   `terminal-boundary-failed`, never clears it).
   Raw counters/lanes/unpaired/exemplars flow —
   EXCEPT the late-cut window projection: a late cut marks the

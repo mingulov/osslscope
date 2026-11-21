@@ -422,7 +422,10 @@ fn otlp_post(endpoint: &str, payload: &str, budget: Duration) -> Result<PostResp
     // ignored). Field names are strict tokens (P2fix7 NEW-43 —
     // no whitespace before the colon, none inside — checked on
     // EVERY line, not just recognized fields) and values trim
-    // HTTP OWS (SP/HTAB only — never general whitespace). The
+    // HTTP OWS (SP/HTAB only — never general whitespace) AND
+    // validate the RFC 9110 field-content charset on EVERY line
+    // including ignored headers (P2fix8 NEW-52 — VCHAR /
+    // obs-text / SP / HTAB only; NUL/CTL/DEL reject). The
     // status is RECOGNIZED past this point, so every framing
     // failure below returns `framing_invalid` (P2fix6 NEW-39 —
     // accounts without retry, never a transport error: the 2xx
@@ -436,6 +439,19 @@ fn otlp_post(endpoint: &str, payload: &str, budget: Duration) -> Result<PostResp
             return Ok(framing_invalid(status));
         };
         if name.is_empty() || !name.bytes().all(is_tchar) {
+            return Ok(framing_invalid(status));
+        }
+        // Field-value grammar (P2fix8 NEW-52 — RFC 9110 §5.5, on
+        // EVERY line including IGNORED headers): after OWS
+        // trimming the content is VCHAR / obs-text / SP / HTAB
+        // only — NUL and other CTLs + DEL reject (an unchecked
+        // ignored value would otherwise survive decoding and
+        // earn success credit for a possibly-corrupt 2xx).
+        let content = value.trim_matches(|c| c == ' ' || c == '\t');
+        let value_ok = content
+            .bytes()
+            .all(|b| b == b' ' || b == b'\t' || (0x21..=0x7e).contains(&b) || b >= 0x80);
+        if !value_ok {
             return Ok(framing_invalid(status));
         }
         if name.eq_ignore_ascii_case("content-length") {
@@ -2757,6 +2773,112 @@ mod tests {
                 Expect::TransportErr => assert!(
                     !out.pushed && !out.malformed && out.attempts == PUSH_ATTEMPTS,
                     "{what} must stay a retried transport error: {out:?}"
+                ),
+                Expect::Pushed => assert!(
+                    out.pushed && out.attempts == 1,
+                    "{what} must push cleanly: {out:?}"
+                ),
+            }
+            filler.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn new52_field_value_grammar() {
+        // P2fix8 NEW-52: EVERY field value validates (including
+        // IGNORED headers — RFC 9110 field rules: after OWS
+        // trimming the content is VCHAR / obs-text / SP / HTAB
+        // only — NUL and other CTLs + DEL reject). A recognized
+        // 2xx with an invalid control in an ignored header is
+        // `framing_invalid` (malformed WITHOUT retry — the 2xx
+        // may have landed). Pre-fix: ignored values skip
+        // validation, so a NUL in an ordinary response header
+        // survives decoding and earns success credit (RED).
+        use std::io::Write;
+        use std::net::TcpListener;
+        #[derive(PartialEq, Eq, Debug)]
+        enum Expect {
+            Framing,
+            Pushed,
+        }
+        for (what, head, expect) in [
+            (
+                "nul-in-ignored-value",
+                b"HTTP/1.0 200 OK\r\nX-Trace: a\x00b\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+                Expect::Framing,
+            ),
+            (
+                "ctl-in-ignored-value",
+                b"HTTP/1.0 200 OK\r\nX-Trace: a\x01b\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+                Expect::Framing,
+            ),
+            (
+                "del-in-ignored-value",
+                b"HTTP/1.0 200 OK\r\nX-Trace: a\x7fb\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+                Expect::Framing,
+            ),
+            (
+                "lf-in-ignored-value",
+                b"HTTP/1.0 200 OK\r\nX-Trace: a\x0ab\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+                Expect::Framing,
+            ),
+            (
+                "nul-in-content-length",
+                b"HTTP/1.0 200 OK\r\nContent-Length: 2\x00\r\n\r\n{}".as_slice(),
+                Expect::Framing,
+            ),
+            (
+                "ows-htab-interior-control",
+                b"HTTP/1.0 200 OK\r\nX-Trace: a\tb c\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+                Expect::Pushed,
+            ),
+            (
+                "obs-text-control",
+                b"HTTP/1.0 200 OK\r\nX-Trace: caf\xc3\xa9\r\nContent-Length: 2\r\n\r\n{}"
+                    .as_slice(),
+                Expect::Pushed,
+            ),
+            (
+                "empty-value-control",
+                b"HTTP/1.0 200 OK\r\nX-Trace:\r\nContent-Length: 2\r\n\r\n{}".as_slice(),
+                Expect::Pushed,
+            ),
+        ] {
+            let stub = TcpListener::bind("127.0.0.1:0").unwrap();
+            stub.set_nonblocking(true).unwrap();
+            let port = stub.local_addr().unwrap().port();
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done2 = done.clone();
+            let filler = std::thread::spawn(move || {
+                loop {
+                    match stub.accept() {
+                        Ok((mut s, _)) => {
+                            let mut buf = [0u8; 4096];
+                            let _ = std::io::Read::read(&mut s, &mut buf);
+                            let _ = s.write_all(head);
+                        }
+                        Err(e)
+                            if e.kind() == std::io::ErrorKind::WouldBlock
+                                && !done2.load(std::sync::atomic::Ordering::Relaxed) =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => break,
+                    }
+                }
+            });
+            let url = format!("http://127.0.0.1:{port}/v1/metrics");
+            let noop_sleep = &mut |_: Duration| {};
+            let out = push_with_discipline(
+                &mut |remaining| otlp_post(&url, "{}", remaining),
+                noop_sleep,
+                Duration::from_secs(45),
+            );
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            match expect {
+                Expect::Framing => assert!(
+                    !out.pushed && out.malformed && out.attempts == 1,
+                    "{what} must malformed-drop on the first attempt: {out:?}"
                 ),
                 Expect::Pushed => assert!(
                     out.pushed && out.attempts == 1,

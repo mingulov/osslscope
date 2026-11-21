@@ -1854,6 +1854,30 @@ fn h5_t3_every_device_site_names_one_domain() {
             "if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {",
             1,
         ),
+        // [p2fix8 NEW-50: fd-anchored containment — the producer
+        // identity, the walk cursor, and each ancestor read are
+        // native fstat (dev, ino) compared raw-vs-raw only (walk
+        // equality vs the producer id, root detection
+        // parent==self); still the same single native domain,
+        // never joined to maps text or encoded devices.]
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "(md.dev(), md.ino())",
+            1,
+        ),
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "let mut cur_id = (opened.dev(), opened.ino());",
+            1,
+        ),
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "let parent_id = (md.dev(), md.ino());",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

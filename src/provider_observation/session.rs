@@ -526,6 +526,15 @@ thread_local! {
     /// behind the busy head (scripted or real).
     pub(super) static TERMINAL_QUIESCE_RECOVERIES: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    /// P2fix8 NEW-49: one-shot proof-acquisition delay — the final
+    /// drain sleeps this once inside terminal-proof acquisition
+    /// (between the ring loop and the proof deadline check),
+    /// staging a deterministic deadline crossing DURING the
+    /// final sweep (a real mid-sweep expiry is timing).
+    /// Test-only, inert unless armed; pins must disarm after
+    /// use.
+    pub(super) static TERMINAL_PROOF_DELAY: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Terminal-drain quiescence re-poll outcome (P2fix5 NEW-23,
@@ -544,11 +553,14 @@ enum QuiesceRepoll {
 /// producer==consumer samples (each proving zero outstanding
 /// bytes at that instant — a busy head implies producer >
 /// consumer, so equality rules it out by construction) needed
-/// to prove writer quiescence + ring exhaustion. The two
+/// to prove ring EXHAUSTION (P2fix8 NEW-49: exhaustion is what
+/// positions prove; writer QUIESCENCE rides the successful RCU
+/// gate close — map-in-map deletion waits out the grace
+/// period, so post-close no new reserves can start). The two
 /// samples straddle a scheduling opportunity (yield + short
-/// sleep): post-close no new reserves can start, and any
-/// admitted writer reserves within its non-preemptible window —
-/// stability across the sleep rules out in-flight reserves. Any
+/// sleep): any admitted writer reserves within its
+/// non-preemptible window — stability across the sleep rules
+/// out in-flight reserves landing between samples. Any
 /// consumed record resets the count and folds through the exact
 /// path; the drain deadline bounds the wait (unproved past it,
 /// never confirmed). Residual: an admitted-but-unreserved
@@ -5362,15 +5374,16 @@ impl ProviderSession {
                 // implies producer > consumer), and
                 // [`TERMINAL_DRAIN_EQUALITY_SAMPLES`]
                 // consecutive equal samples across a
-                // scheduling opportunity prove writer
-                // quiescence + ring exhaustion. Outstanding or
-                // unreadable positions reset the count and wait
-                // (sleeping gives writers a scheduling
-                // opportunity); a recovered record resets the
-                // count and folds through the exact path below
-                // (the loop re-arms quiescence at the next
-                // `None`); an expired deadline fails closed
-                // (unproved).
+                // scheduling opportunity prove ring exhaustion
+                // (P2fix8 NEW-49: positions prove exhaustion;
+                // writer quiescence rides the successful RCU
+                // gate close). Outstanding or unreadable
+                // positions reset the count and wait (sleeping
+                // gives writers a scheduling opportunity); a
+                // recovered record resets the count and folds
+                // through the exact path below (the loop
+                // re-arms quiescence at the next `None`); an
+                // expired deadline fails closed (unproved).
                 None => {
                     std::thread::yield_now();
                     #[cfg(test)]
@@ -5450,6 +5463,13 @@ impl ProviderSession {
         // account the delta later.)
         let mut terminal_loss_ok = true;
         if self.final_drain {
+            // P2fix8 NEW-49 hook: one-shot test-only proof delay
+            // (stages a deadline crossing during the final
+            // sweep — inert unless armed).
+            #[cfg(test)]
+            if let Some(delay) = TERMINAL_PROOF_DELAY.with(|c| c.take()) {
+                std::thread::sleep(delay);
+            }
             terminal_loss_ok = self.poll_loss_lanes(&mut b);
             if !terminal_loss_ok {
                 self.trace.note_boundary_failure();
@@ -5460,6 +5480,24 @@ impl ProviderSession {
             // (its record sits unfolded in the ring — the seal
             // must withhold, never mint on it).
             if terminal_quiesced && !matches!(self.read_ring_positions(), Some((c, p)) if c == p) {
+                terminal_quiesced = false;
+            }
+            // P2fix8 NEW-49: the terminal deadline binds proof
+            // ACQUISITION, not just the ring loop — a final loss
+            // sweep + position recheck that finish AT/PAST the
+            // deadline withhold, never mint (the loop-expiry
+            // checks above cannot see a crossing during this
+            // sweep). The observed terminal loss stays accounted
+            // (consumed above — no future drain exists to account
+            // it later); the proof alone is voided and the
+            // overrun latches like a loop expiry (dirty final
+            // drain + `DrainOverrun`, so `note_terminal_drain`
+            // below records the failed boundary and the seal
+            // never clears on it).
+            if Instant::now() >= deadline {
+                self.fetch_coverage_broken = true;
+                b.gap(ObservationGap::DrainOverrun);
+                drained_clean = false;
                 terminal_quiesced = false;
             }
         }
@@ -29091,6 +29129,103 @@ mod fix4_retire {
                 );
             }
         }
+    }
+
+    /// P2fix8 NEW-49 proof-acquisition deadline AT SEAL: the
+    /// terminal deadline binds proof ACQUISITION, not just the
+    /// ring loop — a final loss sweep + position recheck that
+    /// finish AFTER the deadline withhold, never mint. The pin
+    /// stages a drained ring (real empty ring + real positions —
+    /// NO scripts, so the loop proves equality in ~2 ms, far
+    /// inside the 50 ms deadline) with an intact loss map and a
+    /// one-shot 500 ms proof delay (test-only hook): the sweep +
+    /// recheck complete past the deadline, so the receipt must
+    /// withhold (`DrainOverrun` + `terminal-boundary-failed` on
+    /// clean history, never clears) while the observed terminal
+    /// loss stays accounted. Pre-fix: the post-deadline proof
+    /// mints and the seal clears (RED).
+    #[test]
+    #[ignore = "new49 proof-acquisition overrun: requires BPF map privileges (guest lane)"]
+    fn new49_proof_acquisition_overrun_withholds() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                super::QUIESCE_SCRIPT.with(|s| s.borrow_mut().clear());
+                super::RING_POSITION_SCRIPT.with(|s| s.borrow_mut().clear());
+                super::TERMINAL_PROOF_DELAY.with(|c| c.set(None));
+            }
+        }
+        let _disarm = Disarm;
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP new49 proof-overrun: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = match crate::writer_gate::WriterGate::create(&pool) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP new49 proof-overrun: real gate creation failed: {e}");
+                return;
+            }
+        };
+        if gate.open().is_err() {
+            eprintln!("SKIP new49 proof-overrun: real gate open failed (no caps)");
+            return;
+        }
+        s.gate = gate;
+        let w0 = s.close_trace_window(0);
+        assert!(
+            !w0.pairing_uncertain,
+            "premise: clean history: {:?}",
+            w0.pairing_uncertainty
+        );
+        assert!(
+            super::QUIESCE_SCRIPT.with(|st| st.borrow().is_empty())
+                && super::RING_POSITION_SCRIPT.with(|st| st.borrow().is_empty()),
+            "premise: ring + positions unscripted (real drained ring)"
+        );
+        // The ring loop proves equality in ~2 ms on a drained
+        // ring (the reworked new20 clean leg); the 500 ms armed
+        // delay then carries the sweep + recheck across the
+        // 50 ms deadline (margins: 2 << 50 << 500).
+        super::TERMINAL_PROOF_DELAY.with(|c| c.set(Some(Duration::from_millis(500))));
+        let conf0 = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get());
+        let batch = s.finalize_until(Instant::now() + Duration::from_millis(50));
+        assert!(
+            super::TERMINAL_PROOF_DELAY.with(|c| c.get().is_none()),
+            "premise: the one-shot proof delay fired"
+        );
+        assert!(
+            super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get()) - conf0 > 0,
+            "premise: quiescence rounds ran"
+        );
+        assert!(
+            batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+            "the post-deadline proof latches overrun: {:?}",
+            batch.gaps
+        );
+        s.trace.finalize(LiveClock.monotonic_ns());
+        let w1 = s.close_trace_window(1);
+        assert!(
+            w1.pairing_uncertain,
+            "the post-deadline seal withholds: {:?}",
+            w1.pairing_uncertainty
+        );
+        assert!(
+            w1.pairing_uncertainty
+                .contains(&"terminal-boundary-failed".to_string()),
+            "the failure names itself: {:?}",
+            w1.pairing_uncertainty
+        );
+        let w2 = s.close_trace_window(2);
+        assert!(
+            w2.pairing_uncertain,
+            "the unproved boundary never clears: {:?}",
+            w2.pairing_uncertainty
+        );
     }
 
     /// P2fix2 item 5 (codex PAIRING-OPEN): generic wire rejection
