@@ -791,3 +791,318 @@ fn project_carries_attach_diagnostics_sorted_capped() {
         "attach:link count_entry@0x0 failed (kind=NotFound)"
     );
 }
+
+#[test]
+fn six_trace_counters_force_partial_through_shared_finalizer() {
+    // P2fix1 item 1c/22: the six frozen trace counters project as
+    // Loss-kind GapCounters (computed once, projected twice) and
+    // force PARTIAL via the shared finalize — trace loss can never
+    // hide in a COMPLETE window. The fold below is the REAL
+    // production fold (every counter tripped for real).
+    use osslscope::focused_capture::trace_loss_counters;
+    use osslscope::provider_observation::trace as t;
+    let mut p = t::TraceProducer::new();
+    p.set_mode(t::TRACE_MODE_LATENCY);
+    for i in 0..5000u64 {
+        let k = t::PairKey {
+            pid: 7,
+            tid: 8,
+            generation: 1,
+            cookie: 1000 + i,
+            invocation: i + 1,
+        };
+        p.attempt(t::AttemptEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1000 + i * 10,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        p.result(t::ResultEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1005 + i * 10,
+            outcome: 1,
+            start_time_ns: 1,
+            seed: 1,
+        });
+    }
+    // One backward pair (nonmonotonic) + one orphan attempt + one
+    // orphan result + one decode reject.
+    let kb = t::PairKey {
+        pid: 7,
+        tid: 8,
+        generation: 1,
+        cookie: 99991,
+        invocation: 6000,
+    };
+    p.attempt(t::AttemptEdge {
+        key: kb,
+        api: 20,
+        monotonic_ns: 999000,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    p.result(t::ResultEdge {
+        key: kb,
+        api: 20,
+        monotonic_ns: 999000,
+        outcome: 1,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    let ko = t::PairKey {
+        pid: 7,
+        tid: 8,
+        generation: 1,
+        cookie: 99992,
+        invocation: 6001,
+    };
+    p.attempt(t::AttemptEdge {
+        key: ko,
+        api: 22,
+        monotonic_ns: 999010,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    let kr = t::PairKey {
+        pid: 7,
+        tid: 8,
+        generation: 1,
+        cookie: 99993,
+        invocation: 6002,
+    };
+    p.result(t::ResultEdge {
+        key: kr,
+        api: 22,
+        monotonic_ns: 999020,
+        outcome: 1,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    p.reject_unknown();
+    p.finalize(2_000_000);
+    let w = p.close_window(0, 2_000_000, [0, 0, 3, 0, 0, 0, 0, 0]);
+    assert!(w.dropped > 0, "detail must overflow");
+    assert_eq!(w.nonmonotonic_pairs, 1);
+    assert_eq!(w.unpaired_entries, 1);
+    assert_eq!(w.unpaired_results, 1);
+    assert_eq!(w.rejected_unknown_api, 1);
+    assert_eq!(w.depth_exceeded, 3);
+    let counters = trace_loss_counters(&w);
+    assert_eq!(counters.len(), 6);
+    for c in &counters {
+        assert!(c.forces_partial(), "{} must force PARTIAL", c.name);
+    }
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            gaps: counters,
+            ..Default::default()
+        },
+        &[],
+        &std::collections::BTreeSet::new(),
+    );
+    let reasons = match &doc.status {
+        Completeness::Partial { reasons } => reasons.clone(),
+        s => panic!("lossy trace window must be PARTIAL, got {s:?}"),
+    };
+    for name in [
+        "trace_dropped",
+        "trace_unpaired_entries",
+        "trace_unpaired_results",
+        "trace_depth_exceeded",
+        "trace_nonmonotonic_pairs",
+        "trace_rejected_unknown_api",
+    ] {
+        assert!(
+            reasons
+                .iter()
+                .any(|r| matches!(r, GapReason::Loss { counter, .. } if counter == name)),
+            "missing reason for {name}: {reasons:?}"
+        );
+    }
+    // Clean window: no counters, no trace-loss reasons (still
+    // PARTIAL via the focused unknowns — the pin is the ABSENCE of
+    // trace loss, never a silent zero).
+    let mut q = t::TraceProducer::new();
+    q.set_mode(t::TRACE_MODE_LATENCY);
+    for i in 0..10u64 {
+        let k = t::PairKey {
+            pid: 7,
+            tid: 8,
+            generation: 1,
+            cookie: 2000 + i,
+            invocation: i + 1,
+        };
+        q.attempt(t::AttemptEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1000 + i * 10,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        q.result(t::ResultEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1005 + i * 10,
+            outcome: 1,
+            start_time_ns: 1,
+            seed: 1,
+        });
+    }
+    q.finalize(2_000_000);
+    let clean = q.close_window(0, 2_000_000, [0; 8]);
+    assert!(trace_loss_counters(&clean).is_empty());
+    let clean_doc = project(
+        42,
+        window(),
+        CountSample {
+            gaps: trace_loss_counters(&clean),
+            ..Default::default()
+        },
+        &[],
+        &std::collections::BTreeSet::new(),
+    );
+    let clean_reasons = match &clean_doc.status {
+        Completeness::Partial { reasons } => reasons.clone(),
+        s => panic!("focused project is always PARTIAL here, got {s:?}"),
+    };
+    assert!(
+        !clean_reasons.iter().any(|r| matches!(
+            r,
+            GapReason::Loss { counter, .. } if counter.starts_with("trace_")
+        )),
+        "clean window must carry no trace-loss reasons: {clean_reasons:?}"
+    );
+}
+
+#[test]
+fn newp2e_taint_only_cut_degrades_focused_completeness_and_exit() {
+    // P2fix3 NEW-P2e: a taint-only late cut (every counted loss
+    // zero — the fold holds out-of-interval pairs it cannot
+    // exclude) still degrades focused completeness + exit: the
+    // seal uncertainty rides the seal-gap word through the shared
+    // finalizer (mirrors the standalone degrade rule), while the
+    // six `trace_*` counters stay exactly six.
+    use osslscope::focused_capture::{trace_loss_counters, trace_seal_uncertainty_gap};
+    use osslscope::provider_observation::trace as t;
+    let mut p = t::TraceProducer::new();
+    p.set_mode(t::TRACE_MODE_LATENCY);
+    let k = t::PairKey {
+        pid: 7,
+        tid: 8,
+        generation: 1,
+        cookie: 500,
+        invocation: 100,
+    };
+    p.attempt(t::AttemptEdge {
+        key: k,
+        api: 20,
+        monotonic_ns: 1000,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    p.result(t::ResultEdge {
+        key: k,
+        api: 20,
+        monotonic_ns: 1100,
+        outcome: 1,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    // Late cut (below the consumed pair) + terminal seal.
+    p.note_global_cut(50);
+    p.finalize(2_000_000);
+    let w = p.close_window(0, 2_000_000, [0; 8]);
+    let totals = p.totals();
+    assert!(w.late_cut, "seal marks the late cut");
+    assert!(w.pairing_uncertain);
+    // Taint-only: every counted loss is zero.
+    assert!(trace_loss_counters(&w).is_empty(), "taint-only seal");
+    // ... yet the seal uncertainty rides the seal gap.
+    assert_eq!(
+        trace_seal_uncertainty_gap(&w, &totals),
+        Some(ObservationGap::SamplingPartial)
+    );
+    let doc = project(
+        42,
+        window(),
+        CountSample {
+            gaps: trace_loss_counters(&w),
+            ..Default::default()
+        },
+        &[ObservationGap::SamplingPartial],
+        &std::collections::BTreeSet::new(),
+    );
+    let reasons = match &doc.status {
+        Completeness::Partial { reasons } => reasons.clone(),
+        s => panic!("taint-only cut must be PARTIAL, got {s:?}"),
+    };
+    assert!(
+        reasons.iter().any(
+            |r| matches!(r, GapReason::Loss { counter, .. } if counter == "focused.interval_unknown")
+        ),
+        "seal gap reason present: {reasons:?}"
+    );
+    let delivery = report::DeliveryResult {
+        primary: report::ArtifactOutcome {
+            dest: "stdout".to_string(),
+            ok: true,
+            bytes: 8,
+            error: None,
+        },
+        cbom: None,
+        diagnostics: vec![],
+    };
+    assert_eq!(
+        report::exit_for(policy::PolicyOutcome::Pass, None, &doc, &delivery),
+        3,
+        "taint-only cut exits 3"
+    );
+    // Clean seal: no gap, no interval reason.
+    let mut q = t::TraceProducer::new();
+    q.set_mode(t::TRACE_MODE_LATENCY);
+    q.attempt(t::AttemptEdge {
+        key: k,
+        api: 20,
+        monotonic_ns: 1000,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    q.result(t::ResultEdge {
+        key: k,
+        api: 20,
+        monotonic_ns: 1100,
+        outcome: 1,
+        start_time_ns: 1,
+        seed: 1,
+    });
+    q.note_global_cut(10_000);
+    q.finalize(2_000_000);
+    let clean = q.close_window(0, 2_000_000, [0; 8]);
+    let clean_totals = q.totals();
+    assert!(!clean.late_cut);
+    assert_eq!(
+        trace_seal_uncertainty_gap(&clean, &clean_totals),
+        None,
+        "clean seal rides no gap"
+    );
+}
+
+#[test]
+fn trace_feed_cut_uses_the_effective_end() {
+    // P2fix3 TRACE: the feed cut IS the reported effective end
+    // (observed now clamped to the requested deadline, never
+    // before start) — never the requested deadline alone. One
+    // binding feeds the cut and the published window, so the two
+    // cannot drift.
+    use osslscope::focused_capture::effective_end_ns;
+    // Early finish: now before the deadline clamps the cut.
+    assert_eq!(effective_end_ns(50, 100, 10), 50);
+    // Full-duration finish: now past the deadline clamps to it.
+    assert_eq!(effective_end_ns(150, 100, 10), 100);
+    // Degenerate clock (now before start): never before start.
+    assert_eq!(effective_end_ns(5, 100, 10), 10);
+}

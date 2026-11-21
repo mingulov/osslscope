@@ -1074,6 +1074,8 @@ impl Harness {
                 harvest_timeout: Duration::from_secs(30),
                 grace: Duration::from_secs(5),
                 image_digest: String::new(),
+                trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+                trace_by_api: false,
             },
             owned: true,
             acquired_ns: BASE_NS,
@@ -6165,6 +6167,8 @@ fn live_observe_inner(
         harvest_timeout,
         grace: Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
     };
     let out = observe(
         &cfg,
@@ -8669,6 +8673,8 @@ pub(crate) fn connector_body_ordinary_production_capture_genuinely_observed_slee
         harvest_timeout: Duration::from_secs(30),
         grace: Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
     };
     let out = observe(
         &cfg,

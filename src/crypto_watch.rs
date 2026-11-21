@@ -1277,6 +1277,24 @@ impl<W: Write> Output<'_, W> {
                         writeln!(w, "  {label}s omitted={}", diags.len() - cap)?;
                     }
                 }
+                // NEW-14: the shared request section rides the human
+                // record exactly as it rides the JSON document
+                // (parsed strictly — the same validation both
+                // read paths share; a present-but-unparseable
+                // section renders visibly, never silently).
+                if let Some(section) = d.get("request_evidence") {
+                    match serde_json::from_value::<
+                        crate::provider_observation::request_evidence::RequestEvidence,
+                    >(section.clone())
+                    {
+                        Ok(evidence) => {
+                            w.write_all(evidence.human_section().as_bytes())?;
+                        }
+                        Err(_) => {
+                            writeln!(w, "  request evidence: unknown (unparseable section)")?;
+                        }
+                    }
+                }
                 Ok(())
             }
             Record::End {
@@ -5677,8 +5695,15 @@ mod tests {
         // not_attached) and failed final reads (entries 0 +
         // gaps.map=1) render entries=unknown — and poison the api
         // total — even with an otherwise empty ledger. The shapes
-        // below mirror `ApiActivityRow::unavailable` and the
-        // failed-final-read row byte for byte.
+        // below are SERIALIZED FROM THE PRODUCER constructors (not
+        // hand JSON — the mirror cannot drift): `unavailable`, the
+        // failed-final-read row, and a successful-read row.
+        // PINS/NEW-12 fix4 contract pinned here: the failed row
+        // keeps the attachment bit (its owner was admitted) and
+        // carries no read receipt; only the successful-read row
+        // carries the separate receipt. NEW-18 fix5: the unset
+        // receipt OMITS the key (legacy byte-stability) instead of
+        // serializing false.
         let identity = Incarnation {
             pid: 42,
             starttime: 123,
@@ -5687,30 +5712,46 @@ mod tests {
                 mount: None,
             },
         };
-        let unavailable = serde_json::json!({
-            "api": 20, "entries": 0,
-            "observed_success": 0, "observed_failure": 0,
-            "verification_mismatch": 0, "unsupported": 0,
-            "gaps": {"map": 0, "depth": 0, "unpaired": 0, "tail": 0,
-                     "unsupported_return": 0, "saturated": false,
-                     "not_attached": true, "attachment": true, "finality": true}
-        });
-        let failed_read = serde_json::json!({
-            "api": 21, "entries": 0,
-            "observed_success": 0, "observed_failure": 0,
-            "verification_mismatch": 0, "unsupported": 0,
-            "gaps": {"map": 1, "depth": 0, "unpaired": 0, "tail": 0,
-                     "unsupported_return": 0, "saturated": false,
-                     "not_attached": false, "attachment": true, "finality": true}
-        });
-        let clean_row = serde_json::json!({
-            "api": 22, "entries": 3,
-            "observed_success": 3, "observed_failure": 0,
-            "verification_mismatch": 0, "unsupported": 0,
-            "gaps": {"map": 0, "depth": 0, "unpaired": 0, "tail": 0,
-                     "unsupported_return": 0, "saturated": false,
-                     "not_attached": false, "attachment": true, "finality": true}
-        });
+        let unavailable = serde_json::to_value(crate::api_activity::ApiActivityRow::unavailable(
+            crate::api_activity::ApiId::try_from(20).unwrap(),
+        ))
+        .unwrap();
+        assert_eq!(unavailable["gaps"]["not_attached"], true);
+        assert!(
+            unavailable["gaps"].get("read_receipt").is_none(),
+            "an unset receipt omits the key: {unavailable}"
+        );
+        let failed_read = serde_json::to_value(
+            crate::provider_observation::wire::failed_activity(21).expect("api 21 has a row"),
+        )
+        .unwrap();
+        assert_eq!(failed_read["gaps"]["map"], 1);
+        assert_eq!(
+            failed_read["gaps"]["not_attached"], false,
+            "a failed READ keeps the attachment bit: {failed_read}"
+        );
+        assert!(
+            failed_read["gaps"].get("read_receipt").is_none(),
+            "a failed read omits the receipt key: {failed_read}"
+        );
+        let clean_row = serde_json::to_value(
+            crate::provider_observation::wire::activity(
+                22,
+                crate::provider_observation::wire::contract::ApiAggregate {
+                    entries: 3,
+                    success: 3,
+                    ..Default::default()
+                },
+            )
+            .expect("clean totals decode"),
+        )
+        .unwrap();
+        assert_eq!(clean_row["entries"], 3);
+        assert_eq!(clean_row["gaps"]["not_attached"], false);
+        assert_eq!(
+            clean_row["gaps"]["read_receipt"], true,
+            "only the successful read carries the receipt: {clean_row}"
+        );
         let render = |rows: Vec<serde_json::Value>| {
             let document = serde_json::json!({
                 "sites": [], "fenced": [],
@@ -5839,6 +5880,88 @@ mod tests {
         let doc = &envelope["document"];
         assert_eq!(doc["attach_diagnostics"].as_array().unwrap().len(), 10);
         assert_eq!(doc["refusal_diagnostics"].as_array().unwrap().len(), 1);
+    }
+    #[test]
+    fn human_and_json_modes_carry_the_shared_request_section() {
+        // NEW-14 fix4: `scan --watch --observe-crypto` carries
+        // request evidence in its JSON process document — the
+        // human record renders the SAME shared section (never
+        // JSON-only). The section below is producer-folded (typed
+        // fold, not hand JSON).
+        use crate::provider_observation::request_evidence::{RequestEvidence, RequestScope};
+        use crate::provider_observation::schema::{
+            AlgorithmClass, ContextIdentity, ObservationApi, ObservationFact, ObservationPayload,
+            ObservationSource, Operation, ProviderNameClass, ScopeConfidence,
+        };
+        let fact = ObservationFact {
+            pid: 42,
+            starttime: 123,
+            object_sha256: "b".repeat(64).try_into().unwrap(),
+            generation: 1,
+            context: ContextIdentity::Unknown {},
+            source: ObservationSource::PublicApi,
+            api: ObservationApi::Inventoried(crate::inventory::Api::EvpMdFetch),
+            operation: Operation::Other,
+            class: AlgorithmClass::Other,
+            monotonic_ns: 10,
+            confidence: ScopeConfidence::Observed,
+            payload: ObservationPayload::ApiAttempt {
+                name: ProviderNameClass::Other,
+            },
+        };
+        let section =
+            serde_json::to_value(RequestEvidence::fold(&[fact], RequestScope::batch())).unwrap();
+        let document = serde_json::json!({
+            "sites": [], "fenced": [], "api_activity": [], "objects": [{}],
+            "completeness": {"counters": []},
+            "request_evidence": section,
+        });
+        let identity = Incarnation {
+            pid: 42,
+            starttime: 123,
+            namespaces: inventory::NamespaceIds {
+                pid: None,
+                mount: None,
+            },
+        };
+        let emit = |json: bool| {
+            let mut bytes = Vec::new();
+            let mut out = Output {
+                writer: &mut bytes,
+                sequence: 0,
+                json,
+                pending_gaps: Vec::new(),
+                resolve_paths: false,
+                terminal: false,
+                verbosity: 0,
+            };
+            out.emit(Record::ProcessObservation {
+                incarnation: &identity,
+                segment: 4,
+                retirement: "duration",
+                document: &document,
+                image_epoch: 0,
+                loss: LossSummary::empty(),
+            })
+            .unwrap();
+            bytes
+        };
+        // Human: the shared section renders (banner + folded row).
+        let text = String::from_utf8(emit(false)).unwrap();
+        assert!(
+            text.contains("fetch/load/query facts never mean the fetched object was used"),
+            "human carries the shared request banner:\n{text}"
+        );
+        assert!(
+            text.contains("fetch EVP_MD_fetch"),
+            "human carries the folded fetch row:\n{text}"
+        );
+        // JSON: the same document carries the section in full.
+        let envelope: serde_json::Value = serde_json::from_slice(&emit(true)).unwrap();
+        assert_eq!(
+            envelope["document"]["request_evidence"]["fetches"][0]["export"],
+            "EVP_MD_fetch"
+        );
     }
     #[test]
     fn parser_refused_honestly_with_two_sessions_live_recovers_after() {

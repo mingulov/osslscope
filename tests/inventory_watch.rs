@@ -554,7 +554,9 @@ fn cli_watch_human_refusal_and_output_delivery() {
     assert!(text.contains("unknown"));
     assert!(text.contains("not_observed"));
     assert!(text.contains("incomplete"));
-    assert!(!text.contains("PRIVATE_CANARY"));
+    // No blanket canary assertion here (P2fix2 item 20 — the
+    // TMPDIR-length-fragile `!contains` is replaced by the
+    // field-scoped short/long-TMPDIR test below).
     let unavailable = Command::new(env!("CARGO_BIN_EXE_osslscope"))
         .args([
             "scan",
@@ -591,6 +593,152 @@ fn cli_watch_human_refusal_and_output_delivery() {
         .unwrap();
     assert_eq!(full.status.code(), Some(1));
     assert!(child.child.try_wait().unwrap().is_none());
+}
+
+// P2fix3 CANARY: exact canary placement — the stem appears ONLY
+// inside a `path=` value span (never elsewhere on the row), and
+// maps-hint rows carry the EXACT expected hint spelling (full
+// when short). Returns the path span when the line carries the
+// stem (for the caller's exact-spelling check), Ok(None) when
+// the line carries no stem, Err(row) on any misplacement.
+fn check_canary_placement(line: &str) -> Result<Option<String>, String> {
+    const STEM: &str = "PRIVATE_CANARY";
+    if !line.contains(STEM) {
+        return Ok(None);
+    }
+    let start = line.find("path=").map(|i| i + "path=".len());
+    let Some(begin) = start else {
+        return Err(line.to_string());
+    };
+    let end = line.find(" version=").unwrap_or(line.len());
+    if end < begin {
+        return Err(line.to_string());
+    }
+    let (span, rest) = (
+        &line[begin..end],
+        format!("{}{}", &line[..begin], &line[end..]),
+    );
+    if !span.contains(STEM) || rest.contains(STEM) {
+        return Err(line.to_string());
+    }
+    Ok(Some(span.to_string()))
+}
+
+#[test]
+fn canary_placement_check_rejects_off_field_occurrences() {
+    // Discrimination proof for the exact-placement rule: a stem
+    // occurrence OUTSIDE the path span (on a row that HAS a path
+    // field — the old line-level check passes this) rejects, as
+    // does a stem with no path field at all; in-span occurrences
+    // pass with the span returned.
+    let hole = "  lib sha256=abc identity=verified size=1 path=(unverified maps hint: /tmp/x) version=PRIVATE_CANARY_module";
+    assert!(hole.contains("path="), "premise: old check passes");
+    assert!(check_canary_placement(hole).is_err(), "off-field rejects");
+    assert!(check_canary_placement("note PRIVATE_CANARY here").is_err());
+    let clean = "  lib sha256=abc identity=verified size=1 path=(unverified maps hint: /tmp/c9/PRIVATE_CANARY_module.so) version=none";
+    assert_eq!(
+        check_canary_placement(clean).unwrap(),
+        Some("(unverified maps hint: /tmp/c9/PRIVATE_CANARY_module.so)".to_string())
+    );
+    assert_eq!(
+        check_canary_placement("clean row path=/tmp/x version=none").unwrap(),
+        None
+    );
+}
+
+// P2fix2 item 20 (codex CANARY-PRESERVE) as corrected by P2fix3
+// CANARY: the v0.6.0 path display stands (verified paths shown;
+// maps-hint truncates at 80 chars), and the canary pins EXACT
+// placement across deterministic short AND long TMPDIRs — the
+// stem appears ONLY inside `path=` spans (absence from the rest
+// of every row), with the exact hint spelling when short and
+// total absence when long (truncation cuts inside TMPDIR).
+#[test]
+fn canary_human_path_display_is_field_scoped() {
+    struct TmpdirGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl Drop for TmpdirGuard {
+        fn drop(&mut self) {
+            // SAFETY: serial battery (RUST_TEST_THREADS=1); only
+            // this test swaps TMPDIR, and every other reader gets
+            // valid paths either way.
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("TMPDIR", v),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+        }
+    }
+    for (tag, tmpdir) in [
+        ("short", "/tmp/c9"),
+        (
+            "long",
+            "/tmp/LLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLLL",
+        ),
+    ] {
+        fs::create_dir_all(tmpdir).unwrap();
+        let _guard = TmpdirGuard {
+            prev: std::env::var_os("TMPDIR"),
+        };
+        // SAFETY: same seriality as the guard above.
+        unsafe { std::env::set_var("TMPDIR", tmpdir) };
+        let f = Fixture::new();
+        let module = f.module();
+        let mut child = f.child(&module);
+        child.command(b'm');
+        let human = Command::new(env!("CARGO_BIN_EXE_osslscope"))
+            .args([
+                "scan",
+                "--watch",
+                "--pid",
+                &child.pid().to_string(),
+                "--duration",
+                "0.2",
+            ])
+            .output()
+            .unwrap();
+        assert!(matches!(human.status.code(), Some(0 | 3)), "{tag}");
+        let text = String::from_utf8(human.stdout).unwrap();
+        // Exact placement: every stem occurrence sits INSIDE its
+        // line's `path=` span, with none in the rest of the row.
+        let mut spans: Vec<String> = vec![];
+        for line in text.lines() {
+            match check_canary_placement(line) {
+                Ok(Some(span)) => spans.push(span),
+                Ok(None) => {}
+                Err(row) => panic!("{tag}: canary misplaced: {row:?}"),
+            }
+        }
+        let hint_lines: Vec<&str> = text.lines().filter(|l| l.contains("maps hint:")).collect();
+        // Positive: the hint exists (module unpinned in --pid-only
+        // scope) and follows the documented 80-char rule exactly.
+        assert!(!hint_lines.is_empty(), "{tag}: no maps hint: {text:?}");
+        if tag == "short" {
+            // Exact spelling: at least one path span EQUALS the
+            // full expected hint (module path verbatim).
+            let expected = format!("(unverified maps hint: {})", module.to_string_lossy());
+            assert!(
+                spans.iter().any(|s| s == &expected),
+                "short TMPDIR shows the exact hint {expected:?}: {spans:?}"
+            );
+        } else {
+            for hint in &hint_lines {
+                assert!(
+                    hint.contains('…'),
+                    "long TMPDIR truncates per the 80-char rule: {hint:?}"
+                );
+            }
+            // Total absence (truncation cuts inside TMPDIR — not
+            // even the stem survives).
+            assert!(
+                !text.contains("PRIVATE_CANARY"),
+                "long TMPDIR hides the canary stem: {text:?}"
+            );
+        }
+        assert!(child.child.try_wait().unwrap().is_none());
+    }
 }
 
 // Catches retaining obsolete sampled descriptors after pinned selection failure.
@@ -945,7 +1093,11 @@ fn watch_end_status_preserves_usable_history() {
     let pid = workload.0.id();
     let mut opts = options(pid);
     opts.interval = Duration::from_millis(50);
-    opts.duration = Some(Duration::from_millis(400));
+    // Hardened margin (P2fix2 — the H5 baseline flake tripped under
+    // concurrent-session load: a slow first sample starves the
+    // 400 ms window to a single snapshot; 1500 ms keeps the same
+    // requirement — usable history then an unavailable tail).
+    opts.duration = Some(Duration::from_millis(1500));
     let mut count = 0;
     let mut writer = Records {
         pending: vec![],

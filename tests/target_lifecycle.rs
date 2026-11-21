@@ -3274,6 +3274,8 @@ pub(crate) fn connector_body_ordinary_production_run_counts_real_crypto_free_of_
         harvest_timeout: Duration::from_secs(30),
         grace: Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
         members_object: None,
         dev_bundle: None,
     };

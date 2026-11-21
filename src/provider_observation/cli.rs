@@ -3,6 +3,7 @@
 use super::{
     IntervalCause, ObservationBatch, ObservationGap, ObservationLimits, ProviderSession, artifact,
 };
+use crate::capture::{ClockPort as _, LiveClock};
 use crate::inventory::{
     self,
     scope::{ScopedScanner, Selection},
@@ -16,19 +17,443 @@ use std::{
     time::{Duration, Instant},
 };
 const SCHEMA: &str = "osslscope.discovery.provider.v1";
-const HELP: &str = "usage: osslscope scan --observe-providers [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--duration S] [--interval S]] [--json]\n       osslscope inspect --pid PID --observe-providers [--json]\nObserve public provider APIs for 30 seconds by default; duration (0,3600]s, interval [0.05,3600]s (default 1s).\nStreams snapshot/observation/end records; activation before attachment remains unknown.\nAdvertisements do not prove execution; execution remains not_observed.\n";
+const HELP: &str = "usage: osslscope scan --observe-providers [--pid PID ...] [--cgroup PATH] [--module PATH ...] [--watch [--duration S] [--interval S]] [--json] [--trace MODE] [--trace-histogram-by-api]\n       osslscope inspect --pid PID --observe-providers [--json] [--trace MODE] [--trace-histogram-by-api]\nObserve public provider APIs for 30 seconds by default; duration (0,3600]s, interval [0.05,3600]s (default 1s).\nStreams snapshot/observation/end records; activation before attachment remains unknown.\nAdvertisements do not prove execution; execution remains not_observed.\n--trace MODE programs pairing: off|metadata|latency|status|all (default off; aggregate capture stays default-ON in all modes; operational modes degrade to the aggregate-only fallback while latency acceptance is OPEN).\n--trace-histogram-by-api adds per-API latency distributions (needs latency|all). OSSLSCOPE_TRACE_FALLBACK=aggregate-only enforces the D0-6 aggregate-only fallback.\n";
 const MEANING: &str = "Provider observation: historical activation unknown; advertisements do not prove execution; execution not_observed.\n";
 /// Value-taking options of the scan parser below: the scan router
 /// consumes the token after each of these, so flag-shaped values
 /// never misroute. A new value-taking match arm MUST extend this list.
-pub(crate) const VALUE_OPTIONS: &[&str] =
-    &["--interval", "--duration", "--pid", "--module", "--cgroup"];
+pub(crate) const VALUE_OPTIONS: &[&str] = &[
+    "--interval",
+    "--duration",
+    "--pid",
+    "--module",
+    "--cgroup",
+    "--trace",
+];
+/// Parse a `--trace` word (§6D-9, exact match).
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_word(word: &str) -> Option<u32> {
+    use super::trace::*;
+    Some(match word {
+        "off" => TRACE_MODE_OFF,
+        "metadata" => TRACE_MODE_METADATA,
+        "latency" => TRACE_MODE_LATENCY,
+        "status" => TRACE_MODE_STATUS,
+        "all" => TRACE_MODE_ALL,
+        _ => return None,
+    })
+}
+
+/// Render a mode word (§6D-9 order).
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_word_str(mode: u32) -> &'static str {
+    use super::trace::*;
+    match mode {
+        TRACE_MODE_OFF => "off",
+        TRACE_MODE_METADATA => "metadata",
+        TRACE_MODE_LATENCY => "latency",
+        TRACE_MODE_STATUS => "status",
+        TRACE_MODE_ALL => "all",
+        _ => "off",
+    }
+}
+
+/// Latency-bearing modes (§6D-9: histograms need latency|all).
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_latency_bearing(mode: u32) -> bool {
+    use super::trace::*;
+    matches!(mode, TRACE_MODE_LATENCY | TRACE_MODE_ALL)
+}
+
+/// Pairing modes (§6D-9: the §6D-7 record is null in off/metadata).
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_pairing(mode: u32, fallback: bool) -> bool {
+    super::trace::trace_mode_edge_bearing(mode) || fallback
+}
+
+/// D0-6 fallback requested (`OSSLSCOPE_TRACE_FALLBACK=aggregate-only`)?
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_fallback_env() -> bool {
+    std::env::var("OSSLSCOPE_TRACE_FALLBACK").unwrap_or_default() == "aggregate-only"
+}
+
+/// Resolved trace programming for PUBLIC paths (scan/inspect +
+/// report/check via focused setup).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublicTraceResolution {
+    /// Program the D0-6 aggregate-only fallback (not the mode).
+    pub fallback: bool,
+    /// Effective mode word (`METADATA` under fallback).
+    pub effective: u32,
+    /// The request degraded while C023 is OPEN (callers note it on
+    /// stderr — the output word alone would hide the degrade).
+    pub degraded: bool,
+}
+
+/// Resolve an ISOLATED-QUALIFICATION `--trace` request (codex
+/// DELTA-7): no OPEN forcing (delta activation stays available to
+/// the qual harness); the env switch keeps its explicit meaning
+/// (requested fallback). Reached ONLY via
+/// `FocusedConfig::allow_operational_trace` (never CLI parsing)
+/// or direct session use.
+pub fn resolve_qual_trace_mode(requested: u32, fallback_env: bool) -> PublicTraceResolution {
+    use super::trace::*;
+    if fallback_env {
+        return PublicTraceResolution {
+            fallback: true,
+            effective: TRACE_MODE_METADATA,
+            degraded: false,
+        };
+    }
+    PublicTraceResolution {
+        fallback: false,
+        effective: requested,
+        degraded: false,
+    }
+}
+
+/// Resolve a PUBLIC `--trace` request (codex DELTA-7): while C023
+/// acceptance is OPEN, operational modes (latency/status/all)
+/// degrade to the D0-6 aggregate-only fallback — fetch/lifecycle
+/// pairing, class-0 counts, API aggregates, and loss visibility
+/// stay; operational edges/durations/classes 1..4 stay unreachable.
+/// Off/metadata proceed (already within the reachable set). The env
+/// switch keeps its explicit meaning (requested fallback). Direct
+/// session users (the isolated qualification harness) bypass this:
+/// enforcement lives on the public paths, not in the producer.
+pub fn resolve_public_trace_mode(requested: u32, fallback_env: bool) -> PublicTraceResolution {
+    use super::trace::*;
+    if fallback_env {
+        return PublicTraceResolution {
+            fallback: true,
+            effective: TRACE_MODE_METADATA,
+            degraded: false,
+        };
+    }
+    if super::c023::ACCEPTANCE_OPEN && trace_mode_edge_bearing(requested) {
+        return PublicTraceResolution {
+            fallback: true,
+            effective: TRACE_MODE_METADATA,
+            degraded: true,
+        };
+    }
+    PublicTraceResolution {
+        fallback: false,
+        effective: requested,
+        degraded: false,
+    }
+}
+
+/// Dense per-API availability (§6D-3 rule) from aggregate rows:
+/// each operational ID reads its row's word (`covered` only with
+/// no gap flags), worst word wins across rows (covered claims
+/// complete coverage), absent IDs read `not_attached`. Shared by
+/// the provider-CLI end projection and focused capture (one rule).
+pub fn trace_availability_from_rows(
+    rows: &[crate::api_activity::ApiActivityRow],
+) -> std::collections::BTreeMap<u32, String> {
+    fn rank(word: &str) -> u8 {
+        match word {
+            "covered" => 2,
+            "partial_coverage" => 1,
+            _ => 0,
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    for id in 20..=72u32 {
+        let mut worst: Option<u8> = None;
+        for row in rows.iter().filter(|r| u32::from(r.api) == id) {
+            let word = if row.gaps.not_attached {
+                "not_attached"
+            } else if row.gaps.attachment || row.gaps.finality {
+                "partial_coverage"
+            } else {
+                "covered"
+            };
+            worst = Some(worst.map_or(rank(word), |w| w.min(rank(word))));
+        }
+        out.insert(
+            id,
+            match worst {
+                Some(2) => "covered",
+                Some(1) => "partial_coverage",
+                _ => "not_attached",
+            }
+            .to_string(),
+        );
+    }
+    out
+}
+
+/// End-record detail bound (first-N rows + retained total): 64
+/// rows (the §6D-7 GAP-list 64-record precedent — bounded evidence,
+/// never the full 4096-row retention).
+pub const TRACE_END_DETAIL_MAX_ROWS: usize = 64;
+
+/// §6D-7 record projection (JSON): the sealed window (flat,
+/// established shape) + class_epoch from totals + the qualified
+/// distributions (histograms on latency-bearing modes, by_api on
+/// the opt-in) + bounded detail — all via the single typed
+/// projection ([`super::trace::summarize`] — `gaps` is honestly
+/// empty: no GAP-kind producer exists on this plane; loss rides
+/// GapCounters + lanes; the additive `fallback` key marks D0-6
+/// state).
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_record_json(
+    window: &super::trace::ClosedTraceWindow,
+    totals: &super::trace::TraceTotals,
+    availability: Option<&std::collections::BTreeMap<u32, String>>,
+) -> serde_json::Value {
+    let summary =
+        super::trace::summarize(window, totals, trace_word_str(window.mode), availability);
+    let mut value = serde_json::to_value(&summary.window).unwrap_or(serde_json::Value::Null);
+    if let Some(obj) = value.as_object_mut() {
+        // Unbound window projection (P2fix3 NEW-P2e): a late cut
+        // withholds paired/detail as window-scoped evidence (the
+        // scope mark rides the window object; diagnostics retain).
+        if window.late_cut {
+            obj.insert("paired".to_string(), serde_json::Value::Null);
+        }
+        // Withheld epoch classes stay ABSENT (never null-filled);
+        // the window record's null class_window rides the flat
+        // shape (null = withheld there).
+        if let Some(ce) = summary.class_epoch.as_ref() {
+            obj.insert(
+                "class_epoch".to_string(),
+                serde_json::to_value(ce).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(h) = summary.histograms.as_ref() {
+            obj.insert(
+                "histograms".to_string(),
+                serde_json::to_value(h).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let (Some(b), Some(a)) = (
+            summary.by_api.as_ref(),
+            summary.by_api_availability.as_ref(),
+        ) {
+            obj.insert(
+                "by_api".to_string(),
+                serde_json::to_value(b).unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "by_api_availability".to_string(),
+                serde_json::to_value(a).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        let rows = super::trace::detail_json(window)
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        // Unbound detail withholds with the projection (same rule
+        // as paired above — the rows are unbound evidence, not
+        // window evidence).
+        let (detail_total, rows) = if window.late_cut {
+            (0usize, vec![])
+        } else {
+            (rows.len(), rows)
+        };
+        obj.insert("detail_total".to_string(), detail_total.into());
+        obj.insert(
+            "detail".to_string(),
+            rows.into_iter()
+                .take(TRACE_END_DETAIL_MAX_ROWS)
+                .collect::<Vec<_>>()
+                .into(),
+        );
+    }
+    value
+}
+
+/// §6D-7 terminal section (10 lines max).
+/// Public 6D projection/parse helper (also used by focused capture).
+/// `availability` is the dense §6D-3 map (present iff the by-api
+/// opt-in ran — drives the covered-API count).
+pub fn trace_human(
+    window: &super::trace::ClosedTraceWindow,
+    totals: &super::trace::TraceTotals,
+    availability: Option<&std::collections::BTreeMap<u32, String>>,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    let lanes: Vec<String> = window
+        .ring_loss
+        .iter()
+        .enumerate()
+        .filter(|(_, lane)| **lane > 0)
+        .map(|(i, lane)| format!("{i}={lane}"))
+        .collect();
+    // Unbound window projection (P2fix3 NEW-P2e): a late cut
+    // withholds paired as window-scoped evidence with the cause
+    // named; the scope mark rides only when set (clean lines
+    // byte-stable).
+    let paired = if window.late_cut {
+        "withheld (late-cut)".to_string()
+    } else {
+        window.paired.to_string()
+    };
+    write!(
+        writer,
+        "TRACE mode={} paired={} unpaired_e={} unpaired_r={}",
+        trace_word_str(window.mode),
+        paired,
+        window.unpaired_entries,
+        window.unpaired_results
+    )?;
+    if window.late_cut {
+        write!(writer, " cut_unbound=true")?;
+    }
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "  depth={} dropped={} capped={} nonmono={} rejected={} fallback={}",
+        window.depth_exceeded,
+        window.dropped,
+        window.capped,
+        window.nonmonotonic_pairs,
+        window.rejected_unknown_api,
+        window.fallback
+    )?;
+    // Withholding governs human output too (DELTA-8): the same
+    // interpreted distributions the JSON projection withholds show
+    // as withheld here (never silently zero); raw counters, lanes,
+    // exemplars, and -vv detail always flow.
+    let class = if window.pairing_uncertain {
+        "withheld".to_string()
+    } else {
+        format!(
+            "{}/{}/{}/{}/{}",
+            window.class_counts[1],
+            window.class_counts[2],
+            window.class_counts[3],
+            window.class_counts[4],
+            window.class_counts[0],
+        )
+    };
+    let epoch = if totals.pairing_uncertain {
+        "withheld".to_string()
+    } else {
+        format!(
+            "{}/{}/{}/{}/{}",
+            totals.class_counts[1],
+            totals.class_counts[2],
+            totals.class_counts[3],
+            totals.class_counts[4],
+            totals.class_counts[0],
+        )
+    };
+    writeln!(
+        writer,
+        "  ring=[{}] class={class} epoch={epoch}",
+        if lanes.is_empty() {
+            "-".to_string()
+        } else {
+            lanes.join(",")
+        },
+    )?;
+    // Human/JSON parity: the same folds the JSON end projection
+    // carries (histogram counts, covered-API count — same spelling
+    // as the document human section).
+    if totals.pairing_uncertain {
+        writeln!(writer, "  histograms: withheld (pairing uncertainty)")?;
+    } else if trace_latency_bearing(window.mode) {
+        let h = &totals.histograms;
+        writeln!(
+            writer,
+            "  histograms({}) success={} failure={} empty={} retry={} unknown={}",
+            super::trace::TRACE_EDGES_MARKER,
+            h[1].count,
+            h[2].count,
+            h[3].count,
+            h[4].count,
+            h[0].count,
+        )?;
+    } else {
+        writeln!(writer, "  histograms: none")?;
+    }
+    if totals.api_histograms.is_some() {
+        if totals.pairing_uncertain {
+            writeln!(writer, "  by_api: withheld (pairing uncertainty)")?;
+        } else {
+            let covered = availability
+                .map(|a| a.values().filter(|w| w.as_str() == "covered").count())
+                .unwrap_or(0);
+            writeln!(writer, "  by_api: {covered} covered APIs")?;
+        }
+    }
+    for e in window.exemplars.iter().take(4) {
+        writeln!(
+            writer,
+            "  exemplar {} {} api={} age={}",
+            match e.dir {
+                super::trace::ExemplarDir::Entry => "entry",
+                super::trace::ExemplarDir::Result => "result",
+            },
+            e.key_hash16,
+            e.api,
+            e.age_ns
+        )?;
+    }
+    if window.exemplars.len() > 4 {
+        writeln!(writer, "  +{} more exemplars", window.exemplars.len() - 4)?;
+    }
+    Ok(())
+}
+
+/// Per-call detail rows for `-vv` human output (first 8 + count;
+/// hashed keys only — the same §6D-11 rule as `detail_json`).
+/// Public 6D projection/parse helper (also used by focused capture).
+pub fn trace_detail_human(
+    window: &super::trace::ClosedTraceWindow,
+    writer: &mut impl Write,
+) -> io::Result<()> {
+    // Unbound detail (P2fix3 NEW-P2e): rows withhold with the
+    // projection; the dropped diagnostic retains.
+    if window.late_cut {
+        writeln!(
+            writer,
+            "  detail rows=withheld (late-cut) dropped={}",
+            window.dropped
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        writer,
+        "  detail rows={} dropped={}",
+        window.detail.len(),
+        window.dropped
+    )?;
+    for row in window.detail.iter().take(8) {
+        writeln!(
+            writer,
+            "    {} api={} pid={} tid={} gen={} h={} inv={} ns={} o={}",
+            if row.kind == 1 { "attempt" } else { "result" },
+            row.api,
+            row.key.pid,
+            row.key.tid,
+            row.key.generation,
+            row.key.key_hash16,
+            row.key.invocation,
+            row.monotonic_ns,
+            row.outcome
+        )?;
+    }
+    if window.detail.len() > 8 {
+        writeln!(writer, "    +{} more rows", window.detail.len() - 8)?;
+    }
+    Ok(())
+}
+
 struct Options {
     selection: Selection,
     json: bool,
     watch: bool,
     interval: Duration,
     duration: Duration,
+    /// Requested `--trace` word (default off).
+    trace_mode: u32,
+    /// `--trace-histogram-by-api` (§6D-3 opt-in).
+    trace_by_api: bool,
     /// Human detail level (`-v`/`--verbose` repeatable, `-vv` = 2,
     /// clamped at 2; default 0 is quiet). Gates detail volume
     /// only — exits, stderr, capability words, and JSON bytes are
@@ -69,12 +494,20 @@ fn parse(args: &[String]) -> Result<Options, ()> {
     let mut interval = None;
     let mut duration = None;
     let mut verbosity = 0u8;
+    let mut trace_mode = super::trace::TRACE_MODE_OFF;
+    let mut trace_mode_set = false;
+    let mut trace_by_api = false;
     let mut args = args[1..].iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--observe-providers" if !observe => observe = true,
             "--json" if !json => json = true,
             "--watch" if command == "scan" && !watch => watch = true,
+            "--trace" if !trace_mode_set => {
+                trace_mode = trace_word(args.next().ok_or(())?).ok_or(())?;
+                trace_mode_set = true;
+            }
+            "--trace-histogram-by-api" if !trace_by_api => trace_by_api = true,
             // Repeatable, clamped at 2 below. `-q`/`--quiet` stay
             // unknown (exit 2, empty stdout): the default is
             // already quiet, so no quiet flag exists.
@@ -110,6 +543,11 @@ fn parse(args: &[String]) -> Result<Options, ()> {
     {
         return Err(());
     }
+    // §6D-9: the histogram keying without histograms is a usage
+    // error (exit 2 pre-start, before any side effect).
+    if trace_by_api && !trace_latency_bearing(trace_mode) {
+        return Err(());
+    }
     Ok(Options {
         selection,
         json,
@@ -117,6 +555,8 @@ fn parse(args: &[String]) -> Result<Options, ()> {
         interval: interval.unwrap_or(Duration::from_secs(1)),
         duration: duration.unwrap_or(Duration::from_secs(30)),
         verbosity: verbosity.min(2),
+        trace_mode,
+        trace_by_api,
     })
 }
 fn path(value: Option<&String>) -> Result<PathBuf, ()> {
@@ -204,6 +644,12 @@ struct Record<'a> {
     poll_interval: Duration,
     snapshot: Option<&'a inventory::Snapshot>,
     facts: &'a [super::ObservationFact],
+    /// Phase 1 request fold over this batch's facts (per-batch:
+    /// the unattributed remainder is always Unknown here — the
+    /// operational plane joins only at the window document).
+    /// Skipped when empty so fact-free batches keep their shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_evidence: Option<super::request_evidence::RequestEvidence>,
     gaps: &'a [ObservationGap],
     /// Human-only causes for the interval gaps in [`Self::gaps`],
     /// aligned in order (see
@@ -227,6 +673,16 @@ struct End<'a> {
     capabilities: &'a Capabilities,
     gap: Option<inventory::GapReason>,
     sampled_history: &'static str,
+    /// Effective `--trace` word († additive, always present).
+    trace_mode: &'static str,
+    /// §6D-7 record († additive; skipped in off/metadata to keep
+    /// the end shape byte-identical apart from `trace_mode`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trace: Option<serde_json::Value>,
+    /// Sealed inputs for the human TRACE section (serde skips —
+    /// the machine record carries `trace` above).
+    #[serde(skip)]
+    sealed: Option<SealedTrace>,
     /// Run-level sample history for the human end record only
     /// (F8/H2): skipped by serde, so the machine end shape is
     /// byte-identical.
@@ -431,6 +887,14 @@ impl Render for Record<'_> {
                 writeln!(writer)?;
             }
         }
+        // Phase 1: the batch request fold renders as its own
+        // section after the per-fact rows (never interleaved with
+        // them, and never in the physical-ledger vocabulary).
+        if let Some(evidence) = self.request_evidence.as_ref() {
+            if !evidence.is_empty() {
+                writer.write_all(evidence.human_section().as_bytes())?;
+            }
+        }
         writer.write_all(observation_gap_block(self.gaps, self.interval_causes)?.as_bytes())?;
         Ok(())
     }
@@ -456,6 +920,22 @@ impl Render for End<'_> {
         }
         if let Some(gap) = self.gap {
             writeln!(writer, "  inventory_gap={}", finite(&gap)?)?;
+        }
+        if let Some(sealed) = self.sealed.as_ref() {
+            trace_human(
+                &sealed.window,
+                &sealed.totals,
+                sealed.availability.as_ref(),
+                writer,
+            )?;
+            if verbosity.min(2) >= 2 {
+                trace_detail_human(&sealed.window, writer)?;
+            }
+        } else if self.trace_mode == "unavailable" {
+            // Requested-but-unprogrammed (P2fix2 item 9): the human
+            // end carries the same effective word as the JSON
+            // record (off-mode scans stay silent — byte-identical).
+            writeln!(writer, "  TRACE mode=unavailable (no session opened)")?;
         }
         Ok(())
     }
@@ -484,12 +964,31 @@ fn degraded(gaps: &[ObservationGap]) -> bool {
         )
     })
 }
+/// Sealed §6D-7 inputs for the end record (JSON + human share
+/// them, so both spellings project the same seal).
+#[derive(Clone)]
+struct SealedTrace {
+    window: super::trace::ClosedTraceWindow,
+    totals: super::trace::TraceTotals,
+    /// Dense §6D-3 availability from the close batch rows (`Some`
+    /// iff the by-api opt-in produced per-API folds).
+    availability: Option<std::collections::BTreeMap<u32, String>>,
+}
 struct Stream<'a, W> {
     writer: &'a mut W,
     options: &'a Options,
     capabilities: Capabilities,
     started: Instant,
     sequence: u64,
+    /// Sealed §6D-7 inputs (set once before the end record; `None`
+    /// in off/metadata-without-fallback keeps the end shape).
+    trace: Option<SealedTrace>,
+    /// Effective mode word (requested unless programming failed).
+    trace_effective: u32,
+    /// A provider session opened (P2fix2 item 9: without one, an
+    /// explicit trace request reports `unavailable`, never the
+    /// requested word).
+    trace_session: bool,
     /// Previous snapshot batch digest (W1 heartbeat): `None`
     /// until the first snapshot batch renders full. Snapshots
     /// arrive borrowed, so the stream retains this owned digest
@@ -659,6 +1158,7 @@ impl<W: Write> Stream<'_, W> {
             learned_sites: _,
             static_candidates: _,
             api_activity: _,
+            terminal_scopes_observed: _,
             refreshed_processes: _,
             exec_witnesses: _,
             exec_deferred: _,
@@ -725,6 +1225,15 @@ impl<W: Write> Stream<'_, W> {
             self.writer.flush()?;
             return Ok(());
         }
+        // Phase 1: fold this batch's facts (per-batch scope, so
+        // the operational plane is unobserved and the unattributed
+        // remainder stays Unknown). Empty folds stay None so
+        // fact-free batches keep their exact shape.
+        let fold = super::request_evidence::RequestEvidence::fold(
+            &facts,
+            super::request_evidence::RequestScope::batch(),
+        );
+        let request_evidence = if fold.is_empty() { None } else { Some(fold) };
         emit(
             &Record {
                 schema_version: SCHEMA,
@@ -743,6 +1252,7 @@ impl<W: Write> Stream<'_, W> {
                 poll_interval: self.options.interval,
                 snapshot,
                 facts: &facts,
+                request_evidence,
                 gaps: &gaps,
                 interval_causes: &interval_causes,
                 capabilities: &self.capabilities,
@@ -753,11 +1263,56 @@ impl<W: Write> Stream<'_, W> {
             self.options.verbosity,
         )
     }
+    /// Seal the §6D-7 inputs before the end record (pairing modes
+    /// and fallback only; off/metadata keep `None`).
+    fn set_trace(&mut self, sealed: SealedTrace) {
+        self.trace = Some(sealed);
+    }
+
+    /// Terminal trace loss degrades the end record (P2fix2 item
+    /// 3): the six frozen counters positive OR pairing uncertainty
+    /// (window or epoch scope — corruption observed, even with zero
+    /// counted loss) books cumulative partial. The focused path
+    /// already routes the six through its finalizer; standalone
+    /// scan/inspect route them here (completeness AND exit).
+    fn trace_seal_degrades(
+        window: &super::trace::ClosedTraceWindow,
+        totals: &super::trace::TraceTotals,
+    ) -> bool {
+        window.dropped > 0
+            || window.unpaired_entries > 0
+            || window.unpaired_results > 0
+            || window.depth_exceeded > 0
+            || window.nonmonotonic_pairs > 0
+            || window.rejected_unknown_api > 0
+            || window.pairing_uncertain
+            || totals.pairing_uncertain
+    }
+
+    /// Effective trace word for the end record (P2fix2 item 9): an
+    /// explicit request (any non-off mode, or the fallback switch)
+    /// with no opened session reports `unavailable` (nothing was
+    /// programmed); requested-off stays `off`.
+    fn trace_end_word(&self) -> &'static str {
+        let requested =
+            self.options.trace_mode != super::trace::TRACE_MODE_OFF || trace_fallback_env();
+        if !self.trace_session && requested {
+            "unavailable"
+        } else {
+            trace_word_str(self.trace_effective)
+        }
+    }
+
     fn end(
         &mut self,
         reason: inventory::watch::EndReason,
         gap: Option<inventory::GapReason>,
     ) -> io::Result<u8> {
+        if let Some(sealed) = self.trace.as_ref() {
+            if Self::trace_seal_degrades(&sealed.window, &sealed.totals) {
+                self.cumulative.note_partial(self.sequence);
+            }
+        }
         let status = if !self.cumulative.usable {
             4
         } else if self.cumulative.partial
@@ -768,6 +1323,9 @@ impl<W: Write> Stream<'_, W> {
         } else {
             0
         };
+        let trace = self.trace.as_ref().map(|sealed| {
+            trace_record_json(&sealed.window, &sealed.totals, sealed.availability.as_ref())
+        });
         emit(
             &End {
                 schema_version: SCHEMA,
@@ -782,6 +1340,9 @@ impl<W: Write> Stream<'_, W> {
                 gap,
                 sampled_history: "incomplete",
                 cumulative: self.cumulative.clone(),
+                trace_mode: self.trace_end_word(),
+                trace,
+                sealed: self.trace.clone(),
             },
             self.writer,
             !self.options.json,
@@ -812,6 +1373,9 @@ fn observe(
         started,
         sequence: 0,
         prev: None,
+        trace: None,
+        trace_effective: options.trace_mode,
+        trace_session: false,
         cumulative: inventory::watch::Cumulative::default(),
     };
     let mut scanner =
@@ -848,8 +1412,38 @@ fn observe(
         ),
     };
     stream.capabilities = Capabilities::new(session.is_some());
+    stream.trace_session = session.is_some();
     if let Some(session) = &mut session {
         initial_batch = session.reconcile(&initial);
+    }
+    // §6D-9 mode programming (restart-scoped: once at setup). A
+    // programming failure degrades honestly to off (effective word
+    // + gap, never a silent mismatch). Public-path resolution
+    // (DELTA-7): operational modes degrade to the aggregate-only
+    // fallback while C023 is OPEN.
+    let trace_res = resolve_public_trace_mode(options.trace_mode, trace_fallback_env());
+    if trace_res.degraded {
+        crate::report::err_line(&format!(
+            "osslscope: note: --trace {} degraded to the aggregate-only fallback while latency acceptance is OPEN (C023)",
+            trace_word_str(options.trace_mode)
+        ));
+    }
+    if let Some(session) = &mut session {
+        if trace_res.fallback {
+            if session.set_trace_fallback().is_err() {
+                stream.trace_effective = super::trace::TRACE_MODE_OFF;
+                initial_batch.gaps.push(ObservationGap::BpfUnavailable);
+            } else {
+                stream.trace_effective = trace_res.effective;
+            }
+        } else if trace_res.effective != super::trace::TRACE_MODE_OFF {
+            if session.set_trace_mode(trace_res.effective).is_err() {
+                stream.trace_effective = super::trace::TRACE_MODE_OFF;
+                initial_batch.gaps.push(ObservationGap::BpfUnavailable);
+            } else {
+                session.set_trace_histogram_by_api(options.trace_by_api);
+            }
+        }
     }
     // The startup blocker prints once, before the first sample record:
     // the initial snapshot is the knowledge event.
@@ -904,11 +1498,37 @@ fn observe(
             .min(next_snapshot.saturating_duration_since(Instant::now()));
         std::thread::sleep(wait);
     };
-    if let Some(session) = session {
+    if let Some(mut session) = session {
         let begin = started.elapsed();
-        let batch = session.close();
-        if !batch.facts.is_empty() || !batch.gaps.is_empty() {
-            stream.batch(batch, None, begin, last_drain.elapsed())?;
+        // Bind the trace fold to the effective cut (P2fix2 item 3):
+        // the observation window ends here, so records at/above
+        // this instant skip the trace feed (the terminal drain
+        // below still folds every other plane); pairs already
+        // consumed past a late cut taint instead of standing.
+        session.set_trace_feed_cut(LiveClock.monotonic_ns());
+        // Terminal §6D-7 seal (pairing modes + fallback only): seal
+        // AFTER the final poll (live dirty drains only peek, so an
+        // early seal would read stale zero lanes).
+        if trace_pairing(stream.trace_effective, session.trace_fallback()) {
+            let (batch, window, totals) = session.close_with_trace();
+            let availability = totals.api_histograms.as_ref().map(|_| {
+                let rows: Vec<crate::api_activity::ApiActivityRow> =
+                    batch.api_activity.iter().map(|a| a.row.clone()).collect();
+                trace_availability_from_rows(&rows)
+            });
+            stream.set_trace(SealedTrace {
+                window,
+                totals,
+                availability,
+            });
+            if !batch.facts.is_empty() || !batch.gaps.is_empty() {
+                stream.batch(batch, None, begin, last_drain.elapsed())?;
+            }
+        } else {
+            let batch = session.close();
+            if !batch.facts.is_empty() || !batch.gaps.is_empty() {
+                stream.batch(batch, None, begin, last_drain.elapsed())?;
+            }
         }
     }
     stream.end(end_reason, None)
@@ -1011,6 +1631,9 @@ mod tests {
             started: Instant::now(),
             sequence: 0,
             prev: None,
+            trace: None,
+            trace_effective: super::super::trace::TRACE_MODE_OFF,
+            trace_session: false,
             cumulative: crate::inventory::watch::Cumulative {
                 usable: true,
                 partial: false,
@@ -1056,6 +1679,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             snapshot: None,
             facts: &facts,
+            request_evidence: None,
             gaps: &[],
             interval_causes: &[],
             capabilities: &capabilities,
@@ -1211,6 +1835,7 @@ mod tests {
                 poll_interval: Duration::from_secs(1),
                 snapshot: None,
                 facts: &facts,
+                request_evidence: None,
                 gaps: &[],
                 interval_causes: &[],
                 capabilities: &capabilities,
@@ -1239,6 +1864,89 @@ mod tests {
     }
 
     #[test]
+    fn batch_request_section_renders_after_facts_and_skips_when_empty() {
+        // Phase 1: a batch fold renders as its own human section
+        // after the per-fact rows (JSON key present); a None fold
+        // keeps the record shape byte-identical (no key, no block).
+        use super::super::request_evidence::{RequestEvidence, RequestScope};
+        let capabilities = Capabilities::new(true);
+        let interval = Interval {
+            started_elapsed_ns: 0,
+            finished_elapsed_ns: 10,
+            drain_lag_ns: 10,
+        };
+        let record = Record {
+            schema_version: SCHEMA,
+            mode: "watch",
+            record: "observation",
+            sequence: 1,
+            interval,
+            poll_interval: Duration::from_secs(1),
+            snapshot: None,
+            facts: &[],
+            request_evidence: None,
+            gaps: &[],
+            interval_causes: &[],
+            capabilities: &capabilities,
+            sampled_history: "incomplete",
+        };
+        let mut json = Vec::new();
+        emit(&record, &mut json, false, 0).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert!(value.get("request_evidence").is_none());
+        let mut human = Vec::new();
+        emit(&record, &mut human, true, 0).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(!human.contains("request evidence"), "{human}");
+        let fold = RequestEvidence::fold(&[], RequestScope::batch());
+        assert!(fold.is_empty());
+        // GATE-OPEN + NEW-16 fix5: batch scope claims no silence —
+        // the rendered batch shape is positive rows (edges), never
+        // an armed-idle zero (interval-less zeros no longer
+        // certify, and production batch folds carry no arms).
+        use super::super::schema::{
+            AlgorithmClass, ContextIdentity, ObservationApi, ObservationFact, ObservationPayload,
+            ObservationSource, Operation, ProviderNameClass, ScopeConfidence,
+        };
+        let fact = ObservationFact {
+            pid: 12,
+            starttime: 100,
+            object_sha256: "b".repeat(64).try_into().unwrap(),
+            generation: 1,
+            context: ContextIdentity::Unknown {},
+            source: ObservationSource::PublicApi,
+            api: ObservationApi::Inventoried(crate::inventory::Api::EvpMdFetch),
+            operation: Operation::Other,
+            class: AlgorithmClass::Other,
+            monotonic_ns: 5,
+            confidence: ScopeConfidence::Observed,
+            payload: ObservationPayload::ApiAttempt {
+                name: ProviderNameClass::Other,
+            },
+        };
+        let record = Record {
+            request_evidence: Some(RequestEvidence::fold(&[fact], RequestScope::batch())),
+            ..record
+        };
+        let mut json = Vec::new();
+        emit(&record, &mut json, false, 0).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(
+            value["request_evidence"]["fetches"][0]["surface_id"], 10,
+            "the batch row renders"
+        );
+        assert!(
+            value["request_evidence"].get("silence_window").is_none(),
+            "batch scope claims no silence"
+        );
+        let mut human = Vec::new();
+        emit(&record, &mut human, true, 0).unwrap();
+        let human = String::from_utf8(human).unwrap();
+        assert!(human.contains("request evidence ("), "{human}");
+        assert!(human.contains("EVP_MD_fetch"), "{human}");
+    }
+
+    #[test]
     fn human_facts_render_finite_algorithm_labels_and_safe_identity() {
         let fact: super::super::ObservationFact = serde_json::from_value(serde_json::json!({
             "pid": 12, "starttime": 100, "object_sha256": "a".repeat(64), "generation": 1,
@@ -1260,6 +1968,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             snapshot: None,
             facts: &[fact],
+            request_evidence: None,
             gaps: &[],
             interval_causes: &[],
             capabilities: &capabilities,
@@ -1333,6 +2042,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             snapshot: Some(&snapshot),
             facts: &[],
+            request_evidence: None,
             gaps: &[],
             interval_causes: &[],
             capabilities: &capabilities,
@@ -1431,6 +2141,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             snapshot: Some(&snapshot),
             facts: &[fact],
+            request_evidence: None,
             gaps: &gaps,
             interval_causes: &causes,
             capabilities: &capabilities,
@@ -1562,6 +2273,320 @@ mod tests {
     }
 
     #[test]
+    fn trace_words_parse_exact_and_default_off() {
+        use super::super::trace::*;
+        let parse = |flags: &[&str]| {
+            let mut args = vec!["scan".to_string()];
+            args.extend(flags.iter().map(|f| f.to_string()));
+            args.push("--observe-providers".to_string());
+            super::parse(&args)
+        };
+        assert_eq!(parse(&[]).unwrap().trace_mode, TRACE_MODE_OFF);
+        assert_eq!(
+            parse(&["--trace", "off"]).unwrap().trace_mode,
+            TRACE_MODE_OFF
+        );
+        assert_eq!(
+            parse(&["--trace", "metadata"]).unwrap().trace_mode,
+            TRACE_MODE_METADATA
+        );
+        assert_eq!(
+            parse(&["--trace", "latency"]).unwrap().trace_mode,
+            TRACE_MODE_LATENCY
+        );
+        assert_eq!(
+            parse(&["--trace", "status"]).unwrap().trace_mode,
+            TRACE_MODE_STATUS
+        );
+        assert_eq!(
+            parse(&["--trace", "all"]).unwrap().trace_mode,
+            TRACE_MODE_ALL
+        );
+        // Exact word match: unknown words, `=`, repeats, and missing
+        // values are exit 2 (parse errors).
+        assert!(parse(&["--trace", "latencyy"]).is_err());
+        assert!(parse(&["--trace", "LATENCY"]).is_err());
+        assert!(parse(&["--trace=latency"]).is_err());
+        assert!(parse(&["--trace"]).is_err());
+        assert!(parse(&["--trace", "off", "--trace", "all"]).is_err());
+    }
+
+    #[test]
+    fn public_trace_resolution_forces_aggregate_only_while_open() {
+        // P2fix1 item 2c (codex DELTA-7): while C023 acceptance is
+        // OPEN, PUBLIC paths degrade operational modes to the D0-6
+        // fallback (env switch alone is insufficient — the forcing
+        // is unconditional code, not an opt-in).
+        use super::super::trace::*;
+        assert!(super::super::c023::ACCEPTANCE_OPEN);
+        // Operational modes degrade (with the honest note), even
+        // without the env switch.
+        for mode in [TRACE_MODE_LATENCY, TRACE_MODE_STATUS, TRACE_MODE_ALL] {
+            let r = super::resolve_public_trace_mode(mode, false);
+            assert!(r.fallback, "mode {mode} must force fallback");
+            assert_eq!(r.effective, TRACE_MODE_METADATA);
+            assert!(r.degraded, "mode {mode} must note the degrade");
+        }
+        // Off/metadata proceed (already within the reachable set).
+        for mode in [TRACE_MODE_OFF, TRACE_MODE_METADATA] {
+            let r = super::resolve_public_trace_mode(mode, false);
+            assert!(!r.fallback, "mode {mode} must not force fallback");
+            assert_eq!(r.effective, mode);
+            assert!(!r.degraded);
+        }
+        // The env switch keeps its explicit meaning on every mode
+        // (requested fallback — no degrade note).
+        for mode in [
+            TRACE_MODE_OFF,
+            TRACE_MODE_METADATA,
+            TRACE_MODE_LATENCY,
+            TRACE_MODE_STATUS,
+            TRACE_MODE_ALL,
+        ] {
+            let r = super::resolve_public_trace_mode(mode, true);
+            assert!(r.fallback);
+            assert_eq!(r.effective, TRACE_MODE_METADATA);
+            assert!(!r.degraded);
+        }
+    }
+
+    #[test]
+    fn qual_resolution_keeps_delta_activation_default_denied() {
+        // P2fix1 item 2c (codex DELTA-7): the isolated qual
+        // harness keeps delta activation (no OPEN forcing; env
+        // still honored), reached only via the explicit config
+        // bypass — default-deny everywhere else.
+        use super::super::trace::*;
+        for mode in [TRACE_MODE_LATENCY, TRACE_MODE_STATUS, TRACE_MODE_ALL] {
+            let r = super::resolve_qual_trace_mode(mode, false);
+            assert!(!r.fallback, "mode {mode} must program direct");
+            assert_eq!(r.effective, mode);
+            assert!(!r.degraded);
+        }
+        let r = super::resolve_qual_trace_mode(TRACE_MODE_LATENCY, true);
+        assert!(r.fallback);
+        assert_eq!(r.effective, TRACE_MODE_METADATA);
+        assert!(
+            !crate::focused_capture::FocusedConfig::default().allow_operational_trace,
+            "bypass is default-deny (CLI never sets it)"
+        );
+    }
+
+    #[test]
+    fn trace_histogram_by_api_needs_latency_bearing_mode() {
+        let parse = |flags: &[&str]| {
+            let mut args = vec!["scan".to_string()];
+            args.extend(flags.iter().map(|f| f.to_string()));
+            args.push("--observe-providers".to_string());
+            super::parse(&args)
+        };
+        assert!(parse(&["--trace", "latency", "--trace-histogram-by-api"]).is_ok());
+        assert!(parse(&["--trace", "all", "--trace-histogram-by-api"]).is_ok());
+        assert!(!parse(&[]).unwrap().trace_by_api);
+        // A histogram keying without histograms is a usage error.
+        assert!(parse(&["--trace-histogram-by-api"]).is_err());
+        assert!(parse(&["--trace", "off", "--trace-histogram-by-api"]).is_err());
+        assert!(parse(&["--trace", "metadata", "--trace-histogram-by-api"]).is_err());
+        assert!(parse(&["--trace", "status", "--trace-histogram-by-api"]).is_err());
+    }
+
+    #[test]
+    fn trace_record_json_matches_6d7_shape() {
+        use super::super::trace::*;
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_LATENCY);
+        let k = PairKey {
+            pid: 1,
+            tid: 2,
+            generation: 1,
+            cookie: 9,
+            invocation: 1,
+        };
+        p.attempt(AttemptEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1000,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        p.result(ResultEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1500,
+            outcome: 1,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        let window = p.close_window(7, 9000, [0; 8]);
+        let totals = p.totals();
+        let v = super::trace_record_json(&window, &totals, None);
+        assert_eq!(v["window_seq"], 7);
+        assert_eq!(v["mode"], "latency");
+        assert_eq!(v["fallback"], false);
+        assert_eq!(v["paired"], 1);
+        assert_eq!(v["trace_unpaired_entries"], 0);
+        assert_eq!(v["class_window"]["success"], 1);
+        assert_eq!(v["class_epoch"]["success"], 1);
+        assert_eq!(v["class_window"]["unknown"], 0);
+        assert_eq!(v["gaps"], serde_json::json!([]));
+        assert_eq!(v["gap_overflow"], 0);
+        // Sums conserve.
+        let sum: u64 = ["success", "failure", "empty", "retry", "unknown"]
+            .iter()
+            .map(|c| v["class_window"][c].as_u64().unwrap())
+            .sum();
+        assert_eq!(sum, 1);
+    }
+
+    #[test]
+    fn trace_end_projection_carries_distributions_and_bounded_detail() {
+        // P2fix1 item 1b (codex NEW-P2d): the provider-CLI JSON end
+        // projection must emit the bounded detail + distributions
+        // on qualified modes (not just window + class_epoch), and
+        // the human section must carry the same facts (parity).
+        use super::super::trace::*;
+        use std::collections::BTreeMap;
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_LATENCY);
+        p.set_histogram_by_api(true);
+        for i in 0..100u64 {
+            let k = PairKey {
+                pid: 1,
+                tid: 2,
+                generation: 1,
+                cookie: 5000 + i,
+                invocation: i + 1,
+            };
+            p.attempt(AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 1000 + i * 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.result(ResultEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 1050 + i * 100,
+                outcome: 1,
+                start_time_ns: 1,
+                seed: 1,
+            });
+        }
+        let window = p.close_window(3, 99999, [0; 8]);
+        let totals = p.totals();
+        let mut avail = BTreeMap::new();
+        for id in 20..=72u32 {
+            avail.insert(
+                id,
+                if id == 20 { "covered" } else { "not_attached" }.to_string(),
+            );
+        }
+        let v = super::trace_record_json(&window, &totals, Some(&avail));
+        // Flat window shape preserved (existing pins above).
+        assert_eq!(v["window_seq"], 3);
+        assert_eq!(v["paired"], 100);
+        assert_eq!(v["class_epoch"]["success"], 100);
+        // Distributions ride qualified modes.
+        assert_eq!(v["histograms"]["edges"], "6d-frozen-18");
+        assert_eq!(v["histograms"]["success"]["count"], 100);
+        assert_eq!(v["by_api"]["20"]["success"]["count"], 100);
+        assert_eq!(v["by_api_availability"]["20"], "covered");
+        assert_eq!(v["by_api_availability"]["21"], "not_attached");
+        // Detail is bounded (first 64 of 200 rows + total).
+        assert_eq!(v["detail"].as_array().unwrap().len(), 64);
+        assert_eq!(v["detail_total"], 200);
+        // Human parity: same folds (histogram counts, covered-API
+        // count, classes) in the terminal section, still ≤10 lines.
+        let mut bytes = Vec::new();
+        super::trace_human(&window, &totals, Some(&avail), &mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("paired=100"), "{text:?}");
+        assert!(text.contains("success=100"), "{text:?}");
+        assert!(text.contains("by_api"), "{text:?}");
+        assert!(text.lines().count() <= 10, "{text:?}");
+    }
+
+    #[test]
+    fn trace_withholding_governs_json_and_human() {
+        // P2fix1 items 3/14 (codex PAIRING/DELTA-8): while uncertain,
+        // the end projection withholds interpreted distributions in
+        // BOTH spellings (JSON keys absent/null, human shows
+        // withheld) and keeps raw loss/detail evidence in both.
+        use super::super::trace::*;
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_LATENCY);
+        p.set_histogram_by_api(true);
+        for i in 0..10u64 {
+            let k = PairKey {
+                pid: 1,
+                tid: 2,
+                generation: 1,
+                cookie: 7000 + i,
+                invocation: i + 1,
+            };
+            p.attempt(AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 1000 + i * 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.result(ResultEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 1050 + i * 100,
+                outcome: 1,
+                start_time_ns: 1,
+                seed: 1,
+            });
+        }
+        p.reject_unknown();
+        let window = p.close_window(0, 9000, [0; 8]);
+        let totals = p.totals();
+        assert!(window.pairing_uncertain && totals.pairing_uncertain);
+        let v = super::trace_record_json(&window, &totals, None);
+        // Interpreted: absent/null.
+        assert!(v.get("class_epoch").is_none(), "{v:?}");
+        assert!(v.get("histograms").is_none(), "{v:?}");
+        assert!(v.get("by_api").is_none(), "{v:?}");
+        assert!(v["class_window"].is_null(), "{v:?}");
+        // Raw: kept.
+        assert_eq!(v["paired"], 10);
+        assert_eq!(v["trace_rejected_unknown_api"], 1);
+        assert_eq!(v["pairing_uncertain"], true);
+        assert_eq!(v["detail_total"], 20);
+        assert_eq!(v["detail"].as_array().unwrap().len(), 20);
+        // Human: same rule.
+        let mut bytes = Vec::new();
+        super::trace_human(&window, &totals, None, &mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("paired=10"), "{text:?}");
+        assert!(text.contains("class=withheld"), "{text:?}");
+        assert!(text.contains("epoch=withheld"), "{text:?}");
+        assert!(text.contains("histograms: withheld"), "{text:?}");
+        assert!(text.contains("by_api: withheld"), "{text:?}");
+        assert!(!text.contains("success=10"), "{text:?}");
+        assert!(text.lines().count() <= 10, "{text:?}");
+    }
+
+    #[test]
+    fn trace_human_section_bounds_and_marks_fallback() {
+        use super::super::trace::*;
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_METADATA);
+        p.set_fallback(true);
+        let window = p.close_window(0, 9000, [0; 8]);
+        let totals = p.totals();
+        let mut bytes = Vec::new();
+        super::trace_human(&window, &totals, None, &mut bytes).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.starts_with("TRACE mode=metadata paired=0"), "{text:?}");
+        assert!(text.contains("fallback=true"), "{text:?}");
+        assert!(text.lines().count() <= 10, "{text:?}");
+    }
+
+    #[test]
     fn human_levels_add_state_exports_payload_records_counters() {
         let fact: super::super::ObservationFact = serde_json::from_value(serde_json::json!({
             "pid": 12, "starttime": 100, "object_sha256": "b".repeat(64), "generation": 1,
@@ -1667,6 +2692,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             snapshot: Some(&snapshot),
             facts: &[fact],
+            request_evidence: None,
             gaps: &[],
             interval_causes: &[],
             capabilities: &capabilities,
@@ -1797,6 +2823,8 @@ mod tests {
             interval: Duration::from_secs(1),
             duration: Duration::from_secs(30),
             verbosity: 0,
+            trace_mode: super::super::trace::TRACE_MODE_OFF,
+            trace_by_api: false,
         }
     }
 
@@ -1816,6 +2844,9 @@ mod tests {
                 started: Instant::now(),
                 sequence: 0,
                 prev: None,
+                trace: None,
+                trace_effective: super::super::trace::TRACE_MODE_OFF,
+                trace_session: false,
                 cumulative: crate::inventory::watch::Cumulative::default(),
             };
             stream
@@ -1863,6 +2894,9 @@ mod tests {
                 started: Instant::now(),
                 sequence: 0,
                 prev: None,
+                trace: None,
+                trace_effective: super::super::trace::TRACE_MODE_OFF,
+                trace_session: false,
                 cumulative: crate::inventory::watch::Cumulative::default(),
             };
             for _ in 0..2 {
@@ -1905,6 +2939,9 @@ mod tests {
                 started: Instant::now(),
                 sequence: 0,
                 prev: None,
+                trace: None,
+                trace_effective: super::super::trace::TRACE_MODE_OFF,
+                trace_session: false,
                 cumulative: crate::inventory::watch::Cumulative::default(),
             };
             stream
@@ -1948,6 +2985,9 @@ mod tests {
                 started: Instant::now(),
                 sequence: 0,
                 prev: None,
+                trace: None,
+                trace_effective: super::super::trace::TRACE_MODE_OFF,
+                trace_session: false,
                 cumulative: crate::inventory::watch::Cumulative::default(),
             };
             stream
@@ -2146,6 +3186,7 @@ mod tests {
             poll_interval: Duration::from_secs(1),
             snapshot: Some(&snapshot),
             facts: &[],
+            request_evidence: None,
             gaps: &[],
             interval_causes: &[],
             capabilities: &capabilities,
@@ -2191,5 +3232,315 @@ mod tests {
             "genuinely-unacquirable placeholders, got: {}",
             rows[2]
         );
+    }
+
+    fn end_options(json: bool) -> Options {
+        Options {
+            selection: Selection::default(),
+            json,
+            watch: true,
+            interval: Duration::from_secs(1),
+            duration: Duration::from_secs(30),
+            trace_mode: super::super::trace::TRACE_MODE_LATENCY,
+            trace_by_api: false,
+            verbosity: 0,
+        }
+    }
+
+    fn end_stream<'a>(
+        options: &'a Options,
+        bytes: &'a mut Vec<u8>,
+        sealed: Option<SealedTrace>,
+        session_opened: bool,
+    ) -> Stream<'a, Vec<u8>> {
+        let mut cumulative = crate::inventory::watch::Cumulative::default();
+        cumulative.observe(1, 0);
+        Stream {
+            writer: bytes,
+            options,
+            capabilities: Capabilities::new(session_opened),
+            started: Instant::now(),
+            sequence: 1,
+            prev: None,
+            trace: sealed,
+            trace_effective: options.trace_mode,
+            trace_session: session_opened,
+            cumulative,
+        }
+    }
+
+    fn seal_with(build: impl FnOnce(&mut super::super::trace::TraceProducer)) -> SealedTrace {
+        use super::super::trace as t;
+        let mut p = t::TraceProducer::new();
+        p.set_mode(t::TRACE_MODE_LATENCY);
+        build(&mut p);
+        let window = p.close_window(0, 9000, [0; 8]);
+        let totals = p.totals();
+        SealedTrace {
+            window,
+            totals,
+            availability: None,
+        }
+    }
+
+    #[test]
+    fn p2fix2_standalone_trace_loss_degrades_end_status() {
+        // P2fix2 item 3 (codex TRACE): standalone scan/inspect
+        // terminal trace loss affects completeness AND exit — a
+        // six-positive seal (here: finalized unpaired, otherwise
+        // certain) books cumulative partial and exits 3; a clean
+        // seal exits 0; an uncertain seal with zero six-counters
+        // (late-cut taint, no counted loss) still exits 3
+        // (corruption observed).
+        use super::super::trace as t;
+        // Six-positive + certain: finalize lands one hold unpaired
+        // (no corruption signals).
+        let lossy = seal_with(|p| {
+            let k = t::PairKey {
+                pid: 7,
+                tid: 8,
+                generation: 1,
+                cookie: 501,
+                invocation: 1,
+            };
+            p.attempt(t::AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.finalize(9000);
+        });
+        assert_eq!(lossy.window.unpaired_entries, 1);
+        assert!(!lossy.window.pairing_uncertain);
+        for json in [true, false] {
+            let options = end_options(json);
+            let mut bytes = Vec::new();
+            let mut stream = end_stream(&options, &mut bytes, Some(lossy.clone()), true);
+            let status = stream
+                .end(crate::inventory::watch::EndReason::Duration, None)
+                .unwrap();
+            assert_eq!(status, 3, "six-positive seal exits 3 (json={json})");
+            assert!(stream.cumulative.partial, "completeness books partial");
+            let text = String::from_utf8(bytes).unwrap();
+            if json {
+                let end: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(end["status"], 3);
+            } else {
+                assert!(text.contains("cumulative=partial"), "{text:?}");
+            }
+        }
+        // Clean seal: exits 0.
+        let clean = seal_with(|p| {
+            let k = t::PairKey {
+                pid: 7,
+                tid: 8,
+                generation: 1,
+                cookie: 501,
+                invocation: 1,
+            };
+            p.attempt(t::AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.result(t::ResultEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 200,
+                outcome: 1,
+                start_time_ns: 1,
+                seed: 1,
+            });
+        });
+        assert_eq!(clean.window.paired, 1);
+        assert!(!clean.window.pairing_uncertain);
+        let options = end_options(true);
+        let mut bytes = Vec::new();
+        let mut stream = end_stream(&options, &mut bytes, Some(clean), true);
+        let status = stream
+            .end(crate::inventory::watch::EndReason::Duration, None)
+            .unwrap();
+        assert_eq!(status, 0, "clean seal exits 0");
+        assert!(!stream.cumulative.partial);
+        // Uncertain + zero six: late-cut taint on an otherwise clean
+        // pair — corruption observed, so still partial.
+        let tainted = seal_with(|p| {
+            let k = t::PairKey {
+                pid: 7,
+                tid: 8,
+                generation: 1,
+                cookie: 501,
+                invocation: 1,
+            };
+            p.attempt(t::AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.result(t::ResultEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 200,
+                outcome: 1,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.note_global_cut(50);
+        });
+        assert!(tainted.window.pairing_uncertain);
+        assert_eq!(tainted.window.unpaired_entries, 0);
+        let options = end_options(true);
+        let mut bytes = Vec::new();
+        let mut stream = end_stream(&options, &mut bytes, Some(tainted), true);
+        let status = stream
+            .end(crate::inventory::watch::EndReason::Duration, None)
+            .unwrap();
+        assert_eq!(status, 3, "uncertain seal exits 3");
+        assert!(stream.cumulative.partial);
+    }
+
+    #[test]
+    fn newp2e_late_cut_withholds_window_projection_in_seal_record() {
+        // P2fix3 NEW-P2e: on a late cut the seal record withholds
+        // the unbound window projection (paired/detail) as
+        // window-scoped evidence, while diagnostics retain with
+        // the scope marked — in JSON, human, and -vv detail.
+        let sealed = seal_with(|p| {
+            let k = super::super::trace::PairKey {
+                pid: 7,
+                tid: 8,
+                generation: 1,
+                cookie: 501,
+                invocation: 1,
+            };
+            p.attempt(super::super::trace::AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.result(super::super::trace::ResultEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 200,
+                outcome: 1,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.note_global_cut(50);
+        });
+        assert!(sealed.window.late_cut);
+        // JSON: paired/detail withhold; diagnostics + mark retain.
+        let v = super::trace_record_json(&sealed.window, &sealed.totals, None);
+        assert_eq!(v["cut_unbound"], true, "scope marked");
+        assert!(v["paired"].is_null(), "paired withholds: {v:?}");
+        assert_eq!(v["detail"], serde_json::json!([]), "rows withhold");
+        assert_eq!(v["detail_total"], 0, "detail count withholds");
+        assert_eq!(v["trace_unpaired_entries"], 0, "diagnostic retains");
+        assert_eq!(v["ring_loss"], serde_json::json!([0, 0, 0, 0, 0, 0, 0, 0]));
+        // Human: paired reads withheld with the cause; the scope
+        // marks; diagnostics print.
+        let mut text = Vec::new();
+        super::trace_human(&sealed.window, &sealed.totals, None, &mut text).unwrap();
+        let text = String::from_utf8(text).unwrap();
+        assert!(
+            text.contains("paired=withheld (late-cut)"),
+            "human withholds paired: {text:?}"
+        );
+        assert!(
+            text.contains("cut_unbound=true"),
+            "human marks scope: {text:?}"
+        );
+        assert!(
+            text.contains("unpaired_e=0"),
+            "human keeps diagnostics: {text:?}"
+        );
+        // -vv detail: rows withhold, dropped retains.
+        let mut detail = Vec::new();
+        super::trace_detail_human(&sealed.window, &mut detail).unwrap();
+        let detail = String::from_utf8(detail).unwrap();
+        assert!(
+            detail.contains("rows=withheld (late-cut)"),
+            "detail withholds rows: {detail:?}"
+        );
+        assert!(
+            detail.contains("dropped=0"),
+            "detail keeps dropped: {detail:?}"
+        );
+        assert!(!detail.contains("attempt api="), "no rows leak: {detail:?}");
+        // Clean seal: full projection, no mark (bytes stable).
+        let clean = seal_with(|p| {
+            let k = super::super::trace::PairKey {
+                pid: 7,
+                tid: 8,
+                generation: 1,
+                cookie: 501,
+                invocation: 1,
+            };
+            p.attempt(super::super::trace::AttemptEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 100,
+                start_time_ns: 1,
+                seed: 1,
+            });
+            p.result(super::super::trace::ResultEdge {
+                key: k,
+                api: 20,
+                monotonic_ns: 200,
+                outcome: 1,
+                start_time_ns: 1,
+                seed: 1,
+            });
+        });
+        let v = super::trace_record_json(&clean.window, &clean.totals, None);
+        assert_eq!(v["paired"], 1);
+        assert_eq!(v["detail_total"], 2);
+        assert!(v.get("cut_unbound").is_none(), "clean record unmarked");
+    }
+
+    #[test]
+    fn p2fix2_no_session_reports_unavailable_effective_mode() {
+        // P2fix2 item 9 (codex DELTA-7): when no session opens, the
+        // end record reports the effective mode as `unavailable`
+        // (JSON word + human line) — never the requested word. A
+        // requested-off scan stays `off` (nothing requested, nothing
+        // lost); any explicit request unfulfilled reports
+        // unavailable.
+        let options = end_options(true);
+        let mut bytes = Vec::new();
+        let mut stream = end_stream(&options, &mut bytes, None, false);
+        let status = stream
+            .end(crate::inventory::watch::EndReason::Duration, None)
+            .unwrap();
+        assert_eq!(status, 0);
+        let end: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(end["trace_mode"], "unavailable");
+        // Human carries the same word.
+        let options = end_options(false);
+        let mut bytes = Vec::new();
+        let mut stream = end_stream(&options, &mut bytes, None, false);
+        stream
+            .end(crate::inventory::watch::EndReason::Duration, None)
+            .unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("TRACE mode=unavailable"), "{text:?}");
+        // Requested-off + no session stays `off` in both spellings.
+        let mut off = end_options(true);
+        off.trace_mode = super::super::trace::TRACE_MODE_OFF;
+        let mut bytes = Vec::new();
+        let mut stream = end_stream(&off, &mut bytes, None, false);
+        stream
+            .end(crate::inventory::watch::EndReason::Duration, None)
+            .unwrap();
+        let end: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(end["trace_mode"], "off");
     }
 }

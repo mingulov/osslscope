@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://osslscope.dev/schemas/observed-crypto-v2.json",
   "title": "observed-crypto v2",
-  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4, observed-crypto-v2.5 when the window certified execution attribution, observed-crypto-v2.6 when a sysctl context was sampled, or observed-crypto-v2.7 when the capture retired an owned corpse. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
+  "description": "osslscope report/check window document (continuation R08). The counted unit is entry into a provider-dispatch callback at one physical site; candidates are sorted attribution metadata, not definite executed-algorithm identity. Producers emit observed-crypto-v2.4, observed-crypto-v2.5 when the window certified execution attribution, observed-crypto-v2.6 when a sysctl context was sampled, or observed-crypto-v2.7 when the capture retired an owned corpse, or observed-crypto-v2.8 when the window projected request/fetch/load/query evidence. Readers gate majors via check_version_v2 (accept v2.x, reject other majors); validators enforce this minor's schema strictly (unknown keys fail: a v2.0 validator cannot verify v2.1 keys it does not know) while field-level readers ignore unknown keys. report documents omit policy/disposition when unevaluated/unrecorded; check documents add policy. No raw argv, cmdline, environment or runtime addresses anywhere: every object forbids additional properties.",
   "type": "object",
   "required": ["schema_version", "target", "openssl", "window", "completeness", "sites", "fenced", "objects", "coverage", "legacy_partition"],
   "additionalProperties": false,
@@ -321,6 +321,10 @@
               },
               "not_attached": {
                 "type": "boolean"
+              },
+              "read_receipt": {
+                "type": "boolean",
+                "description": "Successful terminal count read (fix4, optional for pre-fix4 readers): true only on rows built after a successful terminal read of an owner's map — admitted owners, plus verified-positive rows for unadmitted owners whose terminal read vouched genuine BPF-counted totals. This is the ROW read receipt (this row's counts were read); zero eligibility is the separate admission-gated SCOPE receipt. The request-evidence gate counts this receipt behind an observed zero, never the attachment bit."
               },
               "saturated": {
                 "type": "boolean"
@@ -670,6 +674,85 @@
       "properties": {
         "unresolved_calls": { "$ref": "#/$defs/u64" },
         "withheld_uncertain": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "request_evidence": {
+      "description": "Request/fetch/load/query evidence (v2.8, Phase 1, optional): counts of observed provider requests, structurally separate from the physical execution ledger. Fetch/load/query facts never mean the fetched object was used: loads and advertisements carry the candidate tier only, and the unattributed remainder ranges only over the observed operational plane. Present iff the window ran a provider session and projected its request fold.",
+      "type": "object",
+      "required": ["version", "fetches", "fetch_coverage", "loads", "inits", "queries", "advertisements", "default_activation", "unattributed"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/u32" },
+        "fetches": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_fetch_row" }
+        },
+        "fetch_coverage": {
+          "description": "Per-surface probe coverage (NEW-P1): all 14 surfaces in ID order. An absent fetch row under observed=true is an armed-idle in-window zero; under observed=false (refused, missing, or late attach) it is unknown, never a zero.",
+          "type": "array",
+          "minItems": 14,
+          "maxItems": 14,
+          "items": { "$ref": "#/$defs/request_fetch_coverage_row" }
+        },
+        "loads": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_load_row" }
+        },
+        "inits": { "$ref": "#/$defs/request_outcome_counts" },
+        "queries": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_query_row" }
+        },
+        "advertisements": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/request_advert_row" }
+        },
+        "default_activation": { "enum": ["load_observed", "unknown"] },
+        "unattributed": { "$ref": "#/$defs/request_unattributed" },
+        "silence_window": {
+          "description": "Silence interval (fix4, optional — window scope only, omitted on per-batch scope): the monotonic-ns [start_ns, end_ns) over which the section's zeros are claimed. Narrower than the capture window: request rows cover the whole capture window (genuine setup-prefix edges preserved) while silence starts at effective admission. Bound inside the document effective window by check_v2_semantics.",
+          "type": "object",
+          "required": ["start_ns", "end_ns"],
+          "additionalProperties": false,
+          "properties": {
+            "start_ns": { "$ref": "#/$defs/u64" },
+            "end_ns": { "$ref": "#/$defs/u64" }
+          }
+        }
+      }
+    },
+    "trace_summary": {
+      "description": "6D trace projection (v2.9, Phase 2, optional): the sealed PUBLIC-API window record (pairs, classes, unpaired visibility) plus epoch class counts and latency distributions. Pairs, classes, and durations of public export invocations — never physical callback entries, never observer overhead. Present iff the window ran a provider session in a pairing mode (or the D0-6 fallback) and sealed its trace fold.",
+      "type": "object",
+      "required": ["version", "mode", "fallback", "window", "class_epoch"],
+      "additionalProperties": false,
+      "properties": {
+        "version": { "$ref": "#/$defs/u32" },
+        "mode": { "enum": ["off", "metadata", "latency", "status", "all"] },
+        "fallback": { "type": "boolean" },
+        "window": { "$ref": "#/$defs/trace_window_record" },
+        "pairing_uncertain": {
+          "description": "Epoch pairing-uncertainty (sticky withholding marker): while true, class_epoch/histograms/by_api withhold (null/absent) and raw counters stay.",
+          "type": "boolean"
+        },
+        "class_epoch": {
+          "description": "Epoch pairs by class (null while the epoch is pairing-uncertain).",
+          "anyOf": [
+            { "$ref": "#/$defs/trace_class_counts" },
+            { "type": "null" }
+          ]
+        },
+        "histograms": { "$ref": "#/$defs/trace_histograms" },
+        "by_api": {
+          "description": "Sparse per-API distributions (§6D-3 opt-in): decimal API-ID keys of covered operational APIs only (digits, 20..=72).",
+          "type": "object",
+          "additionalProperties": { "$ref": "#/$defs/trace_by_api_entry" }
+        },
+        "by_api_availability": {
+          "description": "Dense per-API availability (§6D-3): all 53 operational IDs, closed covered/not_attached/partial_coverage vocabulary.",
+          "type": "object",
+          "additionalProperties": { "enum": ["covered", "not_attached", "partial_coverage"] }
+        }
       }
     },
     "traversal": {
@@ -1188,6 +1271,266 @@
         "last_ns": { "$ref": "#/$defs/u64" },
         "installed_at": { "$ref": "#/$defs/u64" }
       }
+    },
+    "request_operation": {
+      "description": "Provider operation vocabulary shared by the request_evidence rows.",
+      "enum": ["digest", "cipher", "mac", "kdf", "rand", "keymgmt", "keyexch", "signature", "asym_cipher", "kem", "skeymgmt", "encoder", "decoder", "store", "other"]
+    },
+    "request_outcome_counts": {
+      "description": "Plain success/failure/unknown outcome counts.",
+      "type": "object",
+      "required": ["success", "failure", "unknown"],
+      "additionalProperties": false,
+      "properties": {
+        "success": { "$ref": "#/$defs/u64" },
+        "failure": { "$ref": "#/$defs/u64" },
+        "unknown": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "request_fetch_row": {
+      "description": "Fetch counts for one of the 14 fetch surfaces (stable IDs 10..=15, 73..=80). properties is the explicit not_captured gap: raw property-query strings are forbidden in records.",
+      "type": "object",
+      "required": ["surface_id", "export", "capability", "attempts", "success", "failure", "unknown", "properties"],
+      "additionalProperties": false,
+      "properties": {
+        "surface_id": { "enum": [10, 11, 12, 13, 14, 15, 73, 74, 75, 76, 77, 78, 79, 80] },
+        "export": { "enum": ["EVP_MD_fetch", "EVP_CIPHER_fetch", "EVP_MAC_fetch", "EVP_KDF_fetch", "EVP_SIGNATURE_fetch", "EVP_KEM_fetch", "EVP_ASYM_CIPHER_fetch", "EVP_KEYEXCH_fetch", "EVP_KEYMGMT_fetch", "EVP_RAND_fetch", "EVP_SKEYMGMT_fetch", "OSSL_DECODER_fetch", "OSSL_ENCODER_fetch", "OSSL_STORE_LOADER_fetch"] },
+        "capability": {
+          "anyOf": [
+            { "enum": ["encoder", "decoder", "store_loader"] },
+            {
+              "type": "object",
+              "required": ["evp"],
+              "additionalProperties": false,
+              "properties": {
+                "evp": {
+                  "type": "object",
+                  "required": ["operation"],
+                  "additionalProperties": false,
+                  "properties": {
+                    "operation": { "$ref": "#/$defs/request_operation" }
+                  }
+                }
+              }
+            }
+          ]
+        },
+        "attempts": { "$ref": "#/$defs/u64" },
+        "success": { "$ref": "#/$defs/u64" },
+        "failure": { "$ref": "#/$defs/u64" },
+        "unknown": { "$ref": "#/$defs/u64" },
+        "properties": { "const": "not_captured" }
+      }
+    },
+    "request_fetch_coverage_row": {
+      "description": "Probe coverage for one fetch surface (stable IDs 10..=15, 73..=80).",
+      "type": "object",
+      "required": ["surface_id", "observed"],
+      "additionalProperties": false,
+      "properties": {
+        "surface_id": { "enum": [10, 11, 12, 13, 14, 15, 73, 74, 75, 76, 77, 78, 79, 80] },
+        "observed": { "type": "boolean" }
+      }
+    },
+    "request_load_row": {
+      "description": "Load counts for one provider name class (candidate tier only: same-name providers stay candidates, never a forced winner).",
+      "type": "object",
+      "required": ["name", "attempts", "success", "failure", "unknown", "candidates", "tier"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "enum": ["default", "legacy", "fips", "other", "unreadable", "overlong"] },
+        "attempts": { "$ref": "#/$defs/u64" },
+        "success": { "$ref": "#/$defs/u64" },
+        "failure": { "$ref": "#/$defs/u64" },
+        "unknown": { "$ref": "#/$defs/u64" },
+        "candidates": { "$ref": "#/$defs/u64" },
+        "tier": { "const": "candidate" }
+      }
+    },
+    "request_query_side": {
+      "description": "Query counts for one observation side (public wrapper or provider callback), split by outcome and cacheability. Per side, success+failure+unknown equals cacheable+volatile+cache_unknown (two partitions of the same results).",
+      "type": "object",
+      "required": ["success", "failure", "unknown", "cacheable", "volatile", "cache_unknown"],
+      "additionalProperties": false,
+      "properties": {
+        "success": { "$ref": "#/$defs/u64" },
+        "failure": { "$ref": "#/$defs/u64" },
+        "unknown": { "$ref": "#/$defs/u64" },
+        "cacheable": { "$ref": "#/$defs/u64" },
+        "volatile": { "$ref": "#/$defs/u64" },
+        "cache_unknown": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "request_query_row": {
+      "description": "Query counts for one operation, split by observation side (NEW-P4): the public wrapper and the provider callback observe the same traversal at two layers — never collapsed into one count.",
+      "type": "object",
+      "required": ["operation", "wrapper", "callback"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "$ref": "#/$defs/request_operation" },
+        "wrapper": { "$ref": "#/$defs/request_query_side" },
+        "callback": { "$ref": "#/$defs/request_query_side" }
+      }
+    },
+    "request_advert_row": {
+      "description": "Returned-table advertisement counts for one operation (candidate tier only: a sole advertiser never proves execution). The counted unit is the algorithm row (NEW-P4): per-dispatch-function facts are not additional entries.",
+      "type": "object",
+      "required": ["operation", "count", "tier"],
+      "additionalProperties": false,
+      "properties": {
+        "operation": { "$ref": "#/$defs/request_operation" },
+        "count": { "$ref": "#/$defs/u64" },
+        "tier": { "const": "candidate" }
+      }
+    },
+    "trace_class_counts": {
+      "description": "Per-class pair counts (§6D-7 presentation order).",
+      "type": "object",
+      "required": ["success", "failure", "empty", "retry", "unknown"],
+      "additionalProperties": false,
+      "properties": {
+        "success": { "$ref": "#/$defs/u64" },
+        "failure": { "$ref": "#/$defs/u64" },
+        "empty": { "$ref": "#/$defs/u64" },
+        "retry": { "$ref": "#/$defs/u64" },
+        "unknown": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "trace_distribution": {
+      "description": "One latency distribution (§6D-3): 19 cumulative le buckets, saturating sum (ns), count.",
+      "type": "object",
+      "required": ["buckets", "sum", "count"],
+      "additionalProperties": false,
+      "properties": {
+        "buckets": {
+          "type": "array",
+          "minItems": 19,
+          "maxItems": 19,
+          "items": { "$ref": "#/$defs/u64" }
+        },
+        "sum": { "$ref": "#/$defs/u64" },
+        "count": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "trace_histograms": {
+      "description": "Default-keyed latency distributions (§6D-3): 5 classes under the frozen edge set.",
+      "type": "object",
+      "required": ["edges", "success", "failure", "empty", "retry", "unknown"],
+      "additionalProperties": false,
+      "properties": {
+        "edges": { "const": "6d-frozen-18" },
+        "success": { "$ref": "#/$defs/trace_distribution" },
+        "failure": { "$ref": "#/$defs/trace_distribution" },
+        "empty": { "$ref": "#/$defs/trace_distribution" },
+        "retry": { "$ref": "#/$defs/trace_distribution" },
+        "unknown": { "$ref": "#/$defs/trace_distribution" }
+      }
+    },
+    "trace_by_api_entry": {
+      "description": "Per-API distributions for one covered API (§6D-3 opt-in): dense 5 leaves.",
+      "type": "object",
+      "required": ["success", "failure", "empty", "retry", "unknown"],
+      "additionalProperties": false,
+      "properties": {
+        "success": { "$ref": "#/$defs/trace_distribution" },
+        "failure": { "$ref": "#/$defs/trace_distribution" },
+        "empty": { "$ref": "#/$defs/trace_distribution" },
+        "retry": { "$ref": "#/$defs/trace_distribution" },
+        "unknown": { "$ref": "#/$defs/trace_distribution" }
+      }
+    },
+    "trace_exemplar": {
+      "description": "Unpaired exemplar key (§6D-6): hashes, never raw cookies.",
+      "type": "object",
+      "required": ["dir", "key_hash16", "api", "age_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "dir": { "enum": ["entry", "result"] },
+        "key_hash16": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+        "api": { "$ref": "#/$defs/u32" },
+        "age_ns": { "$ref": "#/$defs/u64" }
+      }
+    },
+    "trace_window_record": {
+      "description": "Sealed §6D-7 window record: pairs, classes, unpaired visibility, loss lanes, exemplars.",
+      "type": "object",
+      "required": ["window_seq", "mode", "fallback", "paired", "trace_unpaired_entries", "trace_unpaired_results", "trace_depth_exceeded", "trace_dropped", "trace_capped", "trace_nonmonotonic_pairs", "trace_rejected_unknown_api", "ring_loss", "class_window"],
+      "additionalProperties": false,
+      "properties": {
+        "window_seq": { "$ref": "#/$defs/u64" },
+        "mode": { "enum": ["off", "metadata", "latency", "status", "all"] },
+        "fallback": { "type": "boolean" },
+        "paired": { "$ref": "#/$defs/u64" },
+        "trace_unpaired_entries": { "$ref": "#/$defs/u64" },
+        "trace_unpaired_results": { "$ref": "#/$defs/u64" },
+        "trace_depth_exceeded": { "$ref": "#/$defs/u64" },
+        "trace_dropped": { "$ref": "#/$defs/u64" },
+        "trace_capped": { "type": "boolean" },
+        "trace_nonmonotonic_pairs": { "$ref": "#/$defs/u64" },
+        "trace_rejected_unknown_api": { "$ref": "#/$defs/u64" },
+        "ring_loss": {
+          "type": "array",
+          "minItems": 8,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/u64" }
+        },
+        "class_window": {
+          "description": "Window pairs by class (null while the window is pairing-uncertain).",
+          "anyOf": [
+            { "$ref": "#/$defs/trace_class_counts" },
+            { "type": "null" }
+          ]
+        },
+        "pairing_uncertain": {
+          "description": "Window pairing-uncertainty (withholding marker): while true, class_window withholds (null) and raw counters stay.",
+          "type": "boolean"
+        },
+        "pairing_uncertainty": {
+          "description": "Uncertainty reasons (empty unless uncertain).",
+          "type": "array",
+          "items": { "enum": ["pending-eviction", "depth-overflow", "decode-reject", "late-cut", "terminal-boundary-failed", "carried"] }
+        },
+        "cut_unbound": {
+          "description": "Unbound window scope (P2fix3 NEW-P2e): the fold holds out-of-interval pairs past a late cut — the window projection withholds as window-scoped evidence while diagnostics retain with this mark. Serializes only when set.",
+          "type": "boolean"
+        },
+        "unmeasured_seqs": {
+          "type": "array",
+          "items": {
+            "type": "array",
+            "minItems": 2,
+            "maxItems": 2,
+            "items": { "$ref": "#/$defs/u64" }
+          }
+        },
+        "gaps": { "type": "array" },
+        "gap_overflow": { "$ref": "#/$defs/u64" },
+        "exemplars": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/trace_exemplar" }
+        }
+      }
+    },
+    "request_unattributed": {
+      "description": "Operational entries unattributed to any fetch: unknown when the operational plane was unobserved (never a zero over an unobserved population), else the observed remainder (Phase 1 proves no fetch-to-execution continuity, so every observed operational entry is unattributed).",
+      "anyOf": [
+        { "const": "unknown" },
+        {
+          "type": "object",
+          "required": ["observed"],
+          "additionalProperties": false,
+          "properties": {
+            "observed": {
+              "type": "object",
+              "required": ["ops"],
+              "additionalProperties": false,
+              "properties": {
+                "ops": { "$ref": "#/$defs/u64" }
+              }
+            }
+          }
+        }
+      ]
     },
     "reason": {
       "description": "Typed reason a window is not COMPLETE.",

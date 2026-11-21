@@ -16,6 +16,8 @@
 //! [`Completeness`]. Nothing else in the tree may mint a COMPLETE
 //! status.
 
+use crate::provider_observation::request_evidence::RequestEvidence;
+use crate::provider_observation::trace::TraceSummary;
 use crate::scan::oracle::{Outcome, TrueT};
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +49,20 @@ pub const CAPTURE_SCHEMA_V2_6: &str = "observed-crypto-v2.6";
 /// `membership` property and the `visibility-lost` reason
 /// alternative in `schemas/observed-crypto-v2.json`.
 pub const CAPTURE_SCHEMA_V2_7: &str = "observed-crypto-v2.7";
+
+/// Schema identity for documents carrying request/fetch/load/query
+/// evidence (v2.8, Phase 1): the producer upgrades to this identity
+/// exactly when it projects a [`RequestEvidence`] section (see
+/// [`stamp_request_evidence`]). [`finalize`] leaves the section
+/// `None` so every existing producer keeps its exact shape.
+pub const CAPTURE_SCHEMA_V2_8: &str = "observed-crypto-v2.8";
+
+/// Schema identity for documents carrying a 6D trace projection
+/// (v2.9, Phase 2): the producer upgrades to this identity exactly
+/// when it projects a [`TraceSummary`] section (see
+/// [`stamp_trace_summary`]). [`finalize`] leaves the section `None`
+/// so every existing producer keeps its exact shape.
+pub const CAPTURE_SCHEMA_V2_9: &str = "observed-crypto-v2.9";
 
 /// Scope token for a certified execution attribution: an observed
 /// successful fetch of an exact spelling returned a method, and
@@ -561,14 +577,38 @@ pub fn parse_sysctl_value(text: &str) -> Option<i64> {
 /// go through here so the schema rule has one home.
 pub fn stamp_context(doc: &mut CaptureDocument, context: CaptureContext) {
     if context.sysctls.is_some() {
-        // R3-3: never downgrade a newer minor's claim — a v2.7
-        // corpse document with a sysctl context keeps v2.7 (its
-        // keys are the newer vocabulary; readers gate majors).
-        if doc.schema != CAPTURE_SCHEMA_V2_7 {
+        // R3-3: never downgrade a newer minor's claim — a v2.7+
+        // document keeps its minor (its keys are the newer
+        // vocabulary; readers gate majors).
+        if doc.schema != CAPTURE_SCHEMA_V2_7
+            && doc.schema != CAPTURE_SCHEMA_V2_8
+            && doc.schema != CAPTURE_SCHEMA_V2_9
+        {
             doc.schema = CAPTURE_SCHEMA_V2_6.to_string();
         }
     }
     doc.context = Some(context);
+}
+
+/// Project request/fetch/load/query evidence onto a finalized
+/// document (v2.8, Phase 1): stamps `request_evidence` and upgrades
+/// the schema identity to v2.8 (newest-minor-wins: never downgrade
+/// a v2.9+ claim — R3-3 discipline). All projection sites go
+/// through here so the schema rule has one home.
+pub fn stamp_request_evidence(doc: &mut CaptureDocument, evidence: RequestEvidence) {
+    doc.request_evidence = Some(evidence);
+    if doc.schema != CAPTURE_SCHEMA_V2_9 {
+        doc.schema = CAPTURE_SCHEMA_V2_8.to_string();
+    }
+}
+
+/// Project a 6D trace fold onto a finalized document (v2.9,
+/// Phase 2): stamps `trace_summary` and upgrades the schema
+/// identity to v2.9 (the newest minor). All projection sites go
+/// through here so the schema rule has one home.
+pub fn stamp_trace_summary(doc: &mut CaptureDocument, summary: TraceSummary) {
+    doc.trace_summary = Some(summary);
+    doc.schema = CAPTURE_SCHEMA_V2_9.to_string();
 }
 
 /// Observed code object: verified identity plus a display locator. The
@@ -883,6 +923,15 @@ pub struct EngineObservation {
     pub window: EngineWindow,
 }
 
+impl EngineObservation {
+    /// Proved-evidence predicate, shared by the typed reader and
+    /// the doc_json presenter path (DELTA-6 parity): in-window
+    /// calls prove the independent ENGINE plane.
+    pub fn is_proved(&self) -> bool {
+        self.calls > 0 && self.window == EngineWindow::InWindow
+    }
+}
+
 /// Index of an `ENGINE_*` symbol in the frozen
 /// [`crate::kinds::ENGINE`] registry: the authoritative join key for
 /// [`EngineObservation::entrypoint`]. `None` for meth/low-level/load
@@ -1177,6 +1226,25 @@ pub struct CaptureDocument {
     /// post-finalization; [`finalize`] leaves it `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attribution_bounds: Option<AttributionBounds>,
+    /// Request/fetch/load/query evidence (v2.8, Phase 1, optional —
+    /// present iff the window ran a provider session and projected
+    /// its request fold). Structurally separate from the physical
+    /// execution ledger: fetch/load/query facts never mean "used
+    /// implementation". Projected post-finalization via
+    /// [`stamp_request_evidence`]; [`finalize`] leaves it `None` so
+    /// every existing producer keeps its exact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_evidence: Option<RequestEvidence>,
+    /// 6D trace projection (v2.9, Phase 2, optional — present iff
+    /// the window ran a provider session in a pairing mode (or the
+    /// D0-6 fallback) and sealed its trace fold). PUBLIC-API plane:
+    /// pairs, classes, and durations of public export invocations —
+    /// never physical callback entries, never observer overhead.
+    /// Projected post-finalization via [`stamp_trace_summary`];
+    /// [`finalize`] leaves it `None` so every existing producer
+    /// keeps its exact shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_summary: Option<TraceSummary>,
 }
 
 /// One BPF object selected for the window (path locates for
@@ -1310,7 +1378,7 @@ impl CaptureDocument {
     pub fn has_proved_engine_evidence(&self) -> bool {
         self.engine_observations
             .iter()
-            .any(|o| o.calls > 0 && o.window == EngineWindow::InWindow)
+            .any(EngineObservation::is_proved)
     }
 
     /// Fatal-kind usability: salvaged Runtime-fatal documents retain
@@ -1484,6 +1552,8 @@ pub fn finalize(mut input: FinalizeInput) -> CaptureDocument {
         execution_attributions: Vec::new(),
         algorithm_selectors: Vec::new(),
         attribution_bounds: None,
+        request_evidence: None,
+        trace_summary: None,
     }
 }
 

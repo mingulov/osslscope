@@ -55,9 +55,23 @@ impl Drop for StagedBinary {
     }
 }
 
+/// Guest-runner opt-in for privileged staging (COMPANIONS fix):
+/// ordinary `cargo test` NEVER stages — even with companions
+/// present and working sudo — unless the guest runner explicitly
+/// exports `OSSL_6A_ALLOW_PRIVILEGED_STAGE=1`. A plain host battery
+/// therefore cannot reach sudo/BPF through this suite.
+fn privileged_staging_opted_in() -> bool {
+    std::env::var("OSSL_6A_ALLOW_PRIVILEGED_STAGE").unwrap_or_default() == "1"
+}
+
 /// Stage the just-built binary with BPF companions, or `None`
-/// (INCONCLUSIVE) when companions are absent or staging is refused.
+/// (INCONCLUSIVE) when the guest-runner opt-in is absent, when
+/// companions are absent, or when staging is refused.
 fn stage_privileged_binary() -> Option<StagedBinary> {
+    if !privileged_staging_opted_in() {
+        eprintln!("INCONCLUSIVE: six_a privileged staging needs OSSL_6A_ALLOW_PRIVILEGED_STAGE=1");
+        return None;
+    }
     let built = PathBuf::from(env!("CARGO_BIN_EXE_osslscope"));
     let release = built.ancestors().nth(2).map(|p| p.join("release")).unwrap();
     let obs = release.join("osslscope-provider-observation");
@@ -95,6 +109,55 @@ fn stage_privileged_binary() -> Option<StagedBinary> {
     }
     let binary = dir.join("osslscope");
     Some(StagedBinary { dir, binary })
+}
+
+#[test]
+fn ordinary_test_run_refuses_privileged_staging() {
+    // COMPANIONS pin (NEW-3 subprocess isolation): the refusal
+    // check runs in a SUBPROCESS with a child-local environment
+    // (opt-in removed, probe armed) — this parallel test binary
+    // never mutates process env, and no unsafe accompanies it.
+    // The child prints a staging sentinel proving it ran the
+    // staging gate (not a vacuous pass).
+    let exe = std::env::current_exe().expect("test binary path");
+    let child = Command::new(exe)
+        .arg("__staging_refusal_probe")
+        .arg("--exact")
+        .arg("--nocapture")
+        .arg("--test-threads=1")
+        .env_remove("OSSL_6A_ALLOW_PRIVILEGED_STAGE")
+        .env("OSSL_6A_REFUSAL_PROBE", "1")
+        .output()
+        .expect("refusal probe subprocess runs");
+    let stderr = String::from_utf8_lossy(&child.stderr);
+    assert!(
+        child.status.success(),
+        "refusal probe subprocess must exit 0 (staging refused): {stderr}"
+    );
+    assert!(
+        stderr.contains("STAGING_REFUSAL_SENTINEL"),
+        "probe must print its staging sentinel (proving it ran the gate): {stderr}"
+    );
+}
+
+#[test]
+fn __staging_refusal_probe() {
+    // Subprocess-only probe (NEW-3): inert unless the parent arms
+    // it via a child-local env var, so ordinary battery/guest runs
+    // never stage (or refuse) here. The parent removes the
+    // guest-runner opt-in from the CHILD environment only.
+    if std::env::var("OSSL_6A_REFUSAL_PROBE").unwrap_or_default() != "1" {
+        return;
+    }
+    assert!(
+        !privileged_staging_opted_in(),
+        "probe runs without the guest-runner opt-in"
+    );
+    assert!(
+        stage_privileged_binary().is_none(),
+        "staging without the guest-runner opt-in must refuse"
+    );
+    eprintln!("STAGING_REFUSAL_SENTINEL opted_in=false");
 }
 
 /// Background observer writing JSON lines to `outfile`. The caller signals
@@ -581,6 +644,26 @@ fn control_1_birth_records_every_child() {
             "burst child {pid} has counts (inherited or invented)"
         );
     }
+    // Survivor-admission tally BEFORE the assertions (fix1 SIXA):
+    // the matched base/candidate comparison reads this line, not the
+    // assertion site — timing flakes move the failure site, the tally
+    // shows what was actually admitted.
+    let admitted: Vec<u64> = survivors
+        .iter()
+        .filter(|pid| segments.contains_key(*pid))
+        .copied()
+        .collect();
+    eprintln!(
+        "control1 tally: survivors={} explicit={} admitted={} gapped={} bursts={}",
+        survivors.len(),
+        survivors
+            .iter()
+            .filter(|pid| explicit.contains_key(*pid))
+            .count(),
+        admitted.len(),
+        gapped.len(),
+        bursts.len(),
+    );
     // Survivors are never covered-only: observing or explicitly deferred.
     for pid in &survivors {
         assert!(
@@ -589,7 +672,7 @@ fn control_1_birth_records_every_child() {
         );
     }
     assert!(
-        survivors.iter().any(|pid| segments.contains_key(pid)),
+        !admitted.is_empty(),
         "no survivor was admitted to a segment: {segments:?}"
     );
     // Per-incarnation segments are distinct (no shared counts).
@@ -3074,6 +3157,32 @@ fn control_7_over_capacity_defers_fairly() {
     );
     let rows = read_rows(&out);
     eprintln!("kinds: {:?}", kinds(&rows));
+    // Overload tally BEFORE the assertions (fix4 SIXA-OPEN —
+    // tally ONLY, no behavior change): admitted/deferred/drop
+    // counts so the matched comparison reads the tally on both
+    // trees, not the flaky assertion site. No assert below is
+    // touched. The base tree carries the IDENTICAL block.
+    let tally_admitted: BTreeSet<u32> = rows
+        .iter()
+        .filter(|r| r["kind"] == "membership" && r["state"] == "observing")
+        .filter_map(|r| r["incarnation"]["pid"].as_u64().map(|p| p as u32))
+        .collect();
+    let tally_deferred: BTreeSet<u32> = rows
+        .iter()
+        .filter(|r| r["kind"] == "limit" && r["reason"] != "deferred_limit")
+        .filter_map(|r| r["incarnation"]["pid"].as_u64().map(|p| p as u32))
+        .collect();
+    let tally_drops = rows
+        .iter()
+        .filter(|r| r["kind"] == "limit" && r["reason"] == "deferred_limit")
+        .count();
+    eprintln!(
+        "control7 tally: admitted={} deferred={} drops={} rows={}",
+        tally_admitted.len(),
+        tally_deferred.len(),
+        tally_drops,
+        rows.len()
+    );
     let key_of = |pid: u32| order.iter().find(|(_, p)| *p == pid).copied();
     // Admitted incarnations are the oldest; every admitted key precedes
     // every deferred key (deterministic oldest-first, incumbents stable).

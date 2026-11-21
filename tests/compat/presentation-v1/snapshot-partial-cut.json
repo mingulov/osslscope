@@ -1,0 +1,142 @@
+{
+  "schema": "osslscope-presentation-v1",
+  "snapshot_seq": 0,
+  "produced_wall_ns": 1700000000000000000,
+  "produced_monotonic_ns": 970929801846660,
+  "source": {
+    "mode": "service",
+    "generation": 0,
+    "run_id": {
+      "pid": 1,
+      "starttime": 2,
+      "boot_id": "00000000-0000-0000-0000-000000000000"
+    },
+    "window_seq": 2,
+    "window_sha256": "a5075c064a8f9ea1c64ff55d3f394efdc61c5a9c28299e42ded42547f86d03ae"
+  },
+  "window": {
+    "requested_start_ns": 970928942583501,
+    "requested_end_ns": 970929942583501,
+    "effective_start_ns": 970928949950750,
+    "effective_end_ns": 970929801846647,
+    "signal_cut": true,
+    "accum_cut": false
+  },
+  "completeness": {
+    "state": "partial",
+    "reasons": [
+      "loss:lifecycle.polling_fallback",
+      "startup-gap",
+      "tail-gap",
+      "signal-cut"
+    ],
+    "epoch_partial_by_class": {
+      "unknown_denominator": 0,
+      "undiscovered_sites": 0,
+      "unattached_sites": 0,
+      "loss": 3,
+      "unattributed_calls": 0,
+      "startup_gap": 0,
+      "tail_gap": 0,
+      "signal_cut": 0,
+      "visibility_lost": 0,
+      "no_reasons": 0
+    }
+  },
+  "policy": {
+    "active": null,
+    "outcome": "observe_only"
+  },
+  "exit_hint": 4,
+  "counts": {
+    "calls_total": 0,
+    "calls_window": 0,
+    "lanes": {
+      "legacy_exclusive": 0,
+      "non_legacy_exclusive": 0,
+      "shared_ambiguous": 0,
+      "unfenced_tails": 0
+    },
+    "lanes_window": {
+      "legacy_exclusive": 0,
+      "non_legacy_exclusive": 0,
+      "shared_ambiguous": 0,
+      "unfenced_tails": 0
+    },
+    "site_rows": 0,
+    "by_outcome": null
+  },
+  "members": {
+    "observed": 0,
+    "retired_in_window": 0,
+    "retired_epoch": 0,
+    "deferred_depth": null
+  },
+  "loss": {
+    "session": null,
+    "epoch_by_cause": {
+      "corpse_wait": 0,
+      "cgroup_move": 0,
+      "membership_unknown": 0,
+      "ring_loss": 0,
+      "connector_drops": 0,
+      "connector_enobufs": 0,
+      "scan_loss": 0,
+      "signal_prefix_unwitnessed": 0,
+      "drain_pending": 0,
+      "exec_spanning_aggregate": 0,
+      "coalesced_loss": 0,
+      "skipped_tick": 0
+    },
+    "counters": [
+      {
+        "kind": "Loss",
+        "name": "lifecycle.polling_fallback",
+        "source": "Lifecycle",
+        "units": "Events",
+        "value": 1
+      }
+    ]
+  },
+  "stream": null,
+  "trace": null,
+  "histograms": null,
+  "health": {
+    "snapshot_age_ns": 13,
+    "stale": false
+  },
+  "presenter": {
+    "epoch_changes": 0,
+    "series_overflow": 0
+  },
+  "unknown": [
+    {
+      "path": "policy.active",
+      "reason": "observe_only"
+    },
+    {
+      "path": "members.deferred_depth",
+      "reason": "not_yet_observed"
+    },
+    {
+      "path": "loss.session",
+      "reason": "not_yet_observed"
+    },
+    {
+      "path": "stream",
+      "reason": "stream_unconfigured"
+    },
+    {
+      "path": "counts.by_outcome",
+      "reason": "trace_disabled"
+    },
+    {
+      "path": "trace",
+      "reason": "trace_disabled"
+    },
+    {
+      "path": "histograms",
+      "reason": "trace_disabled"
+    }
+  ]
+}

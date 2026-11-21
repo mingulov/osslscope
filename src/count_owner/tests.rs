@@ -10244,6 +10244,8 @@ fn g1_actual_owner_open_recovery_reaches_capture_and_cli_consumer() {
                         Duration::from_secs(1)
                     },
                     image_digest: String::new(),
+                    trace_mode: crate::provider_observation::trace::TRACE_MODE_OFF,
+                    trace_by_api: false,
                 };
                 let info = capture::TargetInfo {
                     pid: 1,

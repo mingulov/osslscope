@@ -2588,11 +2588,51 @@ fn mid_window_publish(
         records: assembled.spilled_records,
         bytes: assembled.spilled_bytes,
     };
+    // 6C-1d close GROSS: run-cumulative stream totals at window
+    // close (zeros when the stream is unconfigured).
+    let (stream_gross_close, stream_configured) = match run.stream.as_ref() {
+        Some(s) => {
+            let (records, bytes) = s.queue.gross();
+            let (qf_r, qf_b) = s
+                .queue
+                .gross_by_reason(crate::service::envelope::DropReason::QueueFull);
+            let (ep_r, ep_b) = s
+                .queue
+                .gross_by_reason(crate::service::envelope::DropReason::Epipe);
+            let (sa_r, sa_b) = s
+                .queue
+                .gross_by_reason(crate::service::envelope::DropReason::StreamAbandoned);
+            (
+                crate::service::envelope::StreamDrops {
+                    records,
+                    bytes,
+                    by_reason: crate::service::envelope::ByReason {
+                        queue_full: crate::service::envelope::ReasonTotals {
+                            records: qf_r,
+                            bytes: qf_b,
+                        },
+                        epipe: crate::service::envelope::ReasonTotals {
+                            records: ep_r,
+                            bytes: ep_b,
+                        },
+                        stream_abandoned: crate::service::envelope::ReasonTotals {
+                            records: sa_r,
+                            bytes: sa_b,
+                        },
+                    },
+                },
+                true,
+            )
+        }
+        None => (crate::service::envelope::StreamDrops::default(), false),
+    };
     let envelope = WindowEnvelope {
         schema: crate::service::envelope::SCHEMA_WINDOW.to_string(),
         seq,
         generation: run.generation,
         run_id: run.run_id.clone(),
+        stream_gross_close,
+        stream_configured,
         window: WindowSpan {
             requested_start_ns: cycle.requested_start_ns,
             requested_end_ns: cycle.requested_end_ns,
@@ -4710,6 +4750,7 @@ fn fill_summary(run: &mut Run, summary: &mut RunSummary, diagnostics_dropped: u6
             },
         };
         summary.stream_pending = s.queue.spans();
+        summary.stream_configured = true;
     }
     summary.tap_recovered = run.summary.tap_recovered.clone();
     summary.tap_uncertain = std::mem::take(&mut run.summary.tap_uncertain);

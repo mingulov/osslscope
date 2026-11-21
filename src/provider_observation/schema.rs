@@ -434,13 +434,21 @@ impl ObservationApi {
                 EvpKdfFetch => "EVP_KDF_fetch",
                 EvpSignatureFetch => "EVP_SIGNATURE_fetch",
                 EvpKemFetch => "EVP_KEM_fetch",
+                EvpAsymCipherFetch => "EVP_ASYM_CIPHER_fetch",
+                EvpKeyexchFetch => "EVP_KEYEXCH_fetch",
+                EvpKeymgmtFetch => "EVP_KEYMGMT_fetch",
+                EvpRandFetch => "EVP_RAND_fetch",
+                EvpSkeymgmtFetch => "EVP_SKEYMGMT_fetch",
+                OsslDecoderFetch => "OSSL_DECODER_fetch",
+                OsslEncoderFetch => "OSSL_ENCODER_fetch",
+                OsslStoreLoaderFetch => "OSSL_STORE_LOADER_fetch",
                 OpenSslInitCrypto | OpenSslVersionMajor => return None,
                 _ => return api.operational_id().map(|id| id.export_name()),
             },
         })
     }
 }
-pub(crate) const APIS: [ObservationApi; 69] = [
+pub(crate) const APIS: [ObservationApi; 77] = [
     ObservationApi::Inventoried(inventory::Api::OsslProviderInit),
     ObservationApi::Inventoried(inventory::Api::OsslProviderLoad),
     ObservationApi::Inventoried(inventory::Api::OsslProviderTryLoad),
@@ -456,6 +464,14 @@ pub(crate) const APIS: [ObservationApi; 69] = [
     ObservationApi::Inventoried(inventory::Api::EvpKdfFetch),
     ObservationApi::Inventoried(inventory::Api::EvpSignatureFetch),
     ObservationApi::Inventoried(inventory::Api::EvpKemFetch),
+    ObservationApi::Inventoried(inventory::Api::EvpAsymCipherFetch),
+    ObservationApi::Inventoried(inventory::Api::EvpKeyexchFetch),
+    ObservationApi::Inventoried(inventory::Api::EvpKeymgmtFetch),
+    ObservationApi::Inventoried(inventory::Api::EvpRandFetch),
+    ObservationApi::Inventoried(inventory::Api::EvpSkeymgmtFetch),
+    ObservationApi::Inventoried(inventory::Api::OsslDecoderFetch),
+    ObservationApi::Inventoried(inventory::Api::OsslEncoderFetch),
+    ObservationApi::Inventoried(inventory::Api::OsslStoreLoaderFetch),
     ObservationApi::OsslProviderUnqueryOperation,
     ObservationApi::Operational(crate::api_activity::ApiId::constant(20)),
     ObservationApi::Operational(crate::api_activity::ApiId::constant(21)),
@@ -557,7 +573,7 @@ pub enum ObservationSource {
     ProviderQuery,
     ProviderDispatch,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Digest,
@@ -570,6 +586,10 @@ pub enum Operation {
     Signature,
     AsymCipher,
     Kem,
+    // Phase 1: OSSL_OP_SKEYMGMT (15) per core_dispatch.h — the
+    // EVP_SKEYMGMT_fetch capability peer. Ordered with the fetch
+    // family (declaration order is the section sort order).
+    Skeymgmt,
     Encoder,
     Decoder,
     Store,
@@ -749,6 +769,7 @@ impl Operation {
             Self::Signature => "OSSL_OP_SIGNATURE",
             Self::AsymCipher => "OSSL_OP_ASYM_CIPHER",
             Self::Kem => "OSSL_OP_KEM",
+            Self::Skeymgmt => "OSSL_OP_SKEYMGMT",
             Self::Encoder => "OSSL_OP_ENCODER",
             Self::Decoder => "OSSL_OP_DECODER",
             Self::Store => "OSSL_OP_STORE",
@@ -768,6 +789,7 @@ impl Operation {
             12 => Self::Signature,
             13 => Self::AsymCipher,
             14 => Self::Kem,
+            15 => Self::Skeymgmt,
             20 => Self::Encoder,
             21 => Self::Decoder,
             22 => Self::Store,

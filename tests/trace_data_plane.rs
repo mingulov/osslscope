@@ -63,14 +63,20 @@ fn decoder_gates_unchanged_for_operational() {
     nonzero_status[76..80].copy_from_slice(&9u32.to_le_bytes());
     assert!(wire::decode(&nonzero_status).is_err());
     assert!(wire::decode(&edge(1, 0, 0)).is_err());
-    assert!(wire::decode(&edge(1, 73, 0)).is_err());
+    // P1-A1: 73..=80 are the fetch extension (decodable); the
+    // unknown boundary moved to 81.
+    assert!(wire::decode(&edge(1, 73, 0)).is_ok());
+    assert!(wire::decode(&edge(1, 81, 0)).is_err());
     assert!(wire::decode(&edge(1, 7, 0)).is_err());
     assert!(wire::decode(&edge(2, 20, 5)).is_err());
 }
 
 #[test]
 fn decoder_still_accepts_fetch_lifecycle_edges() {
-    for api in [1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15] {
+    // P1-A1: the 73..=80 fetch extension decodes like 10..=15.
+    for api in [
+        1, 2, 3, 4, 5, 6, 10, 11, 12, 13, 14, 15, 73, 74, 75, 76, 77, 78, 79, 80,
+    ] {
         assert!(wire::decode(&edge(1, api, 0)).is_ok(), "attempt api {api}");
         assert!(wire::decode(&edge(2, api, 1)).is_ok(), "result api {api}");
     }
@@ -79,9 +85,9 @@ fn decoder_still_accepts_fetch_lifecycle_edges() {
 #[test]
 fn rejected_unknown_api_probe() {
     assert!(wire::rejected_unknown_api(&edge(1, 0, 0)));
-    assert!(wire::rejected_unknown_api(&edge(2, 73, 1)));
+    assert!(wire::rejected_unknown_api(&edge(2, 81, 1)));
     assert!(wire::rejected_unknown_api(&edge(1, 1000, 0)));
-    for api in [1, 6, 7, 9, 10, 15, 16, 19, 20, 72] {
+    for api in [1, 6, 7, 9, 10, 15, 16, 19, 20, 72, 73, 76, 80] {
         assert!(!wire::rejected_unknown_api(&edge(1, api, 0)), "api {api}");
     }
     assert!(!wire::rejected_unknown_api(&edge(1, 0, 0)[..95]));

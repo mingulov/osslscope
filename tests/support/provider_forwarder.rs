@@ -44,6 +44,46 @@ getctx_impl: .byte 0xb8,0x0d,0,0,0,0xc3
         );
         Self::assemble(query, unquery, &extra)
     }
+    /// Variant that additionally exports three operational symbols
+    /// (the quarantined `EVP_DigestInit_ex2` (wire id 21),
+    /// `EVP_DigestUpdate` (wire id 22), and `EVP_DigestFinal_ex`
+    /// (wire id 23)) for same-API operational sibling pins
+    /// (FLAG-2 fix8): two such forwarders give two sites for one
+    /// operational API, like the fetch pair.
+    pub fn new_with_operational(query: &str, unquery: &str) -> Self {
+        let extra = r#"
+.globl EVP_DigestInit_ex2
+.type EVP_DigestInit_ex2,@function
+EVP_DigestInit_ex2: .byte 0xb8,0x0d,0,0,0,0xc3
+.size EVP_DigestInit_ex2,.-EVP_DigestInit_ex2
+.space 16,0x90
+.globl EVP_DigestUpdate
+.type EVP_DigestUpdate,@function
+EVP_DigestUpdate: .byte 0xb8,0x0e,0,0,0,0xc3
+.size EVP_DigestUpdate,.-EVP_DigestUpdate
+.space 16,0x90
+.globl EVP_DigestFinal_ex
+.type EVP_DigestFinal_ex,@function
+EVP_DigestFinal_ex: .byte 0xb8,0x0f,0,0,0,0xc3
+.size EVP_DigestFinal_ex,.-EVP_DigestFinal_ex
+.space 16,0x90
+"#;
+        Self::assemble(query, unquery, extra)
+    }
+    /// Variant that additionally exports `EVP_CIPHER_fetch`
+    /// (wire id 11) for two-fetch-surface pins (NEW-32 fix8): a
+    /// second fetch surface whose edges stay unrelated to a
+    /// conflict on the first.
+    pub fn new_with_cipher_fetch(query: &str, unquery: &str) -> Self {
+        let extra = r#"
+.globl EVP_CIPHER_fetch
+.type EVP_CIPHER_fetch,@function
+EVP_CIPHER_fetch: .byte 0xb8,0x10,0,0,0,0xc3
+.size EVP_CIPHER_fetch,.-EVP_CIPHER_fetch
+.space 16,0x90
+"#;
+        Self::assemble(query, unquery, extra)
+    }
     fn assemble(query: &str, unquery: &str, extra: &str) -> Self {
         let directory = std::env::temp_dir().join(format!(
             "osslscope-forwarder-{}-{}-{}",

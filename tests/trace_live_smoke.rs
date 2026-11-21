@@ -96,6 +96,8 @@ fn spawn(app: &std::path::Path) -> (Owned, mpsc::Receiver<String>) {
 }
 
 fn is_fetch_fact(fact: &po::ObservationFact) -> bool {
+    // P1-A1: all 14 fetch surfaces (the six v0.6.0 IDs plus the
+    // eight Phase 1 extension surfaces).
     matches!(
         fact.api,
         po::ObservationApi::Inventoried(
@@ -105,6 +107,14 @@ fn is_fetch_fact(fact: &po::ObservationFact) -> bool {
                 | osslscope::inventory::Api::EvpKdfFetch
                 | osslscope::inventory::Api::EvpSignatureFetch
                 | osslscope::inventory::Api::EvpKemFetch
+                | osslscope::inventory::Api::EvpAsymCipherFetch
+                | osslscope::inventory::Api::EvpKeyexchFetch
+                | osslscope::inventory::Api::EvpKeymgmtFetch
+                | osslscope::inventory::Api::EvpRandFetch
+                | osslscope::inventory::Api::EvpSkeymgmtFetch
+                | osslscope::inventory::Api::OsslDecoderFetch
+                | osslscope::inventory::Api::OsslEncoderFetch
+                | osslscope::inventory::Api::OsslStoreLoaderFetch
         )
     )
 }

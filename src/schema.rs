@@ -3,13 +3,19 @@
 //!
 //! [`check_version`] accepts historical v1.x documents; its schema is
 //! `schemas/observed-crypto-v1.json`. Live report/check producers emit
-//! `observed-crypto-v2.4` through `observed-crypto-v2.7`
+//! `observed-crypto-v2.4` through `observed-crypto-v2.9`
 //! (`src/evidence.rs` is the emitter of record: v2.5 when the window
 //! certified execution attribution, v2.6 when a sysctl context was
-//! sampled, v2.7 when the capture retired an owned corpse);
+//! sampled, v2.7 when the capture retired an owned corpse, v2.8 when
+//! the window projected request/fetch/load/query evidence, v2.9 when
+//! the window sealed a 6D trace fold);
 //! [`check_version_v2`], [`validate_v2`] and [`check_v2_semantics`]
 //! own that contract. Minor additions are optional; field readers
 //! ignore unknown keys while validators stay strict.
+//!
+//! Phase 1 adds `observed-crypto-v2.8` (request/fetch/load/query
+//! evidence); Phase 2 adds `observed-crypto-v2.9` (6D trace
+//! projection); the emitter of record stays `src/evidence.rs`.
 
 /// True iff a v1.x reader accepts this `schema_version`: accepts
 /// `observed-crypto-v1` (implicit .0) and `observed-crypto-v1.<minor>`;
@@ -160,6 +166,7 @@ fn check_keywords(
         "maximum",
         "minLength",
         "maxLength",
+        "pattern",
         "minItems",
         "maxItems",
         "anyOf",
@@ -507,6 +514,33 @@ fn validate_against(
                 ));
             }
         }
+        if let Some(pat) = obj.get("pattern") {
+            let pat = pat
+                .as_str()
+                .ok_or_else(|| schema_err(path, "pattern must be a string".to_string()))?;
+            // `pattern` (P2fix6 NEW-37): the validator ships no
+            // regex engine — the single shipped pattern (the
+            // canonical lowercase 16-hex exemplar spelling)
+            // evaluates by its exact manual equivalent; any other
+            // pattern fails closed (a schema the validator cannot
+            // evaluate proves nothing). Never echoes the input.
+            if pat != "^[0-9a-f]{16}$" {
+                return Err(schema_err(
+                    path,
+                    "unsupported pattern (fail closed)".to_string(),
+                ));
+            }
+            if text.len() != 16
+                || !text
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err(schema_err(
+                    path,
+                    "string does not match pattern".to_string(),
+                ));
+            }
+        }
     }
     if let serde_json::Value::Number(number) = doc {
         if let Some(limit) = obj.get("minimum") {
@@ -607,6 +641,483 @@ pub fn check_v2_semantics(doc: &serde_json::Value) -> Result<(), String> {
     check_preview_count_provenance(root)?;
     check_dynamic_sections(root)?;
     check_v26_sections(root)?;
+    check_request_evidence(root)?;
+    check_trace_summary(root)?;
+    Ok(())
+}
+
+/// NEW-33 fix9: duplicate-preserving JSON mirror — objects keep
+/// every member in wire order (`serde_json::Value` last-wins
+/// duplicates away, so the `Value` gate cannot see them). Only the
+/// object-member lists are consumed (duplicate detection); scalars
+/// exist so any document parses.
+enum RawJson {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array(Vec<RawJson>),
+    Object(Vec<(String, RawJson)>),
+}
+
+impl<'de> serde::Deserialize<'de> for RawJson {
+    fn deserialize<D: serde::Deserializer<'de>>(read: D) -> Result<Self, D::Error> {
+        struct RawVisitor;
+        impl<'de> serde::de::Visitor<'de> for RawVisitor {
+            type Value = RawJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<RawJson, E> {
+                Ok(RawJson::Null)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<RawJson, E> {
+                Ok(RawJson::Null)
+            }
+            fn visit_bool<E: serde::de::Error>(self, _v: bool) -> Result<RawJson, E> {
+                Ok(RawJson::Bool)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _v: i64) -> Result<RawJson, E> {
+                Ok(RawJson::Number)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _v: u64) -> Result<RawJson, E> {
+                Ok(RawJson::Number)
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<RawJson, E> {
+                if v.is_finite() {
+                    Ok(RawJson::Number)
+                } else {
+                    Err(E::custom("doc: non-finite number"))
+                }
+            }
+            fn visit_str<E: serde::de::Error>(self, _v: &str) -> Result<RawJson, E> {
+                Ok(RawJson::String)
+            }
+            fn visit_string<E: serde::de::Error>(self, _v: String) -> Result<RawJson, E> {
+                Ok(RawJson::String)
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<RawJson, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(RawJson::Array(items))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<RawJson, A::Error> {
+                // Collect, never dedup: duplicate members stay visible.
+                let mut members = Vec::new();
+                while let Some((key, value)) = map.next_entry::<String, RawJson>()? {
+                    members.push((key, value));
+                }
+                Ok(RawJson::Object(members))
+            }
+        }
+        read.deserialize_any(RawVisitor)
+    }
+}
+
+/// Raw duplicate-key walk shared by every raw check (P2fix4
+/// NEW-8 — request_evidence, trace_summary, envelope, OTLP
+/// response): object keys repeat nowhere in the walked tree.
+/// Diagnostics name FIXED caller roots + STRUCTURAL positions
+/// only (P2fix5 NEW-25 — object members by member index, array
+/// items by item index; raw input keys NEVER echo — neither the
+/// duplicate key nor any ancestor key); `root` labels the
+/// diagnostic path root.
+fn walk_raw_duplicates(value: &RawJson, path: &mut Vec<String>, root: &str) -> Result<(), String> {
+    match value {
+        RawJson::Object(members) => {
+            let mut seen = std::collections::BTreeSet::new();
+            for (key, _) in members {
+                if !seen.insert(key.clone()) {
+                    return Err(format!("{root}.{}: duplicate field", path.join(".")));
+                }
+            }
+            for (index, (_, member)) in members.iter().enumerate() {
+                path.push(format!("#{index}"));
+                walk_raw_duplicates(member, path, root)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        RawJson::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                path.push(index.to_string());
+                walk_raw_duplicates(item, path, root)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// OTLP/HTTP response duplicate members (P2fix4 NEW-8): reject
+/// duplicate object keys anywhere in the RAW response bytes —
+/// BEFORE `Value` normalization collapses them (last-wins),
+/// which would hide a prior `partialSuccess` (or count) behind
+/// a later clean block. Checked before counting acceptance.
+pub fn check_otlp_response_raw_duplicates(text: &str) -> Result<(), String> {
+    let raw: RawJson =
+        serde_json::from_str(text).map_err(|error| format!("otlp: invalid JSON ({error})"))?;
+    walk_raw_duplicates(&raw, &mut vec![], "otlp")
+}
+
+/// NEW-33 fix9: reject duplicate object keys anywhere under the
+/// top-level `request_evidence` section of the RAW document text —
+/// BEFORE `Value` normalization collapses them (last-wins). The
+/// document gate below receives a `Value`, so without this raw
+/// check a duplicated `start_ns`/`end_ns` is invisible to it.
+/// NEW-33-OPEN fix10: a REPEATED top-level `request_evidence`
+/// member is rejected here too — the scan used to walk only the
+/// first member while `Value` parsing last-wins, so a second
+/// member replaced the checked one and concealed nested
+/// duplicates. Keys outside the section keep their historical
+/// last-wins behavior (out of scope for this finding).
+pub fn check_request_evidence_raw_duplicates(text: &str) -> Result<(), String> {
+    let raw: RawJson =
+        serde_json::from_str(text).map_err(|error| format!("doc: invalid JSON ({error})"))?;
+    let section = match &raw {
+        RawJson::Object(members) => {
+            let mut sections = members
+                .iter()
+                .filter(|(key, _)| key == "request_evidence")
+                .map(|(_, value)| value);
+            let first = sections.next();
+            if sections.next().is_some() {
+                return Err("doc.request_evidence: duplicate field `request_evidence` \
+                     (a repeated top-level section conceals its members)"
+                    .to_string());
+            }
+            first
+        }
+        _ => None,
+    };
+    let Some(section) = section else {
+        return Ok(());
+    };
+    let mut path = vec!["request_evidence".to_string()];
+    walk_raw_duplicates(section, &mut path, "doc")
+}
+
+/// P2fix1 item 23: reject duplicate object keys anywhere under a
+/// `trace_summary` section of the RAW text — BEFORE `Value`
+/// normalization collapses them (last-wins). A duplicated by_api
+/// key would silently pick one distribution for an API identity;
+/// the typed gate below receives a `Value`, so without this raw
+/// check the duplication is invisible to it. Both text shapes are
+/// covered: top-level `trace_summary` (document text) and
+/// `document.trace_summary` (service envelope bytes — the
+/// presenter calls this on window bytes before folding). Keys
+/// outside the section keep their historical last-wins behavior.
+pub fn check_trace_summary_raw_duplicates(text: &str) -> Result<(), String> {
+    let raw: RawJson =
+        serde_json::from_str(text).map_err(|error| format!("doc: invalid JSON ({error})"))?;
+    fn section_members<'a>(raw: &'a RawJson, key: &str) -> Vec<&'a RawJson> {
+        match raw {
+            RawJson::Object(members) => members
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect(),
+            _ => vec![],
+        }
+    }
+    // A repeated section member itself rejects (it would conceal
+    // the checked one under last-wins).
+    let mut sections: Vec<(&RawJson, Vec<String>)> = vec![];
+    let tops = section_members(&raw, "trace_summary");
+    if tops.len() > 1 {
+        return Err("doc.trace_summary: duplicate field `trace_summary`".to_string());
+    }
+    for top in tops {
+        sections.push((top, vec!["trace_summary".to_string()]));
+    }
+    for doc in section_members(&raw, "document") {
+        let nested = section_members(doc, "trace_summary");
+        if nested.len() > 1 {
+            return Err("doc.document.trace_summary: duplicate field `trace_summary`".to_string());
+        }
+        for n in nested {
+            sections.push((n, vec!["document".to_string(), "trace_summary".to_string()]));
+        }
+    }
+    for (section, mut path) in sections {
+        walk_raw_duplicates(section, &mut path, "doc")?;
+    }
+    Ok(())
+}
+
+/// P2fix7 NEW-42: reject duplicate object keys anywhere under an
+/// `api_activity` section of the RAW text — BEFORE `Value`
+/// normalization collapses them (last-wins). A duplicated member
+/// inside one coverage row (or its nested `gaps`) would silently
+/// pick one value for a coverage input; the typed gate below
+/// receives a `Value`, so without this raw check the duplication
+/// is invisible to it. Both text shapes are covered: top-level
+/// `api_activity` (document text) and `document.api_activity`
+/// (service envelope bytes — mirroring the trace-section check).
+/// Keys outside the section keep their historical last-wins
+/// behavior.
+pub fn check_api_activity_raw_duplicates(text: &str) -> Result<(), String> {
+    let raw: RawJson =
+        serde_json::from_str(text).map_err(|error| format!("doc: invalid JSON ({error})"))?;
+    fn section_members<'a>(raw: &'a RawJson, key: &str) -> Vec<&'a RawJson> {
+        match raw {
+            RawJson::Object(members) => members
+                .iter()
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v)
+                .collect(),
+            _ => vec![],
+        }
+    }
+    // A repeated section member itself rejects (it would conceal
+    // the checked one under last-wins).
+    let mut sections: Vec<(&RawJson, Vec<String>)> = vec![];
+    let tops = section_members(&raw, "api_activity");
+    if tops.len() > 1 {
+        return Err("doc.api_activity: duplicate field `api_activity`".to_string());
+    }
+    for top in tops {
+        sections.push((top, vec!["api_activity".to_string()]));
+    }
+    for doc in section_members(&raw, "document") {
+        let nested = section_members(doc, "api_activity");
+        if nested.len() > 1 {
+            return Err("doc.document.api_activity: duplicate field `api_activity`".to_string());
+        }
+        for n in nested {
+            sections.push((n, vec!["document".to_string(), "api_activity".to_string()]));
+        }
+    }
+    for (section, mut path) in sections {
+        walk_raw_duplicates(section, &mut path, "doc")?;
+    }
+    Ok(())
+}
+
+/// P2fix2 item 13: reject duplicate object keys ANYWHERE in a
+/// service window envelope's RAW bytes — BEFORE `Value`
+/// normalization collapses them (last-wins). A repeated envelope
+/// `document` (or any nested key) would conceal the unchecked
+/// section under last-wins; the fold below receives a `Value`, so
+/// without this raw check the duplication is invisible to it.
+/// Whole-tree strict (unlike the v2-document historical scope
+/// above): service envelopes are machine-written JSON that never
+/// legitimately duplicates a key.
+pub fn check_envelope_raw_duplicates(text: &str) -> Result<(), String> {
+    let raw: RawJson =
+        serde_json::from_str(text).map_err(|error| format!("envelope: invalid JSON ({error})"))?;
+    walk_raw_duplicates(&raw, &mut vec![], "envelope")
+}
+
+/// NEW-33 fix9: raw-text document intake — the RAW section checks
+/// run FIRST (a `Value` has already collapsed duplicates), then
+/// the standard structural + semantic pipeline on the parsed
+/// document.
+pub fn check_v2_document_text(text: &str) -> Result<(), String> {
+    check_request_evidence_raw_duplicates(text)?;
+    check_trace_summary_raw_duplicates(text)?;
+    check_api_activity_raw_duplicates(text)?;
+    let doc: serde_json::Value =
+        serde_json::from_str(text).map_err(|error| format!("doc: invalid JSON ({error})"))?;
+    validate_v2(&doc).map_err(|error| error.to_string())?;
+    check_v2_semantics(&doc)
+}
+
+/// Request/fetch/load/query evidence (v2.8, Phase 1): the v2.8
+/// producer trigger pins BOTH directions at minor 8 exactly (the
+/// section is present iff the minor is 8 — nothing else stamps 8;
+/// later minors carry it optionally and still validate it when
+/// present), and a present section must be coherent — rules plain
+/// JSON Schema cannot express. The
+/// section-level rules live in one shared place
+/// ([`RequestEvidence::validate_strict`], enforced identically by the
+/// typed reader): version, surface binding (shape and all — surface
+/// 78 is `decoder`, never an `evp` object), canonical row keys and
+/// order (duplicate IDs rejected), load coherence, activation
+/// coherence, query-partition equality, and the silence-interval
+/// rule (a published interval is nonempty, and every zero claim —
+/// an observed zero remainder or any covered-but-absent surface —
+/// rides one). This gate adds the document-level reconciliations:
+/// the silence interval binds inside the document's effective
+/// window, the unattributed remainder equals the observed
+/// `api_activity` entry sum (an invented remainder is rejected;
+/// `Unknown` with positive entries is rejected — positives are
+/// preserved, never demoted), and `api_activity` is present
+/// whenever the section is. An observed ZERO additionally needs
+/// serialized observation evidence behind it (at least one
+/// read-receipted activity row — empty or entirely-unreceipted
+/// activity proves no observation, so `Observed{0}` over it is
+/// rejected).
+///
+/// Absent sections skip on minors below 8. Unmatched attempt/result
+/// edges are legitimate and never forced equal.
+fn check_request_evidence(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    use crate::provider_observation::request_evidence::{RequestEvidence, Unattributed};
+    let version = root
+        .get("schema_version")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "doc.schema_version: expected string".to_string())?;
+    let minor: u64 = version
+        .strip_prefix("observed-crypto-v2.")
+        .and_then(|m| m.parse().ok())
+        .unwrap_or(0);
+    let Some(section) = root.get("request_evidence") else {
+        // NEW-4: the reverse trigger applies to the CURRENT v2.8
+        // stamp only — a later minor may be stamped for an
+        // unrelated optional feature and validates without this
+        // section.
+        if minor == 8 {
+            return Err(format!(
+                "doc.schema_version: minor == 8 needs its request_evidence trigger, got {version:?} without one"
+            ));
+        }
+        return Ok(());
+    };
+    if minor < 8 {
+        return Err(format!(
+            "doc.schema_version: request_evidence needs minor >= 8, got {version:?}"
+        ));
+    }
+    // Shared strict typed validation (one read path, not two): the
+    // section parses only when every binding/order/coherence rule
+    // holds — shapes, duplicates, partitions included.
+    let section: RequestEvidence = serde_json::from_value(serde_json::Value::Object(
+        section
+            .as_object()
+            .ok_or_else(|| "doc.request_evidence: expected object".to_string())?
+            .clone(),
+    ))
+    .map_err(|error| format!("doc.request_evidence: strict read rejected it ({error})"))?;
+    // GATE-OPEN + NEW-9-OPEN + NEW-16 fix5: every zero claim
+    // rides a nonempty silence interval BOUND inside the
+    // document's effective window (fail closed). The strict read
+    // above already rejects interval-less zeros and empty
+    // intervals; the presence refusal below is explicit anyway
+    // (the document verdict never relies on a layered check
+    // alone), and the binding check convicts unbound intervals.
+    if section.claims_zero() && section.silence_window.is_none() {
+        return Err(
+            "doc.request_evidence: a zero claim needs its published silence interval bound inside the document effective window"
+                .to_string(),
+        );
+    }
+    // NEW-9: the published silence interval binds inside the
+    // document's effective window — a silence claim outside (or
+    // without) the capture window is incoherent (fail closed).
+    if let Some(silence) = section.silence_window {
+        let window = root.get("window").and_then(|v| v.as_object());
+        let effective = |key: &str| window.and_then(|w| w.get(key)).and_then(|v| v.as_u64());
+        match (
+            effective("effective_start_ns"),
+            effective("effective_end_ns"),
+        ) {
+            (Some(start), Some(end)) if start <= silence.start_ns && silence.end_ns <= end => {}
+            _ => {
+                return Err(
+                    "doc.request_evidence.silence_window: silence interval outside (or without) the document effective window"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    // Document-level remainder reconciliation against the observed
+    // operational population (the producer sums the same rows).
+    let activity = root
+        .get("api_activity")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "doc.api_activity: expected array alongside request_evidence".to_string())?;
+    let mut entries = 0u64;
+    // GATE-OPEN + GATE fix3 + PINS/NEW-12 fix4: an observed zero
+    // needs a serialized successful-read receipt behind it — at
+    // least one activity row carrying `gaps.read_receipt`. Empty
+    // or entirely-unreceipted activity proves no observation, so
+    // `Observed{0}` over it is rejected (a row without an explicit
+    // receipt counts unreceipted — fail closed; the `not_attached`
+    // bit is ATTACHMENT only and is never counted here).
+    // Producer invariant (see `wire::failed_activity`;
+    // wording fix7 NEW-28): receipted terminal rows exist only
+    // after a successful read of an owner's map — admitted or
+    // verified-positive unadmitted (the ROW read receipt, not the
+    // admission-gated SCOPE receipt) — failed reads carry no
+    // receipt, so they can never receipt a zero.
+    let mut receipted_rows = 0u64;
+    for (index, row) in activity.iter().enumerate() {
+        let row = row
+            .as_object()
+            .ok_or_else(|| format!("doc.api_activity[{index}]: expected object"))?;
+        let row_entries = row
+            .get("entries")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("doc.api_activity[{index}].entries: expected u64"))?;
+        entries = entries
+            .checked_add(row_entries)
+            .ok_or_else(|| format!("doc.api_activity[{index}].entries: entry sum overflowed"))?;
+        let receipted = row
+            .get("gaps")
+            .and_then(|g| g.as_object())
+            .and_then(|g| g.get("read_receipt"))
+            .and_then(|v| v.as_bool())
+            .is_some_and(|read_receipt| read_receipt);
+        if receipted {
+            receipted_rows = receipted_rows.saturating_add(1);
+        }
+    }
+    match &section.unattributed {
+        Unattributed::Observed { ops } => {
+            if *ops != entries {
+                return Err(format!(
+                    "doc.request_evidence.unattributed: observed remainder {ops} != api_activity entry sum {entries}"
+                ));
+            }
+            if *ops == 0 && receipted_rows == 0 {
+                return Err(
+                    "doc.request_evidence.unattributed: observed zero with no read-receipted api_activity row (empty or entirely-unreceipted activity proves no observation)"
+                        .to_string(),
+                );
+            }
+        }
+        Unattributed::Unknown => {
+            if entries != 0 {
+                return Err(format!(
+                    "doc.request_evidence.unattributed: unknown remainder with {entries} observed entries (positives never demote)"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// v2.9 semantic gate (Phase 2): ONE document-level contract
+/// (P2fix3 GATE29 — shared with both presenter inputs + restored
+/// checkpoints): the producer trigger pins BOTH directions at
+/// minor 9 exactly (present iff minor == 9 — nothing else stamps
+/// 9; later minors carry it optionally and still validate it when
+/// present), and a present section must be coherent (strict typed
+/// read + [`TraceSummary::validate`] + coverage-vs-api_activity
+/// reconciliation).
+fn check_trace_summary(root: &serde_json::Map<String, serde_json::Value>) -> Result<(), String> {
+    use crate::provider_observation::trace as t;
+    let doc = serde_json::Value::Object(root.clone());
+    let parsed = root
+        .get("trace_summary")
+        .map(t::parse_trace_section)
+        .transpose()
+        .map_err(|error| format!("doc.trace_summary: {error}"))?;
+    t::check_trace_contract(
+        t::doc_minor(&doc),
+        parsed.as_ref(),
+        root.get("api_activity"),
+    )
+    .map_err(|error| format!("doc.trace_summary: {error}"))?;
     Ok(())
 }
 
@@ -1994,6 +2505,1060 @@ mod tests {
     }
 
     #[test]
+    fn request_evidence_gate_pins_binding_and_activation() {
+        // Phase 1 (v2.8): the producer-shaped section passes; a
+        // mismatched export/capability, candidates != success, a
+        // manufactured activation, and an old minor all fail.
+        // GATE (fix1): the gate shares the typed strict validation
+        // (shapes, duplicates, order, partitions) and reconciles the
+        // remainder against api_activity, pinning the v2.8 trigger.
+        use serde_json::json;
+        let coverage_all = || {
+            json!([
+                {"surface_id": 10, "observed": true},
+                {"surface_id": 11, "observed": true},
+                {"surface_id": 12, "observed": true},
+                {"surface_id": 13, "observed": true},
+                {"surface_id": 14, "observed": true},
+                {"surface_id": 15, "observed": true},
+                {"surface_id": 73, "observed": true},
+                {"surface_id": 74, "observed": true},
+                {"surface_id": 75, "observed": true},
+                {"surface_id": 76, "observed": true},
+                {"surface_id": 77, "observed": true},
+                {"surface_id": 78, "observed": true},
+                {"surface_id": 79, "observed": true},
+                {"surface_id": 80, "observed": true},
+            ])
+        };
+        // GATE-OPEN + NEW-16 fix5: the default shape is the
+        // producer's windowed form — zero claims ride a bound
+        // nonempty silence interval, so every accept case carries
+        // one and every reject case below fails on its CITED
+        // defect (never on a missing interval).
+        let section_full = |fetches: serde_json::Value,
+                            loads: serde_json::Value,
+                            activation: &str,
+                            coverage: serde_json::Value,
+                            queries: serde_json::Value,
+                            adverts: serde_json::Value,
+                            unattributed: serde_json::Value,
+                            activity: serde_json::Value|
+         -> serde_json::Map<String, serde_json::Value> {
+            json!({
+                "schema_version": "observed-crypto-v2.8",
+                "api_activity": activity,
+                "window": {"effective_start_ns": 100, "effective_end_ns": 200},
+                "request_evidence": {
+                    "version": 1,
+                    "silence_window": {"start_ns": 100, "end_ns": 200},
+                    "fetches": fetches,
+                    "fetch_coverage": coverage,
+                    "loads": loads,
+                    "inits": {"success": 0, "failure": 0, "unknown": 0},
+                    "queries": queries,
+                    "advertisements": adverts,
+                    "default_activation": activation,
+                    "unattributed": unattributed,
+                },
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        };
+        let section = |fetches: serde_json::Value,
+                       loads: serde_json::Value,
+                       activation: &str|
+         -> serde_json::Map<String, serde_json::Value> {
+            section_full(
+                fetches,
+                loads,
+                activation,
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!("unknown"),
+                json!([]),
+            )
+        };
+        let fetch76 = json!({
+            "surface_id": 76, "export": "EVP_RAND_fetch",
+            "capability": {"evp": {"operation": "rand"}},
+            "attempts": 1, "success": 1, "failure": 0, "unknown": 0,
+            "properties": "not_captured",
+        });
+        let load_default = json!({
+            "name": "default", "attempts": 1, "success": 1,
+            "failure": 0, "unknown": 0, "candidates": 1, "tier": "candidate",
+        });
+        assert!(
+            check_request_evidence(&section(
+                json!([fetch76]),
+                json!([load_default]),
+                "load_observed"
+            ))
+            .is_ok()
+        );
+        assert!(check_request_evidence(&section(json!([]), json!([]), "unknown")).is_ok());
+        // Mismatched export for surface 76.
+        let mut bad = fetch76.clone();
+        bad["export"] = json!("EVP_MD_fetch");
+        assert!(check_request_evidence(&section(json!([bad]), json!([]), "unknown")).is_err());
+        // Mismatched capability for surface 76.
+        let mut bad = fetch76.clone();
+        bad["capability"] = json!({"evp": {"operation": "digest"}});
+        assert!(check_request_evidence(&section(json!([bad]), json!([]), "unknown")).is_err());
+        // candidates != success.
+        let mut bad = load_default.clone();
+        bad["candidates"] = json!(2);
+        assert!(
+            check_request_evidence(&section(json!([]), json!([bad]), "load_observed")).is_err()
+        );
+        // Manufactured activation: load_observed with no default success.
+        assert!(check_request_evidence(&section(json!([]), json!([]), "load_observed")).is_err());
+        // ... and unknown despite a default success.
+        assert!(
+            check_request_evidence(&section(json!([]), json!([load_default]), "unknown")).is_err()
+        );
+        // Old minor carrying the section.
+        let mut root = section(json!([]), json!([]), "unknown");
+        root.insert("schema_version".to_string(), json!("observed-crypto-v2.7"));
+        assert!(check_request_evidence(&root).is_err());
+        // Absent sections skip on old minors.
+        let root = json!({"schema_version": "observed-crypto-v2.4"})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(check_request_evidence(&root).is_ok());
+        // GATE: surface 78 with an `evp` object (right word, wrong
+        // shape — the v2.8 producer trigger for this exact case).
+        let shape78 = json!({
+            "surface_id": 78, "export": "OSSL_DECODER_fetch",
+            "capability": {"evp": {"operation": "decoder"}},
+            "attempts": 1, "success": 1, "failure": 0, "unknown": 0,
+            "properties": "not_captured",
+        });
+        assert!(check_request_evidence(&section(json!([shape78]), json!([]), "unknown")).is_err());
+        // GATE: duplicate fetch IDs rejected.
+        assert!(
+            check_request_evidence(&section(
+                json!([fetch76.clone(), fetch76.clone()]),
+                json!([]),
+                "unknown"
+            ))
+            .is_err()
+        );
+        // GATE: out-of-order fetch IDs rejected (canonical ID order).
+        let fetch10 = json!({
+            "surface_id": 10, "export": "EVP_MD_fetch",
+            "capability": {"evp": {"operation": "digest"}},
+            "attempts": 1, "success": 1, "failure": 0, "unknown": 0,
+            "properties": "not_captured",
+        });
+        assert!(
+            check_request_evidence(&section(
+                json!([fetch76.clone(), fetch10.clone()]),
+                json!([]),
+                "unknown"
+            ))
+            .is_err()
+        );
+        assert!(
+            check_request_evidence(&section(json!([fetch10, fetch76]), json!([]), "unknown"))
+                .is_ok()
+        );
+        // GATE: unmatched attempt/result edges are legitimate (never forced).
+        let mut unmatched = fetch76.clone();
+        unmatched["success"] = json!(0);
+        assert!(check_request_evidence(&section(json!([unmatched]), json!([]), "unknown")).is_ok());
+        // GATE-OPEN + NEW-22 fix6: an explicit all-zero fetch row
+        // (fabricated — the producer never emits one) is rejected
+        // even with observed coverage and a bound interval, while a
+        // single nonzero count (unmatched result) stays legitimate.
+        let mut zero = fetch76.clone();
+        zero["attempts"] = json!(0);
+        zero["success"] = json!(0);
+        zero["failure"] = json!(0);
+        zero["unknown"] = json!(0);
+        assert!(
+            check_request_evidence(&section(json!([zero]), json!([]), "unknown")).is_err(),
+            "the document gate must reject an explicit all-zero fetch row"
+        );
+        let mut result_only = fetch76.clone();
+        result_only["attempts"] = json!(0);
+        result_only["failure"] = json!(0);
+        result_only["unknown"] = json!(0);
+        assert!(
+            check_request_evidence(&section(json!([result_only]), json!([]), "unknown")).is_ok(),
+            "an unmatched result stays legitimate"
+        );
+        // GATE: capability extras rejected.
+        let mut extra = fetch76.clone();
+        extra["capability"] = json!({"evp": {"operation": "rand", "smuggled": 1}});
+        assert!(check_request_evidence(&section(json!([extra]), json!([]), "unknown")).is_err());
+        // GATE: a present row without coverage rejected.
+        let mut uncovered = coverage_all();
+        uncovered[9]["observed"] = json!(false);
+        assert!(
+            check_request_evidence(&section_full(
+                json!([fetch76]),
+                json!([]),
+                "unknown",
+                uncovered,
+                json!([]),
+                json!([]),
+                json!("unknown"),
+                json!([]),
+            ))
+            .is_err()
+        );
+        // GATE: unequal query partitions rejected; equal accepted.
+        let query_bad = json!({
+            "operation": "digest",
+            "wrapper": {"success": 1, "failure": 0, "unknown": 0,
+                        "cacheable": 2, "volatile": 0, "cache_unknown": 0},
+            "callback": {"success": 0, "failure": 0, "unknown": 0,
+                         "cacheable": 0, "volatile": 0, "cache_unknown": 0},
+        });
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([query_bad]),
+                json!([]),
+                json!("unknown"),
+                json!([]),
+            ))
+            .is_err()
+        );
+        let query_good = json!({
+            "operation": "digest",
+            "wrapper": {"success": 1, "failure": 0, "unknown": 0,
+                        "cacheable": 1, "volatile": 0, "cache_unknown": 0},
+            "callback": {"success": 0, "failure": 0, "unknown": 1,
+                         "cacheable": 0, "volatile": 0, "cache_unknown": 1},
+        });
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([query_good]),
+                json!([]),
+                json!("unknown"),
+                json!([]),
+            ))
+            .is_ok()
+        );
+        // GATE: duplicate query/advert operations rejected.
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([query_good.clone(), query_good.clone()]),
+                json!([]),
+                json!("unknown"),
+                json!([]),
+            ))
+            .is_err()
+        );
+        let advert = json!({"operation": "digest", "count": 1, "tier": "candidate"});
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([advert.clone(), advert.clone()]),
+                json!("unknown"),
+                json!([]),
+            ))
+            .is_err()
+        );
+        // GATE: duplicate/out-of-order load names rejected.
+        let load_legacy = json!({
+            "name": "legacy", "attempts": 1, "success": 0,
+            "failure": 1, "unknown": 0, "candidates": 0, "tier": "candidate",
+        });
+        assert!(
+            check_request_evidence(&section(
+                json!([]),
+                json!([load_legacy.clone(), load_default.clone()]),
+                "load_observed",
+            ))
+            .is_err(),
+            "legacy before default is out of canonical order"
+        );
+        assert!(
+            check_request_evidence(&section(
+                json!([]),
+                json!([load_default.clone(), load_default.clone()]),
+                "load_observed",
+            ))
+            .is_err(),
+            "duplicate load names rejected"
+        );
+        // GATE: remainder reconciles against api_activity (invented
+        // remainders rejected; exact matches accepted).
+        let activity = json!([
+            {"api": 20, "entries": 2},
+            {"api": 21, "entries": 3},
+        ]);
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 4}}),
+                activity.clone(),
+            ))
+            .is_err(),
+            "invented remainder (4 != 2+3) rejected"
+        );
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 5}}),
+                activity,
+            ))
+            .is_ok(),
+            "exact remainder accepted"
+        );
+        // GATE: Unknown with positive entries rejected (positives are
+        // preserved, never demoted to Unknown).
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!("unknown"),
+                json!([{"api": 20, "entries": 1}]),
+            ))
+            .is_err()
+        );
+        // GATE-OPEN + PINS/NEW-12 fix4: an observed zero needs a
+        // serialized successful-read receipt behind it — empty or
+        // entirely-unreceipted activity rejects; one receipted row
+        // accepts. The attachment bit alone receipts NOTHING (a
+        // failed read keeps it but carries no receipt).
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 0}}),
+                json!([]),
+            ))
+            .is_err(),
+            "observed zero with empty activity rejected"
+        );
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 0}}),
+                json!([
+                    {"api": 20, "entries": 0, "gaps": {"not_attached": true, "read_receipt": false}},
+                    {"api": 35, "entries": 0, "gaps": {"not_attached": true, "read_receipt": false}},
+                ]),
+            ))
+            .is_err(),
+            "observed zero with entirely-unavailable activity rejected"
+        );
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 0}}),
+                json!([
+                    {"api": 20, "entries": 0, "gaps": {"not_attached": false, "read_receipt": false}},
+                    {"api": 35, "entries": 0, "gaps": {"not_attached": true, "read_receipt": false}},
+                ]),
+            ))
+            .is_err(),
+            "observed zero with attached-but-unreceipted rows rejected (attachment alone receipts nothing)"
+        );
+        assert!(
+            check_request_evidence(&section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 0}}),
+                json!([
+                    {"api": 20, "entries": 0, "gaps": {"not_attached": false, "read_receipt": true}},
+                    {"api": 35, "entries": 0, "gaps": {"not_attached": true, "read_receipt": false}},
+                ]),
+            ))
+            .is_ok(),
+            "observed zero with one receipted row accepted (armed idle)"
+        );
+        // NEW-9 fix4: the published silence interval binds inside
+        // the document's effective window — a silence claim
+        // outside the capture window (or without one) is
+        // incoherent, and an inverted interval never parses.
+        let windowed = |start: u64, end: u64| {
+            let mut doc = section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 0}}),
+                json!([
+                    {"api": 20, "entries": 0, "gaps": {"not_attached": false, "read_receipt": true}},
+                ]),
+            );
+            doc.insert(
+                "window".to_string(),
+                json!({"effective_start_ns": 100, "effective_end_ns": 200}),
+            );
+            doc["request_evidence"]["silence_window"] = json!({"start_ns": start, "end_ns": end});
+            doc
+        };
+        assert!(
+            check_request_evidence(&windowed(150, 200)).is_ok(),
+            "silence inside the effective window accepted"
+        );
+        assert!(
+            check_request_evidence(&windowed(50, 200)).is_err(),
+            "silence starting before the capture window rejected"
+        );
+        assert!(
+            check_request_evidence(&windowed(150, 250)).is_err(),
+            "silence ending past the capture window rejected"
+        );
+        assert!(
+            check_request_evidence(&windowed(200, 150)).is_err(),
+            "inverted silence interval rejected"
+        );
+        let mut nowrap = windowed(150, 200);
+        nowrap.remove("window");
+        assert!(
+            check_request_evidence(&nowrap).is_err(),
+            "a silence claim without a capture window rejected (fail closed)"
+        );
+        // GATE-OPEN + NEW-9-OPEN + NEW-16 fix5: zero claims with an
+        // ABSENT or EMPTY silence interval are rejected (the full
+        // gate used to accept them) — both the observed-zero
+        // remainder and covered-but-absent surfaces — while
+        // positive-only evidence without an interval stays valid.
+        let unbacked_zero = || {
+            let mut doc = section_full(
+                json!([]),
+                json!([]),
+                "unknown",
+                coverage_all(),
+                json!([]),
+                json!([]),
+                json!({"observed": {"ops": 0}}),
+                json!([
+                    {"api": 20, "entries": 0, "gaps": {"not_attached": false, "read_receipt": true}},
+                ]),
+            );
+            doc["request_evidence"]
+                .as_object_mut()
+                .unwrap()
+                .remove("silence_window");
+            doc
+        };
+        assert!(
+            check_request_evidence(&unbacked_zero()).is_err(),
+            "an observed zero without a silence interval rejected (receipted rows or not)"
+        );
+        let mut unbacked_surface = section(json!([]), json!([]), "unknown");
+        unbacked_surface["request_evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("silence_window");
+        assert!(
+            check_request_evidence(&unbacked_surface).is_err(),
+            "covered-but-absent surfaces without a silence interval rejected"
+        );
+        assert!(
+            check_request_evidence(&windowed(150, 150)).is_err(),
+            "an empty silence interval rejected (certifies nothing)"
+        );
+        // Positive-only evidence without an interval: valid (batch
+        // shape — one edged surface, positive remainder, no zeros).
+        let mut edged_only = coverage_all();
+        for (index, row) in edged_only.as_array_mut().unwrap().iter_mut().enumerate() {
+            row["observed"] = json!(index == 9);
+        }
+        let mut positive_only = section_full(
+            json!([fetch76]),
+            json!([]),
+            "unknown",
+            edged_only,
+            json!([]),
+            json!([]),
+            json!({"observed": {"ops": 5}}),
+            json!([{"api": 20, "entries": 5}]),
+        );
+        positive_only["request_evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("silence_window");
+        assert!(
+            check_request_evidence(&positive_only).is_ok(),
+            "positive-only evidence without an interval stays valid"
+        );
+        // GATE: the v2.8 producer trigger pins both directions at
+        // minor 8 exactly — v2.8 without the section is rejected
+        // (nothing else stamps 8; NEW-4 narrows the reverse leg to 8).
+        let bare28 = json!({
+            "schema_version": "observed-crypto-v2.8",
+            "api_activity": [],
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(check_request_evidence(&bare28).is_err());
+        // NEW-4: the reverse trigger applies to the CURRENT v2.8
+        // stamp only — a later minor emitted for an unrelated
+        // optional feature validates WITHOUT this section, and a
+        // later minor carrying the section still validates it
+        // (valid accepts, invalid rejects — never skipped).
+        let bare29 = json!({
+            "schema_version": "observed-crypto-v2.9",
+            "api_activity": [],
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(
+            check_request_evidence(&bare29).is_ok(),
+            "v2.9 without the section validates (reverse trigger is v2.8-only)"
+        );
+        let mut with29 = section(json!([]), json!([]), "unknown");
+        with29.insert("schema_version".to_string(), json!("observed-crypto-v2.9"));
+        assert!(
+            check_request_evidence(&with29).is_ok(),
+            "v2.9 with a valid section validates"
+        );
+        let mut bad29 = section_full(
+            json!([]),
+            json!([load_default]),
+            "unknown",
+            coverage_all(),
+            json!([]),
+            json!([]),
+            json!("unknown"),
+            json!([]),
+        );
+        bad29.insert("schema_version".to_string(), json!("observed-crypto-v2.9"));
+        assert!(
+            check_request_evidence(&bad29).is_err(),
+            "v2.9 with an invalid section still rejects (unknown despite default success)"
+        );
+        // NEW-27 fix7: the published schema requires an OBJECT when
+        // `silence_window` is present — the document gate rejects a
+        // positional `[start, end]` array and an explicit `null`
+        // (where omission is legal) alongside the valid omission +
+        // object cases (shared decode with the typed reader).
+        let mut omitted = section(json!([]), json!([]), "unknown");
+        // Omission is legal only with no zero claim: all coverage
+        // unobserved, unknown remainder, no rows.
+        let mut dark = coverage_all();
+        for row in dark.as_array_mut().unwrap().iter_mut() {
+            row["observed"] = json!(false);
+        }
+        omitted["request_evidence"]["fetch_coverage"] = dark;
+        omitted["request_evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("silence_window");
+        assert!(
+            check_request_evidence(&omitted).is_ok(),
+            "omission with no zero claim stays valid"
+        );
+        let mut nulled = omitted.clone();
+        nulled["request_evidence"]["silence_window"] = json!(null);
+        assert!(
+            check_request_evidence(&nulled).is_err(),
+            "the document gate must reject an explicit null silence_window"
+        );
+        let mut arrayed = omitted.clone();
+        arrayed["request_evidence"]["silence_window"] = json!([100, 200]);
+        assert!(
+            check_request_evidence(&arrayed).is_err(),
+            "the document gate must reject a positional silence_window array"
+        );
+        assert!(
+            check_request_evidence(&section(json!([]), json!([]), "unknown")).is_ok(),
+            "the object shape stays valid"
+        );
+    }
+
+    #[test]
+    fn trace_summary_gate_pins_trigger_and_coherence() {
+        // Phase 2 (v2.9): a real producer fold summarizes, stamps,
+        // and passes; version/mode/conservation/bucket/binding
+        // mutations and both trigger directions fail.
+        use crate::provider_observation::trace as t;
+        use serde_json::json;
+        let mut p = t::TraceProducer::new();
+        p.set_mode(t::TRACE_MODE_LATENCY);
+        let k = t::PairKey {
+            pid: 1,
+            tid: 2,
+            generation: 1,
+            cookie: 9,
+            invocation: 1,
+        };
+        p.attempt(t::AttemptEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1000,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        p.result(t::ResultEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1500,
+            outcome: 1,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        let window = p.close_window(0, 9000, [0; 8]);
+        let totals = p.totals();
+        let summary = t::summarize(&window, &totals, "latency", None);
+        summary.validate().expect("real fold validates");
+        let root = |version: &str, section: serde_json::Value| {
+            let mut map = serde_json::Map::new();
+            map.insert("schema_version".to_string(), json!(version));
+            if !section.is_null() {
+                map.insert("trace_summary".to_string(), section);
+            }
+            map
+        };
+        let good = serde_json::to_value(&summary).unwrap();
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", good.clone())).is_ok());
+        // Later minors validate it when present, skip when absent.
+        assert!(check_trace_summary(&root("observed-crypto-v2.10", good.clone())).is_ok());
+        assert!(check_trace_summary(&root("observed-crypto-v2.10", json!(null))).is_ok());
+        assert!(check_trace_summary(&root("observed-crypto-v2.8", json!(null))).is_ok());
+        // Trigger directions.
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", json!(null))).is_err());
+        assert!(check_trace_summary(&root("observed-crypto-v2.8", good.clone())).is_err());
+        // Coherence mutations (each fails on its cited defect).
+        let mut bad = good.clone();
+        bad["version"] = json!(2);
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        let mut bad = good.clone();
+        bad["mode"] = json!("turbo");
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        let mut bad = good.clone();
+        bad["window"]["class_window"]["success"] = json!(99);
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        let mut bad = good.clone();
+        bad["histograms"]["success"]["buckets"][18] = json!(99);
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        let mut bad = good.clone();
+        bad["histograms"] = json!(null);
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        // Status mode carries no histograms.
+        let status = t::summarize(&window, &totals, "status", None);
+        assert!(status.histograms.is_none());
+        let status_v = serde_json::to_value(&status).unwrap();
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", status_v.clone())).is_ok());
+        let mut bad = status_v;
+        bad["histograms"] = good["histograms"].clone();
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        // Off/metadata ride fallback only.
+        let mut bad = good.clone();
+        bad["mode"] = json!("off");
+        bad["fallback"] = json!(false);
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+        // Uncertain epochs withhold (same rule as the typed gate):
+        // a latency summary with withheld classes/distributions
+        // passes; a mismatched one fails.
+        p.reject_unknown();
+        let wu = p.close_window(1, 9900, [0; 8]);
+        let tu = p.totals();
+        let withheld = t::summarize(&wu, &tu, "latency", None);
+        assert!(withheld.pairing_uncertain);
+        let withheld_v = serde_json::to_value(&withheld).unwrap();
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", withheld_v.clone())).is_ok());
+        let mut bad = withheld_v;
+        bad["class_epoch"] = good["class_epoch"].clone();
+        assert!(check_trace_summary(&root("observed-crypto-v2.9", bad)).is_err());
+    }
+
+    #[test]
+    fn new4_duplicate_diagnostics_name_path_not_key() {
+        // P2fix4 NEW-4: duplicate-field rejections name the
+        // containing PATH, never the rejected key text (a canary
+        // key must not echo into diagnostics).
+        let err =
+            check_envelope_raw_duplicates(r#"{"CANARY_K3Y_N0ECHO": 1, "CANARY_K3Y_N0ECHO": 2}"#)
+                .expect_err("duplicated canary key must reject");
+        assert!(err.contains("duplicate field"), "{err}");
+        assert!(
+            !err.contains("CANARY_K3Y_N0ECHO"),
+            "key must not echo: {err}"
+        );
+        let err = check_trace_summary_raw_duplicates(
+            r#"{"trace_summary": {"CANARY_K3Y_N0ECHO": 1, "CANARY_K3Y_N0ECHO": 2}}"#,
+        )
+        .expect_err("duplicated section key must reject");
+        assert!(err.contains("duplicate field"), "{err}");
+        assert!(
+            !err.contains("CANARY_K3Y_N0ECHO"),
+            "key must not echo: {err}"
+        );
+    }
+
+    #[test]
+    fn new25_duplicate_diagnostics_echo_no_ancestor_keys() {
+        // P2fix5 NEW-25: duplicate diagnostics use FIXED field
+        // identifiers (caller roots) + STRUCTURAL positions — raw
+        // ancestor keys never echo (pre-fix: the walked path joins
+        // raw input keys, so a canary in any ANCESTOR position
+        // echoes; the fix4 pin only covered the duplicate key
+        // itself).
+        for (what, text, check) in [
+            (
+                "envelope",
+                r#"{"CANARY_ANCESTOR_N0ECHO": {"x": 1, "x": 2}}"#,
+                check_envelope_raw_duplicates as fn(&str) -> Result<(), String>,
+            ),
+            (
+                "trace",
+                r#"{"trace_summary": {"CANARY_ANCESTOR_N0ECHO": {"x": 1, "x": 2}}}"#,
+                check_trace_summary_raw_duplicates as fn(&str) -> Result<(), String>,
+            ),
+            (
+                "request-evidence",
+                r#"{"request_evidence": {"CANARY_ANCESTOR_N0ECHO": {"x": 1, "x": 2}}}"#,
+                check_request_evidence_raw_duplicates as fn(&str) -> Result<(), String>,
+            ),
+            (
+                "api-activity",
+                r#"{"api_activity": [{"CANARY_ANCESTOR_N0ECHO": {"x": 1, "x": 2}}]}"#,
+                check_api_activity_raw_duplicates as fn(&str) -> Result<(), String>,
+            ),
+            (
+                "otlp",
+                r#"{"CANARY_ANCESTOR_N0ECHO": {"x": 1, "x": 2}}"#,
+                check_otlp_response_raw_duplicates as fn(&str) -> Result<(), String>,
+            ),
+            (
+                "array-nesting",
+                r#"{"arr": [{"CANARY_ANCESTOR_N0ECHO": {"x": 1, "x": 2}}]}"#,
+                check_envelope_raw_duplicates as fn(&str) -> Result<(), String>,
+            ),
+        ] {
+            let err = check(text).expect_err(&format!("{what}: nested dup must reject"));
+            assert!(err.contains("duplicate field"), "{what}: {err}");
+            assert!(
+                !err.contains("CANARY_ANCESTOR_N0ECHO"),
+                "{what}: ancestor key must not echo: {err}"
+            );
+            assert!(
+                !err.contains("\"x\""),
+                "{what}: dup key must not echo: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn trace_summary_raw_duplicates_reject() {
+        // P2fix1 item 23: duplicate keys under `trace_summary`
+        // (notably a doubled by_api identity) reject on the RAW
+        // text — the collapsed `Value` path is blind (last-wins).
+        // Both text shapes covered: document text + envelope bytes.
+        let text = r#"{"trace_summary":{"version":1,"mode":"latency","fallback":false,"by_api":{"20":{"success":{"buckets":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"sum":5,"count":1}}},"window":{"window_seq":0,"mode":"latency","fallback":false,"paired":0,"trace_unpaired_entries":0,"trace_unpaired_results":0,"trace_depth_exceeded":0,"trace_dropped":0,"trace_capped":false,"trace_nonmonotonic_pairs":0,"trace_rejected_unknown_api":0,"ring_loss":[0,0,0,0,0,0,0,0],"class_window":null,"pairing_uncertain":true,"pairing_uncertainty":["decode-reject"],"unmeasured_seqs":[],"gaps":[],"gap_overflow":0,"exemplars":[]},"pairing_uncertain":true,"class_epoch":null}}"#;
+        assert_eq!(check_trace_summary_raw_duplicates(text), Ok(()));
+        // Doubled by_api identity convicts.
+        let at = text.find(r#""20":{"#).unwrap();
+        let mut dup2 = text.to_string();
+        dup2.insert_str(
+            at,
+            r#""20":{"success":{"buckets":[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1],"sum":5,"count":1}},"#,
+        );
+        let err = check_trace_summary_raw_duplicates(&dup2)
+            .expect_err("a doubled by_api key must not pass");
+        assert!(err.contains("duplicate field"), "{err}");
+        assert!(!err.contains("`20`"), "key must not echo: {err}");
+        // The collapsed Value path is blind (premise of the check).
+        let collapsed: serde_json::Value = serde_json::from_str(&dup2).unwrap();
+        assert!(collapsed["trace_summary"]["by_api"]["20"].is_object());
+        // Envelope shape (document.trace_summary) convicts too.
+        let env = format!(r#"{{"seq":0,"generation":1,"document":{text}}}"#);
+        assert_eq!(check_trace_summary_raw_duplicates(&env), Ok(()));
+        let env_dup = env.replacen(
+            r#""20":{"#,
+            r#""20":{"success":{"buckets":[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0],"sum":0,"count":0}},"20":{"#,
+            1,
+        );
+        let err =
+            check_trace_summary_raw_duplicates(&env_dup).expect_err("envelope dup must not pass");
+        assert!(err.contains("duplicate field"), "{err}");
+        assert!(!err.contains("`20`"), "key must not echo: {err}");
+        // A repeated SECTION member rejects (it conceals the
+        // checked one under last-wins).
+        let mut outside = text.to_string();
+        let end = outside.rfind('}').unwrap();
+        outside.insert_str(end, r#","trace_summary":{"version":1}"#);
+        assert!(check_trace_summary_raw_duplicates(&outside).is_err());
+        // Duplicates OUTSIDE the section keep last-wins.
+        let clean = r#"{"a":1,"a":2,"trace_summary":{"version":1}}"#;
+        assert_eq!(check_trace_summary_raw_duplicates(clean), Ok(()));
+    }
+
+    #[test]
+    fn api_activity_raw_duplicates_reject() {
+        // P2fix7 NEW-42: duplicate keys under `api_activity` (a
+        // doubled row member, a doubled nested gaps member)
+        // reject on the RAW text — the collapsed `Value` path is
+        // blind (last-wins). Both text shapes covered: document
+        // text + envelope bytes.
+        let text = r#"{"api_activity":[{"api":20,"entries":1,"gaps":{"map":0,"depth":0}}]}"#;
+        assert_eq!(check_api_activity_raw_duplicates(text), Ok(()));
+        // Doubled row member convicts.
+        let rowdup = text.replacen(r#"{"api":20,"#, r#"{"api":99,"api":20,"#, 1);
+        let err = check_api_activity_raw_duplicates(&rowdup)
+            .expect_err("a doubled row member must not pass");
+        assert!(err.contains("duplicate field"), "{err}");
+        // Doubled nested gaps member convicts.
+        let gapsdup = text.replacen(r#"{"map":0,"#, r#"{"map":7,"map":0,"#, 1);
+        let err = check_api_activity_raw_duplicates(&gapsdup)
+            .expect_err("a doubled gaps member must not pass");
+        assert!(err.contains("duplicate field"), "{err}");
+        // The collapsed Value path is blind (premise of the check).
+        let collapsed: serde_json::Value = serde_json::from_str(&rowdup).unwrap();
+        assert_eq!(collapsed["api_activity"][0]["api"], serde_json::json!(20));
+        // Envelope shape (document.api_activity) convicts too.
+        let env = format!(r#"{{"seq":0,"generation":1,"document":{text}}}"#);
+        assert_eq!(check_api_activity_raw_duplicates(&env), Ok(()));
+        let env_dup = env.replacen(r#"{"api":20,"#, r#"{"api":99,"api":20,"#, 1);
+        let err =
+            check_api_activity_raw_duplicates(&env_dup).expect_err("envelope dup must not pass");
+        assert!(err.contains("duplicate field"), "{err}");
+        // A repeated SECTION member rejects (it conceals the
+        // checked one under last-wins).
+        let mut outside = text.to_string();
+        let end = outside.rfind('}').unwrap();
+        outside.insert_str(end, r#","api_activity":[]"#);
+        assert!(check_api_activity_raw_duplicates(&outside).is_err());
+        // Duplicates OUTSIDE the section keep last-wins.
+        let clean = r#"{"a":1,"a":2,"api_activity":[{"api":20}]}"#;
+        assert_eq!(check_api_activity_raw_duplicates(clean), Ok(()));
+    }
+
+    // NEW-33 fix9 pin (host, raw document intake): the document gate
+    // receives a `Value` AFTER duplicate keys have collapsed, so raw
+    // duplicates in `request_evidence` (notably a doubled
+    // `start_ns`/`end_ns`) are invisible to it. The raw-text intake
+    // validates the RAW section before normalization and rejects
+    // duplicates with duplicate-field errors for BOTH keys — using
+    // otherwise-valid replacements (the same values), so only
+    // duplicate detection can convict. Duplicates OUTSIDE the
+    // section keep last-wins (out of scope).
+    #[test]
+    fn raw_intake_rejects_duplicate_section_keys_before_normalization() {
+        use crate::provider_observation::request_evidence::{
+            FETCH_SURFACES, RequestEvidence, RequestScope,
+        };
+        // A fully valid v2.8 document WITH a published silence
+        // interval (windowed fold + matching activity sum).
+        let evidence = RequestEvidence::fold(
+            &[],
+            RequestScope {
+                operational_entries: Some(7),
+                fetch_armed: FETCH_SURFACES.iter().map(|s| s.id).collect(),
+                window: Some((100, 200)),
+                silence_start: Some(150),
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        let silence = evidence.silence_window.expect("the fold publishes");
+        assert_eq!((silence.start_ns, silence.end_ns), (150, 200));
+        let mut doc = crate::capture::empty_document();
+        doc.window.requested_start_ns = 100;
+        doc.window.requested_end_ns = 200;
+        doc.window.effective_start_ns = 100;
+        doc.window.effective_end_ns = 200;
+        doc.api_activity = crate::api_activity::merge(vec![crate::api_activity::ApiActivityRow {
+            api: crate::api_activity::ApiId::try_from(20).unwrap(),
+            entries: 7,
+            observed_success: 7,
+            observed_failure: 0,
+            verification_mismatch: 0,
+            unsupported: 0,
+            gaps: crate::api_activity::ApiActivityGaps::default(),
+        }])
+        .expect("rows merge");
+        crate::evidence::stamp_request_evidence(&mut doc, evidence.clone());
+        let rendered = crate::report::render_json(&doc).expect("render");
+        let valid = std::str::from_utf8(&rendered).expect("utf8").to_owned();
+        assert_eq!(
+            check_v2_document_text(&valid),
+            Ok(()),
+            "premise: the valid document clears the full raw intake"
+        );
+        // Splice duplicates into the flat silence object (the
+        // render is pretty-printed; the first `}` after its start
+        // still closes it) — otherwise-valid values (the same
+        // start/end), so a collapsed read stays valid and ONLY
+        // duplicate detection rejects.
+        let key = "\"silence_window\": {";
+        let at = valid
+            .find(key)
+            .expect("premise: the rendered doc carries its silence object")
+            + key.len();
+        let rel = valid[at..]
+            .find('}')
+            .expect("premise: the flat silence object closes");
+        let mut dup_start = valid.clone();
+        dup_start.insert_str(at + rel, ",\"start_ns\":150");
+        let mut dup_end = valid.clone();
+        dup_end.insert_str(at + rel, ",\"end_ns\":200");
+        // The finding's premise: the collapsed `Value` path is blind
+        // (last-wins yields the valid document — both gates accept).
+        for (name, dup) in [("start", dup_start.clone()), ("end", dup_end.clone())] {
+            let collapsed: serde_json::Value =
+                serde_json::from_str(&dup).expect("the dup text parses to a Value");
+            assert!(
+                validate_v2(&collapsed).is_ok() && check_v2_semantics(&collapsed).is_ok(),
+                "premise: the Value gate accepts the collapsed {name}-dup document"
+            );
+        }
+        // The raw scan convicts BOTH keys with duplicate-field errors.
+        let err = check_request_evidence_raw_duplicates(&dup_start)
+            .expect_err("a duplicated start_ns must not pass the raw section check");
+        assert!(
+            err.contains("duplicate field"),
+            "the start error is a duplicate-field error: {err}"
+        );
+        assert!(!err.contains("start_ns"), "key must not echo: {err}");
+        let err = check_request_evidence_raw_duplicates(&dup_end)
+            .expect_err("a duplicated end_ns must not pass the raw section check");
+        assert!(
+            err.contains("duplicate field"),
+            "the end error is a duplicate-field error: {err}"
+        );
+        assert!(!err.contains("end_ns"), "key must not echo: {err}");
+        // A nested in-section duplicate convicts the same way.
+        let ops_at = valid
+            .find("\"ops\": 7")
+            .expect("premise: the remainder renders its ops");
+        let mut dup_ops = valid.clone();
+        dup_ops.insert_str(ops_at + "\"ops\": 7".len(), ",\"ops\":7");
+        let err = check_request_evidence_raw_duplicates(&dup_ops)
+            .expect_err("a nested in-section duplicate must not pass");
+        assert!(
+            err.contains("duplicate field"),
+            "the nested error is a duplicate-field error: {err}"
+        );
+        assert!(!err.contains("`ops`"), "key must not echo: {err}");
+        // Scope control: a duplicate OUTSIDE the section keeps
+        // last-wins (the raw check ignores it).
+        let root_end = valid.rfind('}').expect("premise: the doc closes");
+        let mut outside = valid.clone();
+        outside.insert_str(root_end, ",\"schema_version\":\"observed-crypto-v2.8\"");
+        assert_eq!(
+            check_request_evidence_raw_duplicates(&outside),
+            Ok(()),
+            "a duplicate outside the section is out of scope"
+        );
+        // The full intake rejects the raw dups before normalization.
+        for (name, dup) in [("start", dup_start), ("end", dup_end)] {
+            let err = check_v2_document_text(&dup)
+                .expect_err("the full intake must reject the raw {name}-dup document");
+            assert!(
+                err.contains("duplicate field"),
+                "the intake {name} error is a duplicate-field error: {err}"
+            );
+            assert!(
+                !err.contains(&format!("`{name}_ns`")),
+                "key must not echo: {err}"
+            );
+        }
+        // NEW-33-OPEN fix10: a REPEATED top-level section is
+        // rejected before normalization — the raw scan used to
+        // walk only the FIRST member while `Value` parsing
+        // last-wins, so a duplicate-bearing second member replaced
+        // the checked one and concealed its nested duplicates.
+        // Splice a second top-level `request_evidence` member
+        // (clean, and duplicate-bearing) after the first.
+        let section = serde_json::to_string(&evidence).expect("section serializes");
+        let skey = "\"silence_window\":{";
+        let sat = section
+            .find(skey)
+            .expect("premise: the section carries its silence object")
+            + skey.len();
+        let srel = section[sat..]
+            .find('}')
+            .expect("premise: the flat silence object closes");
+        let mut section_dup = section.clone();
+        section_dup.insert_str(sat + srel, ",\"start_ns\":150");
+        let root_end = valid.rfind('}').expect("premise: the doc closes");
+        for (name, second) in [
+            ("clean-second", section.clone()),
+            ("dup-second", section_dup.clone()),
+        ] {
+            let mut two = valid.clone();
+            two.insert_str(root_end, &format!(",\"request_evidence\":{second}"));
+            // The finding's premise: the collapsed `Value` path is
+            // blind (last-wins yields a valid document — both gates
+            // accept, the second member's nested dup concealed).
+            let collapsed: serde_json::Value =
+                serde_json::from_str(&two).expect("the two-section text parses to a Value");
+            assert!(
+                validate_v2(&collapsed).is_ok() && check_v2_semantics(&collapsed).is_ok(),
+                "premise: the Value gate accepts the collapsed {name} document"
+            );
+            let err = check_request_evidence_raw_duplicates(&two)
+                .expect_err("a repeated top-level section must not pass the raw check");
+            assert!(
+                err.contains("duplicate field `request_evidence`"),
+                "the raw {name} error names the repeated section: {err}"
+            );
+            let err = check_v2_document_text(&two)
+                .expect_err("the full intake must reject the repeated-section document");
+            assert!(
+                err.contains("duplicate field `request_evidence`"),
+                "the intake {name} error names the repeated section: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn compat_matrix_v2() {
         assert!(check_version_v2("observed-crypto-v2.0"));
         assert!(check_version_v2("observed-crypto-v2.9"));
@@ -2054,6 +3619,35 @@ mod tests {
         assert!(
             check_inline(&schema, &json!(1)).is_err(),
             "unknown type fails"
+        );
+    }
+
+    #[test]
+    fn validator_pattern_single_shipped_shape() {
+        // P2fix6 NEW-37: `pattern` evaluates the single shipped
+        // shape (canonical lowercase 16-hex) by its exact manual
+        // equivalent — lowercase accepts, uppercase/short/long/
+        // non-hex reject — and any other pattern fails closed
+        // (no regex engine ships).
+        use serde_json::json;
+        let schema = json!({"type": "string", "pattern": "^[0-9a-f]{16}$"});
+        assert!(check_inline(&schema, &json!("814dd7b9784d57c1")).is_ok());
+        for bad in [
+            "814DD7B9784D57C1",
+            "814dd7b9784d57c",
+            "814dd7b9784d57c12",
+            "814dd7b9784d57c!",
+            "",
+        ] {
+            assert!(
+                check_inline(&schema, &json!(bad)).is_err(),
+                "{bad:?} must not match"
+            );
+        }
+        let other = json!({"type": "string", "pattern": "^a+$"});
+        assert!(
+            check_inline(&other, &json!("aaa")).is_err(),
+            "an unevaluatable pattern fails closed"
         );
     }
 
@@ -3062,6 +4656,10 @@ fn check_dynamic_sections(root: &serde_json::Map<String, serde_json::Value>) -> 
         let api = u32::from(row.api);
         if !apis.insert(api)
             || row.gaps.not_attached && (row.entries != 0 || paired != 0)
+            // PINS fix4: an unattached row can carry no read
+            // receipt (nothing was admitted to read) — the
+            // producer never emits this combination.
+            || row.gaps.not_attached && row.gaps.read_receipt
             || paired > row.entries
             || row.gaps.tail != row.entries - paired
             || failure_subsets > row.observed_failure

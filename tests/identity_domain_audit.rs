@@ -1826,6 +1826,34 @@ fn h5_t3_every_device_site_names_one_domain() {
             ".map(|m| (m.dev(), m.ino()) == id)",
             1,
         ),
+        // P2fix6 NEW-34 checkpoint-parent anchoring: native fstat
+        // (dev, ino) bound at open, re-statted at every write,
+        // and re-verified on the opened dir fd — raw-vs-raw
+        // native identity only, never joined to maps text,
+        // encoded evidence devices, or display values.
+        // [p2fix7 NEW-44: open-first validation — the write-time
+        // re-stat + fd-verify sites move into
+        // `validate_opened_parent` (current-occupant stat vs the
+        // opened fd's own identity, bound on match); still
+        // raw-vs-raw native identity, same single domain.]
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "Some((md.dev(), md.ino()))",
+            1,
+        ),
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "Ok((opened.dev(), opened.ino()))",
+            1,
+        ),
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "if (current.dev(), current.ino()) != (opened.dev(), opened.ino()) {",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

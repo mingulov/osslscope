@@ -2464,6 +2464,10 @@ pub const FETCH: &[FetchDef] = &[
         name: "OSSL_ENCODER_fetch",
         since: (3, 0),
     },
+    FetchDef {
+        name: "OSSL_STORE_LOADER_fetch",
+        since: (3, 0),
+    },
 ];
 
 pub const SKEY: &[SkeyDef] = &[
@@ -6997,7 +7001,14 @@ mod tests {
 
     #[test]
     fn fetch_and_skey_shaped() {
-        assert_eq!(FETCH.len(), 13);
+        // Phase 1: all 14 fetch exports (11 EVP incl. SKEYMGMT @
+        // 3.5 + ENCODER/DECODER/STORE_LOADER).
+        assert_eq!(FETCH.len(), 14);
+        assert!(
+            FETCH
+                .iter()
+                .any(|f| f.name == "OSSL_STORE_LOADER_fetch" && f.since == (3, 0))
+        );
         assert!(
             FETCH
                 .iter()

@@ -1255,3 +1255,57 @@ fn v060_inspect_module_denied_file_fires_privilege_hint_with_errno() {
         "human hint fires exactly once: {herr}"
     );
 }
+
+#[test]
+fn report_check_by_api_flag_parses_through_the_binary() {
+    // P2fix2 item 13 (codex NEW-P2d): EXECUTABLE parser controls —
+    // the one-token `--trace-histogram-by-api` flag must not swallow
+    // the next arg through the REAL report/check binaries (flags
+    // before AND after options). A bogus pid runs past parsing to a
+    // scope-unavailable doc (exit 4 + JSON — proving `--format json`
+    // survived); a genuinely bad flag exits 2 (negative control).
+    let bin = env!("CARGO_BIN_EXE_osslscope");
+    for command in ["report", "check"] {
+        let base: Vec<&str> = if command == "check" {
+            vec!["--deny-weak"]
+        } else {
+            vec![]
+        };
+        for position in ["after", "before"] {
+            let mut args = vec![command];
+            args.extend(base.clone());
+            if position == "before" {
+                args.extend(["--trace-histogram-by-api", "--trace", "latency"]);
+            }
+            args.extend(["--pid", "99999991"]);
+            if position == "after" {
+                args.extend(["--trace", "latency", "--trace-histogram-by-api"]);
+            }
+            args.extend(["--format", "json"]);
+            let out = std::process::Command::new(bin)
+                .args(&args)
+                .output()
+                .unwrap();
+            assert_eq!(
+                out.status.code(),
+                Some(4),
+                "{command} {position}: parsed past flags, got {}: {}",
+                out.status.code().unwrap_or(999),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let doc: serde_json::Value =
+                serde_json::from_slice(&out.stdout).expect("json doc survives");
+            assert!(
+                doc.get("completeness").is_some(),
+                "{command} {position}: doc shape"
+            );
+        }
+        // Negative control: a bad flag still exits 2 (the pins above
+        // prove parsing, not just leniency).
+        let out = std::process::Command::new(bin)
+            .args([command, "--bogus-flag-9f2"])
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(2), "{command} negative control");
+    }
+}

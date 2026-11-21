@@ -101,9 +101,11 @@ violation document with one added unknown key. These source/fixture
 controls are distinct from a new live run.
 
 Compatibility is deliberate: producers emit `observed-crypto-v2.4`
-through `observed-crypto-v2.7` (`src/evidence.rs` is the emitter
+through `observed-crypto-v2.9` (`src/evidence.rs` is the emitter
 of record: v2.5 for certified execution attribution, v2.6 for a
-sampled sysctl context, v2.7 for owned-corpse retirement),
+sampled sysctl context, v2.7 for owned-corpse retirement, v2.8
+for request/fetch/load/query evidence, v2.9 for a sealed 6D
+trace fold),
 readers accept `observed-crypto-v2` and
 `observed-crypto-v2.<digits>` and reject every other major, and
 minor versions add OPTIONAL keys only. A v2.0 validator fails

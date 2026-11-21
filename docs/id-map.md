@@ -474,6 +474,7 @@ regenerate_id_map`, review the diff, then commit.
 | EVP_SKEYMGMT_fetch | 3.5 |
 | OSSL_DECODER_fetch | 3.0 |
 | OSSL_ENCODER_fetch | 3.0 |
+| OSSL_STORE_LOADER_fetch | 3.0 |
 
 ## SKEY entry points (`EVP_SKEY_*`, absent in 3.0)
 

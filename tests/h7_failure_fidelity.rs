@@ -1077,6 +1077,8 @@ mod g1_host {
             provider_enrollment: None,
             resolved_provider: None,
             image_digest: String::new(),
+            trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+            trace_by_api: false,
         };
         let info = TargetInfo {
             pid: PID,

@@ -7205,6 +7205,8 @@ fn r19_installed_positive_traffic() {
         harvest_timeout: std::time::Duration::from_secs(30),
         grace: std::time::Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
     };
     let cap = osslscope::capture::run_with_dirs(
         &cfg,
@@ -7391,6 +7393,8 @@ fn r19_init_mode_degrades_harvest_only() {
         harvest_timeout: std::time::Duration::from_secs(30),
         grace: std::time::Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
     };
     let cap = osslscope::capture::run_with_dirs(
         &cfg,
@@ -7670,6 +7674,8 @@ int OSSL_provider_init(const OSSL_CORE_HANDLE *handle, const OSSL_DISPATCH *in,
         harvest_timeout: std::time::Duration::from_secs(30),
         grace: std::time::Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
     };
     // Point the child's module loader at our provider (restored
     // after — live legs run single-threaded (--test-threads=1),

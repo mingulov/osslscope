@@ -42,8 +42,24 @@ pub(crate) fn api(id: u32) -> Result<ObservationApi, ObservationGap> {
         20..=72 => ObservationApi::Operational(
             crate::api_activity::ApiId::try_from(id).map_err(|_| ObservationGap::InvalidWire)?,
         ),
+        // Phase 1 amendment P1-A1: the eight new fetch surfaces.
+        73 => ObservationApi::Inventoried(EvpAsymCipherFetch),
+        74 => ObservationApi::Inventoried(EvpKeyexchFetch),
+        75 => ObservationApi::Inventoried(EvpKeymgmtFetch),
+        76 => ObservationApi::Inventoried(EvpRandFetch),
+        77 => ObservationApi::Inventoried(EvpSkeymgmtFetch),
+        78 => ObservationApi::Inventoried(OsslDecoderFetch),
+        79 => ObservationApi::Inventoried(OsslEncoderFetch),
+        80 => ObservationApi::Inventoried(OsslStoreLoaderFetch),
         _ => return Err(ObservationGap::InvalidWire),
     })
+}
+
+/// Single-sourced attach enumeration (P1-A1): 1..=16
+/// (load/query/fetch/get0dispatch), 20..=72 (operational),
+/// 73..=80 (Phase 1 fetch extension).
+pub(crate) fn attach_ids() -> impl Iterator<Item = u32> {
+    (1..=16).chain(20..=72).chain(73..=80)
 }
 fn outcome(v: u32) -> Result<ApiOutcome, ObservationGap> {
     Ok(match v {
@@ -85,10 +101,11 @@ pub fn decode(bytes: &[u8]) -> Result<ProviderEvent, ObservationGap> {
     decode_record(read_record(bytes)?)
 }
 /// Decode-domain unknown-ID probe (§6D-1): true iff the envelope carries
-/// an ID in {0} ∪ {73+}. Counts `trace_rejected_unknown_api` on decode
+/// an ID in {0} ∪ {81+} (P1-A1: the boundary moved from 73 with the
+/// fetch extension). Counts `trace_rejected_unknown_api` on decode
 /// failure; decode itself is unchanged.
 pub fn rejected_unknown_api(bytes: &[u8]) -> bool {
-    matches!(read_record(bytes), Ok(r) if r.api == 0 || r.api >= 73)
+    matches!(read_record(bytes), Ok(r) if r.api == 0 || r.api > c::MAX_API)
 }
 fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
     let bad = ObservationGap::InvalidWire;
@@ -132,7 +149,7 @@ fn decode_record(r: c::Record) -> Result<ProviderEvent, ObservationGap> {
         return Err(bad);
     }
     let compatible = match r.kind {
-        c::ATTEMPT | c::RESULT => matches!(r.api, 1..=6|10..=15|20..=72),
+        c::ATTEMPT | c::RESULT => matches!(r.api, 1..=6|10..=15|20..=72|73..=80),
         c::INIT => {
             matches!(r.api, c::PROVIDER_INIT | c::GET_DISPATCH) && r.function != 1
                 || r.api == c::ADD_BUILTIN && r.function == 1
@@ -295,6 +312,43 @@ pub(crate) fn decode_transport(bytes: &[u8]) -> Result<Transport, ObservationGap
         Ok(Transport::End(r))
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::inventory::Api as InvApi;
+
+    #[test]
+    fn fetch_ids_73_to_80_decode_to_new_surfaces() {
+        // Phase 1 amendment P1-A1: stable ID allocation for the
+        // eight new fetch surfaces.
+        for (id, want) in [
+            (73, InvApi::EvpAsymCipherFetch),
+            (74, InvApi::EvpKeyexchFetch),
+            (75, InvApi::EvpKeymgmtFetch),
+            (76, InvApi::EvpRandFetch),
+            (77, InvApi::EvpSkeymgmtFetch),
+            (78, InvApi::OsslDecoderFetch),
+            (79, InvApi::OsslEncoderFetch),
+            (80, InvApi::OsslStoreLoaderFetch),
+        ] {
+            assert_eq!(api(id), Ok(ObservationApi::Inventoried(want)), "id {id}");
+        }
+    }
+
+    #[test]
+    fn attach_ids_cover_load_query_fetch_and_operational() {
+        // The attach enumeration is single-sourced here: 1..=16
+        // (load/query/fetch/get0dispatch), 20..=72 (operational),
+        // 73..=80 (Phase 1 fetch extension). Attachment AND
+        // acquisition eligibility consume this exact sequence
+        // (P1-A1 compat: one definition, no drift) — order pinned.
+        let ids: Vec<u32> = attach_ids().collect();
+        let expected: Vec<u32> = (1..=16).chain(20..=72).chain(73..=80).collect();
+        assert_eq!(ids, expected);
+        assert_eq!(ids.len(), 16 + 53 + 8);
+    }
+}
+
 pub(crate) fn algorithm_event(
     mut record: c::Record,
     algorithm: AlgorithmId,
@@ -370,8 +424,46 @@ pub(crate) fn activity(
             ]
             .contains(&u64::MAX),
             not_attached: false,
+            // PINS fix4, wording fix7 NEW-28: this row exists ONLY
+            // after a successful terminal read of an owner's map
+            // (the finalize loop's success arm is the sole
+            // production caller — admitted owners AND
+            // verified-positive unadmitted owners alike) — it
+            // carries the ROW read receipt (not the scope receipt).
+            read_receipt: true,
             attachment: true,
             finality: true,
         },
     })
+}
+/// Failed terminal count read (GATE fix3, PINS/NEW-12 fix4):
+/// the single constructor for the gap row `finalize_until` emits
+/// when an admitted owner's map read fails. The row carries the
+/// map gap and NO read receipt: a failed read is no observation
+/// evidence, so it must never receipt an observed zero. The
+/// attachment bit stays HONEST (PINS fix4): the owner WAS
+/// admitted (attached) — the READ failed, not the attach — so
+/// `not_attached` is false and the missing `read_receipt` is what
+/// withholds the zero. Producer invariant (pinned through the
+/// full validator; wording fix7 NEW-28): `read_receipt == true`
+/// on a terminal row means a successful read of an owner's map —
+/// admitted or verified-positive unadmitted (the ROW read
+/// receipt, not the admission-gated SCOPE receipt) — the
+/// serialized successful-read receipt the semantic gate counts
+/// behind any observed zero (see `activity`, the only
+/// receipt-minting terminal-row constructor). `None` when the
+/// numeric API has no row spelling (the terminal loop drops such
+/// owners).
+pub(crate) fn failed_activity(api: u32) -> Option<crate::api_activity::ApiActivityRow> {
+    let id = crate::api_activity::ApiId::try_from(api).ok()?;
+    let mut row = crate::api_activity::ApiActivityRow::unavailable(id);
+    // PINS fix4: restore the attachment bit (admitted ⟹
+    // attached) — the read outcome rides the receipt, never this.
+    row.gaps.not_attached = false;
+    debug_assert!(
+        !row.gaps.read_receipt,
+        "a failed read must never mint the read receipt"
+    );
+    row.gaps.map = 1;
+    Some(row)
 }

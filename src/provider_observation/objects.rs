@@ -53,6 +53,36 @@ const PARSER_STATE_BYTES: usize = MAX_HEADERS * std::mem::size_of::<Segment>()
 thread_local! {
     pub(super) static EXPIRE_ACQUIRE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static EXPIRE_CANDIDATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// NEW-21 fix6: arm a ONE-SHOT uncached parse failure — the next
+    /// `Object::parsed` attempt on this thread fails with
+    /// `BackingUnavailable` (the `try_clone` shape: uncached, no
+    /// deferred state) and disarms. Pins stage a transient
+    /// discovery refusal that heals on retry; production never
+    /// arms it (inert unless set). Pins must disarm after use (a
+    /// set-but-unfired hook would leak into a later test on the
+    /// shared thread).
+    pub(super) static FAIL_NEXT_PARSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// NEW-25 fix7: arm a ONE-SHOT transient revalidation failure
+    /// for one API's resolve — the next `resolve_api(api)` for the
+    /// staged api on this thread takes the revalidate-failure
+    /// early return (the `read_at` maps shape:
+    /// `ProcessUnavailable`, nothing resolved) and disarms. Pins
+    /// stage a transient discovery skip that heals on retry;
+    /// production never arms it (inert unless set). Pins must
+    /// disarm after use (a set-but-unfired hook would leak into a
+    /// later test on the shared thread).
+    pub(super) static FAIL_RESOLVE_API: std::cell::Cell<Option<ObservationApi>> = const { std::cell::Cell::new(None) };
+    /// NEW-21-OPEN fix7: arm a ONE-SHOT uncached parse failure for
+    /// one API's resolve — the FIRST exporter's parse during the
+    /// staged api's `resolve_api` fails with `BackingUnavailable`
+    /// (the `try_clone` shape: uncached, nothing cached, no
+    /// deferred state) and disarms; every other api resolves
+    /// normally. (The pass-wide `FAIL_NEXT_PARSE` always fires at
+    /// the first parse of the pass — id 1 — so the exact
+    /// one-armed-one-refused sibling shape on a fetch surface
+    /// needs this api-targeted twin.) Test-only, inert unless
+    /// armed; pins must disarm after use.
+    pub(super) static FAIL_PARSE_API: std::cell::Cell<Option<ObservationApi>> = const { std::cell::Cell::new(None) };
 }
 static GENERATION: AtomicU64 = AtomicU64::new(1);
 
@@ -282,6 +312,14 @@ impl Object {
             // failure must not inherit an earlier shared-capacity refusal.
             self.parse_deferred.set(false);
             self.unchanged()?;
+            // NEW-21 fix6 one-shot: a staged transient backing
+            // failure (the `try_clone` shape — uncached, nothing
+            // cached, no deferred state). Test-only, inert unless
+            // armed.
+            #[cfg(test)]
+            if FAIL_NEXT_PARSE.take() {
+                return Err(ObservationGap::BackingUnavailable);
+            }
             let mut fd = self
                 .file
                 .try_clone()
@@ -756,23 +794,38 @@ impl VerifiedSite {
         &self,
         record: Option<&ProcessRecord>,
     ) -> Result<bool, ObservationGap> {
-        let SiteCustody::Startup(original) = &self.custody else {
+        let SiteCustody::Startup(_) = &self.custody else {
             return Err(ObservationGap::Invalidated);
         };
         if let Some(record) = record {
-            if record.pid != original.pid || record.starttime != original.starttime {
-                return Err(ObservationGap::ProcessChanged);
-            }
-            // Missing post-exit observations are uncertainty. A readable supplied
-            // identity mismatch still defeats retained historical authority.
-            if record.namespaces.pid.is_some() && record.namespaces.pid != original.namespaces.pid
-                || record.namespaces.mount.is_some()
-                    && record.namespaces.mount != original.namespaces.mount
-            {
-                return Err(ObservationGap::NamespaceChanged);
-            }
+            self.check_record(record)?;
         }
         self.revalidate_queued()
+    }
+    /// NEW-41 fix13: the record-vs-original comparison half of
+    /// [`VerifiedSite::revalidate_queued_record`] (split out so
+    /// retirement rechecks can attribute a mismatch to the
+    /// ARRIVING record — a different incarnation, never a refusal
+    /// of this source — separately from a backing-revalidation
+    /// failure, which is directly observed custody provenance). A
+    /// mismatch defeats retained historical authority, exactly as
+    /// before; behavior is unchanged.
+    pub(crate) fn check_record(&self, record: &ProcessRecord) -> Result<(), ObservationGap> {
+        let SiteCustody::Startup(original) = &self.custody else {
+            return Err(ObservationGap::Invalidated);
+        };
+        if record.pid != original.pid || record.starttime != original.starttime {
+            return Err(ObservationGap::ProcessChanged);
+        }
+        // Missing post-exit observations are uncertainty. A readable supplied
+        // identity mismatch still defeats retained historical authority.
+        if record.namespaces.pid.is_some() && record.namespaces.pid != original.namespaces.pid
+            || record.namespaces.mount.is_some()
+                && record.namespaces.mount != original.namespaces.mount
+        {
+            return Err(ObservationGap::NamespaceChanged);
+        }
+        Ok(())
     }
     /// Existing queued records only. A terminal original pidfd cannot authorize
     /// new links, reads or mapped relocation. Missing post-exit proc metadata is
@@ -873,6 +926,13 @@ impl StartupApiSite {
     pub(crate) fn into_parts(self) -> (ObservationApi, VerifiedSite) {
         (self.api, self.site)
     }
+    /// NEW-13-OPEN fix5 staging: peek the site's API without
+    /// consuming it (pins select partial-prearm inputs; production
+    /// always prearms the full discovered set).
+    #[cfg(test)]
+    pub(crate) fn api(&self) -> ObservationApi {
+        self.api
+    }
 }
 pub struct ApiSite {
     pub api: ObservationApi,
@@ -932,6 +992,36 @@ pub struct VerifiedProcess {
     generation: u64,
     budget: ObservationBudget,
     gaps: RefCell<std::collections::BTreeSet<ObservationGap>>,
+    /// NEW-10-OPEN + NEW-19 fix5, split fix6: inventoried exports
+    /// no API-discovery pass resolved (a parse refusal skipped
+    /// their object before either attach feed). PASS-SCOPED: the
+    /// attach loop resets it at every pass start
+    /// ([`Self::begin_api_discovery_pass`]) and failures during
+    /// the pass re-record — a later clean pass proves coverage
+    /// from the claim start (passes complete before establishment,
+    /// and ready targets run no further passes, so the final
+    /// pass's set is the honest verdict). A fresh acquisition
+    /// mints a fresh process. The seal reads it (withholding the
+    /// surfaces) — never the attach loops, which must not see gaps
+    /// they did not earn.
+    unresolved_api: RefCell<std::collections::BTreeSet<inventory::Api>>,
+    /// FLAG-2 fix8: operational wire IDs (20..=72) this
+    /// discovery pass skipped — a parse refusal during an
+    /// operational API's resolve, or a revalidation early return
+    /// for one. Pass-scoped like `unresolved_api` (reset at every
+    /// pass start — a clean pass re-proves the surface); recorded
+    /// per RESOLVE (the skipped API), never per object (a refused
+    /// exporter's sibling APIs may resolve fine). The seal reads
+    /// it (an operational surface no pass resolved stays blind
+    /// even when a sibling site armed).
+    unresolved_operational: RefCell<std::collections::BTreeSet<u32>>,
+    /// NEW-19 fix5, split fix6: inventoried exports static
+    /// discovery skipped (a cached nondeferred parse refusal — the
+    /// static cursor never revisits a mapping, so a recorded skip
+    /// is permanent within the acquisition). MONOTONE; a fresh
+    /// acquisition mints a fresh process. Read together with the
+    /// API set above (see [`Self::unresolved_inventoried`]).
+    unresolved_static: RefCell<std::collections::BTreeSet<inventory::Api>>,
     static_discovery: RefCell<StaticDiscovery>,
     // Inventory hints excluded from this acquisition. Stronger later metadata
     // can request fresh custody, but cannot promote these old locators.
@@ -1041,6 +1131,121 @@ impl VerifiedProcess {
     }
     pub fn gaps(&self) -> Vec<ObservationGap> {
         self.gaps.borrow().iter().copied().collect()
+    }
+    /// NEW-10-OPEN fix5, pass-scoped fix6: record an inventoried
+    /// object's exports as API-unresolved — call on an API-discovery
+    /// parse refusal (the object is skipped before either attach
+    /// feed on this pass, so its known exporters stay blind for
+    /// the pass verdict). The set resets at every pass start (see
+    /// [`Self::begin_api_discovery_pass`]) and re-records during
+    /// the pass — cached refusals persist across passes (they fail
+    /// every time), healed transients clear (the clean pass proves
+    /// coverage from the claim start).
+    fn record_unresolved_api_exports(&self, object: &Object) {
+        if let Some(info) = object.expected.as_ref() {
+            self.unresolved_api
+                .borrow_mut()
+                .extend(info.exports.iter().copied());
+        }
+    }
+    /// NEW-35 fix9: record a refused operational resolve precisely
+    /// — call on a per-MAPPING parse refusal during an operational
+    /// `resolve_api`, and ONLY when the refused mapping is ELIGIBLE
+    /// for the resolve (its known exports include the resolve's
+    /// API). An unrelated exporter (fetch-only for an operational
+    /// resolve) contributes no operational uncertainty — its
+    /// inventoried exports still record through
+    /// `record_unresolved_api_exports` (the fetch seal still voids
+    /// its surfaces), but the operational verdict stays clean. The
+    /// production refusal arm and the test one-shot share this
+    /// helper (identical shape, never drifted).
+    fn record_operational_parse_refusal(&self, api: ObservationApi, object: &Object) {
+        if let ObservationApi::Operational(id) = api {
+            let eligible = object.expected.as_ref().is_some_and(|info| {
+                info.exports
+                    .iter()
+                    .any(|export| export.operational_id() == Some(id))
+            });
+            if eligible {
+                self.unresolved_operational
+                    .borrow_mut()
+                    .insert(u32::from(id));
+            }
+        }
+    }
+    /// NEW-25 fix7: record one skipped API into the pass-scoped
+    /// unresolved set — call on the `resolve_api` revalidation
+    /// early return (a transient `ProcessUnavailable` skips the
+    /// API before per-object tracking; without this record a
+    /// retry clears the prior verdict, keeps an earlier sibling
+    /// arm, and passes later revalidation without ever resolving
+    /// the missing site). Inventoried APIs map into the
+    /// inventoried set; FLAG-2 fix8 maps operational APIs into
+    /// the operational set (their skips void the operational
+    /// zero — a heal on retry clears them, like the inventoried
+    /// twin). Callback APIs have no attach surface, so their
+    /// skips still ride the gap set alone. NEW-35 fix9: this
+    /// whole-API tracking is RETAINED for process revalidation
+    /// failure (the skip precedes per-object tracking, so no
+    /// mapping eligibility applies).
+    fn record_unresolved_api(&self, api: ObservationApi) {
+        match api {
+            ObservationApi::Inventoried(inv) => {
+                self.unresolved_api.borrow_mut().insert(inv);
+            }
+            ObservationApi::Operational(id) => {
+                self.unresolved_operational
+                    .borrow_mut()
+                    .insert(u32::from(id));
+            }
+            _ => {}
+        }
+    }
+    /// NEW-19 fix5, monotone fix6: record an inventoried object's
+    /// exports as static-unresolved — call ONLY on a permanent
+    /// static-discovery skip (a cached nondeferred refusal: the
+    /// static cursor never revisits the mapping, so the skip is
+    /// permanent within the acquisition). Lag/deferred returns
+    /// retry (no record, no cursor advance); uncached transient
+    /// failures record nothing (the API path re-resolves the
+    /// shared cell independently — recording would void surfaces
+    /// whose exporters resolve fine).
+    fn record_unresolved_static_exports(&self, object: &Object) {
+        if let Some(info) = object.expected.as_ref() {
+            self.unresolved_static
+                .borrow_mut()
+                .extend(info.exports.iter().copied());
+        }
+    }
+    /// NEW-10-OPEN fix6: open a new API-discovery pass — the
+    /// pass-scoped set resets (the attach loop calls this before
+    /// every resolve loop; failures during the pass re-record).
+    /// The static set is untouched (monotone — the static cursor
+    /// never revisits). FLAG-2 fix8: the operational pass-scoped
+    /// set resets with it (a clean pass re-proves operational
+    /// surfaces too).
+    pub(crate) fn begin_api_discovery_pass(&self) {
+        self.unresolved_api.borrow_mut().clear();
+        self.unresolved_operational.borrow_mut().clear();
+    }
+    /// NEW-10-OPEN + NEW-19 fix5, union fix6: inventoried exports
+    /// no discovery pass resolved (snapshot for the seal, which
+    /// withholds their surfaces even when a sibling exporter
+    /// armed) — the union of the pass-scoped API set and the
+    /// monotone static set.
+    pub(crate) fn unresolved_inventoried(&self) -> std::collections::BTreeSet<inventory::Api> {
+        self.unresolved_api
+            .borrow()
+            .union(&self.unresolved_static.borrow())
+            .copied()
+            .collect()
+    }
+    /// FLAG-2 fix8: operational wire IDs the last discovery pass
+    /// skipped (snapshot for the seal, which withholds the scope
+    /// receipt while any is present — a skipped operational
+    /// surface stays blind even when a sibling site armed).
+    pub(crate) fn unresolved_operational(&self) -> std::collections::BTreeSet<u32> {
+        self.unresolved_operational.borrow().clone()
     }
     pub(super) fn remember_refusal(&self, gap: ObservationGap) {
         self.gaps.borrow_mut().insert(gap);
@@ -1156,8 +1361,31 @@ impl VerifiedProcess {
         if api.export_name().is_none() {
             return Vec::new();
         }
-        if let Err(gap) = self.revalidate() {
+        // NEW-25 fix7 one-shot: a staged transient revalidation
+        // failure for THIS resolve (test-only, inert unless
+        // armed) — shadows the revalidation result so the hook
+        // takes the exact production early-return path below.
+        #[cfg(test)]
+        let revalidated = if FAIL_RESOLVE_API.with(|slot| {
+            if slot.get() == Some(api) {
+                slot.set(None);
+                true
+            } else {
+                false
+            }
+        }) {
+            Err(ObservationGap::ProcessUnavailable)
+        } else {
+            self.revalidate()
+        };
+        #[cfg(not(test))]
+        let revalidated = self.revalidate();
+        if let Err(gap) = revalidated {
             self.gaps.borrow_mut().insert(gap);
+            // NEW-25 fix7: the skipped API carries into the pass
+            // verdict (a heal on retry clears it — the clean pass
+            // re-proves the surface).
+            self.record_unresolved_api(api);
             return Vec::new();
         }
         let mut sites = Vec::new();
@@ -1174,10 +1402,53 @@ impl VerifiedProcess {
             {
                 continue;
             }
+            // NEW-21-OPEN fix7 one-shot: a staged transient parse
+            // failure for the FIRST exporter of THIS resolve
+            // (test-only, inert unless armed) — takes the exact
+            // `parsed()`-failure arm below (gap + pass-verdict
+            // record + skip before either feed; uncached, nothing
+            // cached, no deferred state).
+            #[cfg(test)]
+            if FAIL_PARSE_API.with(|slot| {
+                if slot.get() == Some(api) {
+                    slot.set(None);
+                    true
+                } else {
+                    false
+                }
+            }) {
+                self.gaps
+                    .borrow_mut()
+                    .insert(ObservationGap::BackingUnavailable);
+                self.record_unresolved_api_exports(object);
+                // NEW-35 fix9: shared refusal shape (eligible
+                // mappings record; unrelated exporters don't).
+                self.record_operational_parse_refusal(api, object);
+                continue;
+            }
             let parsed = match object.parsed(&self.budget) {
                 Ok(parsed) => parsed,
                 Err(gap) => {
                     self.gaps.borrow_mut().insert(gap);
+                    // NEW-10-OPEN fix5, uncached fix6: EVERY parse
+                    // refusal skips the known exporter before
+                    // either feed on this pass — cached AND
+                    // uncached alike (an uncached transient sets no
+                    // deferred state and the pass may still complete
+                    // and go ready, so the skip would otherwise
+                    // vanish while its armed sibling certifies).
+                    // The pass verdict carries the uncertainty; a
+                    // later clean pass re-proves the surface (see
+                    // `begin_api_discovery_pass`).
+                    self.record_unresolved_api_exports(object);
+                    // NEW-35 fix9: when the REFUSED resolve is
+                    // itself operational, the skipped surface
+                    // records precisely (per-resolve, not per
+                    // object — the refused exporter's sibling
+                    // surfaces may resolve fine) and ONLY when
+                    // the refused mapping is eligible for it (an
+                    // unrelated exporter vetoes nothing).
+                    self.record_operational_parse_refusal(api, object);
                     continue;
                 }
             };
@@ -1302,6 +1573,13 @@ impl VerifiedProcess {
                 Err(ObservationGap::SnapshotLag) => return Err(ObservationGap::SnapshotLag),
                 Err(g) => {
                     self.gaps.borrow_mut().insert(g);
+                    // No unresolved recording here (deliberate):
+                    // table discovery has its own cell — a table
+                    // refusal skips table candidates only, while
+                    // API sites still resolve through the
+                    // independent parse cache. Recording would
+                    // void surfaces whose exporters resolve fine.
+                    // Only parse refusals (shared cell) track.
                     discovery.mapping += 1;
                     continue;
                 }
@@ -1320,6 +1598,12 @@ impl VerifiedProcess {
                 }
                 Err(g) => {
                     self.gaps.borrow_mut().insert(g);
+                    // NEW-19 fix5: a cached refusal is a permanent
+                    // skip (uncached transients retry) — the
+                    // skipped inventoried exporter stays tracked.
+                    if object.parsed.get().is_some() {
+                        self.record_unresolved_static_exports(object);
+                    }
                     discovery.mapping += 1;
                     continue;
                 }
@@ -1760,6 +2044,9 @@ pub(crate) fn acquire_with_incarnation(
         generation: GENERATION.fetch_add(1, Ordering::Relaxed),
         budget: limits.clone(),
         gaps: RefCell::new(gaps),
+        unresolved_api: RefCell::new(std::collections::BTreeSet::new()),
+        unresolved_operational: RefCell::new(std::collections::BTreeSet::new()),
+        unresolved_static: RefCell::new(std::collections::BTreeSet::new()),
         static_discovery: RefCell::default(),
         refused_inventory,
         revalidated_at: Cell::new(None),
@@ -3375,12 +3662,74 @@ pub(super) mod fixture_support {
             generation: GENERATION.fetch_add(1, Ordering::Relaxed),
             budget: budget.clone(),
             gaps: RefCell::default(),
+            unresolved_api: RefCell::default(),
+            unresolved_operational: RefCell::default(),
+            unresolved_static: RefCell::default(),
             static_discovery: RefCell::default(),
             refused_inventory: Vec::new(),
             revalidated_at: Cell::new(None),
         };
         verified.revalidate().unwrap();
         verified
+    }
+    /// NEW-10-OPEN + NEW-19 fix5 staging: bind one more file's
+    /// mappings into an acquired process with CALLER-SUPPLIED
+    /// expected inventory (production acquisition never takes this
+    /// path — it always inspects the bound file). Supplying
+    /// another file's inventory stages the stale-inventory TOCTOU
+    /// shape: the bound file is current (process revalidation
+    /// passes) but discovery parses against mismatched inventory
+    /// and refuses nondeferred — the known exporter is skipped
+    /// before either attach feed. The file must be mapped by the
+    /// live process (same inode-identity binding as
+    /// `mapped_process`).
+    pub fn bind_stale_mapping(process: &mut VerifiedProcess, file: File, expected: ModuleInfo) {
+        let metadata = file.metadata().unwrap();
+        let object = Rc::new(Object {
+            file,
+            stamp: Stamp::of(&metadata),
+            page: None,
+            expected: Some(expected),
+            parsed: OnceCell::new(),
+            tables: OnceCell::new(),
+            parse_deferred: Cell::new(false),
+            anchor: OnceCell::new(),
+        });
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: borrowed descriptor and properly sized output; read on success.
+        let direct = unsafe { libc::fstatfs(object.file.as_raw_fd(), stat.as_mut_ptr()) } == 0
+            && matches!(
+                unsafe { stat.assume_init() }.f_type,
+                0xef53
+                    | 0x58465342
+                    | 0x9123683e
+                    | 0x01021994
+                    | 0x858458f6
+                    | 0x958458f6
+                    | 0x73717368
+                    | 0xf2f52010
+                    | 0x3153464a
+                    | 0x2fc12fc1
+            );
+        let fresh: Vec<BoundMapping> = process
+            .maps
+            .split(|&b| b == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| parse_mapping(line).unwrap())
+            .filter(|map| direct && metadata.ino() == map.inode)
+            .map(|map| BoundMapping {
+                map,
+                object: object.clone(),
+                backing: None,
+            })
+            .collect();
+        assert!(
+            !fresh.is_empty(),
+            "stale fixture descriptor must match actual executable mappings"
+        );
+        process.mappings.extend(fresh);
+        process.revalidated_at.set(None);
+        process.revalidate().unwrap();
     }
     /// Fix4 F3 test staging: mint an attachment site against an
     /// already-acquired process with caller-chosen file identity.

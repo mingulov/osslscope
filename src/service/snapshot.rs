@@ -702,13 +702,20 @@ pub fn produce(
 
     // api_activity: retired-verbatim rows + open-empty, concatenated
     // in segment order then stable-sorted by serialized bytes
-    // (duplicates preserved).
+    // (duplicates preserved). NEW-18 fix5: the legacy-stamped
+    // service window strips the read receipt on copy — receipt
+    // vocabulary stays within versioned request-evidence output
+    // (the seal rows come from versioned focused documents that
+    // may carry it; the receipt is meaningless here, where no
+    // request section claims silence).
     let mut api_rows: Vec<(u64, crate::api_activity::ApiActivityRow)> = Vec::new();
     for (id, fact) in &member_facts {
         if fact.retired {
             if let Some(seal) = sealed.get(&id.2) {
                 for row in &seal.doc.api_activity {
-                    api_rows.push((id.2, row.clone()));
+                    let mut legacy = row.clone();
+                    legacy.gaps.read_receipt = false;
+                    api_rows.push((id.2, legacy));
                 }
             }
         }
@@ -1406,6 +1413,63 @@ mod tests {
         assert_eq!(e.calls, 11);
         assert_eq!(e.generation, 2);
         assert_eq!(e.entrypoint, 3);
+    }
+
+    #[test]
+    fn legacy_service_window_strips_receipt_vocabulary() {
+        // PINS-OPEN + NEW-18 fix5: the ACTUAL older-version
+        // producer path (service-window `produce` with the default
+        // legacy stamp) emits byte-stable legacy rows even when
+        // the sealed input carries read receipts — receipt
+        // vocabulary stays within versioned request-evidence
+        // output (the coordinator envelopes this document
+        // verbatim, so no other service layer can reintroduce
+        // the key).
+        use crate::api_activity::{ApiActivityGaps, ApiActivityRow, ApiId};
+        let produce_with = |receipt: bool| {
+            let open = snap(vec![member(9, 1, Vec::new(), Vec::new())]);
+            let close = snap(Vec::new());
+            let mut gaps = ApiActivityGaps::default();
+            gaps.read_receipt = receipt;
+            let mut doc = sealed_doc(vec![(site("lib"), 1, 25)]);
+            doc.api_activity = vec![ApiActivityRow {
+                api: ApiId::try_from(20).unwrap(),
+                entries: 0,
+                observed_success: 0,
+                observed_failure: 0,
+                verification_mismatch: 0,
+                unsupported: 0,
+                gaps,
+            }];
+            let mut sealed = HashMap::new();
+            sealed.insert(1, seal(doc, 9, 100, 0));
+            produce(&open, &close, &sealed, &ctx())
+        };
+        let p = produce_with(true);
+        assert_eq!(
+            p.document.schema,
+            crate::evidence::CAPTURE_SCHEMA_V2,
+            "the service window keeps its legacy stamp"
+        );
+        assert_eq!(p.document.api_activity.len(), 1, "the row copies over");
+        assert!(
+            !p.document.api_activity[0].gaps.read_receipt,
+            "the legacy copy carries no receipt"
+        );
+        let bytes = serde_json::to_vec(&p.document).unwrap();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(
+            !text.contains("read_receipt"),
+            "no receipt vocabulary in legacy service-window bytes"
+        );
+        // Byte-stability twin: receipted input produces
+        // byte-identical output to receipt-free input.
+        let twin = produce_with(false);
+        let twin_bytes = serde_json::to_vec(&twin.document).unwrap();
+        assert_eq!(
+            bytes, twin_bytes,
+            "a sealed receipt must not perturb legacy service-window bytes"
+        );
     }
 
     /// R1 finding 4 (spilled seals): a retirement record that

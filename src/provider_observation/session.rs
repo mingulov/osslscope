@@ -50,6 +50,13 @@ pub struct ObservationBatch {
     pub learned_sites: Vec<VerifiedSiteCandidate>,
     pub static_candidates: Vec<VerifiedStaticCandidate>,
     pub api_activity: Vec<ProcessApiActivity>,
+    /// Scopes with a SUCCESSFUL terminal count read (NEW-P1): one
+    /// `(pid, starttime)` per incarnation with at least one
+    /// successful scoped read. Failed reads and merge-padded rows
+    /// never land here — the request-fold plane gates on this set
+    /// (absent scope + zero entries = Unknown, never an observed
+    /// zero). Never serialized.
+    pub terminal_scopes_observed: BTreeSet<(u32, u64)>,
     /// Internal provider reacquisition marker for stronger inventory authority.
     /// Count may bridge only after independently revalidating retained custody;
     /// this is not a claim that process or backing code changed identity.
@@ -140,6 +147,8 @@ impl ObservationBatch {
         self.learned_sites.extend(other.learned_sites);
         self.static_candidates.extend(other.static_candidates);
         self.api_activity.extend(other.api_activity);
+        self.terminal_scopes_observed
+            .extend(other.terminal_scopes_observed);
         self.refreshed_processes.extend(other.refreshed_processes);
         self.exec_witnesses.extend(other.exec_witnesses);
         self.exec_deferred.extend(other.exec_deferred);
@@ -236,6 +245,58 @@ fn role_site(pid: u32, starttime: u64, site: &VerifiedSite) -> RoleSite {
         site.inode(),
         site.file_offset(),
     ]
+}
+/// NEW-5-OPEN per-pid sealed-cut cap: at most this many fence
+/// cycles retained per pid (oldest closed pair merges into its
+/// span past the cap — never dropped). Close replay scans at most
+/// `journal_cap × MAX` cut checks per seal: bounded work under
+/// repeated recovery.
+pub(crate) const MAX_SEALED_FENCE_CUTS: usize = 8;
+/// NEW-5-OPEN push-or-merge (pure, pinned): retain one more sealed
+/// fence edge for a pid. An already-open interval keeps the
+/// earliest edge (like the live fence); otherwise the edge opens a
+/// new interval — merging the two oldest recorded cycles into
+/// their minimum-start + maximum-end span first when the list is
+/// full (NEW-5-OPEN + NEW-11 fix4: sound for ANY recorded order,
+/// including backdated and overlapping cycles — the span is a
+/// SUPERSET of the merged union: replay still excludes every
+/// uncertain edge, plus some valid ones — the caller counts the
+/// merge for the seal gap). Returns true iff a merge engaged.
+fn retain_sealed_cut(intervals: &mut Vec<(u64, Option<u64>)>, edge_ns: u64) -> bool {
+    if let Some((edge, _)) = intervals.iter_mut().find(|(_, resume)| resume.is_none()) {
+        *edge = (*edge).min(edge_ns);
+        return false;
+    }
+    if intervals.len() >= MAX_SEALED_FENCE_CUTS {
+        // Saturated (all closed — an open interval reuses above):
+        // merge the two oldest RECORDED cycles into their
+        // minimum-start + maximum-end span, then open the new
+        // edge. Min/max for ANY recorded order (NEW-5-OPEN +
+        // NEW-11 fix4): a later recorded cycle may start earlier
+        // (backdated, e.g. `[20,30)` + later `[10,40)`) or
+        // overlap — the span is a SUPERSET of the merged union
+        // (replay still excludes every uncertain edge, plus some
+        // valid ones — the caller counts the merge for the seal
+        // gap), never a dropped prefix. Bounded, sound.
+        debug_assert!(intervals.len() >= 2);
+        let (first_edge, first_resume) = intervals.remove(0);
+        let (second_edge, second_resume) = intervals.remove(0);
+        let span = (
+            first_edge.min(second_edge),
+            match (first_resume, second_resume) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                // Unreachable (an open interval reuses above) —
+                // fail closed toward exclusion: an open end stays
+                // open, never truncated to a finite resume.
+                _ => None,
+            },
+        );
+        intervals.insert(0, span);
+        intervals.push((edge_ns, None));
+        return true;
+    }
+    intervals.push((edge_ns, None));
+    false
 }
 fn validate_candidate_member(member: &c::Member, generation: u64) -> Result<(), ObservationGap> {
     // Epoch is the advertisement lease. Its invalidation does not invalidate
@@ -376,6 +437,13 @@ struct Attachment {
     site: VerifiedSite,
     cookie: u64,
     api: u32,
+    /// NEW-P1-OPEN: monotonic instant of the last successful CONFIG
+    /// arm (`None` = never armed, or voided by a fence — a stopped
+    /// plane covers nothing). The seal query compares it against
+    /// the claimed-interval start (NEW-P1 fix3): arms at or before
+    /// effective admission cover the window; post-claim arms do
+    /// not (the blind prefix stays outside the claim).
+    armed_ns: Option<u64>,
     advertisers: Vec<ObjectHash>,
     generation: u64,
     object: u64,
@@ -409,6 +477,110 @@ pub(crate) enum PrearmLinks {
 }
 #[cfg(test)]
 thread_local! { static EXPIRE_STATIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+thread_local! {
+    /// NEW-34 fix9: arm a ONE-SHOT terminal-read deadline expiry for
+    /// one cookie — that cookie's terminal totals read takes the
+    /// exact production `DrainOverrun` path (as if the terminal
+    /// deadline expired before its read), while earlier cookies in
+    /// read order succeed. Stages a deterministic deadline crossing
+    /// between eligible reads (a real mid-loop expiry is timing).
+    /// Test-only, inert unless armed; pins must disarm after use.
+    pub(super) static FAIL_TOTALS_READ_DEADLINE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+thread_local! {
+    /// P2fix5 NEW-23: scripted terminal-quiescence re-polls (stack —
+    /// push in reverse arrival order). Each entry replaces ONE
+    /// ring re-poll behind a terminal-drain `None`: `Some(bytes)`
+    /// simulates a busy head resolving into a record (folded
+    /// through the exact production path), `None` simulates one
+    /// quiet re-poll (P2fix7 NEW-41: quiet re-polls prove
+    /// nothing alone — the drain samples ring positions past
+    /// them; script one `None` per round). Test-only, inert
+    /// unless armed (an empty script falls through to the real
+    /// ring); pins must disarm after use.
+    pub(super) static QUIESCE_SCRIPT: std::cell::RefCell<Vec<Option<Vec<u8>>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// P2fix7 NEW-41: scripted ring positions — each entry
+    /// replaces ONE terminal-drain position sample (ringbuf
+    /// consumer/producer positions): `Some((c, p))` samples
+    /// those positions, `None` samples UNREADABLE (the
+    /// mmap-failure logic). Stack (push in reverse arrival
+    /// order, like [`QUIESCE_SCRIPT`]) with a STICKY tail (the
+    /// last entry repeats forever — a persistently-unreadable
+    /// head scripts as ONE `(c, p>c)` entry). Test-only, inert
+    /// unless armed (an empty script reads the real ring
+    /// mapping — unscripted positives exercise the production
+    /// mmap path); pins must disarm after use.
+    pub(super) static RING_POSITION_SCRIPT: std::cell::RefCell<Vec<Option<(u64, u64)>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// P2fix5 NEW-23: terminal-quiescence confirmations executed
+    /// (re-polls behind a terminal-drain `None`, scripted or
+    /// real). Pins snapshot the delta across the drain under
+    /// test.
+    pub(super) static TERMINAL_QUIESCE_CONFIRMATIONS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// P2fix5 NEW-23: quiescence re-polls that recovered a record
+    /// behind the busy head (scripted or real).
+    pub(super) static TERMINAL_QUIESCE_RECOVERIES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Terminal-drain quiescence re-poll outcome (P2fix5 NEW-23,
+/// P2fix6 NEW-32, P2fix7 NEW-41).
+enum QuiesceRepoll {
+    /// One quiet re-poll (a `None` — busy-or-empty, NEVER
+    /// exhaustion evidence by itself; the drain samples ring
+    /// positions past it).
+    Quiet,
+    /// A record resolved behind the busy head (owned bytes for
+    /// the exact production fold path).
+    Recovered(Vec<u8>),
+}
+/// Affirmative equality samples (P2fix7 NEW-41 — REPLACES the
+/// P2fix6 NEW-32 `None`-streak: consecutive ringbuf
+/// producer==consumer samples (each proving zero outstanding
+/// bytes at that instant — a busy head implies producer >
+/// consumer, so equality rules it out by construction) needed
+/// to prove writer quiescence + ring exhaustion. The two
+/// samples straddle a scheduling opportunity (yield + short
+/// sleep): post-close no new reserves can start, and any
+/// admitted writer reserves within its non-preemptible window —
+/// stability across the sleep rules out in-flight reserves. Any
+/// consumed record resets the count and folds through the exact
+/// path; the drain deadline bounds the wait (unproved past it,
+/// never confirmed). Residual: an admitted-but-unreserved
+/// writer descheduled across BOTH samples (vanishing —
+/// disclosed, not proven).
+const TERMINAL_DRAIN_EQUALITY_SAMPLES: u32 = 2;
+/// Quiet-sample spacing (P2fix6 NEW-32, reused P2fix7 NEW-41):
+/// the sleep between consecutive position samples (the
+/// writer-quiescence wait — a descheduled writer gets a
+/// scheduling opportunity before the next sample; recoveries
+/// drain at full speed, never slept).
+const TERMINAL_QUIESCE_SAMPLE_SLEEP: Duration = Duration::from_millis(1);
+/// Load (consumer, producer) from a ringbuf meta-pages base
+/// (P2fix7 NEW-41): consumer at +0, producer at +page_size
+/// (kernel ringbuf ABI — the same offsets aya 0.14.0 maps: its
+/// consumer page at file offset 0, its producer page at file
+/// offset page_size, position words first).
+///
+/// SAFETY: `base` must map ≥2 readable pages holding the EVENTS
+/// meta pages (or an equivalent test mapping); both offsets are
+/// page-aligned (atomic-aligned). Acquire loads — pair the
+/// kernel's Release on reserve/commit and aya's Release on
+/// consume.
+unsafe fn read_positions_from_base(base: *const u8, page_size: usize) -> (u64, u64) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // SAFETY: upheld by the caller (see above).
+    unsafe {
+        let consumer = (&*(base as *const AtomicUsize)).load(Ordering::Acquire);
+        let producer = (&*(base.add(page_size) as *const AtomicUsize)).load(Ordering::Acquire);
+        (consumer as u64, producer as u64)
+    }
+}
 /// First cookie of the typed range; see `next_typed_cookie`.
 pub(crate) const TYPED_COOKIE_FIRST: u64 = 1 << 31;
 /// One past the last typed cookie (u32 range end, exclusive).
@@ -460,6 +632,87 @@ struct Target {
     attachments: Vec<Attachment>,
     ranges: usize,
     ready: bool,
+    /// NEW-10: APIs with an ELIGIBLE site that never armed on this
+    /// incarnation (a resolved site's attach failed softly, or a
+    /// role-conflict disarm removed it). One armed site must not
+    /// certify a surface whose other site is blind — the seal
+    /// withholds these APIs from fetch coverage (voided, never an
+    /// in-window zero). Persists across retries of the incarnation
+    /// (a site down at setup missed the prefix even if a retry
+    /// arms it later); a fresh incarnation mints a fresh set.
+    site_gap_apis: BTreeSet<u32>,
+}
+/// NEW-31-OPEN fix10: a sorted-unique set backed by ONE `Vec`
+/// with exactly known heap storage. The session retention sets
+/// are leased byte-exact, and a `BTreeSet`'s allocated nodes
+/// (2,752 measured heap bytes for 64+64 elements vs the 1,344
+/// key-payload reserve) cannot be honestly accounted from key
+/// sizes — std node layout is undocumented and
+/// version-dependent. Constructed with `with_cap` (one exact
+/// `cap × size_of::<T>()` heap block); while `len ≤ cap` the
+/// block never reallocates, so the worst case IS the payload.
+/// Callers enforce the cap (retention overflows fail closed into
+/// the session-wide latch — see the call sites); this type only
+/// stores (a `debug_assert` convicts an over-cap insert in test
+/// builds). Sorted order preserves `BTreeSet` iteration
+/// semantics; `clear` keeps the block (refills never realloc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SortedVecSet<T: Ord> {
+    inner: Vec<T>,
+}
+impl<T: Ord> SortedVecSet<T> {
+    pub(crate) fn with_cap(cap: usize) -> Self {
+        Self {
+            inner: Vec::with_capacity(cap),
+        }
+    }
+    pub(crate) fn contains(&self, value: &T) -> bool {
+        self.inner.binary_search(value).is_ok()
+    }
+    /// Insert `value` (sorted, unique). The caller holds `len <
+    /// cap` (the retention call sites check before inserting and
+    /// fail closed past the cap); over-cap insertion would
+    /// reallocate past the leased block.
+    pub(crate) fn insert(&mut self, value: T) -> bool {
+        match self.inner.binary_search(&value) {
+            Ok(_) => false,
+            Err(at) => {
+                debug_assert!(
+                    self.inner.len() < self.inner.capacity(),
+                    "retention insert past the leased block"
+                );
+                self.inner.insert(at, value);
+                true
+            }
+        }
+    }
+    pub(crate) fn len(&self) -> usize {
+        self.inner.len()
+    }
+    /// Test-only: production sizes through `len` (cap checks).
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    pub(crate) fn clear(&mut self) {
+        self.inner.clear();
+    }
+    /// Sorted iteration (the `BTreeSet` order the callers keep).
+    /// Test-only: production reads through `contains`/`len`.
+    #[cfg(test)]
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.inner.iter()
+    }
+    /// Leased heap bytes RIGHT NOW (the block never shrinks or
+    /// grows past `with_cap` while callers hold `len ≤ cap`).
+    /// Test-only: the reserve pins this number independently (a
+    /// shared computation would make the pin tautological).
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.inner
+            .capacity()
+            .saturating_mul(std::mem::size_of::<T>())
+    }
 }
 pub struct ProviderSession {
     gate: crate::writer_gate::WriterGate,
@@ -498,12 +751,145 @@ pub struct ProviderSession {
     /// into every record for incarnation namespacing.
     task_start_off: u64,
     trace: super::trace::TraceProducer,
+    /// Trace feed-cut instant (P2fix2 item 3 — the seal binds the
+    /// trace fold to the effective cut): records at/above this
+    /// monotonic instant skip the trace feed (they are outside the
+    /// claimed interval — out-of-interval by design, like the
+    /// request fold's post-deadline exclusion, never loss). Armed
+    /// once per run by the seal owner (scan/inspect at duration end,
+    /// focused finish at the capture deadline) via
+    /// [`Self::set_trace_feed_cut`]; `None` (unarmed — direct
+    /// session users such as the qual harness) feeds everything.
+    trace_feed_cut: Option<u64>,
     api_owners: BTreeMap<u64, (u32, u64, u32)>,
+    /// NEW-1 admission receipts, NEW-6 commit rule: cookies whose
+    /// CONFIG arm SUCCEEDED **and** whose matching membership is
+    /// live (same generation in MEMBERS, so BPF can accept the
+    /// cookie) — recorded after the membership write, distinct
+    /// from the allocation in `attach_pair`. The terminal read
+    /// receipts only these: a readable zero map over a plane BPF
+    /// could never accept certifies nothing. Verified POSITIVE
+    /// totals project without admission too (NEW-6-OPEN + NEW-13
+    /// fix4 — preserved, never receipted). Subset of
+    /// `api_owners` keys (same 1024 cap story — refused
+    /// allocations never arm).
+    api_admitted: BTreeSet<u64>,
+    /// NEW-P1-OPEN coverage epoch: monotonic instant of the FIRST
+    /// drain pass (set once at `drain`/`retire_drain` entry).
+    /// `None` (no drain yet) covers nothing — fail closed.
+    coverage_epoch_ns: Option<u64>,
+    /// NEW-P1 fix3 claimed-interval start: the effective admission
+    /// instant the window's silence is claimed from (monotone-max
+    /// over `set_api_window` calls — the focused path re-establishes
+    /// it after the first attach, so setup arms precede the claim
+    /// and the blind setup prefix stays outside it). Covered ⟺
+    /// armed at or before this start (plus epoch present, never
+    /// fence-voided, no latched loss). `None` (window never
+    /// programmed) covers nothing — fail closed.
+    coverage_window_start_ns: Option<u64>,
+    /// NEW-P1-OPEN loss latch (NEW-7 extends the sources): any
+    /// in-window observed loss (loss-lane delta, `FactLimit` drop,
+    /// `StateLimit` drop, failed terminal loss-map read,
+    /// final-deadline remainder) voids every in-window zero (a
+    /// dropped edge may have been the missing one). Reset when
+    /// `set_api_window` advances the claim — pre-window loss
+    /// predates the observation and must not poison it.
+    fetch_coverage_broken: bool,
+    /// NEW-24 fix7: incarnations whose operational plane was
+    /// disarmed mid-run (a completed non-terminal retire removes
+    /// the target's rows — an additive refresh is the live case —
+    /// so coverage across the claimed interval is no longer
+    /// continuous). The terminal scope receipt requires
+    /// continuity: marked incarnations earn no receipt even when
+    /// an old admitted counter still reads successfully (verified
+    /// positives still project — only zero eligibility voids).
+    /// Cleared when `set_api_window` advances the claim
+    /// (pre-claim churn predates the observation, like pre-window
+    /// loss). Terminal (preserving) retires never mark — an
+    /// orderly exit ends observation, it never gaps it.
+    /// NEW-38 fix11: keyed by the EXACT `(pid, starttime)`
+    /// incarnation (a pid-wide mark lets a replacement
+    /// incarnation's retirement revoke an earlier preserving
+    /// retiree's receipt after PID reuse). Whole-pid terminal
+    /// refusals (`final_refusals`) stay pid-wide DELIBERATELY:
+    /// refused records cannot be attributed to an incarnation,
+    /// so uncertain custody still voids every scope (fail closed).
+    /// NEW-31-OPEN fix10: exactly-accounted storage (see
+    /// [`SortedVecSet`]) — the leased bytes ARE this block.
+    scope_continuity_broken: SortedVecSet<(u32, u64)>,
+    /// NEW-31 fix8: session-wide continuity latch — set when a
+    /// claim-relevant mark overflows the session-bound retention
+    /// cap (see `mark_scope_continuity_broken`). Fails closed
+    /// (every scope receipt voids — a dropped mark would grant a
+    /// false zero) and is NEVER cleared (the dropped mark's pid
+    /// is unknown, so no re-epoch can honestly discharge it).
+    scope_continuity_broken_all: bool,
+    /// FLAG-C fix9: operational-gap verdicts retained through
+    /// PRESERVING terminal retirement, keyed by the EXACT claimed
+    /// incarnation `(pid, starttime)` — the retire removes the
+    /// target (and its live verdict) while claim-eligible cookies
+    /// survive, so without retention a clean sibling read would
+    /// certify the blind site. Only post-quarantine-exclusion gaps
+    /// retain (quarantine-only verdicts never void, live or
+    /// retired). Cleared on claim advance (the fresh snapshot
+    /// excludes retired incarnations, so a retained verdict is
+    /// moot afterwards); bounded at the session cap with overflow
+    /// failing closed into `scope_continuity_broken_all` (a
+    /// dropped verdict would grant a false zero).
+    /// NEW-31-OPEN fix10: exactly-accounted storage (see
+    /// [`SortedVecSet`]) — the leased bytes ARE this block.
+    retired_operational_gaps: SortedVecSet<(u32, u64)>,
+    /// NEW-39 fix12: custody refusals retained through EVICTING
+    /// live-drain retirement, keyed by the EXACT historical
+    /// incarnation `(pid, starttime)` — live drain can detect a
+    /// revalidation failure on a claimed original's rows after a
+    /// preserving retirement, then discard that source while its
+    /// counters stay readable; with no live target no continuity
+    /// mark records, and the seal can no longer revalidate an
+    /// evicted source — so without retention its stale reads would
+    /// certify zero. NEW-41 fix13: retirement-recheck and
+    /// reconcile-match refusals retain here too (same direct-
+    /// observation rule). Only DIRECTLY OBSERVED refusals retain
+    /// (the evicted rows' own site revalidation produced the gap —
+    /// ring-event and re-add retires carry externally-attributed
+    /// gaps that say nothing about the historical source's custody,
+    /// so they retain nothing). Unlike whole-pid terminal refusals
+    /// (`final_refusals` — refused RECORDS cannot be attributed),
+    /// these refusals name the exact incarnation whose own
+    /// revalidation failed, so a later reuse incarnation is never
+    /// voided by them. Cleared on claim advance (like the verdicts
+    /// above); bounded at the session cap with overflow failing
+    /// closed into `scope_continuity_broken_all`. Exactly-accounted
+    /// storage (see [`SortedVecSet`]) — the leased bytes ARE this
+    /// block.
+    retired_custody_refusals: SortedVecSet<(u32, u64)>,
+    /// NEW-30 fix8: zero-eligible operational cookies — the
+    /// cookies holding LIVE operational admission for their exact
+    /// incarnation at the last claim advance (snapshotted by
+    /// `set_api_window`; `None` until the first advance). The
+    /// terminal scope receipt requires membership: a retired
+    /// incarnation's still-admitted cookies (disarmed CONFIG,
+    /// stale map rows) must not certify a re-added incarnation's
+    /// interval — only cookies live for the exact incarnation at
+    /// claim start vouch for the claimed window. Verified
+    /// POSITIVE totals still project for non-member cookies (row
+    /// logic is untouched — only zero eligibility binds).
+    claim_admitted: Option<BTreeSet<u64>>,
     startup: BTreeMap<u32, Vec<Attachment>>,
     targets: BTreeMap<u32, Target>,
     // Replaces (never adds to) an admitted target during metadata-only refresh.
     // The shared process lease still bounds this map and any Count site owners.
     refreshing: BTreeMap<u32, objects::ProcessIncarnation>,
+    /// NEW-21 fix7 staged-process test seam: a caller-staged
+    /// `VerifiedProcess` per pid that the NEXT `add_target` for
+    /// that pid adopts INSTEAD of acquiring (one-shot — consumed
+    /// on use). The attach/arm/commit/seal below it are all
+    /// production; only the process binding is staged, so pins
+    /// get a deterministic two-exporter observation with genuine
+    /// links, arm instants, and admission. Test-only (`#[cfg(test)]`,
+    /// never shipped); production acquisition is untouched.
+    #[cfg(test)]
+    process_override: std::cell::RefCell<BTreeMap<u32, objects::VerifiedProcess>>,
     /// R5-3: pids with a deferred retire awaiting retry (the
     /// retire's gap rides along for the retry; R6-1: plus its
     /// operation for the lifecycle effects). Recorded at
@@ -547,6 +933,23 @@ pub struct ProviderSession {
     /// Pre-seal fences (exec/exit/reuse) never flag: the member
     /// seals instead of resuming.
     unfence_after_drain: BTreeSet<u32>,
+    /// NEW-2 sealed fence cuts: pid → excluded intervals
+    /// `(edge, resume)`, retained through seal across recovery
+    /// drains. `fence_target` opens `(edge, None)`; the recovery
+    /// drain closes it with the unfence instant instead of
+    /// forgetting the cut (the live `fenced` entry still clears so
+    /// post-recovery records flow). An open interval excludes
+    /// `[edge, ∞)`; a closed one excludes `[edge, resume)`. One
+    /// entry per fence cycle (same order as `exec_witnesses`),
+    /// capped at [`MAX_SEALED_FENCE_CUTS`] per pid (NEW-5-OPEN:
+    /// past-cap cycles MERGE the oldest closed pair into their
+    /// span — never dropped — so replay stays bounded and sound).
+    sealed_fences: BTreeMap<u32, Vec<(u64, Option<u64>)>>,
+    /// NEW-5-OPEN saturating merge count (cut-store saturations
+    /// since session open). Surfaced once at seal (focused
+    /// `finish` gaps when nonzero — merged spans over-exclude
+    /// valid edges, never silently).
+    sealed_cut_merges: u64,
     /// fix3: retire-drain carry — events the retire-drain consumed
     /// between ticks (facts/gaps/signals conserved, never dropped).
     /// The next `drain`/`reconcile_records` takes it as its batch
@@ -620,13 +1023,42 @@ pub struct ProviderSession {
     last_drain: Instant,
     closed: bool,
 }
+/// NEW-41 fix13: a retirement-recheck failure with its
+/// provenance — the batch gap plus, for DIRECTLY OBSERVED
+/// backing-refusals only, the exact failing incarnation (the
+/// row's own site identity, like the live-drain capture). A
+/// record-vs-original mismatch attributes its GAP to the
+/// arriving record (a DIFFERENT incarnation — PID reuse, not a
+/// refusal of this source) — NEW-45 fix14: but the retained
+/// original is still validated independently, and its own
+/// genuine backing refusal carries the original's exact
+/// incarnation alongside the mismatch gap — NEW-48 fix15: and
+/// EVERY retained original is validated, not just the first
+/// (several distinct backing files can sit under one PID; a
+/// healthy first backing must not hide a refused later one —
+/// the eviction orphans every row, so any genuine refusal rides
+/// back). A mismatch over clean backing carries NO incarnation
+/// and retains nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TerminalRecheck {
+    gap: ObservationGap,
+    observed: Option<(u32, u64)>,
+}
 fn terminal_originals(
     startup: &[Attachment],
     target: Option<&Target>,
     record: Option<&inventory::ProcessRecord>,
-) -> Result<bool, ObservationGap> {
+) -> Result<bool, TerminalRecheck> {
     let mut found = false;
     let mut terminal = true;
+    // NEW-48 fix15: the scan validates EVERY retained original
+    // before the mismatch-driven eviction — the first gap wins
+    // (unchanged attribution), but validation never returns
+    // early: same-pid rows share one site identity and the
+    // retire evicts them together, so one observation still
+    // suffices, yet it must survive a healthy first backing.
+    let mut failure: Option<ObservationGap> = None;
+    let mut observed: Option<(u32, u64)> = None;
     for a in startup
         .iter()
         .chain(target.into_iter().flat_map(|t| &t.attachments))
@@ -637,8 +1069,51 @@ fn terminal_originals(
             .or_else(|| a.site.is_startup().then_some(&a.site))
         {
             found = true;
-            terminal &= original.revalidate_queued_record(record)?;
+            if !original.is_startup() {
+                // The old `revalidate_queued_record` custody arm:
+                // a mapped original carries no queued authority —
+                // Invalidated, unattributed (retains nothing
+                // itself — but the scan continues: a LATER
+                // retained original's genuine refusal still
+                // rides back).
+                failure.get_or_insert(ObservationGap::Invalidated);
+                continue;
+            }
+            // The record comparison first: a mismatch attributes
+            // to the ARRIVING record (a different incarnation),
+            // never to this source. NEW-45 fix14: the mismatch
+            // must not skip validation of the RETAINED original
+            // itself — before the mismatch-driven eviction
+            // reconcile runs, the original's descriptor is
+            // checked independently, and any genuine refusal
+            // rides back for exact-incarnation persistence
+            // alongside the mismatch gap (else the old scope
+            // receipts the stale reads the eviction orphaned).
+            // NEW-48 fix15: that independent check runs for
+            // EVERY retained original, not just the first —
+            // the scan continues past a healthy first backing.
+            // Clean backing retains nothing — the
+            // N38/N45-clean reuse controls keep receipting.
+            if let Some(record) = record {
+                if let Err(gap) = original.check_record(record) {
+                    if original.revalidate_queued().is_err() {
+                        observed.get_or_insert((a.site.pid(), a.site.starttime()));
+                    }
+                    failure.get_or_insert(gap);
+                    continue;
+                }
+            }
+            match original.revalidate_queued() {
+                Ok(exited) => terminal &= exited,
+                Err(gap) => {
+                    observed.get_or_insert((a.site.pid(), a.site.starttime()));
+                    failure.get_or_insert(gap);
+                }
+            }
         }
+    }
+    if let Some(gap) = failure {
+        return Err(TerminalRecheck { gap, observed });
     }
     Ok(found && terminal)
 }
@@ -1695,10 +2170,16 @@ fn combine_disarm(
 /// the kept sources, a visible gap, retry next tick). Every
 /// caller skips post-retire bookkeeping on deferral; the
 /// deferred link count feeds the dropper's deferral counter.
+/// NEW-24-OPEN/NEW-29 fix8: the deferral carries the preserve bit
+/// too (computed before the disarm, like the completion path) —
+/// a deferred terminal retire is still an orderly exit (it never
+/// gaps coverage), while a deferred non-terminal retire disarmed
+/// mid-run (coverage voids AT the disarm transition, not at the
+/// retry's completion).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetireOutcome {
     Retired(bool),
-    Deferred(usize),
+    Deferred { links: usize, preserve: bool },
 }
 /// R4-4: startup-retire outcome — queued (offloaded, arms),
 /// closed (sync or empty, no arm), or deferred (saturated:
@@ -1761,7 +2242,11 @@ fn retire_source_owners(
     disarm: impl FnOnce(&[Attachment], Option<&Target>) -> Result<(), ObservationGap>,
     offload: impl FnOnce(Vec<std::os::fd::OwnedFd>),
     can_offload: impl FnOnce(usize) -> bool,
-) -> RetireOutcome {
+    // NEW-41 fix13: alongside the outcome, the recheck's
+    // directly-observed refusal (the exact failing incarnation)
+    // for the retiree to persist — `None` when no recheck ran or
+    // the failure attributes to the arriving record instead.
+) -> (RetireOutcome, Option<(u32, u64)>) {
     let rows: &[Attachment] = startup.get(&pid).map_or(&[], Vec::as_slice);
     // A resolver can record an earlier confirmed failure before a subsequent
     // call returns mere unavailability. Both forms retain refusal provenance.
@@ -1771,13 +2256,20 @@ fn retire_source_owners(
     if let Some(recorded) = recorded {
         b.gap(recorded);
     }
+    // NEW-41 fix13: the recheck's directly-observed refusal (if
+    // any) rides back to the retiree for exact persistence —
+    // through evicting completions AND deferred evictions (a
+    // retry's re-recording can skip the recheck, so the deferral
+    // itself must not drop the observation).
+    let mut observed: Option<(u32, u64)> = None;
     let preserve = if rejects_history(gap) || recorded.is_some() {
         false
     } else {
         match terminal_originals(rows, targets.get(&pid), record) {
             Ok(terminal) => terminal,
-            Err(gap) => {
-                b.gap(gap);
+            Err(failure) => {
+                b.gap(failure.gap);
+                observed = failure.observed;
                 false
             }
         }
@@ -1806,7 +2298,13 @@ fn retire_source_owners(
             .unwrap_or(0);
     if disarmed && !can_offload(doomed_links) {
         b.gap(ObservationGap::SamplingPartial);
-        return RetireOutcome::Deferred(doomed_links);
+        return (
+            RetireOutcome::Deferred {
+                links: doomed_links,
+                preserve,
+            },
+            observed,
+        );
     }
     b.learned_sites.retain(|site| site.pid != pid);
     b.static_candidates.retain(|site| site.pid() != pid);
@@ -1872,7 +2370,7 @@ fn retire_source_owners(
             drop(doomed);
         }
     }
-    RetireOutcome::Retired(preserve)
+    (RetireOutcome::Retired(preserve), observed)
 }
 /// R4-4: delete one pid's disarm rows (members + every config
 /// cookie + every range index), verdicting each delete through
@@ -2024,6 +2522,41 @@ fn record_binding<'a>(
         return Err(ObservationGap::InvalidWire);
     }
     Ok(None)
+}
+/// NEW-10-OPEN + NEW-19 fix5: wire ids for unresolved inventoried
+/// exporters (reverse of `wire::api` over the attach enumeration —
+/// the seal withholds the surfaces discovery could not resolve).
+/// Inventoried apis only: operational discovery uncertainty stays a
+/// recorded gap (visible) but feeds no fetch verdict — fetch edges
+/// come only from fetch exports, so operational blindness is not
+/// fetch blindness.
+fn unresolved_wire_ids(unresolved: &BTreeSet<crate::inventory::Api>) -> BTreeSet<u32> {
+    wire::attach_ids()
+        .filter(|id| {
+            wire::api(*id).is_ok_and(
+                |api| matches!(api, ObservationApi::Inventoried(inv) if unresolved.contains(&inv)),
+            )
+        })
+        .collect()
+}
+/// NEW-8-OPEN + NEW-17 fix5: one attachment's terminal custody —
+/// the per-cookie authority `final_record_binding` demands on the
+/// terminal path: its OWN validated original (a sibling's
+/// original cannot help — retention is not authority), evaluated
+/// exactly as the binding does (missing original or failed
+/// revalidation = no custody, fail closed). The seal rule
+/// requires custody for EACH contributing fetch attachment, so a
+/// mapped-only fetch whose edge the terminal binding drops never
+/// stays eligible for silence.
+fn terminal_custody(a: &Attachment) -> bool {
+    let Some(original) = a
+        .original
+        .as_ref()
+        .or_else(|| a.site.is_startup().then_some(&a.site))
+    else {
+        return false;
+    };
+    original.revalidate_queued_record(None).unwrap_or(false)
 }
 fn final_record_binding<'a>(
     targets: &'a BTreeMap<u32, Target>,
@@ -2358,6 +2891,9 @@ impl ProviderSession {
         trace_mode
             .set(0, 0u32, 0)
             .map_err(|_| ObservationGap::BpfUnavailable)?;
+        // NEW-31-OPEN fix10: the retention blocks are leased
+        // exactly at the session cap (see `SortedVecSet`).
+        let retention_cap = budget.limits.max_processes;
         Ok(Self {
             gate,
             final_drain: false,
@@ -2369,7 +2905,17 @@ impl ProviderSession {
             trace_mode,
             task_start_off,
             trace: super::trace::TraceProducer::new(),
+            trace_feed_cut: None,
             api_owners: BTreeMap::new(),
+            api_admitted: BTreeSet::new(),
+            coverage_epoch_ns: None,
+            coverage_window_start_ns: None,
+            fetch_coverage_broken: false,
+            scope_continuity_broken: SortedVecSet::with_cap(retention_cap),
+            scope_continuity_broken_all: false,
+            retired_operational_gaps: SortedVecSet::with_cap(retention_cap),
+            retired_custody_refusals: SortedVecSet::with_cap(retention_cap),
+            claim_admitted: None,
             startup: BTreeMap::new(),
             events: RingBuf::try_from(map(&loaded, "EVENTS")?)
                 .map_err(|_| ObservationGap::BpfUnavailable)?,
@@ -2392,12 +2938,16 @@ impl ProviderSession {
             typed_startup: Vec::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
+            #[cfg(test)]
+            process_override: std::cell::RefCell::new(BTreeMap::new()),
             pending_retire: BTreeMap::new(),
             pending_startup: BTreeSet::new(),
             exec_sealed: BTreeSet::new(),
             fenced: BTreeMap::new(),
             fence_withheld: 0,
             unfence_after_drain: BTreeSet::new(),
+            sealed_fences: BTreeMap::new(),
+            sealed_cut_merges: 0,
             retire_carry: ObservationBatch::default(),
             roles: Roles::default(),
             aliases: super::assembly::Sequences::default(),
@@ -2580,6 +3130,7 @@ impl ProviderSession {
                 site,
                 cookie,
                 api,
+                armed_ns: None,
                 advertisers,
             })
         })()
@@ -2609,6 +3160,155 @@ impl ProviderSession {
             })
             .or_insert(PendingRetire { gap, op });
     }
+    /// NEW-31-OPEN fix9: the retiring incarnation owns a cookie
+    /// in the ACTIVE claim cohort — the claim-start snapshot when
+    /// a claim advanced (stable across the retire), else
+    /// live-incarnation admission evaluated NOW (call at retire
+    /// ENTRY, before the retire disarms; the seal-time fallback's
+    /// CONFIG-liveness conjunct is the retire's own victim, so the
+    /// mark-time test drops it). NEW-38 fix11: the membership is
+    /// EXACT — `(pid, starttime)` in both branches (a pid-only
+    /// snapshot test admits a replacement incarnation's retire
+    /// under a stale incarnation's cookies, revoking the earlier
+    /// retiree's receipt after PID reuse). An incarnation outside
+    /// the cohort can earn no receipt, so its mark would be
+    /// meaningless — and stale re-retires of historical pids must
+    /// not consume the bounded set (or fire the latch). Unlike
+    /// terminal-gap retention (NEW-36-OPEN: established claim
+    /// required), the claimless live branch stays: a mid-run
+    /// disarm voids a claimless-fallback receipt too (the re-added
+    /// plane is live at the seal).
+    fn retiring_incarnation_in_active_claim_cohort(&self, pid: u32, starttime: u64) -> bool {
+        if let Some(snapshot) = &self.claim_admitted {
+            return snapshot.iter().any(|cookie| {
+                matches!(self.api_owners.get(cookie), Some((owner, cookie_starttime, _)) if *owner == pid && *cookie_starttime == starttime)
+            });
+        }
+        let Some(target) = self.targets.get(&pid) else {
+            return false;
+        };
+        if target.starttime != starttime {
+            return false;
+        }
+        self.api_owners
+            .iter()
+            .any(|(cookie, (owner, cookie_starttime, _))| {
+                *owner == pid
+                    && *cookie_starttime == starttime
+                    && self.api_admitted.contains(cookie)
+            })
+    }
+    /// NEW-36 fix10: the retiring `(pid, starttime)` owns a
+    /// claim-eligible cookie — an EXACT member of the established
+    /// cohort: a cookie in the claim-start snapshot owned by THIS
+    /// incarnation (stable across the retire — call at retire
+    /// ENTRY, before the retire disarms). NEW-36-OPEN fix11: an
+    /// ESTABLISHED claim is REQUIRED — no claim, no retention. A
+    /// claimless preserving retire removes its owner from the
+    /// live seal fallback (`live_operational_admission` needs a
+    /// live target), so a claimless retained gap could only waste
+    /// the bounded slot or latch an unrelated scope. Terminal-gap
+    /// verdicts retain ONLY for exact members of an established
+    /// claim — the retention is incarnation-keyed, and a pid
+    /// check would admit a re-added incarnation's retire under a
+    /// stale incarnation's cookies. A late, claimless, or
+    /// otherwise off-cohort retiree can earn no receipt, so its
+    /// verdict would be meaningless — and must not consume the
+    /// bounded set (or fire the latch).
+    fn retiring_incarnation_in_claim_cohort(&self, pid: u32, starttime: u64) -> bool {
+        let Some(snapshot) = &self.claim_admitted else {
+            return false;
+        };
+        snapshot.iter().any(|cookie| {
+            matches!(self.api_owners.get(cookie), Some((owner, cookie_starttime, _)) if *owner == pid && *cookie_starttime == starttime)
+        })
+    }
+    /// NEW-31 fix8: record a mid-run operational-coverage break
+    /// for the `(pid, starttime)` incarnation (called for
+    /// non-terminal retire completions AND non-terminal retire
+    /// deferrals — the disarm transition in both cases). NEW-38
+    /// fix11: the mark is incarnation-EXACT (a pid-wide mark lets
+    /// a replacement incarnation's retirement revoke an earlier
+    /// preserving retiree's receipt after PID reuse). Retains
+    /// state ONLY for the active claim cohort (`claim_relevant`,
+    /// snapshotted by the caller at retire entry — the completion
+    /// path runs after the target is gone, when liveness no
+    /// longer reads). An incarnation outside the cohort can earn
+    /// no receipt, so its mark would be meaningless — and
+    /// victimless failed acquisitions must not accumulate entries
+    /// their released provisional admission no longer bounds. The
+    /// set is charged under the session bound (`max_processes` —
+    /// one entry per live process slot, like the admission it
+    /// shadows, with its retained bytes on the session lease —
+    /// see `scope_retention_reserve_bytes`); past the cap the mark
+    /// fails CLOSED into the session-wide latch (a dropped mark
+    /// would grant a false zero) with a visible gap. Re-marks are
+    /// idempotent (the completion mark after a deferral mark
+    /// retains nothing new).
+    fn mark_scope_continuity_broken(
+        &mut self,
+        pid: u32,
+        starttime: u64,
+        claim_relevant: bool,
+        b: &mut ObservationBatch,
+    ) {
+        if self.scope_continuity_broken.contains(&(pid, starttime)) {
+            return;
+        }
+        if !claim_relevant {
+            return;
+        }
+        if self.scope_continuity_broken.len() < self.budget.limits.max_processes {
+            self.scope_continuity_broken.insert((pid, starttime));
+        } else {
+            b.gap(ObservationGap::StateLimit);
+            self.scope_continuity_broken_all = true;
+        }
+    }
+    /// NEW-39 fix12: persist a live-drain custody refusal for the
+    /// EXACT `(pid, starttime)` historical incarnation (called from
+    /// the live-drain startup validation once its retire completes
+    /// EVICTING — the seal can no longer revalidate a discarded
+    /// source, so without this record its stale readable counters
+    /// would certify zero). NEW-41 fix13: retirement-recheck and
+    /// reconcile-match refusals call this too (their retire's
+    /// incoming gap skips its own recheck, so the recheck is the
+    /// only observation point). Only DIRECTLY OBSERVED refusals
+    /// reach here: the evicted rows' own site revalidation
+    /// produced the gap (a healed transient preserves instead of
+    /// evicting and persists nothing — the seal revalidates the
+    /// kept rows itself; ring-event and re-add retires carry
+    /// externally-attributed gaps and never call this; a record
+    /// mismatch over clean backing names a different
+    /// incarnation and never calls this — NEW-45 fix14: a
+    /// mismatch whose retained original genuinely refuses
+    /// DOES call this for the original's exact incarnation).
+    /// Retains state ONLY for the active claim cohort
+    /// (`claim_relevant`, same predicate family as the continuity
+    /// marks — an off-cohort incarnation can earn no receipt, so
+    /// its refusal would be meaningless). Bounded like the marks
+    /// with the same fail-closed session-wide latch on overflow.
+    /// Re-persists are idempotent.
+    fn persist_historical_custody_refusal(
+        &mut self,
+        pid: u32,
+        starttime: u64,
+        claim_relevant: bool,
+        b: &mut ObservationBatch,
+    ) {
+        if self.retired_custody_refusals.contains(&(pid, starttime)) {
+            return;
+        }
+        if !claim_relevant {
+            return;
+        }
+        if self.retired_custody_refusals.len() < self.budget.limits.max_processes {
+            self.retired_custody_refusals.insert((pid, starttime));
+        } else {
+            b.gap(ObservationGap::StateLimit);
+            self.scope_continuity_broken_all = true;
+        }
+    }
     fn retire_for_gap(
         &mut self,
         pid: u32,
@@ -2636,7 +3336,37 @@ impl ProviderSession {
                 .startup
                 .get(&pid)
                 .is_some_and(|rows| rows.iter().any(|a| !a.links.is_empty()));
-        let outcome = retire_source_owners(
+        // NEW-31-OPEN fix9: snapshot claim-cohort relevance at
+        // retire ENTRY (the completion path below runs after the
+        // target is gone, when liveness no longer reads).
+        // NEW-38 fix11: the retiring incarnation is the live
+        // target at entry — exact `(pid, starttime)` relevance.
+        // No live target (a targetless reuse-race retire, a stale
+        // re-retire) disarms no live plane — pre-target rows
+        // never entered a claim snapshot — so nothing marks.
+        let retiring_starttime = self.targets.get(&pid).map(|t| t.starttime);
+        let claim_relevant = retiring_starttime.is_some_and(|starttime| {
+            self.retiring_incarnation_in_active_claim_cohort(pid, starttime)
+        });
+        // FLAG-C fix9: snapshot the live operational-gap verdict
+        // (post-quarantine-exclusion) at retire ENTRY — a
+        // preserving completion removes the target, so the seal
+        // can no longer read it there.
+        let retiring_gap: Option<(u64, bool)> = self.targets.get(&pid).map(|target| {
+            (
+                target.starttime,
+                Self::live_target_has_operational_gap(target),
+            )
+        });
+        // NEW-36 fix10: snapshot exact-incarnation cohort
+        // membership at retire ENTRY too (the completion path
+        // below runs after the target is gone) — terminal-gap
+        // verdicts retain only for exact members of the
+        // established cohort.
+        let retiring_cohort_exact = retiring_gap.is_some_and(|(starttime, _)| {
+            self.retiring_incarnation_in_claim_cohort(pid, starttime)
+        });
+        let (outcome, observed) = retire_source_owners(
             (&mut self.startup, &mut self.targets),
             &mut self.aliases,
             pid,
@@ -2666,11 +3396,32 @@ impl ProviderSession {
             offload_fd_drop,
             |links| fd_dropper().can_absorb_links(links),
         );
+        // NEW-41 fix13: a directly-observed recheck refusal
+        // persists for the EXACT incarnation whenever the retire
+        // does not complete preserving — evicting completions
+        // (the seal can no longer revalidate a discarded source)
+        // AND deferrals (the disarm already ran — the same
+        // transition the deferred arm below voids coverage at —
+        // and a retry's re-recording can skip the recheck, so a
+        // deferred eviction must not drop the observation).
+        // Externally-attributed gaps (no recheck ran) and
+        // record-mismatch rechecks over clean backing (a
+        // different incarnation) carry no observation and
+        // persist nothing — the N38 reuse control keeps
+        // receipting. NEW-45 fix14: a mismatch whose retained
+        // original genuinely refuses carries the original's
+        // observation and persists it here.
+        if !matches!(outcome, RetireOutcome::Retired(true)) {
+            if let Some((rpid, starttime)) = observed {
+                let relevant = self.retiring_incarnation_in_active_claim_cohort(rpid, starttime);
+                self.persist_historical_custody_refusal(rpid, starttime, relevant, b);
+            }
+        }
         // R4-4: a deferred retire keeps everything (refreshing
         // handoff, spend, sources) for the retry — nothing arms
         // (no victims detached) and every caller skips its
         // post-retire bookkeeping.
-        if let RetireOutcome::Deferred(links) = outcome {
+        if let RetireOutcome::Deferred { links, preserve } = outcome {
             // R5-3: persist the retry intent (with the retire's
             // gap for the retry) — the next reconcile drains it
             // FIRST, before validation/readiness shortcuts.
@@ -2682,6 +3433,29 @@ impl ProviderSession {
             // Exec displaces non-Exec; otherwise first-wins).
             self.record_pending_op(pid, gap, PendingOp::Plain);
             fd_dropper().note_deferred(links);
+            // NEW-24-OPEN/NEW-29 fix8: the disarm ALREADY ran
+            // (deferral implies disarmed — the probe fails only
+            // after a successful disarm), so coverage voids AT
+            // this transition, not at the retry's completion (a
+            // seal while still deferred must see the gap):
+            // invalidate BOTH planes (operational continuity for
+            // non-terminal retires — a deferred terminal retire is
+            // still an orderly exit and never marks — plus every
+            // arm instant on the kept target) and retire readiness
+            // (a disarmed plane cannot establish a claim; the
+            // retry's re-add re-arms and re-readies through the
+            // production path).
+            if !preserve {
+                if let Some(starttime) = retiring_starttime {
+                    self.mark_scope_continuity_broken(pid, starttime, claim_relevant, b);
+                }
+            }
+            if let Some(target) = self.targets.get_mut(&pid) {
+                for a in target.attachments.iter_mut() {
+                    a.armed_ns = None;
+                }
+                target.ready = false;
+            }
             return outcome;
         }
         // R5-3: completion clears the target retry intent
@@ -2692,6 +3466,50 @@ impl ProviderSession {
         // the startup retry to collect.
         self.pending_retire.remove(&pid);
         self.refreshing.remove(&pid);
+        // NEW-24 fix7: a completed NON-TERMINAL retire disarmed
+        // the plane mid-run — operational coverage is no longer
+        // continuous across the claimed interval, so the terminal
+        // scope receipt must not grant (a later re-add re-arms
+        // late; the old admitted counter's successful read vouches
+        // only for its fragments). Terminal (preserving) retires
+        // never mark — an orderly exit ends observation, it never
+        // gaps it. NEW-24-OPEN fix8: deferred retires mark at the
+        // disarm transition above (same helper — the completion
+        // mark below is idempotent for them).
+        if !matches!(outcome, RetireOutcome::Retired(true)) {
+            if let Some(starttime) = retiring_starttime {
+                self.mark_scope_continuity_broken(pid, starttime, claim_relevant, b);
+            }
+        }
+        // FLAG-C fix9: a preserving completion removes the target
+        // (and its live gap verdict) while claim-eligible cookies
+        // survive — retain the verdict for the EXACT claimed
+        // incarnation, so a clean sibling read cannot certify the
+        // blind site at the seal. Only post-exclusion gaps retain
+        // (quarantine-only verdicts never void). NEW-36 fix10:
+        // only exact members of the established cohort retain (a
+        // late or otherwise off-cohort retiree can earn no receipt
+        // — its verdict must not consume the cap or fire the
+        // latch). Bounded like continuity: overflow fails closed
+        // into the same session-wide latch (a dropped verdict
+        // would grant a false zero).
+        if matches!(outcome, RetireOutcome::Retired(true)) {
+            // An off-cohort preserving retire retains nothing and
+            // fires no latch (its verdict is moot — it can earn no
+            // receipt); the release bookkeeping below still runs.
+            if let Some((starttime, true)) = retiring_gap {
+                if retiring_cohort_exact
+                    && !self.retired_operational_gaps.contains(&(pid, starttime))
+                {
+                    if self.retired_operational_gaps.len() < self.budget.limits.max_processes {
+                        self.retired_operational_gaps.insert((pid, starttime));
+                    } else {
+                        b.gap(ObservationGap::StateLimit);
+                        self.scope_continuity_broken_all = true;
+                    }
+                }
+            }
+        }
         // Retire-time budget release (R3-2: lazy, worker-gated):
         // a retire that detaches victims ARMS the release gate —
         // the worker may hold the retired links (kernel programs
@@ -2756,6 +3574,39 @@ impl ProviderSession {
             return;
         }
         self.fenced.insert(pid, edge_ns);
+        // P2fix2 item 13: the irreversible trace fold cannot exclude
+        // pairs consumed before this edge armed — note the cut so an
+        // overrun taints (`late-cut`) instead of silently standing.
+        // Post-arm records past the edge never feed (consume's live
+        // fence check), so only pre-arm consumption can overrun.
+        self.trace.note_cut_edge(pid, edge_ns);
+        // NEW-2: open a sealed excluded interval (an already-open
+        // interval keeps the earliest edge, like the live fence; a
+        // recovered pid appends a fresh cycle and keeps the old
+        // ones — replay excludes their union). NEW-5-OPEN: past
+        // the per-pid cap the oldest closed pair merges into its
+        // span (never dropped) — counted for the seal gap.
+        let merged = {
+            let intervals = self.sealed_fences.entry(pid).or_default();
+            retain_sealed_cut(intervals, edge_ns)
+        };
+        if merged {
+            self.sealed_cut_merges = self.sealed_cut_merges.saturating_add(1);
+        }
+        // NEW-P1-OPEN: a fence stops the plane (rows removed
+        // below) — void every arm instant for the pid so the seal
+        // cannot claim coverage over a stopped plane. Re-adds mint
+        // fresh attachments with fresh (late) arm times.
+        if let Some(target) = self.targets.get_mut(&pid) {
+            for a in &mut target.attachments {
+                a.armed_ns = None;
+            }
+        }
+        if let Some(rows) = self.startup.get_mut(&pid) {
+            for a in rows {
+                a.armed_ns = None;
+            }
+        }
         let _ = self.members.remove(&pid);
         if let Some(target) = self.targets.get(&pid) {
             for a in &target.attachments {
@@ -2772,6 +3623,180 @@ impl ProviderSession {
     /// 6A provider-plane fence conservation, taken once at seal.
     pub(crate) fn take_fence_withheld(&mut self) -> u64 {
         std::mem::take(&mut self.fence_withheld)
+    }
+    /// Incarnation fence edge for one pid (NEW-P2): facts past this
+    /// monotonic-ns edge are wrong-incarnation. Read at seal so the
+    /// request projection excludes late-fenced edges even when they
+    /// were fed before the fence arrived.
+    /// NEW-2 sealed fence cuts for one pid: the excluded intervals
+    /// `(edge, resume)` retained through seal across recovery
+    /// drains (see `sealed_fences`). `finish` projects the request
+    /// fold through these — never through the live `fenced` entry
+    /// a recovery drain clears.
+    pub(crate) fn sealed_fence_cuts(&self, pid: u32) -> Vec<(u64, Option<u64>)> {
+        self.sealed_fences.get(&pid).cloned().unwrap_or_default()
+    }
+    /// NEW-5-OPEN: take (drain) the cut-store merge count — the
+    /// seal surfaces a gap when nonzero (merged spans
+    /// over-exclude valid edges, never silently).
+    pub(crate) fn take_sealed_cut_merges(&mut self) -> u64 {
+        std::mem::take(&mut self.sealed_cut_merges)
+    }
+    /// NEW-5-OPEN retained-memory reservation for worst-case
+    /// sealed cuts: every admittable pid at the full per-pid cap
+    /// plus map slack, held by the focused session lease for the
+    /// session lifetime (single-sourced from the admission bound
+    /// and [`MAX_SEALED_FENCE_CUTS`]; the reservation test pins
+    /// the equality).
+    pub(crate) fn sealed_cuts_reserve_bytes() -> usize {
+        super::schema::ObservationLimits::default()
+            .max_processes
+            .saturating_mul(MAX_SEALED_FENCE_CUTS)
+            .saturating_mul(std::mem::size_of::<(u64, Option<u64>)>())
+            .saturating_add(64)
+    }
+    /// NEW-31-OPEN fix9: retained-memory reservation for worst-case
+    /// scope-retention state — the continuity set (one incarnation
+    /// per admittable process at the session cap) plus the FLAG-C
+    /// terminal-gap verdicts (one `(pid, starttime)` pair per
+    /// admittable process at the same cap) plus the NEW-39
+    /// historical custody refusals (one exact pair per admittable
+    /// process at the same cap), plus the explicit header
+    /// allowance — held by the focused session lease for the
+    /// session lifetime (single-sourced from the admission bound;
+    /// the reservation test pins the equality). NEW-31-OPEN fix10:
+    /// this is the ACTUAL worst-case
+    /// storage, not a key-payload estimate — all three sets are
+    /// [`SortedVecSet`]s built with `with_cap(max_processes)` (one
+    /// exact heap block each, never reallocated while callers hold
+    /// `len ≤ cap`). NEW-38 fix11: the continuity keys are exact
+    /// `(pid, starttime)` pairs too, so the heap worst case is
+    /// exactly `cap × (16 + 16 + 16)` bytes. NEW-42 fix13: all
+    /// three `Vec` headers are charged EXPLICITLY (three measured
+    /// headers — 72 bytes on 64-bit — never a literal: the old
+    /// `+64` undercharged three 24-byte headers).
+    pub(crate) fn scope_retention_reserve_bytes() -> usize {
+        super::schema::ObservationLimits::default()
+            .max_processes
+            .saturating_mul(
+                std::mem::size_of::<(u32, u64)>()
+                    .saturating_add(std::mem::size_of::<(u32, u64)>())
+                    .saturating_add(std::mem::size_of::<(u32, u64)>()),
+            )
+            .saturating_add(3usize.saturating_mul(std::mem::size_of::<Vec<(u32, u64)>>()))
+    }
+    /// Effective fetch coverage (NEW-P1-OPEN seal rule, NEW-P1
+    /// fix3 claimed-interval form, NEW-10 fix4 site form): from the
+    /// sealed incarnation's attachments as `(api, armed_ns)` pairs
+    /// plus the session window start/epoch/latch/site-gaps, the
+    /// fetch APIs whose silence is an honest in-window zero.
+    /// Covered ⟺ fetch API, armed at or before the
+    /// claimed-interval start (effective admission — the blind
+    /// setup prefix stays outside the claim), a drain on record
+    /// (the seal always drains), never fence-voided (`armed_ns:
+    /// None`), no in-window loss latched (a dropped edge may have
+    /// been the missing one), and EVERY eligible site armed (no
+    /// site gap — one armed export never certifies a surface whose
+    /// second site stayed blind). Pure over its inputs so the
+    /// session path pins without BPF maps.
+    fn fetch_coverage_effective(
+        attachments: &[(u32, Option<u64>)],
+        window_start: Option<u64>,
+        epoch: Option<u64>,
+        broken: bool,
+        site_gaps: &BTreeSet<u32>,
+    ) -> BTreeSet<u32> {
+        if broken {
+            return BTreeSet::new();
+        }
+        let Some(start) = window_start else {
+            return BTreeSet::new();
+        };
+        if epoch.is_none() {
+            return BTreeSet::new();
+        }
+        attachments
+            .iter()
+            .filter(|(_, armed)| armed.is_some_and(|t| t <= start))
+            .map(|(api, _)| *api)
+            .filter(|id| c::fetch_api(*id))
+            .filter(|id| !site_gaps.contains(id))
+            .collect()
+    }
+
+    /// Fetch surface IDs with live probe coverage for one incarnation
+    /// (NEW-P1): the fetch APIs with an armed attachment on the
+    /// matching `(pid, starttime)` target. Refused, missing, retired,
+    /// post-claim-armed, fence-voided, loss-uncertain, or
+    /// terminal-custody-less (NEW-8-OPEN + NEW-17 fix5: a terminal
+    /// pid's fetch attachment contributes only with its own
+    /// validated original) surfaces are absent — their absent
+    /// request rows are unknown, never in-window zeros. Read at
+    /// seal (after the closing batch, before link teardown).
+    pub(crate) fn armed_fetch_ids(&self, pid: u32, starttime: u64) -> BTreeSet<u32> {
+        // NEW-8(b) fix4: a final source refusal discards the pid's
+        // queued records — without valid source custody the stale
+        // arms certify nothing (already-fed positives still
+        // project through the caller's fold).
+        if self.final_refusals.contains_key(&pid) {
+            return BTreeSet::new();
+        }
+        let target = self
+            .targets
+            .get(&pid)
+            .filter(|target| target.starttime == starttime);
+        let pairs: Vec<(u32, Option<u64>)> = target
+            .map(|target| {
+                target
+                    .attachments
+                    .iter()
+                    .map(|a| (a.api, a.armed_ns))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // NEW-10: APIs with an eligible-but-unarmed site stay
+        // uncovered (surface-wide silence needs EVERY site).
+        let no_target_no_gaps = BTreeSet::new();
+        let site_gaps = target
+            .map(|target| &target.site_gap_apis)
+            .unwrap_or(&no_target_no_gaps);
+        // NEW-8-OPEN + NEW-17 fix5: a terminal pid's fetch
+        // attachments contribute coverage only with terminal
+        // custody EACH — one valid startup original must not
+        // authorize a sibling mapped-only fetch whose edge the
+        // terminal binding drops (per-cookie refusal voids the
+        // surface, like the whole-PID refusal above).
+        // NEW-10-OPEN + NEW-19 fix5: discovery uncertainty
+        // withholds too — an inventoried exporter no discovery
+        // pass resolved (stale inventory, refused parse) leaves
+        // its surface blind even when a sibling exporter armed
+        // (lazy seal read: the process set only grows, so the
+        // verdict always sees current uncertainty; a fresh
+        // acquisition re-resolves from scratch).
+        let mut gaps = site_gaps.clone();
+        if let Some(target) = target {
+            gaps.extend(unresolved_wire_ids(
+                &target.process.unresolved_inventoried(),
+            ));
+        }
+        if self.final_terminal.contains(&pid) {
+            if let Some(target) = target {
+                gaps.extend(
+                    target
+                        .attachments
+                        .iter()
+                        .filter(|a| c::fetch_api(a.api) && !terminal_custody(a))
+                        .map(|a| a.api),
+                );
+            }
+        }
+        Self::fetch_coverage_effective(
+            &pairs,
+            self.coverage_window_start_ns,
+            self.coverage_epoch_ns,
+            self.fetch_coverage_broken,
+            &gaps,
+        )
     }
     /// R7-1: true while a deferred exec retry is outstanding (a
     /// recorded `PendingOp::Exec`). The focused layer latches
@@ -2865,6 +3890,7 @@ impl ProviderSession {
     /// OUTPUT (over-limit facts fold to `FactLimit`/`StateLimit`
     /// gaps per fact — no silent drops, no unbounded facts).
     fn retire_drain(&mut self) -> bool {
+        self.note_coverage_epoch();
         let mut scratch = ObservationBatch::default();
         let mut consumed = 0usize;
         let mut empty_polls = 0u32;
@@ -2900,14 +3926,12 @@ impl ProviderSession {
             match event {
                 Ok(e) => self.consume(e, &mut scratch),
                 Err(g) => {
-                    self.aliases.clear();
+                    self.note_wire_rejection(g, &mut scratch);
                     // fix4 (R4-2): a decode error invalidates the
                     // WHOLE carry (pre-existing + scratch), not
                     // just this drain's scratch — carried
                     // attribution is exactly as suspect.
-                    invalidate_algorithms(&mut scratch);
                     invalidate_algorithms(&mut self.retire_carry);
-                    scratch.gap(g);
                 }
             }
         }
@@ -3049,7 +4073,7 @@ impl ProviderSession {
             // Completion clears the marker (inside
             // `retire_for_gap`); a re-deferral re-records it for
             // the next reconcile.
-            if !matches!(outcome, RetireOutcome::Deferred(_)) {
+            if !matches!(outcome, RetireOutcome::Deferred { .. }) {
                 // R6-1: the retry performs the original caller's
                 // lifecycle effects EXACTLY ONCE — the target is
                 // gone, so the later caller cannot run and
@@ -3238,7 +4262,7 @@ impl ProviderSession {
                     // count fence arms with the preceding-clean
                     // edge immediately — the witness still rides
                     // retry completion.
-                    if matches!(outcome, RetireOutcome::Deferred(_)) {
+                    if matches!(outcome, RetireOutcome::Deferred { .. }) {
                         let edge = LiveClock.monotonic_ns();
                         self.fence_target(pid, edge);
                         self.record_pending_op(pid, gap, PendingOp::Exec { edge_ns: edge });
@@ -3266,7 +4290,7 @@ impl ProviderSession {
                     // operation (the retry hands off + notifies
                     // exactly once); the drain recomputes the
                     // handoff from the kept target.
-                    if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
+                    if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred { .. }) {
                         self.record_pending_op(
                             pid,
                             ObservationGap::Invalidated,
@@ -3285,7 +4309,7 @@ impl ProviderSession {
             // R4-4: a deferred retire preserves nothing yet (the
             // re-add still strands on the kept target — the retry
             // re-preserves).
-            if !matches!(outcome, RetireOutcome::Deferred(_)) {
+            if !matches!(outcome, RetireOutcome::Deferred { .. }) {
                 if let Some(retained) = preserved {
                     self.refreshing.insert(pid, retained);
                     readd_deferred.push(pid);
@@ -3319,9 +4343,22 @@ impl ProviderSession {
                     self.retire_for_gap(pid, record, ObservationGap::ProcessUnavailable, &mut b);
                     continue;
                 }
-                Err(gap) => {
+                Err(failure) => {
+                    // NEW-41 fix13: the same provenance rule as
+                    // the historical branch — a directly-observed
+                    // backing refusal persists for the exact
+                    // incarnation before the evicting retire (the
+                    // retire's own gap skips its recheck). NEW-45
+                    // fix14: that includes a mismatch whose
+                    // retained original genuinely refuses; a
+                    // mismatch over clean backing retains nothing.
+                    if let Some((rpid, starttime)) = failure.observed {
+                        let relevant =
+                            self.retiring_incarnation_in_active_claim_cohort(rpid, starttime);
+                        self.persist_historical_custody_refusal(rpid, starttime, relevant, &mut b);
+                    }
                     self.retire(pid, &mut b);
-                    b.gap(gap);
+                    b.gap(failure.gap);
                     continue;
                 }
                 Ok(false) => (),
@@ -3331,7 +4368,7 @@ impl ProviderSession {
             // operation (the retry hands off + notifies exactly
             // once — the R6-1 twin of the additive path); the
             // drain recomputes the handoff from the kept target.
-            if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
+            if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred { .. }) {
                 self.record_pending_op(pid, ObservationGap::Invalidated, PendingOp::Refresh);
             } else {
                 self.refreshing.insert(pid, retained);
@@ -3344,6 +4381,18 @@ impl ProviderSession {
                 || additive_refreshed.contains(&record.pid)
                 || drained_skip.contains(&record.pid)
                 || self.exec_sealed.contains(&record.pid)
+                // NEW-29 fix8: a pid with an outstanding deferred
+                // retire is owned by its retry (drained first
+                // above) — the re-add loop must not resurrect its
+                // disarmed kept target (deferral retires
+                // readiness, so the ready skip below no longer
+                // protects it; re-adding would re-ready a
+                // disarmed plane and let stale readiness
+                // establish). Unready NON-pending targets (the
+                // SnapshotLag-kept tick1-partial shape) still
+                // re-add here — that production retry is the
+                // NEW-21-OPEN path.
+                || self.pending_retire.contains_key(&record.pid)
             {
                 continue;
             }
@@ -3378,20 +4427,57 @@ impl ProviderSession {
         record: &inventory::ProcessRecord,
         b: &mut ObservationBatch,
     ) -> Result<(), ObservationGap> {
-        if let Some(rows) = self
+        // The historical-branch recheck runs under a shared
+        // borrow (its owned verdict outlives the rows); the
+        // persistence below needs `&mut self`.
+        let historical_recheck = self
             .startup
             .get(&record.pid)
             .filter(|rows| rows.iter().any(|a| a.historical))
-        {
-            if terminal_originals(rows, None, Some(record))? {
-                return Ok(());
+            .map(|rows| terminal_originals(rows, None, Some(record)));
+        if let Some(recheck) = historical_recheck {
+            match recheck {
+                Ok(true) => return Ok(()),
+                Ok(false) => return Err(ObservationGap::Invalidated),
+                Err(failure) => {
+                    // NEW-41 fix13: a genuine backing refusal under
+                    // a MATCHING historical record persists for
+                    // the exact incarnation BEFORE the evicting
+                    // retire reconcile runs — that retire's
+                    // incoming gap skips its own recheck, so this
+                    // is the only observation point. NEW-45
+                    // fix14: a mismatch whose retained original
+                    // genuinely refuses persists the same way
+                    // (`observed` carries the original's exact
+                    // incarnation); a mismatch over clean backing
+                    // (a different incarnation) or a gap
+                    // reconcile does not retire on persists
+                    // nothing.
+                    if let Some((rpid, starttime)) = failure.observed {
+                        if identity_failure(failure.gap) {
+                            let relevant =
+                                self.retiring_incarnation_in_active_claim_cohort(rpid, starttime);
+                            self.persist_historical_custody_refusal(rpid, starttime, relevant, b);
+                        }
+                    }
+                    return Err(failure.gap);
+                }
             }
-            return Err(ObservationGap::Invalidated);
         }
         let mut target = if let Some(target) = self.targets.remove(&record.pid) {
             target
         } else {
-            let process = if let Some(retained) = self.refreshing.get(&record.pid) {
+            // NEW-21 fix7 staged-process seam (test-only): a
+            // caller-staged process is adopted INSTEAD of
+            // acquiring (one-shot). Everything below — resolve,
+            // attach, arm, commit — is production.
+            #[cfg(test)]
+            let staged = self.process_override.borrow_mut().remove(&record.pid);
+            #[cfg(not(test))]
+            let staged: Option<objects::VerifiedProcess> = None;
+            let process = if let Some(staged) = staged {
+                staged
+            } else if let Some(retained) = self.refreshing.get(&record.pid) {
                 objects::acquire_with_incarnation(record, &mut self.budget, Some(retained))?
             } else {
                 let Some(process) = acquire_observable(record, &mut self.budget)? else {
@@ -3433,6 +4519,7 @@ impl ProviderSession {
                 attachments: Vec::new(),
                 ranges: 0,
                 ready: false,
+                site_gap_apis: BTreeSet::new(),
             }
         };
         let generation = target.generation;
@@ -3462,7 +4549,13 @@ impl ProviderSession {
             // accounting on every early return as well as the normal path.
             let mut staging = Vec::new();
             let mut public_sites = Vec::new();
-            for id in (1..=16).chain(20..=72) {
+            // NEW-10-OPEN fix6: open a new API-discovery pass — the
+            // pass-scoped unresolved set resets and failures during
+            // this loop re-record (cached refusals persist across
+            // passes; healed transients clear — the clean pass
+            // proves coverage from the claim start).
+            target.process.begin_api_discovery_pass();
+            for id in wire::attach_ids() {
                 for resolved in target.process.resolve_api(wire::api(id)?) {
                     self.roles.observe(
                         role_site(pid, record.starttime, &resolved.site),
@@ -3485,12 +4578,25 @@ impl ProviderSession {
             for (id, resolved) in public_sites {
                 let key = role_site(pid, record.starttime, &resolved.site);
                 if !self.roles.accepts(key, id) {
+                    // NEW-10: the conflicted site goes blind for
+                    // every API that held it — record the gap for
+                    // the skipped id and each disarmed attachment
+                    // (surface-wide silence needs every site).
+                    let blind: Vec<u32> = target
+                        .attachments
+                        .iter()
+                        .filter(|a| same_site(&a.site, &resolved.site))
+                        .map(|a| a.api)
+                        .collect();
                     disarm_site(&mut target, &resolved.site, &mut self.config)?;
+                    target.site_gap_apis.insert(id);
+                    target.site_gap_apis.extend(blind);
                     if let Some(rows) = self.startup.get_mut(&pid) {
                         while let Some(index) =
                             rows.iter().position(|a| same_site(&a.site, &resolved.site))
                         {
                             let a = rows.swap_remove(index);
+                            target.site_gap_apis.insert(a.api);
                             let _ = self.config.remove(&a.cookie);
                             drop(a.links);
                         }
@@ -3511,6 +4617,7 @@ impl ProviderSession {
                 }) {
                     let mut a = self.startup.get_mut(&pid).unwrap().swap_remove(index);
                     let task_off = self.task_start_off;
+                    let arm_ns = LiveClock.monotonic_ns();
                     let adopt = (|| {
                         a.adopt_site(resolved.site)?;
                         arm_attachment(
@@ -3522,13 +4629,16 @@ impl ProviderSession {
                             task_off,
                         )
                     })();
-                    target.attachments.push(a);
                     if let Err(gap) = adopt {
-                        let _ = self
-                            .config
-                            .remove(&target.attachments.last().unwrap().cookie);
+                        let _ = self.config.remove(&a.cookie);
                         return Err(gap);
                     }
+                    // Adopt armed: the arm instant (NEW-P1-OPEN
+                    // effective coverage). Admission commits below
+                    // for live attachments once the matching
+                    // membership is live (NEW-6).
+                    a.armed_ns = Some(arm_ns);
+                    target.attachments.push(a);
                     continue;
                 }
                 let advertisers = if id == c::PROVIDER_INIT {
@@ -3545,8 +4655,9 @@ impl ProviderSession {
                     generation,
                     true,
                 ) {
-                    Ok(a) => {
+                    Ok(mut a) => {
                         let task_off = self.task_start_off;
+                        let arm_ns = LiveClock.monotonic_ns();
                         arm_attachment(
                             &mut self.config,
                             &target.process,
@@ -3555,9 +4666,18 @@ impl ProviderSession {
                             generation,
                             task_off,
                         )?;
+                        a.armed_ns = Some(arm_ns);
                         target.attachments.push(a)
                     }
-                    Err(g) => cold_attach_error(g, b)?,
+                    Err(g) => {
+                        cold_attach_error(g, b)?;
+                        // NEW-10: soft failure (the hard arm
+                        // above fails the pass instead) — an
+                        // eligible site stayed blind, so the
+                        // surface's silence is unknowable even
+                        // when a sibling site armed.
+                        target.site_gap_apis.insert(id);
+                    }
                 }
             }
             drop(staging);
@@ -3584,6 +4704,33 @@ impl ProviderSession {
             self.members
                 .insert(pid, mapped_member(previous, generation, target.ranges)?, 0)
                 .map_err(|_| ObservationGap::AttachFailed)?;
+            // NEW-6: the matching membership is live — commit
+            // admission for every CURRENTLY-ARMED operational
+            // attachment on this target (CONFIG row live, same
+            // generation — re-checked per cookie, so a fenced or
+            // disarmed plane admits nothing). This MUST cover arms
+            // from earlier partial passes of the same incarnation:
+            // retries reuse the kept target and skip re-arming
+            // live attachments, so staging only the current pass
+            // would strand them with no receipt (the focused
+            // tick1-partial/tick2-complete pattern). A
+            // static-candidate or membership failure before this
+            // point still admits nothing (no commit runs).
+            // Independently recorded positives are preserved
+            // (additive — never cleared).
+            let live: Vec<u64> = target
+                .attachments
+                .iter()
+                .filter(|a| c::operational_api(a.api))
+                .filter(|a| {
+                    matches!(
+                        self.config.get(&a.cookie, 0),
+                        Ok(row) if row.generation == generation
+                    )
+                })
+                .map(|a| a.cookie)
+                .collect();
+            self.api_admitted.extend(live);
             // The second check fences setup changes after all links and membership.
             target.process.revalidate_fresh()?;
             if let Some(gap) = recorded_refusal(&target.process) {
@@ -3625,7 +4772,7 @@ impl ProviderSession {
                 // yet (the retry re-preserves).
                 if !matches!(
                     self.retire_for_gap(pid, Some(record), g, b),
-                    RetireOutcome::Deferred(_)
+                    RetireOutcome::Deferred { .. }
                 ) {
                     if let Some(retained) = preserved {
                         self.refreshing.insert(pid, retained);
@@ -3664,7 +4811,12 @@ impl ProviderSession {
     /// survivors would be correct; the downgrade over-approximates
     /// (downgrade ⊇ affected). The ACCOUNTING (`loss_totals`) is
     /// independently load-bearing for the coordinator ledger.
-    fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) {
+    /// Returns true iff ALL eight lanes read successfully
+    /// (P2fix7 NEW-47 — the terminal drain gates its positive
+    /// receipt on it; live drains ignore it since later reads
+    /// self-heal).
+    fn poll_loss_lanes(&mut self, b: &mut ObservationBatch) -> bool {
+        let mut all_ok = true;
         for index in 0..8 {
             // fix7 (R7-2): sample the receipt tick BEFORE the map
             // read. A completion-time stamp certifies coverage the
@@ -3686,6 +4838,10 @@ impl ProviderSession {
                     self.last_accounted_tick[index] = tick;
                     let total = values.iter().fold(0u64, |sum, v| sum.saturating_add(*v));
                     if total > self.last_loss[index] {
+                        // NEW-P1-OPEN: accounted loss voids every
+                        // in-window zero (a dropped edge may have
+                        // been the missing one).
+                        self.fetch_coverage_broken = true;
                         self.loss_totals[index] =
                             self.loss_totals[index].saturating_add(total - self.last_loss[index]);
                         self.aliases.clear();
@@ -3695,12 +4851,27 @@ impl ProviderSession {
                     }
                 }
                 Err(_) => {
+                    // NEW-7: a failed TERMINAL loss-map read voids
+                    // in-window zeros (no future drain exists to
+                    // account the delta later — unobserved loss may
+                    // hide there). Mid-run failures self-heal (a
+                    // later read accounts the delta, latching then
+                    // iff loss shows), so they latch nothing.
+                    // Surviving positives still project.
+                    // P2fix7 NEW-47: the failure reports (the
+                    // terminal drain gates its positive receipt
+                    // on all-success).
+                    all_ok = false;
+                    if self.final_drain {
+                        self.fetch_coverage_broken = true;
+                    }
                     self.aliases.clear();
                     invalidate_algorithms(b);
                     b.gap(ObservationGap::BpfUnavailable);
                 }
             }
         }
+        all_ok
     }
     /// N4 + fix7 (R7-2): sample the receipt tick for a CONSUMING
     /// LOSS map read. Called BEFORE the map read; the caller
@@ -3789,7 +4960,141 @@ impl ProviderSession {
             }
         }
     }
+    /// NEW-P1-OPEN: latch the coverage epoch at the first drain
+    /// pass (set-once — later passes must not move it). Called at
+    /// `drain` and `retire_drain` entries (the only ring
+    /// consumers): arms at or before it are setup arms covering
+    /// the window; later arms are late.
+    fn note_coverage_epoch(&mut self) {
+        if self.coverage_epoch_ns.is_none() {
+            self.coverage_epoch_ns = Some(LiveClock.monotonic_ns());
+        }
+    }
+
+    /// Shared wire-rejection arm (NEW-23 fix6 funnel): both ring
+    /// drains (`drain` + `retire_drain`) funnel decode failures
+    /// here — aliases cleared, attribution invalidated, gap
+    /// recorded. A rejected edge voids fetch zero eligibility (a
+    /// zero incarnation stamp is one concrete path: the record is
+    /// refused but the ring reservation may have succeeded, so an
+    /// edge is unaccounted — and its api word is untrusted, so no
+    /// surface can be excluded): already-fed positives still
+    /// project through the caller's fold. (The retire drain
+    /// additionally invalidates its whole carry at its call site.)
+    fn note_wire_rejection(&mut self, gap: ObservationGap, b: &mut ObservationBatch) {
+        // NEW-23: the rejected edge may have been the missing
+        // in-window one — void every in-window zero (pre-claim
+        // rejections clear at establishment like any pre-window
+        // loss, via `set_api_window`).
+        self.fetch_coverage_broken = true;
+        self.aliases.clear();
+        invalidate_algorithms(b);
+        b.gap(gap);
+        // P2fix2 item 5: every generic wire rejection taints trace
+        // pairing (the rejected edge is unaccounted — its api word
+        // is untrusted, so no pairing trust survives it). The
+        // unknown-ID subset ALSO counts under `reject_unknown`
+        // (counted once each, at the drain sites above this funnel
+        // — same `decode-reject` taint, exact per-cause counts).
+        self.trace.note_wire_rejection();
+    }
+
+    /// Terminal-drain quiescence re-poll (P2fix5 NEW-23, P2fix6
+    /// NEW-32, P2fix7 NEW-41): one more ring read behind a
+    /// terminal-drain `None`. One `None` is one quiet re-poll
+    /// (busy-or-empty — the drain samples ring positions past
+    /// it; `None`s alone never prove exhaustion); a record means
+    /// the head was busy (its bytes return owned for the exact
+    /// production fold path — never peeked-and-dropped: dropping
+    /// an aya item consumes it). The only test seam is the script
+    /// stack (inert unless armed — an empty script reads the real
+    /// ring).
+    fn terminal_quiesce_repoll(&mut self) -> QuiesceRepoll {
+        #[cfg(test)]
+        if let Some(scripted) = QUIESCE_SCRIPT.with(|s| s.borrow_mut().pop()) {
+            return match scripted {
+                None => QuiesceRepoll::Quiet,
+                Some(bytes) => {
+                    TERMINAL_QUIESCE_RECOVERIES.with(|c| c.set(c.get().saturating_add(1)));
+                    QuiesceRepoll::Recovered(bytes)
+                }
+            };
+        }
+        match self.events.next() {
+            None => QuiesceRepoll::Quiet,
+            Some(item) => {
+                #[cfg(test)]
+                TERMINAL_QUIESCE_RECOVERIES.with(|c| c.set(c.get().saturating_add(1)));
+                QuiesceRepoll::Recovered(item.to_vec())
+            }
+        }
+    }
+
+    /// Terminal-drain ring positions (P2fix7 NEW-41): the EVENTS
+    /// ringbuf's (consumer, producer) positions — the AFFIRMATIVE
+    /// exhaustion signal. `producer == consumer` proves zero
+    /// outstanding bytes: every reservation advances the producer
+    /// position at RESERVE time (kernel ringbuf ABI — the record
+    /// header carries BUSY until submit/discard), so a busy head
+    /// implies producer > consumer and equality rules it out by
+    /// construction (aya's `None` cannot — it conflates a busy
+    /// head with an empty ring). Positions come from a private
+    /// read-only mapping of the ringbuf meta pages (two pages at
+    /// file offset 0 — consumer word at +0, producer word at
+    /// +page_size). The only test seam is the position script
+    /// (inert unless armed — an empty script reads the real
+    /// mapping). `None` (unmappable/unreadable/scripted-blank)
+    /// is UNPROVED, never exhausted.
+    fn read_ring_positions(&self) -> Option<(u64, u64)> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        #[cfg(test)]
+        {
+            let scripted = RING_POSITION_SCRIPT.with(|s| {
+                let mut s = s.borrow_mut();
+                if s.len() > 1 {
+                    s.pop()
+                } else {
+                    s.last().cloned()
+                }
+            });
+            if let Some(sample) = scripted {
+                return sample;
+            }
+        }
+        // SAFETY: `sysconf` has no failure mode here beyond a
+        // non-positive return (checked); the events fd is borrowed
+        // from `&self` (alive across the call); the mapping is
+        // read-only, MAP_FAILED-checked, and unmapped before
+        // return; the two loads run through the checked
+        // positions helper on the mapped base.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        if page_size <= 0 {
+            return None;
+        }
+        let page_size = page_size as usize;
+        let len = page_size.checked_mul(2)?;
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                self.events.as_fd().as_raw_fd(),
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return None;
+        }
+        let sample = unsafe { read_positions_from_base(base as *const u8, page_size) };
+        unsafe {
+            libc::munmap(base, len);
+        }
+        Some(sample)
+    }
+
     pub fn drain(&mut self, deadline: Instant) -> ObservationBatch {
+        self.note_coverage_epoch();
         // fix3: the retire carry (if any) heads this batch (see
         // `reconcile_records` — same conservation; the final drain
         // funnels through here, so close emits the carry too).
@@ -3853,7 +5158,7 @@ impl ProviderSession {
                         // seals exactly once). R7-1: the batch also
                         // signals the DETECTION (`exec_deferred`)
                         // for the immediate focused count fence.
-                        if matches!(outcome, RetireOutcome::Deferred(_)) {
+                        if matches!(outcome, RetireOutcome::Deferred { .. }) {
                             let edge = LiveClock.monotonic_ns();
                             self.fence_target(pid, edge);
                             self.record_pending_op(pid, gap, PendingOp::Exec { edge_ns: edge });
@@ -3883,7 +5188,7 @@ impl ProviderSession {
                         // preserves its operation (the next
                         // reconcile's drain hands off + notifies
                         // exactly once).
-                        if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
+                        if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred { .. }) {
                             self.record_pending_op(
                                 pid,
                                 ObservationGap::Invalidated,
@@ -3901,7 +5206,7 @@ impl ProviderSession {
                 // (the retry re-preserves).
                 if !matches!(
                     self.retire_for_gap(pid, None, gap, &mut b),
-                    RetireOutcome::Deferred(_)
+                    RetireOutcome::Deferred { .. }
                 ) {
                     if let Some(retained) = preserved {
                         self.refreshing.insert(pid, retained);
@@ -3918,17 +5223,57 @@ impl ProviderSession {
                 .iter()
                 .map(|(&pid, rows)| {
                     let mut exited = false;
-                    let result = rows.iter().try_for_each(|a| {
-                        exited |= a.site.revalidate_queued()?;
-                        Ok::<_, ObservationGap>(())
-                    });
-                    (pid, result.map(|()| exited))
+                    // NEW-39 fix12: the failing rows' EXACT
+                    // historical incarnation, captured BEFORE the
+                    // retiring evict below (first refusal wins —
+                    // same-pid rows share one site identity and the
+                    // retire evicts them together).
+                    let mut refused: Option<(u32, u64)> = None;
+                    let result = rows
+                        .iter()
+                        .try_for_each(|a| match a.site.revalidate_queued() {
+                            Ok(e) => {
+                                exited |= e;
+                                Ok::<_, ObservationGap>(())
+                            }
+                            Err(gap) => {
+                                refused.get_or_insert((a.site.pid(), a.site.starttime()));
+                                Err(gap)
+                            }
+                        });
+                    (pid, result.map(|()| exited), refused)
                 })
                 .collect();
-            for (pid, result) in validation {
+            for (pid, result, refused) in validation {
                 match result {
                     Err(gap) => {
-                        self.retire_for_gap(pid, None, gap, &mut b);
+                        // NEW-39 fix12: a DIRECTLY OBSERVED custody
+                        // refusal (the rows' own revalidation
+                        // produced this gap) whose retire completes
+                        // EVICTING persists for the exact historical
+                        // incarnation — with no live target no
+                        // continuity mark records, and the seal can
+                        // no longer revalidate a discarded source.
+                        // A healed transient preserves instead (rows
+                        // kept — the seal revalidates them itself)
+                        // and a deferral keeps them for the retry
+                        // (the seal covers it pid-wide) — neither
+                        // persists here. No gap filter: once the
+                        // source is evicted on its own validation
+                        // failure, voiding is the only honest
+                        // verdict for every gap (mirroring the final
+                        // drain, which records every revalidation
+                        // failure).
+                        let outcome = self.retire_for_gap(pid, None, gap, &mut b);
+                        if matches!(outcome, RetireOutcome::Retired(false)) {
+                            if let Some((rpid, starttime)) = refused {
+                                let relevant = self
+                                    .retiring_incarnation_in_active_claim_cohort(rpid, starttime);
+                                self.persist_historical_custody_refusal(
+                                    rpid, starttime, relevant, &mut b,
+                                );
+                            }
+                        }
                         b.gap(gap);
                     }
                     Ok(true) => {
@@ -3955,21 +5300,46 @@ impl ProviderSession {
         // leaves un-consumed backlog for the next drain, which must
         // still run under the fence.
         let mut drained_clean = true;
+        // P2fix5 NEW-23 + P2fix6 NEW-32 + P2fix7 NEW-41:
+        // terminal exhaustion confirmation (AFFIRMATIVE ringbuf
+        // position equality — the positive receipt's ring half;
+        // live drains don't need it since the next drain
+        // continues the backlog). The count tracks consecutive
+        // producer==consumer samples across scheduling
+        // opportunities; any consumed record resets it.
+        let mut terminal_quiesced = false;
+        let mut equality_samples = 0u32;
         loop {
             if Instant::now() >= deadline {
+                // NEW-P1-OPEN: a live deadline overrun only delays
+                // (the kernel ring holds the backlog for the next
+                // drain), but the FINAL drain drops its remainder —
+                // that remainder may hold the missing edge.
+                if self.final_drain {
+                    self.fetch_coverage_broken = true;
+                }
                 b.gap(ObservationGap::DrainOverrun);
                 drained_clean = false;
                 break;
             }
-            let event = match self.events.next() {
-                Some(bytes) => {
-                    let event = wire::decode_transport(&bytes);
-                    if event.is_err() && wire::rejected_unknown_api(&bytes) {
-                        self.trace.reject_unknown();
+            // First poll (scoped: the ring borrow ends with the
+            // block, before the quiescence re-poll below
+            // re-borrows; the decoded event is owned).
+            let first = {
+                match self.events.next() {
+                    Some(bytes) => {
+                        let event = wire::decode_transport(&bytes);
+                        if event.is_err() && wire::rejected_unknown_api(&bytes) {
+                            self.trace.reject_unknown();
+                        }
+                        Some(event)
                     }
-                    event
+                    None => None,
                 }
-                // fix7 (R7-1 verdict (i)): a `None` break keeps
+            };
+            let event = match first {
+                Some(event) => event,
+                // fix7 (R7-1 verdict (i)): a LIVE `None` break keeps
                 // `drained_clean` even though `None` ≠ empty (a
                 // busy head hides queued records; producers may
                 // queue-and-lose while descheduled). The next
@@ -3978,25 +5348,150 @@ impl ProviderSession {
                 // other records), not a steal: the poll below stays
                 // as conservative defense-in-depth plus exact
                 // coordinator accounting.
-                None => break,
+                None if !self.final_drain => break,
+                // P2fix5 NEW-23 + P2fix6 NEW-32 + P2fix7 NEW-41:
+                // a TERMINAL-drain `None` is busy-or-empty —
+                // quiesce (yield so an in-flight commit lands;
+                // the writers detached at the terminal cut, so
+                // no NEW records start) and re-poll before
+                // believing it. A quiet re-poll proves NOTHING
+                // by itself (aya repeats `None` for the same
+                // busy head) — past it the drain samples ring
+                // positions (AFFIRMATIVE): producer==consumer
+                // proves zero outstanding bytes (a busy head
+                // implies producer > consumer), and
+                // [`TERMINAL_DRAIN_EQUALITY_SAMPLES`]
+                // consecutive equal samples across a
+                // scheduling opportunity prove writer
+                // quiescence + ring exhaustion. Outstanding or
+                // unreadable positions reset the count and wait
+                // (sleeping gives writers a scheduling
+                // opportunity); a recovered record resets the
+                // count and folds through the exact path below
+                // (the loop re-arms quiescence at the next
+                // `None`); an expired deadline fails closed
+                // (unproved).
+                None => {
+                    std::thread::yield_now();
+                    #[cfg(test)]
+                    TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.set(c.get().saturating_add(1)));
+                    if Instant::now() >= deadline {
+                        self.fetch_coverage_broken = true;
+                        b.gap(ObservationGap::DrainOverrun);
+                        drained_clean = false;
+                        break;
+                    }
+                    match self.terminal_quiesce_repoll() {
+                        QuiesceRepoll::Quiet => {
+                            match self.read_ring_positions() {
+                                Some((consumer, producer)) if consumer == producer => {
+                                    equality_samples += 1;
+                                    if equality_samples >= TERMINAL_DRAIN_EQUALITY_SAMPLES {
+                                        terminal_quiesced = true;
+                                        break;
+                                    }
+                                }
+                                // Outstanding bytes (busy head
+                                // or unread records) or
+                                // unreadable positions — NOT
+                                // exhausted: reset and keep
+                                // waiting for the proof.
+                                _ => {
+                                    equality_samples = 0;
+                                }
+                            }
+                            // Another scheduling opportunity
+                            // before the next sample (the
+                            // writer-quiescence wait —
+                            // recoveries never sleep, only
+                            // quiet spacing).
+                            std::thread::sleep(TERMINAL_QUIESCE_SAMPLE_SLEEP);
+                            continue;
+                        }
+                        QuiesceRepoll::Recovered(bytes) => {
+                            // (The fold below resets the
+                            // equality count — one reset point
+                            // for every consumed record.)
+                            let event = wire::decode_transport(&bytes);
+                            if event.is_err() && wire::rejected_unknown_api(&bytes) {
+                                self.trace.reject_unknown();
+                            }
+                            event
+                        }
+                    }
+                }
             };
             match event {
                 Ok(e) => self.consume(e, &mut b),
-                Err(g) => {
-                    self.aliases.clear();
-                    invalidate_algorithms(&mut b);
-                    b.gap(g);
-                }
+                Err(g) => self.note_wire_rejection(g, &mut b),
             }
+            // Any consumed record — first-poll or recovered —
+            // resets the equality count (P2fix6 NEW-32, P2fix7
+            // NEW-41: consecutive equal samples only; a record
+            // between samples proves the head was busy).
+            equality_samples = 0;
             if self.emitted >= self.budget.limits.max_facts {
+                // NEW-P1-OPEN: dropped backlog voids in-window zeros.
+                self.fetch_coverage_broken = true;
                 b.gap(ObservationGap::FactLimit);
                 drained_clean = false;
                 break;
             }
         }
+        // P2fix7 NEW-47: successful terminal loss-lane reads are
+        // IN the proof — the terminal loss poll runs BEFORE the
+        // receipt (no positive receipt before loss polling). Any
+        // failed lane latches the producer boundary (the seal
+        // withholds interpretations and C023 takes no validity
+        // credit for the quiet lane — the unread lane keeps its
+        // old value while unobserved loss may hide there) and
+        // voids the receipt. (The pre-existing dirty-final rule
+        // below still consumes here — no future drain exists to
+        // account the delta later.)
+        let mut terminal_loss_ok = true;
+        if self.final_drain {
+            terminal_loss_ok = self.poll_loss_lanes(&mut b);
+            if !terminal_loss_ok {
+                self.trace.note_boundary_failure();
+            }
+            // P2fix7 NEW-41 post-loss re-sample (cheap honest
+            // narrowing): a reserve landing between the last
+            // equality sample and the loss poll voids the proof
+            // (its record sits unfolded in the ring — the seal
+            // must withhold, never mint on it).
+            if terminal_quiesced && !matches!(self.read_ring_positions(), Some((c, p)) if c == p) {
+                terminal_quiesced = false;
+            }
+        }
+        // P2fix4 NEW-20 + P2fix5 NEW-23 + P2fix6 NEW-32 + P2fix7
+        // NEW-41/NEW-47: the terminal drain's completion enters
+        // trace settlement affirmatively (a dirty FINAL drain
+        // drops its remainder — the missing edge may be in it —
+        // so the producer boundary failed exactly like a failed
+        // gate close; prior taint carries, never clears).
+        // Cleanliness additionally requires affirmative
+        // position-equality (a bare `None` never proves
+        // exhaustion — only spaced producer==consumer samples
+        // store the positive drain receipt) AND all-successful
+        // terminal loss reads.
+        if self.final_drain {
+            self.trace
+                .note_terminal_drain(drained_clean && terminal_quiesced && terminal_loss_ok);
+        }
         if drained_clean {
+            // NEW-2: recovery clears the LIVE fence so post-recovery
+            // records flow — but the seal retains the excluded
+            // interval, closed with the unfence instant. Edges in
+            // `[edge, resume)` stay excluded at projection while
+            // valid facts on both sides still project.
+            let resume = LiveClock.monotonic_ns();
             for pid in std::mem::take(&mut self.unfence_after_drain) {
                 self.fenced.remove(&pid);
+                if let Some(intervals) = self.sealed_fences.get_mut(&pid) {
+                    for (_, slot) in intervals.iter_mut().filter(|(_, resume)| resume.is_none()) {
+                        *slot = Some(resume);
+                    }
+                }
             }
         }
         // fix6 (R6-3): clean-gated LOSS accounting — CONSUME (the
@@ -4031,10 +5526,15 @@ impl ProviderSession {
         // silent either way (a dirty break always rides
         // `DrainOverrun`/`FactLimit` on this batch, and
         // `finalize_until` appends `IntervalUnknown`).
-        if drained_clean || self.final_drain {
-            self.poll_loss_lanes(&mut b);
-        } else {
-            self.peek_loss_lanes(&mut b);
+        // P2fix7 NEW-47: final drains already consumed
+        // pre-receipt above (same consume rule, earlier) — no
+        // second poll. Live drains poll-or-peek here as before.
+        if !self.final_drain {
+            if drained_clean {
+                self.poll_loss_lanes(&mut b);
+            } else {
+                self.peek_loss_lanes(&mut b);
+            }
         }
         for pid in terminal {
             // R4-4: a deferred startup retire keeps rows and
@@ -4096,7 +5596,11 @@ impl ProviderSession {
         // 6D trace data plane: every decoded ATTEMPT/RESULT edge feeds the
         // pairing producer (mode-gated inside; fence/binding already applied).
         // The RESULT class comes from the RAW record outcome (D0-4 C1).
-        if r.kind == c::ATTEMPT || r.kind == c::RESULT {
+        // P2fix2 item 3: past the armed feed-cut the trace feed
+        // skips (outside the claimed interval — other planes fold
+        // normally under their own rules).
+        let trace_cut = self.trace_feed_cut.is_some_and(|cut| r.monotonic_ns >= cut);
+        if (r.kind == c::ATTEMPT || r.kind == c::RESULT) && !trace_cut {
             let key = super::trace::PairKey {
                 pid: r.pid,
                 tid: r.tid,
@@ -4231,6 +5735,8 @@ impl ProviderSession {
             *advertiser_candidates = advertisers;
         }
         if self.emitted >= self.budget.limits.max_facts {
+            // NEW-P1-OPEN: a dropped fact voids in-window zeros.
+            self.fetch_coverage_broken = true;
             b.gap(ObservationGap::FactLimit);
             return;
         }
@@ -4243,6 +5749,11 @@ impl ProviderSession {
                 _ => 0,
             };
         if self.budget.state(state).is_err() {
+            // NEW-7: a dropped fact voids in-window zeros (like the
+            // FactLimit drop above — a dropped edge may have been
+            // the missing one). Fed facts still project (surviving
+            // positives preserved).
+            self.fetch_coverage_broken = true;
             b.gap(ObservationGap::StateLimit);
             return;
         }
@@ -4254,6 +5765,9 @@ impl ProviderSession {
             Operation::Kdf => AlgorithmClass::Kdf,
             Operation::Rand => AlgorithmClass::Rand,
             Operation::Keymgmt | Operation::Keyexch | Operation::AsymCipher => AlgorithmClass::Key,
+            // SKEYMGMT manages provider-side symmetric-key objects:
+            // key material, not cipher execution.
+            Operation::Skeymgmt => AlgorithmClass::Key,
             Operation::Signature => AlgorithmClass::Signature,
             Operation::Kem => AlgorithmClass::Kem,
             Operation::Encoder | Operation::Decoder => AlgorithmClass::Encoding,
@@ -4548,12 +6062,52 @@ impl ProviderSession {
         match self.roles.observe(key, api, &self.budget) {
             Ok(true) => {}
             Ok(false) => {
+                // NEW-32 fix8: collect EVERY disarmed surface
+                // BEFORE the disarm removes the attachments (the
+                // conflicted API plus each same-site attachment's
+                // API — the add_target conflict path's `blind`
+                // shape).
+                let mut blind_ids: Vec<u32> = vec![api];
+                if let Some(target) = self.targets.get(&pid) {
+                    blind_ids.extend(
+                        target
+                            .attachments
+                            .iter()
+                            .filter(|a| same_site(&a.site, &site))
+                            .map(|a| a.api),
+                    );
+                }
+                let discarded: BTreeSet<ObservationApi> = blind_ids
+                    .iter()
+                    .filter_map(|id| wire::api(*id).ok())
+                    .collect();
                 let result =
                     disarm_site(self.targets.get_mut(&pid).unwrap(), &site, &mut self.config);
-                // A conflict may be discovered after earlier queued records in this
-                // batch. Do not return those facts/candidates as usable evidence.
-                b.facts.retain(|fact| fact.pid != pid);
-                b.learned_sites.retain(|candidate| candidate.pid != pid);
+                // Mark every disarmed surface — a surviving
+                // same-API sibling must not certify a surface
+                // whose evidence was just discarded (the seal
+                // voids these APIs: fetch coverage withholds
+                // them, and the operational receipt withholds on
+                // them — the void lands wherever the conflict
+                // discarded fetch evidence).
+                if let Some(target) = self.targets.get_mut(&pid) {
+                    target.site_gap_apis.extend(blind_ids.iter().copied());
+                }
+                // A conflict may be discovered after earlier
+                // queued records in this batch. Drop ONLY the
+                // conflicted surface's facts (a queued fact with
+                // a discarded API may have come from either
+                // claimant — unattributable, unusable, even when
+                // a same-API sibling survives); facts from
+                // unrelated surfaces are verified edges from
+                // unambiguous sites — preserved. Learned
+                // candidates carry exact sites, so they filter
+                // by site, not by API.
+                b.facts
+                    .retain(|fact| fact.pid != pid || !discarded.contains(&fact.api));
+                b.learned_sites.retain(|candidate| {
+                    candidate.pid != pid || !same_site(candidate.site(), &site)
+                });
                 self.aliases.retire(pid);
                 b.gap(ObservationGap::AmbiguousSite);
                 b.gap(ObservationGap::Invalidated);
@@ -4605,7 +6159,7 @@ impl ProviderSession {
             // retry re-preserves).
             if !matches!(
                 self.retire_for_gap(pid, None, g, b),
-                RetireOutcome::Deferred(_)
+                RetireOutcome::Deferred { .. }
             ) {
                 if let Some(retained) = preserved {
                     self.refreshing.insert(pid, retained);
@@ -4615,10 +6169,11 @@ impl ProviderSession {
         }
         let generation = self.targets.get(&pid).unwrap().generation;
         match self.attach_pair(pid, api, site, advertisers, 0, generation, true) {
-            Ok(a) => {
+            Ok(mut a) => {
                 // Pair exists but CONFIG is absent: full process/maps/object
                 // validation precedes the only arm operation, and runs again after it.
                 let task_off = self.task_start_off;
+                let arm_ns = LiveClock.monotonic_ns();
                 let result = arm_attachment(
                     &mut self.config,
                     &self.targets[&pid].process,
@@ -4643,7 +6198,7 @@ impl ProviderSession {
                     // yet (the retry re-preserves).
                     if !matches!(
                         self.retire_for_gap(pid, None, g, b),
-                        RetireOutcome::Deferred(_)
+                        RetireOutcome::Deferred { .. }
                     ) {
                         if let Some(retained) = preserved {
                             self.refreshing.insert(pid, retained);
@@ -4651,12 +6206,32 @@ impl ProviderSession {
                     }
                     return;
                 }
+                // Live arm succeeded: arm instant (NEW-P1-OPEN)
+                // plus the admission receipt (NEW-1) — committed
+                // ONLY when the matching membership is live
+                // (NEW-6: same generation, so BPF can accept the
+                // cookie; a fenced or stale member admits nothing
+                // and records no receipt).
+                let member_live = matches!(
+                    self.members.get(&pid, 0),
+                    Ok(member) if member.generation == generation
+                );
+                if c::operational_api(a.api) && member_live {
+                    self.api_admitted.insert(a.cookie);
+                }
+                a.armed_ns = Some(arm_ns);
                 self.targets.get_mut(&pid).unwrap().attachments.push(a);
             }
             Err(g) => {
                 b.gap(g);
                 if identity_failure(g) {
                     self.retire_for_gap(pid, None, g, b);
+                }
+                // NEW-10: a learned site that never armed voids
+                // its surface like a cold-attach failure (no-op
+                // when the retire above removed the target).
+                if let Some(target) = self.targets.get_mut(&pid) {
+                    target.site_gap_apis.insert(api);
                 }
             }
         }
@@ -4667,7 +6242,120 @@ impl ProviderSession {
         }
         self.api_window
             .set(0, c::Range { start, end }, 0)
-            .map_err(|_| ObservationGap::BpfUnavailable)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        // NEW-P1 fix3: the coverage claim starts here — but only
+        // ever moves LATER (monotone-max over calls; the focused
+        // path re-establishes the start at effective admission
+        // after the first attach). An earlier start can never
+        // widen a claim retroactively. The loss latch resets only
+        // when the claim advances: pre-window loss predates the
+        // observation and must not poison in-window zero claims.
+        // (The loss lanes stay cumulative for the coordinator;
+        // only the coverage verdict re-epochs.) A failed map
+        // program leaves both untouched — fail closed.
+        if self.coverage_window_start_ns.is_none_or(|cur| start > cur) {
+            self.coverage_window_start_ns = Some(start);
+            self.fetch_coverage_broken = false;
+            // NEW-24 fix7: pre-claim churn predates the
+            // observation — continuity breaks clear with the
+            // re-epoch like any pre-window loss.
+            self.scope_continuity_broken.clear();
+            // FLAG-C fix9: retained terminal-gap verdicts clear
+            // with the same re-epoch — the fresh snapshot below
+            // only admits live incarnations, so a retired
+            // incarnation's verdict is moot afterwards (its
+            // cookies miss the new snapshot either way).
+            self.retired_operational_gaps.clear();
+            // NEW-39 fix12: retained custody refusals clear with
+            // the same re-epoch (same mootness — the fresh
+            // snapshot only admits live incarnations).
+            self.retired_custody_refusals.clear();
+            // NEW-30 fix8: bind zero eligibility at the same
+            // re-epoch — the cookies holding live operational
+            // admission for their exact incarnation RIGHT NOW
+            // (the claim's start) are the only ones that can
+            // vouch for the claimed window. (The NEVER-cleared
+            // session-wide latch above is untouched — unknown
+            // dropped marks discharge never.)
+            self.claim_admitted = Some(self.live_operational_admission());
+        }
+        Ok(())
+    }
+    /// NEW-30 fix8: cookies holding live operational admission
+    /// for their exact incarnation — admitted, owned by a live
+    /// target with the SAME starttime, CONFIG row live under the
+    /// incarnation's generation (a disarmed, fenced, or retired
+    /// plane admits nothing, however readable its stale totals).
+    /// Snapshotted at every claim advance; the claimless fallback
+    /// (no advance ever ran) evaluates it at seal instead.
+    fn live_operational_admission(&self) -> BTreeSet<u64> {
+        self.api_admitted
+            .iter()
+            .copied()
+            .filter(|cookie| {
+                let Some((pid, starttime, _)) = self.api_owners.get(cookie) else {
+                    return false;
+                };
+                let Some(target) = self.targets.get(pid) else {
+                    return false;
+                };
+                if target.starttime != *starttime {
+                    return false;
+                }
+                matches!(
+                    self.config.get(cookie, 0),
+                    Ok(row) if row.generation == target.generation
+                )
+            })
+            .collect()
+    }
+    /// NEW-P1 fix3 trigger read: our incarnation completed a cold
+    /// attach (CONFIG armed, static candidates taken, membership
+    /// live — post NEW-6, admission recorded). The focused run
+    /// path establishes the effective window start on the first
+    /// tick this holds.
+    pub(crate) fn target_ready(&self, pid: u32, starttime: u64) -> bool {
+        self.targets
+            .get(&pid)
+            .is_some_and(|t| t.ready && t.starttime == starttime)
+    }
+    /// NEW-P1-OPEN fix4 claim-establishment gate: the focused
+    /// run path establishes the claimed window start ONLY through
+    /// here. Establishes (programs the window, narrowing the
+    /// claim to the effective admission) iff the incarnation is
+    /// ready AND no recovery fence withholds its records AND the
+    /// deadline still leaves an interval to claim (NEW-16 fix5:
+    /// at/after the deadline nothing remains — refuse before any
+    /// readiness check, so no empty window is ever programmed and
+    /// the loss latch never clears on an expired claim). A claim
+    /// established mid-fence would certify silence over unobserved
+    /// time. Returns false (caller retries next tick) when
+    /// unready, fenced, or expired.
+    pub(crate) fn establish_claim_start(
+        &mut self,
+        pid: u32,
+        starttime: u64,
+        now: u64,
+        end: u64,
+    ) -> Result<bool, ObservationGap> {
+        // The expiry conjunct refuses before any map programming
+        // (no empty window is ever programmed, the loss latch
+        // never clears on an expired claim).
+        let ready = self.target_ready(pid, starttime);
+        let fenced = self.fenced.contains_key(&pid);
+        if !Self::claim_establishment_decision(ready, fenced, now, end) {
+            return Ok(false);
+        }
+        self.set_api_window(now, end)?;
+        Ok(true)
+    }
+
+    /// NEW-16 fix5: the claim-establishment decision (pure — the
+    /// gate above applies it): a claim establishes only for a
+    /// ready, unfenced incarnation strictly before the deadline
+    /// (`now < end` — at/after it no interval remains to claim).
+    fn claim_establishment_decision(ready: bool, fenced: bool, now: u64, end: u64) -> bool {
+        ready && !fenced && now < end
     }
     /// Program the `TRACE_MODE` word (§6D-0 D0-1, §6D-9 order). Modes are
     /// restart-scoped; any word outside 2/3/4 runs the maps-only path.
@@ -4680,6 +6368,102 @@ impl ProviderSession {
             .map_err(|_| ObservationGap::BpfUnavailable)?;
         self.trace.set_mode(mode);
         Ok(())
+    }
+
+    /// Engage the D0-6 aggregate-only fallback: BPF runs
+    /// `TRACE_MODE_METADATA` (no operational emission — zero delta
+    /// cost; fetch/lifecycle emission stays ungated) while the host
+    /// pairs fetch/lifecycle only (class-0). Operational
+    /// edges/durations/classes 1..4 stay unreachable. Process-start
+    /// scoped (call before any drain).
+    pub fn set_trace_fallback(&mut self) -> Result<(), ObservationGap> {
+        if self.final_drain || !self.gate.admitting() {
+            return Err(ObservationGap::Invalidated);
+        }
+        self.trace_mode
+            .set(0, super::trace::TRACE_MODE_METADATA, 0)
+            .map_err(|_| ObservationGap::BpfUnavailable)?;
+        self.trace.set_mode(super::trace::TRACE_MODE_METADATA);
+        self.trace.set_fallback(true);
+        Ok(())
+    }
+
+    /// Enable the §6D-3 by-api histogram opt-in on the trace fold.
+    pub fn set_trace_histogram_by_api(&mut self, on: bool) {
+        self.trace.set_histogram_by_api(on);
+    }
+
+    /// Fallback active on the trace fold?
+    pub fn trace_fallback(&self) -> bool {
+        self.trace.fallback()
+    }
+
+    /// Arm the trace feed-cut (P2fix2 item 3): bind the trace fold
+    /// to the effective cut — records at/above `cut_ns` skip the
+    /// trace feed (outside the claimed interval, never loss — other
+    /// planes still fold them under their own rules). Arming ALSO
+    /// notes the cut against already-folded timestamps: a seal owner
+    /// that arms late (pairs already consumed past the cut) taints
+    /// `late-cut` instead of silently standing. One-way (earliest
+    /// cut wins — the claim only narrows); call before the terminal
+    /// drain. Unarmed sessions (direct users, qual harness) feed
+    /// everything.
+    pub fn set_trace_feed_cut(&mut self, cut_ns: u64) {
+        if self.trace_feed_cut.is_some_and(|c| c <= cut_ns) {
+            return;
+        }
+        self.trace_feed_cut = Some(cut_ns);
+        self.trace.note_global_cut(cut_ns);
+    }
+
+    /// Terminal trace finalize: every held edge lands unpaired.
+    pub fn trace_finalize(&mut self) {
+        self.trace.finalize(LiveClock.monotonic_ns());
+    }
+
+    /// Terminal seal with trace (seal AFTER the final poll): runs
+    /// the terminal drain (which POLLS the loss lanes — live dirty
+    /// drains only peek, so sealing before close would read stale
+    /// zeros), finalizes pairing, seals the single window against
+    /// the final totals, then disposes. Returns the close batch
+    /// (with `api_activity` + terminal gaps) plus the sealed
+    /// window and cumulative totals. The seal binds the trace fold
+    /// to the effective cut (P2fix2 item 3): the owner arms
+    /// [`Self::set_trace_feed_cut`] at the claim end before the
+    /// terminal drain, so only in-interval pairs fold (post-cut
+    /// records skip the trace feed; a late arm taints `late-cut`),
+    /// and the finalize-then-close sequence proves the fresh
+    /// boundary for the sealed window.
+    pub fn close_with_trace(
+        self,
+    ) -> (
+        ObservationBatch,
+        super::trace::ClosedTraceWindow,
+        super::trace::TraceTotals,
+    ) {
+        self.close_with_trace_seq(0)
+    }
+
+    /// Terminal seal with an explicit final-window label (multi-
+    /// window runs close mid-run windows with ascending labels and
+    /// seal the final window with the next one).
+    pub fn close_with_trace_seq(
+        mut self,
+        window_seq: u64,
+    ) -> (
+        ObservationBatch,
+        super::trace::ClosedTraceWindow,
+        super::trace::TraceTotals,
+    ) {
+        let batch = self.finalize_until(Instant::now() + Duration::from_secs(5));
+        self.trace.finalize(LiveClock.monotonic_ns());
+        let window = self.close_trace_window(window_seq);
+        let totals = self.trace_totals();
+        (batch, window, totals)
+    }
+    /// The currently open trace-window index (bind seals to it).
+    pub fn trace_window_index(&self) -> u64 {
+        self.trace.current_window()
     }
     /// Seal the current trace window (§6D-6/§6D-7 data plane).
     pub fn close_trace_window(&mut self, window_seq: u64) -> super::trace::ClosedTraceWindow {
@@ -5448,8 +7232,7 @@ impl ProviderSession {
         let mut resolved = Vec::new();
         for site in sites {
             let (api, site) = site.into_parts();
-            let id = (1..=16)
-                .chain(20..=72)
+            let id = wire::attach_ids()
                 .find(|&id| wire::api(id) == Ok(api))
                 .ok_or(ObservationGap::InvalidWire)?;
             let key = role_site(site.pid(), site.starttime(), &site);
@@ -5547,6 +7330,8 @@ impl ProviderSession {
                 generation,
                 matches!(links, PrearmLinks::Create),
             )?;
+            let cookie = a.cookie;
+            let arm_ns = LiveClock.monotonic_ns();
             retain_and_arm(&mut self.startup, pid, a, |a| {
                 let result = validate_then_arm(
                     || a.site.revalidate_object(),
@@ -5583,8 +7368,58 @@ impl ProviderSession {
                 }
                 result
             })?;
+            // Prearm armed: admission receipt (NEW-1) + arm instant
+            // (NEW-P1-OPEN) on the retained row.
+            if c::operational_api(api) {
+                self.api_admitted.insert(cookie);
+            }
+            if let Some(rows) = self.startup.get_mut(&pid) {
+                if let Some(row) = rows.iter_mut().find(|row| row.cookie == cookie) {
+                    row.armed_ns = Some(arm_ns);
+                }
+            }
         }
         Ok(())
+    }
+    /// FLAG-2 fix8: true when the scope's incarnation (exact
+    /// `(pid, starttime)`) carries an operational coverage gap —
+    /// an eligible operational site that never armed (attach
+    /// soft-failure or role-conflict disarm, read from the
+    /// incarnation's site gaps) or an operational surface whose
+    /// discovery skipped (read from the pass verdict). Either
+    /// voids the scope receipt: a same-API sibling's zero never
+    /// certifies a blind site. FLAG-2-OPEN fix9: the explicit API
+    /// 21 quarantine is excluded from BOTH inputs (quarantined
+    /// sites are blind by policy — an API-21-only verdict on
+    /// either input still receipts). FLAG-C fix9: a preserving
+    /// terminal retirement removes the target but NOT its verdict
+    /// — the retained verdict for the exact claimed incarnation
+    /// voids here (non-terminal retires additionally void through
+    /// the continuity mark).
+    fn scope_has_operational_gap(&self, pid: u32, starttime: u64) -> bool {
+        if let Some(target) = self.targets.get(&pid) {
+            if target.starttime == starttime && Self::live_target_has_operational_gap(target) {
+                return true;
+            }
+        }
+        self.retired_operational_gaps.contains(&(pid, starttime))
+    }
+    /// Post-quarantine-exclusion live verdict for one target
+    /// (shared by the seal gate and the FLAG-C retire-entry
+    /// snapshot, so the retained verdict equals the live one).
+    fn live_target_has_operational_gap(target: &Target) -> bool {
+        if target
+            .site_gap_apis
+            .iter()
+            .any(|id| c::operational_api(*id) && !quarantined_api(*id))
+        {
+            return true;
+        }
+        target
+            .process
+            .unresolved_operational()
+            .iter()
+            .any(|id| !quarantined_api(*id))
     }
     pub fn close(self) -> ObservationBatch {
         self.close_until(Instant::now() + Duration::from_millis(100))
@@ -5597,6 +7432,14 @@ impl ProviderSession {
     pub(crate) fn finalize_until(&mut self, deadline: Instant) -> ObservationBatch {
         self.final_drain = true;
         if self.gate.close().is_err() {
+            // NEW-8(a) fix4: the terminal cut failed — the seal must
+            // not certify from the stale arms/epoch afterwards
+            // (latch broken; already-fed positives still project
+            // through the caller's fold). P2fix3 PAIRING: the
+            // producer boundary failed too — pairing taint must
+            // carry through the terminal seal, never clear on it.
+            self.fetch_coverage_broken = true;
+            self.trace.note_boundary_failure();
             let mut b = ObservationBatch::default();
             b.gap(ObservationGap::BpfUnavailable);
             b.gap_interval_unknown(IntervalCause::JoinMiss);
@@ -5607,8 +7450,53 @@ impl ProviderSession {
         self.budget.set_deadline(deadline);
         let mut b = self.drain(deadline);
         b.gap_interval_unknown(IntervalCause::JoinMiss); // in-flight returns are not synthesized
+        // NEW-30 fix8: the claim-start binding (snapshotted at
+        // the last advance; a run that never advanced a claim —
+        // the N1 claimless shape — evaluates liveness at seal
+        // instead, preserving its receipt).
+        let claim_eligible = self
+            .claim_admitted
+            .clone()
+            .unwrap_or_else(|| self.live_operational_admission());
+        // NEW-34 fix9: per-scope eligible-read completeness — the
+        // read loop below records (rows, gaps, and outcomes, in
+        // read order); the per-scope grant after the loop requires
+        // the COMPLETE eligible cohort to have read successfully
+        // before a scope certifies idle zero.
+        let mut eligible_present: std::collections::BTreeSet<(u32, u64)> =
+            std::collections::BTreeSet::new();
+        let mut eligible_failed: std::collections::BTreeSet<(u32, u64)> =
+            std::collections::BTreeSet::new();
         for (&cookie, &(pid, starttime, api)) in &self.api_owners {
-            let values = if Instant::now() >= deadline {
+            // NEW-1: allocation (owner + totals row) without a
+            // successful arm admits nothing — a readable zero map
+            // over a never-armed plane must not certify it (no
+            // receipt, no row; the merge pads unavailable and the
+            // plane reads Unknown). The arm failure rode its gap
+            // at attach time. NEW-6-OPEN + NEW-13 fix4: VERIFIED
+            // POSITIVES are preserved independently of admission —
+            // a mapped cookie that BPF counted (only BPF writes
+            // these totals: CONFIG + live same-generation member)
+            // projects its row even when the committing pass
+            // failed, but earns NO scope receipt (zero eligibility
+            // stays admission-gated).
+            let admitted = self.api_admitted.contains(&cookie);
+            // NEW-34 fix9 one-shot: a staged terminal-deadline
+            // expiry for THIS cookie's read (test-only, inert
+            // unless armed) — shadows the deadline check so the
+            // hook takes the exact production `DrainOverrun` path.
+            #[cfg(test)]
+            let forced_deadline = FAIL_TOTALS_READ_DEADLINE.with(|slot| {
+                if slot.get() == Some(cookie) {
+                    slot.set(None);
+                    true
+                } else {
+                    false
+                }
+            });
+            #[cfg(not(test))]
+            let forced_deadline = false;
+            let values = if Instant::now() >= deadline || forced_deadline {
                 Err(ObservationGap::DrainOverrun)
             } else {
                 self.api_totals
@@ -5638,17 +7526,84 @@ impl ProviderSession {
                 }
                 wire::activity(api, total)
             }) {
-                Ok(row) => b.api_activity.push(ProcessApiActivity {
-                    pid,
-                    starttime,
-                    row,
-                }),
+                Ok(row) => {
+                    if !admitted && row.entries == 0 {
+                        // NEW-1: unadmitted + zero totals — no
+                        // observation, no row, no receipt.
+                        continue;
+                    }
+                    if admitted {
+                        // NEW-P1: a successful scoped count read
+                        // vouches for this incarnation's
+                        // operational plane (failed reads below
+                        // record a gap row but no receipt).
+                        // NEW-24 fix7: the receipt additionally
+                        // needs CONTINUOUS coverage across the
+                        // claimed interval (a mid-run disarm —
+                        // additive refresh is the live case —
+                        // voids it even when the old admitted
+                        // counter still reads) and no source
+                        // refusal — whole-pid terminal, or exact
+                        // historical (NEW-39 fix12: a live-drain
+                        // refusal retained through the evicting
+                        // retire voids the same way) — without
+                        // valid source custody the stale arms
+                        // certify nothing — the fetch seal
+                        // already voids these; the receipt
+                        // follows. Verified positives still
+                        // project below regardless.
+                        // NEW-30 fix8: plus claim-start binding
+                        // (only cookies live for the exact
+                        // incarnation at claim start vouch).
+                        // NEW-31 fix8: plus the never-cleared
+                        // session-wide latch. FLAG-2 fix8: plus
+                        // no operational coverage gap on the
+                        // live incarnation (an eligible
+                        // operational site that never armed, or
+                        // an operational surface discovery
+                        // skipped — a same-API sibling's zero
+                        // never certifies a blind site).
+                        // NEW-34 fix9: eligibility records here;
+                        // the per-scope grant below (after every
+                        // cookie reads) additionally requires the
+                        // COMPLETE eligible cohort to have read
+                        // successfully — one successful zero read
+                        // never certifies past an unread sibling
+                        // (which may hold positives).
+                        if claim_eligible.contains(&cookie) {
+                            eligible_present.insert((pid, starttime));
+                        }
+                    }
+                    // NEW-6-OPEN + NEW-13: admitted rows vouch as
+                    // before; unadmitted rows reach here ONLY with
+                    // verified positive totals (projected, never
+                    // receipted).
+                    b.api_activity.push(ProcessApiActivity {
+                        pid,
+                        starttime,
+                        row,
+                    })
+                }
                 Err(gap) => {
+                    if !admitted {
+                        // Unadmitted + unreadable: no observation at
+                        // all (failed-read gap rows are for admitted
+                        // owners only).
+                        continue;
+                    }
+                    // NEW-34 fix9: an eligible cookie that fails
+                    // to read (or is skipped at the terminal
+                    // deadline) withholds its scope's receipt —
+                    // the diagnostic row below still projects.
+                    if claim_eligible.contains(&cookie) {
+                        eligible_present.insert((pid, starttime));
+                        eligible_failed.insert((pid, starttime));
+                    }
                     b.gap(gap);
-                    if let Ok(api) = crate::api_activity::ApiId::try_from(api) {
-                        let mut row = crate::api_activity::ApiActivityRow::unavailable(api);
-                        row.gaps.not_attached = false;
-                        row.gaps.map = 1;
+                    // GATE fix3: the failed-read row comes from the
+                    // single shared constructor (shape-pinned through
+                    // the full validator — see the report pin).
+                    if let Some(row) = wire::failed_activity(api) {
                         b.api_activity.push(ProcessApiActivity {
                             pid,
                             starttime,
@@ -5657,6 +7612,25 @@ impl ProviderSession {
                     }
                 }
             }
+        }
+        // NEW-34 fix9: per-scope grants — a scope certifies idle
+        // zero only with at least one eligible cookie, EVERY
+        // eligible cookie successfully read, continuous coverage,
+        // no session-wide latch, valid source custody (live,
+        // whole-pid terminal, or exact historical — NEW-39 fix12),
+        // and no operational gap (live or retained through
+        // preserving retirement).
+        for (pid, starttime) in &eligible_present {
+            if eligible_failed.contains(&(*pid, *starttime))
+                || self.scope_continuity_broken.contains(&(*pid, *starttime))
+                || self.scope_continuity_broken_all
+                || self.final_refusals.contains_key(pid)
+                || self.retired_custody_refusals.contains(&(*pid, *starttime))
+                || self.scope_has_operational_gap(*pid, *starttime)
+            {
+                continue;
+            }
+            b.terminal_scopes_observed.insert((*pid, *starttime));
         }
         self.trace.finalize(LiveClock.monotonic_ns());
         self.closed = true;
@@ -5710,7 +7684,7 @@ impl Drop for ProviderSession {
             // possible). The deferred rows are already disarmed
             // (the retire disarms before probing), so the late
             // close is safe.
-            if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred(_)) {
+            if matches!(self.retire(pid, &mut b), RetireOutcome::Deferred { .. }) {
                 let links = drain_pid_links(&mut self.startup, &mut self.targets, pid);
                 Self::close_offpath_links(
                     true,
@@ -5729,10 +7703,16 @@ fn acquire_observable(
     // Inventory has already classified dynamic code exports. Names, build IDs,
     // dependencies and non-observable exports cannot authorize acquisition.
     // A later snapshot is evaluated afresh, so late module arrival can retry.
+    // The acquisition range is single-sourced with attachment
+    // (`wire::attach_ids`): eligibility and arming consume the same
+    // API definitions, so they can never drift apart. (Operational
+    // IDs decode to `Operational`, never `Inventoried`, so their
+    // presence in the attach enumeration is neutral here.)
     if !record.modules.iter().any(|module| {
         module.info.exports.iter().any(|api| {
             api.operational_id().is_some()
-                || (1..=16).any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api)))
+                || wire::attach_ids()
+                    .any(|id| wire::api(id) == Ok(ObservationApi::Inventoried(*api)))
         })
     }) {
         return Ok(None);
@@ -6033,12 +8013,14 @@ mod tests {
             assert!(ProviderSession::trace_plane_only(c::ATTEMPT, api));
             assert!(ProviderSession::trace_plane_only(c::RESULT, api));
         }
-        for api in [1, 6, 7, 9, 10, 15, 16, 19] {
+        // P1-A1: the 73..=80 fetch extension flows to cold-fact
+        // assembly byte-identical (never trace-plane-only).
+        for api in [1, 6, 7, 9, 10, 15, 16, 19, 73, 76, 80] {
             assert!(!ProviderSession::trace_plane_only(c::ATTEMPT, api));
             assert!(!ProviderSession::trace_plane_only(c::RESULT, api));
         }
         assert!(!ProviderSession::trace_plane_only(c::ATTEMPT, 0));
-        assert!(!ProviderSession::trace_plane_only(c::RESULT, 73));
+        assert!(!ProviderSession::trace_plane_only(c::RESULT, 81));
         assert!(!ProviderSession::trace_plane_only(c::INIT, 20));
         assert!(!ProviderSession::trace_plane_only(c::IMPLEMENTATION, 45));
         assert!(!ProviderSession::trace_plane_only(c::GAP, 20));
@@ -6054,7 +8036,9 @@ mod tests {
             "EVP_DigestInit_ex2"
         );
         assert!(super::quarantined_api(21));
-        for api in [1, 7, 20, 22, 45, 72] {
+        // P1-A1: the quarantine still names exactly API 21 — the
+        // fetch extension (73..=80) is admitted, not quarantined.
+        for api in [1, 7, 10, 15, 20, 22, 45, 72, 73, 76, 80] {
             assert!(!super::quarantined_api(api));
         }
     }
@@ -7258,7 +9242,11 @@ mod tests {
             .unwrap();
             // Retain a real final consumer but deliberately omit its safe API
             // aggregate: this makes the actual post-cut map lookup return ENOENT.
+            // NEW-1: the owner is admitted (arm succeeded) — this
+            // test's subject is post-cut READ failure, and only
+            // admitted owners reach the terminal read.
             session.api_owners.insert(91, (std::process::id(), 1, 20));
+            session.api_admitted.insert(91);
             if mode == "delete" {
                 session.gate.fail_next_delete();
             }
@@ -7300,6 +9288,7560 @@ mod tests {
                 session.gate.receipt().is_some()
             );
         }
+    }
+    #[test]
+    fn late_arm_silence_is_not_an_in_window_zero_through_session_path() {
+        // NEW-P1-OPEN pin through the SESSION path (not the fold
+        // unit), NEW-P1 fix3 claimed-interval form: the seal rule
+        // takes the sealed incarnation's attachments as `(api,
+        // armed_ns)` pairs plus the session window start/epoch/latch.
+        // Covered ⟺ armed at or before the CLAIMED start. A post-start
+        // arm with no edges must NOT project an in-window zero —
+        // even when it precedes the first drain (the blind prefix is
+        // outside the claim); neither must a fence-voided arm, an
+        // un-armed row, a missing start/epoch, nor any surface once
+        // loss latches. Setup arms (at/before the start) stay
+        // covered; non-fetch APIs never count.
+        let start = Some(950u64);
+        let epoch = Some(1_000u64);
+        // Setup arm + post-start pre-drain arm + post-drain arm +
+        // fence-voided + never-armed + non-fetch, no loss: only the
+        // setup arm covers.
+        let pairs = vec![
+            (10u32, Some(900u64)),
+            (11u32, Some(975u64)),
+            (12u32, Some(1_100u64)),
+            (13u32, None),
+            (14u32, None),
+            (20u32, Some(900u64)),
+        ];
+        assert_eq!(
+            ProviderSession::fetch_coverage_effective(
+                &pairs,
+                start,
+                epoch,
+                false,
+                &BTreeSet::new()
+            ),
+            BTreeSet::from([10]),
+            "setup arm covers; post-start/voided/non-fetch do not"
+        );
+        // Arming exactly at the claimed start still covers.
+        assert_eq!(
+            ProviderSession::fetch_coverage_effective(
+                &[(10, Some(950))],
+                start,
+                epoch,
+                false,
+                &BTreeSet::new()
+            ),
+            BTreeSet::from([10]),
+        );
+        // Post-start, pre-first-drain arm: NOT covered (the NEW-P1
+        // fix3 pin — the first drain is later than the effective
+        // window start and cannot verify the blind prefix).
+        assert!(
+            ProviderSession::fetch_coverage_effective(
+                &[(11, Some(975))],
+                start,
+                epoch,
+                false,
+                &BTreeSet::new()
+            )
+            .is_empty(),
+            "a post-start pre-drain arm covers nothing"
+        );
+        // No claimed start yet (window never programmed): nothing
+        // covers (fail closed).
+        assert!(
+            ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                None,
+                epoch,
+                false,
+                &BTreeSet::new()
+            )
+            .is_empty(),
+            "no window start covers nothing"
+        );
+        // No epoch yet (no drain): nothing covers (fail closed).
+        assert!(
+            ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                start,
+                None,
+                false,
+                &BTreeSet::new()
+            )
+            .is_empty(),
+            "no drain yet covers nothing"
+        );
+        // Loss latched: even setup arms go unknown.
+        assert!(
+            ProviderSession::fetch_coverage_effective(&pairs, start, epoch, true, &BTreeSet::new())
+                .is_empty(),
+            "in-window loss voids every in-window zero"
+        );
+        // Empty incarnation: empty coverage.
+        assert!(
+            ProviderSession::fetch_coverage_effective(&[], start, epoch, false, &BTreeSet::new())
+                .is_empty(),
+        );
+    }
+    #[test]
+    fn two_site_partial_attach_covers_no_surface_through_session_path() {
+        // NEW-10 fix4 pin through the SESSION path (pure seal
+        // rule): one armed export must not certify a whole surface
+        // when a second resolved site failed attachment —
+        // surface-wide silence needs EVERY eligible site. A
+        // setup-armed api WITH a site gap stays uncovered; the same
+        // arms without the gap cover; gaps never leak across
+        // surfaces.
+        let start = Some(950u64);
+        let epoch = Some(1_000u64);
+        // Two attachments for api 10 (two resolved sites), both
+        // setup-armed — but the second site failed attachment: a
+        // site gap is recorded for the surface.
+        let pairs = vec![(10u32, Some(900u64)), (10u32, Some(910u64))];
+        assert!(
+            ProviderSession::fetch_coverage_effective(
+                &pairs,
+                start,
+                epoch,
+                false,
+                &BTreeSet::from([10])
+            )
+            .is_empty(),
+            "one armed site + one blind site covers nothing"
+        );
+        // Control: the same arms with no gap cover.
+        assert_eq!(
+            ProviderSession::fetch_coverage_effective(
+                &pairs,
+                start,
+                epoch,
+                false,
+                &BTreeSet::new()
+            ),
+            BTreeSet::from([10]),
+            "both sites armed covers"
+        );
+        // Gaps don't leak across surfaces.
+        let pairs = vec![(10u32, Some(900u64)), (11u32, Some(900u64))];
+        assert_eq!(
+            ProviderSession::fetch_coverage_effective(
+                &pairs,
+                start,
+                epoch,
+                false,
+                &BTreeSet::from([11])
+            ),
+            BTreeSet::from([10]),
+            "a gap voids only its own surface"
+        );
+    }
+    #[test]
+    fn claim_establishment_decision_table() {
+        // NEW-16 fix5 pin (pure decision the gate applies): a claim
+        // establishes only for a ready, unfenced incarnation
+        // strictly before the deadline — at/after it no interval
+        // remains to claim, so establishment is refused (no empty
+        // window programmed, latch untouched).
+        use super::ProviderSession;
+        assert!(
+            ProviderSession::claim_establishment_decision(true, false, 100, 200),
+            "ready + unfenced + live establishes"
+        );
+        assert!(
+            !ProviderSession::claim_establishment_decision(true, false, 200, 200),
+            "establishment AT the deadline refused"
+        );
+        assert!(
+            !ProviderSession::claim_establishment_decision(true, false, 250, 200),
+            "establishment PAST the deadline refused"
+        );
+        assert!(
+            !ProviderSession::claim_establishment_decision(false, false, 100, 200),
+            "unready refused"
+        );
+        assert!(
+            !ProviderSession::claim_establishment_decision(true, true, 100, 200),
+            "fenced refused"
+        );
+        assert!(
+            !ProviderSession::claim_establishment_decision(false, true, 250, 200),
+            "unready + fenced + expired refused"
+        );
+    }
+    #[test]
+    fn sealed_cuts_stay_bounded_and_sound_under_repeated_recovery() {
+        // NEW-5-OPEN host pin for the pure push-or-merge: 12
+        // fence→recovery cycles (open, then close with a resume —
+        // the recovery-drain shape) keep the retained list capped
+        // (merges engaged past the cap, counted), while every
+        // original uncertain span stays excluded (merged spans are
+        // supersets — replay soundness preserved). Open-reuse keeps
+        // earliest-wins without growing.
+        let mut intervals: Vec<(u64, Option<u64>)> = Vec::new();
+        let mut spans: Vec<(u64, u64)> = Vec::new();
+        let mut merges = 0u64;
+        for cycle in 0..12u64 {
+            let edge = 1_000 + cycle * 100;
+            if super::retain_sealed_cut(&mut intervals, edge) {
+                merges += 1;
+            }
+            let resume = edge + 10;
+            for (_, slot) in intervals.iter_mut().filter(|(_, r)| r.is_none()) {
+                *slot = Some(resume);
+            }
+            spans.push((edge, resume));
+        }
+        assert_eq!(
+            intervals.len(),
+            super::MAX_SEALED_FENCE_CUTS,
+            "12 recoveries saturate (never exceed) the cap"
+        );
+        assert_eq!(merges, 4, "cycles 9-12 each merge once");
+        // Every original uncertain span stays excluded: each span's
+        // every instant sits inside some retained cut.
+        for (edge, resume) in &spans {
+            for ts in [*edge, edge.saturating_add(1), resume.saturating_sub(1)] {
+                assert!(
+                    intervals
+                        .iter()
+                        .any(|(cut, end)| { ts >= *cut && end.is_none_or(|stop| ts < stop) }),
+                    "span [{edge}, {resume}) stays excluded at {ts}: {intervals:?}"
+                );
+            }
+        }
+        // The newest cycles stay exact (only the oldest merge).
+        assert!(
+            intervals
+                .iter()
+                .any(|(e, r)| *e == 1_000 + 11 * 100 && *r == Some(1_000 + 11 * 100 + 10)),
+            "the newest cycle stays exact: {intervals:?}"
+        );
+        // Open-reuse: earliest wins, no growth, no merge.
+        let mut open: Vec<(u64, Option<u64>)> = Vec::new();
+        assert!(!super::retain_sealed_cut(&mut open, 500));
+        assert!(!super::retain_sealed_cut(&mut open, 400));
+        assert_eq!(open, vec![(400, None)]);
+    }
+    #[test]
+    fn sealed_cut_merge_preserves_backdated_union_with_min_max() {
+        // NEW-5-OPEN + NEW-11 fix4 pin (pure push-or-merge): a
+        // later RECORDED cycle may start earlier (backdated) or
+        // overlap — the saturated merge must span minimum start +
+        // maximum end (the FULL union, never a dropped prefix).
+        // The codex example: `[20,30)` + later `[10,40)` merges to
+        // `[10,40)` — the old oldest-pair span `[20,40)` lost
+        // `[10,20)` and resurrected edges there.
+        let excluded = |intervals: &[(u64, Option<u64>)], ts: u64| {
+            intervals
+                .iter()
+                .any(|(cut, end)| ts >= *cut && end.is_none_or(|stop| ts < stop))
+        };
+        // Backdated leg: the two oldest recorded cycles are out of
+        // time order; the 9th retain merges them.
+        let mut intervals: Vec<(u64, Option<u64>)> = vec![
+            (20, Some(30)),
+            (10, Some(40)),
+            (100, Some(110)),
+            (200, Some(210)),
+            (300, Some(310)),
+            (400, Some(410)),
+            (500, Some(510)),
+            (600, Some(610)),
+        ];
+        assert_eq!(intervals.len(), super::MAX_SEALED_FENCE_CUTS);
+        assert!(
+            super::retain_sealed_cut(&mut intervals, 700),
+            "saturated retain merges"
+        );
+        assert_eq!(intervals.len(), super::MAX_SEALED_FENCE_CUTS);
+        for ts in [10u64, 15, 20, 29, 39] {
+            assert!(
+                excluded(&intervals, ts),
+                "the backdated span [10,40) stays excluded at {ts}: {intervals:?}"
+            );
+        }
+        for (edge, resume) in [
+            (100u64, 110u64),
+            (200, 210),
+            (300, 310),
+            (400, 410),
+            (500, 510),
+            (600, 610),
+        ] {
+            for ts in [edge, edge + 1, resume - 1] {
+                assert!(
+                    excluded(&intervals, ts),
+                    "span [{edge},{resume}) stays excluded at {ts}: {intervals:?}"
+                );
+            }
+        }
+        assert!(
+            intervals.iter().any(|(e, r)| *e == 700 && r.is_none()),
+            "the newest edge stays exact: {intervals:?}"
+        );
+        // Overlapping leg: [(10,20),(15,25)] merges to (10,25).
+        let mut overlap: Vec<(u64, Option<u64>)> = vec![
+            (10, Some(20)),
+            (15, Some(25)),
+            (100, Some(110)),
+            (200, Some(210)),
+            (300, Some(310)),
+            (400, Some(410)),
+            (500, Some(510)),
+            (600, Some(610)),
+        ];
+        assert!(super::retain_sealed_cut(&mut overlap, 700));
+        for ts in [10u64, 12, 17, 22, 24] {
+            assert!(
+                excluded(&overlap, ts),
+                "the overlapping span [10,25) stays excluded at {ts}: {overlap:?}"
+            );
+        }
+        assert!(
+            !excluded(&overlap, 9) && !excluded(&overlap, 25),
+            "the merge spans the union, not the world: {overlap:?}"
+        );
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn terminal_receipt_requires_admission_distinct_from_allocation() {
+        // NEW-1-OPEN + NEW-6 pin through the PRODUCTION attach path
+        // (no hand-supplied admission — the admitted set is earned
+        // by real cold attaches, never inserted by hand):
+        // allocation (owner + readable zero totals, registered by
+        // `attach_pair`) with a failed initial admission (CONFIG
+        // armed, but static-candidate failure lands before MEMBERS
+        // is installed) must NOT produce a terminal receipt or an
+        // attached activity row — a readable zero map over a plane
+        // BPF could never accept certifies nothing. The completed
+        // twin (same production path to ready, admission committed
+        // once the matching membership is live) receipts and rows
+        // normally.
+        use std::process::{Command, Stdio};
+        struct Owned(std::process::Child);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let child = Owned(
+            Command::new("/usr/bin/openssl")
+                .args([
+                    "speed", "-elapsed", "-seconds", "30", "-evp", "SHA512", "-bytes", "64",
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("openssl speed child spawns"),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let pid = child.0.id();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        // Phase A: failed initial admission. Static-candidate
+        // discovery expires AFTER the API loop armed CONFIG (links
+        // live, owners allocated) but BEFORE MEMBERS is installed.
+        let mut failed = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        failed.set_deadline(Instant::now() + Duration::from_secs(10));
+        EXPIRE_STATIC.with(|flag| flag.set(true));
+        let first = failed.reconcile_records(&records);
+        EXPIRE_STATIC.with(|flag| flag.set(false));
+        assert!(
+            first.gaps.contains(&ObservationGap::SnapshotLag),
+            "static expiry fails the pass: {:?}",
+            first.gaps
+        );
+        assert!(
+            !failed.targets.get(&pid).is_some_and(|t| t.ready),
+            "a failed initial admission leaves the target unready"
+        );
+        assert!(
+            failed.link_count() > 0,
+            "CONFIG armed before the failure (links live)"
+        );
+        assert!(
+            !failed.api_owners.is_empty(),
+            "allocation happened (owners registered by attach_pair)"
+        );
+        assert!(
+            failed.api_admitted.is_empty(),
+            "NEW-6: no admission without a live matching membership: {:?}",
+            failed.api_admitted
+        );
+        // The denial comes from admission, not from read failure:
+        // an allocated owner's totals read back as zeros.
+        let cookie = *failed.api_owners.keys().next().unwrap();
+        let totals = failed
+            .api_totals
+            .get(&cookie, 0)
+            .expect("allocated totals are readable");
+        assert!(
+            totals.iter().all(|v| v.entries == 0),
+            "the unread plane reads back zero"
+        );
+        let batch = failed.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no receipt without admission: {:?}",
+            batch.terminal_scopes_observed
+        );
+        assert!(
+            batch.api_activity.iter().all(|a| a.row.gaps.not_attached),
+            "no attached row without admission: {:?}",
+            batch
+                .api_activity
+                .iter()
+                .map(|a| (a.row.entries, a.row.gaps.clone()))
+                .collect::<Vec<_>>()
+        );
+        // Phase B: the completed twin — same production path to
+        // ready earns its admission (no hand supply) and receipts.
+        let mut completed = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        completed.set_deadline(Instant::now() + Duration::from_secs(30));
+        let second = completed.reconcile_records(&records);
+        assert!(
+            completed.target_ready(pid, starttime),
+            "the twin attach completes: {:?}",
+            second.gaps
+        );
+        assert!(
+            !completed.api_admitted.is_empty(),
+            "the completed attach earns admission through the production path"
+        );
+        let batch = completed.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the admitted incarnation receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        assert!(
+            batch
+                .api_activity
+                .iter()
+                .any(|a| a.pid == pid && !a.row.gaps.not_attached),
+            "the admitted incarnation rows an attached (receipted) row"
+        );
+        // Phase C: the retry pattern (NEW-6 regression pin for the
+        // focused tick1-partial/tick2-complete shape) — a partial
+        // pass arms CONFIG but fails before MEMBERS, then the retry
+        // reuses the kept target (skipping re-arm) and completes:
+        // the commit must cover the FIRST pass's live arms too
+        // (staging only the completing pass strands them with no
+        // receipt).
+        let mut retried = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        retried.set_deadline(Instant::now() + Duration::from_secs(30));
+        EXPIRE_STATIC.with(|flag| flag.set(true));
+        let partial = retried.reconcile_records(&records);
+        EXPIRE_STATIC.with(|flag| flag.set(false));
+        assert!(
+            partial.gaps.contains(&ObservationGap::SnapshotLag),
+            "first pass fails partial: {:?}",
+            partial.gaps
+        );
+        assert!(
+            !retried.target_ready(pid, starttime),
+            "partial pass leaves the target unready"
+        );
+        assert!(
+            retried.api_admitted.is_empty(),
+            "no admission before any membership is live"
+        );
+        retried.set_deadline(Instant::now() + Duration::from_secs(30));
+        let retry = retried.reconcile_records(&records);
+        assert!(
+            retried.target_ready(pid, starttime),
+            "the retry completes: {:?}",
+            retry.gaps
+        );
+        assert!(
+            !retried.api_admitted.is_empty(),
+            "the completing pass commits the earlier pass's live arms"
+        );
+        let batch = retried.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the retried incarnation receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        // NEW-P6-OPEN fix4: post-assertion receipt (the leg greps
+        // this — a setup skip or zero-test run never prints it).
+        eprintln!("new1: phases=ABC failed_unadmitted=true twin_receipted=true retry_covers=true");
+    }
+    #[test]
+    #[ignore = "requires BPF map privileges (minimal session, no attach)"]
+    fn seal_retains_excluded_interval_across_recovery_drain() {
+        // NEW-2 pin: fence → recovery (re-add schedules unfence; a
+        // clean drain clears the LIVE fence so post-recovery
+        // records flow) → the seal still retains the excluded
+        // interval `(edge, resume)`. Without retention the finish
+        // reads no cut and journaled uncertain-interval facts
+        // resurrect alongside valid recovered facts.
+        let Some(mut session) = ProviderSession::minimal_for_coordinator_tests() else {
+            eprintln!("SKIP seal-retention pin: BPF map creation failed (no caps)");
+            return;
+        };
+        use crate::capture::{ClockPort as _, LiveClock};
+        let pid = 4242u32;
+        let edge = LiveClock.monotonic_ns().saturating_sub(1_000_000);
+        session.fence_target(pid, edge);
+        assert_eq!(session.fenced.get(&pid), Some(&edge));
+        // Recovery leg: the re-add flags unfence-after-drain, and
+        // the clean drain clears the live fence.
+        session.unfence_after_drain.insert(pid);
+        let _ = session.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !session.fenced.contains_key(&pid),
+            "the recovery drain clears the live fence"
+        );
+        let cuts = session.sealed_fence_cuts(pid);
+        assert_eq!(
+            cuts.len(),
+            1,
+            "the seal retains one excluded interval across the recovery drain, got {cuts:?}"
+        );
+        assert_eq!(cuts[0].0, edge, "the retained edge is the fence edge");
+        let resume = cuts[0]
+            .1
+            .expect("recovery closes the interval with a resume cut");
+        assert!(
+            resume >= edge,
+            "resume {resume} closes at or after the edge {edge}"
+        );
+        // NEW-P6-OPEN fix4: post-assertion receipt (the leg greps
+        // this — the setup-skip early return never prints it).
+        eprintln!("new2: cuts=1 edge={edge} resume={resume}");
+    }
+    #[test]
+    #[ignore = "requires BPF map privileges (minimal session, no attach)"]
+    fn repeated_recovery_keeps_sealed_cuts_bounded() {
+        // NEW-5-OPEN guest pin: 12 fence→recovery cycles on one pid
+        // through the production fence/drain path — the seal must
+        // retain a BOUNDED cut list (past-cap cycles merge, never
+        // drop — counted for the seal gap), every cycle's uncertain
+        // span must stay excluded (replay soundness), and close
+        // replay work must stay bounded (journal cap × cut cap).
+        let Some(mut session) = ProviderSession::minimal_for_coordinator_tests() else {
+            eprintln!("SKIP repeated-recovery pin: BPF map creation failed (no caps)");
+            return;
+        };
+        use crate::capture::{ClockPort as _, LiveClock};
+        let pid = 4242u32;
+        let mut edges: Vec<u64> = Vec::new();
+        for _ in 0..12 {
+            let edge = LiveClock.monotonic_ns();
+            edges.push(edge);
+            session.fence_target(pid, edge);
+            session.unfence_after_drain.insert(pid);
+            let _ = session.drain(Instant::now() + Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let cuts = session.sealed_fence_cuts(pid);
+        assert_eq!(
+            cuts.len(),
+            super::MAX_SEALED_FENCE_CUTS,
+            "12 recoveries saturate (never exceed) the cap, got {}",
+            cuts.len()
+        );
+        assert_eq!(
+            session.take_sealed_cut_merges(),
+            4,
+            "cycles 9-12 each merge once (visible at seal)"
+        );
+        // Every cycle closed (recovery drains close opens) and every
+        // fenced edge stays inside some retained cut.
+        for (cut, resume) in &cuts {
+            assert!(
+                resume.is_some(),
+                "recovery closes every retained cut: {cuts:?}"
+            );
+            assert!(resume.unwrap() >= *cut);
+        }
+        for edge in &edges {
+            assert!(
+                cuts.iter()
+                    .any(|(cut, resume)| *cut <= *edge && edge < &resume.unwrap()),
+                "edge {edge} stays excluded: {cuts:?}"
+            );
+        }
+        // Replay work bound: a full-cap journal replays over at most
+        // the capped cut list.
+        let replay_checks =
+            crate::provider_observation::request_evidence::RequestEvidenceFold::journal_cap()
+                .saturating_mul(cuts.len());
+        assert!(
+            replay_checks
+                <= crate::provider_observation::request_evidence::RequestEvidenceFold::journal_cap(
+                )
+                .saturating_mul(super::MAX_SEALED_FENCE_CUTS),
+            "replay work stays bounded under repeated recovery"
+        );
+        eprintln!(
+            "sealed_cuts_bounded: cycles=12 cuts={} merges=4 replay_checks<={}",
+            cuts.len(),
+            crate::provider_observation::request_evidence::RequestEvidenceFold::journal_cap()
+                .saturating_mul(super::MAX_SEALED_FENCE_CUTS)
+        );
+    }
+    /// NEW-7 seal helper: build the idle provider-load fixture
+    /// (libcrypto-linked, blocked on stdin — zero ring pressure
+    /// while idle) and spawn it past its `ready` line. Returns the
+    /// child (killed on drop) and its pid.
+    struct New7Owned(std::process::Child);
+    impl Drop for New7Owned {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    fn new7_idle_child(dir: &std::path::Path) -> (New7Owned, u32) {
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+        let app = dir.join("provider_load_loop");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_load_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        let mut child = std::process::Command::new(&app)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("fixture spawns");
+        let pid = child.id();
+        let mut first = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut line = String::new();
+        first.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n", "fixture prints its ready line");
+        (New7Owned(child), pid)
+    }
+    /// NEW-7 seal helper: forge one fetch ATTEMPT record image
+    /// bound to a real attachment (offsets mirror the fix4
+    /// `edge_bytes` shape; outcome 0 — ATTEMPT requires a zero
+    /// outcome at decode).
+    fn new7_fetch_bytes(
+        pid: u32,
+        cookie: u64,
+        api: u32,
+        generation: u64,
+        invocation: u64,
+        mono_ns: u64,
+        start: u64,
+    ) -> Vec<u8> {
+        use super::wire::contract as c;
+        let mut b = vec![0u8; c::EVENT_SIZE];
+        for (at, v) in [
+            (0, c::VERSION),
+            (4, c::ATTEMPT),
+            (8, c::EVENT_SIZE as u32),
+            (12, api),
+            (16, pid),
+            (20, pid),
+        ] {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [
+            (24, cookie),
+            (32, generation),
+            (40, mono_ns),
+            (48, invocation),
+        ] {
+            b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b[96..104].copy_from_slice(&start.to_le_bytes());
+        b
+    }
+    /// NEW-7(a) pin AT SEAL: a userspace `StateLimit` drop of a
+    /// decoded fetch (production `consume`, bound to a real
+    /// attachment, against an exhausted state budget) invalidates
+    /// zero certification — the seal covers nothing afterwards —
+    /// while a surviving funded positive still projects.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn statelimit_drop_invalidates_zero_certification_at_seal() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new7a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        // Bind one real fetch attachment for the crafted events.
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        // Settle the (idle, near-empty) backlog, then claim from
+        // here: pre-window loss predates the observation.
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        if s.loss_totals().iter().any(|lane| *lane > 0) {
+            panic!(
+                "VOID: ring loss before the NEW-7(a) window: {:?}",
+                s.loss_totals()
+            );
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&api),
+            "control: the seal covers the fetch surface pre-failure"
+        );
+        // Survivor positive: one funded fetch fact lands through
+        // production consume.
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(
+            survivor.facts.len(),
+            1,
+            "one funded fetch fact lands: gaps={:?}",
+            survivor.gaps
+        );
+        assert!(
+            !s.fetch_coverage_broken,
+            "funded observation latches nothing"
+        );
+        // Exhaust state, then drop a decoded fetch through
+        // production consume.
+        let spent = s.budget.state_spent_test();
+        let left = s.budget.limits.max_state_bytes - spent;
+        s.budget.state(left).expect("exhaustion spend fits");
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid,
+            cookie,
+            api,
+            generation,
+            2,
+            mono + 1,
+            starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut dropped = super::ObservationBatch::default();
+        s.consume(event, &mut dropped);
+        assert!(dropped.facts.is_empty(), "the exhausted fetch drops");
+        assert!(
+            dropped.gaps.contains(&ObservationGap::StateLimit),
+            "the drop gaps StateLimit: {:?}",
+            dropped.gaps
+        );
+        // AT SEAL: zero certification invalidated, positives survive.
+        assert!(
+            s.fetch_coverage_broken,
+            "a StateLimit drop latches coverage-broken"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "the seal covers nothing after the drop: {sealed:?}"
+        );
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &survivor.facts,
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries: None,
+                fetch_armed: sealed,
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        assert_eq!(evidence.fetches[0].attempts, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new7a: survivor=1 sealed_empty=true");
+    }
+    /// NEW-7(b) pin AT SEAL: a failed TERMINAL loss-map read
+    /// (production `finalize_until` terminal drain against a
+    /// short LOSS map — lanes 4..8 unreadable) invalidates zero
+    /// certification, while a non-terminal failure (self-healing
+    /// via a later read) latches nothing and surviving positives
+    /// still project.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn failed_terminal_loss_read_invalidates_zero_certification_at_seal() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new7b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        if s.loss_totals().iter().any(|lane| *lane > 0) {
+            panic!(
+                "VOID: ring loss before the NEW-7(b) window: {:?}",
+                s.loss_totals()
+            );
+        }
+        // Sabotage the loss plane (setup): lanes 4..8 become
+        // unreadable (out-of-range keys on the short map).
+        s.loss = aya::maps::PerCpuArray::create(4, 0).expect("short loss map creates");
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let first = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            first.gaps.contains(&ObservationGap::BpfUnavailable),
+            "lanes 4..8 reads fail on the short map: {:?}",
+            first.gaps
+        );
+        assert!(
+            !s.fetch_coverage_broken,
+            "a non-terminal failed loss read latches nothing (later reads heal it)"
+        );
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&api),
+            "control: the seal covers the fetch surface pre-failure"
+        );
+        // Survivor positive (the plane observed).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one fetch fact lands");
+        // The terminal loss read fails through the production seal.
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.gaps.contains(&ObservationGap::BpfUnavailable),
+            "the terminal loss read fails: {:?}",
+            batch.gaps
+        );
+        assert!(
+            s.fetch_coverage_broken,
+            "a failed TERMINAL loss read latches coverage-broken"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "the seal covers nothing after it: {sealed:?}"
+        );
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &survivor.facts,
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries: None,
+                fetch_armed: sealed,
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new7b: survivor=1 sealed_empty=true");
+    }
+    /// NEW-23 fix6 pin AT SEAL: a fetch edge rejected during wire
+    /// decoding (zero incarnation stamp — the BPF offset read
+    /// failed, but the ring reservation may have succeeded, so an
+    /// edge is unaccounted) voids zero eligibility through the
+    /// shared drain funnel (`note_wire_rejection` — both ring
+    /// drains call it): the seal covers nothing afterwards, while
+    /// a verified survivor positive still projects. (The ring
+    /// itself is kernel-producer-only, so the pin drives the
+    /// funnel directly with real record bytes — the decode shape
+    /// and the latch are both production code.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn wire_rejection_voids_zero_certification_keeps_positive() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new23-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        // Bind one real fetch attachment for the crafted events.
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        // Settle the (idle, near-empty) backlog, then claim from
+        // here: pre-window loss predates the observation.
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        if s.loss_totals().iter().any(|lane| *lane > 0) {
+            panic!(
+                "VOID: ring loss before the NEW-23 window: {:?}",
+                s.loss_totals()
+            );
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&api),
+            "control: the seal covers the fetch surface pre-failure"
+        );
+        // Survivor positive: one funded fetch fact lands through
+        // production consume.
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(
+            survivor.facts.len(),
+            1,
+            "one funded fetch fact lands: gaps={:?}",
+            survivor.gaps
+        );
+        assert!(
+            !s.fetch_coverage_broken,
+            "funded observation latches nothing"
+        );
+        // The rejected edge: the same fetch shape with a ZERO
+        // incarnation stamp — wire decoding refuses it (fail
+        // closed), and the drain funnel voids zero eligibility
+        // (the unaccounted edge may have been the missing
+        // in-window one).
+        let rejected = super::wire::decode_transport(&new7_fetch_bytes(
+            pid,
+            cookie,
+            api,
+            generation,
+            2,
+            mono + 1,
+            0,
+        ));
+        let Err(gap) = rejected else {
+            panic!("a zero incarnation stamp is rejected at decode");
+        };
+        assert_eq!(
+            gap,
+            ObservationGap::InvalidWire,
+            "the zero-stamp rejection gaps InvalidWire"
+        );
+        let mut drained = super::ObservationBatch::default();
+        s.note_wire_rejection(gap, &mut drained);
+        assert!(
+            drained.gaps.contains(&ObservationGap::InvalidWire),
+            "the rejection gaps InvalidWire: {:?}",
+            drained.gaps
+        );
+        // AT SEAL: zero certification invalidated, positives survive.
+        assert!(
+            s.fetch_coverage_broken,
+            "a wire rejection latches coverage-broken"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "the seal covers nothing after the rejection: {sealed:?}"
+        );
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &survivor.facts,
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries: None,
+                fetch_armed: sealed,
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        assert_eq!(evidence.fetches[0].attempts, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new23: rejected=invalidwire sealed_empty=true survivor=1");
+    }
+    /// NEW-6/NEW-13 fix4 seal helper: like `new7_idle_child` but the
+    /// caller keeps the fixture's stdin (to drive the 'D' digest
+    /// round — genuine BPF-counted operational calls) and a stdout
+    /// reader (to read the oracle line).
+    struct NewOpOwned {
+        child: std::process::Child,
+        stdin: std::process::ChildStdin,
+        stdout: std::io::BufReader<std::process::ChildStdout>,
+    }
+    impl Drop for NewOpOwned {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+    fn newop_digest_child(dir: &std::path::Path) -> (NewOpOwned, u32) {
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+        let app = dir.join("provider_load_loop");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_load_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        let mut child = std::process::Command::new(&app)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("fixture spawns");
+        let pid = child.id();
+        let stdin = child.stdin.take().expect("fixture stdin");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("fixture stdout"));
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        assert_eq!(line, "ready\n", "fixture prints its ready line");
+        line.clear();
+        stdout.read_line(&mut line).unwrap();
+        assert!(
+            line.starts_with("pre default=0x"),
+            "fixture prints its pre line: {line:?}"
+        );
+        (
+            NewOpOwned {
+                child,
+                stdin,
+                stdout,
+            },
+            pid,
+        )
+    }
+    /// NEW-13-OPEN fix5 helper: production prearm + a pre-commit
+    /// failure on the adopting pass (static-candidate expiry AFTER
+    /// the API loop armed under the live prearm member, BEFORE the
+    /// admission commit — the N1 injector on the startup-adoption
+    /// path). The cold target reuses the startup generation (the
+    /// live member's), so newly armed cookies count immediately —
+    /// but the failed pass commits nothing, and the caller seals
+    /// WITHOUT retrying. Returns the session (unready target, live
+    /// member, armed-but-unadmitted cookies) with the budget
+    /// deadline restored (unstaging the one-shot fault — the
+    /// skipped commit is never re-run) after a genuine counting
+    /// window under the live workload.
+    struct FailedCommitAdoption {
+        s: ProviderSession,
+        _child: crate::target::OwnedTarget,
+        pid: u32,
+    }
+    fn prearm_then_fail_commit() -> FailedCommitAdoption {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        // Self-running workload (no stdin — runs past the seal).
+        let argv: Vec<String> = [
+            "/usr/bin/openssl",
+            "speed",
+            "-elapsed",
+            "-seconds",
+            "30",
+            "-evp",
+            "SHA512",
+            "-bytes",
+            "64",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .expect("child spawns stopped");
+        let pid = child.pid();
+        let cancel = AtomicBool::new(false);
+        let mut budget = super::ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            None,
+        )
+        .expect("startup discovery");
+        assert!(
+            !startup.apis.is_empty(),
+            "premise: pre-exec discovery finds startup sites"
+        );
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        // Partial prearm (staging): lifecycle sites only — no
+        // operational site prearms, so prearm itself admits nothing
+        // and the ONLY admission event in the run would be the cold
+        // pass's commit (which the staged failure skips). The member
+        // still goes live (any prearmed site installs it), so the
+        // cold pass reuses the startup generation.
+        let prearm: Vec<_> = startup
+            .apis
+            .into_iter()
+            .filter(|site| !matches!(site.api(), super::schema::ObservationApi::Operational(_)))
+            .collect();
+        assert!(
+            !prearm.is_empty(),
+            "premise: lifecycle startup sites exist to prearm"
+        );
+        s.prearm_startup(
+            prearm,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            super::PrearmLinks::Create,
+        )
+        .expect("prearm");
+        assert!(
+            s.startup.get(&pid).is_some_and(|rows| !rows.is_empty()),
+            "premise: startup rows retained"
+        );
+        child.release().expect("child releases");
+        std::thread::sleep(Duration::from_millis(200));
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        // The committing pass fails BEFORE admission: static expiry
+        // lands after the API loop armed (links live, owners
+        // allocated, CONFIG under the live member) but before the
+        // commit point.
+        super::EXPIRE_STATIC.with(|flag| flag.set(true));
+        let first = s.reconcile_records(&records);
+        super::EXPIRE_STATIC.with(|flag| flag.set(false));
+        assert!(
+            first.gaps.contains(&ObservationGap::SnapshotLag),
+            "premise: static expiry fails the pass: {:?}",
+            first.gaps
+        );
+        assert!(
+            !s.target_ready(pid, starttime),
+            "premise: the failed pass leaves the target unready"
+        );
+        assert!(
+            s.api_admitted.is_empty(),
+            "premise: the failed pass commits no admission"
+        );
+        assert!(
+            !s.api_owners.is_empty(),
+            "premise: owners allocated (terminal reads happen — scope absence below is admission, not read failure)"
+        );
+        // Startup-generation reuse: the cold target adopts the
+        // prearmed sites under the LIVE prearm member (same
+        // generation — BPF counts immediately).
+        let target = s.targets.get(&pid).expect("target kept");
+        assert!(
+            target.attachments.iter().any(|a| a.original.is_some()),
+            "premise: the failed pass adopts prearmed sites"
+        );
+        let member_gen = s
+            .members
+            .get(&pid, 0)
+            .expect("premise: the prearm member is live")
+            .generation;
+        assert_eq!(
+            target.generation, member_gen,
+            "premise: the cold target reuses the startup generation"
+        );
+        let counted = target
+            .attachments
+            .iter()
+            .filter(|a| c::operational_api(a.api))
+            .find(|a| {
+                s.config
+                    .get(&a.cookie, 0)
+                    .is_ok_and(|row| row.generation == member_gen)
+            })
+            .expect("premise: an operational cookie is armed under the live member");
+        assert_eq!(
+            counted.generation, member_gen,
+            "premise: the armed cookie reuses the member generation"
+        );
+        // Unstage the one-shot fault (the skipped commit is never
+        // re-run — the caller seals without retrying), then a
+        // genuine counting window under the live workload.
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            child.peek_exit().expect("exit peeks").is_none(),
+            "premise: the workload runs through the counting window"
+        );
+        FailedCommitAdoption {
+            s,
+            _child: child,
+            pid,
+        }
+    }
+    /// NEW-13-OPEN fix5 pin AT SEAL (production prearm + genuine
+    /// BPF-counted workload + a REAL pre-commit failure — no
+    /// hand-cleared admission): the adopting pass arms under the
+    /// live prearm member (startup-generation reuse) and fails
+    /// before the admission commit; genuine operational calls land
+    /// under the live member; the seal must PROJECT the verified
+    /// positives, not skip the owners.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn generation_reuse_failed_pass_preserves_genuine_positives() {
+        use std::time::{Duration, Instant};
+        let mut fixed = prearm_then_fail_commit();
+        let pid = fixed.pid;
+        let batch = fixed
+            .s
+            .finalize_until(Instant::now() + Duration::from_secs(10));
+        let positive: Vec<_> = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.entries > 0)
+            .collect();
+        assert!(
+            !positive.is_empty(),
+            "genuine BPF-counted positives project despite the failed commit (got {} rows)",
+            batch.api_activity.len()
+        );
+        let sum: u64 = positive.iter().map(|a| a.row.entries).sum();
+        assert!(sum > 0, "the projected positives carry counts");
+        crate::target::kill_test_child(pid, Duration::from_secs(5));
+        eprintln!("new6: positive_rows={} entries_sum={sum}", positive.len());
+    }
+    /// NEW-13-OPEN fix5 pin AT SEAL (same production shape as
+    /// NEW-6 — real prearm + real pre-commit failure, no
+    /// hand-cleared admission): verified positive totals are
+    /// preserved INDEPENDENTLY of zero eligibility — the adopted
+    /// cookie counted under the live prearm member (reused
+    /// generation), the pass failed before the commit, the seal
+    /// projects the positive row (attached + read-receipted) but
+    /// grants NO terminal scope receipt, and the fold still
+    /// observes the positive remainder (positives never demote for
+    /// lack of a receipt).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn startup_adoption_failure_preserves_positives_without_zero_eligibility() {
+        use std::time::{Duration, Instant};
+        let mut fixed = prearm_then_fail_commit();
+        let pid = fixed.pid;
+        let batch = fixed
+            .s
+            .finalize_until(Instant::now() + Duration::from_secs(10));
+        let positive: Vec<_> = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.entries > 0)
+            .collect();
+        assert!(
+            !positive.is_empty(),
+            "verified positives project despite the failed commit"
+        );
+        for a in &positive {
+            assert!(
+                !a.row.gaps.not_attached,
+                "the preserved row is attached (probes armed, BPF counted)"
+            );
+            assert!(
+                a.row.gaps.read_receipt,
+                "the preserved row carries the read receipt (the terminal read vouched)"
+            );
+        }
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no zero eligibility without admission: {:?}",
+            batch.terminal_scopes_observed
+        );
+        // End to end through the fold: the positive remainder
+        // observes without any scope receipt.
+        let sum: u64 = positive.iter().map(|a| a.row.entries).sum();
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &[],
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries:
+                    crate::provider_observation::request_evidence::RequestEvidence::operational_plane(
+                        sum, false,
+                    ),
+                fetch_armed: std::collections::BTreeSet::new(),
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Observed { ops: sum },
+            "positives never demote for lack of a receipt"
+        );
+        crate::target::kill_test_child(pid, Duration::from_secs(5));
+        eprintln!(
+            "new13: positive_rows={} scopes_empty=true remainder_observed={sum}",
+            positive.len()
+        );
+    }
+    /// NEW-8(a) fix4 pin AT SEAL: a failed writer closure returns
+    /// before the terminal drain — the seal must NOT certify from
+    /// the stale arms/epoch (the failed cut latches broken),
+    /// while an already-fed positive still projects. Pre-fix the
+    /// latch never engages and the stale arms stay eligible (RED).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn failed_close_voids_zero_certification_keeps_positive() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new8a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&api),
+            "control: the seal covers the fetch surface pre-failure"
+        );
+        // Survivor positive: one funded fetch fact lands through
+        // production consume (pre-final).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one funded fetch fact lands");
+        // Sabotage: the terminal cut fails.
+        s.gate.fail_next_delete();
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.gaps.contains(&ObservationGap::BpfUnavailable),
+            "premise: the failed cut gaps: {:?}",
+            batch.gaps
+        );
+        assert!(
+            s.fetch_coverage_broken,
+            "a failed terminal cut latches coverage-broken"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "the seal covers nothing after a failed cut: {sealed:?}"
+        );
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &survivor.facts,
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries: None,
+                fetch_armed: sealed,
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new8a: close_failed=true sealed_empty=true survivor=1");
+    }
+    /// NEW-8(b) fix4 pin AT SEAL: a final source refusal discards
+    /// queued fetches — the arms must not stay eligible (no valid
+    /// source custody, no zero certification), while an
+    /// earlier-fed positive still projects. Pre-fix the refused
+    /// pid's arms stay covered (RED).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn final_refusal_voids_arms_keeps_positive() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new8b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&api),
+            "control: the seal covers the fetch surface pre-refusal"
+        );
+        // Survivor positive: one funded fetch fact lands through
+        // production consume (pre-final).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one funded fetch fact lands");
+        // Sabotage: the terminal source check refuses custody.
+        s.targets
+            .get(&pid)
+            .expect("target present")
+            .process
+            .remember_refusal(ObservationGap::ObjectChanged);
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.gaps.contains(&ObservationGap::ObjectChanged),
+            "premise: the refusal gaps the batch: {:?}",
+            batch.gaps
+        );
+        assert!(
+            s.final_refusals.contains_key(&pid),
+            "premise: the final refusal is recorded"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "refused custody voids the arms: {sealed:?}"
+        );
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &survivor.facts,
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries: None,
+                fetch_armed: sealed,
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new8b: refused=true sealed_empty=true survivor=1");
+    }
+    /// NEW-24 fix7 pin (guest, production attach + focused
+    /// finish): an additive refresh retires and disarms the
+    /// target mid-claim (no sealed fence) and the re-add arms
+    /// late — the old admitted counter must NOT grant the
+    /// terminal scope receipt (operational zero needs CONTINUOUS
+    /// coverage across the claimed interval), while an
+    /// already-fed positive still projects. Pre-fix the seal
+    /// certifies an observed zero (RED).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn additive_refresh_readd_voids_scope_receipt_through_focused_finish() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new24a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let snap = || {
+            crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes
+        };
+        let records = snap();
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        // Establish the claim BEFORE the refresh (the disarm lands
+        // mid-claim — the continuity case).
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, starttime, now, now.saturating_add(60_000_000_000))
+                .expect("gate decides"),
+            "premise: establishment accepted"
+        );
+        // Stage added-rows-only maps and reconcile: the additive
+        // path retires (disarm, no sealed fence) and hands off.
+        super::objects::fixture_support::stage_additive_rows(
+            &mut s.targets.get_mut(&pid).expect("target present").process,
+        );
+        let refreshed = s.reconcile_records(&snap());
+        assert_eq!(
+            refreshed.additive_refreshes,
+            vec![pid],
+            "the additive refresh fires exactly once: {:?}",
+            refreshed.additive_refreshes
+        );
+        assert!(
+            s.refreshing.contains_key(&pid),
+            "the refresh hands off its incarnation"
+        );
+        assert!(
+            !s.targets.contains_key(&pid),
+            "premise: the refresh retired the target (disarmed)"
+        );
+        // Next tick re-adds through the handoff (production
+        // admission, late arms).
+        let readded = s.reconcile_records(&snap());
+        assert!(
+            s.target_ready(pid, starttime),
+            "the re-add completes: {:?}",
+            readded.gaps
+        );
+        assert!(!s.refreshing.contains_key(&pid), "the handoff is consumed");
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment re-arms");
+            assert!(
+                a.armed_ns.is_some_and(|t| t > now),
+                "the re-added arm is late (past the claim start)"
+            );
+            (a.cookie, a.api, a.generation)
+        };
+        // Survivor positive through production consume (pre-final).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one funded fetch fact lands");
+        // Seal through the real focused finish (established claim
+        // spanning the refresh).
+        let namespaces = snap()[0].namespaces.clone();
+        let start_ns = now.saturating_sub(1_000_000_000);
+        let deadline_ns = now.saturating_add(60_000_000_000);
+        let sealed = crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+            s,
+            pid,
+            starttime,
+            namespaces,
+            &pool,
+            start_ns,
+            Some(now),
+            deadline_ns,
+            &survivor.facts,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("finish seals");
+        let evidence = sealed
+            .document
+            .request_evidence
+            .expect("the sealed document carries its section");
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "a mid-claim disarm voids the operational zero (no continuous coverage)"
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        evidence
+            .validate_strict()
+            .expect("the sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new24a: refreshed=true readded=true scopes_empty=true survivor=1");
+    }
+    /// NEW-24 fix7 pin (guest, production attach + focused
+    /// finish): a final source refusal disqualifies the terminal
+    /// scope receipt (no valid source custody, no operational
+    /// zero) while an already-fed positive still projects.
+    /// Pre-fix the old admitted counter still grants the receipt
+    /// (RED). (The N8b pin covers the fetch arms; this pin covers
+    /// the operational receipt through the established finish.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn final_refusal_voids_scope_receipt_through_focused_finish() {
+        use super::wire::contract as c;
+        use super::{ObservationGap, ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new24b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let namespaces = records[0].namespaces.clone();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, starttime, now, now.saturating_add(60_000_000_000))
+                .expect("gate decides"),
+            "premise: establishment accepted"
+        );
+        // Survivor positive through production consume (pre-final).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one funded fetch fact lands");
+        // Sabotage: the terminal source check refuses custody.
+        s.targets
+            .get(&pid)
+            .expect("target present")
+            .process
+            .remember_refusal(ObservationGap::ObjectChanged);
+        // Seal through the real focused finish (established claim).
+        let start_ns = now.saturating_sub(1_000_000_000);
+        let deadline_ns = now.saturating_add(60_000_000_000);
+        let sealed = crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+            s,
+            pid,
+            starttime,
+            namespaces,
+            &pool,
+            start_ns,
+            Some(now),
+            deadline_ns,
+            &survivor.facts,
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("finish seals");
+        let evidence = sealed
+            .document
+            .request_evidence
+            .expect("the sealed document carries its section");
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "a final source refusal voids the operational zero"
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        evidence
+            .validate_strict()
+            .expect("the sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new24b: refused=true scopes_empty=true survivor=1");
+    }
+    /// NEW-26 fix7 pin (guest, production attach + focused
+    /// finish): an early finish (live target, deadline far off)
+    /// closes the writer gate BEFORE sampling its end instant —
+    /// the sealed silence interval must end at the successful
+    /// cut's conservative `close_before_ns` (never past it: the
+    /// claimed span past the cut observed nothing), while a
+    /// verified capture-window positive still projects. Pre-fix
+    /// the silence runs through the later end sample (RED).
+    /// NEW-30 fix8 pin (guest, pre-claim retirement +
+    /// lifecycle-only readiness): a live incarnation earns real
+    /// operational admission and genuine BPF-counted positives,
+    /// then retires BEFORE the claim is programmed; the re-added
+    /// incarnation (same pid, same starttime) goes ready with
+    /// lifecycle attachments alone (no operational arms, no new
+    /// admission) while the old admitted cookies still read. The
+    /// claim advance clears the pre-claim churn mark — but the
+    /// old operational map must not certify the new idle
+    /// interval: zero eligibility binds to live operational
+    /// admission for the exact incarnation at claim start. The
+    /// historical positives still project.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn preclaim_retire_lifecycle_readd_voids_scope_receipt() {
+        use super::wire::contract as c;
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::io::{BufRead as _, Write as _};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new30-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (mut owned, pid) = newop_digest_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        assert!(
+            !s.api_admitted.is_empty(),
+            "premise: the live incarnation earns operational admission"
+        );
+        // Genuine BPF-counted positives under the live plane.
+        owned.stdin.write_all(b"D").unwrap();
+        owned.stdin.flush().unwrap();
+        let mut line = String::new();
+        owned.stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line, "done digest=3,3\n",
+            "premise: the workload ran: {line:?}"
+        );
+        let old_admitted = s.api_admitted.clone();
+        // Retire BEFORE any claim is programmed (pre-claim churn).
+        let mut b = super::ObservationBatch::default();
+        s.retire(pid, &mut b);
+        assert!(
+            !s.targets.contains_key(&pid),
+            "premise: the incarnation retired"
+        );
+        assert_eq!(
+            s.api_admitted, old_admitted,
+            "premise: historical admission survives the retire"
+        );
+        // Re-add the SAME incarnation (same pid, same starttime)
+        // with lifecycle attachments alone: the staged process
+        // exports no operational symbols, so no operational site
+        // resolves, arms, or admits — yet the pass goes ready.
+        let _mapped = super::startup_api_controls::MAPPED_FIXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let staged = super::startup_api_controls::two_exporter_fixture(false);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is still inventoried");
+        assert_eq!(
+            records[0].starttime, starttime,
+            "premise: the re-add is the same incarnation"
+        );
+        s.process_override.borrow_mut().insert(pid, staged.process);
+        let readd = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "the lifecycle-only re-add goes ready: {:?}",
+            readd.gaps
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .all(|a| !c::operational_api(a.api)),
+            "premise: lifecycle attachments alone (no operational arms)"
+        );
+        assert_eq!(
+            s.api_admitted, old_admitted,
+            "premise: the re-add admits nothing new"
+        );
+        // Program the claim AFTER the churn (the advance clears
+        // the pre-claim mark — the bug's enabler).
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        assert!(
+            s.scope_continuity_broken.is_empty(),
+            "premise: the claim advance clears pre-claim churn"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt from the stale operational map: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.entries > 0)
+            .count();
+        assert!(positives > 0, "historical positives still project");
+        let _ = (owned, staged._child, staged._mappings, staged._forwarders);
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "new30: retired=true readded_lifecycle_only=true scopes_empty=true positives_preserved={positives}"
+        );
+    }
+    /// NEW-31 fix8 pin (guest, victimless retention): repeated
+    /// VICTIMLESS failed acquisitions (stale-inventory
+    /// `ObjectChanged` — a recorded refusal that fails the pass
+    /// before the attach loop, so nothing arms and nothing
+    /// admits) retain no continuity state (a failed acquisition
+    /// owns nothing, and its released provisional admission must
+    /// not leave an unbounded PID entry behind). Three distinct
+    /// pids (one staged stale process each — the seam is
+    /// one-shot per pass).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn failed_acquisitions_retain_no_continuity() {
+        use super::{ObservationLimits, ProviderSession};
+        use std::time::{Duration, Instant};
+        let _mapped = super::startup_api_controls::MAPPED_FIXTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 3,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let mut holds = Vec::new();
+        for _ in 0..3 {
+            let staged = super::startup_api_controls::two_exporter_fixture(true);
+            let pid = staged._child.pid();
+            let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            assert_eq!(records.len(), 1, "the child is inventoried");
+            let starttime = records[0].starttime;
+            s.process_override.borrow_mut().insert(pid, staged.process);
+            let b = s.reconcile_records(&records);
+            assert!(
+                b.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "premise: the stale pass really fails: {:?}",
+                b.gaps
+            );
+            assert!(
+                !s.target_ready(pid, starttime),
+                "premise: the stale pass leaves no ready target"
+            );
+            assert!(
+                !s.targets.contains_key(&pid),
+                "premise: the failed acquisition owns no target"
+            );
+            holds.push((staged._child, staged._mappings, staged._forwarders));
+        }
+        assert!(
+            s.api_admitted.is_empty(),
+            "premise: the failed acquisitions admit nothing"
+        );
+        assert!(
+            s.scope_continuity_broken.is_empty(),
+            "victimless failures retain no continuity state: {:?}",
+            s.scope_continuity_broken
+        );
+        let _ = holds;
+        eprintln!("new31a: failures=3 retained=0");
+    }
+    /// NEW-31-OPEN fix10 pin (host, no BPF): the retention blocks
+    /// are EXACTLY accounted — `with_cap` allocates exactly
+    /// `cap × elem` heap bytes, filling to the cap (in reverse,
+    /// exercising front inserts) never reallocates, duplicates
+    /// stay idempotent, iteration stays sorted, `clear` keeps the
+    /// block, and the lease reserve equals all three blocks plus
+    /// the documented slack (equality — a drift fails here, not
+    /// silently at admission). NEW-38 fix11: the continuity keys
+    /// are exact `(pid, starttime)` pairs too. NEW-39 fix12: the
+    /// historical custody refusals are the third exact block.
+    #[test]
+    fn retention_storage_is_exactly_accounted() {
+        use super::{ObservationLimits, ProviderSession, SortedVecSet};
+        let cap = ObservationLimits::default().max_processes;
+        let mut marks = SortedVecSet::<(u32, u64)>::with_cap(cap);
+        let mut gaps = SortedVecSet::<(u32, u64)>::with_cap(cap);
+        let mut refusals = SortedVecSet::<(u32, u64)>::with_cap(cap);
+        assert_eq!(
+            marks.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "the continuity block is exactly cap × (u32, u64)"
+        );
+        assert_eq!(
+            gaps.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "the gap-verdict block is exactly cap × (u32, u64)"
+        );
+        assert_eq!(
+            refusals.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "the custody-refusal block is exactly cap × (u32, u64)"
+        );
+        for i in (0..cap as u32).rev() {
+            assert!(
+                marks.insert((i, u64::from(i))),
+                "reverse insertion fills the block"
+            );
+            assert!(
+                gaps.insert((i, u64::from(i))),
+                "reverse insertion fills the gap block"
+            );
+            assert!(
+                refusals.insert((i, u64::from(i))),
+                "reverse insertion fills the refusal block"
+            );
+        }
+        assert_eq!(marks.len(), cap, "the continuity block fills to the cap");
+        assert_eq!(gaps.len(), cap, "the gap block fills to the cap");
+        assert_eq!(refusals.len(), cap, "the refusal block fills to the cap");
+        assert!(
+            !marks.insert((0, 0)),
+            "re-insertion is idempotent, not growth"
+        );
+        assert!(
+            !gaps.insert((0, 0)),
+            "gap re-insertion is idempotent, not growth"
+        );
+        assert!(
+            !refusals.insert((0, 0)),
+            "refusal re-insertion is idempotent, not growth"
+        );
+        assert_eq!(
+            marks.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "filling to the cap never reallocates the continuity block"
+        );
+        assert_eq!(
+            gaps.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "filling to the cap never reallocates the gap block"
+        );
+        assert_eq!(
+            refusals.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "filling to the cap never reallocates the refusal block"
+        );
+        let sorted: Vec<(u32, u64)> = marks.iter().copied().collect();
+        assert!(
+            sorted.windows(2).all(|w| w[0] < w[1]),
+            "iteration stays sorted (BTreeSet order)"
+        );
+        marks.clear();
+        assert!(marks.is_empty(), "clear empties the set");
+        assert_eq!(
+            marks.heap_bytes(),
+            cap.saturating_mul(std::mem::size_of::<(u32, u64)>()),
+            "clear keeps the block (refills never realloc)"
+        );
+        // NEW-42 fix13: the expected allowance is derived
+        // INDEPENDENTLY of heap capacity — from the admission
+        // bound, the key size, and three measured `Vec` headers
+        // (never from `capacity()` reads or a literal): a reserve
+        // that undercharges the headers fails here.
+        assert_eq!(
+            std::mem::size_of::<Vec<(u32, u64)>>(),
+            3usize.saturating_mul(std::mem::size_of::<usize>()),
+            "a Vec header is ptr + len + cap (24 bytes on 64-bit)"
+        );
+        let blocks = cap
+            .saturating_mul(std::mem::size_of::<(u32, u64)>())
+            .saturating_mul(3);
+        let headers = 3usize.saturating_mul(std::mem::size_of::<Vec<(u32, u64)>>());
+        assert_eq!(
+            ProviderSession::scope_retention_reserve_bytes(),
+            blocks.saturating_add(headers),
+            "the lease reserve is the three exact blocks plus three explicit Vec headers"
+        );
+    }
+    // NEW-31-OPEN fix9: the fix8 churn pin
+    // (`churned_continuity_stays_within_session_bound`) is DELETED —
+    // the sabotage run (`fix9-sabotage-trip.log`) proved it blind
+    // (green with the latch conjunct removed: it seals after
+    // removing every target, so its empty receipt never exercises
+    // the latch). The pin below supersedes it.
+    /// NEW-31-OPEN fix9 pin (guest, latch blocks an eligible
+    /// cookie): two distinct admitted incarnations churn through a
+    /// one-process session (the second overflows into the
+    /// session-wide latch with a visible `StateLimit`), while a
+    /// THIRD incarnation stays live with genuine BPF-counted
+    /// positives — claimless-eligible, successfully read — and is
+    /// denied its receipt ONLY by the latch. It supersedes the
+    /// fix8 churn pin (deleted above — the sabotage run proved it
+    /// blind: it sealed after removing every target, so its empty
+    /// receipt never exercised the latch).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn continuity_latch_blocks_otherwise_eligible_cookie() {
+        use super::{ObservationLimits, ProviderSession};
+        use std::io::{BufRead as _, Write as _};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::env::temp_dir().join(format!("osslscope-new31b9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child_a, pid_a) = new7_idle_child(&dir);
+        let (_child_d, pid_d) = new7_idle_child(&dir);
+        assert_ne!(pid_a, pid_d, "premise: distinct churn pids");
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        for pid in [pid_a, pid_d] {
+            let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            assert_eq!(records.len(), 1, "the child is inventoried");
+            let setup = s.reconcile_records(&records);
+            assert!(
+                s.target_ready(pid, records[0].starttime),
+                "premise: churn pid {pid} admits: {:?}",
+                setup.gaps
+            );
+            assert!(
+                !s.api_admitted.is_empty(),
+                "premise: churn pid {pid} earns admission"
+            );
+            let mut b = super::ObservationBatch::default();
+            s.retire(pid, &mut b);
+            assert!(
+                !s.targets.contains_key(&pid),
+                "premise: churn pid {pid} retired"
+            );
+            if pid == pid_d {
+                assert!(
+                    b.gaps.contains(&super::ObservationGap::StateLimit),
+                    "the overflow carries a visible StateLimit: {:?}",
+                    b.gaps
+                );
+            }
+        }
+        assert!(
+            s.scope_continuity_broken.len() <= 1,
+            "retention stays within the session bound: {:?}",
+            s.scope_continuity_broken
+        );
+        assert!(
+            s.scope_continuity_broken_all,
+            "the overflow fails closed into the session-wide latch"
+        );
+        // The genuine eligible control: live, admitted, successfully
+        // read, with BPF-counted positives — receipted but for the
+        // latch.
+        let dir_c = dir.join("control");
+        std::fs::create_dir(&dir_c).unwrap();
+        let (mut owned_c, pid_c) = newop_digest_child(&dir_c);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_c],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the control is inventoried");
+        let starttime_c = records[0].starttime;
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid_c, starttime_c),
+            "premise: the control admits live: {:?}",
+            setup.gaps
+        );
+        owned_c.stdin.write_all(b"D").unwrap();
+        owned_c.stdin.flush().unwrap();
+        let mut line = String::new();
+        owned_c.stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line, "done digest=3,3\n",
+            "premise: the control workload ran: {line:?}"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "the latch blocks the otherwise-eligible control: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_c && a.row.entries > 0)
+            .count();
+        assert!(
+            positives > 0,
+            "the control's verified positives still project"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "new31b: churned=2 retained_capped=true control_voided=true statelimit_visible=true positives={positives}"
+        );
+    }
+    /// NEW-31-OPEN fix9 pin (guest, cohort-bound retention): in a
+    /// claimed session, a HISTORICAL admitted pid (retired
+    /// pre-claim, outside the claim-start snapshot) re-retired
+    /// post-claim retains NOTHING — retention binds to the active
+    /// claim cohort, not to any historically admitted PID — with
+    /// room (no entry) and against the full set (no false latch
+    /// for a pid that can earn no receipt). The cohort member's
+    /// own retire still marks (only the stale re-retire is
+    /// dropped). Pre-fix the historical pid retains (RED).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn non_cohort_retires_retain_no_continuity() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::env::temp_dir().join(format!("osslscope-new31c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child_x, pid_x) = new7_idle_child(&dir);
+        let (_child_a, pid_a) = new7_idle_child(&dir);
+        assert_ne!(pid_x, pid_a, "premise: distinct pids");
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        // X: live, admitted, retired pre-claim (historical).
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_x],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "X is inventoried");
+        let starttime_x = records[0].starttime;
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid_x, starttime_x),
+            "premise: X admits: {:?}",
+            setup.gaps
+        );
+        // Production ticks drop each batch before the next acquire
+        // (batches hold candidate sites referencing the process) —
+        // a shadowed live batch would pin X's process slot and
+        // refuse A's acquire with ProcessLimit.
+        drop(setup);
+        let x_admitted = s.api_admitted.clone();
+        assert!(!x_admitted.is_empty(), "premise: X earns admission");
+        let mut b = super::ObservationBatch::default();
+        s.retire(pid_x, &mut b);
+        assert!(
+            !s.targets.contains_key(&pid_x),
+            "premise: X retired (not deferred)"
+        );
+        assert!(
+            !s.pending_retire.contains_key(&pid_x),
+            "premise: X's retire completed (no pending retry)"
+        );
+        assert!(
+            s.scope_continuity_broken.contains(&(pid_x, starttime_x)),
+            "premise: X's live retire marks (pre-claim): {:?}",
+            s.scope_continuity_broken
+        );
+        // A: live at the claim advance (the cohort).
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_a],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "A is inventoried");
+        let starttime_a = records[0].starttime;
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid_a, starttime_a),
+            "premise: A admits: {:?}",
+            setup.gaps
+        );
+        drop(setup);
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        assert!(
+            s.scope_continuity_broken.is_empty(),
+            "premise: the claim advance clears pre-claim churn"
+        );
+        assert_eq!(
+            s.api_admitted.intersection(&x_admitted).count(),
+            x_admitted.len(),
+            "premise: X's historical admission survives"
+        );
+        // X's stale re-retire with ROOM retains nothing (outside
+        // the cohort — pre-fix it inserts here).
+        let mut b = super::ObservationBatch::default();
+        s.retire(pid_x, &mut b);
+        assert!(
+            s.scope_continuity_broken.is_empty(),
+            "the historical re-retire retains nothing: {:?}",
+            s.scope_continuity_broken
+        );
+        assert!(
+            !s.scope_continuity_broken_all,
+            "no latch from the historical re-retire (nothing overflowed)"
+        );
+        // A's retire marks (cohort member).
+        let mut b = super::ObservationBatch::default();
+        s.retire(pid_a, &mut b);
+        assert!(
+            s.scope_continuity_broken.contains(&(pid_a, starttime_a)),
+            "the cohort member's retire still marks: {:?}",
+            s.scope_continuity_broken
+        );
+        // X's stale re-retire against the FULL set fires no latch
+        // either (pre-fix it fails the whole session closed for a
+        // pid that can earn no receipt).
+        let mut b = super::ObservationBatch::default();
+        s.retire(pid_x, &mut b);
+        assert!(
+            s.scope_continuity_broken.len() == 1
+                && s.scope_continuity_broken.contains(&(pid_a, starttime_a)),
+            "the historical re-retire retains nothing against the full set: {:?}",
+            s.scope_continuity_broken
+        );
+        assert!(
+            !s.scope_continuity_broken_all,
+            "no latch from the historical re-retire against the full set"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "control: the marked cohort earns no receipt: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new31c: historical_retained=0 cohort_marked=true");
+    }
+    /// FLAG-A fix9 pin (guest, late joiner in both modes): one
+    /// claimed session pins a claim-start owner (A) plus a late
+    /// owner (B, admitted after the claim) — B's receipt is
+    /// withheld in the claimed interval (its coverage starts
+    /// mid-window) while its verified positives still project;
+    /// the claimless twin session (same shape, no claim advance)
+    /// receipts BOTH owners with positives projecting. Withholding
+    /// in claimed intervals is already correct (fix8 residual (a))
+    /// — this pins the direction in both modes (the pin fails if
+    /// either mode misbehaves: a claimed grant to B, or a
+    /// claimless withholding, both fail it). FLAG-A-OPEN fix10:
+    /// the twin mirrors the two admission ticks (D arrives after
+    /// C) — the fix9 single joint reconcile never tested late
+    /// arrival into a claimless session.
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn late_joiner_withholds_receipt_keeps_positives_both_modes() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::io::{BufRead as _, Write as _};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::env::temp_dir().join(format!("osslscope-flaga-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let drive = |owned: &mut NewOpOwned, who: &str| {
+            owned.stdin.write_all(b"D").unwrap();
+            owned.stdin.flush().unwrap();
+            let mut line = String::new();
+            owned.stdout.read_line(&mut line).unwrap();
+            assert_eq!(
+                line, "done digest=3,3\n",
+                "premise: the {who} workload ran: {line:?}"
+            );
+        };
+        // Claimed session: A live at claim start, B joins late.
+        let dir_a = dir.join("a");
+        let dir_b = dir.join("b");
+        std::fs::create_dir(&dir_a).unwrap();
+        std::fs::create_dir(&dir_b).unwrap();
+        let (mut owned_a, pid_a) = newop_digest_child(&dir_a);
+        let (mut owned_b, pid_b) = newop_digest_child(&dir_b);
+        assert_ne!(pid_a, pid_b, "premise: distinct owners");
+        let mut s = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let records_a = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_a],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records_a.len(), 1, "A is inventoried");
+        let starttime_a = records_a[0].starttime;
+        let setup = s.reconcile_records(&records_a);
+        assert!(
+            s.target_ready(pid_a, starttime_a),
+            "premise: A admits: {:?}",
+            setup.gaps
+        );
+        let a_cookies: std::collections::BTreeSet<u64> = s.api_admitted.iter().copied().collect();
+        assert!(!a_cookies.is_empty(), "premise: A earns admission");
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        assert!(
+            a_cookies.iter().all(|c| s
+                .claim_admitted
+                .as_ref()
+                .is_some_and(|snap| snap.contains(c))),
+            "premise: A is the claim-start cohort"
+        );
+        // The late join reconciles the FULL snapshot (production
+        // ticks always do — reconciling B alone would retire the
+        // absent A).
+        let records_ab = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_a, pid_b],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records_ab.len(), 2, "both owners are inventoried");
+        let starttime_b = records_ab
+            .iter()
+            .find(|r| r.pid == pid_b)
+            .expect("B inventoried")
+            .starttime;
+        let setup = s.reconcile_records(&records_ab);
+        assert!(
+            s.target_ready(pid_b, starttime_b),
+            "premise: the late joiner admits: {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.target_ready(pid_a, starttime_a),
+            "premise: the full snapshot keeps A: {:?}",
+            setup.gaps
+        );
+        let b_cookies: Vec<u64> = s.api_admitted.difference(&a_cookies).copied().collect();
+        assert!(!b_cookies.is_empty(), "premise: B earns admission");
+        assert!(
+            b_cookies.iter().all(|c| !s
+                .claim_admitted
+                .as_ref()
+                .is_some_and(|snap| snap.contains(c))),
+            "premise: the late joiner misses the claim-start snapshot"
+        );
+        drive(&mut owned_a, "A");
+        drive(&mut owned_b, "B");
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch
+                .terminal_scopes_observed
+                .contains(&(pid_a, starttime_a)),
+            "the claim-start owner receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        assert!(
+            !batch
+                .terminal_scopes_observed
+                .contains(&(pid_b, starttime_b)),
+            "the late joiner's receipt is withheld in the claimed interval: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives_a = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_a && a.row.entries > 0)
+            .count();
+        let positives_b = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_b && a.row.entries > 0)
+            .count();
+        assert!(positives_a > 0, "A's verified positives project");
+        assert!(
+            positives_b > 0,
+            "the late joiner's verified positives project (receipt withheld, rows kept)"
+        );
+        // Claimless twin: the same shape without a claim advance —
+        // BOTH owners receipt with positives projecting.
+        // FLAG-A-OPEN fix10: the twin mirrors the claimed half's
+        // TWO admission ticks (D arrives late, after C) — a single
+        // joint reconcile never tests late arrival into a
+        // claimless session.
+        let dir_c = dir.join("c");
+        let dir_d = dir.join("d");
+        std::fs::create_dir(&dir_c).unwrap();
+        std::fs::create_dir(&dir_d).unwrap();
+        let (mut owned_c, pid_c) = newop_digest_child(&dir_c);
+        let (mut owned_d, pid_d) = newop_digest_child(&dir_d);
+        assert_ne!(pid_c, pid_d, "premise: distinct twin owners");
+        let mut t = ProviderSession::open(ObservationLimits::default(), &object).unwrap();
+        t.set_deadline(Instant::now() + Duration::from_secs(30));
+        let records_c = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_c],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records_c.len(), 1, "the first twin child is inventoried");
+        let starttime_c = records_c[0].starttime;
+        let setup = t.reconcile_records(&records_c);
+        assert!(
+            t.target_ready(pid_c, starttime_c),
+            "premise: the twin first admits: {:?}",
+            setup.gaps
+        );
+        assert!(
+            !t.targets.contains_key(&pid_d),
+            "premise: the late twin is absent after the first tick"
+        );
+        let c_cookies: std::collections::BTreeSet<u64> = t.api_admitted.iter().copied().collect();
+        assert!(!c_cookies.is_empty(), "premise: C earns admission");
+        // The late arrival reconciles the FULL snapshot (production
+        // ticks always do — reconciling D alone would retire the
+        // absent C).
+        let records_cd = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_c, pid_d],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records_cd.len(), 2, "both twin children are inventoried");
+        let starttime_d = records_cd
+            .iter()
+            .find(|r| r.pid == pid_d)
+            .expect("D inventoried")
+            .starttime;
+        let setup = t.reconcile_records(&records_cd);
+        assert!(
+            t.target_ready(pid_d, starttime_d),
+            "premise: the late twin admits: {:?}",
+            setup.gaps
+        );
+        assert!(
+            t.target_ready(pid_c, starttime_c),
+            "premise: the full snapshot keeps C: {:?}",
+            setup.gaps
+        );
+        let d_cookies: Vec<u64> = t.api_admitted.difference(&c_cookies).copied().collect();
+        assert!(
+            !d_cookies.is_empty(),
+            "premise: the late twin earns admission after its arrival tick"
+        );
+        drive(&mut owned_c, "twin first");
+        drive(&mut owned_d, "twin late");
+        let batch = t.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch
+                .terminal_scopes_observed
+                .contains(&(pid_c, starttime_c)),
+            "the claimless first receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        assert!(
+            batch
+                .terminal_scopes_observed
+                .contains(&(pid_d, starttime_d)),
+            "the claimless late arrival receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives_c = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_c && a.row.entries > 0)
+            .count();
+        let positives_d = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_d && a.row.entries > 0)
+            .count();
+        assert!(positives_c > 0, "the twin first's positives project");
+        assert!(positives_d > 0, "the twin late arrival's positives project");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "newflaga: claimed_owner_receipted=true late_withheld=true late_positives={positives_b} claimless_both_receipted=true"
+        );
+    }
+    /// FLAG-C fix9 pin (guest, gap verdict survives preserving
+    /// retirement): a preserving terminal retirement removes the
+    /// target AND its live operational-gap verdict — the retained
+    /// verdict for the EXACT claimed incarnation must still void.
+    /// Gapped leg (established adopted target, op-22 discovery
+    /// skip, genuine workload positives, claim, exit, production
+    /// tick, seal): no receipt, positives project. Clean leg
+    /// (same shape, no skip, quarantine-only gaps): receipt plus
+    /// positives. Pre-fix the gapped leg grants (a clean sibling
+    /// read certifies the blind site — RED); the clean leg
+    /// receipts throughout (control). Both legs advance a claim
+    /// while live (a claimless seal needs a LIVE target, so the
+    /// hole only bites claimed runs).
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn terminal_retirement_preserves_operational_gap_verdict() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _disarm = DisarmHook;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        // One adopted-speed leg; `skip_op22` stages the discovery
+        // skip (gapped) or not (clean). Returns (receipted, positives).
+        let run_leg = |skip_op22: bool| {
+            let argv: Vec<String> = [
+                "/usr/bin/openssl",
+                "speed",
+                "-elapsed",
+                "-seconds",
+                "30",
+                "-evp",
+                "SHA512",
+                "-bytes",
+                "64",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let mut child =
+                crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                    .expect("child spawns stopped");
+            let pid = child.pid();
+            let cancel = AtomicBool::new(false);
+            let mut budget = super::ObservationBudget::default();
+            let startup = crate::startup_objects::prepare_owned_startup(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                None,
+            )
+            .expect("startup discovery");
+            assert!(
+                !startup.apis.is_empty(),
+                "premise: pre-exec discovery finds startup sites"
+            );
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    // fix10 staging robustness (assertions
+                    // unchanged): a warm (fully inventoried)
+                    // adopt stages more pre-22 sites, and the
+                    // acquire loop aborts silently past the state
+                    // budget — fund the skipped-adopt shape with
+                    // margin (tracked from the default, never a
+                    // literal).
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s.prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                super::PrearmLinks::Create,
+            )
+            .expect("prearm");
+            child.release().expect("child releases");
+            // Settle-gate: `openssl speed` is heavy (cold page
+            // cache + provider init can outlast a fixed sleep) —
+            // reconcile only once the snapshot shows an ACQUIRABLE
+            // record (the exact `acquire_observable` predicate: an
+            // exe-only snapshot declines Ok(None) and the attach
+            // silently skips). Bounded; the hook arms after the
+            // gate, just before the single reconcile.
+            let acquirable = |record: &crate::inventory::ProcessRecord| {
+                record.modules.iter().any(|module| {
+                    module.info.exports.iter().any(|api| {
+                        api.operational_id().is_some()
+                            || wire::attach_ids().any(|id| {
+                                wire::api(id) == Ok(super::ObservationApi::Inventoried(*api))
+                            })
+                    })
+                })
+            };
+            let until = Instant::now() + Duration::from_secs(15);
+            let records = loop {
+                let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                    pids: vec![pid],
+                    ..Default::default()
+                })
+                .processes;
+                assert_eq!(records.len(), 1, "the child is inventoried");
+                if acquirable(&records[0]) || Instant::now() >= until {
+                    break records;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            let settled = acquirable(&records[0]);
+            assert!(
+                settled,
+                "premise: the child settled to an acquirable record within 15s"
+            );
+            let starttime = records[0].starttime;
+            if skip_op22 {
+                FAIL_RESOLVE_API.with(|slot| slot.set(Some(wire::api(22).expect("op id"))));
+            }
+            let setup = s.reconcile_records(&records);
+            if skip_op22 {
+                assert!(
+                    FAIL_RESOLVE_API.with(|slot| slot.get().is_none()),
+                    "premise: the skip one-shot fired (consumed)"
+                );
+            }
+            assert!(
+                s.target_ready(pid, starttime),
+                "the adopting attach completes: {:?}",
+                setup.gaps
+            );
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .attachments
+                    .iter()
+                    .any(|a| a.original.is_some()),
+                "premise: reconcile adopts prearmed sites (originals authorize history)"
+            );
+            assert_eq!(
+                s.targets.get(&pid).expect("target present").site_gap_apis,
+                std::collections::BTreeSet::from([21u32]),
+                "premise: quarantine is the only site gap"
+            );
+            if skip_op22 {
+                assert!(
+                    s.targets
+                        .get(&pid)
+                        .expect("target present")
+                        .process
+                        .unresolved_operational()
+                        .contains(&22),
+                    "premise: the op-22 skip is tracked: {:?}",
+                    s.targets
+                        .get(&pid)
+                        .expect("target present")
+                        .process
+                        .unresolved_operational()
+                );
+            } else {
+                assert!(
+                    s.targets
+                        .get(&pid)
+                        .expect("target present")
+                        .process
+                        .unresolved_operational()
+                        .is_empty(),
+                    "premise: clean discovery tracks nothing operational: {:?}",
+                    s.targets
+                        .get(&pid)
+                        .expect("target present")
+                        .process
+                        .unresolved_operational()
+                );
+            }
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted
+                    .as_ref()
+                    .is_some_and(|snap| !snap.is_empty()),
+                "premise: the claim snapshots live cookies"
+            );
+            // Genuine workload positives under the live plane.
+            std::thread::sleep(Duration::from_secs(2));
+            // Exit + a production tick: the exited pid is absent
+            // from the snapshot, so reconcile retires it — adopted
+            // originals authorize history, so the retire preserves
+            // (target removed, NO continuity mark, adopted rows
+            // kept historical). (The FINAL drain never removes
+            // targets — the verdict's hole needs this MID-RUN
+            // preserving retire before the seal.)
+            crate::target::kill_test_child(pid, Duration::from_secs(5));
+            let exit = s.reconcile_records(&[]);
+            assert!(
+                exit.gaps
+                    .contains(&super::ObservationGap::MembershipUnknown),
+                "premise: the tick detects the exit: {:?}",
+                exit.gaps
+            );
+            assert!(
+                !s.targets.contains_key(&pid),
+                "premise: the preserving retire removed the target"
+            );
+            assert!(
+                !s.scope_continuity_broken.contains(&(pid, starttime)),
+                "premise: the preserving retire marks nothing (an orderly exit gaps nothing)"
+            );
+            assert!(
+                !s.pending_retire.contains_key(&pid),
+                "premise: the retire completed (not deferred)"
+            );
+            assert!(
+                s.startup
+                    .get(&pid)
+                    .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|a| a.historical)),
+                "premise: adopted rows are kept historical"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                !s.final_refusals.contains_key(&pid),
+                "premise: no whole-pid refusal (the verdict below is per-scope, not custody)"
+            );
+            let positives = batch
+                .api_activity
+                .iter()
+                .filter(|a| a.pid == pid && a.row.entries > 0)
+                .count();
+            let receipted = batch.terminal_scopes_observed.contains(&(pid, starttime));
+            (receipted, positives)
+        };
+        let (gapped_receipted, gapped_positives) = run_leg(true);
+        assert!(
+            !gapped_receipted,
+            "no scope receipt past the terminally retired gap"
+        );
+        assert!(
+            gapped_positives > 0,
+            "the gapped leg's verified positives still project"
+        );
+        let (clean_receipted, clean_positives) = run_leg(false);
+        assert!(
+            clean_receipted,
+            "the clean terminal idle still receipts (quarantine never voids, live or retired)"
+        );
+        assert!(clean_positives > 0, "the clean leg's positives project");
+        eprintln!(
+            "newflagc: gapped_voided=true clean_receipted=true survivor={gapped_positives} quarantine_only=true"
+        );
+    }
+    /// NEW-36 fix10 staging: the adopted-`openssl speed` child
+    /// (the FLAG-C shape — prearm + adopt, so exits retire
+    /// preserving) with an optional op-22 discovery skip (a
+    /// genuine tracked gap verdict). Returns the held child, pid,
+    /// and starttime. The caller holds the child until its kill.
+    fn n36_speed_argv() -> Vec<String> {
+        [
+            "/usr/bin/openssl",
+            "speed",
+            "-elapsed",
+            "-seconds",
+            "30",
+            "-evp",
+            "SHA512",
+            "-bytes",
+            "64",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+    }
+    fn n36_adopt_child(
+        s: &mut super::ProviderSession,
+        who: &str,
+        skip_op22: bool,
+        keep_pids: &[u32],
+    ) -> (crate::target::OwnedTarget, u32, u64) {
+        n36_adopt_child_with_ld(s, who, skip_op22, keep_pids, None)
+    }
+    /// NEW-43 fix13: `n36_adopt_child` with a child-LOCAL
+    /// loader-env override (`None` inherits the process
+    /// environment — the wrapper above keeps every existing
+    /// caller byte-identical).
+    fn n36_adopt_child_with_ld(
+        s: &mut super::ProviderSession,
+        who: &str,
+        skip_op22: bool,
+        keep_pids: &[u32],
+        child_ld: Option<crate::target::ChildLdOverride>,
+    ) -> (crate::target::OwnedTarget, u32, u64) {
+        let argv = n36_speed_argv();
+        n36_adopt_child_with_argv(s, who, skip_op22, keep_pids, &argv, false, child_ld)
+    }
+    /// NEW-39 fix12: the argv-parameterized core of
+    /// `n36_adopt_child` (the wrapper above keeps every existing
+    /// caller on `/usr/bin/openssl` with the legacy settle gate,
+    /// byte-identically). The owned-openssl legs stage a temp copy
+    /// (the chmod stimulus needs test-owned objects) and adopt
+    /// through this entry with the staged argv. `strict_libcrypto`
+    /// additionally gates the settle on a VERIFIED libcrypto
+    /// module in the record (staged legs only): an early snapshot
+    /// can catch every module as a `LocatorCandidate` (parsed but
+    /// identity-unverified mid-transition), and reconciling it
+    /// attaches NOTHING (locator modules are excluded) with no
+    /// adopted originals — libcrypto hosts every prearmed site,
+    /// so settling on its verified entry closes the race.
+    /// NEW-43 fix13: `child_ld` carries a child-LOCAL
+    /// loader-env override (`None` inherits — every existing
+    /// caller stays byte-identical); the override feeds BOTH the
+    /// child spawn and pre-exec discovery, so the two agree
+    /// without touching the process environment.
+    fn n36_adopt_child_with_argv(
+        s: &mut super::ProviderSession,
+        who: &str,
+        skip_op22: bool,
+        keep_pids: &[u32],
+        argv: &[String],
+        strict_libcrypto: bool,
+        child_ld: Option<crate::target::ChildLdOverride>,
+    ) -> (crate::target::OwnedTarget, u32, u64) {
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let mut child = match &child_ld {
+            Some(spec) => crate::target::OwnedTarget::spawn_stopped_with_ld(
+                argv,
+                crate::target::WorkloadDest::Null,
+                spec.clone(),
+            )
+            .expect("child spawns stopped"),
+            None => {
+                crate::target::OwnedTarget::spawn_stopped(argv, crate::target::WorkloadDest::Null)
+                    .expect("child spawns stopped")
+            }
+        };
+        let pid = child.pid();
+        let cancel = AtomicBool::new(false);
+        let mut budget = super::ObservationBudget::default();
+        let startup = match &child_ld {
+            Some(crate::target::ChildLdOverride::Set(value)) => {
+                let text = value.to_str().expect("the staged LD value is UTF-8");
+                crate::startup_objects::prepare_owned_startup_with_ld(
+                    &child,
+                    argv,
+                    &mut budget,
+                    Instant::now() + Duration::from_secs(15),
+                    &cancel,
+                    None,
+                    Some(text),
+                )
+                .expect("startup discovery")
+            }
+            Some(crate::target::ChildLdOverride::Remove) => {
+                crate::startup_objects::prepare_owned_startup_with_ld(
+                    &child,
+                    argv,
+                    &mut budget,
+                    Instant::now() + Duration::from_secs(15),
+                    &cancel,
+                    None,
+                    None,
+                )
+                .expect("startup discovery")
+            }
+            None => crate::startup_objects::prepare_owned_startup(
+                &child,
+                argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                None,
+            )
+            .expect("startup discovery"),
+        };
+        assert!(
+            !startup.apis.is_empty(),
+            "premise: pre-exec discovery finds startup sites"
+        );
+        s.prearm_startup(
+            startup.apis,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            super::PrearmLinks::Create,
+        )
+        .expect("prearm");
+        child.release().expect("child releases");
+        // The FLAG-C settle-gate (exact `acquire_observable`
+        // predicate): reconcile only once the snapshot shows an
+        // acquirable record, else the attach silently skips. A
+        // skipped adopt additionally waits for the SKIPPED surface
+        // (op-22 `EvpDigestUpdate`) to be inventoried — the
+        // one-shot shadows its resolve, and a cold-start tick
+        // before its exporter maps would attach without ever
+        // resolving it (the one-shot stays armed, the gap never
+        // tracks).
+        let acquirable = |record: &crate::inventory::ProcessRecord| {
+            record.modules.iter().any(|module| {
+                module.info.exports.iter().any(|api| {
+                    api.operational_id().is_some()
+                        || wire::attach_ids()
+                            .any(|id| wire::api(id) == Ok(super::ObservationApi::Inventoried(*api)))
+                })
+            })
+        };
+        let has_op22 = |record: &crate::inventory::ProcessRecord| {
+            record.modules.iter().any(|module| {
+                module
+                    .info
+                    .exports
+                    .iter()
+                    .any(|api| api.operational_id().is_some_and(|id| u32::from(id) == 22))
+            })
+        };
+        // NEW-39 fix12: staged legs additionally settle on a
+        // VERIFIED mapped libcrypto (see the `strict_libcrypto`
+        // doc above — a locator-candidate entry attaches
+        // nothing).
+        let has_libcrypto = |record: &crate::inventory::ProcessRecord| {
+            record.modules.iter().any(|module| {
+                module.identity_status == crate::inventory::IdentityStatus::Verified
+                    && module
+                        .info
+                        .file_soname
+                        .as_deref()
+                        .is_some_and(|soname| soname.starts_with("libcrypto.so"))
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(15);
+        let records = loop {
+            let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            assert_eq!(records.len(), 1, "the child is inventoried");
+            let settled = acquirable(&records[0])
+                && (!skip_op22 || has_op22(&records[0]))
+                && (!strict_libcrypto || has_libcrypto(&records[0]));
+            if settled || Instant::now() >= until {
+                break records;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert!(
+            acquirable(&records[0]),
+            "premise: the child settled to an acquirable record within 15s"
+        );
+        if skip_op22 {
+            assert!(
+                has_op22(&records[0]),
+                "premise: op-22 (EvpDigestUpdate) is inventoried before the skipped reconcile"
+            );
+        }
+        if strict_libcrypto {
+            assert!(
+                has_libcrypto(&records[0]),
+                "premise: libcrypto is verified before the staged reconcile"
+            );
+        }
+        // NEW-43 fix13: the settled child runs exec'd — its
+        // `/proc` environ block is final, so pin the child got
+        // EXACTLY the intended loader env (and only the child).
+        if let Some(spec) = &child_ld {
+            assert_child_environ_ld(pid, spec, who);
+        }
+        let starttime = records[0].starttime;
+        if skip_op22 {
+            FAIL_RESOLVE_API.with(|slot| slot.set(Some(wire::api(22).expect("op id"))));
+        }
+        // Production ticks reconcile the FULL snapshot —
+        // reconciling the newcomer alone would retire every
+        // absent live target (the FLAGA lesson).
+        let mut all = records;
+        for pid in keep_pids {
+            all.extend(
+                crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                    pids: vec![*pid],
+                    ..Default::default()
+                })
+                .processes,
+            );
+        }
+        let setup = s.reconcile_records(&all);
+        eprintln!(
+            "n36adopt: {who} pid={pid} skip={skip_op22} keep={keep_pids:?} gaps={:?} oneshot_armed={}",
+            setup.gaps,
+            FAIL_RESOLVE_API.with(|slot| slot.get().is_some()),
+        );
+        if skip_op22 {
+            assert!(
+                FAIL_RESOLVE_API.with(|slot| slot.get().is_none()),
+                "premise: the skip one-shot fired (consumed)"
+            );
+        }
+        assert!(
+            s.target_ready(pid, starttime),
+            "the adopting attach completes: {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .any(|a| a.original.is_some()),
+            "premise: reconcile adopts prearmed sites (originals authorize history)"
+        );
+        assert_eq!(
+            s.targets.get(&pid).expect("target present").site_gap_apis,
+            std::collections::BTreeSet::from([21u32]),
+            "premise: quarantine is the only site gap"
+        );
+        if skip_op22 {
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .process
+                    .unresolved_operational()
+                    .contains(&22),
+                "premise: the op-22 skip is tracked"
+            );
+        } else {
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .process
+                    .unresolved_operational()
+                    .is_empty(),
+                "premise: clean discovery tracks nothing operational"
+            );
+        }
+        (child, pid, starttime)
+    }
+    /// NEW-36 fix10 staging: kill + a production tick over `keep`
+    /// (the live records the tick must NOT retire), asserting the
+    /// retire completed preserving (target removed, no continuity
+    /// mark, adopted rows kept historical).
+    fn n36_retire_exited(
+        s: &mut super::ProviderSession,
+        pid: u32,
+        starttime: u64,
+        keep: &[crate::inventory::ProcessRecord],
+    ) {
+        use std::time::Duration;
+        crate::target::kill_test_child(pid, Duration::from_secs(5));
+        let exit = s.reconcile_records(keep);
+        assert!(
+            exit.gaps
+                .contains(&super::ObservationGap::MembershipUnknown),
+            "premise: the tick detects the exit: {:?}",
+            exit.gaps
+        );
+        assert!(
+            !s.targets.contains_key(&pid),
+            "premise: the preserving retire removed the target"
+        );
+        assert!(
+            !s.scope_continuity_broken.contains(&(pid, starttime)),
+            "premise: the preserving retire marks nothing (an orderly exit gaps nothing)"
+        );
+        assert!(
+            !s.pending_retire.contains_key(&pid),
+            "premise: the retire completed (not deferred)"
+        );
+        assert!(
+            s.startup
+                .get(&pid)
+                .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|a| a.historical)),
+            "premise: adopted rows are kept historical"
+        );
+    }
+    /// NEW-36 fix10 pin, leg 1 (guest, off-cohort preserving
+    /// retire against the FULL set): a one-process claimed session
+    /// whose cohort gap-retiree fills the terminal-gap set; a late
+    /// (off-cohort) joiner's preserving gap-retire then retains
+    /// NOTHING and fires NO latch (pre-fix it fails the whole
+    /// session closed for a pid that can earn no receipt). No
+    /// receipt is possible in this leg (the filler voids itself,
+    /// the late joiner is off-cohort) — the seal control asserts
+    /// empty.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn off_cohort_preserving_retire_against_full_set_fires_no_latch() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _disarm = DisarmHook;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                // A warm (fully inventoried) adopt stages more
+                // pre-22 sites, and the acquire loop aborts
+                // silently past the state budget — fund the
+                // skipped-adopt shape with margin (tracked from
+                // the default, never a literal).
+                max_state_bytes: ObservationLimits::default()
+                    .max_state_bytes
+                    .saturating_mul(2),
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let (_a1, pid_a, starttime_a) = n36_adopt_child(&mut s, "A1", true, &[]);
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        assert!(
+            s.claim_admitted
+                .as_ref()
+                .is_some_and(|snap| !snap.is_empty()),
+            "premise: the claim snapshots live cookies"
+        );
+        n36_retire_exited(&mut s, pid_a, starttime_a, &[]);
+        assert_eq!(
+            s.retired_operational_gaps.len(),
+            1,
+            "premise: the cohort gap-retiree fills the one-slot set: {:?}",
+            s.retired_operational_gaps
+        );
+        assert!(
+            s.retired_operational_gaps.contains(&(pid_a, starttime_a)),
+            "premise: the cohort verdict retains exactly: {:?}",
+            s.retired_operational_gaps
+        );
+        // The late joiner (admitted after the claim — off-cohort).
+        let (_b, pid_b, starttime_b) = n36_adopt_child(&mut s, "B1", true, &[]);
+        let b_cookies: Vec<u64> = s
+            .api_admitted
+            .difference(s.claim_admitted.as_ref().expect("claim snapshotted"))
+            .copied()
+            .collect();
+        assert!(!b_cookies.is_empty(), "premise: B earns admission");
+        assert!(
+            b_cookies.iter().all(|c| !s
+                .claim_admitted
+                .as_ref()
+                .is_some_and(|snap| snap.contains(c))),
+            "premise: the late joiner misses the claim-start snapshot"
+        );
+        n36_retire_exited(&mut s, pid_b, starttime_b, &[]);
+        assert!(
+            !s.retired_operational_gaps.contains(&(pid_b, starttime_b)),
+            "the off-cohort preserving retire retains nothing: {:?}",
+            s.retired_operational_gaps
+        );
+        assert_eq!(
+            s.retired_operational_gaps.len(),
+            1,
+            "the set still holds only the cohort verdict: {:?}",
+            s.retired_operational_gaps
+        );
+        assert!(
+            !s.scope_continuity_broken_all,
+            "no latch from the off-cohort retire against the full set"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "control: no receipt is possible in this leg (filler voided, late joiner off-cohort): {:?}",
+            batch.terminal_scopes_observed
+        );
+        eprintln!("new36a: offcohort_retained=0 latch_clear=true");
+    }
+    /// NEW-36 fix10 pin, leg 2 (guest, the eligible owner
+    /// receipts): a two-process claimed session — one cohort gap
+    /// filler plus a live clean cohort owner — then TWO
+    /// off-cohort preserving gap-retires (the second lands against
+    /// the set the first would fill pre-fix). Post-fix neither
+    /// retains, the latch stays clear, and the eligible owner
+    /// receipts; pre-fix the first consumes the cap and the second
+    /// latches, suppressing the eligible receipt. The eligible
+    /// owner is a digest child (mapping-stable, no expiry —
+    /// direct attach, it never retires), and the filler's
+    /// keep-record is frozen at adopt: a long-lived `speed`
+    /// child lazily maps provider modules, and fresh records
+    /// would re-resolve across ticks (healing the tracked skip
+    /// or voiding the owner through its own re-resolved gap).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn off_cohort_preserving_retires_leave_eligible_owner_receipted() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::io::{BufRead as _, Write as _};
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _disarm = DisarmHook;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 2,
+                // Four sequential heavy adopts (filler + owner +
+                // two late joiners) legitimately parse past the
+                // default ELF budget — each adopt anchors
+                // full-file parses, and the worker-gated release
+                // needs idle, which the live owner denies. Fund
+                // the staged shape (tracked from the default,
+                // never a literal), not the default flow.
+                max_elf_read_bytes: ObservationLimits::default()
+                    .max_elf_read_bytes
+                    .saturating_mul(2),
+                // A warm (fully inventoried) adopt stages more
+                // pre-22 sites, and the acquire loop aborts
+                // silently past the state budget — fund the
+                // skipped-adopt shape with margin too.
+                max_state_bytes: ObservationLimits::default()
+                    .max_state_bytes
+                    .saturating_mul(2),
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let (_a1, pid_a, starttime_a) = n36_adopt_child(&mut s, "A1", true, &[]);
+        // Freeze the filler's record for the keep tick below (see
+        // the pin docs): A1 retires right after the claim, so the
+        // frozen record always names a live incarnation here.
+        let a1_frozen = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_a],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(
+            a1_frozen.len(),
+            1,
+            "premise: the filler is live for its frozen record"
+        );
+        let dir = std::env::temp_dir().join(format!("osslscope-new36b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let dir_c = dir.join("c");
+        std::fs::create_dir(&dir_c).unwrap();
+        let (mut owned_c, pid_c) = newop_digest_child(&dir_c);
+        assert_ne!(pid_a, pid_c, "premise: distinct cohort pids");
+        let records_c = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_c],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records_c.len(), 1, "the eligible owner is inventoried");
+        let starttime_c = records_c[0].starttime;
+        let mut all_c = records_c;
+        all_c.extend(a1_frozen.clone());
+        let setup = s.reconcile_records(&all_c);
+        assert!(
+            s.target_ready(pid_c, starttime_c),
+            "premise: the eligible owner attaches: {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.target_ready(pid_a, starttime_a),
+            "premise: the full snapshot keeps the filler: {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.targets
+                .get(&pid_a)
+                .expect("filler present")
+                .process
+                .unresolved_operational()
+                .contains(&22),
+            "premise: the keep tick heals nothing on the filler"
+        );
+        assert!(
+            s.targets
+                .get(&pid_c)
+                .expect("owner present")
+                .process
+                .unresolved_operational()
+                .is_empty(),
+            "premise: the eligible owner attaches clean"
+        );
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let snap = s
+            .claim_admitted
+            .as_ref()
+            .expect("claim snapshotted")
+            .clone();
+        assert!(
+            !snap.is_empty(),
+            "premise: the claim snapshots live cookies"
+        );
+        for (pid, who) in [(pid_a, "filler"), (pid_c, "eligible owner")] {
+            assert!(
+                snap.iter().any(|cookie| {
+                    matches!(s.api_owners.get(cookie), Some((owner, _, _)) if *owner == pid)
+                }),
+                "premise: the {who} owns claim-start cookies"
+            );
+        }
+        // The cohort filler gap-retires (room in the two-slot set).
+        let keep_c = || {
+            crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid_c],
+                ..Default::default()
+            })
+            .processes
+        };
+        n36_retire_exited(&mut s, pid_a, starttime_a, &keep_c());
+        assert!(
+            s.retired_operational_gaps.contains(&(pid_a, starttime_a)),
+            "premise: the cohort gap verdict retains: {:?}",
+            s.retired_operational_gaps
+        );
+        // Two off-cohort preserving gap-retires (late joiners).
+        for who in ["B", "D"] {
+            let (_child, pid, starttime) = n36_adopt_child(&mut s, who, true, &[pid_c]);
+            let late_cookies: Vec<u64> = s.api_admitted.difference(&snap).copied().collect();
+            assert!(!late_cookies.is_empty(), "premise: {who} earns admission");
+            assert!(
+                late_cookies.iter().all(|c| !snap.contains(c)),
+                "premise: the late joiner {who} misses the claim-start snapshot"
+            );
+            n36_retire_exited(&mut s, pid, starttime, &keep_c());
+            assert!(
+                !s.retired_operational_gaps.contains(&(pid, starttime)),
+                "the off-cohort preserving retire ({who}) retains nothing: {:?}",
+                s.retired_operational_gaps
+            );
+            assert!(
+                s.targets
+                    .get(&pid_c)
+                    .expect("owner present")
+                    .process
+                    .unresolved_operational()
+                    .is_empty(),
+                "the keep ticks re-resolve nothing on the eligible owner ({who})"
+            );
+        }
+        assert_eq!(
+            s.retired_operational_gaps.len(),
+            1,
+            "the set still holds only the cohort verdict: {:?}",
+            s.retired_operational_gaps
+        );
+        assert!(
+            !s.scope_continuity_broken_all,
+            "no latch from the off-cohort retires (room-phase and full-phase)"
+        );
+        // The eligible owner's genuine workload (driven digest
+        // round — BPF-counted positives under the live plane).
+        owned_c.stdin.write_all(b"D").unwrap();
+        owned_c.stdin.flush().unwrap();
+        let mut line = String::new();
+        owned_c.stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line, "done digest=3,3\n",
+            "premise: the eligible workload ran: {line:?}"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch
+                .terminal_scopes_observed
+                .contains(&(pid_c, starttime_c)),
+            "the eligible owner receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        assert!(
+            !batch
+                .terminal_scopes_observed
+                .contains(&(pid_a, starttime_a)),
+            "control: the gap filler voids itself: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives_c = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_c && a.row.entries > 0)
+            .count();
+        assert!(
+            positives_c > 0,
+            "the eligible owner's genuine workload projects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new36b: offcohort_retained=0 latch_clear=true eligible_receipted=true");
+    }
+    /// NEW-36-OPEN fix11 pin (guest, claimless preserving
+    /// churn): a one-process CLAIMLESS session (no claim ever
+    /// advances — the seal falls back to live admission) churns
+    /// TWO preserving gap-retires through the one-slot
+    /// terminal-gap set, then adopts a live clean owner. A
+    /// preserving retire removes its owner from the live seal
+    /// fallback, so a claimless retained gap can only waste the
+    /// slot or latch an unrelated scope — post-fix claimless
+    /// retires retain NOTHING: the set stays empty, the latch
+    /// stays clear, and the live owner receipts with genuine
+    /// positives. Pre-fix the first churn inserts (room phase)
+    /// and the second latches (full phase), suppressing the
+    /// eligible receipt. RED: the set holds the churn verdict.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn claimless_preserving_churn_retains_nothing_and_receipts_live_owner() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::io::{BufRead as _, Write as _};
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _disarm = DisarmHook;
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                // Same adopted-shape margin as the N36 legs
+                // (tracked from the default, never a literal).
+                max_state_bytes: ObservationLimits::default()
+                    .max_state_bytes
+                    .saturating_mul(2),
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        // Two sequential preserving gap-retires (the churn): each
+        // is adopted with a skipped op-22 (a live gap verdict at
+        // retire entry) and exited before the next adopt (the
+        // one-process session churns sequentially).
+        for who in ["B", "D"] {
+            let (_child, pid, starttime) = n36_adopt_child(&mut s, who, true, &[]);
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("churn target present")
+                    .process
+                    .unresolved_operational()
+                    .contains(&22),
+                "premise: the churn retiree {who} carries a live gap verdict"
+            );
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            assert!(
+                !s.retired_operational_gaps.contains(&(pid, starttime)),
+                "the claimless churn retire ({who}) retains nothing: {:?}",
+                s.retired_operational_gaps
+            );
+        }
+        assert!(
+            s.retired_operational_gaps.is_empty(),
+            "the claimless churn retains nothing across room and full phases: {:?}",
+            s.retired_operational_gaps
+        );
+        assert!(
+            !s.scope_continuity_broken_all,
+            "no latch from the claimless churn (room-phase and full-phase)"
+        );
+        assert!(
+            s.claim_admitted.is_none(),
+            "premise: no claim ever advanced (the seal falls back to live admission)"
+        );
+        // The live clean owner (digest child, direct attach —
+        // mapping-stable, never retires) adopts into the churned
+        // session and receipts through the live fallback.
+        let dir = std::env::temp_dir().join(format!("osslscope-new36c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let dir_c = dir.join("c");
+        std::fs::create_dir(&dir_c).unwrap();
+        let (mut owned_c, pid_c) = newop_digest_child(&dir_c);
+        let records_c = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid_c],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records_c.len(), 1, "the eligible owner is inventoried");
+        let starttime_c = records_c[0].starttime;
+        let setup = s.reconcile_records(&records_c);
+        assert!(
+            s.target_ready(pid_c, starttime_c),
+            "premise: the eligible owner attaches: {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.targets
+                .get(&pid_c)
+                .expect("owner present")
+                .process
+                .unresolved_operational()
+                .is_empty(),
+            "premise: the eligible owner attaches clean"
+        );
+        owned_c.stdin.write_all(b"D").unwrap();
+        owned_c.stdin.flush().unwrap();
+        let mut line = String::new();
+        owned_c.stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line, "done digest=3,3\n",
+            "premise: the eligible workload ran: {line:?}"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch
+                .terminal_scopes_observed
+                .contains(&(pid_c, starttime_c)),
+            "the live claimless owner receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives_c = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_c && a.row.entries > 0)
+            .count();
+        assert!(
+            positives_c > 0,
+            "the eligible owner's genuine workload projects"
+        );
+        assert!(
+            s.claim_admitted.is_none(),
+            "control: still claimless at the seal (the receipt rode the live fallback)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new36c: churn_retained=0 latch_clear=true eligible_receipted=true");
+    }
+    /// NEW-38 fix11 pin (guest, PID-reuse race): a claimed
+    /// adopted owner preserving-retires (receipt-eligible), then
+    /// the production drain-path retire runs for its pid with NO
+    /// live target — `retire_for_gap(pid, None, ProcessChanged)`,
+    /// exactly the shape the drain passes when a ring event fails
+    /// identity (the observable consequence of PID reuse racing
+    /// a stale probe: the event carries no inventory record, and
+    /// the replacement incarnation was never acquired — the
+    /// historical originals refuse it fail-closed). Continuity is
+    /// incarnation-exact post-fix, so a retire with no live
+    /// incarnation marks NOTHING: no mark, no latch, and the
+    /// earlier retiree's receipt stands with genuine positives.
+    /// Pre-fix the pid-wide mark revokes the receipt. RED: the
+    /// mark set holds the pid. The custody twin (second session,
+    /// same staging) stages a whole-pid terminal refusal — the
+    /// terminal cut genuinely cannot attribute refused records to
+    /// an incarnation — and the seal still voids pid-wide (fail
+    /// closed) while positives project.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn pid_reuse_race_retire_keeps_earlier_receipt_and_refusal_voids() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        // One claimed adopted owner through its preserving
+        // retire; returns the session plus the retiree identity.
+        let run_leg = |tag: &str| {
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    // Same adopted-shape margin as the N36 legs
+                    // (tracked from the default, never a literal).
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            let (_child, pid, starttime) = n36_adopt_child(&mut s, tag, false, &[]);
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted.as_ref().is_some_and(|snap| {
+                    !snap.is_empty()
+                        && snap.iter().any(|cookie| {
+                            matches!(s.api_owners.get(cookie), Some((owner, st, _)) if *owner == pid && *st == starttime)
+                        })
+                }),
+                "premise: the claim snapshots the owner's exact cookies ({tag})"
+            );
+            // Genuine workload positives under the live plane
+            // (`speed` works continuously — the seal must show a
+            // genuine observation, not a vacuous receipt).
+            std::thread::sleep(Duration::from_secs(2));
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            assert!(
+                !s.retired_operational_gaps.contains(&(pid, starttime)),
+                "premise: the clean retire retains no gap verdict ({tag}): {:?}",
+                s.retired_operational_gaps
+            );
+            (s, pid, starttime)
+        };
+        // Main leg: the reuse-race retire (drain-path shape, no
+        // live incarnation) marks nothing; the receipt stands.
+        let (mut s, pid_a, starttime_a) = run_leg("A");
+        let mut b = super::ObservationBatch::default();
+        let outcome = s.retire_for_gap(pid_a, None, super::ObservationGap::ProcessChanged, &mut b);
+        assert!(
+            matches!(outcome, super::RetireOutcome::Retired(false)),
+            "premise: the race retire completes non-preserving: {outcome:?}"
+        );
+        assert!(
+            !s.startup.contains_key(&pid_a),
+            "premise: the race retire consumed the historical rows (the seal below rides the snapshot + totals, not the rows)"
+        );
+        assert!(
+            s.scope_continuity_broken.is_empty(),
+            "the reuse-race retire marks nothing without a live incarnation: {:?}",
+            s.scope_continuity_broken
+        );
+        assert!(
+            !s.scope_continuity_broken_all,
+            "no latch from the reuse-race retire"
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch
+                .terminal_scopes_observed
+                .contains(&(pid_a, starttime_a)),
+            "the earlier preserving retiree's receipt stands: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives_a = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_a && a.row.entries > 0)
+            .count();
+        assert!(
+            positives_a > 0,
+            "the earlier retiree's genuine workload projects"
+        );
+        // Custody twin: same staging, plus a staged whole-pid
+        // terminal refusal (production mints identical entries at
+        // the terminal cut; refused records cannot be attributed
+        // to an incarnation) — the seal voids pid-wide.
+        let (mut t, pid_t, starttime_t) = run_leg("T");
+        t.final_refusals
+            .insert(pid_t, super::ObservationGap::ProcessChanged);
+        let twin = t.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            !twin
+                .terminal_scopes_observed
+                .contains(&(pid_t, starttime_t)),
+            "control: the pid-wide refusal voids the twin receipt (fail-closed custody): {:?}",
+            twin.terminal_scopes_observed
+        );
+        let positives_t = twin
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid_t && a.row.entries > 0)
+            .count();
+        assert!(
+            positives_t > 0,
+            "control: the twin's verified positives still project"
+        );
+        eprintln!(
+            "new38: reused_marked=false earlier_receipted=true custody_voided=true positives={positives_a},{positives_t}"
+        );
+    }
+    /// NEW-43 fix13: the staged legs' child-local loader value
+    /// — the staged tree prepended to the inherited lane value
+    /// (the same join the old guard computed, but READ-ONLY and
+    /// passed explicitly to the child spawn + pre-exec discovery —
+    /// the process environment is never mutated).
+    fn n39_child_ld_value(tree: &std::path::Path) -> String {
+        let mut next = tree.as_os_str().to_owned();
+        if let Some(prev) = std::env::var_os("LD_LIBRARY_PATH") {
+            next.push(":");
+            next.push(prev);
+        }
+        next.into_string().expect("the staged LD value is UTF-8")
+    }
+    /// NEW-43 fix13: the pristine control's child-local loader
+    /// value — the inherited lane value WITHOUT the staged tree
+    /// (read-only; the control observes the lane libs, never
+    /// staged objects).
+    fn n39_lane_ld_override() -> crate::target::ChildLdOverride {
+        match std::env::var_os("LD_LIBRARY_PATH") {
+            Some(lane) => crate::target::ChildLdOverride::Set(lane),
+            None => crate::target::ChildLdOverride::Remove,
+        }
+    }
+    /// NEW-43 fix13: pin the child got EXACTLY the intended loader
+    /// env, read through `/proc/<pid>/environ` (the exec'd block —
+    /// callers assert only after the child settled running, never
+    /// pre-exec where the fork image still shows the parent
+    /// block).
+    fn assert_child_environ_ld(pid: u32, spec: &crate::target::ChildLdOverride, who: &str) {
+        // The child must be ALIVE at the read: a zombie keeps its
+        // exe link but has no environ, which would misread as a
+        // wrong environment instead of the early death it is.
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap_or_else(|e| panic!("the child stat reads ({who}): {e}"));
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, after)| after.split_ascii_whitespace().next());
+        assert!(
+            state.is_some_and(|s| s != "Z" && s != "X" && s != "x"),
+            "the child is alive at the environ read ({who}: state={state:?})"
+        );
+        let environ = std::fs::read(format!("/proc/{pid}/environ"))
+            .unwrap_or_else(|e| panic!("the child environ reads ({who}): {e}"));
+        let entries: Vec<&[u8]> = environ.split(|byte| *byte == 0).collect();
+        match spec {
+            crate::target::ChildLdOverride::Set(value) => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let mut needle = b"LD_LIBRARY_PATH=".to_vec();
+                needle.extend_from_slice(value.as_os_str().as_bytes());
+                assert!(
+                    entries.iter().any(|entry| *entry == needle.as_slice()),
+                    "the child sees exactly the override value ({who})"
+                );
+            }
+            crate::target::ChildLdOverride::Remove => {
+                assert!(
+                    entries
+                        .iter()
+                        .all(|entry| !entry.starts_with(b"LD_LIBRARY_PATH=")),
+                    "the pristine child sees no LD entry ({who})"
+                );
+            }
+        }
+    }
+    /// NEW-43 fix13: the fixed property — the staged tree NEVER
+    /// enters the process environment (the old guard put it there
+    /// while retirement could start the fd-dropper worker). RED
+    /// under the guard, GREEN with child-local environments.
+    fn assert_process_env_has_no_tree(tree: &std::path::Path, who: &str) {
+        assert!(
+            std::env::var_os("LD_LIBRARY_PATH").is_none_or(|v| {
+                !v.to_string_lossy()
+                    .split(':')
+                    .any(|component| std::path::Path::new(component) == tree)
+            }),
+            "the staged tree never enters the process environment ({who})"
+        );
+    }
+    // NEW-43 fix13: the old `N39LdGuard` (process-wide
+    // `LD_LIBRARY_PATH` mutation with drop-restore) is DELETED —
+    // a serial harness does not make the process single-threaded,
+    // and retirement can start the fd-dropper worker before the
+    // guard restores. Staged legs now launch with child-local
+    // environments (`n39_child_ld_value` + `spawn_stopped_with_ld`
+    // + `prepare_owned_startup_with_ld`); the pristine control
+    // uses `n39_lane_ld_override`. The staged-inode premises
+    // (`n39_chmod_staged_sites`) are unchanged.
+    /// NEW-39 fix12 staging: copy `/usr/bin/openssl` plus every
+    /// `ldd`-resolved library into `dir/tree/` (test-owned
+    /// objects — the chmod stimulus needs owned files),
+    /// returning the staged TREE path (the `LD_LIBRARY_PATH`
+    /// entry; the binary is `tree/openssl`). The tree lives in a
+    /// subdir so the chmod hits ONLY staged objects — never the
+    /// fixture binary or stdout sinks the idle twin stages beside
+    /// it. Premise-asserts libcrypto AND libssl stage (else
+    /// discovery/loader silently fall back to system files the pin
+    /// cannot mutate) and that the staged tree runs.
+    fn n39_stage_owned_openssl(dir: &std::path::Path) -> std::path::PathBuf {
+        let tree = dir.join("tree");
+        std::fs::create_dir(&tree).expect("stage tree dir");
+        let ldd = std::process::Command::new("ldd")
+            .arg("/usr/bin/openssl")
+            .output()
+            .expect("ldd runs");
+        assert!(
+            ldd.status.success(),
+            "premise: ldd resolves /usr/bin/openssl"
+        );
+        let text = String::from_utf8(ldd.stdout).expect("ldd output is UTF-8");
+        let mut libs = Vec::new();
+        for line in text.lines() {
+            // `libssl.so.3 => /usr/lib/.../libssl.so.3 (0x...)`.
+            if let Some((_, rest)) = line.trim().split_once("=>") {
+                let path = rest.split_whitespace().next().unwrap_or("");
+                if path.starts_with('/') {
+                    libs.push(path.to_string());
+                }
+            }
+        }
+        assert!(
+            libs.iter().any(|p| p.contains("libcrypto")),
+            "premise: ldd resolves libcrypto: {text:?}"
+        );
+        assert!(
+            libs.iter().any(|p| p.contains("libssl")),
+            "premise: ldd resolves libssl: {text:?}"
+        );
+        std::fs::copy("/usr/bin/openssl", tree.join("openssl")).expect("stage the openssl binary");
+        for lib in &libs {
+            let name = std::path::Path::new(lib)
+                .file_name()
+                .unwrap_or_else(|| panic!("lib basename: {lib}"));
+            std::fs::copy(lib, tree.join(name)).unwrap_or_else(|e| panic!("stage {lib}: {e}"));
+        }
+        let probe = std::process::Command::new(tree.join("openssl"))
+            .arg("version")
+            .env("LD_LIBRARY_PATH", &tree)
+            .output()
+            .expect("the staged openssl spawns");
+        assert!(
+            probe.status.success(),
+            "premise: the staged openssl tree runs: {probe:?}"
+        );
+        tree
+    }
+    /// NEW-39 fix12 stimulus: chmod every staged file (a mode+ctime
+    /// flip — the stamp moves while the bytes stay intact), AFTER
+    /// proving EVERY historical row's site object is a staged file
+    /// (comparing live (dev, ino) through the site's own fd —
+    /// discovery must have used the staged tree, never system
+    /// files). Premise-fails unless at least one row exists and
+    /// every checked site then revalidates to `ObjectChanged` (the
+    /// genuine refusal the live drain below must detect through the
+    /// production path).
+    fn n39_chmod_staged_sites(
+        dir: &std::path::Path,
+        s: &super::ProviderSession,
+        pid: u32,
+        who: &str,
+    ) {
+        use std::os::fd::AsRawFd as _;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let rows = s
+            .startup
+            .get(&pid)
+            .expect("historical rows present for the chmod stimulus");
+        assert!(
+            !rows.is_empty(),
+            "premise: historical rows are kept ({who})"
+        );
+        let mut staged: std::collections::BTreeSet<(u64, u64)> = std::collections::BTreeSet::new();
+        for entry in std::fs::read_dir(dir).expect("staged dir reads") {
+            let path = entry.expect("staged entry").path();
+            if path.is_file() {
+                let meta = std::fs::metadata(&path).expect("staged file stats");
+                staged.insert((meta.dev(), meta.ino()));
+            }
+        }
+        for a in rows {
+            let link = std::fs::read_link(format!(
+                "/proc/self/fd/{}",
+                a.site.attachment_fd().as_raw_fd()
+            ))
+            .expect("site fd readlinks");
+            let meta = std::fs::metadata(&link).expect("site object stats through its fd path");
+            assert!(
+                staged.contains(&(meta.dev(), meta.ino())),
+                "premise: the adopted site object is staged ({who}): {}",
+                link.display()
+            );
+        }
+        for entry in std::fs::read_dir(dir).expect("staged dir re-reads") {
+            let path = entry.expect("staged entry").path();
+            if path.is_file() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .unwrap_or_else(|e| panic!("chmod {}: {e}", path.display()));
+            }
+        }
+        for a in rows {
+            assert_eq!(
+                a.site.revalidate_queued(),
+                Err(super::ObservationGap::ObjectChanged),
+                "premise: the chmod'd site genuinely refuses ({who})"
+            );
+        }
+    }
+    /// NEW-39 fix12 pin (guest, genuine live-drain custody
+    /// refusal): after a preserving retirement, live drain detects
+    /// `ObjectChanged` on a claimed original, then discards that
+    /// source while its counters stay readable — with no live
+    /// target no continuity mark records, and the seal sees neither
+    /// the discarded source nor its refusal, so stale reads certify
+    /// zero. The fix persists the refusal for the EXACT historical
+    /// incarnation before eviction. Two legs: (R) the workload
+    /// refusal — genuine `ObjectChanged` (chmod'd staged objects)
+    /// during a production live `drain()` evicts the historical
+    /// rows; the seal voids the scope while verified positives
+    /// project. (C) the clean targetless-reuse control — the N38
+    /// drain-path retire shape (no genuine refusal) still receipts
+    /// with positives. RED (pre-fix): (R) grants the stale receipt.
+    /// The control is green both ways (it discriminates refusal
+    /// persistence from the reuse retire).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn live_drain_custody_refusal_voids_historical_scope_keeps_positives() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::path::Path::new("/dev/shm")
+            .join(format!("osslscope-new39-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let tree = n39_stage_owned_openssl(&dir);
+        // Leg R: genuine refusal during a production live drain.
+        let positives_r = {
+            // NEW-43 fix13: child-local staged env (no
+            // process-wide mutation — the guard is gone).
+            let staged_ld = crate::target::ChildLdOverride::Set(n39_child_ld_value(&tree).into());
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            let mut argv = n36_speed_argv();
+            argv[0] = tree.join("openssl").to_string_lossy().into_owned();
+            let (_child, pid, starttime) =
+                n36_adopt_child_with_argv(&mut s, "R", false, &[], &argv, true, Some(staged_ld));
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted.as_ref().is_some_and(|snap| {
+                    !snap.is_empty()
+                        && snap.iter().any(|cookie| {
+                            matches!(s.api_owners.get(cookie), Some((owner, st, _)) if *owner == pid && *st == starttime)
+                        })
+                }),
+                "premise: the claim snapshots the owner's exact cookies (R)"
+            );
+            std::thread::sleep(Duration::from_secs(2));
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            n39_chmod_staged_sites(&tree, &s, pid, "R");
+            let live = s.drain(Instant::now() + Duration::from_secs(10));
+            assert!(
+                live.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "the live drain genuinely detects ObjectChanged on the claimed original: {:?}",
+                live.gaps
+            );
+            assert!(
+                !s.startup.contains_key(&pid),
+                "the refused retire evicts the historical rows"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "the refused historical scope earns no receipt (stale reads certify nothing): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let positives = batch
+                .api_activity
+                .iter()
+                .filter(|a| a.pid == pid && a.row.entries > 0)
+                .count();
+            assert!(
+                positives > 0,
+                "the refused scope's verified positives still project"
+            );
+            // NEW-43 fix13: the staged tree never entered the
+            // process environment (child-local from spawn on).
+            assert_process_env_has_no_tree(&tree, "R");
+            positives
+        };
+        // Leg C: clean targetless-reuse control (the N38 drain-path
+        // retire shape — direct, no genuine refusal, child-local
+        // pristine env).
+        assert_process_env_has_no_tree(&tree, "C-pre");
+        let (_child, pid_c, starttime_c) = {
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            // NEW-43 fix13: the control launches with a child-local
+            // pristine (lane, unstaged) loader env.
+            let (_child, pid, starttime) =
+                n36_adopt_child_with_ld(&mut s, "C", false, &[], Some(n39_lane_ld_override()));
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            std::thread::sleep(Duration::from_secs(2));
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            let mut b = super::ObservationBatch::default();
+            let outcome =
+                s.retire_for_gap(pid, None, super::ObservationGap::ProcessChanged, &mut b);
+            assert!(
+                matches!(outcome, super::RetireOutcome::Retired(false)),
+                "premise: the race retire completes non-preserving: {outcome:?}"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "control: the clean targetless reuse still receipts: {:?}",
+                batch.terminal_scopes_observed
+            );
+            let positives = batch
+                .api_activity
+                .iter()
+                .filter(|a| a.pid == pid && a.row.entries > 0)
+                .count();
+            assert!(
+                positives > 0,
+                "control: the reuse scope's positives project"
+            );
+            eprintln!(
+                "new39: drain_refused=true receipt_voided=true control_receipted=true positives={positives_r},{positives}"
+            );
+            (_child, pid, starttime)
+        };
+        let _ = (_child, pid_c, starttime_c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// NEW-39 fix12 pin, idle twin (guest, genuine live-drain
+    /// custody refusal through the transplanted `finish`): the same
+    /// genuine `ObjectChanged` during a production live `drain()`
+    /// over a genuinely idle child (zero BPF-counted entries)
+    /// seals `Unknown` — never a stale observed zero. Two twin
+    /// seals of the refused idle: direct (no scope receipt, zero
+    /// positives, zero-entry rows) and transplanted through the
+    /// real `finish` (emitted `Unknown` remainder + a published
+    /// nonempty silence interval, so the void is the refusal, not
+    /// an unestablished claim). RED (pre-fix): the direct twin
+    /// grants the stale receipt (and the transplant would seal
+    /// `Observed{0}`).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn live_drain_custody_refusal_seals_idle_unknown() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::path::Path::new("/dev/shm")
+            .join(format!("osslscope-new39idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let tree = n39_stage_owned_openssl(&dir);
+        // NEW-43 fix13: child-local staged env (no process-wide
+        // mutation — the guard is gone).
+        let staged_value = n39_child_ld_value(&tree);
+        let app = dir.join("provider_idle_loop");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_idle_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        // One refused-idle leg; `tag` names its stdout sink.
+        // Returns the session right after the refusing live drain
+        // plus the seal inputs.
+        let run_leg = |tag: &str| {
+            let staged_ld = crate::target::ChildLdOverride::Set(staged_value.clone().into());
+            let argv: Vec<String> = [app.to_string_lossy().into_owned()].to_vec();
+            let stdout_path = dir.join(format!("idle-out-{tag}.txt"));
+            std::fs::write(&stdout_path, b"").unwrap();
+            let mut child = crate::target::OwnedTarget::spawn_stopped_with_ld(
+                &argv,
+                crate::target::WorkloadDest::File(stdout_path.clone()),
+                staged_ld.clone(),
+            )
+            .expect("child spawns stopped");
+            let pid = child.pid();
+            let cancel = AtomicBool::new(false);
+            let mut budget = super::ObservationBudget::default();
+            let setup_mono = LiveClock.monotonic_ns();
+            let startup = crate::startup_objects::prepare_owned_startup_with_ld(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                None,
+                Some(&staged_value),
+            )
+            .expect("startup discovery");
+            assert!(
+                !startup.apis.is_empty(),
+                "premise: pre-exec discovery finds startup sites ({tag})"
+            );
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s.prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                super::PrearmLinks::Create,
+            )
+            .expect("prearm");
+            child.release().expect("child releases");
+            // Ready-gate (the FLAGCIDLE shape): the fixture prints
+            // `ready` AFTER both provider pre-loads succeed — attach
+            // only then, so the window counts exactly zero.
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+                if out.contains("ready") || Instant::now() >= until {
+                    assert!(
+                        out.contains("ready"),
+                        "premise: the idle fixture prints ready within 15s ({tag})"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let acquirable = |record: &crate::inventory::ProcessRecord| {
+                record.modules.iter().any(|module| {
+                    module.info.exports.iter().any(|api| {
+                        api.operational_id().is_some()
+                            || wire::attach_ids().any(|id| {
+                                wire::api(id) == Ok(super::ObservationApi::Inventoried(*api))
+                            })
+                    })
+                })
+            };
+            let has_libcrypto = |record: &crate::inventory::ProcessRecord| {
+                record.modules.iter().any(|module| {
+                    module.identity_status == crate::inventory::IdentityStatus::Verified
+                        && module
+                            .info
+                            .file_soname
+                            .as_deref()
+                            .is_some_and(|soname| soname.starts_with("libcrypto.so"))
+                })
+            };
+            let until = Instant::now() + Duration::from_secs(15);
+            let records = loop {
+                let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                    pids: vec![pid],
+                    ..Default::default()
+                })
+                .processes;
+                assert_eq!(records.len(), 1, "the child is inventoried");
+                // The staged strict settle (same locator race as
+                // the `speed` leg above — settle on VERIFIED
+                // libcrypto; a locator-candidate entry attaches
+                // nothing).
+                if (acquirable(&records[0]) && has_libcrypto(&records[0]))
+                    || Instant::now() >= until
+                {
+                    break records;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            assert!(
+                acquirable(&records[0]),
+                "premise: the child settled to an acquirable record within 15s"
+            );
+            assert!(
+                has_libcrypto(&records[0]),
+                "premise: libcrypto is verified before the staged reconcile"
+            );
+            // NEW-43 fix13: the settled child runs exec'd — pin it
+            // got exactly the staged loader env child-locally.
+            assert_child_environ_ld(pid, &staged_ld, tag);
+            let record = records[0].clone();
+            let starttime = record.starttime;
+            let setup = s.reconcile_records(&records);
+            assert!(
+                s.target_ready(pid, starttime),
+                "the adopting attach completes: {:?}",
+                setup.gaps
+            );
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .attachments
+                    .iter()
+                    .any(|a| a.original.is_some()),
+                "premise: reconcile adopts prearmed sites (originals authorize history)"
+            );
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted
+                    .as_ref()
+                    .is_some_and(|snap| !snap.is_empty()),
+                "premise: the claim snapshots live cookies ({tag})"
+            );
+            // Genuine idle: the fixture sleeps — nothing is driven.
+            std::thread::sleep(Duration::from_secs(2));
+            crate::target::kill_test_child(pid, Duration::from_secs(5));
+            let exit = s.reconcile_records(&[]);
+            assert!(
+                exit.gaps
+                    .contains(&super::ObservationGap::MembershipUnknown),
+                "premise: the tick detects the exit ({tag}): {:?}",
+                exit.gaps
+            );
+            assert!(
+                !s.targets.contains_key(&pid),
+                "premise: the preserving retire removed the target ({tag})"
+            );
+            assert!(
+                !s.scope_continuity_broken.contains(&(pid, starttime)),
+                "premise: the preserving retire marks nothing ({tag})"
+            );
+            assert!(
+                !s.pending_retire.contains_key(&pid),
+                "premise: the retire completed (not deferred) ({tag})"
+            );
+            assert!(
+                s.startup
+                    .get(&pid)
+                    .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|a| a.historical)),
+                "premise: adopted rows are kept historical ({tag})"
+            );
+            // The genuine refusal THROUGH the production live drain
+            // (not a direct retire — the N38 twin's gap).
+            n39_chmod_staged_sites(&tree, &s, pid, tag);
+            let live = s.drain(Instant::now() + Duration::from_secs(10));
+            assert!(
+                live.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "the live drain genuinely detects ObjectChanged on the claimed original ({tag}): {:?}",
+                live.gaps
+            );
+            assert!(
+                !s.startup.contains_key(&pid),
+                "the refused retire evicts the historical rows ({tag})"
+            );
+            // NEW-43 fix13: the staged tree never entered the
+            // process environment (child-local from spawn on).
+            assert_process_env_has_no_tree(&tree, tag);
+            (
+                s,
+                pid,
+                starttime,
+                record.namespaces.clone(),
+                setup_mono,
+                start,
+            )
+        };
+        // Direct seal: no receipt, zero positives, zero-entry rows.
+        let (mut s, pid, starttime, _, _, _) = run_leg("direct");
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the refused idle scope earns no receipt (stale zero-entry reads certify nothing): {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.entries > 0)
+            .count();
+        assert_eq!(
+            positives, 0,
+            "the idle leg counts zero positives (genuine idle)"
+        );
+        // NEW-41-idle fix14: SUCCESSFUL zero-count reads,
+        // explicitly (rows present, reads succeeded, zero
+        // counts) — the old `all()` passed with empty or
+        // unreadable activity.
+        let direct_rows: Vec<_> = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid)
+            .map(|a| &a.row)
+            .collect();
+        assert!(
+            rows_are_successful_zero_reads(&direct_rows),
+            "the refused idle seal reads successful zero-count rows"
+        );
+        // Transplanted seal through the real `finish`: the emitted
+        // `Unknown` remainder plus its interval, strictly valid.
+        let (s, pid, starttime, namespaces, setup_mono, provider_start) = run_leg("seal");
+        let sealed = crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+            s,
+            pid,
+            starttime,
+            namespaces,
+            &pool,
+            setup_mono,
+            Some(provider_start),
+            setup_mono.saturating_add(60_000_000_000),
+            &[],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("finish seals");
+        let evidence = sealed
+            .document
+            .request_evidence
+            .as_ref()
+            .expect("the sealed document carries its section");
+        let silence = evidence
+            .silence_window
+            .as_ref()
+            .expect("premise: the established seal publishes its interval (the void is the refusal, not an unestablished claim)");
+        assert!(
+            silence.end_ns > silence.start_ns,
+            "premise: the emitted interval is nonempty"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "the refused idle plane is Unknown, never a stale observed zero"
+        );
+        // NEW-41-idle fix14: the sealed twin of the direct
+        // claim above — a NONEMPTY receipted subset, all zero,
+        // zero grand total (the old sum passed with empty or
+        // unreadable activity; unreceipted unavailable rows for
+        // unobserved APIs are expected in the merged document).
+        assert!(
+            sealed_rows_are_successful_zero_reads(&sealed.document.api_activity),
+            "premise: the sealed idle carries successful zero-count reads (genuine idle)"
+        );
+        evidence
+            .validate_strict()
+            .expect("the refused sealed section validates");
+        eprintln!("new39idle: drain_refused=true direct_voided=true idle_unknown=true entries=0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// NEW-41 fix13 pin (guest, retirement-recheck + reconcile
+    /// custody refusal): when the first live check returns
+    /// `Ok(true)`, retirement RECHECKS the original — an
+    /// `ObjectChanged` detected only in that recheck becomes a
+    /// batch gap plus eviction with NO retained refusal; reconcile
+    /// likewise evicts on a genuine backing refusal under a
+    /// matching historical record. Both paths leave readable claim
+    /// counters eligible at seal. The fix carries exact
+    /// source-refusal provenance through both checks (and any
+    /// deferred eviction) into the historical custody set. Three
+    /// legs: (R) the second-check race — the first check
+    /// genuinely returns `Ok(true)` per row (same
+    /// `revalidate_queued` the live drain calls — staged
+    /// deterministically, since a live-drain race would be
+    /// timing-flaky by construction), then the production retire's
+    /// internal recheck genuinely refuses; the seal voids while
+    /// verified positives project. (M) the matching-record path —
+    /// reconcile with the historical incarnation's own record
+    /// over chmod'd backing evicts through `add_target`; the seal
+    /// voids while positives project. (C) the eligible clean
+    /// reuse control (no genuine refusal, child-local pristine
+    /// env) still receipts with positives. RED (pre-fix): (R) and
+    /// (M) grant the stale receipt.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn retirement_recheck_refusal_voids_through_seal_keeps_positives() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::path::Path::new("/dev/shm")
+            .join(format!("osslscope-new41-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        // One staged tree PER staged leg: a leg's chmod stimulus
+        // strips the staged binary's exec bit, so sharing one tree
+        // would leave the next leg's child unspawnable.
+        let dir_r = dir.join("R");
+        std::fs::create_dir(&dir_r).unwrap();
+        let tree_r = n39_stage_owned_openssl(&dir_r);
+        let dir_m = dir.join("M");
+        std::fs::create_dir(&dir_m).unwrap();
+        let tree_m = n39_stage_owned_openssl(&dir_m);
+        let staged_ld = |tree: &std::path::Path| {
+            crate::target::ChildLdOverride::Set(n39_child_ld_value(tree).into())
+        };
+        let open_session = || {
+            // (`set_deadline` takes `&self` — the callers bind
+            // `mut` for the &mut session methods below.)
+            let s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s
+        };
+        let claim_cookies = |s: &mut ProviderSession, pid: u32, starttime: u64, who: &str| {
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted.as_ref().is_some_and(|snap| {
+                    !snap.is_empty()
+                        && snap.iter().any(|cookie| {
+                            matches!(s.api_owners.get(cookie), Some((owner, st, _)) if *owner == pid && *st == starttime)
+                        })
+                }),
+                "premise: the claim snapshots the owner's exact cookies ({who})"
+            );
+        };
+        let positives_of = |batch: &super::ObservationBatch, pid: u32| {
+            batch
+                .api_activity
+                .iter()
+                .filter(|a| a.pid == pid && a.row.entries > 0)
+                .count()
+        };
+        // Leg R: the second-check race.
+        let positives_r = {
+            let mut s = open_session();
+            let mut argv = n36_speed_argv();
+            argv[0] = tree_r.join("openssl").to_string_lossy().into_owned();
+            let (_child, pid, starttime) = n36_adopt_child_with_argv(
+                &mut s,
+                "R",
+                false,
+                &[],
+                &argv,
+                true,
+                Some(staged_ld(&tree_r)),
+            );
+            claim_cookies(&mut s, pid, starttime, "R");
+            std::thread::sleep(Duration::from_secs(2));
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            // The FIRST check genuinely returns `Ok(true)` per
+            // row (exited, backing unchanged) — the same function
+            // the live drain calls.
+            for a in s
+                .startup
+                .get(&pid)
+                .expect("historical rows present for the first check")
+            {
+                assert_eq!(
+                    a.site.revalidate_queued(),
+                    Ok(true),
+                    "premise: the first live check returns Ok(true) (R)"
+                );
+            }
+            n39_chmod_staged_sites(&tree_r, &s, pid, "R");
+            // The SECOND check runs inside the production retire —
+            // the recheck genuinely refuses, and the retire evicts.
+            let mut b = super::ObservationBatch::default();
+            let outcome =
+                s.retire_for_gap(pid, None, super::ObservationGap::ProcessUnavailable, &mut b);
+            assert!(
+                matches!(outcome, super::RetireOutcome::Retired(false)),
+                "premise: the recheck-refused retire completes evicting: {outcome:?}"
+            );
+            assert!(
+                b.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "the retire's recheck genuinely detects ObjectChanged: {:?}",
+                b.gaps
+            );
+            assert!(
+                !s.startup.contains_key(&pid),
+                "the recheck-refused retire evicts the historical rows"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "the recheck-refused scope earns no receipt (stale reads certify nothing): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let positives = positives_of(&batch, pid);
+            assert!(
+                positives > 0,
+                "the recheck-refused scope's verified positives still project"
+            );
+            assert!(
+                s.retired_custody_refusals.contains(&(pid, starttime)),
+                "the recheck refusal persists for the exact historical incarnation"
+            );
+            assert_process_env_has_no_tree(&tree_r, "R");
+            positives
+        };
+        // Leg M: the matching-record path.
+        let positives_m = {
+            let mut s = open_session();
+            let mut argv = n36_speed_argv();
+            argv[0] = tree_m.join("openssl").to_string_lossy().into_owned();
+            let (_child, pid, starttime) = n36_adopt_child_with_argv(
+                &mut s,
+                "M",
+                false,
+                &[],
+                &argv,
+                true,
+                Some(staged_ld(&tree_m)),
+            );
+            claim_cookies(&mut s, pid, starttime, "M");
+            std::thread::sleep(Duration::from_secs(2));
+            let saved = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes
+            .into_iter()
+            .next()
+            .expect("premise: the live child is inventoried (M)");
+            assert_eq!(
+                (saved.pid, saved.starttime),
+                (pid, starttime),
+                "premise: the saved record names the live incarnation (M)"
+            );
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            n39_chmod_staged_sites(&tree_m, &s, pid, "M");
+            // Reconcile with the historical incarnation's OWN
+            // record over refused backing: `add_target` matches
+            // the historical rows, genuinely refuses, and the
+            // retire evicts.
+            let back = s.reconcile_records(std::slice::from_ref(&saved));
+            assert!(
+                back.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "reconcile genuinely refuses the matched historical backing: {:?}",
+                back.gaps
+            );
+            assert!(
+                !s.startup.contains_key(&pid),
+                "the matched-record retire evicts the historical rows"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "the matched-record refused scope earns no receipt (stale reads certify nothing): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let positives = positives_of(&batch, pid);
+            assert!(
+                positives > 0,
+                "the matched-record scope's verified positives still project"
+            );
+            assert!(
+                s.retired_custody_refusals.contains(&(pid, starttime)),
+                "the matched-record refusal persists for the exact historical incarnation"
+            );
+            assert_process_env_has_no_tree(&tree_m, "M");
+            positives
+        };
+        // Leg C: the eligible clean reuse control (the N38
+        // drain-path retire shape — direct, no genuine refusal,
+        // child-local pristine env).
+        let positives_c = {
+            let mut s = open_session();
+            let (_child, pid, starttime) =
+                n36_adopt_child_with_ld(&mut s, "C", false, &[], Some(n39_lane_ld_override()));
+            claim_cookies(&mut s, pid, starttime, "C");
+            std::thread::sleep(Duration::from_secs(2));
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            let mut b = super::ObservationBatch::default();
+            let outcome =
+                s.retire_for_gap(pid, None, super::ObservationGap::ProcessChanged, &mut b);
+            assert!(
+                matches!(outcome, super::RetireOutcome::Retired(false)),
+                "premise: the race retire completes non-preserving: {outcome:?}"
+            );
+            assert!(
+                !s.retired_custody_refusals.contains(&(pid, starttime)),
+                "control: the clean reuse persists no refusal"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "control: the clean targetless reuse still receipts: {:?}",
+                batch.terminal_scopes_observed
+            );
+            let positives = positives_of(&batch, pid);
+            assert!(
+                positives > 0,
+                "control: the reuse scope's positives project"
+            );
+            assert_process_env_has_no_tree(&tree_r, "C");
+            assert_process_env_has_no_tree(&tree_m, "C");
+            positives
+        };
+        eprintln!(
+            "new41: race_voided=true record_voided=true control_receipted=true positives={positives_r},{positives_m},{positives_c}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// NEW-45 fix14 pin (guest, replacement-record
+    /// reconciliation through production seal): reconcile with a
+    /// REPLACEMENT record (a different incarnation for the kept
+    /// pid — the PID-reuse shape, staged as the child's own
+    /// inventoried record with a bumped starttime: real PID
+    /// reuse cannot be staged deterministically, so the pin
+    /// stages reconcile's exact production input) over kept
+    /// historical rows. Two legs: (X) changed backing — the
+    /// retained ORIGINAL's genuine `ObjectChanged` is
+    /// independently validated despite the record mismatch and
+    /// persists for the original's exact incarnation; the seal
+    /// voids while verified positives project over
+    /// successfully-read rows. (C) clean backing — the
+    /// mismatch evicts with NO persistence; the seal receipts
+    /// with successfully-read positives. RED (pre-fix): (X)
+    /// grants the stale receipt (the mismatch returns before
+    /// the original's descriptor is checked, and the evicting
+    /// retire skips its own recheck).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn replacement_record_reconciliation_voids_refused_original_keeps_clean_reuse() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::path::Path::new("/dev/shm")
+            .join(format!("osslscope-new45-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        // One staged tree PER staged leg (fix13 precedent: a
+        // leg's chmod strips the staged binary's exec bit).
+        let dir_x = dir.join("X");
+        std::fs::create_dir(&dir_x).unwrap();
+        let tree_x = n39_stage_owned_openssl(&dir_x);
+        let dir_c = dir.join("C");
+        std::fs::create_dir(&dir_c).unwrap();
+        let tree_c = n39_stage_owned_openssl(&dir_c);
+        let staged_ld = |tree: &std::path::Path| {
+            crate::target::ChildLdOverride::Set(n39_child_ld_value(tree).into())
+        };
+        let open_session = || {
+            let s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s
+        };
+        let claim_cookies = |s: &mut ProviderSession, pid: u32, starttime: u64, who: &str| {
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted.as_ref().is_some_and(|snap| {
+                    !snap.is_empty()
+                        && snap.iter().any(|cookie| {
+                            matches!(s.api_owners.get(cookie), Some((owner, st, _)) if *owner == pid && *st == starttime)
+                        })
+                }),
+                "premise: the claim snapshots the owner's exact cookies ({who})"
+            );
+        };
+        // Adopt + claim + workload, retire exited, then
+        // reconcile the REPLACEMENT record (the saved live
+        // record with a bumped starttime — a different
+        // incarnation for the kept pid). `chmod` selects the
+        // changed-backing leg. Returns the session plus the
+        // retiree identity for the seal below.
+        let run_leg = |tag: &str, tree: &std::path::Path, chmod: bool| {
+            let mut s = open_session();
+            let mut argv = n36_speed_argv();
+            argv[0] = tree.join("openssl").to_string_lossy().into_owned();
+            let (_child, pid, starttime) = n36_adopt_child_with_argv(
+                &mut s,
+                tag,
+                false,
+                &[],
+                &argv,
+                true,
+                Some(staged_ld(tree)),
+            );
+            claim_cookies(&mut s, pid, starttime, tag);
+            std::thread::sleep(Duration::from_secs(2));
+            let saved = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes
+            .into_iter()
+            .next()
+            .expect("premise: the live child is inventoried");
+            assert_eq!(
+                (saved.pid, saved.starttime),
+                (pid, starttime),
+                "premise: the saved record names the live incarnation ({tag})"
+            );
+            n36_retire_exited(&mut s, pid, starttime, &[]);
+            if chmod {
+                n39_chmod_staged_sites(tree, &s, pid, tag);
+            }
+            let mut replacement = saved.clone();
+            replacement.starttime = saved.starttime.wrapping_add(1);
+            assert_ne!(
+                replacement.starttime, starttime,
+                "premise: the replacement record names a different incarnation ({tag})"
+            );
+            let back = s.reconcile_records(std::slice::from_ref(&replacement));
+            assert!(
+                back.gaps.contains(&super::ObservationGap::ProcessChanged),
+                "reconcile genuinely detects the replacement-record mismatch ({tag}): {:?}",
+                back.gaps
+            );
+            assert!(
+                !back.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "the mismatch (not a recheck gap) is what reconcile saw ({tag}): {:?}",
+                back.gaps
+            );
+            assert!(
+                !s.startup.contains_key(&pid),
+                "the mismatch retire evicts the historical rows ({tag})"
+            );
+            assert_process_env_has_no_tree(tree, tag);
+            (s, pid, starttime)
+        };
+        // Leg X: changed backing — the seal voids.
+        let positives_x = {
+            let (mut s, pid, starttime) = run_leg("X", &tree_x, true);
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "the mismatch-evicted refused scope earns no receipt (stale reads certify nothing): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let rows: Vec<_> = batch.api_activity.iter().filter(|a| a.pid == pid).collect();
+            assert!(!rows.is_empty(), "rows present (X)");
+            assert!(
+                rows.iter().all(|a| a.row.gaps.read_receipt),
+                "every row is a successful read (X)"
+            );
+            let positives = rows.iter().filter(|a| a.row.entries > 0).count();
+            assert!(
+                positives > 0,
+                "the refused scope's verified positives still project (X)"
+            );
+            assert!(
+                s.retired_custody_refusals.contains(&(pid, starttime)),
+                "the original's refusal persists for its exact incarnation (X)"
+            );
+            positives
+        };
+        // Leg C: clean backing — the seal receipts.
+        let positives_c = {
+            let (mut s, pid, starttime) = run_leg("C", &tree_c, false);
+            assert!(
+                !s.retired_custody_refusals.contains(&(pid, starttime)),
+                "control: the clean mismatch persists no refusal (C)"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "control: the clean mismatch still receipts (C): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let rows: Vec<_> = batch.api_activity.iter().filter(|a| a.pid == pid).collect();
+            assert!(!rows.is_empty(), "rows present (C)");
+            assert!(
+                rows.iter().all(|a| a.row.gaps.read_receipt),
+                "every row is a successful read (C)"
+            );
+            let positives = rows.iter().filter(|a| a.row.entries > 0).count();
+            assert!(
+                positives > 0,
+                "control: the clean scope's positives project (C)"
+            );
+            positives
+        };
+        eprintln!(
+            "new45: refused_voided=true clean_receipted=true positives={positives_x},{positives_c}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// NEW-48 fix15 staging: a staged tree PLUS a staged test
+    /// provider module — `n39_stage_owned_openssl` stages the
+    /// openssl/libcrypto closure; the provider `.so` (built once
+    /// per test from `provider_observation_provider.c`, which
+    /// exports the recognized startup-supported
+    /// `OSSL_provider_init`) is copied into the tree so the
+    /// fixture app's DT_NEEDED closure resolves BOTH backings to
+    /// test-owned files. Returns the tree plus the staged
+    /// module's `(device, inode)`. One tree per leg (fix13
+    /// precedent: a leg's chmod strips exec bits).
+    fn n48_stage_tree_with_provider(
+        dir: &std::path::Path,
+        prov_src: &std::path::Path,
+    ) -> (std::path::PathBuf, (u64, u64)) {
+        use std::os::unix::fs::MetadataExt as _;
+        let tree = n39_stage_owned_openssl(dir);
+        let staged = tree.join("libn48prov.so");
+        std::fs::copy(prov_src, &staged).expect("stage the provider module");
+        let meta = std::fs::metadata(&staged).expect("staged module stats");
+        (tree, (meta.dev(), meta.ino()))
+    }
+    /// NEW-48 fix15 adopt: the `n36_adopt_child_with_argv` shape
+    /// (spawn stopped, pre-exec discovery, prearm, release,
+    /// settle, full-snapshot reconcile, readiness premises) with
+    /// a provider-module settle gate added — the settle waits for
+    /// a VERIFIED module matching the staged provider's
+    /// `(device, inode)` whose exports include
+    /// `OsslProviderInit`, so the adopting reconcile resolves
+    /// that API against the mapped module and the kept rows span
+    /// TWO backing files (the module is DT_NEEDED-mapped from
+    /// exec, so no ready-handshake is needed — the gate covers
+    /// only inventory lag). `strict_libcrypto` is always on
+    /// (staged legs only); no skip seam.
+    fn n48_adopt_child(
+        s: &mut super::ProviderSession,
+        who: &str,
+        argv: &[String],
+        prov_id: (u64, u64),
+        child_ld: Option<crate::target::ChildLdOverride>,
+    ) -> (crate::target::OwnedTarget, u32, u64) {
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let mut child = match &child_ld {
+            Some(spec) => crate::target::OwnedTarget::spawn_stopped_with_ld(
+                argv,
+                crate::target::WorkloadDest::Null,
+                spec.clone(),
+            )
+            .expect("child spawns stopped"),
+            None => {
+                crate::target::OwnedTarget::spawn_stopped(argv, crate::target::WorkloadDest::Null)
+                    .expect("child spawns stopped")
+            }
+        };
+        let pid = child.pid();
+        let cancel = AtomicBool::new(false);
+        let mut budget = super::ObservationBudget::default();
+        let startup = match &child_ld {
+            Some(crate::target::ChildLdOverride::Set(value)) => {
+                let text = value.to_str().expect("the staged LD value is UTF-8");
+                crate::startup_objects::prepare_owned_startup_with_ld(
+                    &child,
+                    argv,
+                    &mut budget,
+                    Instant::now() + Duration::from_secs(15),
+                    &cancel,
+                    None,
+                    Some(text),
+                )
+                .expect("startup discovery")
+            }
+            Some(crate::target::ChildLdOverride::Remove) => {
+                crate::startup_objects::prepare_owned_startup_with_ld(
+                    &child,
+                    argv,
+                    &mut budget,
+                    Instant::now() + Duration::from_secs(15),
+                    &cancel,
+                    None,
+                    None,
+                )
+                .expect("startup discovery")
+            }
+            None => crate::startup_objects::prepare_owned_startup(
+                &child,
+                argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                None,
+            )
+            .expect("startup discovery"),
+        };
+        assert!(
+            !startup.apis.is_empty(),
+            "premise: pre-exec discovery finds startup sites ({who})"
+        );
+        s.prearm_startup(
+            startup.apis,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            super::PrearmLinks::Create,
+        )
+        .expect("prearm");
+        child.release().expect("child releases");
+        let acquirable = |record: &crate::inventory::ProcessRecord| {
+            record.modules.iter().any(|module| {
+                module.info.exports.iter().any(|api| {
+                    api.operational_id().is_some()
+                        || wire::attach_ids()
+                            .any(|id| wire::api(id) == Ok(super::ObservationApi::Inventoried(*api)))
+                })
+            })
+        };
+        let has_libcrypto = |record: &crate::inventory::ProcessRecord| {
+            record.modules.iter().any(|module| {
+                module.identity_status == crate::inventory::IdentityStatus::Verified
+                    && module
+                        .info
+                        .file_soname
+                        .as_deref()
+                        .is_some_and(|soname| soname.starts_with("libcrypto.so"))
+            })
+        };
+        let has_provider = |record: &crate::inventory::ProcessRecord| {
+            record.modules.iter().any(|module| {
+                module.identity_status == crate::inventory::IdentityStatus::Verified
+                    && (module.info.device, module.info.inode) == prov_id
+                    && module
+                        .info
+                        .exports
+                        .iter()
+                        .any(|api| matches!(api, crate::inventory::Api::OsslProviderInit))
+            })
+        };
+        let until = Instant::now() + Duration::from_secs(15);
+        let records = loop {
+            let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            assert_eq!(records.len(), 1, "the child is inventoried ({who})");
+            let settled =
+                acquirable(&records[0]) && has_libcrypto(&records[0]) && has_provider(&records[0]);
+            if settled || Instant::now() >= until {
+                break records;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        assert!(
+            acquirable(&records[0]),
+            "premise: the child settled to an acquirable record within 15s ({who})"
+        );
+        assert!(
+            has_libcrypto(&records[0]),
+            "premise: libcrypto is verified before the staged reconcile ({who})"
+        );
+        assert!(
+            has_provider(&records[0]),
+            "premise: the staged provider module is verified before the staged reconcile ({who})"
+        );
+        if let Some(spec) = &child_ld {
+            assert_child_environ_ld(pid, spec, who);
+        }
+        let starttime = records[0].starttime;
+        let setup = s.reconcile_records(&records);
+        eprintln!("n48adopt: {who} pid={pid} gaps={:?}", setup.gaps,);
+        assert!(
+            s.target_ready(pid, starttime),
+            "the adopting attach completes ({who}): {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .any(|a| a.original.is_some()),
+            "premise: reconcile adopts prearmed sites (originals authorize history) ({who})"
+        );
+        assert_eq!(
+            s.targets.get(&pid).expect("target present").site_gap_apis,
+            std::collections::BTreeSet::from([21u32]),
+            "premise: quarantine is the only site gap ({who})"
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+                .is_empty(),
+            "premise: clean discovery tracks nothing operational ({who})"
+        );
+        (child, pid, starttime)
+    }
+    /// NEW-48 fix15 stimulus: group the kept historical rows by
+    /// backing file (`(device, inode)` of each row's checked
+    /// original — every kept row's checked original is its
+    /// startup site, premised) in row order (the exact iteration
+    /// order `terminal_originals` scans); premise every backing
+    /// is a staged tree file (basenames only in the diagnostic —
+    /// never full paths) and at least TWO distinct backings are
+    /// present. With `refuse_later`, chmod ONLY the second
+    /// group's file (the first backing stays healthy) and premise
+    /// the later rows genuinely refuse (`ObjectChanged`) while
+    /// every other row still validates; without it, premise
+    /// every row validates (the all-clean control shape).
+    /// Returns `(first, later)` backing ids.
+    fn n48_backing_groups(
+        tree: &std::path::Path,
+        s: &super::ProviderSession,
+        pid: u32,
+        who: &str,
+        refuse_later: bool,
+    ) -> ((u64, u64), (u64, u64)) {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let rows = s
+            .startup
+            .get(&pid)
+            .expect("historical rows present for the backing stimulus");
+        assert!(
+            !rows.is_empty(),
+            "premise: historical rows are kept ({who})"
+        );
+        for a in rows.iter() {
+            assert!(
+                a.original.is_none() && a.site.is_startup(),
+                "premise: every kept row's checked original is its startup site ({who})"
+            );
+        }
+        let ids: Vec<(u64, u64)> = rows
+            .iter()
+            .map(|a| (a.site.native_device(), a.site.inode()))
+            .collect();
+        let mut groups: Vec<(u64, u64)> = Vec::new();
+        for id in &ids {
+            if !groups.contains(id) {
+                groups.push(*id);
+            }
+        }
+        assert!(
+            groups.len() >= 2,
+            "premise: kept rows span at least two backing files ({who}): {groups:?}"
+        );
+        assert_eq!(
+            ids[0], groups[0],
+            "the first row heads the first backing group ({who})"
+        );
+        let mut staged: Vec<(std::path::PathBuf, (u64, u64))> = Vec::new();
+        for entry in std::fs::read_dir(tree).expect("staged tree reads") {
+            let path = entry.expect("staged entry").path();
+            if path.is_file() {
+                let meta = std::fs::metadata(&path).expect("staged file stats");
+                staged.push((path, (meta.dev(), meta.ino())));
+            }
+        }
+        let mut names: Vec<String> = Vec::new();
+        let mut paths: Vec<std::path::PathBuf> = Vec::new();
+        for id in &groups {
+            let path = staged
+                .iter()
+                .find(|(_, sid)| sid == id)
+                .unwrap_or_else(|| {
+                    panic!("premise: every backing is a staged file ({who}): {id:?}")
+                })
+                .0
+                .clone();
+            assert!(
+                path.starts_with(tree),
+                "the backing stays inside the staged tree ({who})"
+            );
+            names.push(
+                path.file_name()
+                    .expect("staged basename")
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            paths.push(path);
+        }
+        let counts: Vec<usize> = groups
+            .iter()
+            .map(|g| ids.iter().filter(|id| *id == g).count())
+            .collect();
+        eprintln!(
+            "n48backing: ({who}) rows={} groups={} first={}x{} later={}x{}",
+            rows.len(),
+            groups.len(),
+            names[0],
+            counts[0],
+            names[1],
+            counts[1],
+        );
+        let (first, later) = (groups[0], groups[1]);
+        if refuse_later {
+            std::fs::set_permissions(&paths[1], std::fs::Permissions::from_mode(0o600))
+                .unwrap_or_else(|e| panic!("chmod {}: {e}", paths[1].display()));
+        }
+        for (a, id) in rows.iter().zip(ids.iter()) {
+            if refuse_later && *id == later {
+                assert_eq!(
+                    a.site.revalidate_queued(),
+                    Err(super::ObservationGap::ObjectChanged),
+                    "premise: the later backing genuinely refuses ({who})"
+                );
+            } else {
+                assert!(
+                    a.site.revalidate_queued().is_ok(),
+                    "premise: non-refused backings stay healthy ({who}): {id:?}"
+                );
+            }
+        }
+        (first, later)
+    }
+    /// NEW-48 fix15 pin (guest, two-backing replacement-record
+    /// reconciliation through production seal): production
+    /// startup can retain API sites from several distinct
+    /// backing files under one PID, but mismatch validation
+    /// returns after the FIRST retained original — with a
+    /// healthy first backing and a refused later one, reconcile
+    /// evicts all rows without retaining the later refusal, and
+    /// the readable counters stay eligible to certify zero. The
+    /// pin stages reconcile's exact production input (the
+    /// child's own inventoried record with a bumped starttime)
+    /// over kept historical rows spanning two staged backings
+    /// (staged libcrypto + a staged provider module, both
+    /// DT_NEEDED-prearmed). Two legs: (X) only the LATER
+    /// backing refused — the seal voids (Unknown, no receipt)
+    /// while verified positives project over successfully-read
+    /// rows (including successfully-read zero-count rows) and
+    /// the refusal persists for the exact incarnation. (C)
+    /// all-clean — the two-backing mismatch evicts with NO
+    /// persistence; the seal receipts the reuse with
+    /// successfully-read positives. RED (pre-fix): (X) grants
+    /// the stale receipt (the first healthy backing ends the
+    /// validation scan, and the evicting retire skips its own
+    /// recheck).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn two_backing_mismatch_voids_later_refusal_keeps_clean_reuse() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::path::Path::new("/dev/shm")
+            .join(format!("osslscope-new48-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let prov_src = dir.join("libn48prov.so");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-shared", "-fPIC", "-o"])
+                .arg(&prov_src)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_observation_provider.c"
+                ))
+                .status()
+                .unwrap()
+                .success(),
+            "provider module builds"
+        );
+        let app = dir.join("n48app");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/n48_two_backing_loop.c"
+                ))
+                .arg("-L")
+                .arg(&dir)
+                .args(["-ln48prov", "-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture app builds"
+        );
+        // One staged tree PER staged leg (fix13 precedent: a
+        // leg's chmod strips the staged files' exec bit).
+        let dir_x = dir.join("X");
+        std::fs::create_dir(&dir_x).unwrap();
+        let (tree_x, prov_x) = n48_stage_tree_with_provider(&dir_x, &prov_src);
+        let dir_c = dir.join("C");
+        std::fs::create_dir(&dir_c).unwrap();
+        let (tree_c, prov_c) = n48_stage_tree_with_provider(&dir_c, &prov_src);
+        let staged_ld = |tree: &std::path::Path| {
+            crate::target::ChildLdOverride::Set(n39_child_ld_value(tree).into())
+        };
+        let open_session = || {
+            let s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s
+        };
+        let claim_cookies = |s: &mut ProviderSession, pid: u32, starttime: u64, who: &str| {
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted.as_ref().is_some_and(|snap| {
+                    !snap.is_empty()
+                        && snap.iter().any(|cookie| {
+                            matches!(s.api_owners.get(cookie), Some((owner, st, _)) if *owner == pid && *st == starttime)
+                        })
+                }),
+                "premise: the claim snapshots the owner's exact cookies ({who})"
+            );
+        };
+        // Adopt + claim + workload, retire exited, group the
+        // kept rows by backing (refusing ONLY the later backing
+        // when asked), then reconcile the REPLACEMENT record
+        // (the saved live record with a bumped starttime — a
+        // different incarnation for the kept pid). Returns the
+        // session plus the retiree identity for the seal below.
+        let run_leg =
+            |tag: &str, tree: &std::path::Path, prov_id: (u64, u64), refuse_later: bool| {
+                let mut s = open_session();
+                let argv = [app.to_string_lossy().into_owned()].to_vec();
+                let (_child, pid, starttime) =
+                    n48_adopt_child(&mut s, tag, &argv, prov_id, Some(staged_ld(tree)));
+                claim_cookies(&mut s, pid, starttime, tag);
+                std::thread::sleep(Duration::from_secs(2));
+                let saved = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                    pids: vec![pid],
+                    ..Default::default()
+                })
+                .processes
+                .into_iter()
+                .next()
+                .expect("premise: the live child is inventoried");
+                assert_eq!(
+                    (saved.pid, saved.starttime),
+                    (pid, starttime),
+                    "premise: the saved record names the live incarnation ({tag})"
+                );
+                n36_retire_exited(&mut s, pid, starttime, &[]);
+                let (first, later) = n48_backing_groups(tree, &s, pid, tag, refuse_later);
+                assert_ne!(
+                    first, later,
+                    "premise: the refused backing differs from the first ({tag})"
+                );
+                let mut replacement = saved.clone();
+                replacement.starttime = saved.starttime.wrapping_add(1);
+                assert_ne!(
+                    replacement.starttime, starttime,
+                    "premise: the replacement record names a different incarnation ({tag})"
+                );
+                let back = s.reconcile_records(std::slice::from_ref(&replacement));
+                assert!(
+                    back.gaps.contains(&super::ObservationGap::ProcessChanged),
+                    "reconcile genuinely detects the replacement-record mismatch ({tag}): {:?}",
+                    back.gaps
+                );
+                assert!(
+                    !back.gaps.contains(&super::ObservationGap::ObjectChanged),
+                    "the mismatch (not a recheck gap) is what reconcile saw ({tag}): {:?}",
+                    back.gaps
+                );
+                assert!(
+                    !s.startup.contains_key(&pid),
+                    "the mismatch retire evicts the historical rows ({tag})"
+                );
+                assert_process_env_has_no_tree(tree, tag);
+                (s, pid, starttime)
+            };
+        // Leg X: only the later backing refused — the seal voids.
+        let positives_x = {
+            let (mut s, pid, starttime) = run_leg("X", &tree_x, prov_x, true);
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "the later-refused two-backing scope earns no receipt (stale reads certify nothing): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let rows: Vec<_> = batch.api_activity.iter().filter(|a| a.pid == pid).collect();
+            assert!(!rows.is_empty(), "rows present (X)");
+            assert!(
+                rows.iter().all(|a| a.row.gaps.read_receipt),
+                "every row is a successful read (X)"
+            );
+            assert!(
+                rows.iter()
+                    .any(|a| a.row.entries == 0 && a.row.gaps.read_receipt),
+                "zero-count rows are successfully read (X)"
+            );
+            let positives = rows.iter().filter(|a| a.row.entries > 0).count();
+            assert!(
+                positives > 0,
+                "the refused scope's verified positives still project (X)"
+            );
+            assert!(
+                s.retired_custody_refusals.contains(&(pid, starttime)),
+                "the later refusal persists for its exact incarnation (X)"
+            );
+            positives
+        };
+        // Leg C: all clean — the seal receipts the reuse.
+        let positives_c = {
+            let (mut s, pid, starttime) = run_leg("C", &tree_c, prov_c, false);
+            assert!(
+                !s.retired_custody_refusals.contains(&(pid, starttime)),
+                "control: the clean two-backing mismatch persists no refusal (C)"
+            );
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            assert!(
+                batch.terminal_scopes_observed.contains(&(pid, starttime)),
+                "control: the clean mismatch still receipts (C): {:?}",
+                batch.terminal_scopes_observed
+            );
+            let rows: Vec<_> = batch.api_activity.iter().filter(|a| a.pid == pid).collect();
+            assert!(!rows.is_empty(), "rows present (C)");
+            assert!(
+                rows.iter().all(|a| a.row.gaps.read_receipt),
+                "every row is a successful read (C)"
+            );
+            let positives = rows.iter().filter(|a| a.row.entries > 0).count();
+            assert!(
+                positives > 0,
+                "control: the clean scope's positives project (C)"
+            );
+            positives
+        };
+        eprintln!(
+            "new48: later_voided=true clean_receipted=true positives={positives_x},{positives_c}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// NEW-41-idle fix14: the non-vacuous successful-zero-read
+    /// predicate — rows PRESENT, every row a successful read
+    /// (`read_receipt`, minted only by `wire::activity` after a
+    /// successful terminal map read), every row zero entries.
+    /// The old `all()` + sum shape passes with empty or
+    /// unreadable activity; this rejects both. Both idle twins
+    /// (N39idle, N41idle) assert through this on their direct
+    /// seal; the transplanted seal asserts through
+    /// `sealed_rows_are_successful_zero_reads` below (the merged
+    /// document always carries one row per API, so the
+    /// receipted subset is the non-vacuous claim there).
+    fn rows_are_successful_zero_reads(rows: &[&crate::api_activity::ApiActivityRow]) -> bool {
+        !rows.is_empty()
+            && rows.iter().all(|row| row.gaps.read_receipt)
+            && rows.iter().all(|row| row.entries == 0)
+    }
+    /// NEW-41-idle fix14: the transplanted-seal twin of the
+    /// predicate above. The sealed document merges per-API over
+    /// an `unavailable` row per API, so unreceipted zero rows
+    /// are expected there — the non-vacuous claim is a NONEMPTY
+    /// receipted subset, all zero, with a zero grand total.
+    fn sealed_rows_are_successful_zero_reads(rows: &[crate::api_activity::ApiActivityRow]) -> bool {
+        let receipted: Vec<_> = rows.iter().filter(|row| row.gaps.read_receipt).collect();
+        !receipted.is_empty()
+            && receipted.iter().all(|row| row.entries == 0)
+            && rows.iter().map(|row| row.entries).sum::<u64>() == 0
+    }
+    /// NEW-41-idle fix14 (host, no BPF): the predicates above
+    /// are non-vacuous — they reject empty and unreadable
+    /// activity and accept genuine successful zero-count reads.
+    /// RED-first: first run with inverted (old-shape)
+    /// expectations, failed right-reason, then corrected.
+    #[test]
+    fn successful_zero_read_predicates_reject_vacuous_activity() {
+        use super::wire::contract as c;
+        use crate::api_activity::{ApiActivityRow, ApiId};
+        let api = ApiId::all().next().expect("at least one API id");
+        let num = u32::from(api);
+        // Empty activity: the old `all()` passed; the direct
+        // predicate rejects.
+        assert!(!rows_are_successful_zero_reads(&[]));
+        assert!(!sealed_rows_are_successful_zero_reads(&[]));
+        // Unreadable activity (a failed-read gap row, no
+        // receipt, zero entries): the old `all(entries == 0)`
+        // and sum passed; both predicates reject.
+        let unread = ApiActivityRow::unavailable(api);
+        assert_eq!(unread.entries, 0);
+        assert!(!unread.gaps.read_receipt);
+        assert!(!rows_are_successful_zero_reads(&[&unread]));
+        assert!(!sealed_rows_are_successful_zero_reads(
+            std::slice::from_ref(&unread)
+        ));
+        // A receipted positive row is not a zero read.
+        let positive = super::wire::activity(
+            num,
+            c::ApiAggregate {
+                entries: 5,
+                success: 5,
+                ..Default::default()
+            },
+        )
+        .expect("the positive aggregate is well-formed");
+        assert!(positive.gaps.read_receipt);
+        assert!(!rows_are_successful_zero_reads(&[&positive]));
+        // Genuine successful zero-count reads: both accept (the
+        // sealed twin beside an expected unavailable row for an
+        // unobserved API).
+        let zero = super::wire::activity(num, c::ApiAggregate::default())
+            .expect("the zero aggregate is well-formed");
+        assert!(zero.gaps.read_receipt);
+        assert_eq!(zero.entries, 0);
+        assert!(rows_are_successful_zero_reads(&[&zero]));
+        assert!(sealed_rows_are_successful_zero_reads(&[zero, unread]));
+    }
+    /// NEW-41 fix13 pin, idle twin (guest, second-check refusal
+    /// through the transplanted `finish`): the same genuine
+    /// `ObjectChanged` in the production retire's recheck over a
+    /// genuinely idle child (zero BPF-counted entries, successful
+    /// zero-count reads) seals `Unknown` — never a stale observed
+    /// zero. Two twin seals of the refused idle: direct (no scope
+    /// receipt, zero positives, zero-entry rows) and transplanted
+    /// through the real `finish` (emitted `Unknown` remainder + a
+    /// published nonempty silence interval, so the void is the
+    /// refusal, not an unestablished claim). The first check
+    /// genuinely returns `Ok(true)` per row before the chmod (the
+    /// race shape, staged deterministically). RED (pre-fix): the
+    /// direct twin grants the stale receipt (and the transplant
+    /// would seal `Observed{0}`).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn retirement_recheck_refusal_seals_idle_unknown() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::path::Path::new("/dev/shm")
+            .join(format!("osslscope-new41idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let tree = n39_stage_owned_openssl(&dir);
+        let staged_value = n39_child_ld_value(&tree);
+        let app = dir.join("provider_idle_loop");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_idle_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        // One refused-idle leg; `tag` names its stdout sink.
+        // Returns the session right after the refusing retire plus
+        // the seal inputs.
+        let run_leg = |tag: &str| {
+            let staged_ld = crate::target::ChildLdOverride::Set(staged_value.clone().into());
+            let argv: Vec<String> = [app.to_string_lossy().into_owned()].to_vec();
+            let stdout_path = dir.join(format!("idle-out-{tag}.txt"));
+            std::fs::write(&stdout_path, b"").unwrap();
+            let mut child = crate::target::OwnedTarget::spawn_stopped_with_ld(
+                &argv,
+                crate::target::WorkloadDest::File(stdout_path.clone()),
+                staged_ld.clone(),
+            )
+            .expect("child spawns stopped");
+            let pid = child.pid();
+            let cancel = AtomicBool::new(false);
+            let mut budget = super::ObservationBudget::default();
+            let setup_mono = LiveClock.monotonic_ns();
+            let startup = crate::startup_objects::prepare_owned_startup_with_ld(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                None,
+                Some(&staged_value),
+            )
+            .expect("startup discovery");
+            assert!(
+                !startup.apis.is_empty(),
+                "premise: pre-exec discovery finds startup sites ({tag})"
+            );
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s.prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                super::PrearmLinks::Create,
+            )
+            .expect("prearm");
+            child.release().expect("child releases");
+            // Ready-gate (the FLAGCIDLE shape): the fixture prints
+            // `ready` AFTER both provider pre-loads succeed — attach
+            // only then, so the window counts exactly zero.
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+                if out.contains("ready") || Instant::now() >= until {
+                    assert!(
+                        out.contains("ready"),
+                        "premise: the idle fixture prints ready within 15s ({tag})"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            let acquirable = |record: &crate::inventory::ProcessRecord| {
+                record.modules.iter().any(|module| {
+                    module.info.exports.iter().any(|api| {
+                        api.operational_id().is_some()
+                            || wire::attach_ids().any(|id| {
+                                wire::api(id) == Ok(super::ObservationApi::Inventoried(*api))
+                            })
+                    })
+                })
+            };
+            let has_libcrypto = |record: &crate::inventory::ProcessRecord| {
+                record.modules.iter().any(|module| {
+                    module.identity_status == crate::inventory::IdentityStatus::Verified
+                        && module
+                            .info
+                            .file_soname
+                            .as_deref()
+                            .is_some_and(|soname| soname.starts_with("libcrypto.so"))
+                })
+            };
+            let until = Instant::now() + Duration::from_secs(15);
+            let records = loop {
+                let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                    pids: vec![pid],
+                    ..Default::default()
+                })
+                .processes;
+                assert_eq!(records.len(), 1, "the child is inventoried");
+                // The staged strict settle (same locator race as
+                // the `speed` legs — settle on VERIFIED libcrypto;
+                // a locator-candidate entry attaches nothing).
+                if (acquirable(&records[0]) && has_libcrypto(&records[0]))
+                    || Instant::now() >= until
+                {
+                    break records;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            assert!(
+                acquirable(&records[0]),
+                "premise: the child settled to an acquirable record within 15s"
+            );
+            assert!(
+                has_libcrypto(&records[0]),
+                "premise: libcrypto is verified before the staged reconcile"
+            );
+            // NEW-43 fix13: the settled child runs exec'd — pin it
+            // got exactly the staged loader env child-locally.
+            assert_child_environ_ld(pid, &staged_ld, tag);
+            let record = records[0].clone();
+            let starttime = record.starttime;
+            let setup = s.reconcile_records(&records);
+            assert!(
+                s.target_ready(pid, starttime),
+                "the adopting attach completes: {:?}",
+                setup.gaps
+            );
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .attachments
+                    .iter()
+                    .any(|a| a.original.is_some()),
+                "premise: reconcile adopts prearmed sites (originals authorize history)"
+            );
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted
+                    .as_ref()
+                    .is_some_and(|snap| !snap.is_empty()),
+                "premise: the claim snapshots live cookies ({tag})"
+            );
+            // Genuine idle: the fixture sleeps — nothing is driven.
+            std::thread::sleep(Duration::from_secs(2));
+            crate::target::kill_test_child(pid, Duration::from_secs(5));
+            let exit = s.reconcile_records(&[]);
+            assert!(
+                exit.gaps
+                    .contains(&super::ObservationGap::MembershipUnknown),
+                "premise: the tick detects the exit ({tag}): {:?}",
+                exit.gaps
+            );
+            assert!(
+                !s.targets.contains_key(&pid),
+                "premise: the preserving retire removed the target ({tag})"
+            );
+            assert!(
+                !s.scope_continuity_broken.contains(&(pid, starttime)),
+                "premise: the preserving retire marks nothing ({tag})"
+            );
+            assert!(
+                !s.pending_retire.contains_key(&pid),
+                "premise: the retire completed (not deferred) ({tag})"
+            );
+            assert!(
+                s.startup
+                    .get(&pid)
+                    .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|a| a.historical)),
+                "premise: adopted rows are kept historical ({tag})"
+            );
+            // The second-check race, staged deterministically: the
+            // FIRST check genuinely returns `Ok(true)` per row,
+            // then the production retire's recheck genuinely
+            // refuses over the chmod'd backing.
+            for a in s
+                .startup
+                .get(&pid)
+                .expect("historical rows present for the first check")
+            {
+                assert_eq!(
+                    a.site.revalidate_queued(),
+                    Ok(true),
+                    "premise: the first live check returns Ok(true) ({tag})"
+                );
+            }
+            n39_chmod_staged_sites(&tree, &s, pid, tag);
+            let mut b = super::ObservationBatch::default();
+            let outcome =
+                s.retire_for_gap(pid, None, super::ObservationGap::ProcessUnavailable, &mut b);
+            assert!(
+                matches!(outcome, super::RetireOutcome::Retired(false)),
+                "premise: the recheck-refused retire completes evicting ({tag}): {outcome:?}"
+            );
+            assert!(
+                b.gaps.contains(&super::ObservationGap::ObjectChanged),
+                "the retire's recheck genuinely detects ObjectChanged ({tag}): {:?}",
+                b.gaps
+            );
+            assert!(
+                !s.startup.contains_key(&pid),
+                "the recheck-refused retire evicts the historical rows ({tag})"
+            );
+            assert_process_env_has_no_tree(&tree, tag);
+            (
+                s,
+                pid,
+                starttime,
+                record.namespaces.clone(),
+                setup_mono,
+                start,
+            )
+        };
+        // Direct seal: no receipt, zero positives, zero-entry rows.
+        let (mut s, pid, starttime, _, _, _) = run_leg("direct");
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            !batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the recheck-refused idle scope earns no receipt (stale zero-entry reads certify nothing): {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.entries > 0)
+            .count();
+        assert_eq!(
+            positives, 0,
+            "the idle leg counts zero positives (genuine idle)"
+        );
+        // NEW-41-idle fix14: SUCCESSFUL zero-count reads,
+        // explicitly (rows present, reads succeeded, zero
+        // counts) — the old `all()` passed with empty or
+        // unreadable activity.
+        let direct_rows: Vec<_> = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid)
+            .map(|a| &a.row)
+            .collect();
+        assert!(
+            rows_are_successful_zero_reads(&direct_rows),
+            "the recheck-refused idle seal reads successful zero-count rows"
+        );
+        // Transplanted seal through the real `finish`: the emitted
+        // `Unknown` remainder plus its interval, strictly valid.
+        let (s, pid, starttime, namespaces, setup_mono, provider_start) = run_leg("seal");
+        let sealed = crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+            s,
+            pid,
+            starttime,
+            namespaces,
+            &pool,
+            setup_mono,
+            Some(provider_start),
+            setup_mono.saturating_add(60_000_000_000),
+            &[],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("finish seals");
+        let evidence = sealed
+            .document
+            .request_evidence
+            .as_ref()
+            .expect("the sealed document carries its section");
+        let silence = evidence
+            .silence_window
+            .as_ref()
+            .expect("premise: the established seal publishes its interval (the void is the refusal, not an unestablished claim)");
+        assert!(
+            silence.end_ns > silence.start_ns,
+            "premise: the emitted interval is nonempty"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "the refused idle plane is Unknown, never a stale observed zero"
+        );
+        // NEW-41-idle fix14: the sealed twin of the direct
+        // claim above — a NONEMPTY receipted subset, all zero,
+        // zero grand total (the old sum passed with empty or
+        // unreadable activity; unreceipted unavailable rows for
+        // unobserved APIs are expected in the merged document).
+        assert!(
+            sealed_rows_are_successful_zero_reads(&sealed.document.api_activity),
+            "premise: the sealed idle carries successful zero-count reads (genuine idle)"
+        );
+        evidence
+            .validate_strict()
+            .expect("the refused sealed section validates");
+        eprintln!("new41idle: recheck_refused=true direct_voided=true idle_unknown=true entries=0");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// NEW-37 fix11 pin (host, no BPF): the idle fixture's
+    /// `ready` line requires BOTH provider handles. The normal run
+    /// prints `ready` promptly and stays alive behind it; the
+    /// failure-injection run (legacy swapped for a nonexistent
+    /// provider — a genuine NULL from a real
+    /// `OSSL_PROVIDER_load`) prints no `ready` and exits nonzero
+    /// promptly. RED: the pre-gate fixture prints `ready` and
+    /// sleeps either way.
+    #[test]
+    fn idle_fixture_readiness_requires_both_provider_handles() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+        struct KillOnDrop(std::process::Child);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("osslscope-new37fix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let app = dir.join("provider_idle_loop");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_idle_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        // Normal run: `ready` promptly, child alive behind it.
+        let normal_out = dir.join("normal.txt");
+        let sink = std::fs::File::create(&normal_out).unwrap();
+        let mut normal = KillOnDrop(
+            std::process::Command::new(&app)
+                .stdout(Stdio::from(sink))
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .env_remove("OSSLSCOPE_IDLE_DROP_LEGACY")
+                .spawn()
+                .expect("fixture spawns"),
+        );
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let text = std::fs::read_to_string(&normal_out).unwrap_or_default();
+            if text.contains("ready") || Instant::now() >= until {
+                assert!(
+                    text.contains("ready"),
+                    "the normal run prints ready: {text:?}"
+                );
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(
+            normal.0.try_wait().unwrap().is_none(),
+            "the ready child stays alive (it sleeps, never exits)"
+        );
+        drop(normal);
+        // Failure-injection run: genuine NULL legacy handle — no
+        // `ready`, nonzero exit, promptly (never a sleep behind a
+        // NULL handle).
+        let fail_out = dir.join("fail.txt");
+        let sink = std::fs::File::create(&fail_out).unwrap();
+        let mut failed = KillOnDrop(
+            std::process::Command::new(&app)
+                .stdout(Stdio::from(sink))
+                .stderr(Stdio::null())
+                .stdin(Stdio::null())
+                .env("OSSLSCOPE_IDLE_DROP_LEGACY", "1")
+                .spawn()
+                .expect("fixture spawns"),
+        );
+        let until = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = failed.0.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= until {
+                panic!(
+                    "the failed-load run must exit promptly (it must never sleep behind a NULL handle)"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        assert!(!status.success(), "the failed-load run exits nonzero");
+        let text = std::fs::read_to_string(&fail_out).unwrap_or_default();
+        assert!(
+            !text.contains("ready"),
+            "a failed provider load never prints ready: {text:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("new37fix: ready_gated=true");
+    }
+    /// FLAG-C-OPEN fix10 pin (guest, genuine clean idle through
+    /// preserving retirement): the fix9 clean leg runs the same
+    /// workload and REQUIRES positives, so it never pins clean
+    /// terminal idle. This control adopts a genuinely idle child
+    /// (preloaded providers, then sleep — zero crypto in-window),
+    /// claims, idles, exits, and seals through the mid-run
+    /// preserving retire — asserting the receipt AND the published
+    /// observed zero. Two twin seals of the same shape: direct
+    /// (receipt + zero positives + zero-entry rows) and
+    /// transplanted through the real `finish` (emitted
+    /// `Observed{0}` remainder + nonempty silence interval +
+    /// strict validation). NEW-37 fix11: the transplanted twin
+    /// additionally validates the FULL emitted document with its
+    /// actual activity rows (section-only validation cannot check
+    /// serialized receipts).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn terminal_retirement_preserves_clean_idle_zero() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let dir = std::env::temp_dir().join(format!("osslscope-flagcidle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let app = dir.join("provider_idle_loop");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/provider_idle_loop.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        // One adopted-idle leg; `tag` names its stdout sink.
+        // Returns the session right after the preserving retire
+        // plus the seal inputs.
+        let run_leg = |tag: &str| {
+            let argv: Vec<String> = [app.to_string_lossy().into_owned()].to_vec();
+            let stdout_path = dir.join(format!("idle-out-{tag}.txt"));
+            std::fs::write(&stdout_path, b"").unwrap();
+            let mut child = crate::target::OwnedTarget::spawn_stopped(
+                &argv,
+                crate::target::WorkloadDest::File(stdout_path.clone()),
+            )
+            .expect("child spawns stopped");
+            let pid = child.pid();
+            let cancel = AtomicBool::new(false);
+            let mut budget = super::ObservationBudget::default();
+            let setup_mono = LiveClock.monotonic_ns();
+            let startup = crate::startup_objects::prepare_owned_startup(
+                &child,
+                &argv,
+                &mut budget,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                None,
+            )
+            .expect("startup discovery");
+            assert!(
+                !startup.apis.is_empty(),
+                "premise: pre-exec discovery finds startup sites"
+            );
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    // A warm (fully inventoried) adopt stages more
+                    // sites, and the acquire loop aborts silently
+                    // past the state budget — fund the adopted
+                    // shape with margin (tracked from the default,
+                    // never a literal).
+                    max_state_bytes: ObservationLimits::default()
+                        .max_state_bytes
+                        .saturating_mul(2),
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            s.prearm_startup(
+                startup.apis,
+                Instant::now() + Duration::from_secs(15),
+                &cancel,
+                super::PrearmLinks::Create,
+            )
+            .expect("prearm");
+            child.release().expect("child releases");
+            // Ready-gate: the fixture prints `ready` AFTER its
+            // provider pre-loads — and only when BOTH loads
+            // succeeded (NEW-37 fix11) — attach only then, so the
+            // pre-load dispatch predates the probes and the window
+            // counts exactly zero. Bounded; failure names the leg.
+            let until = Instant::now() + Duration::from_secs(15);
+            loop {
+                let out = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+                if out.contains("ready") || Instant::now() >= until {
+                    assert!(
+                        out.contains("ready"),
+                        "premise: the idle fixture prints ready within 15s ({tag})"
+                    );
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            // The FLAG-C settle-gate (exact `acquire_observable`
+            // predicate): reconcile only once the snapshot shows
+            // an acquirable record, else the attach silently skips.
+            let acquirable = |record: &crate::inventory::ProcessRecord| {
+                record.modules.iter().any(|module| {
+                    module.info.exports.iter().any(|api| {
+                        api.operational_id().is_some()
+                            || wire::attach_ids().any(|id| {
+                                wire::api(id) == Ok(super::ObservationApi::Inventoried(*api))
+                            })
+                    })
+                })
+            };
+            let until = Instant::now() + Duration::from_secs(15);
+            let records = loop {
+                let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                    pids: vec![pid],
+                    ..Default::default()
+                })
+                .processes;
+                assert_eq!(records.len(), 1, "the child is inventoried");
+                if acquirable(&records[0]) || Instant::now() >= until {
+                    break records;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            assert!(
+                acquirable(&records[0]),
+                "premise: the child settled to an acquirable record within 15s"
+            );
+            let record = records[0].clone();
+            let starttime = record.starttime;
+            let setup = s.reconcile_records(&records);
+            assert!(
+                s.target_ready(pid, starttime),
+                "the adopting attach completes: {:?}",
+                setup.gaps
+            );
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .attachments
+                    .iter()
+                    .any(|a| a.original.is_some()),
+                "premise: reconcile adopts prearmed sites (originals authorize history)"
+            );
+            assert_eq!(
+                s.targets.get(&pid).expect("target present").site_gap_apis,
+                std::collections::BTreeSet::from([21u32]),
+                "premise: quarantine is the only site gap"
+            );
+            assert!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .process
+                    .unresolved_operational()
+                    .is_empty(),
+                "premise: clean discovery tracks nothing operational"
+            );
+            let start = LiveClock.monotonic_ns();
+            s.set_api_window(start, start.saturating_add(60_000_000_000))
+                .expect("window programs");
+            assert!(
+                s.claim_admitted
+                    .as_ref()
+                    .is_some_and(|snap| !snap.is_empty()),
+                "premise: the claim snapshots live cookies"
+            );
+            // Genuine idle: the fixture sleeps — nothing is driven.
+            std::thread::sleep(Duration::from_secs(2));
+            // Exit + a production tick (preserving: adopted
+            // originals authorize history — target removed, rows
+            // kept historical, no continuity mark).
+            crate::target::kill_test_child(pid, Duration::from_secs(5));
+            let exit = s.reconcile_records(&[]);
+            assert!(
+                exit.gaps
+                    .contains(&super::ObservationGap::MembershipUnknown),
+                "premise: the tick detects the exit: {:?}",
+                exit.gaps
+            );
+            assert!(
+                !s.targets.contains_key(&pid),
+                "premise: the preserving retire removed the target"
+            );
+            assert!(
+                !s.scope_continuity_broken.contains(&(pid, starttime)),
+                "premise: the preserving retire marks nothing (an orderly exit gaps nothing)"
+            );
+            assert!(
+                !s.pending_retire.contains_key(&pid),
+                "premise: the retire completed (not deferred)"
+            );
+            assert!(
+                s.startup
+                    .get(&pid)
+                    .is_some_and(|rows| !rows.is_empty() && rows.iter().all(|a| a.historical)),
+                "premise: adopted rows are kept historical"
+            );
+            assert!(
+                !s.final_refusals.contains_key(&pid),
+                "premise: no whole-pid refusal (the verdict below is per-scope, not custody)"
+            );
+            (
+                s,
+                pid,
+                starttime,
+                record.namespaces.clone(),
+                setup_mono,
+                start,
+            )
+        };
+        // Direct seal: the receipt plus the genuine idle (zero
+        // positives, zero-entry rows — the opposite of the
+        // positive legs' requires-positives control).
+        let (mut s, pid, starttime, _, _, _) = run_leg("direct");
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the clean terminal idle receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let positives = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.entries > 0)
+            .count();
+        assert_eq!(
+            positives, 0,
+            "the idle leg counts zero positives (genuine idle)"
+        );
+        assert!(
+            batch
+                .api_activity
+                .iter()
+                .filter(|a| a.pid == pid)
+                .all(|a| a.row.entries == 0),
+            "every idle row reads zero entries"
+        );
+        // Transplanted seal through the real `finish`: the
+        // published observed zero plus its interval, strictly
+        // valid (the gate requires read-receipted rows behind an
+        // observed zero — this convicts a vacuous seal).
+        let (s, pid, starttime, namespaces, setup_mono, provider_start) = run_leg("seal");
+        let sealed = crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+            s,
+            pid,
+            starttime,
+            namespaces,
+            &pool,
+            setup_mono,
+            Some(provider_start),
+            setup_mono.saturating_add(60_000_000_000),
+            &[],
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("finish seals");
+        // NEW-37 fix11: the FULL emitted document validates with
+        // its actual activity rows — the section-only check below
+        // cannot see serialized receipts, so a producer that
+        // dropped them would still pass it. The emitted JSON is
+        // the real `doc_json` rendering (the exact bytes a reader
+        // validates), through the full intake
+        // (raw-duplicate check + structural + semantic gates).
+        let emitted = crate::report::doc_json(&sealed.document);
+        let activity = emitted
+            .get("api_activity")
+            .and_then(|v| v.as_array())
+            .expect("the emitted document carries its activity rows");
+        assert!(
+            !activity.is_empty(),
+            "the idle seal emits activity rows (the zero rides observed reads, not vacuity)"
+        );
+        let receipted_rows = activity
+            .iter()
+            .filter(|row| {
+                row.get("gaps")
+                    .and_then(|g| g.get("read_receipt"))
+                    .and_then(|v| v.as_bool())
+                    .is_some_and(|receipt| receipt)
+            })
+            .count();
+        assert!(
+            receipted_rows > 0,
+            "the emitted idle rows carry serialized read receipts"
+        );
+        let text = serde_json::to_string(&emitted).expect("the emitted document serializes");
+        crate::schema::check_v2_document_text(&text)
+            .expect("the full emitted idle document validates");
+        eprintln!(
+            "new37doc: fulldoc_valid=true activity_rows={} receipted_rows={receipted_rows}",
+            activity.len()
+        );
+        let evidence = sealed
+            .document
+            .request_evidence
+            .expect("the sealed document carries its section");
+        let silence = evidence
+            .silence_window
+            .expect("the seal publishes its interval");
+        assert_eq!(
+            silence.start_ns, provider_start,
+            "the claimed interval starts at establishment"
+        );
+        assert!(
+            silence.end_ns > silence.start_ns,
+            "the claimed interval is nonempty"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Observed { ops: 0 },
+            "the clean terminal idle publishes the observed zero"
+        );
+        evidence
+            .validate_strict()
+            .expect("the idle sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!("newflagcidle: receipted=true observed_zero=true");
+    }
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn early_finish_bounds_silence_by_writer_cut_through_focused_finish() {
+        use super::wire::contract as c;
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new26-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let namespaces = records[0].namespaces.clone();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        let (cookie, api, generation) = {
+            let target = s.targets.get(&pid).expect("target present");
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            (a.cookie, a.api, a.generation)
+        };
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, starttime, now, now.saturating_add(60_000_000_000))
+                .expect("gate decides"),
+            "premise: establishment accepted"
+        );
+        // Survivor positive through production consume (pre-final).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one funded fetch fact lands");
+        // A real opened writer gate (production finish closes it
+        // before sampling its end instant); the pin keeps a clone
+        // to read the cut receipt afterwards.
+        let gate = crate::writer_gate::WriterGate::create(&pool).expect("gate creates");
+        gate.open().expect("gate opens");
+        let probe = gate.clone();
+        // Early finish: live target, deadline far off.
+        let start_ns = now.saturating_sub(1_000_000_000);
+        let deadline_ns = now.saturating_add(60_000_000_000);
+        let sealed = crate::focused_capture::FocusedSession::seal_transplanted_with_gate_for_test(
+            s,
+            pid,
+            starttime,
+            namespaces,
+            &pool,
+            start_ns,
+            Some(now),
+            deadline_ns,
+            &survivor.facts,
+            Instant::now() + Duration::from_secs(10),
+            gate,
+        )
+        .expect("finish seals");
+        let receipt = probe
+            .receipt()
+            .expect("premise: the finish cut the writers");
+        let evidence = sealed
+            .document
+            .request_evidence
+            .expect("the sealed document carries its section");
+        let silence = evidence
+            .silence_window
+            .expect("the established seal publishes its interval");
+        assert_eq!(silence.start_ns, now, "silence starts at establishment");
+        assert!(
+            silence.end_ns <= receipt.close_before_ns,
+            "silence ends at the writer cut, never past it: silence_end={} close_before={} close_after={}",
+            silence.end_ns,
+            receipt.close_before_ns,
+            receipt.close_after_ns,
+        );
+        assert!(
+            silence.end_ns < sealed.document.window.effective_end_ns,
+            "the cut strictly precedes the end sample: silence_end={} effective_end={}",
+            silence.end_ns,
+            sealed.document.window.effective_end_ns,
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the verified capture-window positive still projects"
+        );
+        evidence
+            .validate_strict()
+            .expect("the sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "new26: bounded=true survivor=1 silence_end={} close_before={} effective_end={}",
+            silence.end_ns, receipt.close_before_ns, sealed.document.window.effective_end_ns,
+        );
+    }
+    /// NEW-8-OPEN + NEW-17 fix5 pin AT SEAL (production prearm +
+    /// adoption): the child is spawned stopped, prearmed from
+    /// pre-exec startup discovery, released, and reconciled —
+    /// adopted attachments carry their startup originals while
+    /// fetch attachments stay mapped-only (fetch is mapped-only
+    /// by construction). After the child is killed, the seal lands
+    /// terminal (adopted originals authorize history) — but the
+    /// mapped-only fetch's per-cookie terminal refusal voids its
+    /// surface (one valid startup original must not authorize a
+    /// sibling's history), while an already-fed positive still
+    /// projects. The child is idle (zero ring pressure), so no
+    /// loss latch or site gap can mask the custody void — the pin
+    /// asserts the void's isolation explicitly. Pre-fix (or
+    /// sabotaged custody) the mapped fetch stays covered (RED).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn terminal_owner_with_mixed_custody_voids_mapped_fetch_keeps_positive() {
+        use super::wire::contract as c;
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::sync::atomic::AtomicBool;
+        use std::time::{Duration, Instant};
+        // Idle libcrypto-mapped child (no stdin, no calls — the
+        // seal below is loss-free, so the void isolates to
+        // custody).
+        let dir = std::env::temp_dir().join(format!("osslscope-new17-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let app = dir.join("libcrypto_idle");
+        assert!(
+            std::process::Command::new("cc")
+                .args(["-O1", "-o"])
+                .arg(&app)
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/libcrypto_idle.c"
+                ))
+                .args(["-lcrypto"])
+                .status()
+                .unwrap()
+                .success(),
+            "fixture builds"
+        );
+        let argv: Vec<String> = vec![app.to_string_lossy().into_owned()];
+        let mut child =
+            crate::target::OwnedTarget::spawn_stopped(&argv, crate::target::WorkloadDest::Null)
+                .expect("child spawns stopped");
+        let pid = child.pid();
+        let cancel = AtomicBool::new(false);
+        let mut budget = super::ObservationBudget::default();
+        let startup = crate::startup_objects::prepare_owned_startup(
+            &child,
+            &argv,
+            &mut budget,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            None,
+        )
+        .expect("startup discovery");
+        assert!(
+            !startup.apis.is_empty(),
+            "premise: pre-exec discovery finds startup sites"
+        );
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        s.prearm_startup(
+            startup.apis,
+            Instant::now() + Duration::from_secs(15),
+            &cancel,
+            super::PrearmLinks::Create,
+        )
+        .expect("prearm");
+        child.release().expect("child releases");
+        std::thread::sleep(Duration::from_millis(200));
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "adopting attach completes: {:?}",
+            setup.gaps
+        );
+        // Mixed pre-state: adopted attachments carry originals,
+        // fetch attachments stay mapped-only.
+        let target = s.targets.get(&pid).expect("target present");
+        assert!(
+            target.attachments.iter().any(|a| a.original.is_some()),
+            "premise: reconcile adopts prearmed sites"
+        );
+        let (cookie, api, generation) = {
+            let a = target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms");
+            assert!(
+                a.original.is_none(),
+                "premise: fetch stays mapped-only (no original)"
+            );
+            (a.cookie, a.api, a.generation)
+        };
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&api),
+            "control: the seal covers the mapped fetch surface pre-exit"
+        );
+        // Survivor positive: one funded fetch fact lands through
+        // production consume (pre-final, live binding).
+        let mono = LiveClock.monotonic_ns();
+        let event = super::wire::decode_transport(&new7_fetch_bytes(
+            pid, cookie, api, generation, 1, mono, starttime,
+        ))
+        .expect("fetch bytes decode");
+        let mut survivor = super::ObservationBatch::default();
+        s.consume(event, &mut survivor);
+        assert_eq!(survivor.facts.len(), 1, "one funded fetch fact lands");
+        // Kill + reap: the seal must land terminal (not refused) —
+        // adopted originals authorize history.
+        crate::target::kill_test_child(pid, Duration::from_secs(5));
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            s.final_terminal.contains(&pid),
+            "premise: the seal lands terminal (adopted originals authorize history): gaps={:?} refusals={:?}",
+            batch.gaps,
+            s.final_refusals,
+        );
+        assert!(
+            !s.final_refusals.contains_key(&pid),
+            "premise: no whole-pid refusal (the void below is per-cookie)"
+        );
+        // Isolation: no loss latch, no site gap for the surface —
+        // the void below is custody alone (a loud workload would
+        // latch at the final drain and mask it).
+        assert!(
+            !s.fetch_coverage_broken,
+            "premise: the idle seal latches nothing"
+        );
+        assert!(
+            !s.targets
+                .get(&pid)
+                .expect("target present")
+                .site_gap_apis
+                .contains(&api),
+            "premise: no site gap for the surface"
+        );
+        let target = s.targets.get(&pid).expect("target present");
+        assert!(
+            target
+                .attachments
+                .iter()
+                .filter(|a| a.original.is_some())
+                .all(super::terminal_custody),
+            "adopted attachments keep terminal custody"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            !sealed.contains(&api),
+            "the mapped-only fetch surface is voided at the terminal seal: {sealed:?}"
+        );
+        let evidence = crate::provider_observation::request_evidence::RequestEvidence::fold(
+            &survivor.facts,
+            crate::provider_observation::request_evidence::RequestScope {
+                operational_entries: None,
+                fetch_armed: sealed,
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        assert_eq!(
+            evidence.fetches.len(),
+            1,
+            "the surviving positive still projects"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "new17: terminal=true adopted_kept=true mapped_voided=true survivor=1 isolated=true"
+        );
+    }
+    /// NEW-P1-OPEN fix4 pin through the SEAL (production attach):
+    /// a first ready target must NOT establish the claim while its
+    /// recovery fence withholds records (fenced-claim refused, no
+    /// claim, seal empty); after recovery the same gate accepts
+    /// (unfenced-claim accepted, seal covers). The retire/re-add
+    /// between models recovery (fresh arms under a live fence —
+    /// BPF counts, userspace withholds). Pre-fix the fenced
+    /// establishment succeeds and the seal covers withheld time
+    /// (RED).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn fenced_claim_refused_unfenced_claimed_through_seal() {
+        use super::wire::contract as c;
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-newp1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        // max_processes=2: the recovery re-add below is a fresh
+        // acquire past the retired one (the pin's subject is claim
+        // establishment, not recovery budgeting).
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 2,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        let api = {
+            let target = s.targets.get(&pid).expect("target present");
+            target
+                .attachments
+                .iter()
+                .find(|a| c::fetch_api(a.api))
+                .expect("a fetch attachment arms")
+                .api
+        };
+        // Settle drains for the epoch (drains never establish —
+        // only the claim gate does).
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        assert!(
+            s.coverage_window_start_ns.is_none(),
+            "premise: no claim before establishment"
+        );
+        // Recovery shape: fence, retire, re-add (fresh arms under
+        // the live fence).
+        s.fence_target(pid, LiveClock.monotonic_ns());
+        assert!(s.fenced.contains_key(&pid), "premise: fence live");
+        s.retire(pid, &mut super::ObservationBatch::default());
+        assert!(
+            !s.targets.contains_key(&pid),
+            "premise: retire evicts the target"
+        );
+        assert!(
+            s.fenced.contains_key(&pid),
+            "premise: the fence outlives the retire"
+        );
+        let readd = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "re-add completes under the live fence: {:?}",
+            readd.gaps
+        );
+        // Fenced establishment: REFUSED.
+        let fenced_now = LiveClock.monotonic_ns();
+        let established = s
+            .establish_claim_start(
+                pid,
+                starttime,
+                fenced_now,
+                fenced_now.saturating_add(60_000_000_000),
+            )
+            .expect("gate decides");
+        assert!(!established, "fenced-claim refused");
+        assert!(
+            s.coverage_window_start_ns.is_none(),
+            "no claim while fenced"
+        );
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "seal covers nothing without a claim: {sealed:?}"
+        );
+        // Recovery: the fence clears, the same gate ACCEPTS, and
+        // the seal covers the unfenced claim.
+        s.unfence_after_drain.insert(pid);
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !s.fenced.contains_key(&pid),
+            "premise: recovery clears the fence"
+        );
+        let now = LiveClock.monotonic_ns();
+        let established = s
+            .establish_claim_start(pid, starttime, now, now.saturating_add(60_000_000_000))
+            .expect("gate decides");
+        assert!(established, "unfenced-claim accepted");
+        let sealed = s.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.contains(&api),
+            "seal covers after unfenced establishment: {sealed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "newp1: fenced_refused=true fenced_sealed_empty=true unfenced_accepted=true sealed_covers=true"
+        );
+    }
+    /// NEW-P1-OPEN fix5 pin through `FocusedSession::finish`
+    /// (production attach, transplanted seal), reworked fix6
+    /// (NEW-P1-OPEN + NEW-16-OPEN + NEW-20): the fenced case seals
+    /// empty coverage with NO silence interval (establishment
+    /// refused under the fence — the claim is never established,
+    /// so no setup-time interval stands in); the unfenced case
+    /// seals covering with its emitted silence interval; and the
+    /// expired case (establishment at the deadline refused —
+    /// NEW-16) seals through the SAME deadline with no interval
+    /// and an Unknown idle plane (no operational zero without an
+    /// established silence interval). Each case asserts the
+    /// EMITTED coverage AND silence interval of the sealed
+    /// document (the direct gate pin above covers the decision;
+    /// this pin covers the seal wiring).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn establishment_cases_seal_through_focused_finish() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        // One production session per case (finish consumes): attach,
+        // settle drains for the epoch, then shape the case.
+        let setup_case = |tag: &str| {
+            let dir =
+                std::env::temp_dir().join(format!("osslscope-newp1f-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir(&dir).unwrap();
+            let (_child, pid) = new7_idle_child(&dir);
+            let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            assert_eq!(records.len(), 1, "the child is inventoried");
+            let record = records.into_iter().next().unwrap();
+            let mut s = ProviderSession::open(
+                ObservationLimits {
+                    max_processes: 1,
+                    ..Default::default()
+                },
+                &object,
+            )
+            .unwrap();
+            s.set_deadline(Instant::now() + Duration::from_secs(30));
+            let setup_records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes;
+            let setup = s.reconcile_records(&setup_records);
+            assert!(
+                s.target_ready(pid, record.starttime),
+                "real attach completes: {:?}",
+                setup.gaps
+            );
+            let api = s
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .find(|a| super::wire::contract::fetch_api(a.api))
+                .expect("a fetch attachment arms")
+                .api;
+            for _ in 0..3 {
+                s.drain(Instant::now() + Duration::from_millis(200));
+            }
+            (dir, _child, pid, record, s, api)
+        };
+        let seal = |s: ProviderSession,
+                    pid: u32,
+                    record: &crate::inventory::ProcessRecord,
+                    start_ns: u64,
+                    provider_start_ns: Option<u64>,
+                    deadline_ns: u64| {
+            crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+                s,
+                pid,
+                record.starttime,
+                record.namespaces.clone(),
+                &pool,
+                start_ns,
+                provider_start_ns,
+                deadline_ns,
+                &[],
+                Instant::now() + Duration::from_secs(10),
+            )
+            .expect("finish seals")
+            .document
+            .request_evidence
+            .expect("the sealed document carries its section")
+        };
+        // Case F (fenced, never established): the gate refuses under
+        // the fence; the seal covers nothing and publishes NO
+        // silence interval (NEW-16-OPEN + NEW-20 fix6: no
+        // setup-time fallback for an unestablished claim); the
+        // idle plane is Unknown.
+        let (dir, _child, pid, record, mut s, _api) = setup_case("fenced");
+        s.fence_target(pid, LiveClock.monotonic_ns());
+        assert!(s.fenced.contains_key(&pid), "premise: fence live");
+        let fenced_now = LiveClock.monotonic_ns();
+        assert!(
+            !s.establish_claim_start(
+                pid,
+                record.starttime,
+                fenced_now,
+                fenced_now + 60_000_000_000
+            )
+            .expect("gate decides"),
+            "premise: fenced establishment refused"
+        );
+        let start_ns = LiveClock.monotonic_ns();
+        let deadline_ns = start_ns.saturating_add(60_000_000_000);
+        let sealed_empty = s.armed_fetch_ids(pid, record.starttime);
+        assert!(
+            sealed_empty.is_empty(),
+            "premise: no seal coverage while fenced: {sealed_empty:?}"
+        );
+        let evidence = seal(s, pid, &record, start_ns, None, deadline_ns);
+        assert_eq!(
+            evidence.silence_window, None,
+            "an unestablished seal publishes no silence interval"
+        );
+        assert!(
+            evidence.fetch_coverage.iter().all(|r| !r.observed),
+            "fenced establishment seals empty coverage"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "the fenced idle plane is Unknown"
+        );
+        evidence
+            .validate_strict()
+            .expect("the fenced sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Case U (unfenced, established): the seal covers with its
+        // emitted silence interval; the idle plane is an observed
+        // zero.
+        let (dir, _child, pid, record, mut s, api) = setup_case("unfenced");
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, record.starttime, now, now + 60_000_000_000)
+                .expect("gate decides"),
+            "premise: unfenced establishment accepted"
+        );
+        let start_ns = LiveClock.monotonic_ns().saturating_sub(1_000_000_000);
+        let deadline_ns = start_ns.saturating_add(60_000_000_000);
+        let sealed = s.armed_fetch_ids(pid, record.starttime);
+        assert!(
+            sealed.contains(&api),
+            "premise: the seal covers after establishment: {sealed:?}"
+        );
+        let evidence = seal(s, pid, &record, start_ns, Some(now), deadline_ns);
+        let silence = evidence
+            .silence_window
+            .expect("the seal publishes its interval");
+        assert_eq!(
+            silence.start_ns, now,
+            "the emitted interval starts at establishment"
+        );
+        assert!(
+            silence.end_ns > silence.start_ns,
+            "the emitted interval is nonempty"
+        );
+        let covered = evidence
+            .fetch_coverage
+            .iter()
+            .find(|r| r.surface_id == api)
+            .expect("coverage row");
+        assert!(
+            covered.observed,
+            "the established seal covers the fetch surface"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Observed { ops: 0 },
+            "the unfenced idle plane is an observed zero"
+        );
+        evidence
+            .validate_strict()
+            .expect("the established sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Case E (expired — NEW-16, reworked NEW-P1-OPEN + NEW-20
+        // fix6): establishment AT the deadline is refused (no
+        // interval remains); the seal runs through the SAME
+        // deadline with no established claim — it covers nothing,
+        // publishes NO silence interval, and the unestablished
+        // idle plane stays Unknown (no operational zero without
+        // an established silence interval — terminal reads alone
+        // never certify one).
+        let (dir, _child, pid, record, mut s, _api) = setup_case("expired");
+        let at = LiveClock.monotonic_ns();
+        assert!(
+            !s.establish_claim_start(pid, record.starttime, at, at)
+                .expect("gate decides"),
+            "premise: establishment at the deadline refused"
+        );
+        assert!(
+            s.coverage_window_start_ns.is_none(),
+            "premise: no window programmed on expiry"
+        );
+        let start_ns = at.saturating_sub(1_000_000_000);
+        let evidence = seal(s, pid, &record, start_ns, None, at);
+        assert!(
+            evidence.fetch_coverage.iter().all(|r| !r.observed),
+            "expired establishment seals empty coverage"
+        );
+        assert_eq!(
+            evidence.silence_window, None,
+            "the expired seal publishes no silence interval"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "the unestablished idle plane stays Unknown"
+        );
+        evidence
+            .validate_strict()
+            .expect("the expired sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "newp1f: fenced_empty=true fenced_silence=none unfenced_covers=true expired_empty=true expired_silence=none expired_idle=unknown"
+        );
+    }
+    /// NEW-15 fix5 pin through `FocusedSession::finish` (production
+    /// attach, transplanted seal): a mid-window fence voids the
+    /// operational zero when its sealed cut intersects the claimed
+    /// interval (fenced idle seals Unknown), the unfenced twin
+    /// seals the observed zero (the ONLY difference is the cut —
+    /// isolating the void to the fence), and the fenced positive
+    /// seals its observed remainder (verified positives are
+    /// retained across the cut). Each case asserts the EMITTED
+    /// document's remainder and silence interval.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn mid_window_fence_voids_operational_zero_through_finish() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::io::{BufRead as _, Write as _};
+        use std::time::{Duration, Instant};
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let seal = |s: ProviderSession,
+                    pid: u32,
+                    record: &crate::inventory::ProcessRecord,
+                    start_ns: u64,
+                    provider_start_ns: Option<u64>,
+                    deadline_ns: u64| {
+            crate::focused_capture::FocusedSession::seal_transplanted_for_test(
+                s,
+                pid,
+                record.starttime,
+                record.namespaces.clone(),
+                &pool,
+                start_ns,
+                provider_start_ns,
+                deadline_ns,
+                &[],
+                Instant::now() + Duration::from_secs(10),
+            )
+            .expect("finish seals")
+            .document
+            .request_evidence
+            .expect("the sealed document carries its section")
+        };
+        // Fenced idle (A): establish, fence mid-window, retire,
+        // re-add, recover (the cut closes but still intersects the
+        // claim) — the sealed idle plane is Unknown.
+        let dir = std::env::temp_dir().join(format!("osslscope-new15a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let record = records[0].clone();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 2,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(
+            &crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes,
+        );
+        assert!(
+            s.target_ready(pid, record.starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let setup_mono = LiveClock.monotonic_ns();
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, record.starttime, now, now + 60_000_000_000)
+                .expect("gate decides"),
+            "premise: establishment accepted"
+        );
+        s.fence_target(pid, LiveClock.monotonic_ns());
+        s.retire(pid, &mut super::ObservationBatch::default());
+        let readd = s.reconcile_records(
+            &crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes,
+        );
+        assert!(
+            s.target_ready(pid, record.starttime),
+            "re-add completes: {:?}",
+            readd.gaps
+        );
+        s.unfence_after_drain.insert(pid);
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !s.fenced.contains_key(&pid),
+            "premise: recovery clears the fence"
+        );
+        let cuts = s.sealed_fence_cuts(pid);
+        assert_eq!(cuts.len(), 1, "premise: one sealed cut: {cuts:?}");
+        assert!(
+            cuts[0].0 > now,
+            "premise: the cut opens mid-window: {cuts:?}"
+        );
+        let deadline_ns = setup_mono.saturating_add(60_000_000_000);
+        let evidence = seal(s, pid, &record, setup_mono, Some(now), deadline_ns);
+        let silence = evidence
+            .silence_window
+            .expect("the seal publishes its interval");
+        assert_eq!(silence.start_ns, now, "the claim starts at establishment");
+        assert!(
+            silence.end_ns > silence.start_ns,
+            "the claimed interval is nonempty"
+        );
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Unknown,
+            "the fenced idle plane is Unknown"
+        );
+        evidence
+            .validate_strict()
+            .expect("the fenced sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Unfenced idle (B): the twin without the fence seals the
+        // observed zero — isolating the void above to the cut.
+        let dir = std::env::temp_dir().join(format!("osslscope-new15b-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let record = records[0].clone();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(
+            &crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes,
+        );
+        assert!(
+            s.target_ready(pid, record.starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let setup_mono = LiveClock.monotonic_ns();
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, record.starttime, now, now + 60_000_000_000)
+                .expect("gate decides"),
+            "premise: establishment accepted"
+        );
+        let deadline_ns = setup_mono.saturating_add(60_000_000_000);
+        let evidence = seal(s, pid, &record, setup_mono, Some(now), deadline_ns);
+        assert_eq!(
+            evidence.unattributed,
+            crate::provider_observation::request_evidence::Unattributed::Observed { ops: 0 },
+            "the unfenced idle plane is an observed zero"
+        );
+        evidence
+            .validate_strict()
+            .expect("the unfenced sealed section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        // Fenced positive (C): the same fence+recovery shape with a
+        // genuine post-recovery workload — the positive remainder
+        // is retained across the cut.
+        let dir = std::env::temp_dir().join(format!("osslscope-new15c-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (mut owned, pid) = newop_digest_child(&dir);
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let record = records[0].clone();
+        let mut s = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 2,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = s.reconcile_records(
+            &crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes,
+        );
+        assert!(
+            s.target_ready(pid, record.starttime),
+            "real attach completes: {:?}",
+            setup.gaps
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let setup_mono = LiveClock.monotonic_ns();
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            s.establish_claim_start(pid, record.starttime, now, now + 60_000_000_000)
+                .expect("gate decides"),
+            "premise: establishment accepted"
+        );
+        s.fence_target(pid, LiveClock.monotonic_ns());
+        s.retire(pid, &mut super::ObservationBatch::default());
+        let readd = s.reconcile_records(
+            &crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+                pids: vec![pid],
+                ..Default::default()
+            })
+            .processes,
+        );
+        assert!(
+            s.target_ready(pid, record.starttime),
+            "re-add completes: {:?}",
+            readd.gaps
+        );
+        s.unfence_after_drain.insert(pid);
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !s.fenced.contains_key(&pid),
+            "premise: recovery clears the fence"
+        );
+        owned.stdin.write_all(b"D").unwrap();
+        owned.stdin.flush().unwrap();
+        let mut line = String::new();
+        owned.stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line, "done digest=3,3\n",
+            "premise: the workload ran: {line:?}"
+        );
+        let deadline_ns = setup_mono.saturating_add(60_000_000_000);
+        let evidence = seal(s, pid, &record, setup_mono, Some(now), deadline_ns);
+        let ops = match evidence.unattributed {
+            crate::provider_observation::request_evidence::Unattributed::Observed { ops } => ops,
+            crate::provider_observation::request_evidence::Unattributed::Unknown => {
+                panic!("the fenced positive remainder must stay observed")
+            }
+        };
+        assert!(ops > 0, "verified positives survive the cut");
+        assert!(
+            evidence.silence_window.is_some(),
+            "the seal publishes its interval"
+        );
+        evidence
+            .validate_strict()
+            .expect("the fenced positive section validates");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "new15: fenced_idle_unknown=true unfenced_idle_zero=true fenced_positive_observed={ops}"
+        );
+    }
+    /// NEW-10 fix4 feed pin (production attach): a LinkLimit-shaped
+    /// budget fails all but the first site softly — every failed
+    /// id records a site gap and the seal withholds the surfaces;
+    /// the full-budget twin records no gaps and covers (control).
+    /// (Same-id partial logic rides the host rule pin; this pin
+    /// proves the production attach feeds the gap set.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn partial_attach_voids_surface_through_production_attach() {
+        use super::{ObservationLimits, ProviderSession};
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("osslscope-new10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let (_child, pid) = new7_idle_child(&dir);
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        // Shaped session: exactly one site fits (the first) — every
+        // other resolved site fails softly with LinkLimit.
+        let mut shaped = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                max_links: 2,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        shaped.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = shaped.reconcile_records(&records);
+        assert!(
+            shaped.target_ready(pid, starttime),
+            "the shaped attach completes: {:?}",
+            setup.gaps
+        );
+        let gaps = shaped
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .site_gap_apis
+            .clone();
+        assert!(
+            gaps.contains(&10) && gaps.contains(&73),
+            "soft failures record fetch site gaps: {gaps:?}"
+        );
+        for _ in 0..3 {
+            shaped.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        shaped
+            .set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = shaped.drain(Instant::now() + Duration::from_secs(5));
+        let sealed = shaped.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "the seal withholds gapped surfaces: {sealed:?}"
+        );
+        // Control twin: full budget — no gaps, full coverage.
+        let mut twin = ProviderSession::open(
+            ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        twin.set_deadline(Instant::now() + Duration::from_secs(30));
+        let setup = twin.reconcile_records(&records);
+        assert!(
+            twin.target_ready(pid, starttime),
+            "the twin attach completes: {:?}",
+            setup.gaps
+        );
+        let twin_gaps = twin
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .site_gap_apis
+            .clone();
+        // The ONLY gap on a full attach is the deliberate API 21
+        // quarantine (a refused site is still a blind site —
+        // fail-closed uniform rule; 21 is operational, so fetch
+        // coverage is unaffected).
+        assert_eq!(
+            twin_gaps,
+            std::collections::BTreeSet::from([21]),
+            "full attach records only the quarantine gap: {twin_gaps:?}"
+        );
+        for _ in 0..3 {
+            twin.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        twin.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = twin.drain(Instant::now() + Duration::from_secs(5));
+        let sealed = twin.armed_fetch_ids(pid, starttime);
+        assert_eq!(sealed.len(), 14, "the twin seal covers all 14: {sealed:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "new10: gapped_fetch=true sealed_empty=true control_gaps_quarantine_only=true control_covers=14"
+        );
+    }
+    /// NEW-P6-OPEN fix4 control: the setup-skip SHAPE (early return,
+    /// no asserts, no receipt — the exact
+    /// `minimal_for_coordinator_tests` skip the privileged pins
+    /// share) must NEVER satisfy a receipt leg. With caps the setup
+    /// succeeds and the test still prints no receipt; without caps
+    /// it SKIP-returns. Either way the leg runner must LEG_FAIL
+    /// this shape (a bare `1 passed` is not evidence).
+    #[test]
+    #[ignore = "NEW-P6-OPEN control: must LEG_FAIL its receipt leg in every lane"]
+    fn control_setup_skip_shape_carries_no_receipt() {
+        let Some(_session) = ProviderSession::minimal_for_coordinator_tests() else {
+            eprintln!("SKIP setup-skip control: BPF map creation failed (no caps)");
+            return;
+        };
+        // Deliberately NO receipt: even the fully-set-up shape must
+        // not satisfy a receipt leg without post-assertion evidence.
     }
     #[test]
     fn live_algorithm_identity_separates_thread_local_invocations() {
@@ -17464,7 +27006,7 @@ int main(int argc,char **argv) { if(argc!=2) return 2;
                             let observable = records[0].modules.iter().any(|m| {
                                 m.info.exports.iter().any(|api| {
                                     api.operational_id().is_some()
-                                        || (1..=16).any(|id| {
+                                        || wire::attach_ids().any(|id| {
                                             wire::api(id) == Ok(ObservationApi::Inventoried(*api))
                                         })
                                 })
@@ -17839,16 +27381,36 @@ impl ProviderSession {
             trace_mode,
             task_start_off: 0,
             trace: trace::TraceProducer::new(),
+            trace_feed_cut: None,
             api_owners: BTreeMap::new(),
+            api_admitted: BTreeSet::new(),
+            coverage_epoch_ns: None,
+            coverage_window_start_ns: None,
+            fetch_coverage_broken: false,
+            scope_continuity_broken: SortedVecSet::with_cap(
+                ObservationBudget::default().limits.max_processes,
+            ),
+            scope_continuity_broken_all: false,
+            retired_operational_gaps: SortedVecSet::with_cap(
+                ObservationBudget::default().limits.max_processes,
+            ),
+            retired_custody_refusals: SortedVecSet::with_cap(
+                ObservationBudget::default().limits.max_processes,
+            ),
+            claim_admitted: None,
             startup: BTreeMap::new(),
             targets: BTreeMap::new(),
             refreshing: BTreeMap::new(),
+            #[cfg(test)]
+            process_override: std::cell::RefCell::new(BTreeMap::new()),
             pending_retire: BTreeMap::new(),
             pending_startup: BTreeSet::new(),
             exec_sealed: BTreeSet::new(),
             fenced: BTreeMap::new(),
             fence_withheld: 0,
             unfence_after_drain: BTreeSet::new(),
+            sealed_fences: BTreeMap::new(),
+            sealed_cut_merges: 0,
             retire_carry: ObservationBatch::default(),
             roles: Roles(BTreeMap::new()),
             aliases: assembly::Sequences::default(),
@@ -18133,7 +27695,7 @@ mod fix4_retire {
         _mapping: Fix4Mapping,
     }
 
-    struct Fix4Mapping(*mut libc::c_void, usize);
+    struct Fix4Mapping(*mut libc::c_void, usize, std::path::PathBuf);
     // SAFETY: solely owned by the holding test; unmapped on drop.
     unsafe impl Send for Fix4Mapping {}
     impl Drop for Fix4Mapping {
@@ -18141,7 +27703,28 @@ mod fix4_retire {
             unsafe {
                 libc::munmap(self.0, self.1);
             }
+            let _ = std::fs::remove_file(&self.2);
         }
+    }
+
+    /// Stage the fixture ELF on tmpfs (P2fix2: the vng guest root
+    /// is overlayfs, which fails the product's `direct` backing
+    /// gate in `mapped_process` — the lane-approved tmpfs stage
+    /// keeps the same bytes with direct-path backing, in guest AND
+    /// host lanes; /dev/shm is tmpfs on any Linux). Unique per call
+    /// (parallel suites stay isolated); removed with the mapping.
+    fn fix4_stage_elf() -> Option<std::path::PathBuf> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let staged = std::path::PathBuf::from(format!(
+            "/dev/shm/ossl-fix4-elf-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::copy("/usr/bin/gnutrue", &staged).ok()?;
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)).ok()?;
+        Some(staged)
     }
 
     /// Assemble a live session over fresh real maps with one
@@ -18178,9 +27761,12 @@ mod fix4_retire {
         // binary itself — see `reconcile_fixture`): map a small
         // real ELF PROT_EXEC into self FIRST so the child
         // inherits an executable mapping the fixture process can
-        // bind (same pattern, system file instead of a forwarder
-        // object — never unlinked, so no fixture mutex needed).
-        let elf = File::open("/usr/bin/gnutrue").ok()?;
+        // bind (same pattern, tmpfs-staged bytes instead of the
+        // system file — the guest root is overlayfs, which fails
+        // the `direct` gate; the stage is unlinked with the
+        // mapping, so no fixture mutex needed).
+        let staged = fix4_stage_elf()?;
+        let elf = File::open(&staged).ok()?;
         let elf_len = elf.metadata().ok()?.len() as usize;
         let address = unsafe {
             libc::mmap(
@@ -18195,7 +27781,7 @@ mod fix4_retire {
         if address == libc::MAP_FAILED {
             return None;
         }
-        let mapping = Fix4Mapping(address, elf_len);
+        let mapping = Fix4Mapping(address, elf_len, staged.clone());
         let child = crate::target::OwnedTarget::spawn_stopped(
             &["/bin/true".into()],
             crate::target::WorkloadDest::Null,
@@ -18207,14 +27793,14 @@ mod fix4_retire {
         })
         .processes;
         let record = processes.pop()?;
-        let exe = File::open("/usr/bin/gnutrue").ok()?;
+        let exe = File::open(&staged).ok()?;
         let process = objects::fixture_support::mapped_process(&record, exe, &budget);
-        let site_file = File::open("/usr/bin/gnutrue").ok()?;
+        let site_file = File::open(&staged).ok()?;
 
         // Two forged sites (edge + alias APIs) against the real custody.
         let edge_site =
             objects::fixture_support::forge_site(&process, site_file, 0x1000, GENERATION);
-        let alias_file = File::open("/usr/bin/gnutrue").ok()?;
+        let alias_file = File::open(&staged).ok()?;
         let alias_site =
             objects::fixture_support::forge_site(&process, alias_file, 0x2000, GENERATION);
         let edge_object = object_id(&edge_site);
@@ -18227,6 +27813,7 @@ mod fix4_retire {
                 site: edge_site,
                 cookie: EDGE_COOKIE,
                 api: EDGE_API,
+                armed_ns: None,
                 advertisers: Vec::new(),
                 generation: GENERATION,
                 object: edge_object,
@@ -18238,6 +27825,7 @@ mod fix4_retire {
                 site: alias_site,
                 cookie: ALIAS_COOKIE,
                 api: ALIAS_API,
+                armed_ns: None,
                 advertisers: Vec::new(),
                 generation: GENERATION,
                 object: alias_object,
@@ -18261,6 +27849,7 @@ mod fix4_retire {
             attachments,
             ranges: 0,
             ready: true,
+            site_gap_apis: BTreeSet::new(),
         };
         let mut trace = trace::TraceProducer::new();
         trace.set_mode(trace::TRACE_MODE_ALL);
@@ -18290,16 +27879,36 @@ mod fix4_retire {
             // F3 never arms (no CONFIG rows): honest unprogrammed.
             task_start_off: 0,
             trace,
+            trace_feed_cut: None,
             api_owners: BTreeMap::new(),
+            api_admitted: BTreeSet::new(),
+            coverage_epoch_ns: None,
+            coverage_window_start_ns: None,
+            fetch_coverage_broken: false,
+            scope_continuity_broken: SortedVecSet::with_cap(
+                ObservationBudget::default().limits.max_processes,
+            ),
+            scope_continuity_broken_all: false,
+            retired_operational_gaps: SortedVecSet::with_cap(
+                ObservationBudget::default().limits.max_processes,
+            ),
+            retired_custody_refusals: SortedVecSet::with_cap(
+                ObservationBudget::default().limits.max_processes,
+            ),
+            claim_admitted: None,
             startup: BTreeMap::new(),
             targets: BTreeMap::from([(pid, target)]),
             refreshing: BTreeMap::new(),
+            #[cfg(test)]
+            process_override: std::cell::RefCell::new(BTreeMap::new()),
             pending_retire: BTreeMap::new(),
             pending_startup: BTreeSet::new(),
             exec_sealed: BTreeSet::new(),
             fenced: BTreeMap::new(),
             fence_withheld: 0,
             unfence_after_drain: BTreeSet::new(),
+            sealed_fences: BTreeMap::new(),
+            sealed_cut_merges: 0,
             retire_carry: ObservationBatch::default(),
             roles,
             aliases: assembly::Sequences::default(),
@@ -18857,6 +28466,826 @@ mod fix4_retire {
             "repeated finalize must not double-count"
         );
     }
+
+    /// P2fix4 NEW-20/PAIRING pin AT SEAL: the terminal drain's
+    /// completion enters trace settlement through the production
+    /// `finalize_until → drain` path. Successful close + FAILED
+    /// (expired-deadline) terminal drain: `DrainOverrun` rides
+    /// the batch, the boundary latch engages, and prior taint
+    /// carries through finalize+close AND the next window (never
+    /// clears) — pinned separately from the fully-successful
+    /// boundary (generous deadline: seal carries once, then the
+    /// proved boundary clears).
+    #[test]
+    #[ignore = "new20 terminal-drain settlement: requires BPF map privileges (guest lane)"]
+    fn new20_terminal_drain_settlement_at_seal() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        for clean in [false, true] {
+            let Some(fix) = fix4_session() else {
+                eprintln!("SKIP new20 seal: BPF map creation failed (no caps)");
+                return;
+            };
+            let mut s = fix.session;
+            // A closable gate (the fixture's fake gate never
+            // opens — mint a real gate so the terminal cut
+            // succeeds and the seal reaches the drain).
+            let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+            let gate = match crate::writer_gate::WriterGate::create(&pool) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("SKIP new20 seal: real gate creation failed: {e}");
+                    return;
+                }
+            };
+            if gate.open().is_err() {
+                eprintln!("SKIP new20 seal: real gate open failed (no caps)");
+                return;
+            }
+            s.gate = gate;
+            // Prior taint (decode-reject), sealed uncertain.
+            s.trace.reject_unknown();
+            let w0 = s.close_trace_window(0);
+            assert!(
+                w0.pairing_uncertain,
+                "clean={clean}: premise: decode-reject taints"
+            );
+            let deadline = if clean {
+                Instant::now() + Duration::from_secs(10)
+            } else {
+                Instant::now()
+            };
+            // [p2fix5 NEW-23: the terminal drain's positive
+            // completion is observed, not assumed — the clean leg
+            // runs exactly one quiescence confirmation (empty ring,
+            // no writers) with zero recoveries; the expired leg
+            // never reaches quiescence (loop-top expiry).]
+            // [p2fix6 NEW-32: the streak replaces the single second
+            // `None` — the clean leg runs three quiet samples.]
+            // [p2fix7 NEW-41: affirmative position equality
+            // replaces the streak — the clean leg is the
+            // GENUINELY-DRAINED positive (real empty ring + real
+            // positions, ZERO scripting): two rounds, two equal
+            // samples, no recovery.]
+            assert!(
+                super::RING_POSITION_SCRIPT.with(|st| st.borrow().is_empty()),
+                "clean={clean}: premise: positions unscripted (real ring)"
+            );
+            let conf0 = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get());
+            let rec0 = super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get());
+            let batch = s.finalize_until(deadline);
+            let conf = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get()) - conf0;
+            let rec = super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get()) - rec0;
+            if clean {
+                assert!(
+                    !batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+                    "clean={clean}: premise: no overrun: {:?}",
+                    batch.gaps
+                );
+                assert_eq!(
+                    (conf, rec),
+                    (2, 0),
+                    "clean={clean}: two equality rounds, no recovery"
+                );
+            } else {
+                assert!(
+                    batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+                    "clean={clean}: premise: overrun gaps: {:?}",
+                    batch.gaps
+                );
+                assert_eq!(
+                    (conf, rec),
+                    (0, 0),
+                    "clean={clean}: expired drain never confirms exhaustion"
+                );
+            }
+            s.trace.finalize(LiveClock.monotonic_ns());
+            let w1 = s.close_trace_window(1);
+            assert!(
+                w1.pairing_uncertain,
+                "clean={clean}: the seal carries prior taint"
+            );
+            let w2 = s.close_trace_window(2);
+            if clean {
+                assert!(
+                    !w2.pairing_uncertain,
+                    "fully-successful boundary clears: {:?}",
+                    w2.pairing_uncertainty
+                );
+            } else {
+                assert!(
+                    w2.pairing_uncertain,
+                    "successful close with failed drain never clears: {:?}",
+                    w2.pairing_uncertainty
+                );
+            }
+        }
+    }
+
+    /// P2fix5 NEW-23 busy-head terminal control AT SEAL: a busy
+    /// ring head (first `None`) behind which a full pair resolves —
+    /// the terminal drain recovers BOTH records through the exact
+    /// production fold path (4 rounds: 2 recoveries + 2
+    /// affirmative equality samples [p2fix7 NEW-41 — positions
+    /// unscripted, read from the real ring]), THEN proves
+    /// exhaustion (the trailing re-polls fall through to the real
+    /// empty ring). Settlement clears on the positively proved
+    /// boundary (against the unproved-withholds control, which
+    /// carries without the receipt): the seal carries prior
+    /// taint once with the recovered pair folded, then clears.
+    #[test]
+    #[ignore = "new23 busy-head terminal drain: requires BPF map privileges (guest lane)"]
+    fn new23_busy_head_terminal_drain_recovers_then_proves() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                super::QUIESCE_SCRIPT.with(|s| s.borrow_mut().clear());
+                super::RING_POSITION_SCRIPT.with(|s| s.borrow_mut().clear());
+            }
+        }
+        let _disarm = Disarm;
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP new23 busy-head: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // A closable gate (like the NEW-20 pin — the fixture's
+        // fake gate never opens, so mint a real one for the
+        // terminal cut to succeed and reach the drain).
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = match crate::writer_gate::WriterGate::create(&pool) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP new23 busy-head: real gate creation failed: {e}");
+                return;
+            }
+        };
+        if gate.open().is_err() {
+            eprintln!("SKIP new23 busy-head: real gate open failed (no caps)");
+            return;
+        }
+        s.gate = gate;
+        // Prior taint (decode-reject), sealed uncertain.
+        s.trace.reject_unknown();
+        let w0 = s.close_trace_window(0);
+        assert!(w0.pairing_uncertain, "premise: decode-reject taints");
+        // Script the busy head resolving into a full pair (stack —
+        // push in reverse arrival order). The trailing re-poll
+        // falls through to the real (empty) ring and proves
+        // exhaustion.
+        let attempt = edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED);
+        let result = edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED);
+        super::QUIESCE_SCRIPT.with(|st| {
+            let mut st = st.borrow_mut();
+            st.push(Some(result));
+            st.push(Some(attempt));
+        });
+        let conf0 = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get());
+        let rec0 = super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get());
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            !batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+            "premise: no overrun: {:?}",
+            batch.gaps
+        );
+        // [p2fix7 NEW-41: affirmative equality replaces the
+        // streak — two recovery rounds + two equality samples
+        // (positions unscripted — the real ring proves it).]
+        assert!(
+            super::RING_POSITION_SCRIPT.with(|st| st.borrow().is_empty()),
+            "premise: positions unscripted (real ring)"
+        );
+        assert_eq!(
+            super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get()) - conf0,
+            4,
+            "two recoveries + two equality samples"
+        );
+        assert_eq!(
+            super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get()) - rec0,
+            2,
+            "both records recovered behind the busy head"
+        );
+        assert!(
+            super::QUIESCE_SCRIPT.with(|st| st.borrow().is_empty()),
+            "premise: the one-shot script is consumed"
+        );
+        s.trace.finalize(LiveClock.monotonic_ns());
+        let w1 = s.close_trace_window(1);
+        assert!(
+            w1.pairing_uncertain,
+            "the seal carries prior taint: {:?}",
+            w1.pairing_uncertainty
+        );
+        assert_eq!(
+            w1.paired, 1,
+            "the recovered pair folded through the exact path"
+        );
+        let w2 = s.close_trace_window(2);
+        assert!(
+            !w2.pairing_uncertain,
+            "recovered + proved boundary clears: {:?}",
+            w2.pairing_uncertainty
+        );
+    }
+
+    // P2fix6 NEW-32 persistent-busy pin RETIRED [p2fix7 NEW-41]:
+    // it fed a queue of readable records, which never exercises
+    // a head that keeps returning `None` (codex P2 R7 NEW-20) —
+    // replaced by `new41_persistent_unreadable_head_withholds`
+    // (stuck positions + real-ring `None`s across the whole
+    // interval) and `new41_unreadable_positions_withhold`.
+
+    /// P2fix7 NEW-41 interleaved-record equality control AT SEAL
+    /// (renamed from the P2fix6 NEW-32 streak pin — the streak
+    /// no longer exists): a record consumed BETWEEN equality
+    /// samples resets the count — consecutive equal samples only
+    /// (5 rounds: quiet, recover, recover, quiet × 2 — the
+    /// trailing two prove exhaustion only after the reset;
+    /// positions unscripted, read from the real ring).
+    /// Settlement clears on the positively proved boundary: the
+    /// seal carries prior taint once with the recovered pair
+    /// folded, then clears.
+    #[test]
+    #[ignore = "new41 equality reset: requires BPF map privileges (guest lane)"]
+    fn new41_equality_resets_on_interleaved_record() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                super::QUIESCE_SCRIPT.with(|s| s.borrow_mut().clear());
+                super::RING_POSITION_SCRIPT.with(|s| s.borrow_mut().clear());
+            }
+        }
+        let _disarm = Disarm;
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP new41 equality-reset: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = match crate::writer_gate::WriterGate::create(&pool) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP new41 equality-reset: real gate creation failed: {e}");
+                return;
+            }
+        };
+        if gate.open().is_err() {
+            eprintln!("SKIP new41 equality-reset: real gate open failed (no caps)");
+            return;
+        }
+        s.gate = gate;
+        // Prior taint (decode-reject), sealed uncertain.
+        s.trace.reject_unknown();
+        let w0 = s.close_trace_window(0);
+        assert!(w0.pairing_uncertain, "premise: decode-reject taints");
+        // Script quiet, pair, quiet × 2 (stack — push in reverse
+        // arrival order). The trailing re-polls fall through to
+        // the real (empty) ring only if the script under-runs —
+        // it must not: every entry is consumed. Positions stay
+        // UNSCRIPTED (the real ring proves equality).
+        assert!(
+            super::RING_POSITION_SCRIPT.with(|st| st.borrow().is_empty()),
+            "premise: positions unscripted (real ring)"
+        );
+        let attempt = edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED);
+        let result = edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED);
+        super::QUIESCE_SCRIPT.with(|st| {
+            let mut st = st.borrow_mut();
+            st.push(None);
+            st.push(None);
+            st.push(Some(result));
+            st.push(Some(attempt));
+            st.push(None);
+        });
+        let conf0 = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get());
+        let rec0 = super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get());
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            !batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+            "premise: no overrun: {:?}",
+            batch.gaps
+        );
+        assert_eq!(
+            super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get()) - conf0,
+            5,
+            "quiet + two recoveries + two equality samples"
+        );
+        assert_eq!(
+            super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get()) - rec0,
+            2,
+            "both records recovered behind the busy head"
+        );
+        assert!(
+            super::QUIESCE_SCRIPT.with(|st| st.borrow().is_empty()),
+            "the whole script is consumed (the reset forced the full trailing pair)"
+        );
+        s.trace.finalize(LiveClock.monotonic_ns());
+        let w1 = s.close_trace_window(1);
+        assert!(
+            w1.pairing_uncertain,
+            "the seal carries prior taint: {:?}",
+            w1.pairing_uncertainty
+        );
+        assert_eq!(
+            w1.paired, 1,
+            "the recovered pair folded through the exact path"
+        );
+        let w2 = s.close_trace_window(2);
+        assert!(
+            !w2.pairing_uncertain,
+            "recovered + proved boundary clears: {:?}",
+            w2.pairing_uncertainty
+        );
+    }
+
+    /// P2fix7 NEW-41 persistent-UNREADABLE head AT SEAL (REPLACES
+    /// the P2fix6 NEW-32 persistent-busy pin — readable-record
+    /// queues never test a head that keeps returning `None`):
+    /// the ring keeps returning `None` (the real empty ring —
+    /// the busy-head observable; NO ring entries scripted) while
+    /// positions stay `(0, 120)` (one record's bytes outstanding
+    /// — ONE sticky script entry) across the whole interval.
+    /// Equality is never observed, so no receipt mints; the
+    /// bounded wait expires; the seal withholds EVEN with clean
+    /// history (no taint is introduced here) and never clears.
+    /// Pre-fix: three spaced `None`s mint the receipt and the
+    /// seal clears (RED).
+    #[test]
+    #[ignore = "new41 unreadable head: requires BPF map privileges (guest lane)"]
+    fn new41_persistent_unreadable_head_withholds() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                super::QUIESCE_SCRIPT.with(|s| s.borrow_mut().clear());
+                super::RING_POSITION_SCRIPT.with(|s| s.borrow_mut().clear());
+            }
+        }
+        let _disarm = Disarm;
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP new41 unreadable-head: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = match crate::writer_gate::WriterGate::create(&pool) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP new41 unreadable-head: real gate creation failed: {e}");
+                return;
+            }
+        };
+        if gate.open().is_err() {
+            eprintln!("SKIP new41 unreadable-head: real gate open failed (no caps)");
+            return;
+        }
+        s.gate = gate;
+        // Clean-history premise (no taint anywhere — the seal
+        // below must withhold on the unproved boundary alone).
+        let w0 = s.close_trace_window(0);
+        assert!(
+            !w0.pairing_uncertain,
+            "premise: clean history: {:?}",
+            w0.pairing_uncertainty
+        );
+        // Script the stuck head: positions stay (0, 120) for the
+        // whole interval (sticky tail); the ring script stays
+        // EMPTY so every read returns the real ring's `None`
+        // (the unreadable-head observable — no readable records
+        // anywhere in this pin).
+        assert!(
+            super::QUIESCE_SCRIPT.with(|st| st.borrow().is_empty()),
+            "premise: the ring is unscripted"
+        );
+        super::RING_POSITION_SCRIPT.with(|st| st.borrow_mut().push(Some((0, 120))));
+        let conf0 = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get());
+        let rec0 = super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get());
+        let batch = s.finalize_until(Instant::now() + Duration::from_millis(50));
+        let conf = super::TERMINAL_QUIESCE_CONFIRMATIONS.with(|c| c.get()) - conf0;
+        let rec = super::TERMINAL_QUIESCE_RECOVERIES.with(|c| c.get()) - rec0;
+        assert!(
+            batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+            "the bounded wait expires (DrainOverrun): {:?}",
+            batch.gaps
+        );
+        assert_eq!(rec, 0, "nothing EVER readable (the head stayed unreadable)");
+        assert!(conf > 0, "rounds ran against the stuck head: conf={conf}");
+        assert_eq!(
+            super::RING_POSITION_SCRIPT.with(|st| st.borrow().len()),
+            1,
+            "the sticky tail is intact (positions never met)"
+        );
+        // The unproved boundary withholds on clean history (no
+        // receipt was stored — equality never observed).
+        s.trace.finalize(LiveClock.monotonic_ns());
+        let w1 = s.close_trace_window(1);
+        assert!(
+            w1.pairing_uncertain,
+            "the unreadable-head seal withholds: {:?}",
+            w1.pairing_uncertainty
+        );
+        assert!(
+            w1.pairing_uncertainty
+                .contains(&"terminal-boundary-failed".to_string()),
+            "the failure names itself: {:?}",
+            w1.pairing_uncertainty
+        );
+        let w2 = s.close_trace_window(2);
+        assert!(
+            w2.pairing_uncertain,
+            "the unproved boundary never clears: {:?}",
+            w2.pairing_uncertainty
+        );
+    }
+
+    /// P2fix7 NEW-41 unreadable positions AT SEAL: the ring keeps
+    /// returning `None` (real empty ring — unscripted) while
+    /// EVERY position sample is unreadable (ONE sticky `None` —
+    /// the mmap-failure logic). No receipt mints; the bounded
+    /// wait expires (records would still fold — availability —
+    /// but the proof never completes); the seal withholds on
+    /// clean history and never clears. Pre-fix: three spaced
+    /// `None`s mint the receipt (RED).
+    #[test]
+    #[ignore = "new41 unreadable positions: requires BPF map privileges (guest lane)"]
+    fn new41_unreadable_positions_withhold() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                super::QUIESCE_SCRIPT.with(|s| s.borrow_mut().clear());
+                super::RING_POSITION_SCRIPT.with(|s| s.borrow_mut().clear());
+            }
+        }
+        let _disarm = Disarm;
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP new41 unreadable-positions: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+        let gate = match crate::writer_gate::WriterGate::create(&pool) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("SKIP new41 unreadable-positions: real gate creation failed: {e}");
+                return;
+            }
+        };
+        if gate.open().is_err() {
+            eprintln!("SKIP new41 unreadable-positions: real gate open failed (no caps)");
+            return;
+        }
+        s.gate = gate;
+        let w0 = s.close_trace_window(0);
+        assert!(
+            !w0.pairing_uncertain,
+            "premise: clean history: {:?}",
+            w0.pairing_uncertainty
+        );
+        assert!(
+            super::QUIESCE_SCRIPT.with(|st| st.borrow().is_empty()),
+            "premise: the ring is unscripted"
+        );
+        super::RING_POSITION_SCRIPT.with(|st| st.borrow_mut().push(None));
+        let batch = s.finalize_until(Instant::now() + Duration::from_millis(50));
+        assert!(
+            batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+            "the bounded wait expires (DrainOverrun): {:?}",
+            batch.gaps
+        );
+        s.trace.finalize(LiveClock.monotonic_ns());
+        let w1 = s.close_trace_window(1);
+        assert!(
+            w1.pairing_uncertain,
+            "the unreadable-positions seal withholds: {:?}",
+            w1.pairing_uncertainty
+        );
+        assert!(
+            w1.pairing_uncertainty
+                .contains(&"terminal-boundary-failed".to_string()),
+            "the failure names itself: {:?}",
+            w1.pairing_uncertainty
+        );
+        let w2 = s.close_trace_window(2);
+        assert!(
+            w2.pairing_uncertain,
+            "the unproved boundary never clears: {:?}",
+            w2.pairing_uncertainty
+        );
+    }
+
+    /// P2fix7 NEW-47 terminal loss-read proof AT SEAL: successful
+    /// terminal loss-lane reads are IN the proof — no positive
+    /// receipt mints before loss polling. The negative session
+    /// sabotages the loss plane (short 4-lane map — lanes 4..8
+    /// unreadable) on a clean history with a DRAINED ring (real
+    /// empty ring + real positions — NO scripts, so positions
+    /// alone would prove exhaustion): the terminal loss reads
+    /// fail, no receipt mints, the boundary failure latches, the
+    /// seal withholds (`terminal-boundary-failed`) and never
+    /// clears — so C023 takes no validity credit for the quiet
+    /// lanes (pairing-tainted VOID at the evaluator). The
+    /// positive twin (intact map, same shape) mints the receipt
+    /// and clears. Pre-fix: the receipt mints before loss
+    /// polling and trace settlement stays eligible (RED).
+    #[test]
+    #[ignore = "new47 terminal loss proof: requires BPF map privileges (guest lane)"]
+    fn new47_terminal_loss_read_enters_proof() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        for sabotaged in [true, false] {
+            let Some(fix) = fix4_session() else {
+                eprintln!("SKIP new47 loss-proof: BPF map creation failed (no caps)");
+                return;
+            };
+            let mut s = fix.session;
+            let pool = crate::observation_memory::MemoryPool::new(96 << 20);
+            let gate = match crate::writer_gate::WriterGate::create(&pool) {
+                Ok(g) => g,
+                Err(e) => {
+                    eprintln!("SKIP new47 loss-proof: real gate creation failed: {e}");
+                    return;
+                }
+            };
+            if gate.open().is_err() {
+                eprintln!("SKIP new47 loss-proof: real gate open failed (no caps)");
+                return;
+            }
+            s.gate = gate;
+            let w0 = s.close_trace_window(0);
+            assert!(
+                !w0.pairing_uncertain,
+                "sabotaged={sabotaged}: premise: clean history: {:?}",
+                w0.pairing_uncertainty
+            );
+            assert!(
+                super::RING_POSITION_SCRIPT.with(|st| st.borrow().is_empty()),
+                "sabotaged={sabotaged}: premise: positions unscripted (real ring)"
+            );
+            if sabotaged {
+                // Sabotage the loss plane (NEW-7(b) shape):
+                // lanes 4..8 become unreadable (out-of-range
+                // keys on the short map).
+                let short = match aya::maps::PerCpuArray::create(4, 0) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("SKIP new47 loss-proof: short map creation failed: {e}");
+                        return;
+                    }
+                };
+                s.loss = short;
+            }
+            let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+            if sabotaged {
+                assert!(
+                    batch.gaps.contains(&super::ObservationGap::BpfUnavailable),
+                    "premise: the terminal loss reads fail: {:?}",
+                    batch.gaps
+                );
+                assert!(
+                    s.fetch_coverage_broken,
+                    "premise: the failed terminal loss read latches coverage-broken"
+                );
+            } else {
+                assert!(
+                    !batch.gaps.contains(&super::ObservationGap::BpfUnavailable),
+                    "premise: intact loss reads succeed: {:?}",
+                    batch.gaps
+                );
+            }
+            s.trace.finalize(LiveClock.monotonic_ns());
+            let w1 = s.close_trace_window(1);
+            if sabotaged {
+                assert!(
+                    w1.pairing_uncertain,
+                    "the failed-loss-read seal withholds: {:?}",
+                    w1.pairing_uncertainty
+                );
+                assert!(
+                    w1.pairing_uncertainty
+                        .contains(&"terminal-boundary-failed".to_string()),
+                    "the failure names itself: {:?}",
+                    w1.pairing_uncertainty
+                );
+                let w2 = s.close_trace_window(2);
+                assert!(
+                    w2.pairing_uncertain,
+                    "the unproved boundary never clears: {:?}",
+                    w2.pairing_uncertainty
+                );
+            } else {
+                assert!(
+                    !w1.pairing_uncertain,
+                    "the proved boundary (positions + loss) publishes: {:?}",
+                    w1.pairing_uncertainty
+                );
+            }
+        }
+    }
+
+    /// P2fix2 item 5 (codex PAIRING-OPEN): generic wire rejection
+    /// routes through trace taint — the shared drain funnel marks
+    /// pairing uncertainty (`decode-reject`), so every renderer
+    /// withholds the affected interpretations until a proved fresh
+    /// boundary. A generic (non-unknown-ID) rejection taints WITHOUT
+    /// touching the unknown-ID count (no misattribution).
+    #[test]
+    #[ignore = "p2fix2 T1: requires BPF map privileges (guest lane)"]
+    fn p2fix2_wire_rejection_taints_trace_pairing() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP p2fix2 T1: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // One clean pair first (the window is otherwise healthy).
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED),
+        );
+        // Generic wire rejection through the shared funnel.
+        let mut b = ObservationBatch::default();
+        s.note_wire_rejection(ObservationGap::InvalidWire, &mut b);
+        assert!(
+            b.gaps.contains(&ObservationGap::InvalidWire),
+            "the rejection still gaps InvalidWire: {:?}",
+            b.gaps
+        );
+        let window = s.close_trace_window(0);
+        assert_eq!(window.paired, 1, "the clean pair still seals");
+        assert!(
+            window.pairing_uncertain,
+            "generic wire rejection must taint pairing"
+        );
+        assert!(
+            window
+                .pairing_uncertainty
+                .contains(&"decode-reject".to_string()),
+            "taint reason is decode-reject: {:?}",
+            window.pairing_uncertainty
+        );
+        assert_eq!(
+            window.rejected_unknown_api, 0,
+            "a generic rejection is not an unknown-ID record"
+        );
+    }
+
+    /// P2fix2 item 13 (codex NEW-P2e): the late-cut race pins
+    /// through the live fence — pairs consumed BEFORE a fence edge
+    /// arms cannot be excluded from the irreversible fold, so
+    /// arming below already-consumed timestamps taints the window
+    /// (`late-cut`) and the affected interpretations withhold;
+    /// arming above stays clean (no spurious taint), and post-arm
+    /// records past the edge never feed (existing exclusion).
+    #[test]
+    #[ignore = "p2fix2 T2: requires BPF map privileges (guest lane)"]
+    fn p2fix2_late_fence_edge_taints_consumed_pairs() {
+        // Overrun arm: feed at 100/200, fence at 50 (below) → the
+        // already-consumed pair is past the cut → taint.
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP p2fix2 T2: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED),
+        );
+        s.fence_target(pid, 50);
+        let window = s.close_trace_window(0);
+        assert_eq!(window.paired, 1, "the consumed pair still seals");
+        assert!(
+            window.pairing_uncertain,
+            "a fence edge below consumed pairs must taint"
+        );
+        assert!(
+            window.pairing_uncertainty.contains(&"late-cut".to_string()),
+            "taint reason is late-cut: {:?}",
+            window.pairing_uncertainty
+        );
+        // Clean arm: a fence edge above consumed timestamps taints
+        // nothing (the fold holds only in-interval evidence).
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP p2fix2 T2 clean arm: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED),
+        );
+        s.fence_target(pid, 10_000);
+        let window = s.close_trace_window(0);
+        assert_eq!(window.paired, 1);
+        assert!(
+            !window.pairing_uncertain,
+            "a fence edge above consumed pairs stays clean: {:?}",
+            window.pairing_uncertainty
+        );
+    }
+
+    /// P2fix2 item 3 (codex TRACE): the seal binds the trace fold to
+    /// the effective cut — records at/above the armed feed-cut skip
+    /// the trace feed (their pairs never fold), while pairs consumed
+    /// before a late arm taint `late-cut` (the fold cannot exclude
+    /// them). Only in-interval evidence folds.
+    #[test]
+    #[ignore = "p2fix2 T2b: requires BPF map privileges (guest lane)"]
+    fn p2fix2_trace_feed_cut_binds_fold_to_interval() {
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP p2fix2 T2b: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        // In-interval pair (ts 100/200), then arm the cut at 150 —
+        // late (the pair is already folded) → taint.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED),
+        );
+        s.set_trace_feed_cut(150);
+        // Post-cut pair (ts 300/400): excluded from the fold.
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 2, 300, 0, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 2, 400, 1, OLD_START, SEED),
+        );
+        let window = s.close_trace_window(0);
+        assert_eq!(
+            window.paired, 1,
+            "only the in-interval pair folds (post-cut excluded)"
+        );
+        assert!(
+            window.pairing_uncertain,
+            "the late arm overran folded pairs — must taint"
+        );
+        assert!(
+            window.pairing_uncertainty.contains(&"late-cut".to_string()),
+            "{:?}",
+            window.pairing_uncertainty
+        );
+        // Clean arm: cut above everything, then in-interval feeds —
+        // all fold, nothing taints.
+        let Some(fix) = fix4_session() else {
+            eprintln!("SKIP p2fix2 T2b clean arm: BPF map creation failed (no caps)");
+            return;
+        };
+        let mut s = fix.session;
+        let pid = fix.record.pid;
+        let tid = pid;
+        s.set_trace_feed_cut(10_000);
+        feed(
+            &mut s,
+            &edge_bytes(c::ATTEMPT, pid, tid, 1, 100, 0, OLD_START, SEED),
+        );
+        feed(
+            &mut s,
+            &edge_bytes(c::RESULT, pid, tid, 1, 200, 1, OLD_START, SEED),
+        );
+        let window = s.close_trace_window(0);
+        assert_eq!(window.paired, 1);
+        assert!(
+            !window.pairing_uncertain,
+            "in-interval folds under a clean cut stay certain: {:?}",
+            window.pairing_uncertainty
+        );
+    }
 }
 
 /// Fix6: seed-in-record seeding behavioral test (R6-1).
@@ -19063,8 +29492,8 @@ mod startup_api_controls {
     use super::*;
     // A held child inherits all concurrent parent fixture maps. Keep their
     // lifetimes separate so another test cannot unlink an inherited code file.
-    static MAPPED_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    struct FixtureMapping(*mut libc::c_void, usize);
+    pub(super) static MAPPED_FIXTURES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) struct FixtureMapping(*mut libc::c_void, usize);
     impl Drop for FixtureMapping {
         fn drop(&mut self) {
             unsafe {
@@ -19126,6 +29555,7 @@ mod startup_api_controls {
             links: Vec::new(),
             cookie: 81,
             api: c::PUBLIC_QUERY,
+            armed_ns: None,
             generation: 19,
             advertisers: Vec::new(),
             original: None,
@@ -19160,6 +29590,7 @@ mod startup_api_controls {
                     attachments: vec![attachment],
                     ranges: 1,
                     ready: true,
+                    site_gap_apis: BTreeSet::new(),
                 },
             );
         } else {
@@ -19190,7 +29621,7 @@ mod startup_api_controls {
         let mut batch = ObservationBatch::default();
         let mut spy_called = false;
         let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
-        let outcome = retire_source_owners(
+        let (outcome, _) = retire_source_owners(
             (&mut fixture.startup, &mut fixture.targets),
             &mut aliases,
             pid,
@@ -19225,7 +29656,7 @@ mod startup_api_controls {
         let mut aliases = super::super::assembly::Sequences::default();
         let mut batch = ObservationBatch::default();
         let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
-        let outcome = retire_source_owners(
+        let (outcome, _) = retire_source_owners(
             (&mut fixture.startup, &mut fixture.targets),
             &mut aliases,
             pid,
@@ -19354,7 +29785,7 @@ mod startup_api_controls {
         let mut aliases = super::super::assembly::Sequences::default();
         let mut batch = ObservationBatch::default();
         let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
-        let outcome = retire_source_owners(
+        let (outcome, _) = retire_source_owners(
             (&mut fixture.startup, &mut fixture.targets),
             &mut aliases,
             pid,
@@ -19501,7 +29932,7 @@ mod startup_api_controls {
                 let mut aliases = super::super::assembly::Sequences::default();
                 let mut batch = ObservationBatch::default();
                 let mut spy_called = false;
-                let outcome = retire_source_owners(
+                let (outcome, _) = retire_source_owners(
                     (&mut fixture.startup, &mut fixture.targets),
                     &mut aliases,
                     pid,
@@ -19515,7 +29946,13 @@ mod startup_api_controls {
                     },
                     |links| exhausted.can_absorb_links(links),
                 );
-                assert_eq!(outcome, super::RetireOutcome::Deferred(1));
+                assert_eq!(
+                    outcome,
+                    super::RetireOutcome::Deferred {
+                        links: 1,
+                        preserve: false,
+                    }
+                );
                 assert!(!spy_called, "deferred retire must not offload");
                 assert!(
                     fixture.startup.contains_key(&pid) || fixture.targets.contains_key(&pid),
@@ -19548,7 +29985,7 @@ mod startup_api_controls {
                 // The retry (room available) completes the retire.
                 let mut batch = ObservationBatch::default();
                 let mut captured: Vec<std::os::fd::OwnedFd> = Vec::new();
-                let outcome = retire_source_owners(
+                let (outcome, _) = retire_source_owners(
                     (&mut fixture.startup, &mut fixture.targets),
                     &mut aliases,
                     pid,
@@ -19579,7 +30016,7 @@ mod startup_api_controls {
         let mut aliases = super::super::assembly::Sequences::default();
         let mut batch = ObservationBatch::default();
         let mut spy_called = false;
-        let outcome = retire_source_owners(
+        let (outcome, _) = retire_source_owners(
             (&mut fixture.startup, &mut fixture.targets),
             &mut aliases,
             pid,
@@ -20873,6 +31310,7 @@ mod startup_api_controls {
                 site,
                 cookie: 82,
                 api: c::PUBLIC_UNQUERY,
+                armed_ns: None,
                 links: vec![link.into()],
                 generation: 19,
                 advertisers: Vec::new(),
@@ -20950,6 +31388,2714 @@ mod startup_api_controls {
                 std::io::ErrorKind::WouldBlock
             );
         }
+    }
+    #[test]
+    fn terminal_custody_predicate_matches_per_cookie_binding() {
+        // NEW-8-OPEN + NEW-17 fix5 pin (host, real sites): one
+        // attachment's terminal custody is its OWN validated
+        // original — the same predicate `final_record_binding`
+        // enforces per cookie on the terminal path (a sibling's
+        // original cannot help). A startup attachment carries
+        // custody (its site IS the original); a mapped-only
+        // attachment carries none (no original — the binding
+        // refuses its records). The seal rule unions the
+        // custody-less fetch APIs into its gap set (behavior
+        // pinned through production attach in the guest NEW-17
+        // leg). Custody ignores the API id (the seal filters to
+        // fetch), so the fixture's query/unquery pair stands in.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixture = reconcile_fixture(true);
+        let pid = fixture.child.pid();
+        let target = fixture.targets.get_mut(&pid).unwrap();
+        let site = target
+            .process
+            .resolve_api(wire::api(c::PUBLIC_UNQUERY).unwrap())
+            .remove(0)
+            .site;
+        assert!(!site.is_startup());
+        let (link, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        target.attachments.push(Attachment {
+            object: object_id(&site),
+            site,
+            cookie: 82,
+            api: c::PUBLIC_UNQUERY,
+            armed_ns: None,
+            links: vec![link.into()],
+            generation: 19,
+            advertisers: Vec::new(),
+            original: None,
+            historical: false,
+        });
+        // Seal-time state is post-exit: reap the child so custody
+        // is evaluated through terminal queued-record
+        // revalidation.
+        fixture.child.finish_observation().unwrap();
+        let target = fixture.targets.get(&pid).unwrap();
+        let startup = target
+            .attachments
+            .iter()
+            .find(|a| a.cookie == 81)
+            .expect("startup attachment");
+        let mapped = target
+            .attachments
+            .iter()
+            .find(|a| a.cookie == 82)
+            .expect("mapped attachment");
+        assert!(
+            terminal_custody(startup),
+            "a startup attachment carries terminal custody"
+        );
+        assert!(
+            !terminal_custody(mapped),
+            "a mapped-only attachment carries no terminal custody"
+        );
+    }
+    /// NEW-10-OPEN + NEW-19 fix5 fixture: a live child mapping TWO
+    /// tiny fetch-exporting objects (forwarder pair — same exports,
+    /// distinct files), bound as two exporter mappings of ONE
+    /// process. With `stale`, the second mapping carries the FIRST
+    /// file's inventory (stale-inventory TOCTOU staging — discovery
+    /// refuses its parse nondeferred while process revalidation
+    /// passes, so the known exporter is skipped before either
+    /// attach feed); without, both mappings carry consistent
+    /// inventory (healthy twin — both exporters resolve, nothing
+    /// unresolved). Holds the child, the mmaps, and the fixture
+    /// dirs for the test.
+    pub(super) struct TwoExporterFixture {
+        pub(super) _child: crate::target::OwnedTarget,
+        pub(super) process: super::objects::VerifiedProcess,
+        pub(super) budget: super::ObservationBudget,
+        pub(super) first_expected: crate::inventory::ModuleInfo,
+        pub(super) second_expected: crate::inventory::ModuleInfo,
+        pub(super) _mappings: Vec<FixtureMapping>,
+        pub(super) _forwarders: Vec<startup_fixture::ForwarderFixture>,
+    }
+    /// Callers must hold `MAPPED_FIXTURES` (the guard lives in pin
+    /// scope — never in the fixture, or twin builds self-deadlock).
+    pub(super) fn two_exporter_fixture(stale: bool) -> TwoExporterFixture {
+        two_exporter_fixture_with(stale, ForwarderKind::Plain, ForwarderKind::Plain)
+    }
+    /// FLAG-2 fix8: the two-exporter shape whose forwarders ALSO
+    /// export the operational pair (quarantined id 21 + id 22) —
+    /// two sites for one operational API, like the fetch pair.
+    /// Never stale (deterministic healthy binding only).
+    pub(super) fn two_operational_exporter_fixture() -> TwoExporterFixture {
+        two_exporter_fixture_with(
+            false,
+            ForwarderKind::Operational,
+            ForwarderKind::Operational,
+        )
+    }
+    /// NEW-35 fix9: the mixed two-exporter shape — the FIRST
+    /// forwarder is fetch-only (no operational symbols), the SECOND
+    /// carries the operational triple. A refusal striking the first
+    /// mapping during an operational resolve is an unrelated
+    /// exporter (its known exports exclude the resolve's API);
+    /// the second still arms the sibling. Never stale.
+    fn two_mixed_exporter_fixture() -> TwoExporterFixture {
+        two_exporter_fixture_with(false, ForwarderKind::Plain, ForwarderKind::Operational)
+    }
+    /// NEW-32 fix8: the two-exporter shape whose forwarders ALSO
+    /// export `EVP_CIPHER_fetch` (id 11) — a second fetch surface
+    /// for unrelated-edge pins. Never stale.
+    fn two_cipher_exporter_fixture() -> TwoExporterFixture {
+        two_exporter_fixture_with(
+            false,
+            ForwarderKind::CipherFetch,
+            ForwarderKind::CipherFetch,
+        )
+    }
+    /// Forwarder flavor per side (mixed pairs allowed).
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum ForwarderKind {
+        Plain,
+        Operational,
+        CipherFetch,
+    }
+    fn forwarder_of_kind(
+        kind: ForwarderKind,
+        query: &str,
+        unquery: &str,
+    ) -> startup_fixture::ForwarderFixture {
+        match kind {
+            ForwarderKind::Plain => startup_fixture::ForwarderFixture::new(query, unquery),
+            ForwarderKind::Operational => {
+                startup_fixture::ForwarderFixture::new_with_operational(query, unquery)
+            }
+            ForwarderKind::CipherFetch => {
+                startup_fixture::ForwarderFixture::new_with_cipher_fetch(query, unquery)
+            }
+        }
+    }
+    /// Assert an inventoried export set matches its forwarder flavor
+    /// (every side inventories the fetch export; only the matching
+    /// flavor adds its extras — a plain side is fetch-only).
+    fn assert_forwarder_exports(
+        kind: ForwarderKind,
+        info: &crate::inventory::ModuleInfo,
+        which: &str,
+    ) {
+        assert!(
+            info.exports.contains(&crate::inventory::Api::EvpMdFetch),
+            "premise: the {which} forwarder inventories the fetch export: {:?}",
+            info.exports
+        );
+        let triple = [
+            crate::inventory::Api::EvpDigestInitEx2,
+            crate::inventory::Api::EvpDigestUpdate,
+            crate::inventory::Api::EvpDigestFinalEx,
+        ];
+        if kind == ForwarderKind::Operational {
+            assert!(
+                triple.iter().all(|api| info.exports.contains(api)),
+                "premise: the {which} operational forwarder inventories the operational triple: {:?}",
+                info.exports
+            );
+        } else {
+            assert!(
+                triple.iter().all(|api| !info.exports.contains(api)),
+                "premise: the {which} non-operational forwarder exports no operational symbols: {:?}",
+                info.exports
+            );
+        }
+        if kind == ForwarderKind::CipherFetch {
+            assert!(
+                info.exports
+                    .contains(&crate::inventory::Api::EvpCipherFetch),
+                "premise: the {which} cipher forwarder inventories the second fetch export: {:?}",
+                info.exports
+            );
+        }
+    }
+    fn two_exporter_fixture_with(
+        stale: bool,
+        first_kind: ForwarderKind,
+        second_kind: ForwarderKind,
+    ) -> TwoExporterFixture {
+        let budget = super::ObservationBudget::default();
+        // Same bytes, distinct files (distinct inodes): the stale
+        // inventory (F1's device/inode/size bound to F2's mapping)
+        // mismatches deterministically at parse.
+        let query = ".byte 0xe9\n.long query_impl-.-4";
+        let unquery = ".byte 0xeb\n.byte unquery_impl-.-1";
+        let (f1, f2) = (
+            forwarder_of_kind(first_kind, query, unquery),
+            forwarder_of_kind(second_kind, query, unquery),
+        );
+        // One handle per fixture (file() rewrites — extra handles
+        // clone, so stamps stay valid).
+        let file1 = f1.file();
+        let file2 = f2.file();
+        assert_ne!(
+            file1.metadata().unwrap().ino(),
+            file2.metadata().unwrap().ino(),
+            "premise: distinct exporter files"
+        );
+        let map_whole = |file: &std::fs::File| {
+            use std::os::unix::io::AsRawFd;
+            let len = file.metadata().unwrap().len() as usize;
+            let address = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_ne!(address, libc::MAP_FAILED);
+            FixtureMapping(address, len)
+        };
+        let m1 = map_whole(&file1);
+        let m2 = map_whole(&file2);
+        let child = crate::target::OwnedTarget::spawn_stopped(
+            &["/bin/true".into()],
+            crate::target::WorkloadDest::Null,
+        )
+        .unwrap();
+        let record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![child.pid()],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        // Second inventory: stale (F1's device/inode/size bound to
+        // F2's mapping) or consistent (F2's own). Probes clone —
+        // file() itself is never called twice, so stamps stay
+        // valid.
+        let mut probe1 = file1.try_clone().unwrap();
+        let mut probe2 = file2.try_clone().unwrap();
+        let mut process = super::objects::fixture_support::mapped_process(&record, file1, &budget);
+        let first =
+            crate::inventory::elf::inspect_file(&mut probe1, u64::MAX).expect("first inventory");
+        assert_forwarder_exports(first_kind, &first, "first");
+        let second = if stale {
+            first.clone()
+        } else {
+            crate::inventory::elf::inspect_file(&mut probe2, u64::MAX).expect("own inventory")
+        };
+        if !stale {
+            // A stale second side carries the FIRST side's
+            // inventory (that mismatch is the staleness), so only
+            // a healthy second side matches its own flavor.
+            assert_forwarder_exports(second_kind, &second, "second");
+        }
+        super::objects::fixture_support::bind_stale_mapping(&mut process, file2, second.clone());
+        TwoExporterFixture {
+            _child: child,
+            process,
+            budget,
+            first_expected: first,
+            second_expected: second,
+            _mappings: vec![m1, m2],
+            _forwarders: vec![f1, f2],
+        }
+    }
+    #[test]
+    fn discovery_refusal_withholds_same_api_surface() {
+        // NEW-10-OPEN fix5 pin (host, production discovery + seal
+        // rule): one fetch exporter resolves (its site earns its
+        // attach) while the SAME api's second exporter is refused
+        // in API discovery (stale inventory — nondeferred, cached)
+        // — the refusal carries into the surface verdict and the
+        // seal withholds the surface despite the armed sibling.
+        // The armed pair stands in for the attach the resolved site
+        // earns (attach itself is production-pinned by N1 and the
+        // N10 guest feed pin — this pin's subject is the
+        // discovery→verdict feed, which runs no hand-supplied gap).
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = two_exporter_fixture(true);
+        let fetch10 = wire::api(10).expect("fetch id");
+        let sites = fixture.process.resolve_api(fetch10);
+        assert_eq!(
+            sites.len(),
+            1,
+            "one exporter resolves, one is refused before either feed"
+        );
+        let unresolved = fixture.process.unresolved_inventoried();
+        assert!(
+            unresolved.contains(&crate::inventory::Api::EvpMdFetch),
+            "the refused exporter is tracked: {unresolved:?}"
+        );
+        assert_eq!(
+            unresolved,
+            fixture
+                .second_expected
+                .exports
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "every inventoried export of the refused object is tracked"
+        );
+        let gaps = super::unresolved_wire_ids(&unresolved);
+        assert!(
+            gaps.contains(&10),
+            "the refused surface maps to its wire id: {gaps:?}"
+        );
+        // Seal verdict: the armed pair + the discovery gap withholds
+        // the surface; the control (no gap) covers it.
+        let start = Some(950u64);
+        let epoch = Some(1_000u64);
+        assert!(
+            super::ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                start,
+                epoch,
+                false,
+                &gaps
+            )
+            .is_empty(),
+            "one armed exporter + one refused exporter covers nothing"
+        );
+        assert_eq!(
+            super::ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                start,
+                epoch,
+                false,
+                &std::collections::BTreeSet::new()
+            ),
+            std::collections::BTreeSet::from([10]),
+            "control: the armed exporter alone covers"
+        );
+        // Healthy twin: both exporters resolve, nothing unresolved.
+        let twin = two_exporter_fixture(false);
+        assert_eq!(
+            twin.process.resolve_api(fetch10).len(),
+            2,
+            "both exporters resolve when healthy"
+        );
+        assert!(
+            twin.process.unresolved_inventoried().is_empty(),
+            "healthy discovery tracks nothing"
+        );
+    }
+    #[test]
+    fn static_discovery_refusal_tracks_unresolved_exporters() {
+        // NEW-19 fix5 pin (host, production static discovery): a
+        // nondeferred parse refusal skips the second inventoried
+        // exporter during static discovery — its exports are tracked
+        // as unresolved (the good exporter still yields its
+        // candidates — no over-skip), and the seal withholds the
+        // surface despite the armed sibling.
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = two_exporter_fixture(true);
+        assert!(
+            fixture.process.unresolved_inventoried().is_empty(),
+            "premise: nothing unresolved before discovery"
+        );
+        // Static FIRST (no prior resolve — the recording below is
+        // attributed to static discovery alone). The forwarder
+        // carries no dispatch tables, so static yields no
+        // candidates either way — the skipped mapping is the
+        // signal, not the candidate list.
+        let candidates = fixture
+            .process
+            .static_candidates(&fixture.budget)
+            .expect("static discovery runs");
+        assert!(
+            candidates.is_empty(),
+            "premise: the table-less forwarder yields no static candidates"
+        );
+        let unresolved = fixture.process.unresolved_inventoried();
+        assert!(
+            unresolved.contains(&crate::inventory::Api::EvpMdFetch),
+            "the skipped exporter is tracked: {unresolved:?}"
+        );
+        assert_eq!(
+            unresolved,
+            fixture
+                .second_expected
+                .exports
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "exactly the refused object's inventoried exports are tracked (no over-skip)"
+        );
+        // The good exporter still resolves afterwards (static
+        // skipped only the refused mapping).
+        let fetch10 = wire::api(10).expect("fetch id");
+        assert_eq!(
+            fixture.process.resolve_api(fetch10).len(),
+            1,
+            "the good exporter still resolves after static discovery"
+        );
+        let gaps = super::unresolved_wire_ids(&unresolved);
+        let start = Some(950u64);
+        let epoch = Some(1_000u64);
+        assert!(
+            super::ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                start,
+                epoch,
+                false,
+                &gaps
+            )
+            .is_empty(),
+            "the armed sibling must not certify past the skipped exporter"
+        );
+        // Healthy twin: static discovery tracks nothing.
+        let twin = two_exporter_fixture(false);
+        twin.process
+            .static_candidates(&twin.budget)
+            .expect("twin static discovery runs");
+        assert!(
+            twin.process.unresolved_inventoried().is_empty(),
+            "healthy static discovery tracks nothing"
+        );
+    }
+    /// NEW-10-OPEN fix6 pin (host, production discovery + seal
+    /// rule): one fetch exporter resolves (its site earns its
+    /// attach) while the SAME api's second exporter is refused
+    /// UNCACHED in API discovery (one-shot BackingUnavailable —
+    /// the try_clone shape: nothing cached, no deferred state) —
+    /// the refusal carries into the surface verdict and the seal
+    /// withholds the surface despite the armed sibling. The
+    /// refusal is provably uncached (the same-pass retry heals),
+    /// and the same-pass verdict stands after the heal (a skipped
+    /// api is final for its pass).
+    #[test]
+    fn uncached_discovery_refusal_withholds_same_api_surface() {
+        use crate::provider_observation::objects::FAIL_NEXT_PARSE;
+        // Disarm on every exit (a set-but-unfired hook would leak
+        // into a later test on the shared thread).
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_NEXT_PARSE.with(|flag| flag.set(false));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let fixture = two_exporter_fixture(false);
+        let fetch10 = wire::api(10).expect("fetch id");
+        fixture.process.begin_api_discovery_pass();
+        FAIL_NEXT_PARSE.with(|flag| flag.set(true));
+        let sites = fixture.process.resolve_api(fetch10);
+        assert!(
+            !FAIL_NEXT_PARSE.with(|flag| flag.get()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert_eq!(
+            sites.len(),
+            1,
+            "one exporter resolves, one is refused uncached before either feed"
+        );
+        let unresolved = fixture.process.unresolved_inventoried();
+        assert!(
+            unresolved.contains(&crate::inventory::Api::EvpMdFetch),
+            "the uncached-refused exporter is tracked: {unresolved:?}"
+        );
+        assert_eq!(
+            unresolved,
+            fixture
+                .first_expected
+                .exports
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "every inventoried export of the refused object is tracked"
+        );
+        let gaps = super::unresolved_wire_ids(&unresolved);
+        assert!(
+            gaps.contains(&10),
+            "the refused surface maps to its wire id: {gaps:?}"
+        );
+        // Seal verdict: the armed pair + the discovery gap withholds
+        // the surface; the control (no gap) covers it.
+        let start = Some(950u64);
+        let epoch = Some(1_000u64);
+        assert!(
+            super::ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                start,
+                epoch,
+                false,
+                &gaps
+            )
+            .is_empty(),
+            "one armed exporter + one uncached-refused exporter covers nothing"
+        );
+        assert_eq!(
+            super::ProviderSession::fetch_coverage_effective(
+                &[(10, Some(900))],
+                start,
+                epoch,
+                false,
+                &std::collections::BTreeSet::new()
+            ),
+            std::collections::BTreeSet::from([10]),
+            "control: the armed exporter alone covers"
+        );
+        // Uncached proof: the hook is spent, so the same-pass retry
+        // heals (both exporters resolve — nothing was cached) —
+        // yet the pass verdict stands (the skipped api is final
+        // for its pass).
+        assert_eq!(
+            fixture.process.resolve_api(fetch10).len(),
+            2,
+            "the retry heals — the refusal cached nothing"
+        );
+        assert!(
+            fixture
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the same-pass verdict stands after the heal"
+        );
+    }
+    /// NEW-35 fix9 pin (host, production discovery + pass verdict):
+    /// a parse refusal during an OPERATIONAL resolve records the
+    /// resolve's API as operationally unresolved ONLY when the
+    /// refused mapping is ELIGIBLE for it (its known exports
+    /// include the API). An unrelated exporter (fetch-only for an
+    /// operational resolve) records nothing operational — a
+    /// fetch-only exporter must not veto an otherwise fully
+    /// observed operational zero — while the same-API refusal
+    /// still vetoes. The refused mapping's KNOWN exports still
+    /// record inventoried (the fetch seal still voids its
+    /// surfaces). Whole-API tracking for process revalidation
+    /// failure is untouched (the `record_unresolved_api` path).
+    #[test]
+    fn operational_refusal_records_only_eligible_mappings() {
+        use crate::provider_observation::objects::FAIL_PARSE_API;
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_PARSE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let op22 = wire::api(22).expect("operational id");
+        // Unrelated leg: the mixed fixture's FIRST mapping is
+        // fetch-only — refusing it during the op-22 resolve records
+        // its known exports inventoried but nothing operational.
+        let fixture = two_mixed_exporter_fixture();
+        assert!(
+            !fixture
+                .first_expected
+                .exports
+                .iter()
+                .any(|api| { api.operational_id().is_some_and(|id| u32::from(id) == 22) }),
+            "premise: the first mapping's known exports exclude id 22: {:?}",
+            fixture.first_expected.exports
+        );
+        fixture.process.begin_api_discovery_pass();
+        FAIL_PARSE_API.with(|slot| slot.set(Some(op22)));
+        let sites = fixture.process.resolve_api(op22);
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert_eq!(
+            sites.len(),
+            1,
+            "the operational sibling still resolves past the refused mapping"
+        );
+        assert_eq!(
+            fixture.process.unresolved_inventoried(),
+            fixture
+                .first_expected
+                .exports
+                .iter()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the refused mapping's known exports still record inventoried"
+        );
+        assert!(
+            fixture.process.unresolved_operational().is_empty(),
+            "an unrelated-exporter refusal records no operational uncertainty: {:?}",
+            fixture.process.unresolved_operational()
+        );
+        // Same-API leg: the operational fixture's first mapping
+        // exports id 22 — refusing it still vetoes.
+        let same = two_operational_exporter_fixture();
+        same.process.begin_api_discovery_pass();
+        FAIL_PARSE_API.with(|slot| slot.set(Some(op22)));
+        let sites = same.process.resolve_api(op22);
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the same-API one-shot fired (consumed, nothing cached)"
+        );
+        assert_eq!(
+            sites.len(),
+            1,
+            "the same-API sibling still resolves past the refused mapping"
+        );
+        assert!(
+            same.process.unresolved_operational().contains(&22),
+            "the same-API refusal still vetoes: {:?}",
+            same.process.unresolved_operational()
+        );
+    }
+    /// NEW-21 fix6 pin, reworked fix7 (host, production
+    /// discovery + pass verdict ONLY): a one-shot API-discovery
+    /// failure (uncached BackingUnavailable) tracks the refused
+    /// exporter for its pass — until a later pass cleanly
+    /// resolves every eligible site (the healed pass proves
+    /// coverage from the claim start). Discovery-only: the host
+    /// stages no arms (NEW-21-OPEN: the fix6 revision asserted
+    /// the seal with the same fabricated arm before and after
+    /// the retry) — the armed seal shape runs in the guest
+    /// through production admission (the new21a/b/c legs).
+    #[test]
+    fn one_shot_failure_clears_when_sites_resolve_and_arm() {
+        use crate::provider_observation::objects::FAIL_NEXT_PARSE;
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_NEXT_PARSE.with(|flag| flag.set(false));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let fixture = two_exporter_fixture(false);
+        let fetch10 = wire::api(10).expect("fetch id");
+        // Pass 1: the one-shot fails an exporter; the pass verdict
+        // tracks it (the seal shape is guest-pinned).
+        fixture.process.begin_api_discovery_pass();
+        FAIL_NEXT_PARSE.with(|flag| flag.set(true));
+        let sites = fixture.process.resolve_api(fetch10);
+        assert!(
+            !FAIL_NEXT_PARSE.with(|flag| flag.get()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert_eq!(sites.len(), 1, "one exporter resolves, one fails one-shot");
+        assert!(
+            fixture
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the refused exporter is tracked for its pass"
+        );
+        // Pass 2 (the hook is spent — the transient heals): a clean
+        // re-resolve clears the pass verdict.
+        fixture.process.begin_api_discovery_pass();
+        assert_eq!(
+            fixture.process.resolve_api(fetch10).len(),
+            2,
+            "the healed pass resolves both exporters"
+        );
+        assert!(
+            fixture.process.unresolved_inventoried().is_empty(),
+            "the clean pass clears the transient"
+        );
+    }
+    /// NEW-25 fix7 pin (host, production discovery + pass
+    /// verdict): a transient `ProcessUnavailable` during
+    /// `resolve_api` revalidation records the skipped API into
+    /// the pass verdict (the skip must not vanish while a sibling
+    /// arm certifies) — and a clean retry re-resolves it (a
+    /// healed transient clears on reproof). Discovery-only on
+    /// the host (no arms staged); the production-admission twin
+    /// (retained sibling arms + seal) runs in the guest.
+    #[test]
+    fn transient_revalidation_skip_carries_into_pass_verdict() {
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let fixture = two_exporter_fixture(false);
+        let fetch10 = wire::api(10).expect("fetch id");
+        // Pass 1 (healthy baseline): both exporters resolve, the
+        // verdict is clean.
+        fixture.process.begin_api_discovery_pass();
+        assert_eq!(
+            fixture.process.resolve_api(fetch10).len(),
+            2,
+            "premise: both exporters resolve when healthy"
+        );
+        assert!(
+            fixture.process.unresolved_inventoried().is_empty(),
+            "premise: healthy discovery tracks nothing"
+        );
+        // Pass 2 (transient): the revalidation backing this
+        // resolve fails — nothing resolves and the skipped API
+        // carries into the pass verdict.
+        fixture.process.begin_api_discovery_pass();
+        FAIL_RESOLVE_API.with(|slot| slot.set(Some(fetch10)));
+        assert_eq!(
+            fixture.process.resolve_api(fetch10).len(),
+            0,
+            "the transient resolves nothing"
+        );
+        assert!(
+            FAIL_RESOLVE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed)"
+        );
+        assert!(
+            fixture
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the skipped API carries into the pass verdict"
+        );
+        // Pass 3 (clean reproof): the transient heals — both
+        // exporters resolve and the verdict clears.
+        fixture.process.begin_api_discovery_pass();
+        assert_eq!(
+            fixture.process.resolve_api(fetch10).len(),
+            2,
+            "the healed pass resolves both exporters"
+        );
+        assert!(
+            fixture.process.unresolved_inventoried().is_empty(),
+            "the clean pass clears the transient"
+        );
+    }
+    /// NEW-10-OPEN + NEW-21 fix6 pin through the PRODUCTION seal
+    /// rule (`armed_fetch_ids` on a ready target): a one-shot
+    /// uncached API-discovery failure (BackingUnavailable) with an
+    /// armed sibling withholds the surface at seal — the ready
+    /// target's armed attachment must not certify past the refused
+    /// exporter — while the healthy twin (both exporters resolved
+    /// and armed) covers. Discovery runs the production
+    /// two-exporter path; only the session is minimal (map-backed,
+    /// no attach — the seal rule reads attachments, gaps, and the
+    /// discovery set, never the ring).
+    #[test]
+    #[ignore = "requires BPF map privileges (minimal session, no attach)"]
+    fn uncached_refusal_withholds_ready_state_at_seal() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_NEXT_PARSE;
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_NEXT_PARSE.with(|flag| flag.set(false));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let mut session = super::ProviderSession::minimal_for_coordinator_tests()
+            .expect("the guest lane provides BPF map privileges");
+        let fetch10 = wire::api(10).expect("fetch id");
+        let start_ns = LiveClock.monotonic_ns();
+        session
+            .set_api_window(start_ns, start_ns.saturating_add(60_000_000_000))
+            .expect("window programs");
+        session.note_coverage_epoch();
+        // Failed case: one-shot refusal, sibling resolves and arms.
+        let fixture = two_exporter_fixture(false);
+        let pid = fixture._child.pid();
+        let starttime = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0)
+        .starttime;
+        fixture.process.begin_api_discovery_pass();
+        FAIL_NEXT_PARSE.with(|flag| flag.set(true));
+        let mut sites = fixture.process.resolve_api(fetch10);
+        assert!(
+            !FAIL_NEXT_PARSE.with(|flag| flag.get()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert_eq!(sites.len(), 1, "premise: one exporter resolves, one fails");
+        assert!(
+            fixture
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the refused exporter is tracked"
+        );
+        let generation = fixture.process.generation();
+        let site = sites.remove(0).site;
+        let failed = super::Target {
+            process: fixture.process,
+            starttime,
+            generation,
+            attachments: vec![super::Attachment {
+                object: super::object_id(&site),
+                site,
+                cookie: 82,
+                api: 10,
+                armed_ns: Some(start_ns),
+                links: Vec::new(),
+                generation,
+                advertisers: Vec::new(),
+                original: None,
+                historical: false,
+            }],
+            ranges: 0,
+            ready: true,
+            site_gap_apis: std::collections::BTreeSet::new(),
+        };
+        // The fixture (child, mmaps, dirs) must outlive the seal
+        // read — hold its owned parts beside the moved process.
+        let _held = (fixture._child, fixture._mappings, fixture._forwarders);
+        session.targets.insert(pid, failed);
+        let sealed = session.armed_fetch_ids(pid, starttime);
+        assert!(
+            sealed.is_empty(),
+            "one armed sibling + one uncached-refused exporter seals nothing: {sealed:?}"
+        );
+        // Healthy twin: both exporters resolve and arm — the seal covers.
+        let twin = two_exporter_fixture(false);
+        let twin_pid = twin._child.pid();
+        let twin_starttime = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![twin_pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0)
+        .starttime;
+        twin.process.begin_api_discovery_pass();
+        let twin_sites = twin.process.resolve_api(fetch10);
+        assert_eq!(twin_sites.len(), 2, "premise: both exporters resolve");
+        assert!(
+            twin.process.unresolved_inventoried().is_empty(),
+            "premise: healthy discovery tracks nothing"
+        );
+        let twin_generation = twin.process.generation();
+        let mut cookie = 82u64;
+        let attachments = twin_sites
+            .into_iter()
+            .map(|resolved| {
+                cookie += 1;
+                super::Attachment {
+                    object: super::object_id(&resolved.site),
+                    api: 10,
+                    armed_ns: Some(start_ns),
+                    cookie,
+                    generation: twin_generation,
+                    site: resolved.site,
+                    links: Vec::new(),
+                    advertisers: Vec::new(),
+                    original: None,
+                    historical: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        let _twin_held = (twin._child, twin._mappings, twin._forwarders);
+        session.targets.insert(
+            twin_pid,
+            super::Target {
+                process: twin.process,
+                starttime: twin_starttime,
+                generation: twin_generation,
+                attachments,
+                ranges: 0,
+                ready: true,
+                site_gap_apis: std::collections::BTreeSet::new(),
+            },
+        );
+        assert_eq!(
+            session.armed_fetch_ids(twin_pid, twin_starttime),
+            std::collections::BTreeSet::from([10]),
+            "control: resolve AND arm covers"
+        );
+        eprintln!("new21: withheld=true control_covers=true");
+    }
+    /// Full production session for the staged-process pins
+    /// (NEW-21/NEW-25 fix7): the real BPF object, default budget
+    /// (callers shape their own limits), generous deadline.
+    /// Callers must hold `MAPPED_FIXTURES`.
+    fn staged_production_session() -> super::ProviderSession {
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut s = super::ProviderSession::open(
+            super::ObservationLimits {
+                max_processes: 1,
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        s.set_deadline(std::time::Instant::now() + std::time::Duration::from_secs(30));
+        s
+    }
+    /// NEW-21-OPEN fix7 pin (guest, production admission): a
+    /// one-shot uncached parse refusal on fetch-10's resolve
+    /// leaves the surface with exactly ONE genuinely armed site
+    /// (real link pair, real arm instant, production commit) plus
+    /// its refused sibling — the seal withholds it (Unknown).
+    /// Nothing here is staged except the process binding (the
+    /// override seam); discovery, attach, arms, admission, and
+    /// the seal read are all production. (A stale/cached refusal
+    /// cannot take this path — it fails the pass by design — so
+    /// the transient hook stages the refused sibling; the retry
+    /// half runs in the new21b leg.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn refused_sibling_withholds_surface_through_production_admission() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_PARSE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_PARSE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let fixture = two_exporter_fixture(false);
+        let pid = fixture._child.pid();
+        let record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let starttime = record.starttime;
+        let fetch10 = wire::api(10).expect("fetch id");
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(fetch10)));
+        let mut b = super::ObservationBatch::default();
+        s.add_target(&record, &mut b)
+            .expect("production attach completes");
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert!(
+            s.target_ready(pid, starttime),
+            "the refused sibling still leaves a ready target: {:?}",
+            b.gaps
+        );
+        assert!(
+            s.process_override.borrow().is_empty(),
+            "premise: the seam was consumed (production adopted the staged process)"
+        );
+        // The sibling's fetch site armed GENUINELY (real link pair,
+        // real arm instant); the refused site armed nothing.
+        let fetch_arms: Vec<_> = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 10)
+            .collect();
+        assert_eq!(
+            fetch_arms.len(),
+            1,
+            "one fetch site arms, one is refused: {:?}",
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .map(|a| (a.api, a.links.len(), a.armed_ns))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fetch_arms[0].links.len(),
+            2,
+            "the armed site holds a genuine link pair"
+        );
+        let armed_ns = fetch_arms[0]
+            .armed_ns
+            .expect("the armed site holds a genuine arm instant");
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the refused exporter is tracked for its pass"
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            armed_ns <= start,
+            "the genuine arm precedes the claim start"
+        );
+        assert!(
+            s.armed_fetch_ids(pid, starttime).is_empty(),
+            "one armed site + a refused sibling seals nothing: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        let _ = held;
+        eprintln!("new21a: armed=1 refused_withheld=true");
+    }
+    /// NEW-21-OPEN fix8 pin (guest, NORMAL reconciliation): a
+    /// one-shot transient parse refusal on fetch-10's resolve plus
+    /// a one-shot static-discovery lag leaves pass 1 INCOMPLETE —
+    /// the kept target stays unready with exactly ONE genuine arm
+    /// (real link pair, real arm instant) plus its refused sibling
+    /// — and the incomplete pass certifies no zero (session A).
+    /// The next `reconcile_records` (the production retry path for
+    /// unready targets — no forced `add_target`, which
+    /// reconciliation would skip on a ready target) admits the
+    /// missing second arm genuinely, clears the verdict, and only
+    /// then covers (session B). Supersedes fix7's
+    /// `oneshot_refusal_retry_covers_through_production_admission`
+    /// (both arms on pass 1, forced retry on a ready target).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn incomplete_pass_retains_one_arm_retry_admits_second_through_reconciliation() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_PARSE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_PARSE_API.with(|slot| slot.set(None));
+                super::EXPIRE_STATIC.with(|flag| flag.set(false));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let fetch10 = wire::api(10).expect("fetch id");
+        // Session A: pass 1 only — incomplete, one arm, withholds.
+        let fixture = two_exporter_fixture(false);
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut a = staged_production_session();
+        let held_a = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        a.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(fetch10)));
+        super::EXPIRE_STATIC.with(|flag| flag.set(true));
+        let pass1 = a.reconcile_records(&records);
+        super::EXPIRE_STATIC.with(|flag| flag.set(false));
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the refusal one-shot fired (consumed, nothing cached)"
+        );
+        assert!(
+            pass1.gaps.contains(&super::ObservationGap::SnapshotLag),
+            "premise: static lag fails the pass partial: {:?}",
+            pass1.gaps
+        );
+        assert!(
+            !a.target_ready(pid, starttime),
+            "pass 1 is INCOMPLETE (unready kept target)"
+        );
+        let fetch_arms: Vec<_> = a
+            .targets
+            .get(&pid)
+            .expect("target kept")
+            .attachments
+            .iter()
+            .filter(|at| at.api == 10)
+            .collect();
+        assert_eq!(
+            fetch_arms.len(),
+            1,
+            "the incomplete pass retains one real arm: {:?}",
+            a.targets
+                .get(&pid)
+                .expect("target kept")
+                .attachments
+                .iter()
+                .map(|at| (at.api, at.links.len(), at.armed_ns))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(fetch_arms[0].links.len(), 2, "genuine link pair");
+        assert!(fetch_arms[0].armed_ns.is_some(), "genuine arm instant");
+        assert!(
+            a.targets
+                .get(&pid)
+                .expect("target kept")
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the refused sibling is tracked for its pass"
+        );
+        for _ in 0..3 {
+            a.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        a.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = a.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !a.armed_fetch_ids(pid, starttime).contains(&10),
+            "the incomplete pass certifies no zero: {:?}",
+            a.armed_fetch_ids(pid, starttime)
+        );
+        let _ = held_a;
+        // Session B: pass 1 (incomplete, one arm) + pass 2 (normal
+        // retry admits the missing second arm) — both through
+        // `reconcile_records`, nothing forced.
+        let fixture = two_exporter_fixture(false);
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut b = staged_production_session();
+        let held_b = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        b.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(fetch10)));
+        super::EXPIRE_STATIC.with(|flag| flag.set(true));
+        let pass1 = b.reconcile_records(&records);
+        super::EXPIRE_STATIC.with(|flag| flag.set(false));
+        assert!(
+            pass1.gaps.contains(&super::ObservationGap::SnapshotLag),
+            "premise: pass 1 is partial: {:?}",
+            pass1.gaps
+        );
+        assert!(
+            !b.target_ready(pid, starttime),
+            "premise: pass 1 leaves the target unready"
+        );
+        assert_eq!(
+            b.targets
+                .get(&pid)
+                .expect("target kept")
+                .attachments
+                .iter()
+                .filter(|at| at.api == 10)
+                .count(),
+            1,
+            "premise: pass 1 retains one real arm"
+        );
+        // Pass 2: the SAME reconcile entry (production unready
+        // retry — both one-shots healed, deadline restored like
+        // any tick boundary).
+        b.set_deadline(Instant::now() + Duration::from_secs(30));
+        let pass2 = b.reconcile_records(&records);
+        assert!(
+            b.target_ready(pid, starttime),
+            "the normal retry completes: {:?}",
+            pass2.gaps
+        );
+        assert!(
+            b.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .is_empty(),
+            "the clean pass clears the transient"
+        );
+        let fetch_arms: Vec<_> = b
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|at| at.api == 10)
+            .collect();
+        assert_eq!(
+            fetch_arms.len(),
+            2,
+            "the retry admits the missing second arm"
+        );
+        for at in &fetch_arms {
+            assert_eq!(at.links.len(), 2, "every covering arm is genuine");
+            assert!(at.armed_ns.is_some(), "every covering arm is stamped");
+        }
+        for _ in 0..3 {
+            b.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        b.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = b.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            b.armed_fetch_ids(pid, starttime).contains(&10),
+            "resolve AND genuine second arm covers: {:?}",
+            b.armed_fetch_ids(pid, starttime)
+        );
+        let _ = held_b;
+        eprintln!("new21b: pass1_unready=true pass1_arms=1 retry_covers=true genuine_arms=2");
+    }
+    /// NEW-21-OPEN fix7 pin (guest, production admission): a
+    /// LinkLimit-shaped budget arms the first sites genuinely and
+    /// fails the rest softly — the shaped pass leaves fetch-10
+    /// with one GENUINELY armed site plus a resolved-but-unarmed
+    /// sibling (site gap, empty discovery verdict) and the seal
+    /// withholds it; the full-budget twin covers. The cutoff is
+    /// calibrated from a generous pass's observed attach order
+    /// (same fixture bytes, same order); the verdict, the genuine
+    /// arm, and the empty discovery set are all asserted, not
+    /// assumed.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn resolved_but_unarmed_sibling_withholds_through_production_admission() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        // Calibration: generous budget — every eligible site arms.
+        // Mappings bind m1 before m2, so each api's first
+        // attachment is m1's and its second is m2's.
+        let calib = two_exporter_fixture(false);
+        let calib_pid = calib._child.pid();
+        let calib_record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![calib_pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let calib_starttime = calib_record.starttime;
+        let mut generous = staged_production_session();
+        let calib_held = (&calib._child, &calib._mappings, &calib._forwarders);
+        generous
+            .process_override
+            .borrow_mut()
+            .insert(calib_pid, calib.process);
+        let mut calib_batch = super::ObservationBatch::default();
+        generous
+            .add_target(&calib_record, &mut calib_batch)
+            .expect("calibration attach completes");
+        assert!(
+            generous.target_ready(calib_pid, calib_starttime),
+            "premise: the calibration attach goes ready: {:?}",
+            calib_batch.gaps
+        );
+        let order: Vec<u32> = generous
+            .targets
+            .get(&calib_pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .map(|a| a.api)
+            .collect();
+        let cutoff = order
+            .iter()
+            .position(|api| *api == 10)
+            .expect("premise: fetch-10 arms in the calibration pass");
+        assert!(
+            order.iter().filter(|api| **api == 10).count() == 2,
+            "premise: both fetch exporters arm when healthy: {order:?}"
+        );
+        for _ in 0..3 {
+            generous.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let calib_start = LiveClock.monotonic_ns();
+        generous
+            .set_api_window(calib_start, calib_start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = generous.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            generous
+                .armed_fetch_ids(calib_pid, calib_starttime)
+                .contains(&10),
+            "premise: the generous twin covers fetch-10"
+        );
+        // Shaped pass: arms stop right after m1's fetch-10 site
+        // (each attach checks planned + pair against the cap — the
+        // in-progress target is out of the map during the add, so
+        // live pressure reads zero and `2*(cutoff+1)` admits
+        // exactly the first cutoff+1 sites). M2's fetch-10 site
+        // resolves but never arms.
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut shaped = super::ProviderSession::open(
+            super::ObservationLimits {
+                max_processes: 1,
+                max_links: 2 * (cutoff + 1),
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        shaped.set_deadline(Instant::now() + Duration::from_secs(30));
+        let fixture = two_exporter_fixture(false);
+        let pid = fixture._child.pid();
+        let record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let starttime = record.starttime;
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        shaped
+            .process_override
+            .borrow_mut()
+            .insert(pid, fixture.process);
+        let mut b = super::ObservationBatch::default();
+        shaped
+            .add_target(&record, &mut b)
+            .expect("shaped attach completes");
+        assert!(
+            shaped.target_ready(pid, starttime),
+            "soft failures still leave a ready target: {:?}",
+            b.gaps
+        );
+        let shaped_apis: Vec<u32> = shaped
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .map(|a| a.api)
+            .collect();
+        assert_eq!(
+            shaped_apis,
+            order[..cutoff + 1],
+            "arms stop at the calibrated cutoff"
+        );
+        assert!(
+            shaped
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .all(|a| a.links.len() == 2),
+            "every shaped arm holds a genuine link pair"
+        );
+        let fetch_arms: Vec<_> = shaped
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 10)
+            .collect();
+        assert_eq!(
+            fetch_arms.len(),
+            1,
+            "fetch-10 keeps one armed site plus its resolved-but-unarmed sibling"
+        );
+        assert_eq!(fetch_arms[0].links.len(), 2, "the arm is genuine");
+        assert!(
+            fetch_arms[0].armed_ns.is_some(),
+            "the arm carries a genuine instant"
+        );
+        assert!(
+            shaped
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .site_gap_apis
+                .contains(&10),
+            "the unarmed sibling records its site gap"
+        );
+        assert!(
+            shaped
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .is_empty(),
+            "both siblings RESOLVED — the verdict comes from the armed/unarmed split, not discovery"
+        );
+        for _ in 0..3 {
+            shaped.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        shaped
+            .set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = shaped.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            !shaped.armed_fetch_ids(pid, starttime).contains(&10),
+            "one armed site + a resolved-but-unarmed sibling seals nothing: {:?}",
+            shaped.armed_fetch_ids(pid, starttime)
+        );
+        let _ = (held, calib_held);
+        eprintln!("new21c: armed=1 unarmed_sibling_gapped=true discovery_clean=true");
+    }
+    /// NEW-25 fix7 pin (guest, production admission): a transient
+    /// `ProcessUnavailable` during a retry's `resolve_api`
+    /// revalidation records the skipped API into the pass verdict —
+    /// the seal withholds the surface DESPITE the sibling arms the
+    /// kept target retains — and a clean reproof resolves it and
+    /// the seal covers. (The host twin pins the discovery-only
+    /// verdict; this pin proves the retained-arm shape end to end.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn transient_skip_withholds_despite_retained_arms_through_production_admission() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let fixture = two_exporter_fixture(false);
+        let pid = fixture._child.pid();
+        let record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let starttime = record.starttime;
+        let fetch10 = wire::api(10).expect("fetch id");
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        // Pass 1 (healthy): every eligible site genuinely arms and
+        // the seal covers (baseline).
+        let mut first = super::ObservationBatch::default();
+        s.add_target(&record, &mut first)
+            .expect("production attach completes");
+        assert!(
+            s.target_ready(pid, starttime),
+            "premise: the healthy attach goes ready: {:?}",
+            first.gaps
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&10),
+            "premise: the healthy seal covers fetch-10: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        // Pass 2 (retry with a transient on fetch-10's resolve):
+        // both pass-1 arms are RETAINED on the kept target, yet
+        // the skipped API carries into the verdict and the seal
+        // withholds it.
+        FAIL_RESOLVE_API.with(|slot| slot.set(Some(fetch10)));
+        let mut retry = super::ObservationBatch::default();
+        s.add_target(&record, &mut retry)
+            .expect("production retry completes");
+        assert!(
+            FAIL_RESOLVE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed)"
+        );
+        let fetch_arms: Vec<_> = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 10)
+            .collect();
+        assert_eq!(fetch_arms.len(), 2, "both pass-1 arms are retained");
+        for a in &fetch_arms {
+            assert_eq!(a.links.len(), 2, "the retained arm stays genuine");
+        }
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpMdFetch),
+            "the skipped API carries into the pass verdict"
+        );
+        assert!(
+            !s.armed_fetch_ids(pid, starttime).contains(&10),
+            "retained arms do not certify past the skipped sibling: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        // Pass 3 (clean reproof): the transient heals — the retry
+        // resolves the missing site (already armed, kept) and the
+        // seal covers again.
+        let mut reproof = super::ObservationBatch::default();
+        s.add_target(&record, &mut reproof)
+            .expect("production reproof completes");
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .is_empty(),
+            "the clean pass clears the transient"
+        );
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&10),
+            "the reproof covers again: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        let _ = held;
+        eprintln!("new25: retained_unknown=true reproof_covers=true");
+    }
+    /// NEW-24-OPEN/NEW-29 fix8 helper: an established live target
+    /// (staged operational-exporter process, production attach with
+    /// genuine fetch + operational arms, admission committed, claim
+    /// programmed) whose non-terminal retirement DEFERS under a
+    /// saturated worker (the production probe via
+    /// `with_test_dropper`, like the R5-3 pins). Returns the
+    /// session with the retire still deferred (disarmed CONFIG,
+    /// target kept, links pinned, pending marker live). Callers
+    /// seal/read while deferred; dropping the session collects
+    /// through the healthy global dropper.
+    struct DeferredEstablished {
+        s: super::ProviderSession,
+        pid: u32,
+        starttime: u64,
+        _child: crate::target::OwnedTarget,
+        _mappings: Vec<FixtureMapping>,
+        _forwarders: Vec<startup_fixture::ForwarderFixture>,
+    }
+    /// Callers must hold `MAPPED_FIXTURES`.
+    fn defer_established_target() -> DeferredEstablished {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "premise: production attach completes: {:?}",
+            setup.gaps
+        );
+        // Genuine fetch + operational arms on the established
+        // target (the quarantine refusal on id 21 is the only
+        // setup gap).
+        for (api, want) in [(10u32, 2usize), (22u32, 2usize)] {
+            let arms: Vec<_> = s
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .filter(|a| a.api == api)
+                .collect();
+            assert_eq!(arms.len(), want, "premise: api {api} arms both sites");
+            for a in &arms {
+                assert_eq!(a.links.len(), 2, "premise: api {api} link pair genuine");
+                assert!(a.armed_ns.is_some(), "premise: api {api} arm stamped");
+            }
+        }
+        assert!(
+            !s.api_admitted.is_empty(),
+            "premise: operational admission committed"
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .site_gap_apis
+                .contains(&21),
+            "premise: the quarantine refusal records its gap"
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .is_empty(),
+            "premise: discovery clean"
+        );
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&10),
+            "premise: the established seal covers fetch-10: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        // Defer a non-terminal retirement under a saturated
+        // worker (production probe — the disarm inside really
+        // runs, the capacity probe really fails).
+        let saturated: &'static super::FdDropper = Box::leak(Box::new(spill_exhausted_dropper()));
+        let mut b = super::ObservationBatch::default();
+        super::with_test_dropper(saturated, || {
+            s.retire_for_gap(pid, None, super::ObservationGap::Invalidated, &mut b)
+        });
+        assert!(
+            s.pending_retire.contains_key(&pid),
+            "premise: the retirement deferred (retry intent persisted)"
+        );
+        assert!(
+            s.targets.contains_key(&pid),
+            "premise: the deferred retire keeps its target"
+        );
+        let target = s.targets.get(&pid).expect("target kept");
+        assert!(
+            target.attachments.iter().all(|a| !a.links.is_empty()),
+            "premise: the deferred links stay pinned"
+        );
+        let cookie = target
+            .attachments
+            .iter()
+            .find(|a| a.api == 10)
+            .expect("fetch attachment kept")
+            .cookie;
+        assert!(
+            s.config.get(&cookie, 0).is_err(),
+            "premise: the disarm transition already ran (CONFIG gone)"
+        );
+        let TwoExporterFixture {
+            _child,
+            _mappings,
+            _forwarders,
+            ..
+        } = fixture;
+        DeferredEstablished {
+            s,
+            pid,
+            starttime,
+            _child,
+            _mappings,
+            _forwarders,
+        }
+    }
+    /// NEW-24-OPEN fix8 pin (guest, finish-before-deferred-retry):
+    /// a deferred retirement has ALREADY disarmed when it returns
+    /// (premise above) — sealing while the retry is still
+    /// outstanding must not grant the operational scope receipt
+    /// (the live source still validates at finish, so only the
+    /// disarm-transition void stands between the stale admitted
+    /// counter and a false zero). Admitted zero rows still
+    /// project — only zero eligibility voids.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn deferred_retire_voids_scope_receipt_before_retry() {
+        use std::time::{Duration, Instant};
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let fixed = defer_established_target();
+        let mut s = fixed.s;
+        let pid = fixed.pid;
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt while the disarming retire is deferred: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let rows: Vec<_> = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && !a.row.gaps.not_attached)
+            .collect();
+        assert!(
+            !rows.is_empty(),
+            "admitted rows still project (only eligibility voids)"
+        );
+        assert!(
+            rows.iter().all(|a| a.row.entries == 0),
+            "the idle plane reads zero rows: {:?}",
+            rows.iter().map(|a| a.row.entries).collect::<Vec<_>>()
+        );
+        eprintln!(
+            "new24o: deferred=true scopes_empty=true rows_projected={}",
+            rows.len()
+        );
+    }
+    /// NEW-29 fix8 pin (guest, established target sealing while
+    /// deferred): the same disarm transition must invalidate the
+    /// FETCH plane too (no stale arm timestamps certifying) and
+    /// must retire the target's readiness (a disarmed plane cannot
+    /// establish a claim).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn deferred_retire_voids_fetch_and_readiness_before_retry() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut fixed = defer_established_target();
+        let pid = fixed.pid;
+        let starttime = fixed.starttime;
+        assert!(
+            fixed.s.armed_fetch_ids(pid, starttime).is_empty(),
+            "no fetch coverage from disarmed arms: {:?}",
+            fixed.s.armed_fetch_ids(pid, starttime)
+        );
+        let now = LiveClock.monotonic_ns();
+        assert!(
+            !fixed
+                .s
+                .establish_claim_start(pid, starttime, now, now.saturating_add(60_000_000_000))
+                .expect("gate decides"),
+            "stale readiness must not establish a claim"
+        );
+        eprintln!("new29: fetch_voided=true establish_refused=true");
+    }
+    /// FLAG-2 fix8 pin (guest, mixed same-API discovery refusal):
+    /// a one-shot transient parse refusal on operational id 22's
+    /// resolve leaves exactly ONE genuinely armed site (real link
+    /// pair, real arm instant) plus its refused sibling — the
+    /// sibling's zero-reading admitted counter must not grant the
+    /// scope receipt. The healthy twin (same fixture, no fault)
+    /// earns its receipt with the quarantine refusal as its ONLY
+    /// site gap — the explicit API 21 quarantine never voids. Both
+    /// legs project their admitted rows; only eligibility voids.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn mixed_operational_refusal_withholds_scope_receipt() {
+        use crate::provider_observation::objects::FAIL_PARSE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_PARSE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let op22 = wire::api(22).expect("operational id");
+        // Mixed leg: one armed + one refused same-API sibling.
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(op22)));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert!(
+            s.target_ready(pid, starttime),
+            "the refused sibling still leaves a ready target: {:?}",
+            setup.gaps
+        );
+        let arms: Vec<_> = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 22)
+            .collect();
+        assert_eq!(
+            arms.len(),
+            1,
+            "one operational site arms, one is refused: {:?}",
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .map(|a| (a.api, a.links.len(), a.armed_ns))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(arms[0].links.len(), 2, "the armed site is genuine");
+        assert!(arms[0].armed_ns.is_some(), "the armed site is stamped");
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .contains(&crate::inventory::Api::EvpDigestUpdate),
+            "the refused sibling is tracked for its pass"
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+                .contains(&22),
+            "the skipped operational surface is tracked precisely: {:?}",
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt past the refused same-API sibling: {:?}",
+            batch.terminal_scopes_observed
+        );
+        assert!(
+            batch
+                .api_activity
+                .iter()
+                .any(|a| a.pid == pid && !a.row.gaps.not_attached),
+            "admitted rows still project (only eligibility voids)"
+        );
+        let _ = held;
+        // Control twin: fully armed idle — receipts with the
+        // quarantine as its only site gap.
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        let starttime = records[0].starttime;
+        let mut c = staged_production_session();
+        let held_c = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        c.process_override.borrow_mut().insert(pid, fixture.process);
+        let setup = c.reconcile_records(&records);
+        assert!(
+            c.target_ready(pid, starttime),
+            "premise: the control attach completes: {:?}",
+            setup.gaps
+        );
+        for api in [22u32, 23u32] {
+            assert_eq!(
+                c.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .attachments
+                    .iter()
+                    .filter(|a| a.api == api)
+                    .count(),
+                2,
+                "premise: control api {api} arms both sites"
+            );
+        }
+        assert_eq!(
+            c.targets.get(&pid).expect("target present").site_gap_apis,
+            std::collections::BTreeSet::from([21u32]),
+            "premise: quarantine is the control's only site gap"
+        );
+        let batch = c.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the fully armed idle control receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let _ = held_c;
+        eprintln!(
+            "newf2mix: mixed_voided=true control_receipted=true control_gaps_quarantine_only=true"
+        );
+    }
+    /// FLAG-2 fix8 pin (guest, mixed same-API attach failure): a
+    /// LinkLimit-shaped budget arms the first id-22 site genuinely
+    /// and fails its resolved sibling softly — the resolved but
+    /// unarmed sibling voids the scope receipt even though both
+    /// siblings resolved (empty discovery verdict). Admitted rows
+    /// still project.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn shaped_operational_sibling_withholds_scope_receipt() {
+        use std::time::{Duration, Instant};
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        // Calibration: generous budget — every eligible site arms.
+        let calib = two_operational_exporter_fixture();
+        let calib_pid = calib._child.pid();
+        let calib_record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![calib_pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let calib_starttime = calib_record.starttime;
+        let mut generous = staged_production_session();
+        let calib_held = (&calib._child, &calib._mappings, &calib._forwarders);
+        generous
+            .process_override
+            .borrow_mut()
+            .insert(calib_pid, calib.process);
+        let mut calib_batch = super::ObservationBatch::default();
+        generous
+            .add_target(&calib_record, &mut calib_batch)
+            .expect("calibration attach completes");
+        assert!(
+            generous.target_ready(calib_pid, calib_starttime),
+            "premise: the calibration attach goes ready: {:?}",
+            calib_batch.gaps
+        );
+        let order: Vec<u32> = generous
+            .targets
+            .get(&calib_pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .map(|a| a.api)
+            .collect();
+        let cutoff = order
+            .iter()
+            .position(|api| *api == 22)
+            .expect("premise: id-22 arms in the calibration pass");
+        assert!(
+            order.iter().filter(|api| **api == 22).count() == 2,
+            "premise: both id-22 exporters arm when healthy: {order:?}"
+        );
+        // Shaped pass: arms stop right after the first id-22 site
+        // (same cutoff formula as the N21c fetch shape — the
+        // in-progress target is out of the map during the add, so
+        // live pressure reads zero). The second id-22 site
+        // resolves but never arms.
+        let object =
+            std::fs::read(std::env::var_os("OSSL_PROVIDER_OBSERVATION_TEST_BPF").unwrap()).unwrap();
+        let mut shaped = super::ProviderSession::open(
+            super::ObservationLimits {
+                max_processes: 1,
+                max_links: 2 * (cutoff + 1),
+                ..Default::default()
+            },
+            &object,
+        )
+        .unwrap();
+        shaped.set_deadline(Instant::now() + Duration::from_secs(30));
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let record = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes
+        .remove(0);
+        let starttime = record.starttime;
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        shaped
+            .process_override
+            .borrow_mut()
+            .insert(pid, fixture.process);
+        let mut b = super::ObservationBatch::default();
+        shaped
+            .add_target(&record, &mut b)
+            .expect("shaped attach completes");
+        assert!(
+            shaped.target_ready(pid, starttime),
+            "soft failures still leave a ready target: {:?}",
+            b.gaps
+        );
+        let arms: Vec<_> = shaped
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 22)
+            .collect();
+        assert_eq!(
+            arms.len(),
+            1,
+            "id-22 keeps one armed site plus its resolved-but-unarmed sibling"
+        );
+        assert_eq!(arms[0].links.len(), 2, "the arm is genuine");
+        assert!(arms[0].armed_ns.is_some(), "the arm is stamped");
+        assert!(
+            shaped
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .site_gap_apis
+                .contains(&22),
+            "the unarmed sibling records its site gap"
+        );
+        assert!(
+            shaped
+                .targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried()
+                .is_empty(),
+            "both siblings RESOLVED — the verdict comes from the armed/unarmed split, not discovery"
+        );
+        let batch = shaped.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt past the unarmed same-API sibling: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let rows = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && !a.row.gaps.not_attached)
+            .count();
+        assert!(
+            rows > 0,
+            "admitted rows still project (only eligibility voids)"
+        );
+        let _ = (held, calib_held);
+        eprintln!(
+            "newf2shape: armed=1 gapped=true discovery_clean=true scopes_empty=true rows_projected={rows}"
+        );
+    }
+    /// FLAG-2 fix8 pin (guest, operational discovery skip): a
+    /// transient `ProcessUnavailable` during id-22's
+    /// `resolve_api` revalidation skips the API before
+    /// per-object tracking (zero id-22 sites — nothing to arm)
+    /// while id-23 arms both sites genuinely and earns admission
+    /// — the skipped surface voids the scope receipt the armed
+    /// sibling would otherwise grant. Admitted rows still project.
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn skipped_operational_api_withholds_scope_receipt() {
+        use crate::provider_observation::objects::FAIL_RESOLVE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_RESOLVE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let op22 = wire::api(22).expect("operational id");
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_RESOLVE_API.with(|slot| slot.set(Some(op22)));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            FAIL_RESOLVE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed)"
+        );
+        assert!(
+            s.target_ready(pid, starttime),
+            "the skipped API still leaves a ready target: {:?}",
+            setup.gaps
+        );
+        assert_eq!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .attachments
+                .iter()
+                .filter(|a| a.api == 22)
+                .count(),
+            0,
+            "id-22 resolves nothing (skipped before tracking)"
+        );
+        let arms23: Vec<_> = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 23)
+            .collect();
+        assert_eq!(arms23.len(), 2, "premise: id-23 arms both sites");
+        for a in &arms23 {
+            assert_eq!(a.links.len(), 2, "premise: the id-23 arm is genuine");
+        }
+        assert!(
+            !s.api_admitted.is_empty(),
+            "premise: the armed sibling earns admission"
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+                .contains(&22),
+            "the skipped operational surface is tracked: {:?}",
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt past the skipped operational surface: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let rows = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && !a.row.gaps.not_attached)
+            .count();
+        assert!(
+            rows > 0,
+            "admitted rows still project (only eligibility voids)"
+        );
+        let _ = held;
+        eprintln!("newf2skip: skipped_voided=true rows_projected={rows}");
+    }
+    /// FLAG-2-OPEN fix9 pin (guest, API-21-only discovery refusal):
+    /// a one-shot transient parse refusal on operational id 21's
+    /// resolve leaves the quarantined API as the ONLY discovery
+    /// uncertainty — the gate must apply the quarantine exclusion
+    /// to BOTH inputs (attachment gaps AND unresolved operational
+    /// IDs), so the idle scope still receipts. Pre-fix the gate
+    /// treats any unresolved operational ID (21 included) as
+    /// disqualifying (RED: void). (The terminal-retirement half —
+    /// preserve the verdict through preserving retirement — rides
+    /// the FLAG-C clean-terminal leg, whose quarantine-only
+    /// premise asserts the same exclusion there.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn api21_only_discovery_refusal_receipts() {
+        use crate::provider_observation::objects::FAIL_PARSE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_PARSE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let op21 = wire::api(21).expect("operational id");
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(op21)));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert!(
+            s.target_ready(pid, starttime),
+            "the refused sibling still leaves a ready target: {:?}",
+            setup.gaps
+        );
+        assert_eq!(
+            s.targets.get(&pid).expect("target present").site_gap_apis,
+            std::collections::BTreeSet::from([21u32]),
+            "premise: quarantine is the only site gap"
+        );
+        assert_eq!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational(),
+            std::collections::BTreeSet::from([21u32]),
+            "premise: the refusal tracks quarantined API 21 alone"
+        );
+        for api in [22u32, 23u32] {
+            assert_eq!(
+                s.targets
+                    .get(&pid)
+                    .expect("target present")
+                    .attachments
+                    .iter()
+                    .filter(|a| a.api == api)
+                    .count(),
+                2,
+                "premise: sibling api {api} arms both sites"
+            );
+        }
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "API-21-only discovery refusal still receipts: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let rows = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && !a.row.gaps.not_attached)
+            .count();
+        assert!(rows > 0, "admitted rows project");
+        let _ = held;
+        eprintln!("newf2open: gaps_quarantine_only=true receipted=true rows_projected={rows}");
+    }
+    /// NEW-34 fix9 pin (guest, complete eligible cohort reads): one
+    /// successful zero read must NOT grant the scope receipt while
+    /// another claim-eligible cookie fails to read or is skipped at
+    /// the terminal deadline (the unread cookie may hold positives).
+    /// Mixed-failure session: two eligible cookies, one totals row
+    /// removed — the success row, the verified rows, and the
+    /// failed-read diagnostic all project, but no receipt grants.
+    /// Deadline session: the terminal deadline expires between two
+    /// eligible reads (one-shot hook on the later cookie) — the
+    /// earlier success still projects, the later `DrainOverrun`
+    /// diagnostic projects, no receipt grants. Pre-fix both
+    /// sessions grant (RED).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn incomplete_eligible_reads_withhold_scope_receipt() {
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                super::FAIL_TOTALS_READ_DEADLINE.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        // Mixed-failure session.
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "premise: the attach completes: {:?}",
+            setup.gaps
+        );
+        let admitted: Vec<u64> = s.api_admitted.iter().copied().collect();
+        assert!(
+            admitted.len() >= 2,
+            "premise: at least two eligible cookies: {}",
+            admitted.len()
+        );
+        let removed = admitted[0];
+        s.api_totals
+            .remove(&removed)
+            .expect("premise: the victim totals row exists");
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.gaps.contains(&super::ObservationGap::InvalidWire),
+            "premise: the removed row reads InvalidWire: {:?}",
+            batch.gaps
+        );
+        let failed = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && !a.row.gaps.not_attached && !a.row.gaps.read_receipt)
+            .count();
+        assert_eq!(
+            failed, 1,
+            "the failed-read diagnostic row projects exactly once"
+        );
+        let success = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.gaps.read_receipt)
+            .count();
+        assert!(
+            success >= 1,
+            "successful rows still project (only the receipt voids)"
+        );
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt past the unread eligible cookie: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let _ = held;
+        // Deadline session: the terminal deadline expires between
+        // two eligible reads (the hook takes the exact production
+        // `DrainOverrun` path for the later cookie).
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "premise: the attach completes: {:?}",
+            setup.gaps
+        );
+        let admitted: Vec<u64> = s.api_admitted.iter().copied().collect();
+        assert!(
+            admitted.len() >= 2,
+            "premise: at least two eligible cookies: {}",
+            admitted.len()
+        );
+        // The hooked cookie is the LAST in read order, so an
+        // earlier eligible read genuinely succeeds first.
+        let late = *admitted.last().unwrap();
+        super::FAIL_TOTALS_READ_DEADLINE.with(|slot| slot.set(Some(late)));
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            super::FAIL_TOTALS_READ_DEADLINE.with(|slot| slot.get().is_none()),
+            "premise: the deadline one-shot fired (consumed)"
+        );
+        assert!(
+            batch.gaps.contains(&super::ObservationGap::DrainOverrun),
+            "premise: the late read rides DrainOverrun: {:?}",
+            batch.gaps
+        );
+        let failed = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && !a.row.gaps.not_attached && !a.row.gaps.read_receipt)
+            .count();
+        assert_eq!(
+            failed, 1,
+            "the skipped read's diagnostic row projects exactly once"
+        );
+        let success = batch
+            .api_activity
+            .iter()
+            .filter(|a| a.pid == pid && a.row.gaps.read_receipt)
+            .count();
+        assert!(
+            success >= 1,
+            "the earlier successful read still projects (only the receipt voids)"
+        );
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "no scope receipt past the deadline-skipped eligible cookie: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let _ = held;
+        eprintln!("new34: mixed_voided=true deadline_voided=true rows_preserved=true");
+    }
+    /// NEW-35 fix9 pin (guest, unrelated refusal vetoes nothing): a
+    /// parse refusal striking the mixed fixture's fetch-only first
+    /// mapping during the op-22 resolve records its known exports
+    /// inventoried only — the idle scope RECEIPTS (a fetch-only
+    /// exporter vetoes no operational zero). Alongside, the
+    /// same-API refusal (operational fixture, refused mapping
+    /// exports id 22) still voids. Pre-fix the unrelated leg voids
+    /// (RED); the same-API leg voids throughout (control).
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn unrelated_exporter_refusal_vetoes_nothing() {
+        use crate::provider_observation::objects::FAIL_PARSE_API;
+        use std::time::{Duration, Instant};
+        struct DisarmHook;
+        impl Drop for DisarmHook {
+            fn drop(&mut self) {
+                FAIL_PARSE_API.with(|slot| slot.set(None));
+            }
+        }
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let _disarm = DisarmHook;
+        let op22 = wire::api(22).expect("operational id");
+        // Unrelated leg: mixed fixture, fetch-only first mapping refused.
+        let fixture = two_mixed_exporter_fixture();
+        let pid = fixture._child.pid();
+        let first_exports = fixture.first_expected.exports.clone();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(op22)));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the one-shot fired (consumed, nothing cached)"
+        );
+        assert!(
+            s.target_ready(pid, starttime),
+            "the refused mapping still leaves a ready target: {:?}",
+            setup.gaps
+        );
+        let arms22 = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 22)
+            .count();
+        assert_eq!(
+            arms22, 1,
+            "the operational sibling arms past the refused mapping"
+        );
+        assert_eq!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_inventoried(),
+            first_exports
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "premise: the refused object IS the fetch-only first mapping"
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+                .is_empty(),
+            "an unrelated-exporter refusal records no operational uncertainty: {:?}",
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.contains(&(pid, starttime)),
+            "the unrelated refusal vetoes nothing: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let _ = held;
+        // Same-API leg: operational fixture, refused mapping exports
+        // id 22 — still voids (control).
+        let fixture = two_operational_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        FAIL_PARSE_API.with(|slot| slot.set(Some(op22)));
+        let setup = s.reconcile_records(&records);
+        assert!(
+            FAIL_PARSE_API.with(|slot| slot.get().is_none()),
+            "premise: the same-API one-shot fired (consumed, nothing cached)"
+        );
+        assert!(
+            s.target_ready(pid, starttime),
+            "premise: the same-API target stays ready: {:?}",
+            setup.gaps
+        );
+        assert!(
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+                .contains(&22),
+            "premise: the same-API refusal still vetoes: {:?}",
+            s.targets
+                .get(&pid)
+                .expect("target present")
+                .process
+                .unresolved_operational()
+        );
+        let batch = s.finalize_until(Instant::now() + Duration::from_secs(10));
+        assert!(
+            batch.terminal_scopes_observed.is_empty(),
+            "the same-API refusal still withholds the receipt: {:?}",
+            batch.terminal_scopes_observed
+        );
+        let _ = held;
+        eprintln!("new35: unrelated_receipted=true sameapi_voided=true");
+    }
+    /// NEW-32 fix8 helper: forge one fetch ATTEMPT record image
+    /// bound to a real attachment (mirrors the fix4 `new7_fetch_bytes`
+    /// shape; outcome 0 — ATTEMPT requires a zero outcome at
+    /// decode). Pins feed these through production
+    /// `decode_transport` + `consume`, so the queued facts are
+    /// production-assembled and bound, like N7a's.
+    fn new32_edge_bytes(
+        pid: u32,
+        cookie: u64,
+        api: u32,
+        generation: u64,
+        invocation: u64,
+        mono_ns: u64,
+        start: u64,
+    ) -> Vec<u8> {
+        use super::wire::contract as c;
+        let mut b = vec![0u8; c::EVENT_SIZE];
+        for (at, v) in [
+            (0, c::VERSION),
+            (4, c::ATTEMPT),
+            (8, c::EVENT_SIZE as u32),
+            (12, api),
+            (16, pid),
+            (20, pid),
+        ] {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [
+            (24, cookie),
+            (32, generation),
+            (40, mono_ns),
+            (48, invocation),
+        ] {
+            b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b[96..104].copy_from_slice(&start.to_le_bytes());
+        b
+    }
+    /// NEW-32 fix8 pin (guest, real learned-role conflict): with
+    /// two genuinely armed fetch-10 sites plus a second armed
+    /// fetch surface (id 11), a REAL role conflict (the production
+    /// `attach_learned` observing an already-roled fetch site
+    /// under a second API — genuine `Ok(false)`, nothing
+    /// fabricated) disarms one fetch site while its same-API
+    /// sibling survives armed. The conflict must mark EVERY
+    /// disarmed surface (the conflicted API and each disarmed
+    /// attachment's API), must preserve queued facts from
+    /// unrelated surfaces (production-assembled, bound to real
+    /// attachments), and must void the surviving sibling's silence
+    /// wherever fetch evidence was discarded. (A full wire-level
+    /// INIT collision is not deterministic; the conflict DECISION
+    /// here is genuine production roles state, and the
+    /// filter/mark/seal below it are all production. Query-8
+    /// ATTEMPTs do not assemble to facts — the RED trip proved
+    /// the premise — so the unrelated edge is fetch-11, which
+    /// assembles like any fetch surface.)
+    #[test]
+    #[ignore = "requires privileged BPF and fresh observation object"]
+    fn learned_role_conflict_marks_surfaces_keeps_unrelated_edges() {
+        use crate::capture::{ClockPort as _, LiveClock};
+        use std::time::{Duration, Instant};
+        let _fixtures = MAPPED_FIXTURES.lock().unwrap_or_else(|e| e.into_inner());
+        let fixture = two_cipher_exporter_fixture();
+        let pid = fixture._child.pid();
+        let records = crate::inventory::snapshot(&crate::inventory::SnapshotOptions {
+            pids: vec![pid],
+            ..Default::default()
+        })
+        .processes;
+        assert_eq!(records.len(), 1, "the child is inventoried");
+        let starttime = records[0].starttime;
+        let mut s = staged_production_session();
+        let held = (&fixture._child, &fixture._mappings, &fixture._forwarders);
+        s.process_override.borrow_mut().insert(pid, fixture.process);
+        let setup = s.reconcile_records(&records);
+        assert!(
+            s.target_ready(pid, starttime),
+            "premise: production attach completes: {:?}",
+            setup.gaps
+        );
+        let fetch_cookies: Vec<(u64, u64)> = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 10)
+            .map(|a| (a.cookie, a.generation))
+            .collect();
+        assert_eq!(
+            fetch_cookies.len(),
+            2,
+            "premise: two fetch-10 sites genuinely armed"
+        );
+        for a in s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 10)
+        {
+            assert_eq!(a.links.len(), 2, "premise: genuine link pair");
+            assert!(a.armed_ns.is_some(), "premise: stamped arm");
+        }
+        let (other_cookie, other_generation) = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .find(|a| a.api == 11)
+            .map(|a| (a.cookie, a.generation))
+            .expect("premise: the second fetch surface arms");
+        for _ in 0..3 {
+            s.drain(Instant::now() + Duration::from_millis(200));
+        }
+        let start = LiveClock.monotonic_ns();
+        s.set_api_window(start, start.saturating_add(60_000_000_000))
+            .expect("window programs");
+        let _ = s.drain(Instant::now() + Duration::from_secs(5));
+        assert!(
+            s.armed_fetch_ids(pid, starttime).contains(&10),
+            "premise: the seal covers fetch-10 pre-conflict: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        // Queue one conflicted-surface fact (fetch-10, bound to
+        // the first site) and one unrelated fact (fetch-11)
+        // through production decode + consume.
+        let mut batch = super::ObservationBatch::default();
+        let mono = LiveClock.monotonic_ns();
+        for (i, (cookie, api, generation)) in [
+            (fetch_cookies[0].0, 10u32, fetch_cookies[0].1),
+            (other_cookie, 11u32, other_generation),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let event = super::wire::decode_transport(&new32_edge_bytes(
+                pid,
+                cookie,
+                api,
+                generation,
+                (i + 1) as u64,
+                mono + i as u64,
+                starttime,
+            ))
+            .expect("edge bytes decode");
+            s.consume(event, &mut batch);
+        }
+        assert_eq!(
+            batch.facts.len(),
+            2,
+            "premise: both facts queue (gaps={:?})",
+            batch.gaps
+        );
+        // The REAL conflict: observe the first fetch site under a
+        // second API through the production learned path.
+        let site = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .find(|a| a.cookie == fetch_cookies[0].0)
+            .expect("first fetch attachment present")
+            .site
+            .clone();
+        s.attach_learned(pid, 8, site, Vec::new(), &mut batch);
+        assert!(
+            batch.gaps.contains(&ObservationGap::AmbiguousSite),
+            "premise: the conflict really fired: {:?}",
+            batch.gaps
+        );
+        // Every disarmed surface is marked (the conflicted API 8
+        // and the disarmed attachment's API 10).
+        let gaps = &s.targets.get(&pid).expect("target present").site_gap_apis;
+        assert!(
+            gaps.contains(&8) && gaps.contains(&10),
+            "every disarmed surface is marked: {gaps:?}"
+        );
+        // The first fetch site disarmed; its same-API sibling
+        // survives armed.
+        let survivors: Vec<_> = s
+            .targets
+            .get(&pid)
+            .expect("target present")
+            .attachments
+            .iter()
+            .filter(|a| a.api == 10)
+            .collect();
+        assert_eq!(
+            survivors.len(),
+            1,
+            "one fetch site disarms, its sibling survives"
+        );
+        assert_eq!(survivors[0].cookie, fetch_cookies[1].0);
+        assert_eq!(survivors[0].links.len(), 2, "the survivor stays genuine");
+        assert!(
+            survivors[0].armed_ns.is_some(),
+            "the survivor stays stamped"
+        );
+        // Unrelated verified edges are preserved; the discarded
+        // surface's edges are gone.
+        assert_eq!(
+            batch.facts.len(),
+            1,
+            "only the conflicted surface's facts drop: {:?}",
+            batch.facts.iter().map(|f| f.api).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            batch.facts[0].api,
+            wire::api(11).expect("cipher id"),
+            "the unrelated fetch edge is preserved"
+        );
+        // ... and the surviving sibling certifies nothing (its
+        // surface's silence is void wherever evidence discarded).
+        assert!(
+            !s.armed_fetch_ids(pid, starttime).contains(&10),
+            "the surviving sibling seals nothing: {:?}",
+            s.armed_fetch_ids(pid, starttime)
+        );
+        let _ = held;
+        eprintln!("new32: conflict_marked=true unrelated_kept=true sibling_voided=true");
     }
     #[test]
     fn final_cut_validation_retains_terminal_owners_and_permanent_refusals() {
@@ -21076,7 +34222,7 @@ mod startup_api_controls {
             );
             let mut membership = true;
             let mut code_ranges = usize::from(adopted);
-            let kept = retire_source_owners(
+            let (kept, _) = retire_source_owners(
                 (&mut fixture.startup, &mut fixture.targets),
                 &mut aliases,
                 pid,
@@ -21244,7 +34390,8 @@ mod startup_api_controls {
                         |_, _| Ok(()),
                         offload_fd_drop,
                         |_| true,
-                    ),
+                    )
+                    .0,
                     super::RetireOutcome::Retired(false),
                     "generic failure became historical authority: case={case}, adopted={adopted}"
                 );
@@ -21312,7 +34459,7 @@ mod startup_api_controls {
             };
             let mut aliases = super::super::assembly::Sequences::default();
             let mut batch = ObservationBatch::default();
-            let outcome = retire_source_owners(
+            let (outcome, _) = retire_source_owners(
                 (&mut fixture.startup, &mut fixture.targets),
                 &mut aliases,
                 pid,
@@ -21412,7 +34559,8 @@ mod startup_api_controls {
                     |_, _| Ok(()),
                     offload_fd_drop,
                     |_| true,
-                ),
+                )
+                .0,
                 super::RetireOutcome::Retired(false),
                 "cached confirmed {confirmed:?} was lost behind later unavailability"
             );
@@ -21467,7 +34615,7 @@ mod startup_api_controls {
                 .unwrap_err();
             assert_eq!(unavailable, ObservationGap::ProcessUnavailable);
             let mut aliases = super::super::assembly::Sequences::default();
-            let outcome = retire_source_owners(
+            let (outcome, _) = retire_source_owners(
                 (&mut fixture.startup, &mut fixture.targets),
                 &mut aliases,
                 pid,
@@ -21536,7 +34684,8 @@ mod startup_api_controls {
                 |_, _| Ok(()),
                 offload_fd_drop,
                 |_| true,
-            ),
+            )
+            .0,
             super::RetireOutcome::Retired(false),
             "an unavailable error cannot substitute for an independently terminal original pidfd"
         );
@@ -21593,7 +34742,7 @@ mod startup_api_controls {
             }
             let mut aliases = super::super::assembly::Sequences::default();
             let mut batch = ObservationBatch::default();
-            let outcome = retire_source_owners(
+            let (outcome, _) = retire_source_owners(
                 (&mut fixture.startup, &mut fixture.targets),
                 &mut aliases,
                 pid,
@@ -21663,6 +34812,7 @@ mod startup_api_controls {
             links: Vec::new(),
             cookie: 81,
             api: c::PUBLIC_QUERY,
+            armed_ns: None,
             generation: 19,
             advertisers: Vec::new(),
             original: None,
@@ -21718,7 +34868,8 @@ mod startup_api_controls {
     fn additive_operational_api_identities_round_trip_through_wire_and_spellings() {
         use crate::api_activity::{API_NAMES, ApiId};
         // Task 7 (5G) round 2: 49-72 are first-class operational identities;
-        // 73+ refuses; every export spelling resolves exactly once.
+        // 81+ refuses (P1-A1: 73..=80 are the fetch extension);
+        // every export spelling resolves exactly once.
         assert_eq!(API_NAMES.len(), 53);
         let mut seen = std::collections::BTreeSet::new();
         for id in 20..=72u32 {
@@ -21733,7 +34884,7 @@ mod startup_api_controls {
             assert!(ApiId::try_from(id).is_err(), "ApiId {id} must refuse");
         }
         // wire::api also serves the inventoried 1-19 plane; 19 is valid wire.
-        for id in [0, 73, 127, 128, 256, u32::MAX] {
+        for id in [0, 81, 127, 128, 256, u32::MAX] {
             assert!(wire::api(id).is_err(), "wire {id} must refuse");
         }
         assert!(wire::api(19).is_ok());
@@ -23264,6 +36415,7 @@ mod startup_api_controls {
                             links,
                             cookie: index as u64 + 1,
                             api,
+                            armed_ns: None,
                             generation: 1,
                             advertisers: Vec::new(),
                             original: None,
@@ -23716,6 +36868,7 @@ mod startup_api_controls {
             cookie: 81,
             generation: 19,
             api: c::PUBLIC_QUERY,
+            armed_ns: None,
             advertisers: Vec::new(),
             original: None,
             historical: false,
@@ -23741,6 +36894,7 @@ mod startup_api_controls {
                 attachments: Vec::new(),
                 ranges: 0,
                 ready: false,
+                site_gap_apis: BTreeSet::new(),
             },
         )]);
         let mut startup = BTreeMap::from([(child.pid(), vec![a])]);
@@ -24259,5 +37413,52 @@ int main(int argc,char **argv) { if(argc!=4) return 2; ready=argv[1];go=argv[2];
         );
         drop(_pinned);
         child.finish_observation().unwrap();
+    }
+}
+
+/// Ringbuf position-slot reads (P2fix7 NEW-41, host-runnable —
+/// no BPF).
+#[cfg(test)]
+mod ring_position_slots {
+    #[test]
+    fn position_slots_read_distinct_offsets() {
+        // P2fix7 NEW-41: the two position reads land at DISTINCT
+        // correct offsets (consumer +0, producer +page_size) —
+        // a same-address bug (always-equal → false receipts)
+        // fails here. Anonymous mapping with planted distinct
+        // values (host-runnable — no BPF; the kernel ABI half —
+        // consumer@0/producer@page_size — is pinned live by the
+        // genuinely-drained guest positive, which runs the
+        // production mmap path with zero scripting).
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        assert!(page >= 8, "premise: page holds a word");
+        let len = page.checked_mul(2).unwrap();
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "premise: anonymous mapping");
+        unsafe {
+            (base as *mut u64).write(0x1111_1111_1111_1111);
+            ((base as *mut u8).add(page) as *mut u64).write(0x2222_2222_2222_2222);
+            let (consumer, producer) = super::read_positions_from_base(base as *const u8, page);
+            assert_eq!(
+                (consumer, producer),
+                (0x1111_1111_1111_1111, 0x2222_2222_2222_2222),
+                "consumer reads +0, producer reads +page_size"
+            );
+            // Equal values read equal (the receipt comparison's
+            // premise — same value both slots).
+            ((base as *mut u8).add(page) as *mut u64).write(0x1111_1111_1111_1111);
+            let (consumer, producer) = super::read_positions_from_base(base as *const u8, page);
+            assert_eq!(consumer, producer);
+            libc::munmap(base, len);
+        }
     }
 }

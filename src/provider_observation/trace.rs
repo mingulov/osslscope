@@ -24,7 +24,7 @@ pub fn trace_mode_edge_bearing(mode: u32) -> bool {
 pub enum TraceFamily {
     /// Lifecycle-pair IDs (1..=9, 16..=19); ATTEMPT/RESULT wire-valid on 1..=6.
     Lifecycle,
-    /// Fetch carve-out (10..=15).
+    /// Fetch carve-out (10..=15 plus the P1-A1 73..=80 extension).
     Fetch,
     /// Operational exports (20..=72).
     PublicApi,
@@ -41,14 +41,31 @@ impl TraceFamily {
     }
 }
 
-/// Family demux BEFORE unknown-ID rejection (§6D-1). `None` ⟺ {0} ∪ {73+}.
+/// Slots in the per-API edge arrays: IDs 1..=80 addressable, slot 0
+/// unused (P1-A1: grown from 73 with the fetch extension).
+pub const TRACE_API_SLOTS: usize = 81;
+
+/// Family demux BEFORE unknown-ID rejection (§6D-1). `None` ⟺ {0} ∪ {81+}.
 pub fn demux(api: u32) -> Option<TraceFamily> {
     match api {
         1..=9 | 16..=19 => Some(TraceFamily::Lifecycle),
-        10..=15 => Some(TraceFamily::Fetch),
+        10..=15 | 73..=80 => Some(TraceFamily::Fetch),
         20..=72 => Some(TraceFamily::PublicApi),
         _ => None,
     }
+}
+
+/// §6D-6 fallback pairing family (P2fix4 NEW-17): the wire-valid
+/// fetch/lifecycle IDs — lifecycle 1..=6 plus the contract fetch
+/// carve-out (10..=15, 73..=80). ONE classifier shared by
+/// production pairing ([`TraceProducer::pairs`]), intake
+/// validation ([`TraceSummary::validate`]), and the stored
+/// fallback-family check ([`fallback_family_clean`]): the
+/// producer pairs exactly this set under fallback, so intake
+/// accepts exactly this set (expanded-fetch orphans validate;
+/// operational IDs reject).
+pub fn fallback_pairing_family(api: u32) -> bool {
+    matches!(api, 1..=6) || c::fetch_api(api)
 }
 
 /// Fold-input class (F5 / frozen §6D-2 arm 1): operational pairs
@@ -332,13 +349,1179 @@ pub struct ClosedTraceWindow {
     /// Window latency distributions by class ID (§6D-3 default
     /// keying; operational pairs only).
     pub histograms: [TraceHistogram; 5],
+    /// D0-6 aggregate-only fallback active for this window.
+    pub fallback: bool,
+    /// Window per-API distributions (§6D-3 opt-in; `None` unless
+    /// `--trace-histogram-by-api`).
+    pub api_histograms: Option<ApiHistograms>,
     /// Window ATTEMPT edges by API ID (§6D-10 multiset/fetch
     /// inputs; slot 0 unused).
-    pub api_attempts: [u64; 73],
+    pub api_attempts: [u64; TRACE_API_SLOTS],
     /// Window RESULT edges by API ID (slot 0 unused).
-    pub api_results: [u64; 73],
+    pub api_results: [u64; TRACE_API_SLOTS],
     /// Exemplars (≤8 per direction).
     pub exemplars: Vec<TraceExemplar>,
+    /// Pairing-uncertainty for this window (item 3): pairing-state
+    /// corruption was observed (fresh signals below, or taint
+    /// carried across the close). Interpreted distributions
+    /// withhold while set; raw counters/detail/exemplars stay.
+    pub pairing_uncertain: bool,
+    /// Uncertainty reasons (`pending-eviction`, `depth-overflow`,
+    /// `decode-reject`, `late-cut`, `terminal-boundary-failed`,
+    /// `carried`).
+    pub pairing_uncertainty: Vec<String>,
+    /// Late cut (P2fix3 NEW-P2e): the feed cut armed below already-
+    /// consumed timestamps — the fold holds out-of-interval pairs
+    /// it cannot exclude, so the window projection is UNBOUND
+    /// (withheld as window-scoped evidence; diagnostics retain
+    /// with the scope marked).
+    pub late_cut: bool,
+}
+
+/// Per-API latency distributions: `[api - 20][class]` over
+/// operational IDs 20..=72 (§6D-3 opt-in keying).
+pub type ApiHistograms = [[TraceHistogram; 5]; 53];
+
+/// Frozen histogram edge-set marker (§6D-3).
+pub const TRACE_EDGES_MARKER: &str = "6d-frozen-18";
+
+/// Per-class pair counts, §6D-7 presentation order.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceClassCounts {
+    pub success: u64,
+    pub failure: u64,
+    pub empty: u64,
+    pub retry: u64,
+    pub unknown: u64,
+}
+
+impl TraceClassCounts {
+    /// From by-class-ID counts (`[unknown, success, failure, empty,
+    /// retry]` slot order).
+    pub fn from_slots(counts: [u64; 5]) -> Self {
+        Self {
+            success: counts[1],
+            failure: counts[2],
+            empty: counts[3],
+            retry: counts[4],
+            unknown: counts[0],
+        }
+    }
+
+    /// Exact class total (P2fix4 NEW-P2f): widened to u128 so
+    /// an overfull vector can never saturate into a false
+    /// conservation equality at u64::MAX.
+    pub fn sum(self) -> u128 {
+        u128::from(self.success)
+            + u128::from(self.failure)
+            + u128::from(self.empty)
+            + u128::from(self.retry)
+            + u128::from(self.unknown)
+    }
+}
+
+/// One serializable latency distribution (§6D-3 form).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceDistribution {
+    pub buckets: [u64; 19],
+    pub sum: u64,
+    pub count: u64,
+}
+
+impl From<&TraceHistogram> for TraceDistribution {
+    fn from(h: &TraceHistogram) -> Self {
+        Self {
+            buckets: h.buckets,
+            sum: h.sum,
+            count: h.count,
+        }
+    }
+}
+
+/// Default-keyed distributions (§6D-3).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceHistograms {
+    pub edges: String,
+    pub success: TraceDistribution,
+    pub failure: TraceDistribution,
+    pub empty: TraceDistribution,
+    pub retry: TraceDistribution,
+    pub unknown: TraceDistribution,
+}
+
+/// Per-API distributions for one covered API (dense 5 leaves).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceByApiEntry {
+    pub success: TraceDistribution,
+    pub failure: TraceDistribution,
+    pub empty: TraceDistribution,
+    pub retry: TraceDistribution,
+    pub unknown: TraceDistribution,
+}
+
+/// Serde skip predicate for default-false scope marks.
+pub(crate) fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// Document schema minor (`observed-crypto-v2.N`) from either
+/// document shape (producer `schema`, doc_json/raw
+/// `schema_version`). Unparseable/absent reads `None` (the
+/// contract fails closed where a version is required).
+pub(crate) fn doc_minor(doc: &serde_json::Value) -> Option<u64> {
+    let v = doc
+        .get("schema_version")
+        .and_then(|x| x.as_str())
+        .or_else(|| doc.get("schema").and_then(|x| x.as_str()))?;
+    v.strip_prefix("observed-crypto-v2.")?.parse().ok()
+}
+
+/// Required-nullable presence + non-nullable null rules (P2fix4
+/// NEW-19/GATE29): enforced on the RAW section BEFORE serde
+/// normalization collapses absent-vs-null. The raw schema
+/// requires explicit `class_epoch` + `window.class_window`
+/// (present, null allowed — withheld shapes stay explicit);
+/// the non-nullable optionals (`histograms`, `by_api`,
+/// `by_api_availability`) reject explicit null. Same rules at
+/// every typed reader (both presenter inputs via
+/// [`parse_trace_section`], restored checkpoints via the restore
+/// path) — identical to the raw schema gate. Field-naming
+/// errors only (never rejected input text — P2fix4 NEW-4).
+pub(crate) fn check_trace_shape_presence(section: &serde_json::Value) -> Result<(), String> {
+    let obj = section
+        .as_object()
+        .ok_or_else(|| "trace_summary: not an object".to_string())?;
+    if !obj.contains_key("class_epoch") {
+        return Err("trace_summary.class_epoch: required field absent".to_string());
+    }
+    let window = obj
+        .get("window")
+        .and_then(|w| w.as_object())
+        .ok_or_else(|| "trace_summary.window: not an object".to_string())?;
+    if !window.contains_key("class_window") {
+        return Err("trace_summary.window.class_window: required field absent".to_string());
+    }
+    for key in ["histograms", "by_api", "by_api_availability"] {
+        if obj.get(key).is_some_and(|v| v.is_null()) {
+            return Err(format!("trace_summary.{key}: explicit null rejected"));
+        }
+    }
+    Ok(())
+}
+
+/// Strict trace-section read: object shape + [`TraceSummary::validate`]
+/// (version, closed mode word, fallback/mode coherence,
+/// withholding biconditionals, uncertainty vocabulary + scope
+/// coherence, class/paired conservation, cumulative buckets,
+/// L1 combined conservation, edge marker, by-api/availability
+/// agreement, GAP/exemplar/range rules). Closed shape at every
+/// level (P2fix5 NEW-27 — extra properties reject, never
+/// discard, matching the raw schema gate).
+pub(crate) fn parse_trace_section(section: &serde_json::Value) -> Result<TraceSummary, String> {
+    check_trace_shape_presence(section)?;
+    let ts: TraceSummary = serde_json::from_value(section.clone())
+        .map_err(|_| "strict read rejected it".to_string())?;
+    ts.validate()?;
+    Ok(ts)
+}
+
+/// ONE document-level trace contract (P2fix3 GATE29) across raw
+/// intake, both presenter inputs, and restored checkpoints —
+/// the section/version triggers, required-vs-withheld
+/// (via [`TraceSummary::validate`]), inner/outer mode +
+/// uncertainty coherence (ditto), class/histogram conservation
+/// (ditto), and coverage-vs-`api_activity` reconciliation here:
+/// EVERY availability word binds to the producer's worst-wins
+/// rule (P2fix4 GATE29 — the stamp rule in
+/// [`super::cli::trace_availability_from_rows`]: per API the
+/// worst row wins — any `not_attached` row, else any
+/// attachment/finality row, else `covered` over ≥1 clean row;
+/// missing rows read `not_attached`). A claimed word that
+/// differs from its row-derived word rejects, as does any
+/// malformed row (P2fix5 NEW-27 + P2fix6 NEW-37 + P2fix7 NEW-42 —
+/// complete row validation: a present collection must be an
+/// array, and EVERY row carries the complete raw-schema shape
+/// with its api in 20..=72 and no duplicate apis, validated
+/// before ranking — no skips, no short-circuit — whenever the
+/// section is present, EVEN with the by-api opt-in disabled:
+/// supplied rows never bypass shape validation for want of an
+/// availability map). Only the word reconciliation itself is
+/// vacuous without an availability map (no invented requirement
+/// — current producers report none).
+/// Returns the validated section (`None` when legitimately
+/// absent).
+pub(crate) fn check_trace_contract(
+    minor: Option<u64>,
+    section: Option<&TraceSummary>,
+    activity: Option<&serde_json::Value>,
+) -> Result<Option<TraceSummary>, String> {
+    // Section/version triggers (both directions).
+    match (minor, section.is_some()) {
+        (Some(9), false) => {
+            return Err("minor == 9 needs its trace_summary section".to_string());
+        }
+        (_, true) if minor.is_none_or(|m| m < 9) => {
+            return Err("trace_summary needs a schema minor >= 9".to_string());
+        }
+        _ => {}
+    }
+    let Some(ts) = section else {
+        return Ok(None);
+    };
+    // Complete row validation (P2fix5 NEW-27, P2fix6 NEW-37,
+    // P2fix7 NEW-42): applies to SUPPLIED activity whenever the
+    // section is present — EVEN with the by-api opt-in disabled
+    // (no availability-absent skip: a present-but-malformed
+    // collection rejects, never reads-as-absent — only ABSENT
+    // reads rowless, the conservative direction claiming nothing
+    // covered). A PRESENT collection must be an array, and EVERY
+    // row carries the COMPLETE activity-row shape BEFORE ranking
+    // — the raw schema's required keys with exact types (API +
+    // flags alone is insufficient), no unknown keys (the raw
+    // `additionalProperties: false`), each api in 20..=72 like
+    // every other reader, and each api at most ONCE (duplicate
+    // coverage inputs reject on every reader —
+    // availability-driving rows are never silently normalized).
+    // No skips, no short-circuit.
+    let rows: &[serde_json::Value] = match activity {
+        None => &[],
+        Some(collection) => collection
+            .as_array()
+            .map(Vec::as_slice)
+            .ok_or_else(|| "api_activity: present collection must be an array".to_string())?,
+    };
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut ranked: Vec<(u64, u8)> = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let obj = row
+            .as_object()
+            .ok_or_else(|| "api_activity row: want object".to_string())?;
+        for key in obj.keys() {
+            if !matches!(
+                key.as_str(),
+                "api"
+                    | "entries"
+                    | "observed_success"
+                    | "observed_failure"
+                    | "verification_mismatch"
+                    | "unsupported"
+                    | "gaps"
+            ) {
+                return Err("api_activity row: unknown field".to_string());
+            }
+        }
+        let api = obj
+            .get("api")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| "api_activity row api: want u64".to_string())?;
+        if !(20..=72).contains(&api) {
+            return Err("api_activity row api: out of range".to_string());
+        }
+        if !seen.insert(api) {
+            return Err("api_activity: duplicate api row".to_string());
+        }
+        for key in [
+            "entries",
+            "observed_success",
+            "observed_failure",
+            "verification_mismatch",
+            "unsupported",
+        ] {
+            obj.get(key)
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| format!("api_activity row {key}: want u64"))?;
+        }
+        let gaps = obj
+            .get("gaps")
+            .and_then(|g| g.as_object())
+            .ok_or_else(|| "api_activity row without gaps".to_string())?;
+        for key in gaps.keys() {
+            if !matches!(
+                key.as_str(),
+                "map"
+                    | "depth"
+                    | "unpaired"
+                    | "tail"
+                    | "unsupported_return"
+                    | "attachment"
+                    | "finality"
+                    | "not_attached"
+                    | "read_receipt"
+                    | "saturated"
+            ) {
+                return Err("api_activity row gaps: unknown field".to_string());
+            }
+        }
+        for key in ["map", "depth", "unpaired", "tail", "unsupported_return"] {
+            gaps.get(key)
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| format!("api_activity row gaps.{key}: want u64"))?;
+        }
+        let flag = |key: &str| {
+            gaps.get(key)
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| format!("api_activity row gaps.{key}: want bool"))
+        };
+        // All flags validate before branching (no
+        // short-circuit — a malformed sibling flag never
+        // hides behind not_attached). Ranks (the producer's
+        // per-row rule): 0 = not_attached, 1 = partial, 2 =
+        // covered.
+        let (not_attached, attachment, finality) = (
+            flag("not_attached")?,
+            flag("attachment")?,
+            flag("finality")?,
+        );
+        flag("saturated")?;
+        if let Some(receipt) = gaps.get("read_receipt") {
+            receipt
+                .as_bool()
+                .ok_or_else(|| "api_activity row gaps.read_receipt: want bool".to_string())?;
+        }
+        let rank = if not_attached {
+            0
+        } else if attachment || finality {
+            1
+        } else {
+            2
+        };
+        ranked.push((api, rank));
+    }
+    // Coverage reconciliation (availability-gated): every
+    // availability word binds to the producer worst-wins rule
+    // over the validated rows above. Vacuous without a map —
+    // but the row validation above is NOT.
+    if let Some(avail) = ts.by_api_availability.as_ref() {
+        for id in 20..=72u32 {
+            let claimed = avail.get(&id.to_string()).map(String::as_str);
+            let mut worst: Option<u8> = None;
+            for (api, rank) in ranked.iter() {
+                if *api != u64::from(id) {
+                    continue;
+                }
+                worst = Some(worst.map_or(*rank, |w| w.min(*rank)));
+            }
+            let expected = match worst {
+                Some(2) => "covered",
+                Some(1) => "partial_coverage",
+                _ => "not_attached",
+            };
+            if claimed != Some(expected) {
+                return Err(format!(
+                    "by_api_availability[{id}]: claimed {claimed:?} disagrees with worst-wins {expected:?} over api_activity rows"
+                ));
+            }
+        }
+    }
+    Ok(Some(ts.clone()))
+}
+
+/// Stored fallback-family check (P2fix3 NEW-3): a
+/// fallback-shaped stored summary carries ONLY fallback-family
+/// content — fetch/lifecycle classes (class-0 only) and §6D-6
+/// family exemplars (the shared [`fallback_pairing_family`]
+/// classifier — P2fix4 NEW-17). Operational classes or exemplar
+/// IDs fail (the presenter withholds on failure, never trusting
+/// intake alone). Non-fallback summaries always pass.
+pub(crate) fn fallback_family_clean(ts: &TraceSummary) -> bool {
+    if !ts.fallback {
+        return true;
+    }
+    for c in [ts.window.class_window.as_ref(), ts.class_epoch.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        if c.success > 0 || c.failure > 0 || c.empty > 0 || c.retry > 0 {
+            return false;
+        }
+    }
+    ts.window
+        .exemplars
+        .iter()
+        .all(|e| fallback_pairing_family(e.api))
+}
+
+/// §6D-7 window record, typed (JSON shape matches the frozen
+/// record; the additive `fallback` key marks D0-6 state).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceWindowRecord {
+    pub window_seq: u64,
+    pub mode: String,
+    pub fallback: bool,
+    pub paired: u64,
+    pub trace_unpaired_entries: u64,
+    pub trace_unpaired_results: u64,
+    pub trace_depth_exceeded: u64,
+    pub trace_dropped: u64,
+    pub trace_capped: bool,
+    pub trace_nonmonotonic_pairs: u64,
+    pub trace_rejected_unknown_api: u64,
+    pub ring_loss: [u64; 8],
+    /// Window pairs by class (withheld — `None` — while the window
+    /// is pairing-uncertain; a present block always sums to
+    /// `paired`).
+    pub class_window: Option<TraceClassCounts>,
+    /// Pairing-uncertainty for this window (withholding marker).
+    #[serde(default)]
+    pub pairing_uncertain: bool,
+    /// Uncertainty reasons (empty unless uncertain).
+    #[serde(default)]
+    pub pairing_uncertainty: Vec<String>,
+    /// Unbound window scope (P2fix3 NEW-P2e): the fold holds
+    /// out-of-interval pairs past a late cut — the window
+    /// projection withholds as window-scoped evidence while
+    /// diagnostics retain with this mark. Serializes only when
+    /// set (clean-run bytes stable).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub cut_unbound: bool,
+    /// Folded-but-null seq ranges (epoch scope; always empty on a
+    /// single-window summary — the presenter owns the epoch fold).
+    #[serde(default)]
+    pub unmeasured_seqs: Vec<[u64; 2]>,
+    #[serde(default)]
+    pub gaps: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub gap_overflow: u64,
+    #[serde(default)]
+    pub exemplars: Vec<TraceExemplarJson>,
+}
+
+/// Exemplar JSON (§6D-7: hashes, never raw cookies).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceExemplarJson {
+    pub dir: String,
+    pub key_hash16: String,
+    pub api: u32,
+    pub age_ns: u64,
+}
+
+/// Document-level trace projection (v2.9 `trace_summary`): the
+/// sealed window record + epoch folds. Histograms ride latency-
+/// bearing modes only; by-api rides the opt-in only.
+/// Closed shape (P2fix5 NEW-27 — every level denies unknown
+/// fields, matching the raw schema's `additionalProperties:
+/// false`): the typed readers enforce the same
+/// pre-normalization shape as the raw gate (extra properties
+/// reject, never discard).
+#[derive(Clone, PartialEq, Eq, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TraceSummary {
+    /// Summary version (1).
+    pub version: u32,
+    /// Effective mode word.
+    pub mode: String,
+    /// D0-6 aggregate-only fallback active.
+    pub fallback: bool,
+    /// Sealed §6D-7 window record.
+    pub window: TraceWindowRecord,
+    /// Epoch pairing-uncertainty (sticky withholding marker).
+    #[serde(default)]
+    pub pairing_uncertain: bool,
+    /// Epoch pairs by class (withheld — `None` — while the epoch
+    /// is pairing-uncertain).
+    pub class_epoch: Option<TraceClassCounts>,
+    /// Epoch default-keyed distributions (None in status mode).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub histograms: Option<TraceHistograms>,
+    /// Sparse per-API distributions (None unless the opt-in
+    /// produced them; L1 keys are decimal API-ID strings of
+    /// covered APIs only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_api: Option<std::collections::BTreeMap<String, TraceByApiEntry>>,
+    /// Dense per-API availability (present iff `by_api` is
+    /// non-null; all 53 IDs, closed `covered`/`not_attached`/
+    /// `partial_coverage` vocabulary).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by_api_availability: Option<std::collections::BTreeMap<String, String>>,
+}
+
+impl TraceSummary {
+    /// Strict self-validation — the SAME rules raw intake and both
+    /// presenter paths enforce (items 4/23): version, closed mode
+    /// word, mode/fallback coherence (fallback rides metadata only
+    /// with fetch-only classes and no distributions; off/metadata
+    /// without fallback pair nothing; status carries no
+    /// histograms), withholding biconditionals (classes present
+    /// iff certain), uncertainty vocabulary + coherence
+    /// (uncertain iff reasons nonempty; unbound mark iff
+    /// late-cut reason), class/paired conservation,
+    /// histogram-count coherence (folded counts never exceed
+    /// their class; no positive sum without pairs),
+    /// cumulative-bucket invariants (default AND by-api),
+    /// combined L1 conservation (counts/buckets/sums never
+    /// exceed the default fold), edge marker,
+    /// by-api/availability agreement (both directions — entries
+    /// need covered AND covered needs entries), empty GAP inputs
+    /// (DELTA-3: nonempty rejected until a typed producer
+    /// exists), exemplar identities (fallback family only under
+    /// fallback), and well-formed ranges.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "trace_summary.version: want 1, got {}",
+                self.version
+            ));
+        }
+        if !matches!(
+            self.mode.as_str(),
+            "off" | "metadata" | "latency" | "status" | "all"
+        ) {
+            // Field-only (P2fix4 NEW-4 — the rejected word never
+            // echoes).
+            return Err("trace_summary.mode: bad word".to_string());
+        }
+        let latency_bearing = matches!(self.mode.as_str(), "latency" | "all");
+        let edge_bearing = trace_mode_edge_bearing(match self.mode.as_str() {
+            "off" => TRACE_MODE_OFF,
+            "metadata" => TRACE_MODE_METADATA,
+            "latency" => TRACE_MODE_LATENCY,
+            "status" => TRACE_MODE_STATUS,
+            _ => TRACE_MODE_ALL,
+        });
+        // Withholding biconditionals (classes present iff certain).
+        if self.window.class_window.is_none() != self.window.pairing_uncertain {
+            return Err(
+                "trace_summary.window: class_window withheld iff pairing_uncertain".to_string(),
+            );
+        }
+        if self.class_epoch.is_none() != self.pairing_uncertain {
+            return Err("trace_summary: class_epoch withheld iff pairing_uncertain".to_string());
+        }
+        // Uncertain summaries carry no interpreted distributions.
+        if self.pairing_uncertain && (self.histograms.is_some() || self.by_api.is_some()) {
+            return Err(
+                "trace_summary: uncertain epoch must withhold histograms/by_api".to_string(),
+            );
+        }
+        // Inner/outer coherence (P2fix2 item 13): an uncertain
+        // window taints its epoch — inner-uncertain under
+        // outer-certain is incoherent (the sticky direction is
+        // inner-certain + outer-uncertain). Mode + fallback words
+        // agree (one resolution stamps both — a mismatch is a
+        // forged section).
+        if self.window.pairing_uncertain && !self.pairing_uncertain {
+            return Err("trace_summary: uncertain window under certain epoch".to_string());
+        }
+        if self.window.mode != self.mode {
+            return Err("trace_summary: window/outer mode mismatch".to_string());
+        }
+        if self.window.fallback != self.fallback {
+            return Err("trace_summary: window/outer fallback mismatch".to_string());
+        }
+        // Uncertainty reasons (P2fix3 DELTA-8): closed vocabulary
+        // (the six seal reasons — P2fix6 NEW-32 adds the explicit
+        // terminal-boundary failure) + uncertain-iff-nonempty —
+        // every renderer (JSON, frames, terminal) reads validated
+        // reasons only, never free strings.
+        for reason in self.window.pairing_uncertainty.iter() {
+            if !matches!(
+                reason.as_str(),
+                "pending-eviction"
+                    | "depth-overflow"
+                    | "decode-reject"
+                    | "late-cut"
+                    | "terminal-boundary-failed"
+                    | "carried"
+            ) {
+                // Field-only (P2fix4 NEW-4 — the rejected reason
+                // never echoes).
+                return Err("trace_summary.window: bad uncertainty reason".to_string());
+            }
+        }
+        if self.window.pairing_uncertain == self.window.pairing_uncertainty.is_empty() {
+            return Err(
+                "trace_summary.window: pairing_uncertain iff pairing_uncertainty nonempty"
+                    .to_string(),
+            );
+        }
+        // Unbound scope (P2fix3 NEW-P2e): the mark rides the
+        // late-cut reason exactly (mark ⟺ reason present), and a
+        // marked window is always pairing-uncertain (the seal
+        // latches both together).
+        let late_cut_reason = self
+            .window
+            .pairing_uncertainty
+            .iter()
+            .any(|r| r == "late-cut");
+        if self.window.cut_unbound != late_cut_reason {
+            return Err("trace_summary.window: cut_unbound iff late-cut reason".to_string());
+        }
+        if self.window.cut_unbound && !self.window.pairing_uncertain {
+            return Err(
+                "trace_summary.window: unbound window must be pairing-uncertain".to_string(),
+            );
+        }
+        // Fallback rides metadata only, with fetch-only classes and
+        // no distributions.
+        if self.fallback {
+            if self.mode != "metadata" {
+                return Err("trace_summary: fallback rides metadata only".to_string());
+            }
+            if self.histograms.is_some() || self.by_api.is_some() {
+                return Err("trace_summary: fallback carries no histograms/by_api".to_string());
+            }
+            for (scope, classes) in [
+                ("class_window", self.window.class_window.as_ref()),
+                ("class_epoch", self.class_epoch.as_ref()),
+            ] {
+                if let Some(c) = classes {
+                    if c.success > 0 || c.failure > 0 || c.empty > 0 || c.retry > 0 {
+                        return Err(format!(
+                            "trace_summary.{scope}: operational classes under fallback"
+                        ));
+                    }
+                }
+            }
+        }
+        // Off/metadata without fallback never seal (the producer
+        // gates seals on pairing modes + fallback) — reject
+        // outright, same as raw intake ("ride fallback only").
+        if !self.fallback && !edge_bearing {
+            return Err("trace_summary: non-pairing mode without fallback".to_string());
+        }
+        // Status carries classes but no histograms (default or
+        // by-API — P2fix2 item 13 closes the by-API hole).
+        if !self.fallback && self.mode == "status" && self.histograms.is_some() {
+            return Err("trace_summary: status mode must not carry histograms".to_string());
+        }
+        if !self.fallback && self.mode == "status" && self.by_api.is_some() {
+            return Err("trace_summary: status mode must not carry by_api".to_string());
+        }
+        // Latency-bearing certain summaries carry histograms.
+        if !self.fallback && latency_bearing && !self.pairing_uncertain && self.histograms.is_none()
+        {
+            return Err("trace_summary: latency-bearing mode without histograms".to_string());
+        }
+        if let Some(cw) = self.window.class_window.as_ref() {
+            if cw.sum() != u128::from(self.window.paired) {
+                return Err("trace_summary.window: class_window does not sum to paired".to_string());
+            }
+        }
+        if let Some(h) = self.histograms.as_ref() {
+            if h.edges != TRACE_EDGES_MARKER {
+                return Err(format!(
+                    "trace_summary.histograms.edges: want {TRACE_EDGES_MARKER:?}"
+                ));
+            }
+            for (name, dist) in [
+                ("success", &h.success),
+                ("failure", &h.failure),
+                ("empty", &h.empty),
+                ("retry", &h.retry),
+                ("unknown", &h.unknown),
+            ] {
+                if dist.buckets[18] != dist.count {
+                    return Err(format!(
+                        "trace_summary.histograms.{name}: buckets[18] != count"
+                    ));
+                }
+                // Impossible sum (P2fix3 NEW-P2f): no pairs folded
+                // a positive total — same rule as the adapters.
+                if dist.count == 0 && dist.sum > 0 {
+                    return Err(format!(
+                        "trace_summary.histograms.{name}: count=0 with sum>0"
+                    ));
+                }
+                let mut prev = 0u64;
+                for (i, b) in dist.buckets.iter().enumerate() {
+                    if *b < prev {
+                        return Err(format!(
+                            "trace_summary.histograms.{name}: buckets not cumulative at {i}"
+                        ));
+                    }
+                    prev = *b;
+                }
+            }
+            // Folded durations never exceed their class (nonmonotonic
+            // pairs are excluded from exactly their class).
+            if let Some(ce) = self.class_epoch.as_ref() {
+                for (name, dist, class) in [
+                    ("success", &h.success, ce.success),
+                    ("failure", &h.failure, ce.failure),
+                    ("empty", &h.empty, ce.empty),
+                    ("retry", &h.retry, ce.retry),
+                    ("unknown", &h.unknown, ce.unknown),
+                ] {
+                    if dist.count > class {
+                        return Err(format!(
+                            "trace_summary.histograms.{name}: count above class"
+                        ));
+                    }
+                }
+            }
+        }
+        match (&self.by_api, &self.by_api_availability) {
+            (None, None) => {}
+            (Some(by_api), Some(avail)) => {
+                // L1 sub-folds ride the default fold (P2fix2 item
+                // 13): by_api without histograms is impossible (the
+                // mode rules above already exclude every such case;
+                // this states it mode-independently).
+                if self.histograms.is_none() {
+                    return Err("trace_summary: by_api without histograms".to_string());
+                }
+                if avail.len() != 53 {
+                    return Err(format!(
+                        "trace_summary.by_api_availability: want 53 entries, got {}",
+                        avail.len()
+                    ));
+                }
+                for id in 20..=72u32 {
+                    match avail.get(&id.to_string()).map(String::as_str) {
+                        Some("covered" | "not_attached" | "partial_coverage") => {}
+                        // Field-only (P2fix4 NEW-4 — the rejected
+                        // word never echoes; the [id] is the loop
+                        // index, not input).
+                        _ => {
+                            return Err(format!(
+                                "trace_summary.by_api_availability[{id}]: bad word"
+                            ));
+                        }
+                    }
+                }
+                for (id, entry) in by_api.iter() {
+                    // Field-only (P2fix4 NEW-4 — the rejected key
+                    // never echoes).
+                    let parsed: u32 = id
+                        .parse()
+                        .map_err(|_| "trace_summary.by_api: bad key".to_string())?;
+                    if !(20..=72).contains(&parsed) || *id != parsed.to_string() {
+                        return Err("trace_summary.by_api: bad key".to_string());
+                    }
+                    if avail.get(id).map(String::as_str) != Some("covered") {
+                        return Err(format!(
+                            "trace_summary.by_api[{id}]: L1 entry without covered availability"
+                        ));
+                    }
+                    for (name, dist) in [
+                        ("success", &entry.success),
+                        ("failure", &entry.failure),
+                        ("empty", &entry.empty),
+                        ("retry", &entry.retry),
+                        ("unknown", &entry.unknown),
+                    ] {
+                        if dist.buckets[18] != dist.count {
+                            return Err(format!(
+                                "trace_summary.by_api[{id}].{name}: buckets[18] != count"
+                            ));
+                        }
+                        // Impossible sum (P2fix3 NEW-P2f — same
+                        // rule as the default fold above).
+                        if dist.count == 0 && dist.sum > 0 {
+                            return Err(format!(
+                                "trace_summary.by_api[{id}].{name}: count=0 with sum>0"
+                            ));
+                        }
+                        let mut prev = 0u64;
+                        for (i, b) in dist.buckets.iter().enumerate() {
+                            if *b < prev {
+                                return Err(format!(
+                                    "trace_summary.by_api[{id}].{name}: buckets not cumulative at {i}"
+                                ));
+                            }
+                            prev = *b;
+                        }
+                    }
+                    // Impossible distributions (P2fix2 item 13): an
+                    // L1 sub-fold never exceeds its default fold —
+                    // the covered API's pairs are a subset of all
+                    // pairs (per class).
+                    if let Some(h) = self.histograms.as_ref() {
+                        for (name, l1, base) in [
+                            ("success", &entry.success, &h.success),
+                            ("failure", &entry.failure, &h.failure),
+                            ("empty", &entry.empty, &h.empty),
+                            ("retry", &entry.retry, &h.retry),
+                            ("unknown", &entry.unknown, &h.unknown),
+                        ] {
+                            if l1.count > base.count {
+                                return Err(format!(
+                                    "trace_summary.by_api[{id}].{name}: L1 count above default"
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Exact class conservation (P2fix3 NEW-P2f): the L1
+                // sub-folds conserve into their default fold per
+                // class — the COMBINED L1 counts, bucket masses,
+                // and sums never exceed the parent (each entry
+                // alone may fit while their sum overflows; summed
+                // in u128 — no saturation masks a surplus).
+                if let Some(h) = self.histograms.as_ref() {
+                    fn l1_success(e: &TraceByApiEntry) -> &TraceDistribution {
+                        &e.success
+                    }
+                    fn l1_failure(e: &TraceByApiEntry) -> &TraceDistribution {
+                        &e.failure
+                    }
+                    fn l1_empty(e: &TraceByApiEntry) -> &TraceDistribution {
+                        &e.empty
+                    }
+                    fn l1_retry(e: &TraceByApiEntry) -> &TraceDistribution {
+                        &e.retry
+                    }
+                    fn l1_unknown(e: &TraceByApiEntry) -> &TraceDistribution {
+                        &e.unknown
+                    }
+                    for (name, base, l1_of) in [
+                        (
+                            "success",
+                            &h.success,
+                            l1_success as fn(&TraceByApiEntry) -> &TraceDistribution,
+                        ),
+                        (
+                            "failure",
+                            &h.failure,
+                            l1_failure as fn(&TraceByApiEntry) -> &TraceDistribution,
+                        ),
+                        (
+                            "empty",
+                            &h.empty,
+                            l1_empty as fn(&TraceByApiEntry) -> &TraceDistribution,
+                        ),
+                        (
+                            "retry",
+                            &h.retry,
+                            l1_retry as fn(&TraceByApiEntry) -> &TraceDistribution,
+                        ),
+                        (
+                            "unknown",
+                            &h.unknown,
+                            l1_unknown as fn(&TraceByApiEntry) -> &TraceDistribution,
+                        ),
+                    ] {
+                        let count_sum: u128 = by_api.values().map(|e| l1_of(e).count as u128).sum();
+                        if count_sum > base.count as u128 {
+                            return Err(format!(
+                                "trace_summary.by_api.{name}: combined L1 count above default"
+                            ));
+                        }
+                        let sum_sum: u128 = by_api.values().map(|e| l1_of(e).sum as u128).sum();
+                        if sum_sum > base.sum as u128 {
+                            return Err(format!(
+                                "trace_summary.by_api.{name}: combined L1 sum above default"
+                            ));
+                        }
+                        for i in 0..19 {
+                            let bucket_sum: u128 =
+                                by_api.values().map(|e| l1_of(e).buckets[i] as u128).sum();
+                            if bucket_sum > base.buckets[i] as u128 {
+                                return Err(format!(
+                                    "trace_summary.by_api.{name}: combined L1 bucket {i} above default"
+                                ));
+                            }
+                        }
+                    }
+                }
+                // Complete coverage binding: every covered API needs
+                // its L1 entry (a covered-but-absent API is an
+                // incomplete projection, never a silent zero).
+                for id in 20..=72u32 {
+                    if avail.get(&id.to_string()).map(String::as_str) == Some("covered")
+                        && !by_api.contains_key(&id.to_string())
+                    {
+                        return Err(format!(
+                            "trace_summary.by_api: covered API {id} without entry"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                return Err(
+                    "trace_summary: by_api and by_api_availability must be jointly present or absent"
+                        .to_string(),
+                );
+            }
+        }
+        // GAP inputs (DELTA-3): empty + zero until a typed producer
+        // and read-set are reviewed — nonempty inputs reject.
+        if !self.window.gaps.is_empty() {
+            return Err("trace_summary.window: nonempty gaps[]".to_string());
+        }
+        if self.window.gap_overflow > 0 {
+            return Err("trace_summary.window: nonzero gap_overflow".to_string());
+        }
+        // Exemplar identities: closed direction, 16-hex hash (never
+        // a raw cookie), wire-valid API — and under fallback the
+        // §6D-6 pairing family only (P2fix3 NEW-10 as corrected by
+        // P2fix4 NEW-17: the shared `fallback_pairing_family`
+        // classifier — a fallback producer pairs fetch/lifecycle
+        // IDs 1..=6/10..=15/73..=80, so an operational exemplar
+        // under fallback is forged or corrupt, never
+        // projectable).
+        for e in self.window.exemplars.iter() {
+            if e.dir != "entry" && e.dir != "result" {
+                // Field-only (P2fix4 NEW-4 — the rejected dir
+                // never echoes).
+                return Err("trace_summary.window.exemplars: bad dir".to_string());
+            }
+            // Canonical lowercase spelling (P2fix6 NEW-37 — the
+            // raw schema's `^[0-9a-f]{16}$`; uppercase hex that
+            // the raw gate excludes must not pass the typed
+            // reader).
+            if e.key_hash16.len() != 16
+                || !e
+                    .key_hash16
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err("trace_summary.window.exemplars: bad key_hash16".to_string());
+            }
+            if !matches!(e.api, 1..=6 | 10..=15 | 20..=72 | 73..=80) {
+                return Err(format!("trace_summary.window.exemplars: bad api {}", e.api));
+            }
+            if self.fallback && !fallback_pairing_family(e.api) {
+                return Err(format!(
+                    "trace_summary.window.exemplars: non-family api {} under fallback",
+                    e.api
+                ));
+            }
+        }
+        // Unmeasured ranges: ascending, non-overlapping, well-formed.
+        let mut prev_end: Option<u64> = None;
+        for range in self.window.unmeasured_seqs.iter() {
+            if range[0] > range[1] {
+                return Err("trace_summary.window: malformed unmeasured range".to_string());
+            }
+            if let Some(end) = prev_end {
+                if end >= range[0] {
+                    return Err("trace_summary.window: overlapping unmeasured ranges".to_string());
+                }
+            }
+            prev_end = Some(range[1]);
+        }
+        Ok(())
+    }
+}
+
+impl TraceSummary {
+    /// Human section (PUBLIC-API plane, never physical entries):
+    /// mode, pairs, classes, unpaired visibility, histogram counts.
+    pub fn human_section(&self) -> String {
+        let mut s = String::from(
+            "trace (public-API pairs/classes/durations; never physical callback entries, never observer overhead):\n",
+        );
+        let w = &self.window;
+        // Unbound window projection (P2fix4 NEW-P2e — the focused
+        // twin of the standalone rule): a late cut withholds
+        // paired as window-scoped evidence with the cause named;
+        // the scope mark rides only when set (clean lines
+        // byte-stable). The retained count stays in the
+        // explicitly unbound document JSON (paired + mark).
+        let paired = if w.cut_unbound {
+            "withheld (late-cut)".to_string()
+        } else {
+            w.paired.to_string()
+        };
+        s.push_str(&format!(
+            "  mode={} fallback={} paired={} unpaired_e={} unpaired_r={}{}\n",
+            self.mode,
+            self.fallback,
+            paired,
+            w.trace_unpaired_entries,
+            w.trace_unpaired_results,
+            if w.cut_unbound {
+                " cut_unbound=true"
+            } else {
+                ""
+            },
+        ));
+        match w.class_window.as_ref() {
+            Some(c) => s.push_str(&format!(
+                "  class success={} failure={} empty={} retry={} unknown={}\n",
+                c.success, c.failure, c.empty, c.retry, c.unknown
+            )),
+            None => s.push_str("  class: withheld (pairing uncertainty)\n"),
+        }
+        match self.class_epoch.as_ref() {
+            Some(c) => s.push_str(&format!(
+                "  epoch success={} failure={} empty={} retry={} unknown={}\n",
+                c.success, c.failure, c.empty, c.retry, c.unknown
+            )),
+            None => s.push_str("  epoch: withheld (pairing uncertainty)\n"),
+        }
+        match self.histograms.as_ref() {
+            Some(h) => s.push_str(&format!(
+                "  histograms({}) success={} failure={} empty={} retry={} unknown={}\n",
+                h.edges,
+                h.success.count,
+                h.failure.count,
+                h.empty.count,
+                h.retry.count,
+                h.unknown.count
+            )),
+            // Withholding governs this renderer too (P2fix2 item
+            // 10): an uncertain epoch withholds (never the status
+            // mislabel); a certain epoch without histograms is
+            // honestly a non-latency mode.
+            None if self.pairing_uncertain => {
+                s.push_str("  histograms: withheld (pairing uncertainty)\n")
+            }
+            None => s.push_str("  histograms: none (status mode)\n"),
+        }
+        match self.by_api.as_ref() {
+            Some(by_api) => s.push_str(&format!("  by_api: {} covered APIs\n", by_api.len())),
+            // Same withholding rule (never silent while uncertain;
+            // silent when the certain mode produces none).
+            None if self.pairing_uncertain => {
+                s.push_str("  by_api: withheld (pairing uncertainty)\n")
+            }
+            None => {}
+        }
+        s
+    }
+}
+
+/// Per-call metadata trace (JSON): retained detail rows with the
+/// full pairing identity MINUS the raw cookie (§6D-6:
+/// `{pid, tid, generation, key_hash16, invocation, api}` plus
+/// kind/timestamp/outcome — a strict subset of the §6D-1
+/// allowlist). Raw cookies, parameter values, `rv` scalars, and
+/// strings never appear here (§6D-11).
+pub fn detail_json(window: &ClosedTraceWindow) -> serde_json::Value {
+    serde_json::Value::Array(
+        window
+            .detail
+            .iter()
+            .map(|row| {
+                serde_json::json!({
+                    "kind": row.kind,
+                    "api": row.api,
+                    "pid": row.key.pid,
+                    "tid": row.key.tid,
+                    "generation": row.key.generation,
+                    "key_hash16": row.key.key_hash16,
+                    "invocation": row.key.invocation,
+                    "monotonic_ns": row.monotonic_ns,
+                    "outcome": row.outcome,
+                })
+            })
+            .collect(),
+    )
+}
+
+/// Project a sealed window + totals into a document summary.
+/// `availability` maps operational API IDs to the frozen
+/// availability words (computed from `ApiActivityRow` gaps at the
+/// stamp site); the L1 block keeps covered APIs only.
+pub fn summarize(
+    window: &ClosedTraceWindow,
+    totals: &TraceTotals,
+    mode_word: &str,
+    availability: Option<&std::collections::BTreeMap<u32, String>>,
+) -> TraceSummary {
+    // Withholding (items 3/14): interpreted duration/status
+    // distributions withhold while uncertain (epoch scope for
+    // cumulative folds, window scope for the window block); raw
+    // counters/lanes/unpaired/exemplars always flow.
+    let epoch_uncertain = totals.pairing_uncertain;
+    let window_uncertain = window.pairing_uncertain;
+    let class_epoch = if epoch_uncertain {
+        None
+    } else {
+        Some(TraceClassCounts::from_slots(totals.class_counts))
+    };
+    let latency_bearing = matches!(mode_word, "latency" | "all");
+    let histograms = if latency_bearing && !epoch_uncertain {
+        Some(TraceHistograms {
+            edges: TRACE_EDGES_MARKER.to_string(),
+            success: TraceDistribution::from(&totals.histograms[1]),
+            failure: TraceDistribution::from(&totals.histograms[2]),
+            empty: TraceDistribution::from(&totals.histograms[3]),
+            retry: TraceDistribution::from(&totals.histograms[4]),
+            unknown: TraceDistribution::from(&totals.histograms[0]),
+        })
+    } else {
+        None
+    };
+    let (by_api, by_api_availability) = match (
+        latency_bearing && !epoch_uncertain,
+        availability,
+        totals.api_histograms,
+    ) {
+        (true, Some(avail), Some(hists)) => {
+            let mut map = std::collections::BTreeMap::new();
+            let mut dense = std::collections::BTreeMap::new();
+            for id in 20..=72u32 {
+                let word = avail
+                    .get(&id)
+                    .cloned()
+                    .unwrap_or_else(|| "not_attached".to_string());
+                dense.insert(id.to_string(), word.clone());
+                if word == "covered" {
+                    let cell = &hists[(id - 20) as usize];
+                    map.insert(
+                        id.to_string(),
+                        TraceByApiEntry {
+                            success: TraceDistribution::from(&cell[1]),
+                            failure: TraceDistribution::from(&cell[2]),
+                            empty: TraceDistribution::from(&cell[3]),
+                            retry: TraceDistribution::from(&cell[4]),
+                            unknown: TraceDistribution::from(&cell[0]),
+                        },
+                    );
+                }
+            }
+            (Some(map), Some(dense))
+        }
+        _ => (None, None),
+    };
+    TraceSummary {
+        version: 1,
+        mode: mode_word.to_string(),
+        fallback: window.fallback,
+        pairing_uncertain: epoch_uncertain,
+        window: TraceWindowRecord {
+            window_seq: window.window_seq,
+            mode: mode_word.to_string(),
+            fallback: window.fallback,
+            paired: window.paired,
+            trace_unpaired_entries: window.unpaired_entries,
+            trace_unpaired_results: window.unpaired_results,
+            trace_depth_exceeded: window.depth_exceeded,
+            trace_dropped: window.dropped,
+            trace_capped: window.capped,
+            trace_nonmonotonic_pairs: window.nonmonotonic_pairs,
+            trace_rejected_unknown_api: window.rejected_unknown_api,
+            ring_loss: window.ring_loss,
+            class_window: if window_uncertain {
+                None
+            } else {
+                Some(TraceClassCounts::from_slots(window.class_counts))
+            },
+            pairing_uncertain: window_uncertain,
+            pairing_uncertainty: window.pairing_uncertainty.clone(),
+            cut_unbound: window.late_cut,
+            unmeasured_seqs: vec![],
+            gaps: vec![],
+            gap_overflow: 0,
+            exemplars: window
+                .exemplars
+                .iter()
+                .take(16)
+                .map(|e| TraceExemplarJson {
+                    dir: match e.dir {
+                        ExemplarDir::Entry => "entry".to_string(),
+                        ExemplarDir::Result => "result".to_string(),
+                    },
+                    key_hash16: e.key_hash16.clone(),
+                    api: e.api,
+                    age_ns: e.age_ns,
+                })
+                .collect(),
+        },
+        class_epoch,
+        histograms,
+        by_api,
+        by_api_availability,
+    }
 }
 
 /// Cumulative session totals.
@@ -348,6 +1531,9 @@ pub struct TraceTotals {
     pub class_counts: [u64; 5],
     /// Cumulative latency distributions by class ID.
     pub histograms: [TraceHistogram; 5],
+    /// Cumulative per-API distributions (§6D-3 opt-in; `None`
+    /// unless `--trace-histogram-by-api`).
+    pub api_histograms: Option<ApiHistograms>,
     /// Cumulative pairs.
     pub paired: u64,
     /// Cumulative unpaired ATTEMPTs.
@@ -372,6 +1558,11 @@ pub struct TraceTotals {
     pub windows: u64,
     /// Capped windows.
     pub capped_windows: u64,
+    /// Epoch pairing-uncertainty (sticky: latched by any uncertain
+    /// window, never cleared within the run — cumulative folds
+    /// cannot un-mix suspect pairs, so epoch interpreted
+    /// distributions stay withheld once tainted).
+    pub pairing_uncertain: bool,
 }
 
 /// Trace data-plane producer: demux + pairing + caps + counters.
@@ -423,10 +1614,17 @@ pub struct TraceProducer {
     class_counts: [u64; 5],
     /// Window latency distributions by class ID.
     histograms: [TraceHistogram; 5],
+    /// D0-6 aggregate-only fallback: fetch/lifecycle pair
+    /// (class-0); operational edges never pair.
+    fallback: bool,
+    /// §6D-3 by-api opt-in enabled.
+    histogram_by_api: bool,
+    /// Window per-API distributions (`Some` iff opt-in on).
+    api_hists: Option<ApiHistograms>,
     /// Window ATTEMPT edges by API ID.
-    api_attempts: [u64; 73],
+    api_attempts: [u64; TRACE_API_SLOTS],
     /// Window RESULT edges by API ID.
-    api_results: [u64; 73],
+    api_results: [u64; TRACE_API_SLOTS],
     /// Window exemplars.
     exemplars: Vec<TraceExemplar>,
     /// Window paired count.
@@ -445,6 +1643,60 @@ pub struct TraceProducer {
     nonmonotonic_pairs: u64,
     /// Window rejected records.
     rejected_unknown_api: u64,
+    /// Window decode-domain rejections, ALL causes (P2fix2 item 5:
+    /// the session funnel routes every generic wire rejection here;
+    /// unknown-ID records ALSO count under
+    /// `rejected_unknown_api`, so this is the superset — same
+    /// `decode-reject` taint, exact per-cause counts). Window scope
+    /// (resets at close); unpublished (the taint + session gaps
+    /// carry the signal).
+    wire_rejected: u64,
+    /// Window late-cut taint (P2fix2 item 13): set when a cut
+    /// (6A fence edge or feed-cut claim end) is noted at or below
+    /// an already-folded timestamp — the irreversible fold cannot
+    /// exclude those pairs, so the window seals `late-cut`
+    /// uncertain.
+    late_cut: bool,
+    /// Terminal settlement proof (P2fix2 item 5): set by
+    /// `finalize` (every held edge terminally accounted), cleared
+    /// by any later pairing-state mutation (feeds, rejections) and
+    /// by any uncertain close. A close proves a fresh boundary
+    /// only when settled AND clean — empty host pending maps alone
+    /// never clear taint.
+    settled: bool,
+    /// Failed terminal boundary latch (P2fix3 PAIRING): set by
+    /// [`Self::note_boundary_failure`] when the terminal cut
+    /// fails — sticky (a failed boundary is terminal, so nothing
+    /// after it can prove freshness). A close proves fresh only
+    /// when this latch is clear: taint clears ONLY on a
+    /// successful producer boundary.
+    boundary_failed: bool,
+    /// Positive terminal-drain receipt (P2fix5 NEW-23): set ONLY
+    /// by [`Self::note_terminal_drain`] on a quiescence-confirmed
+    /// clean terminal drain (affirmative writer quiescence + ring
+    /// exhaustion — a bare `None` is NOT clean). The fresh-
+    /// boundary proof requires it: host finalization alone
+    /// (settled + clean, no drainage evidence) carries taint,
+    /// never clears it. Consumed by the next close; voided by any
+    /// later pairing-state mutation (like `settled`).
+    terminal_drain_proved: bool,
+    /// Per-pid maximum folded monotonic timestamp, this window
+    /// (P2fix2 item 13: the 6A fence is per-pid, so the overrun
+    /// check scopes to the fenced pid). Capped (kernel-mirrored
+    /// bound); past the cap the global max below answers (sound
+    /// direction — over-taint, never a miss).
+    fed_max: HashMap<u32, u64>,
+    /// Global maximum folded monotonic timestamp, this window
+    /// (claim-end binding + per-pid-map fallback).
+    fed_max_global: u64,
+    /// Live pairing-uncertainty taint (item 3): set when pairing-
+    /// state corruption is observed (pending eviction, depth
+    /// overflow, decode rejection — never plain ring loss), carried
+    /// across closes until a proved fresh boundary (terminal
+    /// settlement via `finalize` plus a clean close — P2fix2 item
+    /// 5) clears it. Epoch totals latch it sticky (cumulative folds
+    /// cannot un-mix suspect pairs).
+    pairing_uncertain: bool,
 }
 
 /// A held edge awaiting its counterpart (N → N+1 carry).
@@ -597,8 +1849,11 @@ impl TraceProducer {
             dropped: 0,
             class_counts: [0; 5],
             histograms: [TraceHistogram::default(); 5],
-            api_attempts: [0; 73],
-            api_results: [0; 73],
+            fallback: false,
+            histogram_by_api: false,
+            api_hists: None,
+            api_attempts: [0; TRACE_API_SLOTS],
+            api_results: [0; TRACE_API_SLOTS],
             exemplars: Vec::new(),
             paired: 0,
             unpaired_entries: 0,
@@ -608,6 +1863,14 @@ impl TraceProducer {
             received: ReceivedCounts::default(),
             nonmonotonic_pairs: 0,
             rejected_unknown_api: 0,
+            wire_rejected: 0,
+            late_cut: false,
+            settled: false,
+            boundary_failed: false,
+            terminal_drain_proved: false,
+            fed_max: HashMap::new(),
+            fed_max_global: 0,
+            pairing_uncertain: false,
         }
     }
 
@@ -619,6 +1882,58 @@ impl TraceProducer {
     /// Active mode word.
     pub fn mode(&self) -> u32 {
         self.mode
+    }
+
+    /// Engage the D0-6 aggregate-only fallback (fetch/lifecycle
+    /// pair; operational edges never pair). The session pairs this
+    /// with BPF `TRACE_MODE_METADATA` (no operational emission).
+    pub fn set_fallback(&mut self, fallback: bool) {
+        self.fallback = fallback;
+    }
+
+    /// Fallback active?
+    pub fn fallback(&self) -> bool {
+        self.fallback
+    }
+
+    /// Enable the §6D-3 by-api histogram opt-in (default off).
+    pub fn set_histogram_by_api(&mut self, on: bool) {
+        self.histogram_by_api = on;
+        if on {
+            if self.api_hists.is_none() {
+                self.api_hists = Some([[TraceHistogram::default(); 5]; 53]);
+            }
+            if self.totals.api_histograms.is_none() {
+                self.totals.api_histograms = Some([[TraceHistogram::default(); 5]; 53]);
+            }
+        } else {
+            self.api_hists = None;
+            self.totals.api_histograms = None;
+        }
+    }
+
+    /// By-api opt-in active?
+    pub fn histogram_by_api(&self) -> bool {
+        self.histogram_by_api
+    }
+
+    /// Pairing predicate: operational pairs only on the
+    /// edge-bearing path without fallback; fetch/lifecycle pair on
+    /// the edge-bearing path OR — under fallback — exactly the
+    /// shared §6D-6 family (P2fix4 NEW-17: the fallback arm calls
+    /// the same [`fallback_pairing_family`] classifier intake
+    /// enforces, so production and intake agree on every ID; the
+    /// wire decoder already rejects non-wire-valid IDs before
+    /// they reach here).
+    fn pairs(&self, api: u32) -> bool {
+        match demux(api) {
+            Some(TraceFamily::PublicApi) => !self.fallback && trace_mode_edge_bearing(self.mode),
+            Some(_) => {
+                trace_mode_edge_bearing(self.mode)
+                    || (self.fallback && fallback_pairing_family(api))
+            }
+            None => false,
+        }
     }
 
     /// Feed a decoded ATTEMPT (received always counted; pairing gated).
@@ -636,9 +1951,10 @@ impl TraceProducer {
             let slot = edge.api as usize;
             self.api_attempts[slot] = self.api_attempts[slot].saturating_add(1);
         }
-        if !trace_mode_edge_bearing(self.mode) {
+        if !self.pairs(edge.api) {
             return;
         }
+        self.note_fed(edge.key.pid, edge.monotonic_ns);
         self.retain(RetainedEdge {
             kind: 1,
             key: HashedKey::of(&edge.key),
@@ -741,9 +2057,10 @@ impl TraceProducer {
             let slot = edge.api as usize;
             self.api_results[slot] = self.api_results[slot].saturating_add(1);
         }
-        if !trace_mode_edge_bearing(self.mode) {
+        if !self.pairs(edge.api) {
             return;
         }
+        self.note_fed(edge.key.pid, edge.monotonic_ns);
         self.retain(RetainedEdge {
             kind: 2,
             key: HashedKey::of(&edge.key),
@@ -787,6 +2104,105 @@ impl TraceProducer {
     pub fn reject_unknown(&mut self) {
         self.rejected_unknown_api = self.rejected_unknown_api.saturating_add(1);
         self.totals.rejected_unknown_api = self.totals.rejected_unknown_api.saturating_add(1);
+        self.settled = false;
+        self.terminal_drain_proved = false;
+    }
+
+    /// Count one generic wire rejection (P2fix2 item 5): any
+    /// decode-domain refusal the session funnel observes (malformed
+    /// record, zero stamp, ...). Unknown-ID records count here too
+    /// (this is the superset — same `decode-reject` taint, exact
+    /// per-cause counts).
+    pub fn note_wire_rejection(&mut self) {
+        self.wire_rejected = self.wire_rejected.saturating_add(1);
+        self.settled = false;
+        self.terminal_drain_proved = false;
+    }
+
+    /// Note a failed terminal producer boundary (P2fix3
+    /// PAIRING): the terminal cut failed, so the seal cannot
+    /// certify freshness — latch the failure (sticky) and drop
+    /// any settlement. A later `finalize` still lands held edges
+    /// unpaired, but the proof stays poisoned: taint carries,
+    /// never clears.
+    pub fn note_boundary_failure(&mut self) {
+        self.boundary_failed = true;
+        self.settled = false;
+    }
+
+    /// Note the TERMINAL drain's completion (P2fix4 NEW-20,
+    /// P2fix5 NEW-23): the affirmative drain-completion result
+    /// enters trace settlement like the gate-close result — a
+    /// dirty terminal drain drops its remainder (the missing edge
+    /// may be in it), so the producer boundary failed exactly
+    /// like a failed gate close (latch + unsettle: prior taint
+    /// carries through the terminal seal, never clears on it). A
+    /// QUIESCENCE-CONFIRMED clean terminal drain stores the
+    /// positive drain receipt (the session passes true ONLY after
+    /// affirmative writer quiescence + ring exhaustion — a bare
+    /// ring `None` is busy-or-empty, never clean by itself). The
+    /// fresh-boundary proof requires the receipt: without it the
+    /// seal carries, never clears. Called by the session exactly
+    /// once, on the terminal drain only (live overruns merely
+    /// delay — the kernel ring holds the backlog for the next
+    /// drain).
+    pub fn note_terminal_drain(&mut self, clean: bool) {
+        if clean {
+            self.terminal_drain_proved = true;
+        } else {
+            self.note_boundary_failure();
+        }
+    }
+
+    /// Record one folded edge's timestamp for cut-overrun checks
+    /// (P2fix2 item 13): per-pid max (capped — past the cap the
+    /// global max answers) + global max. Any feed unsettles the
+    /// terminal-settlement proof.
+    fn note_fed(&mut self, pid: u32, monotonic_ns: u64) {
+        self.settled = false;
+        self.terminal_drain_proved = false;
+        self.fed_max_global = self.fed_max_global.max(monotonic_ns);
+        if self.fed_max.len() < TRACE_PAIRING_CAP || self.fed_max.contains_key(&pid) {
+            self.fed_max
+                .entry(pid)
+                .and_modify(|m| *m = (*m).max(monotonic_ns))
+                .or_insert(monotonic_ns);
+        }
+    }
+
+    /// Note a per-pid cut (P2fix2 item 13 — the 6A fence edge): when
+    /// this pid already folded a timestamp at/above the cut, the
+    /// irreversible fold holds out-of-interval pairs it cannot
+    /// exclude — latch `late-cut` taint (fail closed; the affected
+    /// interpretations withhold at every renderer). A cut above all
+    /// folded timestamps taints nothing, and a pid that folded
+    /// nothing is clean. A capped-out pid (map full, entry absent)
+    /// falls back to the global max (sound direction — over-taint,
+    /// never a miss).
+    pub fn note_cut_edge(&mut self, pid: u32, edge_ns: u64) {
+        match self.fed_max.get(&pid) {
+            Some(fed) => {
+                if *fed >= edge_ns {
+                    self.late_cut = true;
+                }
+            }
+            None if self.fed_max.len() >= TRACE_PAIRING_CAP => {
+                if self.fed_max_global >= edge_ns {
+                    self.late_cut = true;
+                }
+            }
+            None => {}
+        }
+    }
+
+    /// Note a global cut (P2fix2 item 13 — the feed-cut claim end):
+    /// same rule as [`Self::note_cut_edge`] over every folded pid
+    /// (an empty fold is clean at any cut).
+    pub fn note_global_cut(&mut self, cut_ns: u64) {
+        let fed_any = !self.fed_max.is_empty() || self.fed_max_global > 0;
+        if fed_any && self.fed_max_global >= cut_ns {
+            self.late_cut = true;
+        }
     }
 
     /// Seal the current window; `loss_abs` is the cumulative 8-lane read.
@@ -862,6 +2278,78 @@ impl TraceProducer {
             ring_loss[index] = loss_abs[index].saturating_sub(self.last_loss[index]);
             self.last_loss[index] = loss_abs[index];
         }
+        // Pairing-uncertainty (item 3): fresh corruption signals for
+        // this window, plus taint carried across the close. Plain
+        // ring loss on other lanes is detectable loss (PARTIAL-
+        // flagged, never withheld) and sets nothing here.
+        let mut uncertainty = Vec::new();
+        if self.pending_evicted_entries > 0 || self.pending_evicted_results > 0 {
+            uncertainty.push("pending-eviction".to_string());
+        }
+        if ring_loss[2] > 0 {
+            uncertainty.push("depth-overflow".to_string());
+        }
+        if self.rejected_unknown_api > 0 || self.wire_rejected > 0 {
+            uncertainty.push("decode-reject".to_string());
+        }
+        if self.late_cut {
+            uncertainty.push("late-cut".to_string());
+        }
+        // Explicit terminal-boundary failure (P2fix6 NEW-32): a
+        // failed gate cut or a dirty/unproved terminal drain is
+        // itself an uncertainty signal — the seal withholds
+        // interpretations even with clean history (a clean close
+        // can no longer launder a failed producer boundary). The
+        // latch is sticky: later windows keep naming it beside
+        // `carried`.
+        if self.boundary_failed {
+            uncertainty.push("terminal-boundary-failed".to_string());
+        }
+        if self.pairing_uncertain {
+            uncertainty.push("carried".to_string());
+        }
+        let uncertain = !uncertainty.is_empty();
+        // Proved fresh boundary (P2fix2 item 5, P2fix3 PAIRING,
+        // P2fix5 NEW-23): taint clears ONLY on terminal
+        // settlement (`finalize` ran — every held edge terminally
+        // accounted) plus a clean close (empty pending, no fresh
+        // corruption of any kind) on a SUCCESSFUL producer
+        // boundary (no terminal-cut failure latched) WITH a
+        // positive terminal-drain receipt (the session proved
+        // writer quiescence + ring exhaustion — host finalization
+        // alone withholds interpreted data on the unproved
+        // terminal boundary). Empty host pending maps alone NEVER
+        // clear taint (an idle close after a tainted one stays
+        // carried): mid-run closes carry; only a settled clean
+        // close proves the next window fresh. Epoch totals latch
+        // sticky regardless (cumulative folds cannot un-mix
+        // suspect pairs).
+        let proved = self.settled
+            && self.terminal_drain_proved
+            && !self.boundary_failed
+            && self.pending_attempts.is_empty()
+            && self.pending_results.is_empty()
+            && self.pending_evicted_entries == 0
+            && self.pending_evicted_results == 0
+            && ring_loss[2] == 0
+            && self.rejected_unknown_api == 0
+            && self.wire_rejected == 0
+            && !self.late_cut;
+        // The receipt is single-seal (consumed here — every
+        // terminal settlement needs its own drainage proof).
+        self.terminal_drain_proved = false;
+        self.pairing_uncertain = uncertain && !proved;
+        if uncertain {
+            self.totals.pairing_uncertain = true;
+            // Any uncertain close unsettles the proof (taint needs a
+            // NEW terminal settlement to clear — an ancient finalize
+            // never washes fresh corruption).
+            self.settled = false;
+        }
+        let api_histograms = self.api_hists.take();
+        if self.histogram_by_api {
+            self.api_hists = Some([[TraceHistogram::default(); 5]; 53]);
+        }
         let sealed = ClosedTraceWindow {
             window_seq,
             mode: self.mode,
@@ -880,9 +2368,14 @@ impl TraceProducer {
             detail: std::mem::take(&mut self.detail),
             class_counts: std::mem::take(&mut self.class_counts),
             histograms: std::mem::take(&mut self.histograms),
-            api_attempts: std::mem::replace(&mut self.api_attempts, [0; 73]),
-            api_results: std::mem::replace(&mut self.api_results, [0; 73]),
+            fallback: self.fallback,
+            api_histograms,
+            api_attempts: std::mem::replace(&mut self.api_attempts, [0; TRACE_API_SLOTS]),
+            api_results: std::mem::replace(&mut self.api_results, [0; TRACE_API_SLOTS]),
             exemplars: std::mem::take(&mut self.exemplars),
+            pairing_uncertain: uncertain,
+            pairing_uncertainty: uncertainty,
+            late_cut: self.late_cut,
         };
         if sealed.capped {
             self.totals.capped_windows = self.totals.capped_windows.saturating_add(1);
@@ -899,12 +2392,27 @@ impl TraceProducer {
         self.received = ReceivedCounts::default();
         self.nonmonotonic_pairs = 0;
         self.rejected_unknown_api = 0;
+        self.wire_rejected = 0;
+        self.late_cut = false;
+        self.fed_max.clear();
+        self.fed_max_global = 0;
         self.window = self.window.saturating_add(1);
         sealed
     }
 
+    /// The currently open window index (the label the next
+    /// `close_window` must bind — callers never hardcode 0).
+    pub fn current_window(&self) -> u64 {
+        self.window
+    }
+
     /// Terminal finalize: every held edge lands unpaired.
+    /// Settles the fresh-boundary proof (P2fix2 item 5): after this
+    /// call every held edge is terminally accounted, so a following
+    /// clean close proves the next window fresh (until any new
+    /// pairing-state mutation unsettles it).
     pub fn finalize(&mut self, now_ns: u64) {
+        self.settled = true;
         for (key, held) in std::mem::take(&mut self.pending_attempts) {
             self.unpaired_entries = self.unpaired_entries.saturating_add(1);
             self.totals.unpaired_entries = self.totals.unpaired_entries.saturating_add(1);
@@ -1288,6 +2796,17 @@ impl TraceProducer {
         if !nonmonotonic && demux(api) == Some(TraceFamily::PublicApi) {
             self.histograms[slot].fold(duration_ns);
             self.totals.histograms[slot].fold(duration_ns);
+            // §6D-3 opt-in: per-(api, class) distributions over
+            // operational IDs 20..=72 only.
+            if self.histogram_by_api && (20..=72).contains(&api) {
+                let cell = (api - 20) as usize;
+                if let Some(h) = self.api_hists.as_mut() {
+                    h[cell][slot].fold(duration_ns);
+                }
+                if let Some(h) = self.totals.api_histograms.as_mut() {
+                    h[cell][slot].fold(duration_ns);
+                }
+            }
         }
         self.paired = self.paired.saturating_add(1);
         self.totals.paired = self.totals.paired.saturating_add(1);
@@ -1514,17 +3033,30 @@ mod tests {
     }
 
     #[test]
+    fn demux_fetch_extension_is_fetch() {
+        // Phase 1 amendment P1-A1: 73..=80 demux Fetch; the
+        // unknown boundary moves from 73 to 81.
+        for api in 73..=80 {
+            assert_eq!(demux(api), Some(TraceFamily::Fetch), "api {api}");
+        }
+        for api in [0, 81, 82, 100, 1000, u32::MAX] {
+            assert_eq!(demux(api), None, "api {api}");
+        }
+        assert_eq!(TRACE_API_SLOTS, 81);
+    }
+
+    #[test]
     fn demux_families_are_exact() {
         for api in (1..=9).chain(16..=19) {
             assert_eq!(demux(api), Some(TraceFamily::Lifecycle), "api {api}");
         }
-        for api in 10..=15 {
+        for api in (10..=15).chain(73..=80) {
             assert_eq!(demux(api), Some(TraceFamily::Fetch), "api {api}");
         }
         for api in 20..=72 {
             assert_eq!(demux(api), Some(TraceFamily::PublicApi), "api {api}");
         }
-        for api in [0, 73, 74, 100, 1000, u32::MAX] {
+        for api in [0, 81, 82, 100, 1000, u32::MAX] {
             assert_eq!(demux(api), None, "api {api}");
         }
         assert_eq!(
@@ -2236,7 +3768,7 @@ mod tests {
     #[test]
     fn pair_class_normalizes_by_family() {
         // F5 helper pin: total over the demux, all five outcomes.
-        for api in (1..=9).chain(10..=15).chain(16..=19) {
+        for api in (1..=9).chain(10..=15).chain(16..=19).chain(73..=80) {
             for outcome in 0..=4 {
                 assert_eq!(pair_class(api, outcome), 0, "api {api}");
             }
@@ -2246,7 +3778,7 @@ mod tests {
                 assert_eq!(pair_class(api, outcome), outcome, "api {api}");
             }
         }
-        for api in [0, 73, 100, u32::MAX] {
+        for api in [0, 81, 100, u32::MAX] {
             assert_eq!(pair_class(api, 1), 0, "api {api}");
         }
     }
@@ -2982,5 +4514,1636 @@ mod tests {
         let rr: u64 = t.received.results.iter().sum();
         assert_eq!(ra, t.paired + t.unpaired_entries);
         assert_eq!(rr, t.paired + t.unpaired_results);
+    }
+
+    #[test]
+    fn fallback_pairs_fetch_lifecycle_only() {
+        // D0-6 aggregate-only fallback: fetch/lifecycle pair
+        // (class-0); operational edges count received but never
+        // pair, never histogram, never go unpaired.
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_METADATA);
+        p.set_fallback(true);
+        let fetch = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(fetch, 10, 1000));
+        p.result(result(fetch, 10, 1500, 1));
+        let ext = key(1, 1, 1, 101, 2);
+        p.attempt(attempt(ext, 73, 2000));
+        p.result(result(ext, 73, 2500, 1));
+        let life = key(1, 1, 1, 102, 3);
+        p.attempt(attempt(life, 1, 3000));
+        p.result(result(life, 1, 3500, 1));
+        let op = key(1, 1, 1, 103, 4);
+        p.attempt(attempt(op, 20, 4000));
+        p.result(result(op, 20, 4500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(w.fallback);
+        assert_eq!(w.paired, 3);
+        assert_eq!(w.class_counts, [3, 0, 0, 0, 0]);
+        for (c, h) in w.histograms.iter().enumerate() {
+            assert_eq!((h.count, h.sum), (0, 0), "class {c}");
+        }
+        // Operational edges counted (F2) but never pending.
+        assert_eq!(w.api_attempts[20], 1);
+        assert_eq!(w.api_results[20], 1);
+        let w1 = p.close_window(1, 9000, [0; 8]);
+        assert_eq!(w1.unpaired_entries, 0);
+        assert_eq!(w1.unpaired_results, 0);
+        assert!(w1.fallback);
+    }
+
+    #[test]
+    fn fallback_off_is_edge_bearing_only() {
+        // Without fallback, metadata mode pairs nothing (BASE twin).
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_METADATA);
+        assert!(!p.fallback());
+        let fetch = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(fetch, 10, 1000));
+        p.result(result(fetch, 10, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(!w.fallback);
+        assert_eq!(w.paired, 0);
+    }
+
+    #[test]
+    fn by_api_opt_in_folds_per_api_distributions() {
+        // §6D-3 opt-in: per-(api, class) distributions over
+        // operational IDs only; fetch never takes distributions.
+        let mut p = edge_bearing();
+        p.set_histogram_by_api(true);
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        let b = key(1, 1, 1, 101, 2);
+        p.attempt(attempt(b, 64, 2000));
+        p.result(result(b, 64, 2600, 2));
+        let f = key(1, 1, 1, 102, 3);
+        p.attempt(attempt(f, 10, 3000));
+        p.result(result(f, 10, 3600, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert_eq!(w.paired, 3);
+        let by_api = w.api_histograms.expect("opt-in folds per-API");
+        // API 20 success: one 500ns observation.
+        assert_eq!((by_api[0][1].count, by_api[0][1].sum), (1, 500));
+        assert_eq!(by_api[0][1].buckets[18], 1);
+        // API 64 failure: one 600ns observation.
+        assert_eq!((by_api[44][2].count, by_api[44][2].sum), (1, 600));
+        // Every other (api, class) cell is empty.
+        for (i, classes) in by_api.iter().enumerate() {
+            for (c, h) in classes.iter().enumerate() {
+                if (i, c) != (0, 1) && (i, c) != (44, 2) {
+                    assert_eq!((h.count, h.sum), (0, 0), "cell {i}/{c}");
+                }
+            }
+        }
+        // Totals fold cumulatively.
+        let t = p.totals();
+        let th = t.api_histograms.expect("totals fold per-API");
+        assert_eq!((th[0][1].count, th[0][1].sum), (1, 500));
+        assert_eq!((th[44][2].count, th[44][2].sum), (1, 600));
+    }
+
+    #[test]
+    fn by_api_opt_out_folds_nothing() {
+        // Default OFF: no per-API state, no rows.
+        let mut p = edge_bearing();
+        assert!(!p.histogram_by_api());
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert_eq!(w.paired, 1);
+        assert!(w.api_histograms.is_none());
+        assert!(p.totals().api_histograms.is_none());
+    }
+
+    #[test]
+    fn pairing_uncertainty_triggers_and_fresh_boundary_clears() {
+        // P2fix1 item 3 (codex PAIRING) as corrected by P2fix2 item
+        // 5 (codex PAIRING-OPEN): pairing-state corruption (pending
+        // eviction, depth overflow, decode rejection) marks the
+        // window uncertain; plain ring loss does not (detectable
+        // loss rides PARTIAL, not withholding); taint carries until
+        // a PROVED fresh boundary (terminal settlement via finalize
+        // plus a clean close — empty host pending maps alone never
+        // clear it) while epoch totals stay sticky-suspect.
+        // Clean window: certain.
+        let mut p = edge_bearing();
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(!w.pairing_uncertain);
+        assert!(w.pairing_uncertainty.is_empty());
+        assert!(!p.totals().pairing_uncertain);
+        // Decode rejection corrupts pairing trust.
+        let mut p = edge_bearing();
+        p.reject_unknown();
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(w.pairing_uncertain);
+        assert_eq!(w.pairing_uncertainty, vec!["decode-reject".to_string()]);
+        // Depth overflow (the overflow schedule) corrupts trust.
+        let mut p = edge_bearing();
+        let w = p.close_window(0, 9000, [0, 0, 2, 0, 0, 0, 0, 0]);
+        assert!(w.pairing_uncertain);
+        assert_eq!(w.pairing_uncertainty, vec!["depth-overflow".to_string()]);
+        // Plain ring loss on other lanes does NOT (detectable loss
+        // is PARTIAL-flagged, never withheld).
+        let mut p = edge_bearing();
+        let w = p.close_window(0, 9000, [5, 4, 0, 0, 0, 0, 0, 0]);
+        assert!(!w.pairing_uncertain);
+        // Pending-cap eviction corrupts trust.
+        let mut p = edge_bearing();
+        for i in 0..(TRACE_PAIRING_CAP as u64 + 1) {
+            p.attempt(attempt(key(1, 1, 1, 1000 + i, i + 1), 20, 1000 + i));
+        }
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(w.pending_evicted_entries > 0);
+        assert!(w.pairing_uncertain);
+        assert!(
+            w.pairing_uncertainty
+                .contains(&"pending-eviction".to_string())
+        );
+        // Taint carries across unsettled closes (P2fix2: a clean
+        // close with empty pending is NOT a proved boundary — the
+        // old auto-clear is rejected); only terminal settlement
+        // plus a clean close proves the next window fresh.
+        let mut p = edge_bearing();
+        p.reject_unknown();
+        let w0 = p.close_window(0, 9000, [0; 8]);
+        assert!(w0.pairing_uncertain);
+        let b = key(1, 1, 1, 200, 1);
+        p.attempt(attempt(b, 20, 9500));
+        p.result(result(b, 20, 9600, 1));
+        let w1 = p.close_window(1, 9900, [0; 8]);
+        assert!(w1.pairing_uncertain, "taint carries one window");
+        assert!(w1.pairing_uncertainty.contains(&"carried".to_string()));
+        let c = key(1, 1, 1, 201, 2);
+        p.attempt(attempt(c, 20, 9950));
+        p.result(result(c, 20, 9960, 1));
+        let w2 = p.close_window(2, 9990, [0; 8]);
+        assert!(w2.pairing_uncertain, "unsettled clean closes keep carrying");
+        assert!(w2.pairing_uncertainty.contains(&"carried".to_string()));
+        // Proved boundary: settle terminally, seal the boundary
+        // close (still carried — pre-proof data), then fresh.
+        // [p2fix5 NEW-23: the proof includes the positive
+        // terminal-drain receipt — finalize alone withholds.]
+        p.note_terminal_drain(true);
+        p.finalize(9995);
+        let w3 = p.close_window(3, 9999, [0; 8]);
+        assert!(w3.pairing_uncertain, "boundary close seals carried");
+        let w4 = p.close_window(4, 9999, [0; 8]);
+        assert!(
+            !w4.pairing_uncertain,
+            "post-proof windows seal fresh: {:?}",
+            w4.pairing_uncertainty
+        );
+        // ...but epoch totals stay sticky-suspect (cumulative folds
+        // cannot un-mix suspect pairs).
+        assert!(p.totals().pairing_uncertain);
+        // Non-empty pending blocks the fresh boundary (suspect live
+        // holds may persist).
+        let mut p = edge_bearing();
+        p.reject_unknown();
+        let _ = p.close_window(0, 9000, [0; 8]);
+        p.attempt(attempt(key(1, 1, 1, 300, 1), 20, 9500));
+        let w = p.close_window(1, 9900, [0; 8]);
+        assert!(w.pairing_uncertain);
+    }
+
+    #[test]
+    fn withheld_summary_hides_interpreted_keeps_raw() {
+        // P2fix1 items 3/14 (codex PAIRING/DELTA-8): while uncertain,
+        // interpreted duration/status distributions withhold (None)
+        // and raw loss/detail evidence stays; the withheld shape
+        // still validates.
+        let mut p = edge_bearing();
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        p.reject_unknown();
+        let w = p.close_window(0, 9000, [0; 8]);
+        let t = p.totals();
+        assert!(w.pairing_uncertain && t.pairing_uncertain);
+        let s = summarize(&w, &t, "latency", None);
+        assert!(s.window.class_window.is_none());
+        assert!(s.class_epoch.is_none());
+        assert!(s.histograms.is_none());
+        assert!(s.by_api.is_none());
+        // Raw evidence kept.
+        assert_eq!(s.window.paired, 1);
+        assert_eq!(s.window.trace_rejected_unknown_api, 1);
+        assert!(s.window.pairing_uncertain);
+        s.validate().expect("withheld shape validates");
+        // Certain window: everything flows.
+        let mut q = edge_bearing();
+        let b = key(1, 1, 1, 100, 1);
+        q.attempt(attempt(b, 20, 1000));
+        q.result(result(b, 20, 1500, 1));
+        let wq = q.close_window(0, 9000, [0; 8]);
+        let tq = q.totals();
+        let sq = summarize(&wq, &tq, "latency", None);
+        assert_eq!(sq.window.class_window.unwrap().success, 1);
+        assert_eq!(sq.class_epoch.unwrap().success, 1);
+        assert_eq!(sq.histograms.as_ref().unwrap().success.count, 1);
+        sq.validate().expect("certain shape validates");
+    }
+
+    #[test]
+    fn trace_summary_validation_rejects_incoherence() {
+        // P2fix1 items 4/23 (codex GATE29/NEW-P2f): raw intake +
+        // both presenter paths enforce the same strict rules —
+        // inconsistent mode/fallback state, impossible
+        // class/histogram counts, decreasing by-API buckets,
+        // incomplete coverage binding, non-empty GAP inputs,
+        // malformed exemplars/ranges, and withholding mismatches.
+        fn baseline() -> TraceSummary {
+            let mut p = edge_bearing();
+            p.set_histogram_by_api(true);
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 20, 1000));
+            p.result(result(a, 20, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            let mut avail = std::collections::BTreeMap::new();
+            for id in 20..=72u32 {
+                avail.insert(
+                    id,
+                    if id == 20 { "covered" } else { "not_attached" }.to_string(),
+                );
+            }
+            summarize(&w, &t, "latency", Some(&avail))
+        }
+        let good = baseline();
+        good.validate().expect("baseline validates");
+        assert!(good.by_api.as_ref().unwrap().contains_key("20"));
+        // Decreasing by-API buckets.
+        let mut bad = baseline();
+        bad.by_api
+            .as_mut()
+            .unwrap()
+            .get_mut("20")
+            .unwrap()
+            .success
+            .buckets[1] = 0;
+        bad.by_api
+            .as_mut()
+            .unwrap()
+            .get_mut("20")
+            .unwrap()
+            .success
+            .buckets[0] = 1;
+        assert!(bad.validate().is_err(), "decreasing by-api buckets");
+        // Fallback with operational classes / histograms.
+        let mut bad = baseline();
+        bad.mode = "metadata".to_string();
+        bad.fallback = true;
+        assert!(bad.validate().is_err(), "fallback with histograms");
+        let mut bad = baseline();
+        bad.mode = "metadata".to_string();
+        bad.fallback = true;
+        bad.histograms = None;
+        bad.by_api = None;
+        bad.by_api_availability = None;
+        assert!(bad.validate().is_err(), "fallback with operational class");
+        // Off/metadata without fallback never seal (rejected
+        // outright, same as raw intake — even all-zeros).
+        let mut bad = baseline();
+        bad.mode = "off".to_string();
+        assert!(bad.validate().is_err(), "off with pairs");
+        let mut bad = baseline();
+        bad.mode = "metadata".to_string();
+        bad.window.paired = 0;
+        bad.window.class_window = Some(TraceClassCounts::default());
+        bad.class_epoch = Some(TraceClassCounts::default());
+        bad.histograms = None;
+        bad.by_api = None;
+        bad.by_api_availability = None;
+        assert!(bad.validate().is_err(), "zeros metadata without fallback");
+        // Histogram count above its class count.
+        let mut bad = baseline();
+        let h = &mut bad.histograms.as_mut().unwrap().success;
+        h.buckets = [2; 19];
+        h.count = 2;
+        assert!(bad.validate().is_err(), "count above class");
+        // Covered API without a by_api entry (incomplete binding).
+        let mut bad = baseline();
+        bad.by_api.as_mut().unwrap().clear();
+        assert!(bad.validate().is_err(), "covered without entry");
+        // Non-empty GAP inputs (DELTA-3: rejected until a typed
+        // producer exists).
+        let mut bad = baseline();
+        bad.window.gaps = vec![serde_json::json!({"kind": "gap"})];
+        assert!(bad.validate().is_err(), "nonempty gaps");
+        let mut bad = baseline();
+        bad.window.gap_overflow = 1;
+        assert!(bad.validate().is_err(), "nonzero gap_overflow");
+        // Malformed exemplars.
+        let mut bad = baseline();
+        bad.window.exemplars = vec![TraceExemplarJson {
+            dir: "sideways".to_string(),
+            key_hash16: "814dd7b9784d57c1".to_string(),
+            api: 20,
+            age_ns: 5,
+        }];
+        assert!(bad.validate().is_err(), "bad exemplar dir");
+        bad.window.exemplars[0].dir = "entry".to_string();
+        bad.window.exemplars[0].key_hash16 = "XYZ".to_string();
+        assert!(bad.validate().is_err(), "bad exemplar hash");
+        bad.window.exemplars[0].key_hash16 = "814dd7b9784d57c1".to_string();
+        bad.window.exemplars[0].api = 999;
+        assert!(bad.validate().is_err(), "bad exemplar api");
+        // Malformed unmeasured ranges.
+        for ranges in [
+            vec![[5u64, 3u64]],
+            vec![[1u64, 2u64], [2u64, 3u64]],
+            vec![[3u64, 4u64], [1u64, 2u64]],
+        ] {
+            let mut bad = baseline();
+            bad.window.unmeasured_seqs = ranges;
+            assert!(bad.validate().is_err(), "malformed range");
+        }
+        // Withholding mismatches (both directions).
+        let mut bad = baseline();
+        bad.class_epoch = None;
+        assert!(bad.validate().is_err(), "certain without class_epoch");
+        let mut bad = baseline();
+        bad.window.class_window = None;
+        assert!(bad.validate().is_err(), "certain without class_window");
+        let mut bad = baseline();
+        bad.pairing_uncertain = true;
+        assert!(bad.validate().is_err(), "uncertain with class_epoch");
+        let mut bad = baseline();
+        bad.window.pairing_uncertain = true;
+        assert!(bad.validate().is_err(), "uncertain with class_window");
+        // P2fix2 item 13 (codex NEW-P2f): status carries classes but
+        // NO distributions — by-API histograms reject like default
+        // histograms.
+        let mut bad = baseline();
+        bad.mode = "status".to_string();
+        bad.window.mode = "status".to_string();
+        bad.histograms = None;
+        assert!(bad.by_api.is_some(), "premise: by_api rides status");
+        assert!(bad.validate().is_err(), "status with by_api");
+        // Inner/outer state coherence: an uncertain window taints
+        // its epoch (inner-certain + outer-uncertain is the sticky
+        // direction; the reverse is incoherent).
+        let mut bad = baseline();
+        bad.window.pairing_uncertain = true;
+        bad.window.class_window = None;
+        assert!(
+            bad.validate().is_err(),
+            "uncertain window under certain epoch"
+        );
+        // Inner/outer mode + fallback words agree (the projection
+        // stamps both from one resolution — a mismatch is a forged
+        // section).
+        let mut bad = baseline();
+        bad.window.mode = "all".to_string();
+        assert!(bad.validate().is_err(), "window/outer mode mismatch");
+        let mut bad = baseline();
+        bad.window.fallback = true;
+        assert!(bad.validate().is_err(), "window/outer fallback mismatch");
+        // Impossible distributions: an L1 sub-fold never exceeds its
+        // default fold (per class — the covered API's pairs are a
+        // subset of all pairs).
+        let mut bad = baseline();
+        let l1 = bad
+            .by_api
+            .as_mut()
+            .unwrap()
+            .get_mut("20")
+            .unwrap()
+            .success
+            .clone();
+        assert_eq!(
+            (l1.count, bad.histograms.as_ref().unwrap().success.count),
+            (1, 1)
+        );
+        let e = bad.by_api.as_mut().unwrap().get_mut("20").unwrap();
+        e.success.buckets = [2; 19];
+        e.success.count = 2;
+        assert!(bad.validate().is_err(), "L1 count above its default count");
+    }
+
+    fn bearing_latency() -> TraceProducer {
+        let mut p = TraceProducer::new();
+        p.set_mode(TRACE_MODE_LATENCY);
+        p
+    }
+
+    fn pair_at(p: &mut TraceProducer, pid: u32, invocation: u64, t0: u64, t1: u64) {
+        let k = key(pid, pid, 1, 500 + invocation, invocation);
+        p.attempt(attempt(k, 20, t0));
+        p.result(result(k, 20, t1, 1));
+    }
+
+    #[test]
+    fn p2fix2_wire_rejection_taints_decode_reject() {
+        // P2fix2 item 5 (codex PAIRING-OPEN): a generic wire
+        // rejection (any decode-domain refusal, not just
+        // unknown-ID) taints pairing as `decode-reject` — the
+        // session funnel routes it here. The unknown-ID count
+        // stays exact (no misattribution).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_wire_rejection();
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert_eq!(w.paired, 1);
+        assert!(w.pairing_uncertain, "wire rejection must taint");
+        assert!(
+            w.pairing_uncertainty.contains(&"decode-reject".to_string()),
+            "{:?}",
+            w.pairing_uncertainty
+        );
+        assert_eq!(w.rejected_unknown_api, 0, "not an unknown-ID record");
+    }
+
+    #[test]
+    fn p2fix2_taint_carries_until_proved_boundary() {
+        // P2fix2 item 5 (codex PAIRING-OPEN): taint carries across
+        // closes until a PROVED fresh boundary — terminal
+        // settlement (finalize) plus a clean close. Empty host
+        // pending maps alone never clear it (an idle close after a
+        // tainted one stays carried).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.reject_unknown();
+        let w0 = p.close_window(0, 9000, [0; 8]);
+        assert!(w0.pairing_uncertain, "rejection taints window 0");
+        // Idle window 1 (no feeds, empty pending): taint CARRIES
+        // (no proved boundary — finalize never ran).
+        let w1 = p.close_window(1, 9900, [0; 8]);
+        assert!(
+            w1.pairing_uncertain,
+            "taint must carry past an unsettled close"
+        );
+        assert!(
+            w1.pairing_uncertainty.contains(&"carried".to_string()),
+            "{:?}",
+            w1.pairing_uncertainty
+        );
+        // Proved boundary: terminal settlement + clean close. The
+        // boundary close itself still seals pre-proof data as
+        // carried (fail closed — its window predates the proof);
+        // the NEXT window seals fresh (the proof clears live taint).
+        // [p2fix5 NEW-23: the proof includes the positive
+        // terminal-drain receipt — finalize alone withholds.]
+        p.note_terminal_drain(true);
+        p.finalize(9950);
+        let w2 = p.close_window(2, 9990, [0; 8]);
+        assert!(
+            w2.pairing_uncertain,
+            "the boundary close seals pre-proof data as carried"
+        );
+        assert_eq!(w2.pairing_uncertainty, vec!["carried".to_string()]);
+        let w3 = p.close_window(3, 9999, [0; 8]);
+        assert!(
+            !w3.pairing_uncertain,
+            "post-proof windows seal fresh: {:?}",
+            w3.pairing_uncertainty
+        );
+    }
+
+    #[test]
+    fn p2fix2_late_cut_note_taints_overrun_only() {
+        // P2fix2 item 13 (codex NEW-P2e): the irreversible fold
+        // cannot exclude pairs consumed past a late-discovered cut
+        // — noting a cut below already-consumed timestamps taints
+        // (`late-cut`); noting above stays clean.
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_cut_edge(7, 50);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert_eq!(w.paired, 1);
+        assert!(w.pairing_uncertain, "cut below consumed must taint");
+        assert!(
+            w.pairing_uncertainty.contains(&"late-cut".to_string()),
+            "{:?}",
+            w.pairing_uncertainty
+        );
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_cut_edge(7, 10_000);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(
+            !w.pairing_uncertain,
+            "cut above consumed stays clean: {:?}",
+            w.pairing_uncertainty
+        );
+    }
+
+    #[test]
+    fn p2fix2_cut_note_is_per_pid() {
+        // Another pid's fence edge never taints this pid's fold
+        // (the 6A fence is per-pid; the overrun check scopes to
+        // the fenced pid).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_cut_edge(9, 50);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(
+            !w.pairing_uncertain,
+            "foreign-pid cut must not taint: {:?}",
+            w.pairing_uncertainty
+        );
+    }
+
+    /// Forge one wire edge image (full key params — the R13
+    /// schedule needs distinct cookies/invocations/timestamps).
+    fn wire_edge(
+        kind: u32,
+        api: u32,
+        cookie: u64,
+        invocation: u64,
+        mono_ns: u64,
+        outcome: u32,
+    ) -> Vec<u8> {
+        use super::super::wire::contract as c;
+        let mut b = vec![0u8; c::EVENT_SIZE];
+        for (at, v) in [
+            (0, c::VERSION),
+            (4, kind),
+            (8, c::EVENT_SIZE as u32),
+            (12, api),
+            (16, 7u32),
+            (20, 8u32),
+        ] {
+            b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        }
+        for (at, v) in [(24, cookie), (32, 1u64), (40, mono_ns), (48, invocation)] {
+            b[at..at + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b[56..60].copy_from_slice(&outcome.to_le_bytes());
+        b[96..104].copy_from_slice(&1u64.to_le_bytes());
+        b
+    }
+
+    /// Feed forged wire bytes through the REAL decode into the
+    /// producer (the pairing key comes FROM the decoded record —
+    /// producer-side key correctness, never hand-built structs).
+    fn feed_wire(p: &mut TraceProducer, bytes: &[u8]) {
+        use super::super::wire::contract as c;
+        let event = super::super::wire::decode_transport(bytes).expect("r13 bytes decode");
+        let r = event.record();
+        let key = PairKey {
+            pid: r.pid,
+            tid: r.tid,
+            generation: r.generation,
+            cookie: r.cookie,
+            invocation: r.invocation,
+        };
+        if r.kind == c::ATTEMPT {
+            p.attempt(AttemptEdge {
+                key,
+                api: r.api,
+                monotonic_ns: r.monotonic_ns,
+                start_time_ns: r.start_time_ns,
+                seed: r.seed,
+            });
+        } else {
+            p.result(ResultEdge {
+                key,
+                api: r.api,
+                monotonic_ns: r.monotonic_ns,
+                outcome: r.outcome,
+                start_time_ns: r.start_time_ns,
+                seed: r.seed,
+            });
+        }
+    }
+
+    #[test]
+    fn p2fix2_human_section_withholds_like_json() {
+        // P2fix2 item 10 (codex DELTA-8): EVERY renderer withholds
+        // the affected interpretations — the document human section
+        // must mark withheld histograms/by_api as
+        // `withheld (pairing uncertainty)`, never the `(status
+        // mode)` mislabel and never silent.
+        let mut p = bearing_latency();
+        p.set_histogram_by_api(true);
+        for i in 0..(TRACE_PAIRING_CAP as u64 + 1) {
+            let k = key(1, 1, 1, 1000 + i, i + 1);
+            p.attempt(attempt(k, 20, 1000 + i));
+        }
+        let w = p.close_window(0, 20000, [0; 8]);
+        assert!(w.pairing_uncertain);
+        let t = p.totals();
+        let s = summarize(&w, &t, "latency", None);
+        assert!(s.histograms.is_none() && s.by_api.is_none());
+        let human = s.human_section();
+        assert!(
+            human.contains("histograms: withheld (pairing uncertainty)"),
+            "{human:?}"
+        );
+        assert!(
+            human.contains("by_api: withheld (pairing uncertainty)"),
+            "{human:?}"
+        );
+        assert!(!human.contains("status mode"), "{human:?}");
+        // Status-certain keeps its honest `none` (nothing withheld —
+        // the mode produces no distributions).
+        let mut p = bearing_latency();
+        let k = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(k, 20, 1000));
+        p.result(result(k, 20, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        let t = p.totals();
+        let s = summarize(&w, &t, "status", None);
+        let human = s.human_section();
+        assert!(
+            human.contains("histograms: none (status mode)"),
+            "{human:?}"
+        );
+    }
+
+    #[test]
+    fn newp2e_human_section_withholds_unbound_paired() {
+        // P2fix4 NEW-P2e: the focused human summary withholds
+        // scoped pairs like every other late-cut output — a
+        // cut-unbound window prints `paired=withheld (late-cut)`
+        // with the `cut_unbound=true` mark (pre-fix: the
+        // contaminated count prints as ordinary `paired=N`
+        // without the mark), while the retained count stays in
+        // the explicitly unbound document JSON (paired + mark).
+        // Clean summaries keep byte-stable lines.
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_global_cut(50);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(w.late_cut && w.pairing_uncertain);
+        let t = p.totals();
+        let s = summarize(&w, &t, "latency", None);
+        s.validate().expect("marked summary validates");
+        let human = s.human_section();
+        assert!(
+            human.contains("paired=withheld (late-cut)"),
+            "unbound paired withholds: {human:?}"
+        );
+        assert!(
+            human.contains("cut_unbound=true"),
+            "unbound mark rides: {human:?}"
+        );
+        assert!(
+            !human.contains(&format!("paired={}", w.paired)),
+            "contaminated count never prints ordinary: {human:?}"
+        );
+        // Retained count stays in the explicitly unbound
+        // document JSON (paired + mark together).
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["window"]["paired"], w.paired);
+        assert_eq!(v["window"]["cut_unbound"], true);
+        // Clean summary: ordinary count, no mark, stable bytes.
+        let mut q = bearing_latency();
+        pair_at(&mut q, 7, 1, 100, 200);
+        q.note_global_cut(10_000);
+        let wq = q.close_window(0, 9000, [0; 8]);
+        let tq = q.totals();
+        let sq = summarize(&wq, &tq, "latency", None);
+        let clean = sq.human_section();
+        assert!(
+            clean.contains(&format!("paired={}", wq.paired)),
+            "clean count prints: {clean:?}"
+        );
+        assert!(!clean.contains("cut_unbound"), "{clean:?}");
+        assert!(!clean.contains("withheld (late-cut)"), "{clean:?}");
+    }
+
+    #[test]
+    fn new10_fallback_rejects_nonfamily_exemplar_ids() {
+        // P2fix3 NEW-10 as corrected by P2fix4 NEW-17/DELTA-7:
+        // under fallback, exemplar APIs must be the §6D-6
+        // fetch/lifecycle family (1..=6, 10..=15, 73..=80) — the
+        // only pairs a fallback producer emits. Operational IDs
+        // (20..=72) reject (a fallback record carrying them is
+        // forged or corrupt, never projectable); the extended
+        // fetch IDs (73..=80) are legitimate fallback output and
+        // validate.
+        fn fallback_baseline() -> TraceSummary {
+            let mut p = TraceProducer::new();
+            p.set_mode(TRACE_MODE_METADATA);
+            p.set_fallback(true);
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 10, 1000));
+            p.result(result(a, 10, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            summarize(&w, &t, "metadata", None)
+        }
+        let good = fallback_baseline();
+        good.validate().expect("fallback baseline validates");
+        for api in [1u32, 6, 10, 15, 73, 80] {
+            let mut ok = fallback_baseline();
+            ok.window.exemplars = vec![TraceExemplarJson {
+                dir: "entry".to_string(),
+                key_hash16: "814dd7b9784d57c1".to_string(),
+                api,
+                age_ns: 5,
+            }];
+            assert!(ok.validate().is_ok(), "family api {api} validates");
+        }
+        for api in [20u32, 64, 72] {
+            let mut bad = fallback_baseline();
+            bad.window.exemplars = vec![TraceExemplarJson {
+                dir: "entry".to_string(),
+                key_hash16: "814dd7b9784d57c1".to_string(),
+                api,
+                age_ns: 5,
+            }];
+            assert!(
+                bad.validate().is_err(),
+                "non-family api {api} must reject under fallback"
+            );
+        }
+        // Non-fallback keeps the wire-valid rule (an operational
+        // exemplar on a latency summary still validates).
+        let mut p = edge_bearing();
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        let t = p.totals();
+        let mut ok = summarize(&w, &t, "latency", None);
+        ok.window.exemplars = vec![TraceExemplarJson {
+            dir: "entry".to_string(),
+            key_hash16: "814dd7b9784d57c1".to_string(),
+            api: 20,
+            age_ns: 5,
+        }];
+        ok.validate()
+            .expect("operational exemplar validates off-fallback");
+    }
+
+    #[test]
+    fn new17_fallback_family_matches_producer_pairing() {
+        // P2fix4 NEW-17: ONE fetch/lifecycle classifier shared by
+        // production pairing and intake validation. The producer
+        // pairs 73..=80 as fetch under fallback, so their
+        // exemplars validate at intake (pre-fix: rejected);
+        // operational IDs (20..=72) never pair under fallback, so
+        // they still reject. Exhaustive agreement: every api in
+        // 0..=100 pairs under a fallback producer iff the shared
+        // classifier admits it.
+        fn fallback_baseline() -> TraceSummary {
+            let mut p = TraceProducer::new();
+            p.set_mode(TRACE_MODE_METADATA);
+            p.set_fallback(true);
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 10, 1000));
+            p.result(result(a, 10, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            summarize(&w, &t, "metadata", None)
+        }
+        // Expanded-fetch orphan positive (intake).
+        for api in [73u32, 76, 80] {
+            let mut ok = fallback_baseline();
+            ok.window.exemplars = vec![TraceExemplarJson {
+                dir: "entry".to_string(),
+                key_hash16: "814dd7b9784d57c1".to_string(),
+                api,
+                age_ns: 5,
+            }];
+            assert!(
+                ok.validate().is_ok(),
+                "expanded-fetch api {api} must validate under fallback: {:?}",
+                ok.validate().err()
+            );
+            assert!(
+                super::fallback_family_clean(&ok),
+                "expanded-fetch api {api} must read family-clean"
+            );
+        }
+        // Operational-ID negative (intake, kept).
+        for api in [20u32, 45, 72] {
+            let mut bad = fallback_baseline();
+            bad.window.exemplars = vec![TraceExemplarJson {
+                dir: "entry".to_string(),
+                key_hash16: "814dd7b9784d57c1".to_string(),
+                api,
+                age_ns: 5,
+            }];
+            assert!(
+                bad.validate().is_err(),
+                "operational api {api} must reject under fallback"
+            );
+            assert!(
+                !super::fallback_family_clean(&bad),
+                "operational api {api} must read family-broken"
+            );
+        }
+        // Production/intake agreement over the whole ID space.
+        for api in 0..=100u32 {
+            let mut p = TraceProducer::new();
+            p.set_mode(TRACE_MODE_METADATA);
+            p.set_fallback(true);
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, api, 1000));
+            p.result(result(a, api, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let paired = w.paired == 1;
+            assert_eq!(
+                paired,
+                super::fallback_pairing_family(api),
+                "api {api}: production pairing must agree with the shared classifier"
+            );
+        }
+    }
+
+    #[test]
+    fn newp2f_l1_combined_never_exceeds_parent() {
+        // P2fix3 NEW-P2f: exact class conservation — the L1
+        // sub-folds conserve into their default fold per class:
+        // the COMBINED L1 counts/buckets/sums never exceed the
+        // parent (each entry alone may fit while their sum
+        // overflows — that sum is the conserved quantity).
+        fn two_api_baseline() -> TraceSummary {
+            let mut p = TraceProducer::new();
+            p.set_mode(TRACE_MODE_LATENCY);
+            p.set_histogram_by_api(true);
+            for (api, inv) in [(20u32, 1u64), (21u32, 2u64)] {
+                let k = key(1, 1, 1, 100 + inv, inv);
+                p.attempt(attempt(k, api, 1000));
+                p.result(result(k, api, 1500, 1));
+            }
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            let mut avail = std::collections::BTreeMap::new();
+            for id in 20..=72u32 {
+                avail.insert(
+                    id,
+                    if id == 20 || id == 21 {
+                        "covered"
+                    } else {
+                        "not_attached"
+                    }
+                    .to_string(),
+                );
+            }
+            summarize(&w, &t, "latency", Some(&avail))
+        }
+        let good = two_api_baseline();
+        good.validate().expect("two-api baseline validates");
+        // Parent success: count 2, sum 1000 (two 500ns pairs); each
+        // L1 entry holds its own pair (count 1, sum 500).
+        assert_eq!(good.histograms.as_ref().unwrap().success.count, 2);
+        assert_eq!(good.histograms.as_ref().unwrap().success.sum, 1000);
+        // Case A — combined counts above the parent (each entry
+        // alone fits its count: 2 ≤ 2 — with fitting sums).
+        let mut bad = two_api_baseline();
+        for id in ["20", "21"] {
+            let d = &mut bad.by_api.as_mut().unwrap().get_mut(id).unwrap().success;
+            d.buckets = [2; 19];
+            d.count = 2;
+            d.sum = 500;
+        }
+        assert!(
+            bad.validate().is_err(),
+            "combined L1 counts above parent must reject"
+        );
+        // Case B — combined buckets above the parent with fitting
+        // counts (each L1 entry claims full low-edge mass: the
+        // 500ns pairs sit above edge 0, so edge 0 overflows).
+        let mut bad = two_api_baseline();
+        assert_eq!(
+            bad.histograms.as_ref().unwrap().success.buckets[0],
+            0,
+            "premise: 500ns pairs sit above edge 0"
+        );
+        for id in ["20", "21"] {
+            let d = &mut bad.by_api.as_mut().unwrap().get_mut(id).unwrap().success;
+            d.buckets = [1; 19];
+            d.count = 1;
+            d.sum = 500;
+        }
+        assert!(
+            bad.validate().is_err(),
+            "combined L1 buckets above parent must reject"
+        );
+        // Case C — combined sums above the parent with fitting
+        // counts + buckets (each L1 entry carries the parent's
+        // full sum; folded shapes untouched).
+        let mut bad = two_api_baseline();
+        for id in ["20", "21"] {
+            let d = &mut bad.by_api.as_mut().unwrap().get_mut(id).unwrap().success;
+            d.sum = 1000;
+        }
+        assert!(
+            bad.validate().is_err(),
+            "combined L1 sums above parent must reject"
+        );
+    }
+
+    #[test]
+    fn newp2f_class_conservation_is_exact_at_u64_max() {
+        // P2fix4 NEW-P2f: class conservation uses widened exact
+        // arithmetic — a saturating sum must never equal u64::MAX
+        // into acceptance. [MAX, 1, 0, 0, 0] with paired=MAX
+        // saturates to MAX (pre-fix: validates); the exact sum
+        // (MAX+1) exceeds paired and must reject. An exact-MAX
+        // vector still validates (control).
+        let baseline = || {
+            let mut p = edge_bearing();
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 20, 1000));
+            p.result(result(a, 20, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            summarize(&w, &t, "latency", None)
+        };
+        baseline().validate().expect("baseline validates");
+        let mut bad = baseline();
+        bad.window.class_window = Some(TraceClassCounts {
+            success: u64::MAX,
+            failure: 1,
+            empty: 0,
+            retry: 0,
+            unknown: 0,
+        });
+        bad.window.paired = u64::MAX;
+        assert!(
+            bad.validate().is_err(),
+            "overfull class vector (exact sum MAX+1) must reject at paired=MAX"
+        );
+        let mut ok = baseline();
+        ok.window.class_window = Some(TraceClassCounts {
+            success: u64::MAX,
+            failure: 0,
+            empty: 0,
+            retry: 0,
+            unknown: 0,
+        });
+        ok.window.paired = u64::MAX;
+        assert!(
+            ok.validate().is_ok(),
+            "exact-MAX class vector must validate: {:?}",
+            ok.validate().err()
+        );
+    }
+
+    #[test]
+    fn newp2f_gate_rejects_zero_count_positive_sum() {
+        // P2fix3 NEW-P2f: `count=0, sum>0` is impossible (no pairs
+        // folded a positive total) — the trace gate rejects it in
+        // default AND L1 distributions, like the adapters omit it.
+        let bad = {
+            let mut p = edge_bearing();
+            p.set_histogram_by_api(true);
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 20, 1000));
+            p.result(result(a, 20, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            let mut avail = std::collections::BTreeMap::new();
+            for id in 20..=72u32 {
+                avail.insert(
+                    id,
+                    if id == 20 { "covered" } else { "not_attached" }.to_string(),
+                );
+            }
+            summarize(&w, &t, "latency", Some(&avail))
+        };
+        bad.validate().expect("baseline validates");
+        // Default distribution.
+        let mut one = bad.clone();
+        one.histograms.as_mut().unwrap().failure.buckets = [0; 19];
+        one.histograms.as_mut().unwrap().failure.count = 0;
+        one.histograms.as_mut().unwrap().failure.sum = 7;
+        assert!(one.validate().is_err(), "default count=0/sum>0 must reject");
+        // L1 distribution (covered API 20, empty class).
+        let mut two = bad.clone();
+        {
+            let d = &mut two.by_api.as_mut().unwrap().get_mut("20").unwrap().empty;
+            d.buckets = [0; 19];
+            d.count = 0;
+            d.sum = 7;
+        }
+        assert!(two.validate().is_err(), "L1 count=0/sum>0 must reject");
+    }
+
+    #[test]
+    fn delta8_uncertainty_reasons_validate_before_renderers() {
+        // P2fix3 DELTA-8: uncertainty reasons validate (closed
+        // vocabulary + uncertain-iff-nonempty) BEFORE any renderer
+        // trusts them — every downstream emission (JSON, frames,
+        // terminal) reads validated reasons only.
+        fn certain_baseline() -> TraceSummary {
+            let mut p = edge_bearing();
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 20, 1000));
+            p.result(result(a, 20, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            assert!(w.pairing_uncertainty.is_empty());
+            let t = p.totals();
+            summarize(&w, &t, "latency", None)
+        }
+        let good = certain_baseline();
+        good.validate().expect("certain baseline validates");
+        // Closed vocabulary (the five seal reasons).
+        for reason in [
+            "pending-eviction",
+            "depth-overflow",
+            "decode-reject",
+            "late-cut",
+            "carried",
+        ] {
+            let mut ok = certain_baseline();
+            ok.window.pairing_uncertain = true;
+            ok.window.pairing_uncertainty = vec![reason.to_string()];
+            // Scope coherence (P2fix3 NEW-P2e): the mark rides the
+            // late-cut reason exactly.
+            ok.window.cut_unbound = reason == "late-cut";
+            ok.window.class_window = None;
+            ok.pairing_uncertain = true;
+            ok.class_epoch = None;
+            ok.histograms = None;
+            assert!(
+                ok.validate().is_ok(),
+                "vocabulary reason {reason} validates"
+            );
+        }
+        for reason in ["bogus", "decode_reject", "CARRIED", "", "late-cut "] {
+            let mut bad = certain_baseline();
+            bad.window.pairing_uncertain = true;
+            bad.window.pairing_uncertainty = vec![reason.to_string()];
+            bad.window.class_window = None;
+            bad.pairing_uncertain = true;
+            bad.class_epoch = None;
+            bad.histograms = None;
+            assert!(
+                bad.validate().is_err(),
+                "non-vocabulary reason {reason:?} must reject"
+            );
+        }
+        // Uncertain-iff-nonempty (both directions).
+        let mut bad = certain_baseline();
+        bad.window.pairing_uncertain = true;
+        bad.window.class_window = None;
+        bad.pairing_uncertain = true;
+        bad.class_epoch = None;
+        bad.histograms = None;
+        assert!(
+            bad.window.pairing_uncertainty.is_empty(),
+            "premise: producer-empty reasons"
+        );
+        assert!(
+            bad.validate().is_err(),
+            "uncertain with empty reasons must reject"
+        );
+        let mut bad = certain_baseline();
+        bad.window.pairing_uncertainty = vec!["carried".to_string()];
+        assert!(bad.validate().is_err(), "certain with reasons must reject");
+    }
+
+    #[test]
+    fn newp2e_late_cut_seal_marks_window_unbound() {
+        // P2fix3 NEW-P2e: a late cut marks the sealed window
+        // unbound — the seal carries `late_cut`, the summary
+        // carries the `cut_unbound` scope mark with the taint, and
+        // the gate binds mark ⟺ late-cut reason (clean seals stay
+        // bound with stable bytes).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_global_cut(50);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(w.late_cut, "seal marks the late cut");
+        assert!(w.pairing_uncertain);
+        let t = p.totals();
+        let s = summarize(&w, &t, "latency", None);
+        assert!(s.window.cut_unbound, "summary marks unbound scope");
+        assert!(
+            s.window
+                .pairing_uncertainty
+                .contains(&"late-cut".to_string()),
+            "taint rides the mark"
+        );
+        s.validate().expect("marked unbound summary validates");
+        // Gate coherence (both directions).
+        let mut bad = s.clone();
+        bad.window.pairing_uncertainty = vec!["carried".to_string()];
+        assert!(
+            bad.validate().is_err(),
+            "mark without late-cut reason rejects"
+        );
+        let mut bad = s.clone();
+        bad.window.cut_unbound = false;
+        assert!(
+            bad.validate().is_err(),
+            "late-cut reason without mark rejects"
+        );
+        // Clean seals stay bound (no mark, validates, stable
+        // bytes — the mark serializes only when set).
+        let mut q = bearing_latency();
+        pair_at(&mut q, 7, 1, 100, 200);
+        q.note_global_cut(10_000);
+        let wq = q.close_window(0, 9000, [0; 8]);
+        assert!(!wq.late_cut);
+        let tq = q.totals();
+        let sq = summarize(&wq, &tq, "latency", None);
+        assert!(!sq.window.cut_unbound);
+        sq.validate().expect("clean summary validates");
+        let v = serde_json::to_value(&sq).unwrap();
+        assert!(v["window"].get("cut_unbound").is_none());
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["window"]["cut_unbound"], true);
+    }
+
+    #[test]
+    fn pairing_taint_clears_only_on_successful_boundary() {
+        // P2fix3 PAIRING: taint clears ONLY on a SUCCESSFUL
+        // producer boundary — a failed terminal boundary (cut
+        // failure) carries taint through finalize+close instead
+        // of proving fresh, while a successful one clears.
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.reject_unknown();
+        let w0 = p.close_window(0, 9000, [0; 8]);
+        assert!(w0.pairing_uncertain, "decode-reject taints");
+        // Failed terminal boundary: the seal carries (and the
+        // NEXT window still carries — never cleared).
+        p.note_boundary_failure();
+        p.finalize(10_000);
+        let w1 = p.close_window(1, 11_000, [0; 8]);
+        assert!(w1.pairing_uncertain, "failed boundary carries taint");
+        assert!(
+            w1.pairing_uncertainty.contains(&"carried".to_string()),
+            "{:?}",
+            w1.pairing_uncertainty
+        );
+        let w2 = p.close_window(2, 12_000, [0; 8]);
+        assert!(
+            w2.pairing_uncertain,
+            "failed boundary never clears: {:?}",
+            w2.pairing_uncertainty
+        );
+        // Successful terminal boundary (same taint): the seal
+        // carries once, then the proved boundary clears.
+        // [p2fix5 NEW-23: success includes the positive
+        // terminal-drain receipt — finalize alone withholds.]
+        let mut q = bearing_latency();
+        pair_at(&mut q, 7, 1, 100, 200);
+        q.reject_unknown();
+        let _ = q.close_window(0, 9000, [0; 8]);
+        q.note_terminal_drain(true);
+        q.finalize(10_000);
+        let wq = q.close_window(1, 11_000, [0; 8]);
+        assert!(wq.pairing_uncertain, "seal shows carried taint");
+        let wq2 = q.close_window(2, 12_000, [0; 8]);
+        assert!(
+            !wq2.pairing_uncertain,
+            "proved boundary clears: {:?}",
+            wq2.pairing_uncertainty
+        );
+    }
+
+    #[test]
+    fn new20_terminal_drain_overrun_latches_like_gate_close() {
+        // P2fix4 NEW-20/PAIRING: the affirmative terminal-drain
+        // result enters settlement like the gate-close result — a
+        // dirty terminal drain (remainder dropped) latches the
+        // producer-boundary failure: prior taint carries through
+        // finalize+close AND the next window (never clears). A
+        // clean terminal drain latches nothing: the seal carries
+        // once, then the proved boundary clears (pinned
+        // separately from the fully-successful boundary).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.reject_unknown();
+        let w0 = p.close_window(0, 9000, [0; 8]);
+        assert!(w0.pairing_uncertain, "decode-reject taints");
+        // Successful close, FAILED drain: taint carries, never
+        // clears.
+        p.note_terminal_drain(false);
+        p.finalize(10_000);
+        let w1 = p.close_window(1, 11_000, [0; 8]);
+        assert!(
+            w1.pairing_uncertain,
+            "failed drain carries prior taint: {:?}",
+            w1.pairing_uncertainty
+        );
+        assert!(
+            w1.pairing_uncertainty.contains(&"carried".to_string()),
+            "{:?}",
+            w1.pairing_uncertainty
+        );
+        let w2 = p.close_window(2, 12_000, [0; 8]);
+        assert!(
+            w2.pairing_uncertain,
+            "failed drain never clears: {:?}",
+            w2.pairing_uncertainty
+        );
+        // Fully successful boundary (same taint): the seal
+        // carries once, then clears.
+        let mut q = bearing_latency();
+        pair_at(&mut q, 7, 1, 100, 200);
+        q.reject_unknown();
+        let _ = q.close_window(0, 9000, [0; 8]);
+        q.note_terminal_drain(true);
+        q.finalize(10_000);
+        let wq = q.close_window(1, 11_000, [0; 8]);
+        assert!(wq.pairing_uncertain, "seal shows carried taint");
+        let wq2 = q.close_window(2, 12_000, [0; 8]);
+        assert!(
+            !wq2.pairing_uncertain,
+            "clean drain + close proves fresh: {:?}",
+            wq2.pairing_uncertainty
+        );
+    }
+
+    #[test]
+    fn new23_unproved_terminal_boundary_withholds() {
+        // P2fix5 NEW-23: host finalization alone proves NOTHING —
+        // without a positive terminal-drain receipt the taint
+        // carries through finalize+close AND the next window
+        // (pre-fix: the clear predicate passes on settled+clean
+        // alone, clearing without drainage evidence).
+        let mut q = bearing_latency();
+        pair_at(&mut q, 7, 1, 100, 200);
+        q.reject_unknown();
+        let w0 = q.close_window(0, 9000, [0; 8]);
+        assert!(w0.pairing_uncertain, "decode-reject taints");
+        q.finalize(10_000);
+        let w1 = q.close_window(1, 11_000, [0; 8]);
+        assert!(w1.pairing_uncertain, "seal shows carried taint");
+        assert!(
+            w1.pairing_uncertainty.contains(&"carried".to_string()),
+            "{:?}",
+            w1.pairing_uncertainty
+        );
+        let w2 = q.close_window(2, 12_000, [0; 8]);
+        assert!(
+            w2.pairing_uncertain,
+            "an unproved terminal boundary never clears: {:?}",
+            w2.pairing_uncertainty
+        );
+    }
+
+    #[test]
+    fn new32_failed_clean_history_seal_withholds() {
+        // P2fix6 NEW-32: an EXPLICIT failed terminal boundary
+        // withholds interpretations EVEN with clean history (a
+        // clean close can no longer launder a failed producer
+        // boundary — pre-fix: no uncertainty signal fires, so the
+        // seal publishes). Both failure funnels (failed gate cut
+        // via `note_boundary_failure`, failed/unproved drain via
+        // `note_terminal_drain(false)`) seal uncertain with the
+        // `terminal-boundary-failed` reason, and the projection
+        // withholds interpreted classes/distributions while raw
+        // counters stay.
+        for (what, fail) in [("cut", true), ("drain", false)] {
+            let mut p = bearing_latency();
+            pair_at(&mut p, 7, 1, 100, 200);
+            if fail {
+                p.note_boundary_failure();
+            } else {
+                p.note_terminal_drain(false);
+            }
+            p.finalize(10_000);
+            let w = p.close_window(1, 11_000, [0; 8]);
+            assert_eq!(w.paired, 1, "{what}: raw pairs still flow");
+            assert!(
+                w.pairing_uncertain,
+                "{what}: a failed terminal boundary withholds on clean history: {:?}",
+                w.pairing_uncertainty
+            );
+            assert!(
+                w.pairing_uncertainty
+                    .contains(&"terminal-boundary-failed".to_string()),
+                "{what}: the failure names itself: {:?}",
+                w.pairing_uncertainty
+            );
+            let summary = summarize(&w, &p.totals(), "latency", None);
+            summary
+                .validate()
+                .expect("{what}: the withholding seal validates");
+            assert!(
+                summary.class_epoch.is_none(),
+                "{what}: interpreted classes withhold"
+            );
+            assert!(
+                summary.histograms.is_none(),
+                "{what}: interpreted distributions withhold"
+            );
+            // The failure never clears on a later window either.
+            let w2 = p.close_window(2, 12_000, [0; 8]);
+            assert!(
+                w2.pairing_uncertain,
+                "{what}: a failed boundary never clears: {:?}",
+                w2.pairing_uncertainty
+            );
+        }
+    }
+
+    #[test]
+    fn new32_proved_clean_history_seal_publishes() {
+        // P2fix6 NEW-32 positively-settled control: a clean
+        // history WITH the positive terminal-drain receipt seals
+        // certain and publishes interpretations (the receipt is
+        // the difference from the withhold pin above).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_terminal_drain(true);
+        p.finalize(10_000);
+        let w = p.close_window(1, 11_000, [0; 8]);
+        assert_eq!(w.paired, 1);
+        assert!(
+            !w.pairing_uncertain,
+            "a proved clean-history seal publishes: {:?}",
+            w.pairing_uncertainty
+        );
+        let summary = summarize(&w, &p.totals(), "latency", None);
+        summary.validate().expect("the publishing seal validates");
+        assert!(
+            summary.class_epoch.is_some(),
+            "interpreted classes publish on the proved boundary"
+        );
+        assert!(
+            summary.histograms.is_some(),
+            "interpreted distributions publish on the proved boundary"
+        );
+    }
+
+    #[test]
+    fn new23_proved_terminal_boundary_clears() {
+        // P2fix5 NEW-23 control: WITH the positive terminal-drain
+        // receipt the settled clean close carries once, then the
+        // proved boundary clears (green before and after — the
+        // receipt is the difference from the withhold pin above).
+        let mut q = bearing_latency();
+        pair_at(&mut q, 7, 1, 100, 200);
+        q.reject_unknown();
+        let w0 = q.close_window(0, 9000, [0; 8]);
+        assert!(w0.pairing_uncertain, "decode-reject taints");
+        q.note_terminal_drain(true);
+        q.finalize(10_000);
+        let w1 = q.close_window(1, 11_000, [0; 8]);
+        assert!(w1.pairing_uncertain, "seal shows carried taint");
+        let w2 = q.close_window(2, 12_000, [0; 8]);
+        assert!(
+            !w2.pairing_uncertain,
+            "proved boundary clears: {:?}",
+            w2.pairing_uncertainty
+        );
+    }
+
+    #[test]
+    fn new4_trace_diagnostics_name_fields_not_values() {
+        // P2fix4 NEW-4: trace-validation rejections name the FIELD,
+        // never the rejected input text (canary words in mode,
+        // reasons, exemplar dirs, by_api keys, or availability
+        // words must not echo into diagnostics).
+        let mut p = edge_bearing();
+        p.set_histogram_by_api(true);
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        let t = p.totals();
+        let mut avail = std::collections::BTreeMap::new();
+        for id in 20..=72u32 {
+            avail.insert(
+                id,
+                if id == 20 { "covered" } else { "not_attached" }.to_string(),
+            );
+        }
+        let good = summarize(&w, &t, "latency", Some(&avail));
+        good.validate().expect("baseline validates");
+        // Bad mode word.
+        let mut bad = good.clone();
+        bad.mode = "EVIL_MODE_N0ECHO".to_string();
+        bad.window.mode = "EVIL_MODE_N0ECHO".to_string();
+        let err = bad.validate().expect_err("bad mode must reject");
+        assert!(
+            !err.contains("EVIL_MODE_N0ECHO"),
+            "mode must not echo: {err}"
+        );
+        // Bad uncertainty reason.
+        let mut bad = good.clone();
+        bad.pairing_uncertain = true;
+        bad.class_epoch = None;
+        bad.histograms = None;
+        bad.by_api = None;
+        bad.by_api_availability = None;
+        bad.window.pairing_uncertain = true;
+        bad.window.class_window = None;
+        bad.window.pairing_uncertainty = vec!["EVIL_REASON_N0ECHO".to_string()];
+        let err = bad.validate().expect_err("bad reason must reject");
+        assert!(
+            !err.contains("EVIL_REASON_N0ECHO"),
+            "reason must not echo: {err}"
+        );
+        // Bad exemplar dir.
+        let mut bad = good.clone();
+        bad.window.exemplars = vec![TraceExemplarJson {
+            dir: "EVIL_DIR_N0ECHO".to_string(),
+            key_hash16: "814dd7b9784d57c1".to_string(),
+            api: 20,
+            age_ns: 5,
+        }];
+        let err = bad.validate().expect_err("bad dir must reject");
+        assert!(!err.contains("EVIL_DIR_N0ECHO"), "dir must not echo: {err}");
+        // Bad by_api key + bad availability word (via JSON so the
+        // map keys/words ride the typed read).
+        let mut v = serde_json::to_value(&good).unwrap();
+        v["by_api"]["EVIL_KEY_N0ECHO"] = v["by_api"]["20"].clone();
+        v["by_api"].as_object_mut().unwrap().remove("20");
+        let err = super::parse_trace_section(&v).expect_err("bad key must reject");
+        assert!(!err.contains("EVIL_KEY_N0ECHO"), "key must not echo: {err}");
+        let mut v = serde_json::to_value(&good).unwrap();
+        v["by_api_availability"]["20"] = serde_json::json!("EVIL_WORD_N0ECHO");
+        let err = super::parse_trace_section(&v).expect_err("bad word must reject");
+        assert!(
+            !err.contains("EVIL_WORD_N0ECHO"),
+            "word must not echo: {err}"
+        );
+    }
+
+    #[test]
+    fn new3_fallback_family_invariant_detects_operational_content() {
+        // P2fix3 NEW-3: a fallback-shaped stored summary carries
+        // ONLY fallback-family content (fetch/lifecycle classes +
+        // family exemplars) — operational classes or exemplar IDs
+        // fail the invariant (the presenter withholds on failure,
+        // never trusting intake alone).
+        fn fallback_seal() -> TraceSummary {
+            let mut p = TraceProducer::new();
+            p.set_mode(TRACE_MODE_METADATA);
+            p.set_fallback(true);
+            let a = key(1, 1, 1, 100, 1);
+            p.attempt(attempt(a, 10, 1000));
+            p.result(result(a, 10, 1500, 1));
+            let w = p.close_window(0, 9000, [0; 8]);
+            let t = p.totals();
+            summarize(&w, &t, "metadata", None)
+        }
+        let good = fallback_seal();
+        assert!(super::fallback_family_clean(&good));
+        // Operational class under fallback.
+        let mut bad = fallback_seal();
+        bad.window.class_window.as_mut().unwrap().success = 1;
+        assert!(
+            !super::fallback_family_clean(&bad),
+            "operational class under fallback fails"
+        );
+        // Operational exemplar under fallback.
+        let mut bad = fallback_seal();
+        bad.window.exemplars = vec![TraceExemplarJson {
+            dir: "entry".to_string(),
+            key_hash16: "814dd7b9784d57c1".to_string(),
+            api: 20,
+            age_ns: 5,
+        }];
+        assert!(
+            !super::fallback_family_clean(&bad),
+            "operational exemplar under fallback fails"
+        );
+        // Family exemplar under fallback passes.
+        let mut ok = fallback_seal();
+        ok.window.exemplars = vec![TraceExemplarJson {
+            dir: "entry".to_string(),
+            key_hash16: "814dd7b9784d57c1".to_string(),
+            api: 10,
+            age_ns: 5,
+        }];
+        assert!(super::fallback_family_clean(&ok));
+        // Non-fallback summaries always pass (operational content
+        // is legitimate off-fallback).
+        let mut p = edge_bearing();
+        let a = key(1, 1, 1, 100, 1);
+        p.attempt(attempt(a, 20, 1000));
+        p.result(result(a, 20, 1500, 1));
+        let w = p.close_window(0, 9000, [0; 8]);
+        let t = p.totals();
+        let lat = summarize(&w, &t, "latency", None);
+        assert!(super::fallback_family_clean(&lat));
+    }
+
+    #[test]
+    fn r13_emitted_schedule_carries_through_publication() {
+        // P2fix3 item 5 (codex PAIRING-OPEN): the ACTUAL R13 emitted
+        // schedule (`r13_mixed_rejected_steal` — seven framed Y
+        // calls + operational X1, quota units A(Y) + B(X), window
+        // close mid-flight, B's rejected return stealing X1's
+        // frame, A's accept emitting (7,900) against Y7's frame,
+        // X1's genuine return consuming B's orphaned unit) driven
+        // as REAL wire bytes through decode into the producer,
+        // then through summarize → validate → JSON → presenter →
+        // adapters/frame. The quota units + rejected return are
+        // BPF-side mechanics (no wire records — the frozen model
+        // asserts suppr/disc/evicted all 0, so loss_abs stays
+        // zero); the producer sees their EMISSION consequences:
+        // seven Y-keyed RESULTs ([(7,900),(6,6)..(1,1)] — Y7
+        // FIRST with X1's 900ns, then Y6..Y1 in LIFO order; the
+        // model's small durations map to post-close ns deltas, the
+        // 900 mislabel exactly) and NO X1 RESULT. Key-exact
+        // matching pairs all 7 Y frames (Y7 carries the 900 into
+        // fetch class-0, never histogrammed) and orphans X1's
+        // attempt visibly — paired 7 with the orphan + exemplar,
+        // never a silent 8.
+        use super::super::wire::contract as c;
+        let mut p = bearing_latency();
+        // Frames: Y1..Y7 (cookie 1, fetch api 10) + X1 (cookie 2,
+        // operational api 20), invocations 1..=8.
+        for i in 1..=7u64 {
+            feed_wire(&mut p, &wire_edge(c::ATTEMPT, 10, 1, i, 1000 + 10 * i, 0));
+        }
+        feed_wire(&mut p, &wire_edge(c::ATTEMPT, 20, 2, 8, 1100, 0));
+        // The window closes mid-flight (the R13 close — holds carry,
+        // nothing expires: pre-expiry, unlike the retired analog).
+        let w0 = p.close_window(0, 1900, [0; 8]);
+        assert_eq!(
+            (w0.paired, w0.unpaired_entries, w0.unpaired_results),
+            (0, 0, 0)
+        );
+        assert!(!w0.pairing_uncertain);
+        // Emitted RESULTs: (7,900) FIRST, then Y6..Y1 LIFO; X1
+        // emits nothing (consumed by the rejected arm).
+        feed_wire(&mut p, &wire_edge(c::RESULT, 10, 1, 7, 1970, 1));
+        for i in (1..=6u64).rev() {
+            feed_wire(&mut p, &wire_edge(c::RESULT, 10, 1, i, 2080 - 10 * i, 1));
+        }
+        let w1 = p.close_window(1, 9900, [0; 8]);
+        assert_eq!(w1.paired, 7, "seven Y frames pair; X1 orphans");
+        assert_eq!((w1.unpaired_entries, w1.unpaired_results), (1, 0));
+        assert!(!w1.pairing_uncertain, "orphan expiry stays certain");
+        // Classes: 7 fetch class-0, ZERO operational success (X1
+        // never paired — its frame holds no RESULT).
+        assert_eq!(w1.class_counts, [7, 0, 0, 0, 0]);
+        // The mislabeled 900 rides Y7's fetch pair (class-0,
+        // never histogrammed): NO operational duration folds —
+        // verdict distributions stay uncontaminated.
+        for (slot, name) in [(0, "unknown"), (1, "success")] {
+            assert_eq!(w1.histograms[slot].count, 0, "{name} histogram empty");
+            assert_eq!(w1.histograms[slot].sum, 0, "{name} sum empty");
+        }
+        // X1's orphan is visible (entry exemplar, operational api).
+        assert!(
+            w1.exemplars.iter().any(|e| e.api == 20),
+            "X1 orphan exemplified: {:?}",
+            w1.exemplars.iter().map(|e| e.api).collect::<Vec<_>>()
+        );
+        let t = p.totals();
+        assert_eq!(
+            (t.paired, t.unpaired_entries, t.unpaired_results),
+            (7, 1, 0)
+        );
+        assert!(!t.pairing_uncertain);
+        // Through publication: the certain shape projects with
+        // the orphan visible (paired 7, class-0 7, operational 0).
+        let s = summarize(&w1, &t, "latency", None);
+        s.validate().expect("r13 summary validates");
+        let json = serde_json::to_value(&s).unwrap();
+        let back: TraceSummary = serde_json::from_value(json).unwrap();
+        back.validate().expect("round-tripped summary validates");
+        let mut doc = crate::presentation::snapshot::test_document(3, "complete");
+        doc["schema"] = serde_json::json!("observed-crypto-v2.9");
+        doc["trace_summary"] = serde_json::to_value(&back).unwrap();
+        let snap = crate::presentation::snapshot::Presenter::oneshot(&doc).unwrap();
+        snap.check_unknown_invariant().unwrap();
+        let trace = snap.trace.as_ref().expect("trace block projects");
+        assert_eq!(trace.paired, 7);
+        assert_eq!(trace.trace_unpaired_entries, 1);
+        let cw = trace.class_window.as_ref().expect("certain classes show");
+        assert_eq!((cw.success, cw.unknown), (0, 7));
+        assert!(snap.histograms.is_some(), "certain histograms show");
+        assert!(snap.counts.by_outcome.is_some(), "certain fold shows");
+        let prom = crate::presentation::prometheus::render(&snap);
+        assert!(prom.contains("osslscope_trace_calls_total"), "{prom:?}");
+        assert!(
+            prom.contains("osslscope_dispatch_duration_nanoseconds_bucket"),
+            "{prom:?}"
+        );
+        let otel = crate::presentation::otel::render(&snap);
+        assert!(otel.contains("osslscope.trace.calls"), "{otel:?}");
+        let frame = crate::presentation::watch::render_frame(&snap);
+        assert!(frame.contains("class success=0"), "{frame:?}");
+        assert!(frame.contains("unpaired_e=1"), "{frame:?}");
+        assert!(!frame.contains("class withheld"), "{frame:?}");
+    }
+
+    #[test]
+    fn p2fix2_global_cut_note_taints_any_overrun() {
+        // The feed-cut arm (claim-end binding): any already-consumed
+        // timestamp at/above the cut taints (`late-cut`).
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_global_cut(50);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(w.pairing_uncertain, "global cut below consumed must taint");
+        assert!(
+            w.pairing_uncertainty.contains(&"late-cut".to_string()),
+            "{:?}",
+            w.pairing_uncertainty
+        );
+        let mut p = bearing_latency();
+        pair_at(&mut p, 7, 1, 100, 200);
+        p.note_global_cut(10_000);
+        let w = p.close_window(0, 9000, [0; 8]);
+        assert!(
+            !w.pairing_uncertain,
+            "global cut above consumed stays clean: {:?}",
+            w.pairing_uncertainty
+        );
     }
 }

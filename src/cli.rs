@@ -214,10 +214,12 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
         "service-attempt-trace" => crate::service::witness_cli::run_trace(&argv[1..]),
         "report" => crate::report::run(&argv[1..]),
         "check" => crate::check::run(&argv[1..]),
+        "export" => crate::presentation::export::run(&argv),
+        "watch" => crate::presentation::watch::run(&argv),
         "help" | "--help" | "-h" => {
             println!("osslscope — non-interposing OpenSSL observer");
             println!(
-                "usage: osslscope <scan|inspect|doctor|report|check|alias-audit|service> [args]"
+                "usage: osslscope <scan|inspect|doctor|report|check|alias-audit|service|export|watch> [args]"
             );
             println!(
                 "  doctor       inventory, companion integrity and functional tracing preflight"
@@ -230,6 +232,10 @@ pub fn run(args: impl Iterator<Item = String>) -> ExitCode {
                 "  service      bounded-window continuous observation service (see: service --help)"
             );
             println!("  alias-audit  group a harvest doc's rows by shared address");
+            println!(
+                "  export       serve Prometheus exposition + OTLP push from a service out-DIR"
+            );
+            println!("  watch        render one operator frame from a service out-DIR");
             println!(
                 "  report/check use --pid PID or run -- COMMAND; --libcrypto selects legacy diagnostics"
             );

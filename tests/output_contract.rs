@@ -20,6 +20,7 @@ use osslscope::evidence::{
     EngineWindow, ExpectedScope, FatalKind, FencedGeneration, FinalizeInput, GapCounter,
     LegacyCallPartition, ObjectId, ObjectRecord, OpensslVersion, ScopeCoverage, SiteExecution,
     SiteKey, SysctlContext, TargetRecord, engine_index, finalize, stamp_context,
+    stamp_request_evidence,
 };
 use osslscope::policy::{PolicyOutcome, PolicyRule, evaluate_document};
 use osslscope::report::{
@@ -6707,6 +6708,132 @@ fn r33_strict_v24_reader_rejects_only_new_vocabulary() {
     let error = validate_v2_with_schema(V24_SCHEMA_JSON, &and_membership).unwrap_err();
     assert_eq!(error.path, "$.membership");
     assert!(error.message.contains("forbidden"), "{error}");
+}
+
+fn request_doc_fixture() -> CaptureDocument {
+    use osslscope::provider_observation::RequestEvidence;
+    use osslscope::provider_observation::request_evidence::{FETCH_SURFACES, RequestScope};
+    // v2.8 inherits the v2.6 coarse-version rule (same as the
+    // corpse fixture: live captures coarsen; patch strings are a
+    // pre-2.6 fixture shape).
+    let mut input = input_base();
+    input.openssl = OpensslVersion::verified("3.5".to_string());
+    let mut doc = finalize_honest(input);
+    // NEW-P1 scope + GATE reconciliation: the remainder (9) equals
+    // the observed api_activity entry sum in this fixture.
+    let evidence = RequestEvidence::fold(
+        &[],
+        RequestScope {
+            operational_entries: Some(9),
+            fetch_armed: FETCH_SURFACES.iter().map(|s| s.id).collect(),
+            window: None,
+            silence_start: None,
+            silence_end: None,
+            fence_cuts: Vec::new(),
+        },
+    );
+    doc.api_activity = vec![osslscope::api_activity::ApiActivityRow {
+        api: osslscope::api_activity::ApiId::try_from(20).unwrap(),
+        entries: 9,
+        observed_success: 9,
+        observed_failure: 0,
+        verification_mismatch: 0,
+        unsupported: 0,
+        gaps: osslscope::api_activity::ApiActivityGaps::default(),
+    }];
+    stamp_request_evidence(&mut doc, evidence);
+    doc
+}
+
+#[test]
+fn p1_request_evidence_renders_and_validates() {
+    // Phase 1 (v2.8): the ACTUAL rendered artifact (not the model)
+    // must carry the request_evidence section and validate against
+    // the current schema — and the minor version must claim the
+    // new keys.
+    use osslscope::evidence::CAPTURE_SCHEMA_V2_8;
+    let doc = request_doc_fixture();
+    assert_eq!(
+        doc.schema, CAPTURE_SCHEMA_V2_8,
+        "request docs must claim the minor that carries request_evidence"
+    );
+    let v = json_of(&doc);
+    assert_eq!(
+        v["request_evidence"]["unattributed"]["observed"]["ops"], 9,
+        "rendered artifact omits the request section: {v}"
+    );
+    validate_v2(&v).expect("request artifact must validate");
+    check_v2_semantics(&v).expect("request artifact must stay semantic-clean");
+    assert!(
+        check_version_v2(v["schema_version"].as_str().unwrap()),
+        "new minor must pass the old major gate"
+    );
+    // Retained compatibility: an old-shaped document (no request
+    // section) still validates — the addition is an optional key.
+    let mut old = v.clone();
+    old["schema_version"] = Value::from("observed-crypto-v2.4");
+    old.as_object_mut().unwrap().remove("request_evidence");
+    validate_v2(&old).expect("old-shaped doc must keep validating");
+}
+
+/// Pre-v2.8 field-level reader: no `request_evidence` field.
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct Pre28RequestReader {
+    schema_version: String,
+    completeness: Pre28Completeness,
+}
+
+#[derive(serde::Deserialize, Debug)]
+#[allow(dead_code)]
+struct Pre28Completeness {
+    status: String,
+}
+
+#[test]
+fn p1_old_field_reader_tolerates_request_keys() {
+    // An old field-level reader (unknown keys ignored) parses the
+    // v2.8 artifact — tolerance demonstrated, not assumed.
+    let v = json_of(&request_doc_fixture());
+    let back: Pre28RequestReader =
+        serde_json::from_value(v).expect("old field reader parses v2.8 bytes");
+    assert_eq!(back.schema_version, "observed-crypto-v2.8");
+}
+
+#[test]
+fn p1_strict_v24_reader_rejects_only_new_vocabulary() {
+    // The strict old reader rejects the v2.8 artifact at new
+    // vocabulary only (the documented minor-version contract) —
+    // proving nothing else in the artifact broke old readers.
+    // PINS-OPEN fix5: the receipt half of this proof uses an
+    // ACTUALLY receipted row (a bare fixture omits the key under
+    // NEW-18, so stripping it would prove nothing). The legacy
+    // producer path itself (service windows keep older stamps)
+    // is pinned byte-stable separately through the actual
+    // service output at
+    // service::snapshot::tests::legacy_service_window_strips_receipt_vocabulary.
+    let mut v = json_of(&request_doc_fixture());
+    // A successful terminal read (the v2.8 producer shape for a
+    // receipted row).
+    v["api_activity"][0]["gaps"]["read_receipt"] = Value::from(true);
+    let error = validate_v2_with_schema(V24_SCHEMA_JSON, &v).unwrap_err();
+    assert_eq!(error.path, "$.api_activity[0].gaps.read_receipt");
+    assert!(error.message.contains("forbidden"), "{error}");
+    let mut no_receipt = v.clone();
+    for row in no_receipt["api_activity"].as_array_mut().unwrap() {
+        row["gaps"].as_object_mut().unwrap().remove("read_receipt");
+    }
+    let error = validate_v2_with_schema(V24_SCHEMA_JSON, &no_receipt).unwrap_err();
+    assert_eq!(error.path, "$.request_evidence");
+    assert!(error.message.contains("forbidden"), "{error}");
+    let mut old_shaped = no_receipt.clone();
+    old_shaped["schema_version"] = Value::from("observed-crypto-v2.4");
+    old_shaped
+        .as_object_mut()
+        .unwrap()
+        .remove("request_evidence");
+    validate_v2_with_schema(V24_SCHEMA_JSON, &old_shaped)
+        .expect("past the two new keys, old readers accept the rest");
 }
 
 #[test]

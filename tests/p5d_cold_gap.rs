@@ -968,6 +968,8 @@ fn capture_spawn_counts_executions() {
         harvest_timeout: Duration::from_secs(30),
         grace: Duration::from_secs(5),
         image_digest: String::new(),
+        trace_mode: osslscope::provider_observation::trace::TRACE_MODE_OFF,
+        trace_by_api: false,
     };
     let t_entry = monotonic_ns();
     let cap = osslscope::capture::run(

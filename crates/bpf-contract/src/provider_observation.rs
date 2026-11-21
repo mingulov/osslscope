@@ -30,6 +30,32 @@ pub const ADD_BUILTIN: u32 = 6;
 pub const PROVIDER_INIT: u32 = 7;
 pub const PUBLIC_QUERY: u32 = 8;
 pub const PUBLIC_UNQUERY: u32 = 9;
+/// Phase 1 amendment P1-A1: stable fetch IDs. The six v0.6.0 IDs
+/// (10..=15) keep their values; the eight new surfaces take
+/// 73..=80 (EVP group alphabetical, then OSSL group
+/// alphabetical). `Record` layout is unchanged (the api word was
+/// always u32), so VERSION stays 5: old hosts fail closed on
+/// 73..=80 via InvalidWire. The reverse direction is NOT closed:
+/// the BPF entry/return paths are generic over non-excluded api IDs,
+/// so an old (byte-identical) BPF object CAN emit 73..=80 when a new
+/// host supplies those IDs through attach configuration — the new
+/// host decodes them, and old hosts fail closed via InvalidWire.
+pub const FETCH_MD: u32 = 10;
+pub const FETCH_CIPHER: u32 = 11;
+pub const FETCH_MAC: u32 = 12;
+pub const FETCH_KDF: u32 = 13;
+pub const FETCH_SIGNATURE: u32 = 14;
+pub const FETCH_KEM: u32 = 15;
+pub const FETCH_ASYM_CIPHER: u32 = 73;
+pub const FETCH_KEYEXCH: u32 = 74;
+pub const FETCH_KEYMGMT: u32 = 75;
+pub const FETCH_RAND: u32 = 76;
+pub const FETCH_SKEYMGMT: u32 = 77;
+pub const FETCH_DECODER: u32 = 78;
+pub const FETCH_ENCODER: u32 = 79;
+pub const FETCH_STORE_LOADER: u32 = 80;
+/// Highest wire-valid API ID (P1-A1: the fetch extension tail).
+pub const MAX_API: u32 = 80;
 pub const GET_DISPATCH: u32 = 16;
 pub const QUERY_CALLBACK: u32 = 17;
 pub const TEARDOWN: u32 = 18;
@@ -321,6 +347,10 @@ pub const fn load_api(api: u32) -> bool {
 }
 pub const fn query_api(api: u32) -> bool {
     api == PUBLIC_QUERY || api == QUERY_CALLBACK
+}
+/// Fetch carve-out (P1-A1): 10..=15 plus the 73..=80 extension.
+pub const fn fetch_api(api: u32) -> bool {
+    matches!(api, 10..=15 | 73..=80)
 }
 
 /// Wrapper variants collapse only within one object/library-context stack;
@@ -858,6 +888,43 @@ mod tests {
         }
         for mode in [2, 3, 4] {
             assert!(trace_edge_bearing(mode), "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn fetch_ids_cover_all_14_surfaces() {
+        // Phase 1 amendment P1-A1: the six v0.6.0 fetch IDs keep
+        // their values; the eight new surfaces take 73..=80.
+        assert_eq!(
+            (
+                FETCH_MD,
+                FETCH_CIPHER,
+                FETCH_MAC,
+                FETCH_KDF,
+                FETCH_SIGNATURE,
+                FETCH_KEM
+            ),
+            (10, 11, 12, 13, 14, 15)
+        );
+        assert_eq!(
+            (
+                FETCH_ASYM_CIPHER,
+                FETCH_KEYEXCH,
+                FETCH_KEYMGMT,
+                FETCH_RAND,
+                FETCH_SKEYMGMT,
+                FETCH_DECODER,
+                FETCH_ENCODER,
+                FETCH_STORE_LOADER,
+            ),
+            (73, 74, 75, 76, 77, 78, 79, 80)
+        );
+        assert_eq!(MAX_API, 80);
+        for api in [10, 11, 12, 13, 14, 15, 73, 74, 75, 76, 77, 78, 79, 80] {
+            assert!(fetch_api(api), "api {api}");
+        }
+        for api in [0, 1, 6, 7, 9, 16, 19, 20, 72, 81, 100, u32::MAX] {
+            assert!(!fetch_api(api), "api {api}");
         }
     }
 

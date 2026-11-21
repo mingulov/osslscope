@@ -14,8 +14,8 @@ use crate::{
         scope::{ScopedScanner, Selection},
     },
     provider_observation::{
-        AliasStatus, Cacheability, ObservationBatch, ObservationGap, ObservationLimits,
-        ObservationPayload, ProviderSession, cli::Signals,
+        AliasStatus, Cacheability, ObservationBatch, ObservationFact, ObservationGap,
+        ObservationLimits, ObservationPayload, ProviderSession, cli::Signals,
     },
     target::{OwnedTarget, TargetDisposition},
 };
@@ -39,10 +39,27 @@ pub struct FocusedConfig {
     pub duration: Duration,
     pub timeout: Duration,
     pub grace: Duration,
+    /// Requested `--trace` word (§6D-9 mode word, default off).
+    pub trace_mode: u32,
+    /// `--trace-histogram-by-api` (§6D-3 opt-in).
+    pub trace_by_api: bool,
+    /// Isolated-qualification-harness bypass (DELTA-7): program the
+    /// requested operational mode even while C023 is OPEN. Set ONLY
+    /// by the qual harness (direct `run` drive for
+    /// re-qualification captures) — NEVER exposed via CLI parsing
+    /// (public paths always force the fallback while OPEN).
+    pub allow_operational_trace: bool,
     /// Run-shared ELF parse cache handle (F8d RESTORATION; `None`
     /// parses uncached). Clone shares the run's cache.
     pub parsed_cache:
         Option<std::rc::Rc<std::cell::RefCell<crate::provider_observation::objects::ParseCache>>>,
+    /// Attach-readiness handshake (P2fix2 item 11): when `Some`, the
+    /// run sends `()` exactly once as its incarnation completes its
+    /// cold attach (`provider_start_ns` establishment — trace mode
+    /// is programmed before admission, so the handshake implies the
+    /// full setup settled). `None` (production default) handshakes
+    /// nothing. Best-effort (a gone receiver never fails the run).
+    pub attach_ready: Option<std::sync::mpsc::Sender<()>>,
 }
 impl Default for FocusedConfig {
     fn default() -> Self {
@@ -51,6 +68,10 @@ impl Default for FocusedConfig {
             timeout: Duration::from_secs(60),
             grace: Duration::from_secs(5),
             parsed_cache: None,
+            trace_mode: crate::provider_observation::trace::TRACE_MODE_OFF,
+            trace_by_api: false,
+            allow_operational_trace: false,
+            attach_ready: None,
         }
     }
 }
@@ -174,6 +195,78 @@ fn loss(name: &str, source: CounterSource, value: u64) -> GapCounter {
         kind: CounterKind::Loss,
         units: CounterUnits::Events,
     }
+}
+
+/// Project a sealed trace window's six frozen counters (§6D-7
+/// counter namespace) as Loss-kind `GapCounter`s — the
+/// counters-half of "computed once, projected twice". Positive
+/// counters only (zeros are inert under `forces_partial` and the
+/// record fields already carry them explicitly). Names are the
+/// frozen field names verbatim; `trace_depth_exceeded` rides
+/// `KernelRing` (it IS the `LOSS_DEPTH` lane) while the five
+/// host-computed pairing outcomes ride `Discovery`.
+/// Effective capture end (P2fix3 TRACE): the observed now
+/// clamped to the requested deadline, never before start. One
+/// binding feeds the trace feed cut AND the published window, so
+/// the fold interval and the claimed interval cannot drift.
+pub fn effective_end_ns(now_ns: u64, deadline_ns: u64, start_ns: u64) -> u64 {
+    now_ns.min(deadline_ns).max(start_ns)
+}
+
+/// Trace-seal uncertainty gap (P2fix3 NEW-P2e): a
+/// pairing-uncertain seal (window OR epoch scope) degrades focused
+/// completeness through the shared finalizer — the focused twin of
+/// the standalone `trace_seal_degrades` rule. A taint-only cut
+/// carries zero counted loss (the fold holds out-of-interval pairs
+/// it cannot exclude), so without this the window would stay
+/// COMPLETE. The six `trace_*` counters stay exactly six (§6D-7);
+/// the seal caveat rides the seal-gap word.
+pub fn trace_seal_uncertainty_gap(
+    window: &crate::provider_observation::trace::ClosedTraceWindow,
+    totals: &crate::provider_observation::trace::TraceTotals,
+) -> Option<ObservationGap> {
+    if window.pairing_uncertain || totals.pairing_uncertain {
+        Some(ObservationGap::SamplingPartial)
+    } else {
+        None
+    }
+}
+
+pub fn trace_loss_counters(
+    window: &crate::provider_observation::trace::ClosedTraceWindow,
+) -> Vec<GapCounter> {
+    [
+        ("trace_dropped", CounterSource::Discovery, window.dropped),
+        (
+            "trace_unpaired_entries",
+            CounterSource::Discovery,
+            window.unpaired_entries,
+        ),
+        (
+            "trace_unpaired_results",
+            CounterSource::Discovery,
+            window.unpaired_results,
+        ),
+        (
+            "trace_depth_exceeded",
+            CounterSource::KernelRing,
+            window.depth_exceeded,
+        ),
+        (
+            "trace_nonmonotonic_pairs",
+            CounterSource::Discovery,
+            window.nonmonotonic_pairs,
+        ),
+        (
+            "trace_rejected_unknown_api",
+            CounterSource::Discovery,
+            window.rejected_unknown_api,
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, _, value)| *value > 0)
+    .map(|(name, source, value)| loss(name, source, value))
+    .collect()
 }
 fn observation_loss(gap: ObservationGap) -> GapCounter {
     use ObservationGap::*;
@@ -774,6 +867,14 @@ pub(crate) struct FocusedSession {
     next_snapshot: Instant,
     ready: bool,
     start_ns: u64,
+    /// NEW-P1 fix3 effective provider-window start: the claimed
+    /// silence interval starts at effective admission (first
+    /// completed attach), not at setup. Established once by the
+    /// run path (`poll_inner`); `None` (never established —
+    /// refused, fenced, or expired) seals with NO silence
+    /// interval and an Unknown idle plane (NEW-16-OPEN + NEW-20
+    /// fix6: no setup-time fallback — fail closed).
+    provider_start_ns: Option<u64>,
     deadline_ns: u64,
     end: Instant,
     wall_start: Option<u64>,
@@ -782,7 +883,25 @@ pub(crate) struct FocusedSession {
     /// Admission-event sysctl sample (T5 schema D-record rule 7):
     /// sampled once in `open`, retained, never reread.
     sysctls: Option<crate::evidence::SysctlContext>,
+    /// Phase 1 request fold: every applied batch feeds its facts
+    /// here (`apply_batch` + the closing `finalize_until` batch);
+    /// `finish` seals it into `document.request_evidence`. The fold
+    /// journals one compact edge per request edge, capped at the
+    /// production fact cap (NEW-5: past-cap drops surface as
+    /// `FactLimit`, close replay is bounded work over the capped
+    /// journal, and the worst-case capacity rides the session
+    /// lease — see `reservation_bytes`).
+    request_fold: crate::provider_observation::request_evidence::RequestEvidenceFold,
     _reservation: crate::observation_memory::MemoryLease,
+    /// Effective `--trace` word (§6D-9; requested unless
+    /// programming failed, then off).
+    trace_mode: u32,
+    /// `--trace-histogram-by-api` (§6D-3 opt-in).
+    trace_by_api: bool,
+    /// Attach-readiness handshake sender (P2fix2 item 11; from
+    /// config — fired once at cold-attach establishment, then
+    /// taken).
+    attach_ready: Option<std::sync::mpsc::Sender<()>>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionProgress {
@@ -835,13 +954,19 @@ impl FocusedSession {
             next_snapshot: std::time::Instant::now(),
             ready: false,
             start_ns: 0,
+            provider_start_ns: None,
             deadline_ns: 0,
             end: std::time::Instant::now(),
             wall_start: None,
             signal_cut: false,
             workload_discarded: false,
             sysctls: None,
+            request_fold:
+                crate::provider_observation::request_evidence::RequestEvidenceFold::default(),
             _reservation: pool.reserve(1024).expect("hollow lease"),
+            trace_mode: crate::provider_observation::trace::TRACE_MODE_OFF,
+            trace_by_api: false,
+            attach_ready: None,
         }
     }
     /// fix6 F2: hollow shell around a REAL provider session for
@@ -859,6 +984,96 @@ impl FocusedSession {
         let mut hollow = Self::hollow_for_coordinator_tests(pid, starttime, namespaces, pool);
         hollow.session = Some(session);
         hollow
+    }
+    /// NEW-P1-OPEN + NEW-15 fix5 test seam: seal a production
+    /// provider session through the real `finish` with caller-staged
+    /// window/claim/fold inputs (the poll path stages these in
+    /// production — establishment timing, drains, feeds; pins stage
+    /// them directly, and the seal below is production code).
+    /// Test-only; never shipped (`#[cfg(test)]`).
+    #[cfg(test)]
+    pub(crate) fn seal_transplanted_for_test(
+        session: ProviderSession,
+        pid: u32,
+        starttime: u64,
+        namespaces: crate::inventory::NamespaceIds,
+        pool: &crate::observation_memory::MemoryPool,
+        start_ns: u64,
+        provider_start_ns: Option<u64>,
+        deadline_ns: u64,
+        fold_facts: &[crate::provider_observation::ObservationFact],
+        deadline: std::time::Instant,
+    ) -> anyhow::Result<FocusedResult> {
+        Self::seal_transplanted_inner(
+            session,
+            pid,
+            starttime,
+            namespaces,
+            pool,
+            start_ns,
+            provider_start_ns,
+            deadline_ns,
+            fold_facts,
+            deadline,
+            None,
+        )
+    }
+    /// NEW-26 fix7 test seam: the transplanted seal above with a
+    /// caller-supplied writer gate (the production finish closes
+    /// it before sampling its end instant). Pins keep a clone of
+    /// the gate to read the cut receipt `finish` mints.
+    /// Test-only; never shipped (`#[cfg(test)]`).
+    #[cfg(test)]
+    pub(crate) fn seal_transplanted_with_gate_for_test(
+        session: ProviderSession,
+        pid: u32,
+        starttime: u64,
+        namespaces: crate::inventory::NamespaceIds,
+        pool: &crate::observation_memory::MemoryPool,
+        start_ns: u64,
+        provider_start_ns: Option<u64>,
+        deadline_ns: u64,
+        fold_facts: &[crate::provider_observation::ObservationFact],
+        deadline: std::time::Instant,
+        gate: crate::writer_gate::WriterGate,
+    ) -> anyhow::Result<FocusedResult> {
+        Self::seal_transplanted_inner(
+            session,
+            pid,
+            starttime,
+            namespaces,
+            pool,
+            start_ns,
+            provider_start_ns,
+            deadline_ns,
+            fold_facts,
+            deadline,
+            Some(gate),
+        )
+    }
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments, reason = "one coherent seal spec")]
+    fn seal_transplanted_inner(
+        session: ProviderSession,
+        pid: u32,
+        starttime: u64,
+        namespaces: crate::inventory::NamespaceIds,
+        pool: &crate::observation_memory::MemoryPool,
+        start_ns: u64,
+        provider_start_ns: Option<u64>,
+        deadline_ns: u64,
+        fold_facts: &[crate::provider_observation::ObservationFact],
+        deadline: std::time::Instant,
+        gate: Option<crate::writer_gate::WriterGate>,
+    ) -> anyhow::Result<FocusedResult> {
+        let mut focused =
+            Self::with_session_for_coordinator_tests(pid, starttime, namespaces, pool, session);
+        focused.start_ns = start_ns;
+        focused.provider_start_ns = provider_start_ns;
+        focused.deadline_ns = deadline_ns;
+        focused.gate = gate;
+        focused.request_fold.feed(fold_facts);
+        focused.finish(deadline)
     }
     /// fix6 F2 test seam: drain the inner real session (clean,
     /// empty ring — consumes and accounts).
@@ -938,7 +1153,47 @@ impl FocusedSession {
                 )
                 .context("focused map reservation overflow")?;
         }
+        // NEW-5: the request-fold journal is retained for the whole
+        // window (it survives provider idle reclamation, which only
+        // releases budget state/reads to floor — never this lease),
+        // so its worst-case capacity rides the session lease for
+        // the session lifetime.
+        bytes = bytes
+            .checked_add(Self::request_journal_reserve_bytes())
+            .context("focused journal reservation overflow")?;
+        // NEW-5-OPEN: the sealed fence cuts are retained the same
+        // way (per-pid capped cycles, merged past the cap — never
+        // dropped), so their worst case rides the lease too.
+        bytes = bytes
+            .checked_add(Self::sealed_cuts_reserve_bytes())
+            .context("focused cuts reservation overflow")?;
+        // NEW-31-OPEN fix9: the scope-retention worst case
+        // (continuity pids + terminal-gap verdicts at the admission
+        // cap) rides the lease explicitly too.
+        bytes = bytes
+            .checked_add(Self::scope_retention_reserve_bytes())
+            .context("focused retention reservation overflow")?;
         Ok(bytes)
+    }
+
+    /// NEW-5 request-journal reserve (single-sourced from the fold:
+    /// full-cap edges plus slack). The reservation test pins the
+    /// equality so the lease always covers the worst case.
+    pub(crate) fn request_journal_reserve_bytes() -> usize {
+        crate::provider_observation::request_evidence::RequestEvidenceFold::journal_reserve_bytes()
+    }
+    /// NEW-5-OPEN sealed-cuts reserve (single-sourced from the
+    /// session: every admittable pid at the full per-pid cut cap
+    /// plus slack). The reservation test pins the equality.
+    pub(crate) fn sealed_cuts_reserve_bytes() -> usize {
+        crate::provider_observation::session::ProviderSession::sealed_cuts_reserve_bytes()
+    }
+    /// NEW-31-OPEN fix9 scope-retention reserve (single-sourced
+    /// from the session: continuity pids + terminal-gap verdicts
+    /// at the admission cap plus slack). The reservation test pins
+    /// the equality.
+    pub(crate) fn scope_retention_reserve_bytes() -> usize {
+        crate::provider_observation::session::ProviderSession::scope_retention_reserve_bytes()
     }
     /// No signal handlers are installed here. expected is a coordinator's
     /// scanned incarnation and initial metadata, never attachment authority.
@@ -1206,6 +1461,10 @@ impl FocusedSession {
                 end.saturating_duration_since(now).as_nanos(),
             )?)
             .context("focused admission overflow")?;
+        // NEW-P1 fix3: the setup-time program stands (BPF window
+        // from open); the run path re-establishes the claimed start
+        // at effective admission after the first attach (see
+        // `poll_inner` — monotone, never earlier).
         if let Some(gap) = session
             .as_mut()
             .and_then(|s| s.set_api_window(start_ns, deadline_ns).err())
@@ -1328,6 +1587,46 @@ impl FocusedSession {
         if cancel.load(Ordering::Relaxed) || Instant::now() >= setup_deadline {
             bail!("focused setup interrupted or expired");
         }
+        // §6D-9 mode programming (restart-scoped: once at setup).
+        // Programmed BEFORE admission (gate open + child release):
+        // a fast first call must not escape operational tracing.
+        // Public-path resolution (DELTA-7): operational modes
+        // degrade to the aggregate-only fallback while C023 is
+        // OPEN. A programming failure degrades honestly to off
+        // (effective word + gap, never a silent mismatch).
+        let trace_res = if config.allow_operational_trace {
+            crate::provider_observation::cli::resolve_qual_trace_mode(
+                config.trace_mode,
+                crate::provider_observation::cli::trace_fallback_env(),
+            )
+        } else {
+            crate::provider_observation::cli::resolve_public_trace_mode(
+                config.trace_mode,
+                crate::provider_observation::cli::trace_fallback_env(),
+            )
+        };
+        if trace_res.degraded {
+            crate::report::err_line(&format!(
+                "osslscope: note: --trace {} degraded to the aggregate-only fallback while latency acceptance is OPEN (C023)",
+                crate::provider_observation::cli::trace_word_str(config.trace_mode)
+            ));
+        }
+        let mut trace_mode = trace_res.effective;
+        if let Some(s) = session.as_mut() {
+            if trace_res.fallback {
+                if s.set_trace_fallback().is_err() {
+                    trace_mode = crate::provider_observation::trace::TRACE_MODE_OFF;
+                    gaps.insert(ObservationGap::BpfUnavailable);
+                }
+            } else if trace_mode != crate::provider_observation::trace::TRACE_MODE_OFF {
+                if s.set_trace_mode(trace_mode).is_err() {
+                    trace_mode = crate::provider_observation::trace::TRACE_MODE_OFF;
+                    gaps.insert(ObservationGap::BpfUnavailable);
+                } else {
+                    s.set_trace_histogram_by_api(config.trace_by_api);
+                }
+            }
+        }
         if let Some(gate) = &gate {
             gate.open()?;
         }
@@ -1364,6 +1663,7 @@ impl FocusedSession {
                 },
             ready: false,
             start_ns,
+            provider_start_ns: None,
             deadline_ns,
             end,
             wall_start,
@@ -1372,7 +1672,12 @@ impl FocusedSession {
             sysctls: Some(crate::evidence::sample_sysctls_from(std::path::Path::new(
                 "/proc/sys",
             ))),
+            request_fold:
+                crate::provider_observation::request_evidence::RequestEvidenceFold::default(),
             _reservation: reservation,
+            trace_mode,
+            trace_by_api: config.trace_by_api,
+            attach_ready: config.attach_ready,
         })
     }
     /// Admission warm-tier signal: true once this member attached
@@ -1386,6 +1691,46 @@ impl FocusedSession {
     pub(crate) fn set_attached_for_test(&mut self) {
         self.ready = true;
     }
+    /// Settle one physical verdict (EXACTLY-ONCE): Deferred stores
+    /// the batch UNFED for re-drive; Applied folds its facts
+    /// terminally. Every batch reaches exactly one terminal (Applied
+    /// here, a stop/exit drop via [`Self::drop_pending_feeding`],
+    /// stranded at finish, or the separate closing-batch feed), so
+    /// each observed edge folds exactly once however often its batch
+    /// was deferred.
+    /// Window-fold feed funnel (NEW-5): every applied batch feeds
+    /// here, and any past-cap journal drop surfaces as a visible
+    /// `FactLimit` gap on the session (never silent).
+    fn feed_request_fold(&mut self, facts: &[ObservationFact]) {
+        self.request_fold.feed(facts);
+        if self.request_fold.take_journal_dropped() > 0 {
+            self.gaps.insert(ObservationGap::FactLimit);
+        }
+    }
+
+    fn settle_batch(&mut self, batch: ObservationBatch, progress: BatchProgress) {
+        match progress {
+            BatchProgress::Deferred => {
+                // Candidate/file/custody storage is already charged to the
+                // shared provider budget. Keep at most one batch; attach
+                // revalidates every retained file/mapping on the next tick.
+                self.pending = Some(batch);
+            }
+            BatchProgress::Applied(_) => {
+                self.feed_request_fold(&batch.facts);
+            }
+        }
+    }
+
+    /// Drop the stored pending batch, folding its facts first
+    /// (EXACTLY-ONCE: every stop/exit path terminates its batch here —
+    /// never lost, and the `take` guarantees a single fold).
+    fn drop_pending_feeding(&mut self) {
+        if let Some(batch) = self.pending.take() {
+            self.feed_request_fold(&batch.facts);
+        }
+    }
+
     fn apply_batch(
         &mut self,
         batch: ObservationBatch,
@@ -1397,33 +1742,45 @@ impl FocusedSession {
         // pending batches share this funnel); the set dedupes replays.
         self.attach_diagnostics
             .extend(batch.refusals.iter().cloned());
-        if let (Some(session), Some(counter)) = (&self.session, &mut self.counter) {
-            match process_batch(
-                session,
-                counter,
-                &batch,
-                self.pid,
-                (self.deadline_ns, deadline, cancel),
-                &mut self.gaps,
-                &mut self.state_bytes,
-            )? {
-                BatchProgress::Deferred => {
-                    // Candidate/file/custody storage is already charged to the
-                    // shared provider budget. Keep at most one batch; attach
-                    // revalidates every retained file/mapping on the next tick.
-                    self.pending = Some(batch);
-                }
-                BatchProgress::Applied(attached) => {
-                    if attached && !self.ready {
-                        eprintln!(
-                            "osslscope: focused callbacks attached (pid={}, sites={})",
-                            self.pid,
-                            counter.active_site_count()
-                        );
-                        self.ready = true;
-                    }
-                }
+        // Phase 1 request fold: the feed is independent of physical
+        // apply state (EXACTLY-ONCE). Without a physical path the
+        // batch still observed its edges — fold terminally (never
+        // stored, never re-driven, so exactly once).
+        let Some(session) = &self.session else {
+            self.feed_request_fold(&batch.facts);
+            return Ok(());
+        };
+        let Some(counter) = &mut self.counter else {
+            self.feed_request_fold(&batch.facts);
+            return Ok(());
+        };
+        let progress = match process_batch(
+            session,
+            counter,
+            &batch,
+            self.pid,
+            (self.deadline_ns, deadline, cancel),
+            &mut self.gaps,
+            &mut self.state_bytes,
+        ) {
+            Ok(progress) => progress,
+            Err(error) => {
+                // Physical apply failed: the decoded edges were still
+                // observed — fold once (the failure is physical-side,
+                // not observational).
+                self.feed_request_fold(&batch.facts);
+                return Err(error);
             }
+        };
+        let attached = matches!(progress, BatchProgress::Applied(true));
+        let active_sites = counter.active_site_count();
+        self.settle_batch(batch, progress);
+        if attached && !self.ready {
+            eprintln!(
+                "osslscope: focused callbacks attached (pid={}, sites={})",
+                self.pid, active_sites
+            );
+            self.ready = true;
         }
         Ok(())
     }
@@ -1824,14 +2181,14 @@ impl FocusedSession {
     ) -> anyhow::Result<SessionProgress> {
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         if self.signal_cut || now >= self.end || Instant::now() >= self.end {
-            self.pending = None;
+            self.drop_pending_feeding();
             return Ok(SessionProgress::StopRequested);
         }
         // Peek before any maps read: an exited short command keeps its valid
         // prearmed historical counts without a post-exit mapping prerequisite.
         if let Some(child) = &self.owned {
             if child.peek_exit()?.is_some() {
-                self.pending = None;
+                self.drop_pending_feeding();
                 return Ok(SessionProgress::Exited);
             }
         }
@@ -1873,7 +2230,7 @@ impl FocusedSession {
                 if let Some(c) = &mut self.counter {
                     c.retire();
                 }
-                self.pending = None;
+                self.drop_pending_feeding();
                 return Ok(SessionProgress::Unverifiable);
             }
             if cancel.load(Ordering::Relaxed) || Instant::now() >= tick_end {
@@ -1900,6 +2257,51 @@ impl FocusedSession {
                 }
                 self.apply_batch(batch, tick_end, cancel)?;
             }
+            if self.provider_start_ns.is_none() {
+                // NEW-P1 fix3: the window's silence is claimed from
+                // effective admission, not from setup — establish
+                // the claimed start on the first tick our
+                // incarnation completes its cold attach. Setup arms
+                // precede it (same tick, ordered); the blind setup
+                // prefix stays outside the claim. A failed program
+                // keeps NO claim (NEW-16-OPEN + NEW-20 fix6: no
+                // setup-time fallback — the seal publishes no
+                // interval) with a visible gap and retries next
+                // tick. NEW-P1-OPEN fix4: the establishment funnels
+                // through the session gate (refused while a
+                // recovery fence withholds records — retried next
+                // tick, when the fence has cleared — and NEW-16
+                // fix5 refused at/after the deadline, when no
+                // interval remains to claim).
+                match now_ns() {
+                    Ok(now) => {
+                        let decision = self.session.as_mut().map(|s| {
+                            s.establish_claim_start(self.pid, self.starttime, now, self.deadline_ns)
+                        });
+                        match decision {
+                            Some(Ok(true)) => {
+                                self.provider_start_ns = Some(now);
+                                // Attach-readiness handshake (P2fix2
+                                // item 11): the cold attach completed
+                                // (trace mode programmed before
+                                // admission) — fire once, best-effort.
+                                if let Some(hook) = self.attach_ready.take() {
+                                    let _ = hook.send(());
+                                }
+                            }
+                            Some(Err(gap)) => {
+                                self.gaps.insert(gap);
+                            }
+                            // Refused (unready/fenced) or no session:
+                            // retried next tick.
+                            _ => {}
+                        }
+                    }
+                    Err(_) => {
+                        self.gaps.insert(ObservationGap::BpfUnavailable);
+                    }
+                }
+            }
             self.plan_engine_probes(records, tick_end, cancel);
             self.next_snapshot = Instant::now() + RESCAN;
             if self.pending.is_some() {
@@ -1908,7 +2310,7 @@ impl FocusedSession {
         }
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         if self.signal_cut {
-            self.pending = None;
+            self.drop_pending_feeding();
             return Ok(SessionProgress::StopRequested);
         }
         if Instant::now() >= tick_end {
@@ -1933,7 +2335,7 @@ impl FocusedSession {
         }
         self.signal_cut |= cancel.load(Ordering::Relaxed);
         if self.signal_cut {
-            self.pending = None;
+            self.drop_pending_feeding();
             return Ok(SessionProgress::StopRequested);
         }
         if let Some(c) = &mut self.counter {
@@ -1987,7 +2389,7 @@ impl FocusedSession {
     /// Fence active counting before another member's final output can block.
     pub(crate) fn stop_admission(&mut self, cancel: &AtomicBool) {
         self.signal_cut |= cancel.load(Ordering::Relaxed);
-        self.pending = None;
+        self.drop_pending_feeding();
         if let Some(gate) = &self.gate {
             if gate.close().is_err() {
                 self.gaps.insert(ObservationGap::BpfUnavailable);
@@ -2223,6 +2625,46 @@ impl FocusedSession {
     }
     /// 6A seal after a kernel-edge fence: late/resolve fence, then
     /// the normal close drain (withholding applies throughout).
+    /// Seal the §6D-7 trace fold into `document.trace_summary`
+    /// (pairing modes + fallback only; v2.9 stamp). Terminal
+    /// finalize lands every held edge unpaired before the single
+    /// window closes.
+    /// Seal the trace window for THIS capture window (actual
+    /// window index, post-fence-seal order — the fold binds to the
+    /// actual window whose completeness is being decided) and
+    /// project its six frozen counters into the sample gaps. Called
+    /// BEFORE project/finalize so trace loss affects completeness +
+    /// exit through the shared finalizer. Returns the seal for the
+    /// summary stamp (computed once, projected twice).
+    ///
+    /// Binding note: the streaming pair fold cannot be time-sliced
+    /// at seal (pairs form at feed time); incarnation separation
+    /// rides the A2 pairing key (post-fence edges carry new keys and
+    /// never pair across the cut), and the seal runs after fence
+    /// sealing so every held pre-fence edge lands unpaired here.
+    fn seal_trace_counters(
+        &mut self,
+    ) -> Option<(
+        crate::provider_observation::trace::ClosedTraceWindow,
+        crate::provider_observation::trace::TraceTotals,
+    )> {
+        let s = self.session.as_mut()?;
+        if !crate::provider_observation::cli::trace_pairing(self.trace_mode, s.trace_fallback()) {
+            return None;
+        }
+        s.trace_finalize();
+        let seq = s.trace_window_index();
+        let window = s.close_trace_window(seq);
+        let totals = s.trace_totals();
+        self.sample.gaps.extend(trace_loss_counters(&window));
+        // Seal uncertainty degrades completeness + exit (P2fix3
+        // NEW-P2e — the focused twin of the standalone rule).
+        if let Some(gap) = trace_seal_uncertainty_gap(&window, &totals) {
+            self.gaps.insert(gap);
+        }
+        Some((window, totals))
+    }
+
     pub(crate) fn finish_with_edge(
         mut self,
         deadline: Instant,
@@ -2232,29 +2674,77 @@ impl FocusedSession {
         self.finish(deadline)
     }
     pub(crate) fn finish(mut self, deadline: Instant) -> anyhow::Result<FocusedResult> {
-        self.pending = None;
+        // Phase 1 request fold: a stranded Deferred batch never
+        // Applied — terminate it here so every observed edge folds
+        // exactly once (Applied batches settled at apply time).
+        self.drop_pending_feeding();
         // One successful map-in-map delete closes metadata, API and physical
         // writers together. Keep all binding owners until drain/snapshot finish.
+        // NEW-26 fix7: keep the successful cut's receipt — the
+        // seal samples its end instant AFTER closing the writers,
+        // so silence is claimed only through the cut's
+        // conservative `close_before_ns` (the span past the cut
+        // observed nothing). A failed cut keeps the end sample
+        // (the writers may still be open; the gap records the
+        // failure and the session seal latches broken).
+        let mut silence_end = None;
         if let Some(gate) = &self.gate {
-            if gate.close().is_err() {
-                self.gaps.insert(ObservationGap::BpfUnavailable);
+            match gate.close() {
+                Ok(receipt) => silence_end = Some(receipt.close_before_ns),
+                Err(_) => {
+                    self.gaps.insert(ObservationGap::BpfUnavailable);
+                }
             }
             if Instant::now() >= deadline {
                 self.gaps.insert(ObservationGap::DrainOverrun);
             }
         }
-        let end_ns = now_ns()?.min(self.deadline_ns);
+        // One binding for the reported effective end AND the trace
+        // feed cut (P2fix3 TRACE — the cut IS the effective end, so
+        // the two cannot drift: a single variable feeds both).
+        let feed_cut_ns = effective_end_ns(now_ns()?, self.deadline_ns, self.start_ns);
         let mut api_activity = Vec::new();
         let mut fence_withheld = 0u64;
         let mut loss_totals = [0u64; 8];
+        // Phase 1: the closing batch feeds the request fold, and
+        // its presence (a live provider session ran) is what
+        // qualifies the window for a request_evidence section.
+        // NEW-P1: the section's planes gate on observed receipts —
+        // the terminal-read scope set (operational plane) and the
+        // armed fetch IDs (per-surface coverage).
+        let mut session_ran = false;
+        let mut scope_observed = false;
+        let mut fetch_armed = std::collections::BTreeSet::new();
+        let mut fence_cuts = Vec::new();
         if let Some(s) = self.session.as_mut() {
+            // Bind the trace fold to the EFFECTIVE cut (P2fix3
+            // TRACE — the reported effective end, not the requested
+            // deadline): records at/above it skip the trace feed
+            // (the terminal drain below still folds every other
+            // plane); pairs already consumed past a late cut taint
+            // instead of standing. Biteless on clean runs
+            // (stragglers never reach the cut); fail-closed on
+            // overrun.
+            s.set_trace_feed_cut(feed_cut_ns);
             let batch = s.finalize_until(deadline);
+            session_ran = true;
+            scope_observed = batch
+                .terminal_scopes_observed
+                .contains(&(self.pid, self.starttime));
+            fetch_armed = s.armed_fetch_ids(self.pid, self.starttime);
+            fence_cuts = s.sealed_fence_cuts(self.pid);
+            // NEW-5-OPEN: merged spans over-exclude valid edges —
+            // never silent (one seal gap when any merge engaged).
+            if s.take_sealed_cut_merges() > 0 {
+                self.gaps.insert(ObservationGap::SamplingPartial);
+            }
             fence_withheld = fence_withheld.saturating_add(s.take_fence_withheld());
             loss_totals = s.loss_totals();
             if batch_invalidates_advertisements(&batch, self.pid) {
                 self.gaps.insert(ObservationGap::Invalidated);
             }
             self.gaps.extend(batch.gaps);
+            self.feed_request_fold(&batch.facts);
             api_activity = batch
                 .api_activity
                 .into_iter()
@@ -2406,6 +2896,11 @@ impl FocusedSession {
                 self.inventory_gaps,
             ));
         }
+        // §6D-7 trace seal BEFORE project/finalize (item 1c): the
+        // six frozen counters join the sample gaps here so trace
+        // loss affects this window's completeness + exit; the same
+        // seal stamps the summary after the merge below.
+        let sealed_trace = self.seal_trace_counters();
         // One-shot closed attribution: claim, strict final reads, collect,
         // fold. Unattempted without admitted typed sites (legacy-only);
         // refused collects keep the physical evidence below and record a
@@ -2414,7 +2909,7 @@ impl FocusedSession {
             requested_start_ns: self.start_ns,
             requested_end_ns: self.deadline_ns,
             effective_start_ns: self.start_ns,
-            effective_end_ns: end_ns.max(self.start_ns),
+            effective_end_ns: feed_cut_ns,
             signal_cut: self.signal_cut,
             count_admission: Some(CountAdmissionWindow {
                 start_ns: self.start_ns,
@@ -2467,6 +2962,86 @@ impl FocusedSession {
             }
         }
         document.api_activity = crate::api_activity::merge(api_activity)?;
+        if session_ran {
+            // Phase 1: seal the window request fold. The
+            // operational plane is the merged activity rows (their
+            // entries are the observed population the
+            // unattributed remainder ranges over) — but ONLY when
+            // a successful scoped count read vouches for it
+            // (NEW-P1: refused attaches and failed terminal reads
+            // observe no population, so the remainder is Unknown,
+            // never a false observed zero).
+            let entries: u64 = document
+                .api_activity
+                .iter()
+                .map(|row| row.entries)
+                .fold(0u64, |a, b| a.saturating_add(b));
+            let fold = std::mem::take(&mut self.request_fold);
+            // NEW-P2: projection carries the effective window
+            // (post-deadline closing-drain edges excluded) plus the
+            // SEALED fence cuts (NEW-2: wrong-incarnation edges
+            // excluded even when fed before the fence arrived, and
+            // a recovery drain never resurrects them — the live
+            // fence entry it clears is not the seal record).
+            // NEW-P1 fix3: the claimed interval starts at effective
+            // admission. NEW-16-OPEN + NEW-20 fix6: an UNESTABLISHED
+            // claim (refused, fenced, or expired) seals with NO
+            // silence interval and NO operational zero — the
+            // setup-time fallback is gone (setup predates the gate
+            // opening and any mapped admission, so it never
+            // witnessed silence). NEW-9 fix4: the projection window
+            // is the PUBLISHED capture window (genuine setup-prefix
+            // edges project as rows), while the narrower silence
+            // interval (from effective admission) rides beside them
+            // for the zeros.
+            let established = self.provider_start_ns.is_some();
+            // (P2fix3 TRACE: the capture end IS the shared
+            // effective-end binding above.)
+            let capture_end = feed_cut_ns;
+            // NEW-26 fix7: the CLAIMED silence end is the writer
+            // cut when the cut succeeded (bounded by the capture
+            // deadline through `end_ns`), else the capture end.
+            // Request ROWS still project over the whole capture
+            // window (verified positives retained); only the
+            // zeros' interval narrows to the witnessed span.
+            let silence_cap = silence_end.unwrap_or(capture_end).min(capture_end);
+            // NEW-15 fix5: a mid-window fence voids the operational
+            // zero when it intersects the claimed silence interval
+            // (fail closed — the sealed cuts scope the request
+            // edges, and the same cuts scope the operational zero;
+            // verified positives are retained).
+            let operational_entries =
+                crate::provider_observation::request_evidence::RequestEvidence::operational_plane_sealed(
+                    entries,
+                    scope_observed && established,
+                    &fence_cuts,
+                    self.provider_start_ns.unwrap_or(capture_end),
+                    silence_cap,
+                );
+            let scope = crate::provider_observation::request_evidence::RequestScope {
+                operational_entries,
+                fetch_armed,
+                window: Some((self.start_ns, capture_end)),
+                silence_start: self.provider_start_ns,
+                silence_end,
+                fence_cuts,
+            };
+            crate::evidence::stamp_request_evidence(&mut document, fold.finish(scope));
+        }
+        if let Some((window, totals)) = sealed_trace {
+            let availability = if self.trace_by_api {
+                Some(trace_availability(&document.api_activity))
+            } else {
+                None
+            };
+            let summary = crate::provider_observation::trace::summarize(
+                &window,
+                &totals,
+                crate::provider_observation::cli::trace_word_str(self.trace_mode),
+                availability.as_ref(),
+            );
+            crate::evidence::stamp_trace_summary(&mut document, summary);
+        }
         let disposition = match &mut self.owned {
             Some(child) => child.finish_observation()?,
             None => TargetDisposition::Detached { pid: self.pid },
@@ -2500,6 +3075,19 @@ impl FocusedSession {
             _reservation: Some(self._reservation),
         })
     }
+}
+
+/// Per-API availability from merged activity rows (§6D-3
+/// `by_api_availability` rule): `not_attached` iff
+/// `gaps.not_attached`; else `partial_coverage` iff
+/// `gaps.attachment` or `gaps.finality`; else `covered`. Missing
+/// rows read `not_attached`.
+fn trace_availability(
+    rows: &[crate::api_activity::ApiActivityRow],
+) -> std::collections::BTreeMap<u32, String> {
+    // One rule, shared with the provider-CLI end projection (the
+    // focused rows are single-pid, so worst-wins equals first-hit).
+    crate::provider_observation::cli::trace_availability_from_rows(rows)
 }
 
 /// Synchronous one-process wrapper: exactly one signal owner, outside sessions.
@@ -3577,6 +4165,94 @@ mod session_tests {
         assert!(pool.reserve(256 << 20).is_some());
     }
     #[test]
+    fn reservation_bytes_includes_request_journal_capacity() {
+        // NEW-5 RED: the session lease carries the request-journal
+        // worst case for the session lifetime — the reservation's
+        // journal term equals the fold's number exactly (a drift
+        // fails here, not silently at admission).
+        use crate::provider_observation::request_evidence::RequestEvidenceFold;
+        assert_eq!(
+            FocusedSession::request_journal_reserve_bytes(),
+            RequestEvidenceFold::journal_reserve_bytes(),
+            "reservation journal term is single-sourced from the fold"
+        );
+        let bytes = FocusedSession::reservation_bytes(&objects()).unwrap();
+        assert!(
+            bytes >= FocusedSession::request_journal_reserve_bytes(),
+            "reservation {bytes} covers the journal worst case"
+        );
+    }
+    #[test]
+    fn reservation_bytes_includes_sealed_cuts_capacity() {
+        // NEW-5-OPEN: the session lease carries the sealed-cuts
+        // worst case for the session lifetime — the reservation's
+        // cuts term equals the session's number exactly (a drift
+        // fails here, not silently at admission), and the session's
+        // number covers every admittable pid at the full per-pid
+        // cap plus slack.
+        use crate::provider_observation::session::{MAX_SEALED_FENCE_CUTS, ProviderSession};
+        assert_eq!(
+            FocusedSession::sealed_cuts_reserve_bytes(),
+            ProviderSession::sealed_cuts_reserve_bytes(),
+            "reservation cuts term is single-sourced from the session"
+        );
+        let bytes = FocusedSession::reservation_bytes(&objects()).unwrap();
+        assert!(
+            bytes >= FocusedSession::sealed_cuts_reserve_bytes(),
+            "reservation {bytes} covers the cuts worst case"
+        );
+        let worst = crate::provider_observation::schema::ObservationLimits::default()
+            .max_processes
+            .saturating_mul(
+                std::mem::size_of::<(u64, Option<u64>)>().saturating_mul(MAX_SEALED_FENCE_CUTS),
+            );
+        assert_eq!(
+            ProviderSession::sealed_cuts_reserve_bytes(),
+            worst.saturating_add(64),
+            "reserve == all pids at full cap + slack (exact)"
+        );
+    }
+    #[test]
+    fn reservation_bytes_includes_scope_retention_capacity() {
+        // NEW-31-OPEN fix9: the session lease carries the
+        // scope-retention worst case (continuity incarnations +
+        // terminal-gap verdicts + NEW-39 fix12 historical custody
+        // refusals, all at the admission cap plus the explicit
+        // header allowance) for the session lifetime — the
+        // reservation's term equals the session's number exactly
+        // (a drift fails here, not silently at admission), and
+        // the session's number covers every admittable
+        // incarnation at the full cap plus the header allowance.
+        use crate::provider_observation::session::ProviderSession;
+        assert_eq!(
+            FocusedSession::scope_retention_reserve_bytes(),
+            ProviderSession::scope_retention_reserve_bytes(),
+            "reservation retention term is single-sourced from the session"
+        );
+        let bytes = FocusedSession::reservation_bytes(&objects()).unwrap();
+        assert!(
+            bytes >= FocusedSession::scope_retention_reserve_bytes(),
+            "reservation {bytes} covers the retention worst case"
+        );
+        let worst = crate::provider_observation::schema::ObservationLimits::default()
+            .max_processes
+            .saturating_mul(
+                std::mem::size_of::<(u32, u64)>()
+                    .saturating_add(std::mem::size_of::<(u32, u64)>())
+                    .saturating_add(std::mem::size_of::<(u32, u64)>()),
+            );
+        // NEW-42 fix13: three 24-byte `Vec` headers alone need
+        // 72 bytes on 64-bit — the old `+64` undercharged. The
+        // header allowance is explicit and measured, never a
+        // literal.
+        let headers = 3usize.saturating_mul(std::mem::size_of::<Vec<(u32, u64)>>());
+        assert_eq!(
+            ProviderSession::scope_retention_reserve_bytes(),
+            worst.saturating_add(headers),
+            "reserve == all incarnations at full cap + three explicit Vec headers (exact)"
+        );
+    }
+    #[test]
     fn supplied_incarnation_is_checked_before_open_and_foreign_survives() {
         let expected = record();
         let cancel = AtomicBool::new(false);
@@ -4208,6 +4884,237 @@ mod r71_tests {
         );
     }
 }
+#[cfg(test)]
+mod exactly_once_tests {
+    use super::*;
+    use crate::observation_memory::MemoryPool;
+    use crate::provider_observation::{
+        AlgorithmClass, ApiOutcome, ContextIdentity, ObservationApi, ObservationFact,
+        ObservationSource, Operation, ProviderNameClass, ScopeConfidence,
+        request_evidence::RequestScope,
+    };
+
+    fn hollow(pool: &MemoryPool) -> FocusedSession {
+        FocusedSession::hollow_for_coordinator_tests(
+            7,
+            1,
+            crate::inventory::NamespaceIds::default(),
+            pool,
+        )
+    }
+
+    fn fetch_fact(payload: ObservationPayload, monotonic_ns: u64) -> ObservationFact {
+        ObservationFact {
+            pid: 7,
+            starttime: 1,
+            object_sha256: "c".repeat(64).try_into().unwrap(),
+            generation: 1,
+            context: ContextIdentity::Unknown {},
+            source: ObservationSource::PublicApi,
+            api: ObservationApi::Inventoried(crate::inventory::Api::EvpMdFetch),
+            operation: Operation::Other,
+            class: AlgorithmClass::Other,
+            monotonic_ns,
+            confidence: ScopeConfidence::Observed,
+            payload,
+        }
+    }
+
+    fn fetch_batch() -> ObservationBatch {
+        ObservationBatch {
+            facts: vec![
+                fetch_fact(
+                    ObservationPayload::ApiAttempt {
+                        name: ProviderNameClass::Other,
+                    },
+                    10,
+                ),
+                fetch_fact(
+                    ObservationPayload::ApiResult {
+                        name: ProviderNameClass::Other,
+                        outcome: ApiOutcome::Success,
+                    },
+                    11,
+                ),
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn folded_counts(session: &FocusedSession) -> (u64, u64) {
+        let evidence = session.request_fold.project(&RequestScope::batch());
+        let row = evidence
+            .fetches
+            .iter()
+            .find(|r| r.surface_id == 10)
+            .expect("md row");
+        (row.attempts, row.success)
+    }
+
+    // EXACTLY-ONCE RED: a fresh batch folds once even with no physical
+    // counter/session (the request feed is independent of physical
+    // apply state).
+    #[test]
+    fn fresh_batch_feeds_without_session_or_counter() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        let cancel = AtomicBool::new(false);
+        session
+            .apply_batch(
+                fetch_batch(),
+                Instant::now() + Duration::from_secs(10),
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(folded_counts(&session), (1, 1));
+    }
+
+    // EXACTLY-ONCE RED: the stop path folds its dropped pending batch
+    // once (never lost, never doubled on a second poll).
+    #[test]
+    fn stop_feeds_dropped_pending_once() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.pending = Some(fetch_batch());
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::StopRequested
+        );
+        assert_eq!(folded_counts(&session), (1, 1));
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::StopRequested
+        );
+        assert_eq!(folded_counts(&session), (1, 1), "no double feed");
+    }
+
+    // EXACTLY-ONCE RED: coordinator stop folds its dropped pending
+    // batch once.
+    #[test]
+    fn coordinator_stop_feeds_dropped_pending_once() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.pending = Some(fetch_batch());
+        let cancel = AtomicBool::new(false);
+        session.stop_admission(&cancel);
+        assert_eq!(folded_counts(&session), (1, 1));
+    }
+
+    // EXACTLY-ONCE RED: a redriven pending batch terminates (folds
+    // once) even when the poll then goes Unverifiable.
+    #[test]
+    fn redrive_feeds_once_then_unverifiable() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.end = Instant::now() + Duration::from_secs(60);
+        session.pending = Some(fetch_batch());
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::Unverifiable
+        );
+        assert_eq!(folded_counts(&session), (1, 1));
+    }
+
+    // EXACTLY-ONCE RED: owned exit folds its dropped pending batch
+    // once (the drop runs before any redrive).
+    #[test]
+    fn owned_exit_feeds_dropped_pending_once() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.end = Instant::now() + Duration::from_secs(60);
+        let mut target = OwnedTarget::spawn_stopped(
+            &["/bin/true".to_string()],
+            crate::target::WorkloadDest::Null,
+        )
+        .expect("spawn stopped true");
+        target.release().expect("release");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if target.peek_exit().expect("peek").is_some() {
+                break;
+            }
+            assert!(Instant::now() < deadline, "true never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session.owned = Some(target);
+        session.pending = Some(fetch_batch());
+        let cancel = AtomicBool::new(false);
+        assert_eq!(
+            session.poll(Instant::now(), &cancel).unwrap(),
+            SessionProgress::Exited
+        );
+        assert_eq!(folded_counts(&session), (1, 1));
+    }
+
+    // EXACTLY-ONCE RED: the Deferred/Applied settle discipline folds a
+    // repeatedly deferred batch exactly once (compile-RED until the
+    // settle seam exists; behavioral guard after).
+    #[test]
+    fn settle_discipline_feeds_repeated_deferral_once() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.settle_batch(fetch_batch(), BatchProgress::Deferred);
+        assert!(session.pending.is_some(), "deferred batch stored");
+        let redrive = session.pending.take().expect("stored batch");
+        session.settle_batch(redrive, BatchProgress::Deferred);
+        let redrive = session.pending.take().expect("stored batch");
+        session.settle_batch(redrive, BatchProgress::Applied(true));
+        assert_eq!(folded_counts(&session), (1, 1));
+    }
+
+    // EXACTLY-ONCE RED: the drop helper folds once and clears.
+    #[test]
+    fn drop_helper_feeds_once_and_clears() {
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.pending = Some(fetch_batch());
+        session.drop_pending_feeding();
+        assert!(session.pending.is_none());
+        assert_eq!(folded_counts(&session), (1, 1));
+        session.drop_pending_feeding();
+        assert_eq!(folded_counts(&session), (1, 1), "second drop is a no-op");
+    }
+
+    // NEW-5 RED: a past-cap journal overflow surfaces as a visible
+    // `FactLimit` gap on the session (never silent); ordinary
+    // batches gap nothing.
+    #[test]
+    fn settle_batch_applied_surfaces_journal_overflow_as_fact_limit() {
+        use crate::provider_observation::request_evidence::RequestEvidenceFold;
+        let pool = MemoryPool::new(1 << 20);
+        let mut session = hollow(&pool);
+        session.settle_batch(fetch_batch(), BatchProgress::Applied(true));
+        assert!(
+            !session.gaps.contains(&ObservationGap::FactLimit),
+            "ordinary batches gap nothing"
+        );
+        let cap = RequestEvidenceFold::journal_cap();
+        let facts: Vec<ObservationFact> = (0..cap as u64)
+            .map(|ts| {
+                fetch_fact(
+                    ObservationPayload::ApiAttempt {
+                        name: ProviderNameClass::Other,
+                    },
+                    ts,
+                )
+            })
+            .collect();
+        session.settle_batch(
+            ObservationBatch {
+                facts,
+                ..Default::default()
+            },
+            BatchProgress::Applied(true),
+        );
+        assert!(
+            session.gaps.contains(&ObservationGap::FactLimit),
+            "past-cap overflow gaps visibly (2 + cap edges over a cap journal)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod quarantine_visibility_tests {
     use super::*;

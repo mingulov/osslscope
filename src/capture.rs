@@ -123,6 +123,10 @@ pub struct Config {
     /// CI-supplied container image digest for the check
     /// actionability tuple ("" when unknown — bare metal).
     pub image_digest: String,
+    /// Requested `--trace` word (§6D-9 mode word, default off).
+    pub trace_mode: u32,
+    /// `--trace-histogram-by-api` (§6D-3 opt-in).
+    pub trace_by_api: bool,
 }
 
 /// Capture target: spawned child (`run --`) or live pid (staging).
@@ -16924,6 +16928,8 @@ pub(crate) mod tests {
                 harvest_timeout: Duration::from_secs(5),
                 grace: Duration::from_secs(1),
                 image_digest: String::new(),
+                trace_mode: crate::provider_observation::trace::TRACE_MODE_OFF,
+                trace_by_api: false,
             }
         }
 
@@ -20027,6 +20033,8 @@ mod fix1_live_provider_tests {
             harvest_timeout: Duration::from_secs(10),
             grace: Duration::from_millis(100),
             image_digest: String::new(),
+            trace_mode: crate::provider_observation::trace::TRACE_MODE_OFF,
+            trace_by_api: false,
         };
         let info = TargetInfo {
             pid: if invalid == 2 { pid + 1 } else { pid },

@@ -59,6 +59,17 @@ passive inventory without spending trace admission or acquisition budget. Each
 snapshot checks the current exports again, allowing a later module load to
 become eligible within the same observation window.
 
+Each record folds its batch facts into an optional `request_evidence`
+section (fetch/load/query counts per surface, name class, and
+operation, with candidate-only tiers and an explicit unknown
+default activation unless an in-window load was observed). The
+fold is per-batch, so its unattributed remainder stays unknown;
+the window document joins the operational plane instead (see the
+v2.8 `request_evidence` section in `observed-crypto-v2.md`).
+Fetch, load, and query facts never mean the fetched object was
+used: the section names no serving provider, winner, or used
+implementation, and carries no property-query strings.
+
 The event loop drains cooperatively at a 100 ms cadence while it has control.
 Bounded synchronous snapshots and ELF reads can delay draining. Queue loss,
 overrun, lag, first-query uncertainty and unobserved intervals remain explicit;

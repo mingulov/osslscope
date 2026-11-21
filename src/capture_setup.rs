@@ -2488,6 +2488,8 @@ mod app_tests {
                 harvest_timeout: deadline,
                 grace: Duration::from_millis(100),
                 image_digest: String::new(),
+                trace_mode: crate::provider_observation::trace::TRACE_MODE_OFF,
+                trace_by_api: false,
             };
             if hold == Hold::ContextPartial {
                 locked(&owned.attempt.links.0).context_comm_hold = Some(owned.gate.clone());

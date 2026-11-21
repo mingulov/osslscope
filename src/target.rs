@@ -445,6 +445,55 @@ pub(crate) fn wait_test_child(pid: u32, deadline: Instant) -> TestChildWait {
     }
 }
 
+/// NEW-43 fix13: a child-LOCAL `LD_LIBRARY_PATH` override for
+/// a spawned owned child. Mutating the process-wide variable (the
+/// old `N39LdGuard`) is unsound in a multi-threaded test process —
+/// retirement can start the fd-dropper worker while the mutation
+/// is live — so staged legs pass the loader search path
+/// explicitly: the parent builds the child's full `envp`
+/// pre-fork, and the child `execvpe`s it (the child still
+/// allocates nothing post-fork). `None` (no override) keeps the
+/// inherited `execvp` path byte-identically.
+#[cfg_attr(not(test), allow(dead_code, reason = "constructed only by tests"))]
+#[derive(Clone, Debug)]
+pub(crate) enum ChildLdOverride {
+    /// Set `LD_LIBRARY_PATH` to exactly this value in the child.
+    Set(std::ffi::OsString),
+    /// Remove `LD_LIBRARY_PATH` from the child environment.
+    Remove,
+}
+
+/// NEW-43 fix13: the child's `KEY=VALUE` environment block for an
+/// override — the parent environment minus every inherited
+/// `LD_LIBRARY_PATH`, plus the override value when set. Pure over
+/// its inputs (parent-side, pre-fork): a NUL byte fails HERE (no
+/// child spawned), never in the child.
+fn child_envp_cstrings<I>(
+    parent: I,
+    spec: &ChildLdOverride,
+) -> anyhow::Result<Vec<std::ffi::CString>>
+where
+    I: Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+{
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = parent
+        .filter(|(key, _)| key.as_os_str() != "LD_LIBRARY_PATH")
+        .collect();
+    if let ChildLdOverride::Set(value) = spec {
+        vars.push((std::ffi::OsString::from("LD_LIBRARY_PATH"), value.clone()));
+    }
+    vars.into_iter()
+        .map(|(key, value)| {
+            let mut bytes = key.as_os_str().as_bytes().to_vec();
+            bytes.push(b'=');
+            bytes.extend_from_slice(value.as_os_str().as_bytes());
+            std::ffi::CString::new(bytes).map_err(|_| {
+                anyhow::anyhow!("child env override carries a NUL byte (no child spawned)")
+            })
+        })
+        .collect()
+}
+
 /// Test-only best-effort child teardown for the child's OWNER
 /// (sole reaper): probe first — a reaped-by-the-probe or
 /// already-reaped (ECHILD) child is never signaled — then SIGKILL a
@@ -2249,7 +2298,7 @@ impl OwnedTarget {
         deadline: Instant,
         cancel: &AtomicBool,
     ) -> anyhow::Result<Self> {
-        Self::spawn_stopped_with_producer_close(argv, dest, deadline, cancel, None)
+        Self::spawn_stopped_with_producer_close(argv, dest, deadline, cancel, None, None)
     }
     pub(crate) fn spawn_stopped_with_producer_close(
         argv: &[String],
@@ -2257,6 +2306,9 @@ impl OwnedTarget {
         deadline: Instant,
         cancel: &AtomicBool,
         close: Option<crate::lifecycle_producer::ProducerChildCloseSet>,
+        // NEW-43 fix13: child-local loader-env override (`None`
+        // inherits via `execvp`, exactly as before).
+        child_ld: Option<ChildLdOverride>,
     ) -> anyhow::Result<Self> {
         crate::lifecycle_producer::note_acquisition()?;
         let producer = crate::lifecycle_producer::target_registration()?;
@@ -2471,6 +2523,20 @@ impl OwnedTarget {
             SETUP_TEST_HOOK.with(|h| std::mem::replace(&mut h.borrow_mut().fail_fork, false));
         #[cfg(test)]
         let stop_before_producer_close = HOST_BEFORE_PRODUCER_CLOSE_STOP.load(Ordering::Acquire);
+        // NEW-43 fix13: the override child's full `envp`, built
+        // parent-side pre-fork (the child only passes pointers —
+        // it still allocates nothing post-fork). A NUL byte fails
+        // here (no child spawned), never in the child.
+        let child_envp: Option<Vec<std::ffi::CString>> = child_ld
+            .as_ref()
+            .map(|spec| child_envp_cstrings(std::env::vars_os(), spec))
+            .transpose()?;
+        let child_envp_ptrs: Option<Vec<*const libc::c_char>> = child_envp.as_ref().map(|vars| {
+            let mut ptrs: Vec<*const libc::c_char> =
+                vars.iter().map(|entry| entry.as_ptr()).collect();
+            ptrs.push(std::ptr::null());
+            ptrs
+        });
         let pid = if fail_fork {
             -1
         } else {
@@ -2547,7 +2613,18 @@ impl OwnedTarget {
                     }
                 }
                 libc::raise(libc::SIGSTOP);
-                libc::execvp(ptrs[0], ptrs.as_ptr());
+                // NEW-43 fix13: an override child execs its
+                // parent-built `envp` (pointers only — no
+                // post-fork allocation); every other child keeps
+                // the inherited `execvp` path.
+                match &child_envp_ptrs {
+                    Some(envp) => {
+                        libc::execvpe(ptrs[0], ptrs.as_ptr(), envp.as_ptr());
+                    }
+                    None => {
+                        libc::execvp(ptrs[0], ptrs.as_ptr());
+                    }
+                }
                 libc::_exit(127);
             }
         }
@@ -2743,6 +2820,24 @@ impl OwnedTarget {
             .checked_add(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
         Self::spawn_stopped_with_control(argv, dest, deadline, &idle)
+    }
+
+    /// NEW-43 fix13 (test-only): [`OwnedTarget::spawn_stopped`]
+    /// with a child-LOCAL `LD_LIBRARY_PATH` override — the staged
+    /// legs' replacement for process-wide mutation. Same 60s
+    /// pre-stop bound, never cancelled.
+    #[cfg(test)]
+    pub(crate) fn spawn_stopped_with_ld(
+        argv: &[String],
+        dest: WorkloadDest,
+        child_ld: ChildLdOverride,
+    ) -> anyhow::Result<Self> {
+        let idle = AtomicBool::new(false);
+        // Fail closed on overflow (unreachable: 60s past now).
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+        Self::spawn_stopped_with_producer_close(argv, dest, deadline, &idle, None, Some(child_ld))
     }
 
     /// Owned pid.
@@ -5203,5 +5298,179 @@ mod custody_helper_tests {
         // SAFETY: we own fds[0].
         unsafe { libc::close(fds[0]) };
         assert_eq!(&buf, b"verdict");
+    }
+}
+
+#[cfg(test)]
+mod child_ld_override_tests {
+    //! NEW-43 fix13 pins: the child-local loader-env override
+    //! replaces process-wide mutation (the old `N39LdGuard`
+    //! `set_var`, unsound once retirement starts the fd-dropper
+    //! worker). The builder is pinned pure (synthetic parent env);
+    //! the spawn path is pinned end-to-end through
+    //! `/proc/<pid>/environ` with the process env untouched.
+    use super::{ChildLdOverride, OwnedTarget, WorkloadDest, child_envp_cstrings, kill_test_child};
+    use std::ffi::{CString, OsString};
+    use std::time::{Duration, Instant};
+
+    fn parent_env() -> Vec<(OsString, OsString)> {
+        vec![
+            (OsString::from("PATH"), OsString::from("/bin:/usr/bin")),
+            (
+                OsString::from("LD_LIBRARY_PATH"),
+                OsString::from("/lane/lib"),
+            ),
+            (OsString::from("KEEP"), OsString::from("yes")),
+        ]
+    }
+
+    fn entries(block: &[CString]) -> Vec<String> {
+        block
+            .iter()
+            .map(|entry| entry.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn builder_set_replaces_inherited_ld_only() {
+        let block = child_envp_cstrings(
+            parent_env().into_iter(),
+            &ChildLdOverride::Set(OsString::from("/staged/tree:/lane/lib")),
+        )
+        .expect("synthetic env builds");
+        let got = entries(&block);
+        assert_eq!(
+            got.iter()
+                .filter(|entry| entry.starts_with("LD_LIBRARY_PATH="))
+                .count(),
+            1,
+            "exactly one LD entry: {got:?}"
+        );
+        assert!(
+            got.contains(&"LD_LIBRARY_PATH=/staged/tree:/lane/lib".to_string()),
+            "the override value wins: {got:?}"
+        );
+        assert!(
+            got.contains(&"PATH=/bin:/usr/bin".to_string())
+                && got.contains(&"KEEP=yes".to_string()),
+            "unrelated entries pass through: {got:?}"
+        );
+    }
+
+    #[test]
+    fn builder_remove_drops_ld_only() {
+        let block = child_envp_cstrings(parent_env().into_iter(), &ChildLdOverride::Remove)
+            .expect("synthetic env builds");
+        let got = entries(&block);
+        assert!(
+            got.iter()
+                .all(|entry| !entry.starts_with("LD_LIBRARY_PATH=")),
+            "no LD entry survives: {got:?}"
+        );
+        assert!(
+            got.contains(&"PATH=/bin:/usr/bin".to_string())
+                && got.contains(&"KEEP=yes".to_string()),
+            "unrelated entries pass through: {got:?}"
+        );
+    }
+
+    #[test]
+    fn builder_rejects_nul_before_any_spawn() {
+        let mut poisoned = parent_env();
+        poisoned.push((OsString::from("POISON"), OsString::from("a\0b")));
+        assert!(
+            child_envp_cstrings(
+                poisoned.into_iter(),
+                &ChildLdOverride::Set(OsString::from("/staged/tree")),
+            )
+            .is_err(),
+            "a NUL byte fails the build (no child spawned)"
+        );
+    }
+
+    /// `/proc/<pid>/environ` once the child has exec'd (its exe
+    /// link names the payload — a pre-exec read would show the
+    /// fork-inherited parent block). The child must be ALIVE at
+    /// the read: a zombie keeps its exe link but has no environ,
+    /// which would misread as a wrong environment instead of the
+    /// environmental early death it is.
+    fn child_environ_after_exec(pid: u32) -> Vec<u8> {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap_or_default();
+            if exe.to_string_lossy().ends_with("sleep") {
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "the child execs promptly (still {exe:?})"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .expect("child stat reads for the liveness check");
+        let state = stat
+            .rsplit_once(')')
+            .and_then(|(_, after)| after.split_ascii_whitespace().next());
+        assert!(
+            state.is_some_and(|s| s != "Z" && s != "X" && s != "x"),
+            "the child is alive at the environ read (state={state:?})"
+        );
+        std::fs::read(format!("/proc/{pid}/environ")).expect("child environ reads")
+    }
+
+    #[test]
+    fn spawn_delivers_child_local_env_and_leaves_process_env() {
+        let process_before = std::env::var_os("LD_LIBRARY_PATH");
+        // Set leg: the child sees exactly the override value.
+        let value = format!("/tmp/osslscope-ld-test-{}", std::process::id());
+        let mut child = OwnedTarget::spawn_stopped_with_ld(
+            &["/bin/sleep".to_string(), "30".to_string()],
+            WorkloadDest::Null,
+            ChildLdOverride::Set(OsString::from(&value)),
+        )
+        .expect("override child spawns stopped");
+        let pid = child.pid();
+        child.release().expect("child releases");
+        let environ = child_environ_after_exec(pid);
+        let needle = format!("LD_LIBRARY_PATH={value}\0");
+        let matched = environ
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes());
+        // NEW-46 fix14: the failure diagnostic reports ONLY the
+        // loader-path entry count + whether the expected value
+        // matched — never the inherited block (the old message
+        // dumped the child's entire environment).
+        let ld_entries = environ
+            .split(|byte| *byte == 0)
+            .filter(|entry| entry.starts_with(b"LD_LIBRARY_PATH="))
+            .count();
+        assert!(
+            matched,
+            "the child environ carries exactly the override value (ld_entries={ld_entries} expected_matched={matched})",
+        );
+        kill_test_child(pid, Duration::from_secs(5));
+        // Remove leg: the child sees no LD entry at all.
+        let mut bare = OwnedTarget::spawn_stopped_with_ld(
+            &["/bin/sleep".to_string(), "30".to_string()],
+            WorkloadDest::Null,
+            ChildLdOverride::Remove,
+        )
+        .expect("bare child spawns stopped");
+        let bare_pid = bare.pid();
+        bare.release().expect("bare child releases");
+        let bare_environ = child_environ_after_exec(bare_pid);
+        assert!(
+            !bare_environ
+                .split(|byte| *byte == 0)
+                .any(|entry| entry.starts_with(b"LD_LIBRARY_PATH=")),
+            "the bare child environ carries no LD entry"
+        );
+        kill_test_child(bare_pid, Duration::from_secs(5));
+        assert_eq!(
+            std::env::var_os("LD_LIBRARY_PATH"),
+            process_before,
+            "the override path never touches the process environment"
+        );
     }
 }

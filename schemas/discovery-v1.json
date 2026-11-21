@@ -84,7 +84,7 @@
       "enum": ["openssl_compatible", "provider_module", "openssl_consumer", "other"]
     },
     "api": {
-      "description": "Recognized dynamic code exports (Api::COUNT = 70); unknown symbol names are discarded by the producer.",
+      "description": "Recognized dynamic code exports (Api::COUNT = 78); unknown symbol names are discarded by the producer.",
       "enum": [
         "ossl_provider_init",
         "ossl_provider_load",
@@ -103,6 +103,14 @@
         "evp_kdf_fetch",
         "evp_signature_fetch",
         "evp_kem_fetch",
+        "evp_asym_cipher_fetch",
+        "evp_keyexch_fetch",
+        "evp_keymgmt_fetch",
+        "evp_rand_fetch",
+        "evp_skeymgmt_fetch",
+        "ossl_decoder_fetch",
+        "ossl_encoder_fetch",
+        "ossl_store_loader_fetch",
         "evp_digest_init_ex",
         "evp_digest_init_ex2",
         "evp_digest_update",

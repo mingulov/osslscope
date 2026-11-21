@@ -1,0 +1,73 @@
+osslscope osslscope-presentation-v1 seq=0 gen=? run=? win=? age=13 coalesced=0
+WINDOW 0..0 eff=0..0 signal_cut=false accum_cut=false completeness=complete reasons=-
+POLICY outcome=observe_only active=observe-only
+COUNTS epoch=0 window=0 lanes=0/0/0/0 site_rows=0 by_outcome=1200/0/200
+MEMBERS observed=? retired_window=? retired_epoch=0 deferred=?
+LOSS session=? counters=0
+STREAM ? stream_unconfigured
+TRACE seq=0 mode=latency paired=1400 unpaired_e=0 unpaired_r=0 depth=0 dropped=0 capped=false nonmono=0 rejected=0
+  class success=1200 failure=0 empty=0 retry=0 unknown=200
+HIST edges=6d-frozen-18 seqs=0..0 capped_folded=0 counts=1200/0/0/0/0
+UNKNOWN 62
+  source.generation oneshot_no_sequence
+  source.run_id oneshot_no_sequence
+  source.window_seq oneshot_no_sequence
+  members.observed oneshot_no_sequence
+  members.retired_in_window oneshot_no_sequence
+  members.deferred_depth oneshot_no_sequence
+  loss.session oneshot_no_sequence
+  policy.active observe_only
+  stream stream_unconfigured
+  histograms.by_api."20" api_unavailable
+  histograms.by_api."21" api_unavailable
+  histograms.by_api."22" api_unavailable
+  histograms.by_api."23" api_unavailable
+  histograms.by_api."24" api_unavailable
+  histograms.by_api."25" api_unavailable
+  histograms.by_api."26" api_unavailable
+  histograms.by_api."27" api_unavailable
+  histograms.by_api."28" api_unavailable
+  histograms.by_api."29" api_unavailable
+  histograms.by_api."30" api_unavailable
+  histograms.by_api."31" api_unavailable
+  histograms.by_api."32" api_unavailable
+  histograms.by_api."33" api_unavailable
+  histograms.by_api."34" api_unavailable
+  histograms.by_api."35" api_unavailable
+  histograms.by_api."36" api_unavailable
+  histograms.by_api."37" api_unavailable
+  histograms.by_api."38" api_unavailable
+  histograms.by_api."39" api_unavailable
+  histograms.by_api."40" api_unavailable
+  histograms.by_api."41" api_unavailable
+  histograms.by_api."42" api_unavailable
+  histograms.by_api."43" api_unavailable
+  histograms.by_api."44" api_unavailable
+  histograms.by_api."45" api_unavailable
+  histograms.by_api."46" api_unavailable
+  histograms.by_api."47" api_unavailable
+  histograms.by_api."48" api_unavailable
+  histograms.by_api."49" api_unavailable
+  histograms.by_api."50" api_unavailable
+  histograms.by_api."51" api_unavailable
+  histograms.by_api."52" api_unavailable
+  histograms.by_api."53" api_unavailable
+  histograms.by_api."54" api_unavailable
+  histograms.by_api."55" api_unavailable
+  histograms.by_api."56" api_unavailable
+  histograms.by_api."57" api_unavailable
+  histograms.by_api."58" api_unavailable
+  histograms.by_api."59" api_unavailable
+  histograms.by_api."60" api_unavailable
+  histograms.by_api."61" api_unavailable
+  histograms.by_api."62" api_unavailable
+  histograms.by_api."63" api_unavailable
+  histograms.by_api."64" api_unavailable
+  histograms.by_api."65" api_unavailable
+  histograms.by_api."66" api_unavailable
+  histograms.by_api."67" api_unavailable
+  histograms.by_api."68" api_unavailable
+  histograms.by_api."69" api_unavailable
+  histograms.by_api."70" api_unavailable
+  histograms.by_api."71" api_unavailable
+  histograms.by_api."72" api_unavailable

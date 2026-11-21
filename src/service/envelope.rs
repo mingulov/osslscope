@@ -138,6 +138,15 @@ pub struct WindowEnvelope {
     pub seq: u64,
     pub generation: u64,
     pub run_id: RunId,
+    /// Run-cumulative stream GROSS at window close († 6C-1d: the
+    /// §6C-1d fold input; zeros when the stream is unconfigured).
+    /// Additive and old-reader-safe: missing ⇒ unconfigured zeros.
+    #[serde(default)]
+    pub stream_gross_close: StreamDrops,
+    /// Stream configured († 6C-1d: distinguishes configured-quiet
+    /// from unconfigured). Additive: missing ⇒ false.
+    #[serde(default)]
+    pub stream_configured: bool,
     pub window: WindowSpan,
     pub accum_exceeded: Option<AccumExceeded>,
     pub spilled: Spilled,
@@ -369,6 +378,10 @@ pub struct RunSummary {
     pub windows_cut_accum: u64,
     pub quota_exceeded: Option<QuotaExceeded>,
     pub stream_drops: StreamDrops,
+    /// Stream configured († 6C-1d: distinguishes configured-quiet
+    /// from unconfigured on summary adoption). Additive.
+    #[serde(default)]
+    pub stream_configured: bool,
     pub tap_recovered: TapRecovered,
     #[serde(default)]
     pub tap_uncertain: Vec<TapUncertain>,
@@ -410,6 +423,7 @@ impl RunSummary {
             windows_cut_accum: 0,
             quota_exceeded: None,
             stream_drops: StreamDrops::default(),
+            stream_configured: false,
             tap_recovered: TapRecovered::default(),
             tap_uncertain: Vec::new(),
             tap_uncertain_overflow: UncertainOverflow::default(),

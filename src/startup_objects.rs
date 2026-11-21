@@ -157,15 +157,33 @@ pub(crate) fn prepare_owned_startup(
     cancel: &AtomicBool,
     plan: Option<&crate::provider_observation::copied_plan::CopiedPlan>,
 ) -> Result<PreExecSites, ObservationGap> {
+    // This is the observer's inherited spawn environment, never /proc environ.
+    let ld = std::env::var("LD_LIBRARY_PATH").ok();
+    prepare_owned_startup_with_ld(child, argv, budget, deadline, cancel, plan, ld.as_deref())
+}
+
+/// NEW-43 fix13: [`prepare_owned_startup`] with an explicit
+/// loader-search value — the staged legs' replacement for
+/// process-wide mutation (the child spawns with the same value
+/// child-locally, so discovery and the loader agree without
+/// touching the process environment). Production behavior is
+/// unchanged: the wrapper above passes the inherited value.
+pub(crate) fn prepare_owned_startup_with_ld(
+    child: &OwnedTarget,
+    argv: &[String],
+    budget: &mut ObservationBudget,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    plan: Option<&crate::provider_observation::copied_plan::CopiedPlan>,
+    ld_library_path: Option<&str>,
+) -> Result<PreExecSites, ObservationGap> {
     check(deadline, cancel)?;
     budget.set_deadline(deadline);
     let custody = objects::StartupProcess::held(child)?;
     let path = std::env::var("PATH").unwrap_or_else(|_| "/bin:/usr/bin".into());
-    // This is the observer's inherited spawn environment, never /proc environ.
-    let ld = std::env::var("LD_LIBRARY_PATH").ok();
     let env = crate::discovery::onboard::SpawnEnv {
         path: &path,
-        ld_library_path: ld.as_deref(),
+        ld_library_path,
     };
     let executable = crate::discovery::onboard::resolve_spawn_exe(
         argv.first().ok_or(ObservationGap::BackingUnavailable)?,
@@ -278,7 +296,7 @@ pub(crate) fn prepare_owned_startup(
             children_inherited.splice(0..0, dirs.clone());
             dirs.extend(inherited.into_iter().take(MAX_NEEDED - dirs.len()));
         }
-        if let Some(ld) = &ld {
+        if let Some(ld) = ld_library_path {
             append_dirs(&mut dirs, ld, origin);
         }
         for value in &elf.runpaths {

@@ -1042,3 +1042,95 @@ fn provider_human_rows_carry_paths_by_default() {
     }
     redacted(&output);
 }
+
+#[test]
+fn scan_without_session_reports_unavailable_effective_mode() {
+    // P2fix2 item 9 (codex DELTA-7) + item 13 (codex NEW-P2d):
+    // EXECUTABLE effective-mode check — the real scan binary with
+    // an explicit --trace request but no session (host lane: no
+    // BPF) reports `unavailable` in the JSON end word AND the human
+    // line, never the requested word. (RED pre-fix: the binary
+    // emitted the requested `latency` word with no session.)
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let f = Fixture::new();
+    let output = f.cli(&[
+        "scan",
+        "--observe-providers",
+        "--pid",
+        &child.id().to_string(),
+        "--watch",
+        "--duration",
+        "0.3",
+        "--interval",
+        "0.1",
+        "--trace",
+        "latency",
+        "--json",
+    ]);
+    let _ = child.kill();
+    let _ = child.wait();
+    let rows = records(&output);
+    let end = rows
+        .iter()
+        .find(|r| r["record"] == "end")
+        .expect("scan emits an end record");
+    assert_eq!(end["trace_mode"], "unavailable");
+    assert!(end.get("trace").is_none(), "no seal without a session");
+    // Human spelling carries the same word.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = f.cli(&[
+        "scan",
+        "--observe-providers",
+        "--pid",
+        &child.id().to_string(),
+        "--watch",
+        "--duration",
+        "0.3",
+        "--interval",
+        "0.1",
+        "--trace",
+        "latency",
+    ]);
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        text.contains("TRACE mode=unavailable (no session opened)"),
+        "{text:?}"
+    );
+    // Requested-off stays `off` (byte-stable for passive scans).
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let output = f.cli(&[
+        "scan",
+        "--observe-providers",
+        "--pid",
+        &child.id().to_string(),
+        "--watch",
+        "--duration",
+        "0.3",
+        "--interval",
+        "0.1",
+        "--json",
+    ]);
+    let _ = child.kill();
+    let _ = child.wait();
+    let rows = records(&output);
+    let end = rows
+        .iter()
+        .find(|r| r["record"] == "end")
+        .expect("scan emits an end record");
+    assert_eq!(end["trace_mode"], "off");
+    redacted(&output);
+}

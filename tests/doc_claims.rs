@@ -42,7 +42,7 @@ fn m2_zero_ref_shape_disclosed_in_triage_docs() {
 }
 
 /// M3 emitter-side pins: `src/evidence.rs` is the canonical
-/// emitter of record; these four minors are the only live
+/// emitter of record; these five minors are the only live
 /// identities (behavioral triggers are pinned by existing
 /// tests: `output_contract::schema_version_gate` for v2.4,
 /// `attribution::projection_dedupes_selectors_upgrades_schema_and_carries_bounds`
@@ -50,19 +50,24 @@ fn m2_zero_ref_shape_disclosed_in_triage_docs() {
 /// `evidence::stamp_context_upgrades_schema_only_with_sysctls`
 /// for v2.6,
 /// `output_contract::r33_corpse_retirement_renders_membership_and_validates`
-/// for v2.7).
+/// for v2.7,
+/// `report::request_evidence_renders_validates_and_stays_separate`
+/// for v2.8).
 #[test]
-fn m3_emitter_minors_are_v2_4_through_v2_7() {
+fn m3_emitter_minors_are_v2_4_through_v2_9() {
     use osslscope::evidence::{
         CAPTURE_SCHEMA_V2, CAPTURE_SCHEMA_V2_5, CAPTURE_SCHEMA_V2_6, CAPTURE_SCHEMA_V2_7,
+        CAPTURE_SCHEMA_V2_8, CAPTURE_SCHEMA_V2_9,
     };
     assert_eq!(CAPTURE_SCHEMA_V2, "observed-crypto-v2.4");
     assert_eq!(CAPTURE_SCHEMA_V2_5, "observed-crypto-v2.5");
     assert_eq!(CAPTURE_SCHEMA_V2_6, "observed-crypto-v2.6");
     assert_eq!(CAPTURE_SCHEMA_V2_7, "observed-crypto-v2.7");
+    assert_eq!(CAPTURE_SCHEMA_V2_8, "observed-crypto-v2.8");
+    assert_eq!(CAPTURE_SCHEMA_V2_9, "observed-crypto-v2.9");
 }
 
-/// M3: every emission claim names the live v2.4-v2.7 range;
+/// M3: every emission claim names the live v2.4-v2.9 range;
 /// no doc claims an exact-only minor the emitters left behind.
 #[test]
 fn m3_docs_claim_the_live_version_range() {
@@ -73,8 +78,8 @@ fn m3_docs_claim_the_live_version_range() {
     ] {
         let text = read_doc(name);
         assert!(
-            text.contains("observed-crypto-v2.4") && text.contains("observed-crypto-v2.7"),
-            "{name} must name the live v2.4-v2.7 emission range"
+            text.contains("observed-crypto-v2.4") && text.contains("observed-crypto-v2.9"),
+            "{name} must name the live v2.4-v2.9 emission range"
         );
     }
     let contract = read_doc("observed-crypto-v2.md");
@@ -96,8 +101,8 @@ fn m3_docs_claim_the_live_version_range() {
     let schema_rs = std::fs::read_to_string(manifest_dir().join("src/schema.rs"))
         .expect("src/schema.rs must be readable");
     assert!(
-        schema_rs.contains("observed-crypto-v2.4") && schema_rs.contains("observed-crypto-v2.7"),
-        "src/schema.rs docstring must name the live v2.4-v2.7 emission range"
+        schema_rs.contains("observed-crypto-v2.4") && schema_rs.contains("observed-crypto-v2.9"),
+        "src/schema.rs docstring must name the live v2.4-v2.9 emission range"
     );
 }
 

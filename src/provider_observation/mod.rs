@@ -24,7 +24,10 @@ pub use objects::{
 };
 pub use schema::*;
 
+pub mod c023;
+pub mod request_evidence;
 pub mod session;
 pub mod trace;
 pub mod wire;
+pub use request_evidence::RequestEvidence;
 pub use session::{ObservationBatch, ProviderSession, VerifiedSiteCandidate};

@@ -87,6 +87,11 @@ pub const API_NAMES: [&str; 53] = [
     "EVP_CIPHER_CTX_new",
     "EVP_CIPHER_CTX_free",
 ];
+/// NEW-18 fix5: the receipt key serializes only when set.
+fn is_unset_receipt(receipt: &bool) -> bool {
+    !receipt
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApiActivityGaps {
@@ -97,7 +102,27 @@ pub struct ApiActivityGaps {
     pub unsupported_return: u64,
     pub saturated: bool,
     /// No operational export was successfully attached for this ID.
+    /// Attachment ONLY (PINS fix4): a failed terminal READ of an
+    /// admitted owner's map keeps this false — the read outcome
+    /// rides `read_receipt`, never this bit.
     pub not_attached: bool,
+    /// Successful terminal count read (PINS fix4, NEW-12, wording
+    /// fix7 NEW-28): the serialized successful-read receipt — true
+    /// ONLY on rows the producer built after a successful terminal
+    /// read of an owner's map (`wire::activity`; failed reads and
+    /// unavailable rows carry false). Admitted owners AND
+    /// verified-positive unadmitted owners alike (the preserved
+    /// positives earn no scope receipt — this is the ROW read
+    /// receipt, not the admission-gated SCOPE receipt). The
+    /// request-evidence gate counts this receipt behind an
+    /// observed zero, never the attachment bit. Absent on
+    /// pre-fix4 documents (fail closed).
+    /// NEW-18 fix5: the key serializes ONLY when set (receipt
+    /// vocabulary stays within versioned request-evidence
+    /// output) — unreceipted rows are byte-identical to legacy
+    /// output, and the omitted key reads back as unset.
+    #[serde(default, skip_serializing_if = "is_unset_receipt")]
+    pub read_receipt: bool,
     /// Available prefix only: attachment cannot establish first call coverage.
     pub attachment: bool,
     /// Detachment does not prove a synchronized terminal cut.
@@ -143,6 +168,7 @@ pub(crate) fn merge(rows: Vec<ApiActivityRow>) -> anyhow::Result<Vec<ApiActivity
             add!(total.gaps.unsupported_return, row.gaps.unsupported_return);
             total.gaps.saturated |= row.gaps.saturated;
             total.gaps.not_attached &= row.gaps.not_attached;
+            total.gaps.read_receipt |= row.gaps.read_receipt;
             total.gaps.attachment |= row.gaps.attachment;
             total.gaps.finality |= row.gaps.finality;
         } else {
@@ -168,5 +194,33 @@ impl ApiActivityRow {
                 ..Default::default()
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receipt_vocabulary_omitted_unless_set() {
+        // NEW-18 fix5: the read-receipt key serializes ONLY when
+        // set — unreceipted rows stay byte-identical to legacy
+        // output (no new vocabulary for old readers), while the
+        // set receipt still serializes for versioned consumers
+        // (and the omitted key reads back as unset).
+        let plain = serde_json::to_value(ApiActivityGaps::default()).unwrap();
+        assert!(
+            plain.get("read_receipt").is_none(),
+            "an unset receipt omits the key: {plain}"
+        );
+        let mut set = ApiActivityGaps::default();
+        set.read_receipt = true;
+        let keyed = serde_json::to_value(&set).unwrap();
+        assert_eq!(
+            keyed["read_receipt"], true,
+            "a set receipt still serializes: {keyed}"
+        );
+        let back: ApiActivityGaps = serde_json::from_value(plain).unwrap();
+        assert!(!back.read_receipt, "the omitted key reads back unset");
     }
 }

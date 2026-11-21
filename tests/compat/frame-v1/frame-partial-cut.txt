@@ -1,0 +1,17 @@
+osslscope osslscope-presentation-v1 seq=0 gen=0 run=1-2-00000000 win=2 age=13 coalesced=0
+WINDOW 970928942583501..970929942583501 eff=970928949950750..970929801846647 signal_cut=true accum_cut=false completeness=partial reasons=loss:lifecycle.polling_fallback,startup-gap,tail-gap +1 more
+POLICY outcome=observe_only active=observe-only
+COUNTS epoch=0 window=0 lanes=0/0/0/0 site_rows=0 by_outcome=? trace_disabled
+MEMBERS observed=0 retired_window=0 retired_epoch=0 deferred=?
+LOSS session=? counters=1
+  counter name=lifecycle.polling_fallback kind=Loss value=1
+STREAM ? stream_unconfigured
+TRACE ? trace_disabled
+UNKNOWN 7
+  policy.active observe_only
+  members.deferred_depth not_yet_observed
+  loss.session not_yet_observed
+  stream stream_unconfigured
+  counts.by_outcome trace_disabled
+  trace trace_disabled
+  histograms trace_disabled

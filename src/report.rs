@@ -46,6 +46,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut grace_raw: Option<String> = None;
     let mut pid: Option<u32> = None;
     let mut image_digest = String::new();
+    let mut trace_mode = crate::provider_observation::trace::TRACE_MODE_OFF;
+    let mut trace_mode_set = false;
+    let mut trace_by_api = false;
     let mut image_digest_explicit = false;
     let mut cbom: Option<String> = None;
     let mut workload_out: Option<String> = None;
@@ -118,12 +121,27 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             "--cbom" => cbom = Some(val(a)?),
             "--workload-out" => workload_out = Some(val(a)?),
             "--workload-out-fd" => workload_out_fd = Some(val(a)?),
+            "--trace" if !trace_mode_set => {
+                trace_mode = crate::provider_observation::cli::trace_word(&val(a)?)
+                    .ok_or_else(|| "--trace needs off|metadata|latency|status|all".to_string())?;
+                trace_mode_set = true;
+            }
+            "--trace-histogram-by-api" if !trace_by_api => {
+                trace_by_api = true;
+                i += 1;
+                continue;
+            }
             x => return Err(format!("unknown flag {x}")),
         }
         i += 2;
     }
     if format != "human" && format != "json" {
         return Err("--format must be human|json".to_string());
+    }
+    // §6D-9: the histogram keying without histograms is a usage
+    // error (exit 2 pre-start, before any side effect).
+    if trace_by_api && !crate::provider_observation::cli::trace_latency_bearing(trace_mode) {
+        return Err("--trace-histogram-by-api needs --trace latency|all".to_string());
     }
     // H9/R07: destinations are meaningless without `run --`
     // (never silently ignored); mutual exclusion + fd shape live in
@@ -214,6 +232,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             harvest_timeout: timeout,
             grace,
             image_digest,
+            trace_mode,
+            trace_by_api,
         },
         target,
         format,
@@ -465,6 +485,12 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             timeout: args.cfg.harvest_timeout,
             grace: args.cfg.grace,
             parsed_cache: None,
+            trace_mode: args.cfg.trace_mode,
+            trace_by_api: args.cfg.trace_by_api,
+            // Public CLI: never the qual bypass (forced fallback
+            // while C023 is OPEN).
+            allow_operational_trace: false,
+            attach_ready: None,
         };
         return Ok(Prepared {
             args,
@@ -1449,6 +1475,20 @@ pub(crate) fn doc_json(doc: &CaptureDocument) -> serde_json::Value {
     if !doc.api_activity.is_empty() {
         out["api_activity"] = serde_json::json!(doc.api_activity);
     }
+    // v2.8 (Phase 1): request/fetch/load/query evidence rides only
+    // when the window projected it; omitted sections keep older
+    // documents byte-identical. The section is structurally
+    // separate from the physical execution ledger above.
+    if let Some(evidence) = &doc.request_evidence {
+        out["request_evidence"] = serde_json::json!(evidence);
+    }
+    // v2.9 (Phase 2): the 6D trace projection rides only when the
+    // window sealed its trace fold; omitted sections keep older
+    // documents byte-identical. PUBLIC-API plane: pairs, classes,
+    // durations — never physical entries or observer overhead.
+    if let Some(summary) = &doc.trace_summary {
+        out["trace_summary"] = serde_json::json!(summary);
+    }
     // v2.5: certified execution partitions ride only when the
     // closed collect certified them; bounds ride whenever the
     // collect certified a result (even a certified-empty definite
@@ -1923,8 +1963,20 @@ pub fn render_human(doc: &CaptureDocument) -> String {
     if !doc.api_activity.is_empty() {
         s.push_str("public API activity (per exported entry; wrappers and size queries included; no algorithm/provider binding):\n");
         for row in &doc.api_activity {
-            s.push_str(&format!("  {}: {} entries, {} observed-success returns, {} observed-failure returns; gaps: tail={} unpaired={} depth={} map={} unsupported-return={} attachment={} finality={} not-attached={} saturated={}\n", row.api.export_name(), row.entries, row.observed_success, row.observed_failure, row.gaps.tail, row.gaps.unpaired, row.gaps.depth, row.gaps.map, row.gaps.unsupported_return, row.gaps.attachment, row.gaps.finality, row.gaps.not_attached, row.gaps.saturated));
+            s.push_str(&format!("  {}: {} entries, {} observed-success returns, {} observed-failure returns; gaps: tail={} unpaired={} depth={} map={} unsupported-return={} attachment={} finality={} not-attached={} read-receipt={} saturated={}\n", row.api.export_name(), row.entries, row.observed_success, row.observed_failure, row.gaps.tail, row.gaps.unpaired, row.gaps.depth, row.gaps.map, row.gaps.unsupported_return, row.gaps.attachment, row.gaps.finality, row.gaps.not_attached, row.gaps.read_receipt, row.gaps.saturated));
         }
+        s.push('\n');
+    }
+    // v2.8 (Phase 1): the request section renders after — and
+    // separate from — the physical execution ledger above.
+    if let Some(evidence) = &doc.request_evidence {
+        s.push_str(&evidence.human_section());
+        s.push('\n');
+    }
+    // v2.9 (Phase 2): the trace section renders after the request
+    // section (PUBLIC-API plane, never physical entries).
+    if let Some(summary) = &doc.trace_summary {
+        s.push_str(&summary.human_section());
         s.push('\n');
     }
     // v2.5: the execution-attribution plane renders only when
@@ -2476,7 +2528,7 @@ fn omitted_ref(site: &SiteExecution) -> String {
 }
 
 /// Short gap vocabulary for the CBOM disclaimer line.
-fn gap_reason_short(reason: &GapReason) -> String {
+pub(crate) fn gap_reason_short(reason: &GapReason) -> String {
     match reason {
         GapReason::UnknownDenominator { scope } => format!("unknown-denominator:{scope}"),
         GapReason::UndiscoveredSites { scope, .. } => format!("undiscovered-sites:{scope}"),
@@ -3884,6 +3936,342 @@ mod tests {
     }
 
     #[test]
+    fn request_evidence_renders_validates_and_stays_separate() {
+        // Phase 1 (v2.8): the request section rides JSON (validating
+        // against the schema) and renders its own human block only
+        // when projected; empty documents omit both (existing
+        // shapes unchanged). The section never joins the physical
+        // ledger: no execution-claim key, and the human block sits
+        // after the ledger with its honesty banner.
+        use crate::provider_observation::request_evidence::{
+            FETCH_SURFACES, RequestEvidence, RequestScope,
+        };
+        let mut doc = capture::empty_document();
+        let clean: serde_json::Value =
+            serde_json::from_slice(&render_json(&doc).expect("render")).expect("json");
+        assert!(clean.get("request_evidence").is_none());
+        assert!(!render_human(&doc).contains("request evidence"));
+        // NEW-P1 scope + GATE reconciliation: the remainder (7)
+        // equals the observed api_activity entry sum in this fixture.
+        let evidence = RequestEvidence::fold(
+            &[],
+            RequestScope {
+                operational_entries: Some(7),
+                fetch_armed: FETCH_SURFACES.iter().map(|s| s.id).collect(),
+                window: None,
+                silence_start: None,
+                silence_end: None,
+                fence_cuts: Vec::new(),
+            },
+        );
+        doc.api_activity = vec![crate::api_activity::ApiActivityRow {
+            api: crate::api_activity::ApiId::try_from(20).unwrap(),
+            entries: 7,
+            observed_success: 7,
+            observed_failure: 0,
+            verification_mismatch: 0,
+            unsupported: 0,
+            gaps: crate::api_activity::ApiActivityGaps::default(),
+        }];
+        crate::evidence::stamp_request_evidence(&mut doc, evidence);
+        assert_eq!(doc.schema, crate::evidence::CAPTURE_SCHEMA_V2_8);
+        let rendered = render_json(&doc).expect("render");
+        let v: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
+        assert_eq!(v["request_evidence"]["unattributed"]["observed"]["ops"], 7);
+        assert_eq!(v["request_evidence"]["default_activation"], "unknown");
+        crate::schema::validate_v2(&v).expect("request_evidence validates");
+        crate::schema::check_v2_semantics(&v).expect("request_evidence is semantic-clean");
+        let human = render_human(&doc);
+        assert!(
+            human.contains("fetch/load/query facts never mean the fetched object was used"),
+            "{human}"
+        );
+        assert!(
+            human.contains("unattributed operational entries: 7"),
+            "{human}"
+        );
+        assert!(!human.contains("serving provider"), "{human}");
+        assert!(!human.contains("winner"), "{human}");
+    }
+
+    #[test]
+    fn trace_summary_renders_validates_and_stays_separate() {
+        // Phase 2 (v2.9): the trace section rides JSON (validating
+        // against the schema + semantics) and renders its own human
+        // block only when sealed; empty documents omit both
+        // (existing shapes unchanged). The section stays on the
+        // PUBLIC-API plane: no physical-entry language, and the
+        // human block sits after the request section.
+        use crate::provider_observation::trace as t;
+        let mut doc = capture::empty_document();
+        let clean: serde_json::Value =
+            serde_json::from_slice(&render_json(&doc).expect("render")).expect("json");
+        assert!(clean.get("trace_summary").is_none());
+        assert!(!render_human(&doc).contains("public-API pairs/classes/durations"));
+        let mut p = t::TraceProducer::new();
+        p.set_mode(t::TRACE_MODE_LATENCY);
+        let k = t::PairKey {
+            pid: 1,
+            tid: 2,
+            generation: 1,
+            cookie: 9,
+            invocation: 1,
+        };
+        p.attempt(t::AttemptEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1000,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        p.result(t::ResultEdge {
+            key: k,
+            api: 20,
+            monotonic_ns: 1500,
+            outcome: 1,
+            start_time_ns: 1,
+            seed: 1,
+        });
+        let window = p.close_window(0, 9000, [0; 8]);
+        let totals = p.totals();
+        let summary = t::summarize(&window, &totals, "latency", None);
+        crate::evidence::stamp_trace_summary(&mut doc, summary);
+        assert_eq!(doc.schema, crate::evidence::CAPTURE_SCHEMA_V2_9);
+        let rendered = render_json(&doc).expect("render");
+        let v: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
+        assert_eq!(v["trace_summary"]["version"], 1);
+        assert_eq!(v["trace_summary"]["mode"], "latency");
+        assert_eq!(v["trace_summary"]["window"]["paired"], 1);
+        assert_eq!(v["trace_summary"]["class_epoch"]["success"], 1);
+        assert_eq!(v["trace_summary"]["histograms"]["success"]["count"], 1);
+        crate::schema::validate_v2(&v).expect("trace_summary validates");
+        crate::schema::check_v2_semantics(&v).expect("trace_summary is semantic-clean");
+        let human = render_human(&doc);
+        assert!(
+            human.contains("never physical callback entries, never observer overhead"),
+            "{human}"
+        );
+        assert!(
+            human.contains("mode=latency fallback=false paired=1"),
+            "{human}"
+        );
+    }
+
+    #[test]
+    fn fatal_attachzero_engine_parity_across_doc_paths() {
+        // P2fix1 item 13 (codex DELTA-6): the proved-ENGINE
+        // usability signal survives the doc_json projection (the
+        // reader preserves it — never the hard-false residual), so
+        // service/oneshot agree on Fatal-AttachZero: same exit hint
+        // and same P-15.
+        use crate::evidence::{Completeness, EngineObservation, EngineWindow, FatalKind};
+        let mut doc = capture::empty_document();
+        doc.status = Completeness::Fatal {
+            kind: FatalKind::AttachZero,
+            reasons: vec![],
+        };
+        doc.engine_observations = vec![EngineObservation {
+            key: crate::evidence::SiteKey {
+                object: crate::evidence::ObjectId("build:deadbeef".to_string()),
+                device: 1,
+                inode: 2,
+                offset: 3,
+            },
+            generation: 1,
+            entrypoint: 0,
+            calls: 2,
+            window: EngineWindow::InWindow,
+        }];
+        // Producer path (typed): proved.
+        let producer_value = serde_json::to_value(&doc).unwrap();
+        let sig_p =
+            crate::presentation::snapshot::signals_from_producer(&producer_value).expect("signals");
+        assert!(sig_p.proved_engine, "typed path proves ENGINE");
+        // Doc_json path (projection): the SAME bit (not the hard
+        // false).
+        let projected = doc_json(&doc);
+        let sig_d =
+            crate::presentation::snapshot::signals_from_doc_json(&projected).expect("signals");
+        assert!(sig_d.proved_engine, "doc_json path preserves ENGINE");
+        // Same exit hint both paths (service reads 1 with proved
+        // ENGINE — oneshot must match, and P-15 renders it).
+        let hint_p = crate::presentation::snapshot::exit_hint_for(&sig_p);
+        let hint_d = crate::presentation::snapshot::exit_hint_for(&sig_d);
+        assert_eq!(hint_p, hint_d);
+        assert_eq!(hint_p, Some(1));
+        // Same P-15 through both oneshot snapshots.
+        let snap_p = crate::presentation::snapshot::Presenter::oneshot(&producer_value).unwrap();
+        let snap_d = crate::presentation::snapshot::Presenter::oneshot(&projected).unwrap();
+        let p15 = |s: &crate::presentation::snapshot::OperatorSnapshot| {
+            crate::presentation::prometheus::render(s)
+                .lines()
+                .find(|l| l.starts_with("osslscope_window_exit_code "))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(p15(&snap_p), p15(&snap_d));
+        assert_eq!(p15(&snap_p), "osslscope_window_exit_code 1");
+        // Out-of-window / zero-call observations prove nothing on
+        // either path.
+        let mut doc2 = doc.clone();
+        doc2.engine_observations[0].window = EngineWindow::PreWindow;
+        let neg_p = crate::presentation::snapshot::signals_from_producer(
+            &serde_json::to_value(&doc2).unwrap(),
+        )
+        .expect("signals");
+        assert!(!neg_p.proved_engine);
+        let neg_d = crate::presentation::snapshot::signals_from_doc_json(&doc_json(&doc2))
+            .expect("signals");
+        assert!(!neg_d.proved_engine);
+        assert_eq!(
+            crate::presentation::snapshot::exit_hint_for(&neg_p),
+            crate::presentation::snapshot::exit_hint_for(&neg_d)
+        );
+    }
+
+    #[test]
+    fn failed_terminal_read_row_never_receipts_observed_zero_through_full_validator() {
+        // GATE fix3 + PINS/NEW-12 fix4: the PRODUCER's failed-read
+        // row shape (the exact `wire::failed_activity` row
+        // `finalize_until` emits, with its map gap) behind an
+        // observed zero must fail the FULL validator (typed +
+        // semantic + document reconciliation) — a failed read is no
+        // observation evidence. The field contract (fix4): the
+        // failed row keeps `not_attached == false` (its owner WAS
+        // admitted — the READ failed, not the attach) and carries
+        // NO read receipt; the producer's success shape (a
+        // `wire::activity` row, only constructible after a
+        // successful terminal read of an owner — admitted or
+        // verified-positive unadmitted, fix7 NEW-28) carries
+        // the SEPARATE `read_receipt`, so one success row accepts
+        // the same zero. Same verdicts as fix3, honest fields.
+        // GATE-OPEN + NEW-9-OPEN + NEW-16 fix5: the pinned zero
+        // rides its bound nonempty silence interval (interval-free
+        // and empty-interval zeros are refused below — the full
+        // gate used to accept them).
+        use crate::provider_observation::request_evidence::{
+            FETCH_SURFACES, RequestEvidence, RequestScope,
+        };
+        let section_zero = || {
+            RequestEvidence::fold(
+                &[],
+                RequestScope {
+                    operational_entries: Some(0),
+                    fetch_armed: FETCH_SURFACES.iter().map(|s| s.id).collect(),
+                    window: Some((100, 200)),
+                    silence_start: Some(150),
+                    silence_end: None,
+                    fence_cuts: Vec::new(),
+                },
+            )
+        };
+        let validate = |section: RequestEvidence,
+                        rows: Vec<crate::api_activity::ApiActivityRow>| {
+            let mut doc = capture::empty_document();
+            doc.window.requested_start_ns = 100;
+            doc.window.requested_end_ns = 200;
+            doc.window.effective_start_ns = 100;
+            doc.window.effective_end_ns = 200;
+            doc.api_activity = crate::api_activity::merge(rows).expect("rows merge");
+            crate::evidence::stamp_request_evidence(&mut doc, section);
+            let rendered = render_json(&doc).expect("render");
+            let v: serde_json::Value = serde_json::from_slice(&rendered).expect("json");
+            assert_eq!(
+                v["request_evidence"]["unattributed"]["observed"]["ops"], 0,
+                "the pinned shape is an observed zero"
+            );
+            let typed = crate::schema::validate_v2(&v).map_err(|e| e.to_string());
+            let semantic = crate::schema::check_v2_semantics(&v);
+            typed.and(semantic)
+        };
+        let failed =
+            crate::provider_observation::wire::failed_activity(20).expect("api 20 has a row");
+        assert_eq!(failed.gaps.map, 1, "the pin uses the map-gapped row");
+        assert_eq!(failed.entries, 0);
+        // PINS fix4: the failed row's owner was admitted (attach
+        // bit clear) but no read vouched for it (no receipt).
+        assert!(
+            !failed.gaps.not_attached,
+            "a failed READ keeps the attachment bit: {:?}",
+            failed.gaps
+        );
+        assert!(
+            !failed.gaps.read_receipt,
+            "a failed read carries no read receipt: {:?}",
+            failed.gaps
+        );
+        assert!(
+            validate(section_zero(), vec![failed.clone(), failed]).is_err(),
+            "failed-read rows (map gap, no successful read) must not receipt an observed zero"
+        );
+        let success = crate::provider_observation::wire::activity(
+            20,
+            crate::provider_observation::wire::contract::ApiAggregate::default(),
+        )
+        .expect("zero totals decode");
+        assert!(
+            !success.gaps.not_attached,
+            "the success row is attached: {:?}",
+            success.gaps
+        );
+        // NEW-12 fix4: the SEPARATE successful-read receipt.
+        assert!(
+            success.gaps.read_receipt,
+            "the success row carries the read receipt: {:?}",
+            success.gaps
+        );
+        assert!(
+            validate(
+                section_zero(),
+                vec![
+                    success,
+                    crate::provider_observation::wire::failed_activity(35)
+                        .expect("api 35 has a row"),
+                ],
+            )
+            .is_ok(),
+            "one successful-read receipt accepts the armed-idle zero"
+        );
+        // GATE-OPEN + NEW-9-OPEN fix5: the same receipted rows must
+        // NOT accept the zero when its silence interval is absent
+        // or empty (the full gate used to accept both).
+        let receipted = || {
+            vec![
+                crate::provider_observation::wire::activity(
+                    20,
+                    crate::provider_observation::wire::contract::ApiAggregate::default(),
+                )
+                .expect("zero totals decode"),
+            ]
+        };
+        let interval_free = RequestEvidence {
+            silence_window: None,
+            ..section_zero()
+        };
+        assert!(
+            interval_free.claims_zero(),
+            "premise: the interval-free shape still claims zeros"
+        );
+        assert!(
+            validate(interval_free, receipted()).is_err(),
+            "an observed zero without a silence interval must not validate (receipted rows or not)"
+        );
+        let empty_interval = RequestEvidence {
+            silence_window: Some(
+                crate::provider_observation::request_evidence::SilenceWindow {
+                    start_ns: 150,
+                    end_ns: 150,
+                },
+            ),
+            ..section_zero()
+        };
+        assert!(
+            validate(empty_interval, receipted()).is_err(),
+            "an observed zero with an empty silence interval must not validate"
+        );
+    }
+
+    #[test]
     fn refusal_classes_reach_human_and_json() {
         // Per-class gate: every wire string reaches BOTH the human
         // section and the JSON key verbatim (the renderer never
@@ -4197,6 +4585,53 @@ mod tests {
         let mut bi = base.clone();
         bi.extend(["--builtin", "--pid", "9"]);
         assert!(parse(&v(bi)).is_err());
+    }
+
+    #[test]
+    fn trace_by_api_flag_consumes_one_slot_in_any_position() {
+        // P2fix1 item 1a/21 (codex NEW-P2d): the one-token
+        // `--trace-histogram-by-api` flag must not swallow the next
+        // arg — flags before AND after options, through the public
+        // report route.
+        use crate::provider_observation::trace as t;
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // After options: the following --format must still parse.
+        let after = parse(&v(vec![
+            "--pid",
+            "9",
+            "--trace",
+            "latency",
+            "--trace-histogram-by-api",
+            "--format",
+            "json",
+        ]))
+        .expect("by-api before --format must not swallow it");
+        assert_eq!(after.cfg.trace_mode, t::TRACE_MODE_LATENCY);
+        assert!(after.cfg.trace_by_api);
+        assert_eq!(after.format, "json");
+        // Before options: the following --trace/--pid must parse.
+        let before = parse(&v(vec![
+            "--trace-histogram-by-api",
+            "--trace",
+            "latency",
+            "--pid",
+            "9",
+        ]))
+        .expect("by-api first must not swallow --trace");
+        assert_eq!(before.cfg.trace_mode, t::TRACE_MODE_LATENCY);
+        assert!(before.cfg.trace_by_api);
+        // Immediately before run: the run target must survive.
+        let run = parse(&v(vec![
+            "--trace",
+            "latency",
+            "--trace-histogram-by-api",
+            "run",
+            "--",
+            "true",
+        ]))
+        .expect("by-api before run must not swallow it");
+        assert!(run.cfg.trace_by_api);
+        assert!(matches!(run.target, capture::Target::Spawn { .. }));
     }
 }
 

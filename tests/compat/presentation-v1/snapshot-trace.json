@@ -1,0 +1,575 @@
+{
+  "schema": "osslscope-presentation-v1",
+  "snapshot_seq": 0,
+  "produced_wall_ns": 1700000000000000000,
+  "produced_monotonic_ns": 13,
+  "source": {
+    "mode": "oneshot",
+    "generation": null,
+    "run_id": null,
+    "window_seq": null,
+    "window_sha256": "793d941bc7e222ced930d56ee610af1b48e289228b1960d51386048753b748db"
+  },
+  "window": {
+    "requested_start_ns": 0,
+    "requested_end_ns": 0,
+    "effective_start_ns": 0,
+    "effective_end_ns": 0,
+    "signal_cut": false,
+    "accum_cut": false
+  },
+  "completeness": {
+    "state": "complete",
+    "reasons": [],
+    "epoch_partial_by_class": {
+      "unknown_denominator": 0,
+      "undiscovered_sites": 0,
+      "unattached_sites": 0,
+      "loss": 0,
+      "unattributed_calls": 0,
+      "startup_gap": 0,
+      "tail_gap": 0,
+      "signal_cut": 0,
+      "visibility_lost": 0,
+      "no_reasons": 0
+    }
+  },
+  "policy": {
+    "active": null,
+    "outcome": "observe_only"
+  },
+  "exit_hint": 4,
+  "counts": {
+    "calls_total": 0,
+    "calls_window": 0,
+    "lanes": {
+      "legacy_exclusive": 0,
+      "non_legacy_exclusive": 0,
+      "shared_ambiguous": 0,
+      "unfenced_tails": 0
+    },
+    "lanes_window": {
+      "legacy_exclusive": 0,
+      "non_legacy_exclusive": 0,
+      "shared_ambiguous": 0,
+      "unfenced_tails": 0
+    },
+    "site_rows": 0,
+    "by_outcome": {
+      "success": 1200,
+      "failure": 0,
+      "unknown": 200
+    }
+  },
+  "members": {
+    "observed": null,
+    "retired_in_window": null,
+    "retired_epoch": 0,
+    "deferred_depth": null
+  },
+  "loss": {
+    "session": null,
+    "epoch_by_cause": {
+      "corpse_wait": 0,
+      "cgroup_move": 0,
+      "membership_unknown": 0,
+      "ring_loss": 0,
+      "connector_drops": 0,
+      "connector_enobufs": 0,
+      "scan_loss": 0,
+      "signal_prefix_unwitnessed": 0,
+      "drain_pending": 0,
+      "exec_spanning_aggregate": 0,
+      "coalesced_loss": 0,
+      "skipped_tick": 0
+    },
+    "counters": []
+  },
+  "stream": null,
+  "trace": {
+    "window_seq": 0,
+    "mode": "latency",
+    "paired": 1400,
+    "trace_unpaired_entries": 0,
+    "trace_unpaired_results": 0,
+    "trace_depth_exceeded": 0,
+    "trace_dropped": 0,
+    "trace_capped": false,
+    "trace_nonmonotonic_pairs": 0,
+    "trace_rejected_unknown_api": 0,
+    "ring_loss": [
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "class_window": {
+      "success": 1200,
+      "failure": 0,
+      "empty": 0,
+      "retry": 0,
+      "unknown": 200
+    },
+    "class_epoch": {
+      "success": 1200,
+      "failure": 0,
+      "empty": 0,
+      "retry": 0,
+      "unknown": 200
+    },
+    "unmeasured_seqs": [],
+    "gaps": [],
+    "gap_overflow": 0,
+    "exemplars": []
+  },
+  "histograms": {
+    "edges": "6d-frozen-18",
+    "first_seq": 0,
+    "last_seq": 0,
+    "unmeasured_seqs": [],
+    "capped_folded": 0,
+    "success": {
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        999,
+        1000,
+        1000,
+        1198,
+        1199,
+        1199,
+        1199,
+        1199,
+        1199,
+        1200,
+        1200,
+        1200
+      ],
+      "sum": 16534129,
+      "count": 1200
+    },
+    "failure": {
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "sum": 0,
+      "count": 0
+    },
+    "empty": {
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "sum": 0,
+      "count": 0
+    },
+    "retry": {
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "sum": 0,
+      "count": 0
+    },
+    "unknown": {
+      "buckets": [
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0
+      ],
+      "sum": 0,
+      "count": 0
+    },
+    "by_api": {},
+    "by_api_availability": {
+      "20": "partial_coverage",
+      "21": "not_attached",
+      "22": "partial_coverage",
+      "23": "partial_coverage",
+      "24": "partial_coverage",
+      "25": "partial_coverage",
+      "26": "partial_coverage",
+      "27": "partial_coverage",
+      "28": "partial_coverage",
+      "29": "partial_coverage",
+      "30": "partial_coverage",
+      "31": "partial_coverage",
+      "32": "partial_coverage",
+      "33": "partial_coverage",
+      "34": "partial_coverage",
+      "35": "partial_coverage",
+      "36": "partial_coverage",
+      "37": "partial_coverage",
+      "38": "partial_coverage",
+      "39": "partial_coverage",
+      "40": "partial_coverage",
+      "41": "partial_coverage",
+      "42": "partial_coverage",
+      "43": "partial_coverage",
+      "44": "partial_coverage",
+      "45": "partial_coverage",
+      "46": "partial_coverage",
+      "47": "partial_coverage",
+      "48": "partial_coverage",
+      "49": "partial_coverage",
+      "50": "partial_coverage",
+      "51": "partial_coverage",
+      "52": "partial_coverage",
+      "53": "partial_coverage",
+      "54": "partial_coverage",
+      "55": "partial_coverage",
+      "56": "partial_coverage",
+      "57": "partial_coverage",
+      "58": "partial_coverage",
+      "59": "partial_coverage",
+      "60": "partial_coverage",
+      "61": "partial_coverage",
+      "62": "partial_coverage",
+      "63": "partial_coverage",
+      "64": "partial_coverage",
+      "65": "partial_coverage",
+      "66": "partial_coverage",
+      "67": "partial_coverage",
+      "68": "partial_coverage",
+      "69": "partial_coverage",
+      "70": "partial_coverage",
+      "71": "partial_coverage",
+      "72": "partial_coverage"
+    }
+  },
+  "health": {
+    "snapshot_age_ns": 13,
+    "stale": false
+  },
+  "presenter": {
+    "epoch_changes": 0,
+    "series_overflow": 0
+  },
+  "unknown": [
+    {
+      "path": "source.generation",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "source.run_id",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "source.window_seq",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "members.observed",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "members.retired_in_window",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "members.deferred_depth",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "loss.session",
+      "reason": "oneshot_no_sequence"
+    },
+    {
+      "path": "policy.active",
+      "reason": "observe_only"
+    },
+    {
+      "path": "stream",
+      "reason": "stream_unconfigured"
+    },
+    {
+      "path": "histograms.by_api.\"20\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"21\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"22\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"23\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"24\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"25\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"26\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"27\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"28\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"29\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"30\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"31\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"32\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"33\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"34\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"35\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"36\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"37\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"38\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"39\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"40\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"41\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"42\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"43\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"44\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"45\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"46\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"47\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"48\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"49\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"50\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"51\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"52\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"53\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"54\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"55\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"56\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"57\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"58\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"59\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"60\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"61\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"62\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"63\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"64\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"65\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"66\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"67\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"68\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"69\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"70\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"71\"",
+      "reason": "api_unavailable"
+    },
+    {
+      "path": "histograms.by_api.\"72\"",
+      "reason": "api_unavailable"
+    }
+  ]
+}

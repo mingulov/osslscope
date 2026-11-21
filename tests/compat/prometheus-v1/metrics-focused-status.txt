@@ -1,0 +1,79 @@
+# HELP osslscope_epoch_calls_total Provider dispatch callback entries in the current epoch, by legacy partition lane.
+# TYPE osslscope_epoch_calls_total counter
+osslscope_epoch_calls_total{lane="legacy_exclusive"} 0
+osslscope_epoch_calls_total{lane="non_legacy_exclusive"} 0
+osslscope_epoch_calls_total{lane="shared_ambiguous"} 0
+osslscope_epoch_calls_total{lane="unfenced_tails"} 2250
+# HELP osslscope_epoch_changes_total Observed generation changes in the presenter run.
+# TYPE osslscope_epoch_changes_total counter
+osslscope_epoch_changes_total 0
+# HELP osslscope_epoch_partial_total Windows finalizing partial or fatal in the current epoch, by first gap class.
+# TYPE osslscope_epoch_partial_total counter
+osslscope_epoch_partial_total{gap_class="loss"} 0
+osslscope_epoch_partial_total{gap_class="no_reasons"} 0
+osslscope_epoch_partial_total{gap_class="signal_cut"} 0
+osslscope_epoch_partial_total{gap_class="startup_gap"} 0
+osslscope_epoch_partial_total{gap_class="tail_gap"} 0
+osslscope_epoch_partial_total{gap_class="unattached_sites"} 0
+osslscope_epoch_partial_total{gap_class="unattributed_calls"} 0
+osslscope_epoch_partial_total{gap_class="undiscovered_sites"} 0
+osslscope_epoch_partial_total{gap_class="unknown_denominator"} 1
+osslscope_epoch_partial_total{gap_class="visibility_lost"} 0
+# HELP osslscope_exporter_series_overflow_total Series omitted by the cardinality budget in the presenter run.
+# TYPE osslscope_exporter_series_overflow_total counter
+osslscope_exporter_series_overflow_total 0
+# HELP osslscope_loss_events_total Session lost-interval events in the current epoch, by cause.
+# TYPE osslscope_loss_events_total counter
+osslscope_loss_events_total{loss_cause="cgroup_move"} 0
+osslscope_loss_events_total{loss_cause="coalesced_loss"} 0
+osslscope_loss_events_total{loss_cause="connector_drops"} 0
+osslscope_loss_events_total{loss_cause="connector_enobufs"} 0
+osslscope_loss_events_total{loss_cause="corpse_wait"} 0
+osslscope_loss_events_total{loss_cause="drain_pending"} 0
+osslscope_loss_events_total{loss_cause="exec_spanning_aggregate"} 0
+osslscope_loss_events_total{loss_cause="membership_unknown"} 0
+osslscope_loss_events_total{loss_cause="ring_loss"} 0
+osslscope_loss_events_total{loss_cause="scan_loss"} 0
+osslscope_loss_events_total{loss_cause="signal_prefix_unwitnessed"} 0
+osslscope_loss_events_total{loss_cause="skipped_tick"} 0
+# HELP osslscope_members_retired_total Members retired during the current epoch.
+# TYPE osslscope_members_retired_total counter
+osslscope_members_retired_total 0
+# HELP osslscope_policy_outcome_info Current window policy outcome; exactly one series has value 1.
+# TYPE osslscope_policy_outcome_info gauge
+osslscope_policy_outcome_info{outcome="inconclusive"} 0
+osslscope_policy_outcome_info{outcome="no_verdict"} 0
+osslscope_policy_outcome_info{outcome="observe_only"} 1
+osslscope_policy_outcome_info{outcome="pass"} 0
+osslscope_policy_outcome_info{outcome="violation"} 0
+# HELP osslscope_snapshot_age_nanoseconds Nanoseconds from window effective end to snapshot build.
+# TYPE osslscope_snapshot_age_nanoseconds gauge
+osslscope_snapshot_age_nanoseconds 13
+# HELP osslscope_snapshot_stale 1 when the snapshot is stale per the delivery contract, else 0.
+# TYPE osslscope_snapshot_stale gauge
+osslscope_snapshot_stale 0
+# HELP osslscope_trace_calls_total Paired public API invocations in the current epoch, by return class. Absent when trace mode is off or metadata.
+# TYPE osslscope_trace_calls_total counter
+osslscope_trace_calls_total{outcome_class="empty"} 0
+osslscope_trace_calls_total{outcome_class="failure"} 0
+osslscope_trace_calls_total{outcome_class="retry"} 0
+osslscope_trace_calls_total{outcome_class="success"} 900
+osslscope_trace_calls_total{outcome_class="unknown"} 150
+# HELP osslscope_window_completeness_info Current window completeness; exactly one series has value 1.
+# TYPE osslscope_window_completeness_info gauge
+osslscope_window_completeness_info{completeness="complete"} 0
+osslscope_window_completeness_info{completeness="fatal"} 0
+osslscope_window_completeness_info{completeness="partial"} 1
+# HELP osslscope_window_cut_info Current window cut state; exactly one series has value 1.
+# TYPE osslscope_window_cut_info gauge
+osslscope_window_cut_info{cut="accum_cut"} 0
+osslscope_window_cut_info{cut="both_cuts"} 0
+osslscope_window_cut_info{cut="none"} 1
+osslscope_window_cut_info{cut="signal_cut"} 0
+# HELP osslscope_window_exit_code exit_for value of the current window.
+# TYPE osslscope_window_exit_code gauge
+osslscope_window_exit_code 4
+# HELP osslscope_window_site_rows Merged site rows in the current window document.
+# TYPE osslscope_window_site_rows gauge
+osslscope_window_site_rows 2849
+# EOF

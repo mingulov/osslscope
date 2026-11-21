@@ -58,7 +58,7 @@ General rules:
 ## Terminal count uncertainty
 
 Current producers emit `observed-crypto-v2.4` through
-`observed-crypto-v2.7` (`src/evidence.rs` is the emitter of
+`observed-crypto-v2.9` (`src/evidence.rs` is the emitter of
 record). They preserve positive
 current/fenced observations when count completion fails. A count loss
 event is not a measured missing call: pending writers, unread keys and

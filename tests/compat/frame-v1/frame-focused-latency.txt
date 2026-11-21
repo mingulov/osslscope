@@ -1,0 +1,30 @@
+osslscope osslscope-presentation-v1 seq=0 gen=? run=? win=? age=13 coalesced=0
+WINDOW 8700045274..68700045274 eff=8700045274..68700045274 signal_cut=false accum_cut=false completeness=partial reasons=unknown-denominator:focused.execution,loss:focused.ambiguity,loss:focused.attac…
+POLICY outcome=observe_only active=observe-only
+COUNTS epoch=2250 window=2250 lanes=0/0/0/2250 site_rows=2849 by_outcome=900/0/150
+MEMBERS observed=? retired_window=? retired_epoch=0 deferred=?
+LOSS session=? counters=8 +2 more
+  counter name=focused.ambiguity kind=Loss value=1
+  counter name=focused.attach_refused_quarantined kind=Loss value=1
+  counter name=focused.finality_unknown kind=Loss value=1
+  counter name=focused.first_call_unknown kind=Loss value=1
+  counter name=focused.first_query_unknown kind=Loss value=1
+  counter name=focused.identity_unknown kind=Loss value=1
+  counter name=focused.interval_unknown kind=Loss value=1
+  counter name=focused.interval_unknown kind=Loss value=1
+STREAM ? stream_unconfigured
+TRACE seq=0 mode=latency paired=1050 unpaired_e=0 unpaired_r=0 depth=0 dropped=0 capped=false nonmono=0 rejected=0
+  class success=900 failure=0 empty=0 retry=0 unknown=150
+HIST edges=6d-frozen-18 seqs=0..0 capped_folded=0 counts=900/0/0/0/0
+UNKNOWN 11
+  source.generation oneshot_no_sequence
+  source.run_id oneshot_no_sequence
+  source.window_seq oneshot_no_sequence
+  members.observed oneshot_no_sequence
+  members.retired_in_window oneshot_no_sequence
+  members.deferred_depth oneshot_no_sequence
+  loss.session oneshot_no_sequence
+  policy.active observe_only
+  stream stream_unconfigured
+  histograms.by_api opt_in_disabled
+  histograms.by_api_availability opt_in_disabled

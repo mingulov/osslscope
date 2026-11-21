@@ -37,6 +37,14 @@ pub enum Api {
     EvpKdfFetch,
     EvpSignatureFetch,
     EvpKemFetch,
+    EvpAsymCipherFetch,
+    EvpKeyexchFetch,
+    EvpKeymgmtFetch,
+    EvpRandFetch,
+    EvpSkeymgmtFetch,
+    OsslDecoderFetch,
+    OsslEncoderFetch,
+    OsslStoreLoaderFetch,
     EvpDigestInitEx,
     EvpDigestInitEx2,
     EvpDigestUpdate,
@@ -96,7 +104,7 @@ impl Api {
     /// Number of variants in this enum (update together). Bounds
     /// coordinator-supplied export metadata: `exports` is collected
     /// from a `BTreeSet<Api>`, so our own snapshots never exceed it.
-    pub const COUNT: usize = 70;
+    pub const COUNT: usize = 78;
 
     pub(crate) fn operational_id(self) -> Option<crate::api_activity::ApiId> {
         let id = match self {
@@ -980,6 +988,14 @@ mod tests {
             Api::EvpKdfFetch,
             Api::EvpSignatureFetch,
             Api::EvpKemFetch,
+            Api::EvpAsymCipherFetch,
+            Api::EvpKeyexchFetch,
+            Api::EvpKeymgmtFetch,
+            Api::EvpRandFetch,
+            Api::EvpSkeymgmtFetch,
+            Api::OsslDecoderFetch,
+            Api::OsslEncoderFetch,
+            Api::OsslStoreLoaderFetch,
             Api::EvpDigestInitEx,
             Api::EvpDigestInitEx2,
             Api::EvpDigestUpdate,

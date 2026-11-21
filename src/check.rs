@@ -105,6 +105,9 @@ fn parse(argv: &[String]) -> Result<Args, String> {
     let mut timeout_raw: Option<String> = None;
     let mut grace_raw: Option<String> = None;
     let mut image_digest = String::new();
+    let mut trace_mode = crate::provider_observation::trace::TRACE_MODE_OFF;
+    let mut trace_mode_set = false;
+    let mut trace_by_api = false;
     let mut image_digest_explicit = false;
     let mut pid: Option<u32> = None;
     let mut run_at: Option<usize> = None;
@@ -210,12 +213,27 @@ fn parse(argv: &[String]) -> Result<Args, String> {
                 continue;
             }
             "--require-executed" => rules.require_executed.push(val(a)?),
+            "--trace" if !trace_mode_set => {
+                trace_mode = crate::provider_observation::cli::trace_word(&val(a)?)
+                    .ok_or_else(|| "--trace needs off|metadata|latency|status|all".to_string())?;
+                trace_mode_set = true;
+            }
+            "--trace-histogram-by-api" if !trace_by_api => {
+                trace_by_api = true;
+                i += 1;
+                continue;
+            }
             x => return Err(format!("unknown flag {x}")),
         }
         i += 2;
     }
     if format != "human" && format != "json" {
         return Err("--format must be human|json".to_string());
+    }
+    // §6D-9: the histogram keying without histograms is a usage
+    // error (exit 2 pre-start, before any side effect).
+    if trace_by_api && !crate::provider_observation::cli::trace_latency_bearing(trace_mode) {
+        return Err("--trace-histogram-by-api needs --trace latency|all".to_string());
     }
     // H9/R07: destinations are meaningless without `run --`
     // (never silently ignored); mutual exclusion + fd shape live in
@@ -324,6 +342,8 @@ fn parse(argv: &[String]) -> Result<Args, String> {
             harvest_timeout: timeout,
             grace,
             image_digest,
+            trace_mode,
+            trace_by_api,
         },
         target,
         format,
@@ -640,6 +660,12 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Prepared, ExitCode> {
             timeout: args.cfg.harvest_timeout,
             grace: args.cfg.grace,
             parsed_cache: None,
+            trace_mode: args.cfg.trace_mode,
+            trace_by_api: args.cfg.trace_by_api,
+            // Public CLI: never the qual bypass (forced fallback
+            // while C023 is OPEN).
+            allow_operational_trace: false,
+            attach_ready: None,
         };
         return Ok(Prepared {
             args,
@@ -1346,6 +1372,55 @@ require-executed=["SHA2-256"]
         let auto = parse(&v(neither)).unwrap();
         assert!(auto.cfg.provider.is_none());
         assert!(auto.cfg.harvest_object.is_none());
+    }
+
+    #[test]
+    fn trace_by_api_flag_consumes_one_slot_in_any_position() {
+        // P2fix1 item 1a/21 (codex NEW-P2d): the one-token
+        // `--trace-histogram-by-api` flag must not swallow the next
+        // arg — flags before AND after options, through the public
+        // check route.
+        use crate::provider_observation::trace as t;
+        let v = |s: Vec<&str>| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // After options: the following --format must still parse.
+        let after = parse(&v(vec![
+            "--deny-weak",
+            "--pid",
+            "9",
+            "--trace",
+            "latency",
+            "--trace-histogram-by-api",
+            "--format",
+            "json",
+        ]))
+        .expect("by-api before --format must not swallow it");
+        assert_eq!(after.cfg.trace_mode, t::TRACE_MODE_LATENCY);
+        assert!(after.cfg.trace_by_api);
+        assert_eq!(after.format, "json");
+        // Before options: the following --trace/--pid must parse.
+        let before = parse(&v(vec![
+            "--trace-histogram-by-api",
+            "--deny-weak",
+            "--trace",
+            "latency",
+            "--pid",
+            "9",
+        ]))
+        .expect("by-api first must not swallow --deny-weak");
+        assert_eq!(before.cfg.trace_mode, t::TRACE_MODE_LATENCY);
+        assert!(before.cfg.trace_by_api);
+        // Immediately before run: the run target must survive.
+        let run = parse(&v(vec![
+            "--deny-weak",
+            "--trace",
+            "latency",
+            "--trace-histogram-by-api",
+            "run",
+            "--",
+            "true",
+        ]))
+        .expect("by-api before run must not swallow it");
+        assert!(run.cfg.trace_by_api);
     }
 
     #[test]
