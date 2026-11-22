@@ -3609,18 +3609,19 @@ mod tests {
 
     #[test]
     fn new75_late_flush_failure_keeps_live_transaction() {
-        // P2fix13 NEW-75 (+ NEW-16/NEW-70-OPEN): an ACTUAL
-        // late abort at the publish boundary (a FIFO
-        // substituted at the checkpoint target — the joint
-        // flush stages fully and refuses at the fused
-        // publish gate) leaves the LIVE export transaction
-        // untouched: the staged fold is discarded (no
-        // mid-fold resume, no double fold), and the next
-        // refresh after the substitution is removed commits
-        // the same transaction exactly once. Publish-last
-        // leaves no window where disk adopted bytes the live
-        // exporter never published (the pre-fix restore
-        // failure shape).
+        // P2fix13 NEW-75 (+ NEW-16/NEW-70-OPEN), P2fix14 NEW-80
+        // early-gate arm (a pre-standing FIFO now refuses
+        // BEFORE staging; the post-staging publish-boundary
+        // refusal moved to the NEW-85 pin): an ACTUAL late
+        // abort (a FIFO substituted at the checkpoint target)
+        // leaves the LIVE export transaction untouched: the
+        // staged fold is discarded (no mid-fold resume, no
+        // double fold), and the next refresh after the
+        // substitution is removed commits the same
+        // transaction exactly once. Publish-last leaves no
+        // window where disk adopted bytes the live exporter
+        // never published (the pre-fix restore failure
+        // shape).
         use super::super::snapshot;
         let dir = std::env::temp_dir().join(format!(
             "p2fix13-new75-late-{}-{}",
@@ -3828,6 +3829,268 @@ mod tests {
             "the shutdown flush failure reports: {reports:?}"
         );
         let _ = std::fs::remove_file(&checkpoint_sub);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new81_refresh_dir_sync_failure_retries_whole_and_reports() {
+        // P2fix14 NEW-81 (+ NEW-9/NEW-16/NEW-75-OPEN): a
+        // directory-sync failure inside the joint commit fails
+        // the refresh (the staged transaction is discarded —
+        // live state untouched, no mid-fold resume) and the
+        // SAME transaction retries whole after the fault
+        // clears; the shutdown flush reports the same
+        // settlement outcome (never a silent discard).
+        // Pre-fix: the sync result is discarded and the
+        // refresh reports success over unsettled bytes (RED).
+        use super::super::snapshot;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix14-new81-refresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        std::fs::write(
+            dir.join("window-0000000000.json"),
+            serde_json::to_string(&snapshot::test_envelope(0, 0, run.clone(), 10)).unwrap(),
+        )
+        .unwrap();
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits watermark 0");
+        let file_before = std::fs::read(&ckpt).unwrap();
+        // A second window lands; the joint commit's settle
+        // sync fails.
+        std::fs::write(
+            dir.join("window-0000000001.json"),
+            serde_json::to_string(&snapshot::test_envelope(1, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        snapshot::dir_sync_fault::arm(1);
+        let err = refresh_once(&mut p, &mut state)
+            .err()
+            .expect("the unsettled commit fails the refresh");
+        assert!(
+            err.contains("checkpoint flush") && err.contains("directory sync failed"),
+            "the failure is the real unsettled flush: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&ckpt).unwrap(),
+            file_before,
+            "the failed refresh keeps the committed checkpoint bytes"
+        );
+        // The SAME transaction retries whole (calls 10+10,
+        // watermark 1 — a mid-fold resume would double-fold).
+        let qp = refresh_once(&mut p, &mut state).expect("the transaction retries whole");
+        assert_eq!(qp.snap.source.window_seq, Some(1), "the tip advances once");
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(body["watermark_seq"], serde_json::json!(1));
+        assert_eq!(
+            body["accumulators"]["calls_total"],
+            serde_json::json!(20),
+            "exactly one fold of each window (no double fold past the abort)"
+        );
+        // Shutdown reporting reflects the real settlement
+        // outcome too (the sync fault re-armed).
+        snapshot::dir_sync_fault::arm(1);
+        let err = super::shutdown_flush(&mut p)
+            .expect_err("an unsettled shutdown flush must report its error");
+        assert!(
+            format!("{err:?}").contains("directory sync failed"),
+            "shutdown reports the settlement failure: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&ckpt_dir);
+    }
+
+    #[test]
+    fn new85_retention_reopen_through_publish_boundary() {
+        // P2fix14 NEW-85 (+ NEW-22/NEW-33/NEW-75-OPEN —
+        // supersedes the P2fix13 NEW-70 retention pin's
+        // stage-creation refusal): ONE refresh drives through
+        // COMPLETED staging to a VERIFIED publish-boundary
+        // refusal (a FIFO substituted at the target after the
+        // gate stat — the hook first verifies the staged body
+        // is complete, so the refusal is proven post-staging;
+        // the conditional publish detects the substitution
+        // and preserves the FIFO) AFTER retention removed
+        // already-folded windows — then prior bytes + exact
+        // reopen accounting in this SAME test. Pre-fix: the
+        // plain rename replaces the FIFO and reports success
+        // (RED).
+        use super::super::snapshot;
+        use std::os::unix::fs::FileTypeExt as _;
+        let dir = std::env::temp_dir().join(format!(
+            "p2fix14-new85-retention-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({"pid": 1, "starttime": 2, "boot_id": "12345678-9abc-def0-1234-56789abcdef0"});
+        for seq in 0..3u64 {
+            std::fs::write(
+                dir.join(format!("window-{seq:010}.json")),
+                serde_json::to_string(&snapshot::test_envelope(seq, 0, run.clone(), 10)).unwrap(),
+            )
+            .unwrap();
+        }
+        let ckpt_dir = std::path::PathBuf::from(format!("{}.ckptdir", dir.display()));
+        std::fs::create_dir_all(&ckpt_dir).unwrap();
+        let ckpt = ckpt_dir.join("ckpt.json");
+        let mut p = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export").unwrap();
+        let mut state = RefreshState::default();
+        refresh_once(&mut p, &mut state).expect("first refresh commits watermark 2");
+        let file_before = std::fs::read(&ckpt).unwrap();
+        // Retention removes the already-folded windows (seq ≤
+        // watermark); a new fold-pending window lands past a gap.
+        for seq in 0..3u64 {
+            std::fs::remove_file(dir.join(format!("window-{seq:010}.json"))).unwrap();
+        }
+        std::fs::write(
+            dir.join("window-0000000004.json"),
+            serde_json::to_string(&snapshot::test_envelope(4, 0, run, 10)).unwrap(),
+        )
+        .unwrap();
+        // The next refresh stages COMPLETELY, then refuses at
+        // the publish boundary: the hook verifies the staged
+        // body is complete (parseable, hashed, watermark 4)
+        // and only then substitutes the FIFO.
+        let holding = ckpt_dir.join("holding.json");
+        let (ckpt2, holding2, ckpt_dir2) = (ckpt.clone(), holding.clone(), ckpt_dir.clone());
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ran2 = ran.clone();
+        snapshot::pre_exchange_hook::arm(move || {
+            // VERIFIED staging completion: exactly one stage
+            // stands with the full new body.
+            let stages: Vec<std::path::PathBuf> = std::fs::read_dir(&ckpt_dir2)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .filter(|q| {
+                    q.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".staging-")
+                })
+                .collect();
+            assert_eq!(stages.len(), 1, "premise: staging completed exactly once");
+            let staged: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&stages[0]).unwrap())
+                    .expect("premise: the staged body parses");
+            assert_eq!(
+                staged["watermark_seq"],
+                serde_json::json!(4),
+                "premise: the staged body is the full new transaction"
+            );
+            assert!(
+                staged["sha256"].as_str().is_some_and(|h| h.len() == 64),
+                "premise: the staged body is hashed"
+            );
+            std::fs::rename(&ckpt2, &holding2).unwrap();
+            // SAFETY: mkfifo on a fresh private path.
+            assert_eq!(
+                unsafe {
+                    libc::mkfifo(
+                        std::ffi::CString::new(ckpt2.to_str().unwrap())
+                            .unwrap()
+                            .as_ptr(),
+                        0o600,
+                    )
+                },
+                0
+            );
+            ran2.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        let err = refresh_once(&mut p, &mut state)
+            .err()
+            .expect("the publish-boundary refusal fails the refresh");
+        snapshot::pre_exchange_hook::disarm();
+        assert!(
+            ran.load(std::sync::atomic::Ordering::Relaxed),
+            "the hook verified staging, then substituted at the boundary"
+        );
+        assert!(
+            err.contains("checkpoint flush")
+                && err.contains("substituted after the gate")
+                && !err.contains("injected"),
+            "the failure is the real publish-boundary substitution detector: {err}"
+        );
+        // Prior bytes + the preserved FIFO in the same test.
+        assert_eq!(
+            std::fs::read(&holding).unwrap(),
+            file_before,
+            "the prior checkpoint bytes were never touched"
+        );
+        assert!(
+            std::fs::symlink_metadata(&ckpt)
+                .unwrap()
+                .file_type()
+                .is_fifo(),
+            "the substituted FIFO survives (never opened, never replaced)"
+        );
+        let residue: Vec<String> = std::fs::read_dir(&ckpt_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".staging-"))
+            .collect();
+        assert!(residue.is_empty(), "no stage residue: {residue:?}");
+        // Restore + restart: reopen on the committed bytes and
+        // refresh — exact reopen accounting.
+        std::fs::remove_file(&ckpt).unwrap();
+        std::fs::rename(&holding, &ckpt).unwrap();
+        drop(p);
+        drop(state);
+        let mut p2 = snapshot::Presenter::open_with_checkpoint(&dir, &ckpt, 1, "export")
+            .expect("reopen on the committed checkpoint");
+        let mut state2 = RefreshState::restore(&mut p2);
+        let qp = refresh_once(&mut p2, &mut state2).expect("post-reopen refresh recovers");
+        assert_eq!(qp.snap.source.window_seq, Some(4), "the tip advances");
+        assert_eq!(
+            qp.snap.source.generation,
+            Some(0),
+            "same generation across the reopen"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&ckpt).unwrap()).unwrap();
+        assert_eq!(
+            body["watermark_seq"],
+            serde_json::json!(4),
+            "the checkpoint advances past the retained suffix"
+        );
+        assert_eq!(
+            body["accumulators"]["calls_total"],
+            serde_json::json!(40),
+            "exactly one fold of each retained window (3×10 + 10)"
+        );
+        assert_eq!(
+            body["accumulators"]["lanes"],
+            serde_json::json!([40, 0, 0, 0]),
+            "the lane totals are exact"
+        );
+        assert_eq!(
+            body["accumulators"]["trace_unmeasured"],
+            serde_json::json!([[0, 4]]),
+            "the restored span + the retention gap + the folded-but-null tip merge"
+        );
+        assert!(
+            body["accumulators"]["unstable"]
+                .as_array()
+                .is_some_and(|fs| !fs.is_empty()),
+            "the gap flags the epoch"
+        );
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&ckpt_dir);
     }

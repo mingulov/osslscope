@@ -1904,6 +1904,18 @@ fn h5_t3_every_device_site_names_one_domain() {
             "let id = (md.dev(), md.ino());",
             1,
         ),
+        // [p2fix14 NEW-80: own-stage identity — native fstat
+        // (dev, ino) of our own O_EXCL stage fd, compared
+        // raw-vs-raw only (name→inode verification before any
+        // withdrawal/removal unlink); still the single native
+        // domain, never joined to maps text or encoded
+        // devices.]
+        (
+            "src/presentation/snapshot.rs",
+            "raw",
+            "Ok((md.dev(), md.ino()))",
+            1,
+        ),
     ];
     for (file, domain, _, _) in pinned {
         assert!(

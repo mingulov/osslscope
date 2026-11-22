@@ -763,8 +763,17 @@ pub fn run(args: &[String]) -> ExitCode {
                 // Window-file outage: KEEP PUBLISHING last-good with
                 // refreshed staleness (P2fix3 NEW-1 — no exit; the
                 // terminal never freezes on a stale age; recovery
-                // advances below).
-                eprintln!("osslscope: watch: {e} (retaining last-good)");
+                // advances below). The note names the ACCEPTED TIP
+                // beside the rejection (P2fix14 NEW-84 — the live
+                // folded tip from the single scan that just ran,
+                // same line, so live-test synchronization observes
+                // the accepted tip + the rejected tail from the
+                // SAME scan with no buffered-note counting).
+                let tip = match presenter.folded_tip() {
+                    (Some(g), Some(s)) => format!("accepted tip gen={g} seq={s}; "),
+                    _ => "accepted tip none; ".to_string(),
+                };
+                eprintln!("osslscope: watch: {e} ({tip}retaining last-good)");
                 if let Some(last) = last_built.clone() {
                     let mut republished = last;
                     let (age, stale) = super::snapshot::snapshot_freshness(
